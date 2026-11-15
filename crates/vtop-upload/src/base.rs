@@ -169,6 +169,18 @@ pub struct StoredRetention {
     pub legal_hold: Option<bool>,
 }
 
+/// What a store answered about one bucket feature, versioning or Object Lock
+/// (#722). [`NotSupported`](Self::NotSupported) is the store saying it does
+/// not implement the feature at all (HTTP 501 `NotImplemented`), which no
+/// bucket setting can change; a check that could not be made is an `Err`
+/// instead, and proves nothing either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketFeature {
+    Enabled,
+    NotEnabled,
+    NotSupported,
+}
+
 /// What a stored object's retention must satisfy (#684).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionExpectation {
@@ -974,15 +986,17 @@ pub trait UploadBackend: Send + Sync {
 
     /// Whether this backend can return and re-address immutable object
     /// versions. `false` means `put_manifest` never yields a version and
-    /// `get_manifest_pinned`/`verify_bucket_versioning` fail closed.
+    /// `get_manifest_pinned`/`bucket_versioning` fail closed.
     fn supports_object_versions(&self) -> bool {
         false
     }
 
-    /// Preflight for the hardened profile: confirm the bucket keeps immutable
-    /// versions of overwritten objects. Default fails closed for backends
+    /// Preflight for the hardened profile: whether the bucket keeps immutable
+    /// versions of overwritten objects (S3 `GetBucketVersioning`).
+    /// `NotEnabled` and `NotSupported` are the store's answers; `Err` is a
+    /// check that could not be made. The default fails closed for backends
     /// without versioning.
-    async fn verify_bucket_versioning(&self, bucket: &str) -> Result<(), VtopError> {
+    async fn bucket_versioning(&self, bucket: &str) -> Result<BucketFeature, VtopError> {
         Err(VtopError::Upload(format!(
             "backend {} cannot confirm object versioning on bucket {bucket}",
             self.backend_name()
@@ -996,11 +1010,12 @@ pub trait UploadBackend: Send + Sync {
     }
 
     /// Preflight for the Object Lock profile (#684): whether the bucket has
-    /// Object Lock enabled (S3 `GetObjectLockConfiguration`). `Ok(false)` is
-    /// the store's answer that it has not; `Err` is a check that could not be
-    /// made. The default fails closed, like
-    /// [`verify_bucket_versioning`](Self::verify_bucket_versioning).
-    async fn bucket_object_lock_enabled(&self, bucket: &str) -> Result<bool, VtopError> {
+    /// Object Lock enabled (S3 `GetObjectLockConfiguration`). `NotEnabled`
+    /// is the store's answer that it has not, `NotSupported` its answer that
+    /// it does not implement Object Lock at all (#722); `Err` is a check that
+    /// could not be made. The default fails closed, like
+    /// [`bucket_versioning`](Self::bucket_versioning).
+    async fn bucket_object_lock(&self, bucket: &str) -> Result<BucketFeature, VtopError> {
         Err(VtopError::Upload(format!(
             "backend {} cannot read the Object Lock configuration of bucket {bucket}",
             self.backend_name()

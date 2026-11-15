@@ -1,0 +1,1 @@
+{"source_type":"syslog_spool","spool_id":"edge-1","path":"/var/spool/vtop/edge-1.spool","inode":5151,"start_byte":0,"end_byte":2048,"received_time_start":"2026-11-14T11:00:00.000000001+00:00","received_time_end":"2026-11-14T11:05:00.000000002+00:00"}

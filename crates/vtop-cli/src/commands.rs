@@ -168,15 +168,19 @@ pub enum Command {
         /// pinned manifest) and expect the mode `upload.object_lock` sets.
         /// Reports locked, elapsed (an ended retention, not a finding),
         /// missing and mode_mismatch (findings). Needs `upload.object_lock`
-        /// in the config, and `s3:GetObjectRetention` on the bucket.
+        /// in the config, and `s3:GetObjectRetention` on the bucket. When
+        /// receipts are checked, also reads each existing verification
+        /// receipt's retention at its key (one more request per receipt),
+        /// reported apart from the batch's.
         #[arg(long)]
         check_retention: bool,
         /// Check each batch's verification receipt (#671), and report a
         /// missing one as a finding. Receipts are checked without this flag
         /// when the config sets `manifest.verification_receipts`, and then a
         /// missing one (such as a batch archived before receipts were
-        /// enabled) is counted, not a finding. Read-only: the scrub writes no
-        /// receipt.
+        /// enabled) is counted, not a finding. With --check-retention, each
+        /// existing receipt's retention is read too. Read-only: the scrub
+        /// writes no receipt.
         #[arg(long)]
         require_receipts: bool,
     },
@@ -474,7 +478,10 @@ pub async fn dispatch(cli: Cli) -> i32 {
     if let Command::Tier { command } = cli.command {
         return crate::tier_tools::run(command, cli.json).await;
     }
-    let code = match run_command(&cli).await {
+    // Boxed: `run_command` holds every command's future, the engine's whole
+    // cycle among them, and a debug build polled it on a test thread's
+    // stack until that overflowed (#626 grew the cycle a little more).
+    let code = match Box::pin(run_command(&cli)).await {
         Ok(()) => 0,
         Err(e) => {
             // Errors are reported on stderr without leaking secrets.

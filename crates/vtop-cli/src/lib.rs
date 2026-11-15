@@ -5,6 +5,7 @@
 //! tests; [`commands`] wires it to the CLI.
 
 pub mod audit;
+mod bucket_versioning;
 pub mod commands;
 pub mod coverage;
 pub mod engine;
@@ -13,6 +14,7 @@ pub mod metrics_server;
 pub mod node_tools;
 pub mod object_lock;
 pub mod otel;
+mod rebuild;
 mod receipts;
 pub mod scrub;
 pub mod segment_tools;

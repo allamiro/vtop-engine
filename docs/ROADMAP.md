@@ -9,40 +9,6 @@ what each release does **not** yet do.
 
 ---
 
-## Next release — per-stream checksum selection
-
-- **[#669](https://github.com/allamiro/vtop-engine/issues/669)** — choose
-  `checksum.algorithm` per stream, inheriting the global value by default.
-  This is the manual selection step motivated by the paper's cost-aware
-  future work (Eq. 4), recorded in the
-  [implementation plan](https://github.com/allamiro/vtop-engine/issues/669#issuecomment-6806355703).
-  Automatic selection still needs a measured cost model and is future work.
-- **Upgrade note:** older engines silently ignore the new stream key and
-  use the global algorithm. Upgrade all engines before relying on it; keep
-  the global algorithm strong during mixed-version operation. Recovery and
-  scrub continue checking each old batch with its manifest's algorithm.
-  No manifest format or ledger migration is introduced. Downgrade remains
-  unsupported.
-
-- **[#668](https://github.com/allamiro/vtop-engine/issues/668)** — a failed
-  multipart part no longer discards the parts that completed. The failed part
-  alone is retried, up to the new `upload.multipart_part_attempts` (default 3),
-  with backoff; a batch that still fails keeps its multipart session, and the
-  replay of the same bytes resumes it and sends only the missing parts. A
-  running engine sweeps abandoned sessions periodically, not only at startup.
-  New metrics: `vtop_multipart_parts_total{result}`,
-  `vtop_multipart_sessions_total{outcome}`, `vtop_multipart_bytes_reused_total`.
-  `vtopctl tier copy` shares the code, so it gets the per-part retries too.
-- **Upgrade note (#668):** an older engine ignores
-  `upload.multipart_part_attempts` and keeps its behaviour (the SDK's retries
-  only). Session files keep schema 1. An older engine that finds a session
-  the new one kept refuses it (it still compares the local file's name), fails
-  that attempt and aborts the session, and its replay uploads the object
-  afresh: one wasted attempt, no data at risk. Incomplete uploads
-  kept for a replay are billed storage until resumed or swept: add the
-  `AbortIncompleteMultipartUpload` lifecycle rule in PRODUCTION_HA §7.6.
-  Downgrade remains unsupported.
-
 ## v0.1.0 — a range that fails over
 
 Metadata leases, a lease agent on the data node, verified promotion, and the
@@ -50,8 +16,8 @@ first live-chaos scenarios on real processes.
 
 The release pipeline ships `vtop-node` alongside `vtopctl`, publishes a
 multi-arch GHCR image, and attaches an SBOM, cosign signatures and
-`SHA256SUMS`. Tagged as a pre-release: the 0.x series makes no compatibility
-promise across minor versions.
+`SHA256SUMS`. The 0.x series makes no compatibility promise across minor
+versions.
 
 **Not in it:** replicated-range failover without harness-style follower
 restarts, and any form of replica replacement.
@@ -865,7 +831,112 @@ A bug-fix release: only issues labelled `bug`, and the PRs that fix them. Featur
 - #694: the audit trail.
 - #668: multipart resume.
 
-## v0.10.0 and beyond
+## v0.10.0 — an archive that can be audited: receipts, Object Lock, key rotation, an audit trail, and replays that land on the object already archived
+
+v0.9.0 was bug-only; this release carries the features it held back and the remainders of its two largest bugs, #626 and #619. VTOP is still a prototype: the bar for calling it more is #714.
+
+- **Evidence in the archive.**
+  - A manifest `0.4` writer, opt-in through `manifest.write_version`, carrying a `verification_plan` (#671, #698). Readers of v0.8.0 and later verify it.
+  - Verification receipts: a signed `<batch_id>.receipt.json` beside each manifest, recording how the store checked the object, checked by `vtopctl scrub` (#671, #711). `scrub --check-retention` reads each receipt's Object Lock retention too (#710, #749).
+  - MAC key rotation through a key id and a keyring, `manifest.mac` (#685, #703).
+  - An S3 Object Lock profile: every object and manifest written under retention, and the retention read back before a batch may be VERIFIED (#684, #708).
+- **Upload.**
+  - A failed multipart part no longer discards the parts that completed; the replay resumes the session and sends only the missing parts (#668, #702).
+  - BLAKE3 and no-checksum writes send a whole-object SHA-256 header, not the SDK's CRC32 trailer, which Garage and Zenko CloudServer refuse (#778, #788).
+  - A store that does not implement Object Lock or object versions is refused at startup when the configuration needs one (#722, #770).
+- **Archive engine.**
+  - A replay resolves to the object already archived: in a later hour (#626, #755), over a file or spool that grew (#793), and over a Kafka partition that grew (#796).
+  - A range that recovery holds is no longer passed by the running pipeline, so it is archived before anything above it commits (#782, #785).
+  - File source, `delete_after_commit`: the ledger records the read's ctime, so a rewrite that sets the mtime back is seen (#619, #713); an unchecked delete is counted as its own outcome, a changed link count has its own, and late opens are tested (#619, #753); a macOS CI job runs the delete tests (#619, #712).
+- **Operating it.**
+  - An attributable audit record for every command that changes engine or cluster state (#694, #705).
+  - OpenTelemetry traces, OTLP metrics and log correlation, built in and idle until configured (#683, #693).
+  - The Kafka gateway answers an OffsetCommit it cannot keep with `INVALID_REQUEST` and counts what it refuses (#596, #754).
+  - Time spent in each phase of the produce path, and whether group commit is on, are exported; no behaviour change (#752, #779).
+- **Cluster plane.**
+  - A range with no provable lineage says why it refuses, and `vtopctl node promote-unproven` is an explicit, audited, single-use last resort, at feature level 8 (#636, #656).
+  - A candidate serves once a write quorum of replica streams is up, not every stream, so a failover with one peer down no longer waits ten seconds (#750, #756).
+  - A replica that catches up shows its leader's last mark over the records that arrived after it (#787, #790).
+- **Documentation and measurement.**
+  - SECURITY.md, with a disclosure policy and response times (#716, #760).
+  - A data-safety register and a check that keeps it complete (#715, #759).
+  - A compatibility and upgrade policy for 1.0, and the inventory of every format (#743, #768).
+  - Benchmark results record their disk, and every Kafka chart shares one footer and colour registry (#784); the chart job runs every chart test (#745).
+  - Chaos scenario: two replicated Kafka partitions led from different hosts, one idempotent producer across both (#765).
+  - CI: a MinIO job runs the live S3 tests (#707); k8s-smoke waits for each port-forward (#786, #789).
+  - Intermittent test failures fixed at their cause (#791, #794; #792, #797); the third, #787, was a replication bug and is listed under the cluster plane (#790).
+
+**Upgrading from v0.9.0.** Downgrade is not supported.
+
+- **Order.**
+  1. **PostgreSQL: run `vtopctl migrate` from this release, with the migration identity, before starting v0.10.0 engines.** It adds the nullable `sealed_at` column (#626) and the append-only `audit_events` table (#694). Engines of this release refuse a schema without them, naming the missing piece. The runtime and maintenance roles need `SELECT, INSERT` on `audit_events` and `USAGE` on `audit_events_seq_seq` (POSTGRES_DEPLOYMENT.md). The schema marker stays 3, and v0.9.0 engines keep running on the migrated schema with no restart: they never name the new column or table. SQLite adds both on open, and `PRAGMA user_version` stays 1.
+  2. **Upgrade every engine, metadata voter and data node.**
+  3. **Then raise the cluster feature level to 8**, only if you want `vtopctl node promote-unproven` (#636): `vtopctl meta node-versions --level 8`, then `vtopctl meta enable-features --level 8`. The raise is refused, naming each node, until every node reports it can run level 8 (#634).
+  4. **Then turn on the new settings below**, once every engine, `vtopctl` and auditor that reads the archive runs a release that understands them.
+- **One-way changes.** Installing the binary takes none of them. Only an operator action does:
+  - **Raising the feature level to 8 (#656)** is permanent; there is no lowering. A v0.9.0 metadata voter supports levels up to 7 and refuses a raise above it ("newer than this release supports"). Level 8 adds a metadata command kind (39, the promotion attestation), a key category (22), a record value tag (25), a promotion outcome tag (4) and a refusal tag (5), none of which is written below level 8. A v0.9.0 voter that met them would stop rather than guess: it reads the first four as a newer format and the refusal tag as corrupt.
+  - **`manifest.write_version: "0.4"` (#698).** A reader before v0.8.0 re-encodes a `0.4` manifest without the fields it does not know, so the self-hash and MAC fail: it reports the manifest as tampered, and recovery replays the batch (duplicates, not loss). Set `"0.3"` again to go back; `0.4` manifests already written stay readable by v0.8.0 and later.
+  - **`manifest.mac` (#703).** v0.8.0 and v0.9.0 hold one key and ignore the id: they pass a manifest their key signed and report the rest as unauthenticated, so an engine on them replays those batches. Every reader must run this release before the active key changes.
+  - **`upload.object_lock` (#708)** with `mode: compliance`: nobody, the account root included, can remove an object before its date. Objects from failed attempts are locked too.
+  - **No schema marker bump and no refusal to start in an older binary** comes from this release's ledger changes: PostgreSQL stays at marker 3 and SQLite at `user_version` 1. A v0.9.0 engine writes NULL `sealed_at` and reads prune digests that carry it. Only N-1 may share a ledger with this release (#743).
+- **Older engines silently ignore these config keys.** Upgrade every engine before relying on them:
+  - `manifest.write_version`: harmless. An older engine keeps writing `0.3`, the safe direction (#698).
+  - `manifest.verification_receipts`: harmless. An older engine writes no receipts, and the scrub reports the rest `missing`, a finding only under `--require-receipts` (#711).
+  - `manifest.mac`: **not harmless in a mixed fleet.** An older engine keeps signing with `manifest_mac_key_env` and no id, and cannot verify manifests signed with a new key. Rotation is complete only when none remains. It also needs `write_version: "0.4"`, or this release refuses the file (#703).
+  - `upload.object_lock`: **not harmless.** An older engine writes unlocked objects and nothing at the object says so. Keep a bucket default retention as the floor, drain older engines first, and run `vtopctl scrub --check-retention` afterwards to find any unlocked object (#708).
+  - `upload.multipart_part_attempts`: harmless. An older engine keeps the SDK's retries only (#702). An older engine that finds a session this release kept refuses it, fails that attempt and aborts the session; its replay uploads afresh: one wasted attempt, no data at risk.
+  - The audit trail and OpenTelemetry are driven by `VTOP_AUDIT_LOG` and `OTEL_*` environment variables, not by `config.yaml` keys. An older engine ignores them: harmless, but it writes no audit records and exports no spans, so a mixed fleet's trail is only as complete as its least-upgraded node.
+  - Unknown keys **inside** `manifest.mac` and `upload.object_lock` are refused by this release, unlike the rest of the engine config.
+- **Behaviour changes to check before upgrading.**
+  - `vtopctl prune-ledger`, `replay` and `migrate` now fail when their audit record cannot be written (a full disk, a missing grant, an unwritable `VTOP_AUDIT_LOG`). With a manifest MAC key configured they also need it in their environment (#705).
+  - `upload.require_object_versioning: true` against a literal bucket without versioning, or on a backend that cannot address object versions, now refuses to start instead of failing every batch (#770).
+  - A delete under `delete_without_open_check` with no lease is counted `deleted_unchecked`, no longer `deleted`; a dashboard that sums `deleted` must add it. A hard-link keep that was `metadata_changed` is now `links_changed` (#753).
+  - Rows written before this release carry no ctime, so a file archived before the upgrade is re-armed on its mtime alone until its quiet period ends (#713). Rows without a seal instant keep the old behaviour: a replay of one in a later hour may still write a second object, once (#755).
+  - Every command's stderr gains one INFO line saying OpenTelemetry is on or off, and `vtopctl validate --print-effective` gains an `opentelemetry:` block (#693).
+  - On a node with no metadata plane, a Kafka client's OffsetCommit now gets code 42 where it got 43. Both are non-retriable; a consumer with auto-commit logs the failure and keeps reading (#754).
+  - `vtopctl scrub --check-retention` on an archive with receipts can now exit non-zero for a receipt written without a lock (#749).
+  - BLAKE3 and no-checksum uploads read the local file once more to compute the SHA-256 header. A store that still refuses it can be told `AWS_REQUEST_CHECKSUM_CALCULATION=when_required` (#788).
+- **Planned.** `0.4` becomes the default manifest writer at v0.12.0, announced here and in the v0.11.0 notes; `write_version: "0.3"` stays accepted through 1.x with a deprecation warning ([compatibility policy](reference/compatibility.md), #743).
+- **Known open:**
+  - #798, #799: two intermittent test failures (an OpenTelemetry message test, a produce-phase timing test on a slow runner). Both moved to v0.11.0.
+  - #709: a reused object whose Object Lock ended, or that was stored unlocked, fails every replay of the same bytes until the operator extends its retention or deletes that version.
+  - #773, #774: #626 follow-ups (adopting an earlier attempt's object on backends that cannot report absence; reporting failed attempts' objects no committed row names).
+  - #706: the actor of a cluster command is in the admin endpoint's record only, not in the replicated log.
+  - #752, #751: group commit is measured, not yet wired into the data node, and a Kafka client cannot yet follow a failover through a candidate node.
+  - #743: the compatibility policy is written; the format registry and the tested downgrade matrix are not complete.
+  - #733: key and state-store files readable by other local users are not yet refused.
+  - #714: the bar for calling VTOP production-ready. VTOP remains a prototype.
+
+### v0.10.0 in detail
+
+The long form of what the list above names: how each piece works, its limits, and what an operator does about them.
+
+- **[#668](https://github.com/allamiro/vtop-engine/issues/668)** — a failed
+  multipart part no longer discards the parts that completed. The failed part
+  alone is retried, up to the new `upload.multipart_part_attempts` (default 3),
+  with backoff; a batch that still fails keeps its multipart session, and the
+  replay of the same bytes resumes it and sends only the missing parts. A
+  running engine sweeps abandoned sessions periodically, not only at startup.
+  New metrics: `vtop_multipart_parts_total{result}`,
+  `vtop_multipart_sessions_total{outcome}`, `vtop_multipart_bytes_reused_total`.
+  `vtopctl tier copy` shares the code, so it gets the per-part retries too.
+- **Upgrade note (#668):** an older engine ignores
+  `upload.multipart_part_attempts` and keeps its behaviour (the SDK's retries
+  only). Session files keep schema 1. An older engine that finds a session
+  the new one kept refuses it (it still compares the local file's name), fails
+  that attempt and aborts the session, and its replay uploads the object
+  afresh: one wasted attempt, no data at risk. Incomplete uploads
+  kept for a replay are billed storage until resumed or swept: add the
+  `AbortIncompleteMultipartUpload` lifecycle rule in PRODUCTION_HA §7.6.
+  Downgrade remains unsupported.
+- **[#782](https://github.com/allamiro/vtop-engine/issues/782)** — a range
+  recovery holds because its replay decision could not be recorded, or
+  because a newer release wrote it, is no longer passed by the running
+  pipeline: recovery applies every rewind above it in its source unit at the
+  held start, so the held range is read again with the ranges above it and
+  archived before anything above it commits. The ranges above it are
+  archived twice. New metrics: `vtop_recovery_held_total{reason}`,
+  `vtop_recovery_rewinds_lowered_total`. No format or ledger change.
 
 **The audit trail (#694).** Every operator command that changes engine or cluster
 state writes one versioned, attributable record (`audit_version: 1`): who
@@ -907,11 +978,65 @@ New metrics: `vtop_audit_events_total{action,outcome}` and
 - **`vtopctl meta`, `node` and `tier` now log** to stderr at WARN (audit
   records always), where they logged nothing before.
 
-The theme is **the gateway at the speed its durability allows**: wire the
-broker's group commit into the gateway path and close the compatibility
-gaps the Kafka comparison found (#596), measure failover and crash
-durability against Kafka (#597, #599), serve split children as Kafka
-partitions (#473), and ship the egress ceiling once measured (#481).
+**A replay resolves to the object already archived (#626, remainder).**
+v0.9.0 made a replay of the same bytes reuse the stored object. A replay in a
+later hour still named another key, because the time partition came from the
+instant the replay was sealed. Each ledger row now records the instant its
+window was sealed (`sealed_at`), and a window that covers exactly a range an
+earlier attempt sealed and handed back is sealed at that instant again, from
+memory while the engine runs and from the row after a restart. It is filed
+under the same hour and names the same key, so the object, or a multipart
+session the failed upload kept (#668), is reused. What each such replay came
+to is counted in `vtop_replay_rebuilds_total{result}` (`exact`,
+`bytes_differ`, `fallback`, `refused`, `too_large`, `dropped_at_stop`) and
+logged (`replay_rebuilt`, `replay_bytes_differ`, `replay_key_fallback`,
+`replay_bound_refused`, `replay_bound_too_large`, `replay_window_dropped`). Upgrade
+notes:
+
+- **PostgreSQL: run `vtopctl migrate` before starting engines of this
+  release.** It adds the nullable `sealed_at` column; engines of this
+  release refuse a schema without it, naming it. The schema marker stays 3.
+- **SQLite adds the column when an engine of this release opens the file;**
+  the schema version stays 1, so this is no one-way step.
+- **A v0.9.0 engine ignores `sealed_at` and writes NULL**, on either backend,
+  and reads prune digests whose rows carry it. Only N-1 may share a ledger
+  with this release.
+- **Rows written before this release** carry no seal instant. A replay of one
+  of them is filed under the hour it is replayed in, as before, so it may
+  still write a second object once.
+- **A replay over a file, spool or Kafka partition that grew is rebuilt as
+  first cut.** Its
+  re-read stops at the failed window's recorded end, the window is sealed
+  there (not by a threshold, its age or a forced flush), and the bytes after
+  it are the next window. A range over 4x the current batching limits is not
+  bounded (`too_large`); one whose re-read cannot stop at its end is read as
+  before (`refused`); a stop inside a rebuild drops the partial window, which
+  the next start reads again (`dropped_at_stop`). The new trait method
+  `SourceAdapter::bound_replays` defaults to bounding nothing.
+- **Not changed:** a range whose row a power loss rolled back has nothing to
+  rebuild from, and a Kafka range whose records retention or compaction
+  removed is read on from where the log starts (`refused`).
+
+**Kafka gateway: an OffsetCommit it cannot keep says so (#596).** A node
+without a metadata plane (a static leader or a standalone node) has no
+durable offset store and still refuses OffsetCommit, but now answers
+`INVALID_REQUEST` (42) instead of `UNSUPPORTED_FOR_MESSAGE_FORMAT` (43).
+OffsetCommit carries no error message, so a client shows only the code's
+own text: 43's sent the first Kafka comparison looking at record versions,
+and 42's ends "See the broker logs for more details", where the gateway's
+WARN now says what happened, that produce and fetch are unaffected, and to
+run a leased leader on a metadata plane or set `enable.auto.commit=false`.
+A request for an api the gateway does not serve (CreateTopics,
+DescribeConfigs and four other admin keys) is logged by name with the
+operator path (`vtopctl meta create-topic`), at most at each power of two
+per key. Both are counted in a new node metric,
+`vtop_kafka_requests_refused_total{api,reason}`, on every node that runs
+a gateway. A consumer with auto-commit on logs the failed commit and keeps
+reading; an explicit commit fails, as it did with 43. Live-chaos scenario
+19 asserts the refusal for a librdkafka group consumer that reads every
+record and exits cleanly, and scenario 21 runs two such consumers under it.
+Other refusals (a metadata plane that predates head cursors, a version
+outside a served range) are not counted yet.
 
 **Manifest format evolution (#671).** v0.8.0's readers check a
 manifest's `version` first, read `0.1`-`0.4`, verify `0.4` over the stored
@@ -1001,8 +1126,18 @@ known limitations:
   different statement. Recovery writes one only for a batch still VERIFIED.
 - **Object Lock.** A receipt is written and its retention read back like a
   manifest's, and recovery never adds a second version beside one.
-  `vtopctl scrub --check-retention` does not read receipts' retention yet
-  ([#710](https://github.com/allamiro/vtop-engine/issues/710)).
+  When receipts are checked, `vtopctl scrub --check-retention` reads each
+  existing receipt's retention again, at its current key (#710), counted
+  apart from the batch's in `vtop_scrub_receipt_retention_total{result}`: no
+  retention and another mode are findings, an ended retention is not, and a
+  missing receipt is not a retention finding.
+- **A scheduled `scrub --check-retention` can now fail on receipts.** On an
+  archive that has receipts, a receipt written before `upload.object_lock`
+  was set, one the engine's read-back found unlocked (it logged
+  `verification_receipt_failed`), or one whose lock was removed carries no
+  lock and is a finding: the run exits non-zero and
+  `vtop_scrub_last_finding_timestamp_seconds` moves, as for an unlocked
+  object. Each read is one more request per receipt.
 - **Going back.** Set `verification_receipts: false`. Receipts already written
   stay readable; drop `--require-receipts` from scheduled scrubs.
 
@@ -1073,16 +1208,60 @@ mode_mismatch. The deployment profile is
   write needs, the permissions a HEAD needs to return the lock headers), not
   measured.
 
+**File source: the read's ctime is recorded in the ledger (#619).** A file
+marker now carries `ctime`, the file's ctime from the same fstat as its
+`mtime`, after the read. `delete_after_commit` deletes a file only while it
+still has that ctime: at the covering commit, and when a restart re-arms the
+delete (`CommittedCursor::observed_ctime`). Before, a same-length rewrite
+between a file's first page and the page below the archived end that also
+set the mtime back agreed with everything the ledger recorded, so after a
+restart, or between a batch's read and its commit, it was deleted unread. Now
+it is kept, with a `metadata_changed` warning. The field is ledger only: no
+DDL on either backend, so `vtopctl migrate` has nothing to apply, and the
+manifest never carries it, so manifests stay byte for byte what released
+readers verify (ARCHITECTURE.md, "Ledger format note: ctime").
+
+- **Upgrading: rows written before v0.10.0 have no ctime, and arm the delete
+  as before.** After the upgrade, a file archived before it is re-armed on the
+  mtime alone, with the file's ctime at the restart, so for those rows the
+  limit stands - a rewrite while the engine was down that set the mtime back
+  is not seen - until their quiet period ends and they are deleted or kept.
+  Refusing them instead would keep every file archived within the last
+  `delete_quiet_seconds` before the upgrade until someone removed it by hand.
+- **Older engines ignore the field** (serde skips unknown keys) and judge as
+  they always did. Downgrade is still not supported.
+- **Known, and on the side of keeping:** a restart after one of the engine's
+  own delete attempts moved a file aside and put it back (a process opened
+  it during the delete, or the unlink failed) finds the file's ctime moved
+  by the put-back, so the file is kept with a warning that lists that
+  attempt among the causes, and is removed by hand. A stored ctime that is
+  not a timestamp reads as absent, and arms as a pre-v0.10.0 row does.
+
+## v0.11.0 and beyond
+
+The theme is **the gateway at the speed its durability allows, and the road
+to 1.0**: wire group commit into the data node's quorum write (#752) and let a
+Kafka client follow a failover through a candidate node (#751); finish the
+format inventory and the tested upgrade and downgrade matrix (#743); and work
+the criteria in #714 that must be met before VTOP is called anything but a
+prototype (crash and soak testing, real S3 targets, security hardening, a
+restore drill, a pilot). Failover and crash-durability measurements against
+Apache Kafka stay open (#597, #599), as does the head-to-head throughput run
+(#596).
+
 ---
 
 ## Versioning
 
-0.x. Minor versions may break compatibility, and releases are published as
-GitHub pre-releases to say so. **Upgrades are tested** (#291): CI proves a
-data directory written by the newest patch of each released minor series
-(v0.2+) opens under the current build, serves byte-exactly, and still serves
-after a restart; newly published tags join that matrix automatically.
-**Downgrades are not supported** — a newer release's directory may hold
-artifacts an older release cannot interpret, and nothing tests that path;
-going back means a fresh directory or a verified backup taken before the
-upgrade.
+0.x. Minor versions may break compatibility. Every release so far is published
+as a full GitHub release; only a hyphenated version such as `1.0.0-rc.1` would
+be published as a pre-release. What each format promises, the rules for
+changing one, the deprecation notice and the path to 1.0 are in the
+[compatibility policy](reference/compatibility.md) (#743). **Upgrades are
+tested** (#291): CI proves a data directory written by the newest patch of
+each released minor series (v0.2+) opens under the current build, serves
+byte-exactly, and still serves after a restart; newly published tags join that
+matrix automatically. **Downgrades are not supported** — a newer release's
+directory may hold artifacts an older release cannot interpret, and nothing
+tests that path; going back means a fresh directory or a verified backup
+taken before the upgrade.

@@ -14,18 +14,20 @@ Ground truth: `.github/workflows/release.yml` (a push of a `v*` tag publishes), 
 3. **Never re-tag a published release.** The signatures name the tag (`.../release.yml@refs/tags/vX.Y.Z`), the image and archives were built from it, and users verified against it. A bad release is fixed forward with the next patch version. Do not delete, move or re-push a `v*` tag, and do not replace or edit a release's assets.
    - The one precedent for moving a tag is v0.7.0, and nothing had been published: its first run (on the bump commit `af867f7`) was cancelled when GitHub retired the macOS runner the workflow named (#608), and the tag was cut again on `6c8f386` (#609) after two `workflow_dispatch` dry-runs. The first GitHub release for v0.7.0 came from the second run. That is a reason to dry-run first (below), not a licence to move tags.
 4. **Downgrade is not supported and not tested** (`docs/ROADMAP.md`, "Versioning"). Say so in every upgrade note; never imply a rollback path.
-5. **Bug-only release rule.** A milestone can be declared bug-only: v0.9.0 is ("only issues labelled bug, and the PRs that fix them. Features and measurements go to v0.10.0"). While such a milestone is open: merge only a PR that fixes a bug in it; hold every feature PR (the ones for the next milestone say "do not merge until v0.9.0 is tagged"); an issue that is a feature in disguise moves to the next milestone instead of holding the tag. After the tag, features merge. Check `gh api "repos/allamiro/vtop-engine/issues?milestone=N&state=open"` for N empty and every PR in it merged before cutting the bump.
+5. **A patch release changes no format.** No new marker, default, feature level or one-way step (`docs/reference/compatibility.md`, "Change rules within 1.x"). A fix that needs one waits for the next minor; in 0.x, a patch that cannot avoid one says so in its notes as a one-way change.
+6. **Bug-only release rule.** A milestone can be declared bug-only: v0.9.0 is ("only issues labelled bug, and the PRs that fix them. Features and measurements go to v0.10.0"). While such a milestone is open: merge only a PR that fixes a bug in it; hold every feature PR (the ones for the next milestone say "do not merge until v0.9.0 is tagged"); an issue that is a feature in disguise moves to the next milestone instead of holding the tag. After the tag, features merge. Check `gh api "repos/allamiro/vtop-engine/issues?milestone=N&state=open"` for N empty and every PR in it merged before cutting the bump.
 
 ## 0. Before the bump
 
 - `git fetch origin --tags`; list what the release carries: `git log --first-parent --oneline vPREV..origin/main` and `./scripts/release-notes.sh <tag> <previous-tag>` once a tag exists (it groups by the squash subject's `area:` prefix and uses the API to tell PRs from issues).
 - The milestone is empty of open issues and PRs, or each remaining one is moved on deliberately.
+- **Data-safety register and quiet period.** Run `scripts/check-data-safety-register.py --quiet-days` (it reads the `data-safety` label with `gh`). It must pass: every labelled issue has a row in `docs/reference/data-safety-register.md` and every row's state matches its issue. Record the quiet-period line it prints (days since the most recent `data-safety` issue was opened) in the bump PR's body. It is a measurement, not a gate yet (#741); a bug labelled during the release still gets its row before the bump.
 - `main` is green at the commit you will bump from (`gh api repos/allamiro/vtop-engine/commits/<sha>/check-runs`). The v0.8.0 bump rested on "the `upgrade compat` and `live chaos` jobs, both green on main at 2ad1d68".
 - **Did `.github/workflows/release.yml`, `docker/` or `.cargo/config.toml` change since the last tag?** Then dry-run the pipeline before tagging: Actions, Release, Run workflow, with `tag` set to the previous tag (and the branch if the fix is not on `main`). A dispatch builds and tests everything but publishes nothing (the image-manifest and release jobs are skipped for `workflow_dispatch`). This is how #608 and #609 were checked.
 
 ## 1. The bump PR
 
-Branch from `origin/main` (`release/vX.Y.Z-bump` was used for 0.8.0, `release/0.7.0` for 0.7.0). Title `release: bump the workspace to X.Y.Z`. Four files, plus the citation file:
+Branch from `origin/main` (`release/vX.Y.Z-bump` was used for 0.8.0, `release/0.7.0` for 0.7.0). Title `release: bump the workspace to X.Y.Z`. Four files, plus the citation file, and on a minor release `SECURITY.md`:
 
 | File | Change |
 |---|---|
@@ -33,6 +35,7 @@ Branch from `origin/main` (`release/vX.Y.Z-bump` was used for 0.8.0, `release/0.
 | `Cargo.lock` | `cargo update --workspace`. The diff must be exactly the **twelve** `vtop-*` entries and no third-party package; if anything else moved, revert it. Then `cargo check --workspace --locked`. |
 | `helm/vtop/Chart.yaml` | `appVersion: "X.Y.Z"` (it must track the workspace version; GHCR tags follow it). The chart's own `version` follows its contract, not the app: **patch** bump when no template or values changed since the last tag, **minor** when they did (a values-contract change). Check with `git diff vPREV..origin/main --stat -- helm/vtop/templates helm/vtop/values.yaml helm/vtop/ci`. Add the matching comment line above `version:` (0.5.1 for 0.8.0: "no template or values change — the bump carries appVersion 0.8.0"). Nothing in CI ties `appVersion` to `Cargo.toml`, so review it by eye. |
 | `docs/ROADMAP.md` | A section for the release (below), and the forward section renamed to the next release. |
+| `SECURITY.md` | **Minor releases only:** the "Supported versions" row becomes `X.Y.x` (only the latest minor receives security fixes). `scripts/check-security-policy.py` fails the docs build until it matches `Cargo.toml`. |
 | `CITATION.cff` | `version` and `date-released` (the day the tag is pushed, as `YYYY-MM-DD`; v0.8.0 is `2026-11-12`). If the tag goes out on another day, fix the date in a follow-up PR; the tag does not move. |
 
 ### The ROADMAP section
@@ -41,6 +44,8 @@ Branch from `origin/main` (`release/vX.Y.Z-bump` was used for 0.8.0, `release/0.
 
 - **Order.** For v0.8.0: upgrade every engine and data node first, then raise the feature level (`vtopctl meta node-versions` shows what each node reports, `vtopctl meta enable-features` raises it; a level above 7 waits for every node's report, #634).
 - **One-way changes**, each with the reason an older binary refuses: a schema marker bump (#567: marker 3, v0.7.0 refuses), a refusal to start while a state exists (#635 kept disputes), a rewrite older code cannot read (#640 staged rewrites). Find them by reading every merged PR's "Compatibility and upgrade impact" section (the PR template has one) and grepping the range for `marker`, `one-way`, `older binary`, `refuses`.
+- **Each one-way step is operator-gated** (`docs/reference/compatibility.md`, "Downgrade"): say which action takes it. A step a binary takes on its own on first open is not allowed in a minor release without a written sign-off in these notes.
+- **Deprecations**, each with its row in the deprecation table on `docs/reference/compatibility.md` (surface, deprecated in, earliest removal, replacement). In 1.x a notice runs at least two minors before removal.
 - **New keys older engines silently ignore.** Most `config.yaml` sections have no `deny_unknown_fields`, so an older engine ignores a new key without a word (the cluster-plane role configs refuse them instead). List each, say whether ignoring it is harmless, and tell operators to upgrade every engine before relying on it.
 - **Known open**: issues that did not make it, by number, so the notes do not promise them.
 - **Downgrade is not supported.**
@@ -49,7 +54,7 @@ Also retire a stale "Next release" block at the top of the file if what it descr
 
 ### The PR body
 
-Mirror #676: the four files and what changed in each, the chart version and why, that CI runs the upgrade checks, and "After merge, tag `vX.Y.Z` on the merge commit; `release.yml` triggers on `v*` tags and publishes". Link no AI tool and add no trailer (`vtop-contributing`).
+Mirror #676: the four files and what changed in each, the data-safety quiet period from section 0, the chart version and why, that CI runs the upgrade checks, and "After merge, tag `vX.Y.Z` on the merge commit; `release.yml` triggers on `v*` tags and publishes". Link no AI tool and add no trailer (`vtop-contributing`).
 
 ## 2. CI green, then the squash merge pinned to the head
 
@@ -121,9 +126,11 @@ Also: the image's `latest` tag moved (only for a non-pre-release), `helm/vtop/Ch
 ## Checklist
 
 - [ ] Milestone empty or deliberately moved; the bug-only rule respected.
+- [ ] `scripts/check-data-safety-register.py --quiet-days` passes; the quiet-period days are in the bump PR body.
 - [ ] Bump PR touches only Cargo.toml (11 edits), Cargo.lock (12 `vtop-*` entries), Chart.yaml, ROADMAP.md, CITATION.cff.
 - [ ] Chart version bump matches whether templates or values changed.
 - [ ] ROADMAP: upgrade order, one-way changes with reasons, silently ignored keys, known open, no downgrade.
+- [ ] Before the bump PR, on Linux, the ignored delete stress test run by hand on tmpfs, ext4 and overlay, once each (`TMPDIR=<dir on that filesystem> cargo test -p vtop-adapters --lib --locked -- --ignored delete_race_stress --nocapture`; in Docker, `/dev/shm` is tmpfs, the container's `/tmp` is overlay, a named volume is ext4). It must report 0 lines lost; record its summary line (lines written, archived, kept on disk unarchived, deletes, `opened_at_unlink`) in the bump PR. Not a CI gate: a lease behaves by filesystem, and the run is a few minutes of writers racing deletes (#619).
 - [ ] CI green on the exact head; head contains current `main`; merged by REST with `sha` pinned.
 - [ ] Tag is annotated, on the merge commit, and matches `Cargo.toml`.
 - [ ] `release.yml` green; ten assets; `SHA256SUMS`, every Sigstore bundle and the image signature verified; macOS `otool` clean and `minos 11.0`.
