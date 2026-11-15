@@ -2670,3 +2670,40 @@ async fn a_rebuild_whose_remaining_range_expires_on_an_idle_partition_is_refused
     assert_eq!(mock.version_count(&orphan), 1, "the orphan is untouched");
     assert!(refused() > before, "the bound is counted refused");
 }
+
+/// Review of #626 PR 3, against a live broker: `batching.max_bytes` is
+/// lowered after the window `[0, 19]` failed, and `max_records` is not, so
+/// the window passes the record-count cap. A Kafka row records no
+/// uncompressed size, so only the buffer can tell it is over 4x the current
+/// byte limit. Once the held buffer goes over that cap, the hold is released
+/// and counted `too_large`, and the window is sealed by the thresholds from
+/// there. Before, it was held whole whatever its size.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn a_held_kafka_rebuild_over_four_times_the_byte_limit_is_released() {
+    let (topic, _cleanup) = fresh_topic("byte_cap_rebuild", 20).await;
+    let dir = tempfile::tempdir().unwrap();
+    let db = format!("sqlite://{}", dir.path().join("state.db").display());
+    let group = unique_group("byte-cap-rebuild");
+    let mut engine = engine_on(&db, dir.path(), &topic, &group).await;
+    let mock = std::sync::Arc::new(vtop_upload::MockBackend::new().with_throttled_manifest_puts(1));
+    let (_, end, orphan) = fail_first_window(&mut engine, &mock).await;
+    assert_eq!(end, 19);
+
+    // Twenty records of about 50 bytes: the window is over 4x 100 bytes.
+    engine.config.batching.max_bytes = 100;
+    let too_large = || {
+        vtop_core::telemetry::init()
+            .unwrap()
+            .replay_rebuilds_total
+            .with_label_values(&["default", "kafka", "raw", "too_large"])
+            .get()
+    };
+    let before = too_large();
+    let committed = commit_through(&mut engine, 19).await;
+    assert!(too_large() > before, "the held window is counted too_large");
+    assert!(
+        committed[0].1 < 19 && committed[0].2 != orphan,
+        "it is released and sealed by the thresholds, not held whole: {committed:?}"
+    );
+}
