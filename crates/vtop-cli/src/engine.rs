@@ -1666,6 +1666,31 @@ impl<'a> Pipeline<'a> {
         self.commit_traced(adapter, v).instrument(span).await
     }
 
+    /// A VERIFIED batch whose source commit is held back (review of #626
+    /// PR 2): it stays VERIFIED in the ledger, and the engine settles it
+    /// later ([`Engine::settle_verified`]).
+    fn hold_verified(v: VerifiedBatch) -> BatchOutcome {
+        let VerifiedBatch {
+            batch_id,
+            object_uri,
+            record_count,
+            mut metrics,
+            started,
+            mut trace,
+            ..
+        } = v;
+        trace.finish("held_back");
+        metrics.finalize(started.elapsed().as_millis() as u64);
+        BatchOutcome {
+            batch_id,
+            final_state: BatchState::Verified,
+            committed: false,
+            record_count,
+            object_uri: Some(object_uri),
+            metrics: Some(metrics),
+        }
+    }
+
     /// [`Pipeline::commit_verified`] inside its batch's span.
     async fn commit_traced(
         &self,
@@ -3377,8 +3402,63 @@ impl Engine {
         let mut first_err: Option<VtopError> = None;
         let mut rewinds: Vec<ProgressMarker> = Vec::new();
         let mut handed_back: Vec<RecordedWindow> = Vec::new();
+        // Per unit (a file at its inode, a Kafka partition), where the first
+        // window that did not reach VERIFIED this cycle starts. A window of
+        // the same unit read after it must not commit (review of #626 PR 2):
+        // a rebuilt window and the bytes after it are two windows of one unit
+        // in the same cycle, and committing the later one would move the
+        // source's committed point past the failed range, so the rewind below
+        // would be clamped to that point and the failed bytes never archived.
+        let mut failed_from: HashMap<String, i128> = HashMap::new();
+        for (_, window, step) in &verified {
+            let failed = match step {
+                Ok(VerifyStep::Finished(outcome)) => outcome.final_state == BatchState::Failed,
+                Ok(VerifyStep::Verified(_)) => false,
+                Err(_) => true,
+            };
+            if failed {
+                let at = start_position(&window.start);
+                failed_from
+                    .entry(unit_key(&window.start))
+                    .and_modify(|first| *first = (*first).min(at))
+                    .or_insert(at);
+            }
+        }
         for (_, mut window, step) in verified {
             let started_at = window.start.clone();
+            let step = match step {
+                Ok(VerifyStep::Verified(v))
+                    if failed_from
+                        .get(&unit_key(&window.start))
+                        .is_some_and(|first| start_position(&window.start) > *first) =>
+                {
+                    // Held VERIFIED, as recovery holds a row above a range
+                    // being read again (#624): it settles once the source has
+                    // committed through its end, which only the failed
+                    // range's re-read can bring about.
+                    let committed_at_hold = adapter.committed_through(&window.end);
+                    tracing::warn!(
+                        event = "commit_held_back",
+                        batch_id = %v.batch_id,
+                        source = window.source(),
+                        range = %window.range(),
+                        "batch {} of {} is VERIFIED, but an earlier range of the same source failed \
+                         this cycle; its source commit is held back so the failed range is read \
+                         again rather than skipped, and it is committed once that range is; \
+                         nothing to do unless the earlier range keeps failing (see its error)",
+                        v.batch_id,
+                        window.source()
+                    );
+                    self.unsettled.push(Unsettled::held_in_process(
+                        &v.batch_id,
+                        source_type,
+                        committed_at_hold,
+                    ));
+                    outcomes.push(Pipeline::hold_verified(v));
+                    continue;
+                }
+                step => step,
+            };
             match step {
                 Ok(VerifyStep::Finished(outcome)) => {
                     if outcome.final_state == BatchState::Failed {
@@ -5344,6 +5424,24 @@ impl Unsettled {
         }
     }
 
+    /// The pipeline verified the row in this process, and its commit is held
+    /// back above an earlier range of its unit that failed in the same cycle
+    /// (review of #626 PR 2).
+    fn held_in_process(
+        batch_id: &str,
+        source_type: &SourceType,
+        committed_at_hold: Option<i128>,
+    ) -> Self {
+        Self {
+            batch_id: batch_id.to_owned(),
+            source_type: source_type.clone(),
+            held_back: true,
+            committed_at_hold,
+            count_verified: false,
+            recheck: None,
+        }
+    }
+
     /// The pipeline verified the row in this process and its commit failed.
     fn commit_failed(batch_id: &str, source_type: &SourceType) -> Self {
         Self {
@@ -7294,6 +7392,80 @@ mod tests {
         let after = restarted.run_source(SourceType::File, true).await.unwrap();
         assert!(after.is_empty(), "nothing is re-archived: {after:?}");
         assert_eq!(archived_ranges(&restarted).await, vec![(0, n), (n, len)]);
+    }
+
+    /// Review of #626 PR 2: a rebuilt window and the bytes appended after
+    /// it are two windows of one file in the same cycle. When the rebuilt
+    /// window fails again and the next one verifies, the next one must not
+    /// commit: its commit would move the file's committed point past the
+    /// failed range, the rewind would clamp to that point, and the failed
+    /// bytes would never be archived. It is held VERIFIED until the failed
+    /// range has been read again and committed, then settles.
+    #[tokio::test]
+    async fn a_window_after_a_rebuilt_window_that_fails_again_is_held_not_committed() {
+        let _serial = THROTTLE_TESTS.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "line 1\n").unwrap();
+        let mut cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.max_batch_age_seconds = 3_600;
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        // Every put of the range [0, 7) fails: its object and its manifest.
+        let mock = Arc::new(vtop_upload::MockBackend::new());
+        mock.set_failing_put_containing(Some("-b0-7-"));
+        engine.backend = mock.clone();
+        let _ = engine.run_source(SourceType::File, true).await;
+        let n = std::fs::metadata(&input).unwrap().len();
+        assert_eq!(n, 7);
+
+        // The file grows; [0, 7) is rebuilt and fails again; [7, len)
+        // verifies in the same cycle.
+        append_line(&input, "line 2");
+        let second = engine.run_source(SourceType::File, true).await;
+        let second = second.unwrap_or_default();
+        assert!(
+            second.iter().all(|o| !o.committed),
+            "nothing commits past the failed range: {second:?}"
+        );
+
+        // The store recovers; the failed range is read again.
+        mock.set_failing_put_containing(None);
+        for _ in 0..3 {
+            let _ = engine.run_source(SourceType::File, true).await;
+        }
+        let len = std::fs::metadata(&input).unwrap().len();
+        let mut committed: Vec<(u64, u64)> = engine
+            .store
+            .list_batches()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|b| b.state == BatchState::SourceCommitted)
+            .map(file_range)
+            .collect();
+        committed.sort_unstable();
+        committed.dedup();
+        assert_eq!(
+            committed,
+            vec![(0, n), (n, len)],
+            "the failed range is archived, nothing is skipped"
+        );
+        let verified: Vec<_> = engine
+            .store
+            .list_batches()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|b| b.state == BatchState::Verified)
+            .collect();
+        assert!(verified.is_empty(), "the held row settled: {verified:?}");
     }
 
     /// A seal instant for [`Engine::set_seal_clock`].
