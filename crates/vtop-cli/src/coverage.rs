@@ -1436,6 +1436,7 @@ mod tests {
             mtime: String::new(),
             content_fingerprint: None,
             tail_fingerprint: None,
+            ctime: None,
         }
     }
 
@@ -1458,6 +1459,7 @@ mod tests {
             mtime: String::new(),
             content_fingerprint: None,
             tail_fingerprint: None,
+            ctime: None,
         };
         row(id, state, marker(start), marker(end))
     }
@@ -1489,6 +1491,7 @@ mod tests {
             manifest_version_id: None,
             object_size_bytes: Some(10),
             verification_class: None,
+            sealed_at: None,
             record_count: Some(1),
             error_message: None,
             owner: None,
@@ -1570,6 +1573,7 @@ mod tests {
                 mtime: String::new(),
                 content_fingerprint: None,
                 tail_fingerprint: None,
+                ctime: None,
             };
             row(id, Committed, marker(start), marker(start))
         };
@@ -2339,6 +2343,7 @@ mod tests {
                     mtime: String::new(),
                     content_fingerprint: content.clone(),
                     tail_fingerprint: None,
+                    ctime: None,
                 }
             }
         };

@@ -91,6 +91,18 @@ ALTER TABLE batches ADD COLUMN IF NOT EXISTS claim_gen BIGINT NOT NULL DEFAULT 0
 -- below.
 ALTER TABLE batches ADD COLUMN IF NOT EXISTS verification_class TEXT;
 
+-- The instant the batch's contents were fixed (#626), recorded with the
+-- row's first write. A replay reads it back so its object is filed under the
+-- same hour, and named by the same key, as the attempt that failed. NULL on
+-- every row from before it: such a replay is filed under the hour it runs in,
+-- as it always was. Startup names the column (batch_columns!), so engines of
+-- this release need this migration first. Engines of the release before it
+-- (v0.9.0) name their columns and never write this one, so they keep running
+-- against a migrated database: rows they insert carry NULL, and their
+-- replays are filed as they always were. No marker bump: see the marker note
+-- below.
+ALTER TABLE batches ADD COLUMN IF NOT EXISTS sealed_at TEXT;
+
 -- SUPERSEDED (#567): the terminal state of a handed-back range its source has
 -- since committed past. A table created before it carries the CHECK above
 -- without it, and CREATE TABLE IF NOT EXISTS does not touch an existing
@@ -178,7 +190,8 @@ CREATE INDEX IF NOT EXISTS idx_batches_commit_newest ON batches(
 -- MIN_SCHEMA_VERSION together. A new nullable column that startup names
 -- (batch_columns!) and that older engines never name needs no bump: startup
 -- already refuses a schema without it, and an older release's migrate never
--- drops it. The verification_class column (#664) is such a change. From #664
+-- drops it. The verification_class column (#664) and the sealed_at column
+-- (#626) are such changes. From #664
 -- on, engines and migrate refuse a marker above their SCHEMA_VERSION (a newer
 -- release's); releases before it accept every marker at or above their
 -- minimum, which is why the marker is bumped only for what they would

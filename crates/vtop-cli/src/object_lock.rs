@@ -9,7 +9,9 @@ use vtop_core::config::{ObjectLockMode, VtopConfig};
 use vtop_core::errors::VtopError;
 use vtop_core::telemetry;
 use vtop_upload::multipart::redact_urls;
-use vtop_upload::{ObjectLockPolicy, RetentionCheck, RetentionExpectation, UploadBackend};
+use vtop_upload::{
+    BucketFeature, ObjectLockPolicy, RetentionCheck, RetentionExpectation, UploadBackend,
+};
 
 /// One startup line: its level and its text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +84,17 @@ pub(crate) fn bucket_refusal(bucket: &str, did: &str) -> String {
         "bucket {bucket} does not have Object Lock enabled; {did}. Object Lock can only be \
          enabled when a bucket is created: create a new bucket with it and point upload.bucket \
          at it"
+    )
+}
+
+/// The refusal for a store that does not implement Object Lock at all
+/// (#722): HTTP 501 `NotImplemented` to `GetObjectLockConfiguration`. No
+/// bucket setting can change that, so the message says so.
+pub(crate) fn store_unsupported(bucket: &str, did: &str) -> String {
+    format!(
+        "the store does not implement S3 Object Lock (it answered GetObjectLockConfiguration \
+         for bucket {bucket} with \"not implemented\"); {did}. No bucket setting can change \
+         that: use a store that implements S3 Object Lock, or remove upload.object_lock"
     )
 }
 
@@ -171,12 +184,21 @@ pub(crate) async fn preflight(
     let checked = if bucket_is_templated(bucket) {
         "(each bucket the template names is checked at its first upload)"
     } else {
-        match backend.bucket_object_lock_enabled(bucket).await {
-            Ok(true) => {
+        match backend.bucket_object_lock(bucket).await {
+            Ok(BucketFeature::Enabled) => {
                 locked_buckets.lock().unwrap().insert(bucket.to_owned());
                 "(checked)"
             }
-            Ok(false) => {
+            // The store does not implement Object Lock (#722). Before, this
+            // was taken for a check that could not be made: the engine
+            // started, and every batch failed later.
+            Ok(BucketFeature::NotSupported) => {
+                return Err(VtopError::Config(store_unsupported(
+                    bucket,
+                    "the engine did not start",
+                )))
+            }
+            Ok(BucketFeature::NotEnabled) => {
                 return Err(VtopError::Config(bucket_refusal(
                     bucket,
                     "the engine did not start",

@@ -42,9 +42,10 @@ These carry the commit rule:
 | `vtop_commits_total` vs `vtop_verified_total` | Commits must never exceed verifications. |
 | `vtop_verification_mode{mode="size_only"}` | `1` means `upload.require_strong_verification` is off: same-size corruption is accepted. |
 | `vtop_verification_backend_limited_total` | Batches committed on a size-only check. |
-| `vtop_object_lock_checks_total{result}` | With `upload.object_lock`: any result but `ok` is a batch that failed because the store did not keep the retention asked for (or its bucket has no Object Lock). See [S3 Object Lock](../OBJECT_LOCK_DEPLOYMENT.md). |
+| `vtop_object_lock_checks_total{result}` | With `upload.object_lock`: any result but `ok` is a batch that failed because the store did not keep the retention asked for (or its bucket has no Object Lock, `bucket_not_locked`, or the store does not implement Object Lock, `store_unsupported`). See [S3 Object Lock](../OBJECT_LOCK_DEPLOYMENT.md). |
 | `vtop_retention_lost_records_total` | Kafka records deleted by broker retention before the engine read them. Never archived; any increase is an incident. |
 | `vtop_source_replay_refused_total` | A failed range its source could not hand back, so it is missing from the archive. |
+| `vtop_recovery_held_total{reason}` | A range recovery held instead of rewinding (#782). `reason="ledger_write_failed"`: the state store refused the replay decision; check its disk, permissions and connectivity. The range is read again with the ranges above it, so nothing is lost. |
 | `vtop_source_read_errors_total` | A source that cannot be read. |
 | `vtop_replay_required_total`, `vtop_failed_total` | Work repeated, batches failed. |
 | `vtop_stage_duration_seconds{stage}`, `vtop_batch_duration_seconds` | Where time goes, per stage and end to end. |
@@ -100,6 +101,10 @@ groups:
       # Primed at zero at startup, so increase() sees the first one.
       - alert: VtopSourceReplayRefused
         expr: increase(vtop_source_replay_refused_total[15m]) > 0
+      # The state store refused recovery's replay decision. The series
+      # appears at the first hold, so alert on the value, as above.
+      - alert: VtopRecoveryLedgerWriteFailed
+        expr: sum(vtop_recovery_held_total{reason="ledger_write_failed"}) > 0
 ```
 
 ## The lab's Grafana stack
