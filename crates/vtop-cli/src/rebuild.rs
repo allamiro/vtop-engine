@@ -57,6 +57,13 @@ pub(crate) struct RecordedWindow {
     /// The earlier attempt's batch id, for the operator; `None` when its
     /// ledger row could not be written (#627).
     pub(crate) batch_id: Option<String>,
+    /// How many records the window held, when known: for the cap on what a
+    /// bounded replay may hold in memory.
+    pub(crate) record_count: Option<u64>,
+    /// Whether the source agreed to stop the re-read at the window's end
+    /// ([`vtop_adapters::base::SourceAdapter::bound_replays`]). A window
+    /// that is being rebuilt is held until it reaches that end.
+    pub(crate) bounded: bool,
 }
 
 impl RecordedWindow {
@@ -68,6 +75,29 @@ impl RecordedWindow {
             sealed_at: rec.sealed_at.as_deref().and_then(parse_sealed_at),
             digest: recorded_digest(rec.object_sha256.as_deref()),
             batch_id: Some(rec.batch_id.clone()),
+            record_count: rec.record_count.and_then(|n| u64::try_from(n).ok()),
+            bounded: false,
+        }
+    }
+
+    /// The window's range as the replay messages name it.
+    pub(crate) fn range(&self) -> String {
+        ProgressMarker::spanning(&self.start, &self.end).range_token()
+    }
+
+    /// The source the window was read from, for the replay messages.
+    pub(crate) fn source(&self) -> &str {
+        match &self.start {
+            ProgressMarker::Kafka { topic, .. } => topic,
+            ProgressMarker::File { path, .. } | ProgressMarker::SyslogSpool { path, .. } => path,
+        }
+    }
+
+    /// How many bytes the window spans, for a byte-offset source.
+    pub(crate) fn span_bytes(&self) -> Option<u64> {
+        match &self.start {
+            ProgressMarker::Kafka { .. } => None,
+            _ => u64::try_from(end_position(&self.end) - start_position(&self.start)).ok(),
         }
     }
 
@@ -230,6 +260,53 @@ impl RecordedWindows {
         found
     }
 
+    /// The end of the bounded window that starts where a read starting at
+    /// `start` does, if one is being rebuilt there.
+    pub(crate) fn bounded_end(&self, start: &ProgressMarker) -> Option<i128> {
+        let position = start_position(start);
+        self.by_unit
+            .get(&unit_key(start))?
+            .iter()
+            .map(|(_, w)| w)
+            .find(|w| {
+                w.bounded
+                    && start_position(&w.start) == position
+                    && !proven_other(w.start.content_fingerprint(), start.content_fingerprint())
+            })
+            .map(|w| end_position(&w.end))
+    }
+
+    /// Record whether the source bounds the re-read of the window recorded at
+    /// `start`.
+    pub(crate) fn set_bounded(&mut self, start: &ProgressMarker, bounded: bool) {
+        let position = start_position(start);
+        if let Some(w) = self.by_unit.get_mut(&unit_key(start)).and_then(|unit| {
+            unit.iter_mut()
+                .map(|(_, w)| w)
+                .find(|w| start_position(&w.start) == position)
+        }) {
+            w.bounded = bounded;
+        }
+    }
+
+    /// Stop holding the window of `source` recorded from `start` to `end`:
+    /// its re-read could not stop at its end. Returns it, if it was held.
+    pub(crate) fn unbind(&mut self, source: &str, start: u64, end: u64) -> Option<RecordedWindow> {
+        let w = self
+            .by_unit
+            .values_mut()
+            .flatten()
+            .map(|(_, w)| w)
+            .find(|w| {
+                w.bounded
+                    && w.source() == source
+                    && start_position(&w.start) == i128::from(start)
+                    && end_position(&w.end) == i128::from(end)
+            })?;
+        w.bounded = false;
+        Some(w.clone())
+    }
+
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         debug_assert_eq!(
@@ -355,6 +432,99 @@ pub(crate) fn note_rebuilt(
     }
 }
 
+/// How much larger than the current batching limits a recorded window may be
+/// and still be rebuilt exactly (#626). A rebuilt window is held, whatever
+/// the thresholds say, until it reaches its recorded end; the cap keeps that
+/// bounded when the limits were lowered since the window was cut.
+pub(crate) const REBUILD_CAP_FACTOR: u64 = 4;
+
+/// Count one replay result that is not decided at the key (#626).
+fn count(result: &'static str, labels: [&str; 3]) {
+    debug_assert!(
+        telemetry::REPLAY_REBUILD_RESULTS.contains(&result),
+        "{result} is not a pinned replay result"
+    );
+    if let Some(mx) = telemetry::metrics() {
+        mx.replay_rebuilds_total
+            .with_label_values(&[labels[0], labels[1], labels[2], result])
+            .inc();
+    }
+}
+
+/// The window's re-read could not stop at its recorded end (`refused`).
+/// Rate-limited by the caller: `suppressed` is how many were not logged since
+/// the last notice for this source.
+pub(crate) fn note_refused(
+    window: &RecordedWindow,
+    why: &str,
+    labels: [&str; 3],
+    suppressed: Option<u64>,
+) {
+    count("refused", labels);
+    let Some(suppressed) = suppressed else {
+        return;
+    };
+    let (range, source) = (window.range(), window.source());
+    let earlier = window.batch_id.as_deref().unwrap_or("unrecorded");
+    tracing::warn!(
+        event = "replay_bound_refused",
+        earlier_batch_id = earlier,
+        source,
+        range,
+        reason = why,
+        suppressed,
+        "range {range} of {source} (batch {earlier}) cannot be rebuilt as first cut: {why}; it is \
+         read from its start to the current end as before, so a second object may be written for \
+         bytes already archived (the first stays, nothing is lost); find what rewrote or \
+         truncated the source, and run `vtopctl audit-coverage` ({suppressed} more like this \
+         suppressed since the last notice)"
+    );
+}
+
+/// The window is over [`REBUILD_CAP_FACTOR`] times the current limits and is
+/// not bounded (`too_large`).
+pub(crate) fn note_too_large(window: &RecordedWindow, limits: (usize, usize), labels: [&str; 3]) {
+    count("too_large", labels);
+    let (range, source) = (window.range(), window.source());
+    let earlier = window.batch_id.as_deref().unwrap_or("unrecorded");
+    let records = window
+        .record_count
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "?".into());
+    let bytes = window
+        .span_bytes()
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "?".into());
+    let (max_records, max_bytes) = limits;
+    tracing::warn!(
+        event = "replay_bound_too_large",
+        earlier_batch_id = earlier,
+        source,
+        range,
+        records = %records,
+        bytes = %bytes,
+        "range {range} of {source} (batch {earlier}, {records} records, {bytes} bytes) is over \
+         {REBUILD_CAP_FACTOR}x the current batching.max_records ({max_records}) or \
+         batching.max_bytes ({max_bytes}); it is not rebuilt as first cut, so memory stays \
+         bounded, and a second object may be written for bytes already archived (nothing is \
+         lost); raise the limits back, or accept it"
+    );
+}
+
+/// The engine is stopping inside the rebuild of a window (`dropped_at_stop`).
+pub(crate) fn note_dropped_at_stop(source: &str, range: &str, labels: [&str; 3]) {
+    count("dropped_at_stop", labels);
+    tracing::warn!(
+        event = "replay_window_dropped",
+        source,
+        range,
+        "the engine is stopping inside the rebuild of range {range} of {source}; the partial \
+         window was not flushed, because flushing it would write an object the next start \
+         duplicates; the range was never committed, so the next start reads it again; nothing \
+         to do"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +550,8 @@ mod tests {
             sealed_at: parse_sealed_at("2026-01-02T03:04:05Z"),
             digest: None,
             batch_id: Some(format!("b{start}")),
+            record_count: None,
+            bounded: false,
         }
     }
 
