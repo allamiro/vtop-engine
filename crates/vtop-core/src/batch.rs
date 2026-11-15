@@ -160,6 +160,11 @@ impl AdaptiveBatcher {
         self.records.is_empty()
     }
 
+    /// Where the buffered window starts: the first record's start marker.
+    pub fn first_marker(&self) -> Option<&ProgressMarker> {
+        self.progress_start.as_ref()
+    }
+
     /// Add a record. `marker` is the progress position *after* this record.
     /// The first marker observed becomes the batch's `progress_start`.
     pub fn push(

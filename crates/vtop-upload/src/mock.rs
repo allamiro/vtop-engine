@@ -173,6 +173,10 @@ pub struct MockBackend {
     /// (#671 release B): a store refusing verification receipts. Settable on
     /// a shared mock, so one attempt can fail and the next succeed.
     failing_put_suffix: Mutex<Option<String>>,
+    /// Every put (object or manifest) to a key containing this text fails:
+    /// one batch range's puts, which its object key and batch id both name
+    /// (`-b0-7-`), while other ranges' go through (#626).
+    failing_put_containing: Mutex<Option<String>>,
     /// Every put to a key ending with this suffix never answers: a store
     /// that accepts the request and goes quiet (review of #711).
     hanging_put_suffix: Mutex<Option<String>>,
@@ -485,6 +489,7 @@ impl MockBackend {
             lock_config_errors: AtomicUsize::new(0),
             retention: Mutex::new(HashMap::new()),
             failing_put_suffix: Mutex::new(None),
+            failing_put_containing: Mutex::new(None),
             hanging_put_suffix: Mutex::new(None),
             lock_fault_suffix: Mutex::new(None),
             multipart_fail_after_parts: Arc::new(AtomicUsize::new(usize::MAX)),
@@ -549,6 +554,12 @@ impl MockBackend {
         *self.failing_put_suffix.lock().unwrap() = suffix.map(str::to_owned);
     }
 
+    /// Every put to a key containing `text` fails; `None` lets them through
+    /// again.
+    pub fn set_failing_put_containing(&self, text: Option<&str>) {
+        *self.failing_put_containing.lock().unwrap() = text.map(str::to_owned);
+    }
+
     /// Every put to a key ending with `suffix` never answers; `None` lets
     /// them through again.
     pub fn set_hanging_put_suffix(&self, suffix: Option<&str>) {
@@ -574,7 +585,16 @@ impl MockBackend {
     }
 
     fn refuse_put(&self, uri: &str) -> Result<(), VtopError> {
+        let contained = self
+            .failing_put_containing
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|text| uri.contains(text));
         match self.failing_put_suffix.lock().unwrap().as_deref() {
+            _ if contained => Err(VtopError::Upload(format!(
+                "mock put {uri}: InternalError (http 500)"
+            ))),
             Some(suffix) if uri.ends_with(suffix) => {
                 let key = uri.strip_prefix("s3://").unwrap_or(uri);
                 Err(VtopError::Upload(format!(
