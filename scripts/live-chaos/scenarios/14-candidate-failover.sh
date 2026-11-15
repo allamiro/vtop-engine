@@ -17,7 +17,11 @@
 #   4. the new leader serves quorum produce at the new epoch on its own
 #      address, and every record acknowledged before the kill is intact;
 #   5. the two roles the survivors ended in are visible in their logs as
-#      role transitions, not restarts.
+#      role transitions, not restarts;
+#   6. the survivor SERVES within CHAOS_PROMOTION_SERVE_LIMIT_MS (3 s) of
+#      the lease changing hands (#750): it needs a write quorum of replica
+#      streams, and one peer is the node just killed, so waiting for every
+#      stream cost each failover its whole ten-second deadline.
 source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
 # A v2 range (#240): the promotion boundary marker this scenario asserts is
@@ -31,8 +35,16 @@ init_workdir
 
 RECORDS="${CHAOS_CANDIDATE_RECORDS:-600}"
 BATCH="${CHAOS_CANDIDATE_BATCH:-50}"
+SERVE_LIMIT_MS="${CHAOS_PROMOTION_SERVE_LIMIT_MS:-3000}"
 require_integer_in_range CHAOS_CANDIDATE_RECORDS "$RECORDS" 1 100000000
 require_integer_in_range CHAOS_CANDIDATE_BATCH "$BATCH" 1 65536
+require_integer_in_range CHAOS_PROMOTION_SERVE_LIMIT_MS "$SERVE_LIMIT_MS" 1 600000
+
+# A monotonic millisecond clock: `date +%s%N` is GNU-only, and SECONDS is
+# too coarse to tell 3 s from 10 s with a margin.
+monotonic_ms() {
+  python3 -c 'import time; print(int(time.monotonic() * 1000))'
+}
 
 # --- metadata plane ---------------------------------------------------------
 M1=$(start_meta_node 1 2 3)
@@ -113,6 +125,9 @@ log "leader (candidate $WINNER) SIGKILLed mid-hold"
 # an election round.
 read -r NEW_HOLDER NEW_EPOCH <<<"$(await_lease_holder_changed "$LEADER_ID" "$HOLDER" \
   $((LEASE_DURATION_MS / 1000 + ELECTION_TIMEOUT_SECONDS)))"
+# The clock starts once metadata shows the new holder, which is AFTER the
+# acquire committed, so the gap measured below is at most the real one.
+HELD_MS="$(monotonic_ms)"
 [[ "$NEW_EPOCH" -gt "$EPOCH" ]] \
   || fail "a new hold must mint a newer epoch: old $EPOCH, new $NEW_EPOCH"
 NEW_LEADER="$(candidate_by_uuid "$NEW_HOLDER")"
@@ -121,6 +136,24 @@ log "candidate $NEW_LEADER ($NEW_HOLDER) took the range at epoch $NEW_EPOCH — 
 await_log_line "$WORKDIR/logs/data-candidate-$NEW_LEADER.log" \
   "data_node_role_changed role=leader" \
   "the survivor must have BECOME the leader in place; a restart would be scenario 09"
+SERVED_MS="$(monotonic_ms)"
+
+# --- the survivor serves at a write QUORUM of streams (#750) -----------------
+# A liveness bound, not a safety one: the new leader needs one of its two
+# peers, and the other is the corpse. Before #750 it waited for both streams,
+# so this gap was the build's whole ten-second deadline in 15 of 15 measured
+# failovers (#597). The INFO line is the node saying which stream it served
+# without.
+GAP_MS=$((SERVED_MS - HELD_MS))
+[[ "$GAP_MS" -lt "$SERVE_LIMIT_MS" ]] \
+  || fail "the survivor took ${GAP_MS} ms from holding the lease to serving, over the \
+${SERVE_LIMIT_MS} ms limit: a write quorum (itself and one live peer) was available, so it \
+waited for the killed leader's replica stream (#750)"
+await_log_line "$WORKDIR/logs/data-candidate-$NEW_LEADER.log" \
+  "serving with 1 of 2 replica streams connected" \
+  "the survivor must say it serves with the dead peer's stream down, naming it"
+log "the survivor served ${GAP_MS} ms after the lease changed hands, at a write quorum of \
+replica streams"
 
 # --- the new leader serves, on its own address, and nothing acked was lost --
 # A BUMPED PRODUCER EPOCH, not just the new fencing epoch (review): the

@@ -292,6 +292,7 @@ The full table, with what is done and what is planned, is in
 | [Archive path reference](docs/reference/archive-path.md) | sources, formats, the manifest, verification, recovery, metrics |
 | [PRODUCTION_HA.md](docs/PRODUCTION_HA.md) | engine HA: status, design and phased roadmap |
 | [ROADMAP.md](docs/ROADMAP.md) | cluster-plane releases and per-release limitations |
+| [Compatibility policy](docs/reference/compatibility.md) | what each format promises, upgrade and downgrade rules, deprecation |
 | [SECURITY_MODEL.md](docs/SECURITY_MODEL.md) | the security model and its normative rules |
 | [RELEASE_VERIFICATION.md](docs/RELEASE_VERIFICATION.md) | checking a release's signatures, SBOM and provenance |
 | [LIVE_CHAOS_VALIDATION.md](docs/LIVE_CHAOS_VALIDATION.md) | the live-chaos suite: real processes, real TLS, injected faults |

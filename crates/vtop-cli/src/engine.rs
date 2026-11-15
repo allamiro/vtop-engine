@@ -801,48 +801,19 @@ impl<'a> Pipeline<'a> {
             }
         }
 
-        // Hardened manifest profile (#135): refuse to upload into a bucket
-        // that discards overwritten versions — version pinning below is only
-        // meaningful if the store keeps what we pin.
-        if self.config.upload.require_object_versioning {
-            if !self.backend.supports_object_versions() {
-                fail!(format!(
-                    "require_object_versioning is set but backend {} does not expose \
-                     immutable object versions",
-                    self.backend.backend_name()
-                ));
-            }
-            let checked = self.versioned_buckets.lock().unwrap().contains(&bucket);
-            if !checked {
-                if let Err(e) = note_store_request(
-                    self.backend.verify_bucket_versioning(&bucket).await,
-                    "bucket_versioning",
-                    [
-                        tenant.as_str(),
-                        source.source_type.as_str(),
-                        format.extension(),
-                    ],
-                    &self.attempts,
-                    &self.throttles,
-                ) {
-                    fail!(format!("bucket versioning preflight failed: {e}"));
-                }
-                self.versioned_buckets
-                    .lock()
-                    .unwrap()
-                    .insert(bucket.clone());
-            }
-        }
-
         // The S3 Object Lock profile (#684): the bucket must have Object Lock
         // enabled before anything is written to it. A literal bucket passed
         // this at startup; a templated one is checked here, at the first
         // upload to each bucket it names, and cached like versioning.
+        // Checked BEFORE versioning, as startup does (review of #770): a
+        // store without Object Lock usually lacks versioning too, and is
+        // refused for the lock no bucket setting can add, not for versioning
+        // advice it cannot follow.
         if self.config.upload.object_lock.is_some()
             && !self.locked_buckets.lock().unwrap().contains(&bucket)
         {
             let checked = note_store_request(
-                self.backend.bucket_object_lock_enabled(&bucket).await,
+                self.backend.bucket_object_lock(&bucket).await,
                 "bucket_object_lock",
                 [
                     tenant.as_str(),
@@ -853,8 +824,15 @@ impl<'a> Pipeline<'a> {
                 &self.throttles,
             );
             let refusal = match checked {
-                Ok(true) => None,
-                Ok(false) => {
+                Ok(vtop_upload::BucketFeature::Enabled) => None,
+                Ok(vtop_upload::BucketFeature::NotSupported) => {
+                    crate::object_lock::count(&tenant, "store_unsupported");
+                    Some(crate::object_lock::store_unsupported(
+                        &bucket,
+                        "the batch was not uploaded and will be replayed",
+                    ))
+                }
+                Ok(vtop_upload::BucketFeature::NotEnabled) => {
                     crate::object_lock::count(&tenant, "bucket_not_locked");
                     Some(crate::object_lock::bucket_refusal(
                         &bucket,
@@ -883,6 +861,56 @@ impl<'a> Pipeline<'a> {
                     );
                     fail!(m)
                 }
+            }
+        }
+
+        // Hardened manifest profile (#135): refuse to upload into a bucket
+        // that discards overwritten versions — version pinning below is only
+        // meaningful if the store keeps what we pin.
+        if self.config.upload.require_object_versioning {
+            use crate::bucket_versioning as versioning;
+            if !self.backend.supports_object_versions() {
+                fail!(versioning::backend_without_versions(
+                    self.backend.backend_name(),
+                    versioning::Refuser::BATCH,
+                ));
+            }
+            let checked = self.versioned_buckets.lock().unwrap().contains(&bucket);
+            if !checked {
+                // A literal bucket passed this at startup unless the store
+                // could not answer then (#722); a templated one is checked
+                // here, at the first upload to each bucket it names.
+                let refusal = match note_store_request(
+                    self.backend.bucket_versioning(&bucket).await,
+                    "bucket_versioning",
+                    [
+                        tenant.as_str(),
+                        source.source_type.as_str(),
+                        format.extension(),
+                    ],
+                    &self.attempts,
+                    &self.throttles,
+                ) {
+                    Ok(answer) => versioning::refusal(answer, &bucket, versioning::Refuser::BATCH),
+                    Err(e) => Some(versioning::unreadable(
+                        &bucket,
+                        versioning::Refuser::BATCH,
+                        &e,
+                    )),
+                };
+                if let Some(m) = refusal {
+                    tracing::error!(
+                        event = "bucket_versioning_refused",
+                        batch_id,
+                        bucket = %bucket,
+                        "{m}"
+                    );
+                    fail!(m);
+                }
+                self.versioned_buckets
+                    .lock()
+                    .unwrap()
+                    .insert(bucket.clone());
             }
         }
 
@@ -2353,7 +2381,10 @@ impl Engine {
         engine._instance_locks = locks;
         // The S3 Object Lock profile's startup check (#684), before any
         // recovery or batch can write an object.
-        engine.preflight_object_lock().await?;
+        // And the hardened profile's versioning check (#722), so a bucket
+        // that cannot keep the pinned manifest versions refuses startup
+        // instead of failing every batch.
+        engine.preflight_buckets().await?;
         // Reclaim multipart sessions no source will replay (#482, review):
         // a crash mid-upload leaves a *.multipart.json and a live upload id,
         // and since #668 a failed upload keeps its session for the replay.
@@ -2532,6 +2563,33 @@ impl Engine {
     pub async fn preflight_object_lock(&self) -> Result<(), VtopError> {
         crate::object_lock::preflight(&self.config, self.backend.as_ref(), &self.locked_buckets)
             .await
+    }
+
+    /// Both bucket checks at startup, in their order (#722, review of #770):
+    /// the Object Lock check first, so a store without Object Lock is refused
+    /// for that and not for the versioning it usually lacks too, then the
+    /// hardened profile's versioning check.
+    pub async fn preflight_buckets(&self) -> Result<(), VtopError> {
+        self.preflight_object_lock().await?;
+        self.preflight_bucket_versioning().await
+    }
+
+    /// The hardened manifest profile's startup check (#722).
+    ///
+    /// Run by [`Engine::new_exclusive`] after the Object Lock check (so a
+    /// store without Object Lock is refused for that, not for the versioning
+    /// it also lacks): with `upload.require_object_versioning` set, refuses a
+    /// backend that cannot address object versions, and a literal bucket the
+    /// store says does not keep versions, before anything is read or
+    /// written. A templated bucket, and one the store could not answer for,
+    /// are checked at their first upload.
+    pub async fn preflight_bucket_versioning(&self) -> Result<(), VtopError> {
+        crate::bucket_versioning::preflight(
+            &self.config,
+            self.backend.as_ref(),
+            &self.versioned_buckets,
+        )
+        .await
     }
 
     /// Batching thresholds (records / bytes / age) from config.

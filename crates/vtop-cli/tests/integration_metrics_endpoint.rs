@@ -163,6 +163,7 @@ fn the_object_lock_metrics_are_exported() {
         "legal_hold_missing",
         "error",
         "bucket_not_locked",
+        "store_unsupported",
     ] {
         let series =
             format!(r#"vtop_object_lock_checks_total{{result="{result}",tenant="default"}}"#);
