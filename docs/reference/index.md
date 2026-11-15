@@ -37,6 +37,23 @@ The guides link here; these pages do not repeat the guides.
 
     [:octicons-arrow-right-24: Limitations](limitations.md)
 
+-   **Compatibility**
+
+    ---
+
+    What each format promises, how it may change, and which upgrades and
+    downgrades are supported.
+
+    [:octicons-arrow-right-24: Compatibility policy](compatibility.md)
+
+-   **Data-safety register**
+
+    ---
+
+    Every data-safety bug found so far: introduced, found, fixed.
+
+    [:octicons-arrow-right-24: Register](data-safety-register.md)
+
 -   **Protocol**
 
     ---
