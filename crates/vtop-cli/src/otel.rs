@@ -79,6 +79,28 @@ mod tests {
         move |name| vars.get(name).cloned()
     }
 
+    /// `subscriber` as this thread's subscriber, for a test that reads the
+    /// spans it records (#791).
+    ///
+    /// Whether a span callsite is recorded at all is decided once for the
+    /// process, the first time any thread reaches it, and cached. With
+    /// several dispatchers registered, `tracing` asks every one of them, so
+    /// a subscriber that wants the span keeps it. With exactly one, it asks
+    /// only the default of the thread that got there first: when that is
+    /// another test, one with no subscriber of its own running
+    /// `process_once` beside this one, the callsite is cached as never
+    /// wanted, and this thread's exporter gets nothing. A second dispatcher,
+    /// registered once and kept for the life of the process, means there is
+    /// never exactly one. It wants nothing, so it adds no span anywhere.
+    fn subscribe(
+        subscriber: impl tracing::Subscriber + Send + Sync + 'static,
+    ) -> tracing::subscriber::DefaultGuard {
+        static ALWAYS_A_SECOND: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        ALWAYS_A_SECOND
+            .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+        tracing::subscriber::set_default(subscriber)
+    }
+
     /// The binary's layer over an in-memory exporter, as this thread's
     /// subscriber. Thread-local, so tests running beside this one neither
     /// see these spans nor add to them.
@@ -91,8 +113,7 @@ mod tests {
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
             .build();
-        let subscriber = tracing_subscriber::registry().with(otel::layer(&provider));
-        let guard = tracing::subscriber::set_default(subscriber);
+        let guard = subscribe(tracing_subscriber::registry().with(otel::layer(&provider)));
         (provider, exporter, guard)
     }
 
@@ -244,8 +265,7 @@ mod tests {
         let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
             .await
             .unwrap();
-        let subscriber = tracing_subscriber::registry().with(otel::layer(provider));
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = subscribe(tracing_subscriber::registry().with(otel::layer(provider)));
         let started = std::time::Instant::now();
         let outcomes = engine.process_once(SourceType::File).await.unwrap();
         let took = started.elapsed();
@@ -270,6 +290,28 @@ mod tests {
             .map(|s| s.name.into_owned())
             .collect();
         assert_eq!(names, ["ours"]);
+    }
+
+    fn reach_the_probe_span() {
+        tracing::debug_span!(target: "vtop_cli::engine", "probe").in_scope(|| {});
+    }
+
+    /// #791: the first time a span's callsite is reached decides, once for
+    /// the process, whether it is ever recorded. When that first time is on
+    /// another thread, one with no subscriber of its own (another test
+    /// running `process_once` beside this one), this thread's exporter must
+    /// still get the span.
+    #[test]
+    fn a_span_first_reached_on_another_thread_is_still_exported_here() {
+        let (provider, exporter, guard) = capture();
+        std::thread::spawn(reach_the_probe_span).join().unwrap();
+        reach_the_probe_span();
+        drop(guard);
+        let names: Vec<_> = finished(&provider, &exporter)
+            .into_iter()
+            .map(|s| s.name.into_owned())
+            .collect();
+        assert_eq!(names, ["probe"]);
     }
 
     /// #683: one batch is one trace: a root `batch` span carrying the batch's
@@ -676,7 +718,7 @@ mod tests {
                         .with_ansi(false)
                         .with_filter(tracing::level_filters::LevelFilter::INFO),
                 );
-            let _guard = tracing::subscriber::set_default(subscriber);
+            let _guard = subscribe(subscriber);
             for _ in 0..SPANS {
                 tracing::debug_span!(target: "vtop_cli::engine", "batch").in_scope(|| {});
                 assert!(probe.pending() <= QUEUE, "the queue grew past its capacity");
@@ -739,8 +781,7 @@ mod tests {
             },
         );
         let provider = otel::tracer_provider(queue, Sampler::AlwaysOn, &[]);
-        let subscriber = tracing_subscriber::registry().with(otel::layer(&provider));
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = subscribe(tracing_subscriber::registry().with(otel::layer(&provider)));
         tracing::debug_span!(target: "vtop_cli::engine", "queued").in_scope(|| {});
         tracing::debug_span!(target: "vtop_cli::engine", "queued").in_scope(|| {});
         provider
