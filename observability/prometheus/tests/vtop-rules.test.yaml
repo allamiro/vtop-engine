@@ -298,6 +298,30 @@ tests:
         summary: Object Lock check failed (missing) for tenant default on engine-1:9090
         description: A written or reused object or manifest is not under the retention upload.object_lock asks for, or its bucket has no Object Lock. The batch failed and will be replayed. Read the object_lock_check_failed or object_lock_bucket_refused ERROR line, then fix the bucket or the credentials' retention permissions.
         runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopobjectlockcheckfailed
+# Review of #772: primed at zero in the engine, but a check can fail before
+# Prometheus's first scrape, so the first sample it sees is already 1 and
+# increase() never moves.
+- name: 'VtopObjectLockCheckFailed: fires on a failure Prometheus first sees as non-zero'
+  interval: 1m
+  input_series:
+  - series: vtop_object_lock_checks_total{job="vtop-engine",instance="engine-1:9090",tenant="default",result="ok"}
+    values: _x5 3+2x25
+  - series: vtop_object_lock_checks_total{job="vtop-engine",instance="engine-1:9090",tenant="default",result="missing"}
+    values: _x5 1x25
+  alert_rule_test:
+  - eval_time: 8m
+    alertname: VtopObjectLockCheckFailed
+    exp_alerts:
+    - exp_labels:
+        severity: page
+        job: vtop-engine
+        instance: engine-1:9090
+        tenant: default
+        result: missing
+      exp_annotations:
+        summary: Object Lock check failed (missing) for tenant default on engine-1:9090
+        description: A written or reused object or manifest is not under the retention upload.object_lock asks for, or its bucket has no Object Lock. The batch failed and will be replayed. Read the object_lock_check_failed or object_lock_bucket_refused ERROR line, then fix the bucket or the credentials' retention permissions.
+        runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopobjectlockcheckfailed
 - name: 'VtopObjectLockCheckFailed: quiet while every check is ok'
   interval: 1m
   input_series:
@@ -365,6 +389,27 @@ tests:
     values: 0x10 1x20
   alert_rule_test:
   - eval_time: 15m
+    alertname: VtopSourceReplayRefused
+    exp_alerts:
+    - exp_labels:
+        severity: page
+        job: vtop-engine
+        instance: engine-1:9090
+        tenant: default
+        source_type: file
+      exp_annotations:
+        summary: A failed range could not be re-read from file on engine-1:9090
+        description: 'A batch failed and its source refused to hand the range back (for a file: truncated, rewritten, or rotated away and removed). That range is missing from the archive. The path is in the ERROR line beside the count; recover the data from another copy if one exists.'
+        runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopsourcereplayrefused
+# Review of #772: as for Object Lock, a range refused before the first
+# scrape shows up as a series whose first sample is already 1.
+- name: 'VtopSourceReplayRefused: fires on a refusal Prometheus first sees as non-zero'
+  interval: 1m
+  input_series:
+  - series: vtop_source_replay_refused_total{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="file"}
+    values: _x5 1x25
+  alert_rule_test:
+  - eval_time: 8m
     alertname: VtopSourceReplayRefused
     exp_alerts:
     - exp_labels:

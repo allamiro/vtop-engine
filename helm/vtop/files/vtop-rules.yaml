@@ -138,10 +138,15 @@ groups:
           runbook_url: "https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopsizeonlyverification"
 
       # Primed at zero at startup when upload.object_lock is set, so
-      # increase() sees the first failure. Any result but ok failed a batch.
+      # increase() sees the first failure once Prometheus has scraped the
+      # zero. A check can fail before that first scrape; the second branch
+      # catches a series first seen non-zero. Any result but ok failed a
+      # batch.
       - alert: VtopObjectLockCheckFailed
         expr: |
           increase(vtop_object_lock_checks_total{result!="ok"}[15m]) > 0
+          or
+          (vtop_object_lock_checks_total{result!="ok"} > 0 unless vtop_object_lock_checks_total{result!="ok"} offset 15m)
         labels:
           severity: page
         annotations:
@@ -165,10 +170,14 @@ groups:
           runbook_url: "https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopretentionloss"
 
       # A failed range the source could not hand back for re-reading: a range
-      # missing from the archive. Primed at zero at startup.
+      # missing from the archive. Primed at zero at startup; the second
+      # branch catches a refusal before Prometheus's first scrape, whose
+      # series is first seen non-zero.
       - alert: VtopSourceReplayRefused
         expr: |
           increase(vtop_source_replay_refused_total[15m]) > 0
+          or
+          (vtop_source_replay_refused_total > 0 unless vtop_source_replay_refused_total offset 15m)
         labels:
           severity: page
         annotations:
