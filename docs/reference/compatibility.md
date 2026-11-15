@@ -37,7 +37,8 @@ Every format in the [inventory](#inventory) carries one of three statuses.
 ## What frozen means
 
 A format is frozen at 1.0 when all six of these hold. The format registry
-([inventory](#inventory)) records which do for each format.
+(see [inventory](#inventory)) will record which do for each format, as
+#743's later steps add the fixtures, cells and fuzz targets.
 
 1. **The marker is read first.** Every reader checks the version before it
    decodes anything else, and its error says one of three different things:

@@ -44,7 +44,9 @@ REGISTRY = textwrap.dedent(
           - {file: crates/demo/src/lib.rs, name: MAGIC, value: 'b"VTOPDEMO"'}
           - {file: crates/demo/src/lib.rs, name: DEMO_VERSION, value: '1'}
         tag_sets:
-          - {file: crates/demo/src/lib.rs, prefix: COMMAND_KIND_, max: 2}
+          - file: crates/demo/src/lib.rs
+            prefix: COMMAND_KIND_
+            tags: {COMMAND_KIND_FIRST: 1, COMMAND_KIND_SECOND: 2}
     not_formats:
       - {file: crates/demo/src/lib.rs, name: MAX_DEMO_VERSION_BYTES, why: a bound}
     """
@@ -98,8 +100,51 @@ class RegistryCheck(unittest.TestCase):
         self.assertIn("DEMO_VERSION is 2", " ".join(self.problems()))
 
     def test_a_new_command_kind_without_a_registry_edit_fails(self):
-        self.source(SOURCE.replace("const MAX_DEMO", "const COMMAND_KIND_THIRD: u16 = 3;\nconst MAX_DEMO"))
-        self.assertIn("highest COMMAND_KIND_* in crates/demo/src/lib.rs is 3", " ".join(self.problems()))
+        for third in ("3", "0x3", "3u16", "COMMAND_KIND_SECOND + 1"):
+            self.source(SOURCE.replace("const MAX_DEMO", f"const COMMAND_KIND_THIRD: u16 = {third};\nconst MAX_DEMO"))
+            self.assertIn("COMMAND_KIND_THIRD", " ".join(self.problems()), third)
+
+    def test_renumbered_or_colliding_tags_fail(self):
+        swapped = SOURCE.replace("COMMAND_KIND_FIRST: u16 = 1", "COMMAND_KIND_FIRST: u16 = 9")
+        self.source(swapped)
+        self.assertIn("COMMAND_KIND_FIRST", " ".join(self.problems()))
+        both = SOURCE.replace("COMMAND_KIND_SECOND: u16 = 2", "COMMAND_KIND_SECOND: u16 = 1")
+        self.source(both)
+        self.assertIn("COMMAND_KIND_SECOND", " ".join(self.problems()))
+
+    def test_a_plural_versions_set_is_a_format_constant(self):
+        self.source(SOURCE.replace("const MAX_DEMO", 'const LEGACY_VERSIONS: [&str; 2] = ["0.1", "0.2"];\nconst MAX_DEMO'))
+        self.assertIn("LEGACY_VERSIONS", " ".join(self.problems()))
+
+    def test_an_out_of_line_test_module_hides_nothing_after_it(self):
+        self.source(SOURCE.replace("#[cfg(test)]\nmod tests {", "#[cfg(test)]\nmod extra_tests;\nconst NEW_VERSION: u8 = 1;\nfn f() {}\n\n#[cfg(test)]\nmod tests {"))
+        self.assertIn("NEW_VERSION", " ".join(self.problems()))
+
+    def test_byte_raw_strings_and_nested_comments_in_a_test_module_hide_nothing_after_it(self):
+        for literal in ('let _ = br#"a" { "#;', 'let _ = br"\\";', "/* /* */ { */"):
+            body = SOURCE.replace('const FOREIGN', literal + "\n        const FOREIGN")
+            self.source(body + 'const NEW_VERSION: u8 = 1;\n')
+            self.assertIn("NEW_VERSION", " ".join(self.problems()), literal)
+
+    def test_spaces_inside_a_string_value_are_compared_exactly(self):
+        registry = REGISTRY.replace("value: '1'}", "value: '1'}\n      - {file: crates/demo/src/lib.rs, name: DEMO_SCHEMA_PREFIX, value: '\"-- demo \"'}")
+        (self.root / "scripts/compat/formats.yaml").write_text(registry)
+        self.source(SOURCE + 'const DEMO_SCHEMA_PREFIX: &str = "-- demo ";\n')
+        self.assertEqual(self.problems(), [])
+        self.source(SOURCE + 'const DEMO_SCHEMA_PREFIX: &str = "--  demo ";\n')
+        self.assertIn("DEMO_SCHEMA_PREFIX", " ".join(self.problems()))
+
+    def test_a_not_formats_row_cannot_switch_off_a_listed_constant(self):
+        (self.root / "scripts/compat/formats.yaml").write_text(
+            REGISTRY + "  - {file: crates/demo/src/lib.rs, name: DEMO_VERSION, why: sneaky}\n")
+        self.assertIn("both", " ".join(self.problems()))
+
+    def test_a_marker_can_quote_a_constant_and_follows_it(self):
+        registry = REGISTRY.replace('marker: "`VTOPDEMO` v1"', 'marker: "`VTOPDEMO` v{DEMO_VERSION}"')
+        (self.root / "scripts/compat/formats.yaml").write_text(registry)
+        self.assertEqual(self.run_check("--write"), 0)
+        page = (self.root / "docs/reference/compatibility.md").read_text()
+        self.assertIn("`VTOPDEMO` v1 |", page)
 
     def test_a_constant_the_sources_no_longer_hold_fails(self):
         self.source(SOURCE.replace("pub const DEMO_VERSION: u32 = 1;\n", ""))

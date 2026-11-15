@@ -16,7 +16,10 @@
 #   marker, status, at_1_0      the inventory row on the page;
 #   constants                   {file, name, value}: value as written in Rust;
 #   magics                      {file, magic}: a magic not held in a constant;
-#   tag_sets                    {file, prefix, max}: the highest tag in use;
+#   tag_sets                    {file, prefix, tags}: every tag of the set
+#                               and its number; a tag is never renumbered;
+#   marker                      may quote one of the entry's constants as
+#                               {NAME}, so the table follows its value;
 #   fixtures, fuzz              paths and fuzz targets that exist today;
 #   one_way                     one-way steps taken so far, with the operator
 #                               action that takes each.
@@ -33,6 +36,8 @@ formats:
       - {file: crates/vtop-core/src/manifest.rs, name: VTOP_VERSION_04, value: '"0.4"'}
       - {file: crates/vtop-core/src/manifest.rs, name: MAX_READABLE_VERSION, value: '"0.4"'}
       - {file: crates/vtop-core/src/manifest.rs, name: VTOP_PROTOCOL, value: '"VTOP"'}
+      - {file: crates/vtop-core/src/manifest.rs, name: LEGACY_VERSIONS, value: '["0.1", "0.2", "0.3"]'}
+      - {file: crates/vtop-core/src/manifest.rs, name: CANONICAL_VERSIONS, value: '["0.4"]'}
     fixtures: [crates/vtop-core/tests/fixtures/manifests]
     fuzz: [manifest_parse]
     one_way:
@@ -46,7 +51,9 @@ formats:
     at_1_0: stable
     constants:
       - {file: crates/vtop-core/src/manifest/receipt.rs, name: RECEIPT_VERSION, value: '"1"'}
-    fixtures: [crates/vtop-core/tests/fixtures/manifests/release-b-receipt-signed.json]
+    fixtures:
+      - crates/vtop-core/tests/fixtures/manifests/release-b-receipt-signed.json
+      - crates/vtop-core/tests/fixtures/manifests/release-b-receipt-unsigned.json
     fuzz: [manifest_parse]
 
   - id: 3
@@ -128,6 +135,9 @@ formats:
       - {file: crates/vtop-log/src/types.rs, name: FORMAT_VERSION_V2, value: '2'}
       - {file: crates/vtop-log/src/types.rs, name: RECORD_SCHEMA_VERSION_V2, value: '2'}
       - {file: crates/vtop-log/src/types.rs, name: CHUNK_SIDECAR_MAGIC, value: 'b"VTOPCHK1"'}
+      - {file: crates/vtop-log/src/types.rs, name: CHUNK_TREE_SCHEME_V1, value: '"vtop-b3tree-v1"'}
+      - {file: crates/vtop-log/src/types.rs, name: COMMIT_SCHEME_KEYED, value: '"blake3-keyed"'}
+      - {file: crates/vtop-log/src/types.rs, name: COMMIT_SCHEME_UNKEYED, value: '"unkeyed-digest"'}
       - {file: crates/vtop-log/src/segment.rs, name: CHUNK_SIDECAR_VERSION, value: '1'}
       - {file: crates/vtop-log/src/segment.rs, name: COMMIT_MAGIC, value: 'b"VTOPCMT1"'}
       - {file: crates/vtop-log/src/segment.rs, name: COMMIT_VERSION, value: '1'}
@@ -202,7 +212,7 @@ formats:
   - id: 16
     name: Metadata command set
     class: B
-    marker: command kinds, feature levels 3 to 8
+    marker: command kinds, feature levels {BASELINE_FEATURE_LEVEL} to {SUPPORTED_FEATURE_LEVEL}
     status: evolving, level-gated
     at_1_0: "follows #740"
     constants:
@@ -214,7 +224,48 @@ formats:
       - {file: crates/vtop-meta/src/command.rs, name: COMMAND_KIND_SET_FEATURE_LEVEL, value: '36'}
       - {file: crates/vtop-meta/src/command.rs, name: COMMAND_KIND_REPORT_NODE_VERSION, value: '38'}
     tag_sets:
-      - {file: crates/vtop-meta/src/command.rs, prefix: COMMAND_KIND_, max: 39}
+      - file: crates/vtop-meta/src/command.rs
+        prefix: COMMAND_KIND_
+        tags:
+          COMMAND_KIND_REGISTER_NODE: 1
+          COMMAND_KIND_SET_NODE_STATE: 2
+          COMMAND_KIND_CREATE_TOPIC: 3
+          COMMAND_KIND_GRANT_RANGE_LEASE: 4
+          COMMAND_KIND_RELEASE_RANGE_LEASE: 5
+          COMMAND_KIND_REGISTER_SEALED_SEGMENT: 6
+          COMMAND_KIND_MARK_SEGMENT_VERIFIED: 7
+          COMMAND_KIND_PUT_KEY_RECORD: 8
+          COMMAND_KIND_CREATE_CONSUMER_GROUP: 9
+          COMMAND_KIND_JOIN_CONSUMER_GROUP: 10
+          COMMAND_KIND_LEAVE_CONSUMER_GROUP: 11
+          COMMAND_KIND_ASSIGN_MEMBER_RANGES: 12
+          COMMAND_KIND_COMMIT_GROUP_CURSOR: 13
+          COMMAND_KIND_HEARTBEAT_MEMBER: 14
+          COMMAND_KIND_EXPIRE_STALE_MEMBER: 15
+          COMMAND_KIND_SET_NODE_PLACEMENT_ATTRS: 16
+          COMMAND_KIND_COMMIT_SEGMENT_PLACEMENT: 17
+          COMMAND_KIND_COMMIT_REPLACEMENT_PROOF: 18
+          COMMAND_KIND_PLAN_REPLICA_RETIREMENT: 19
+          COMMAND_KIND_CONFIRM_REPLICA_RETIRED: 20
+          COMMAND_KIND_PROPOSE_REBALANCE: 21
+          COMMAND_KIND_CANCEL_REBALANCE: 22
+          COMMAND_KIND_COMMIT_TIER_EVIDENCE: 23
+          COMMAND_KIND_SET_TOPIC_RETENTION_POLICY: 24
+          COMMAND_KIND_PLAN_RETENTION: 25
+          COMMAND_KIND_CONFIRM_RETENTION_EXPIRED: 26
+          COMMAND_KIND_CANCEL_RETENTION: 27
+          COMMAND_KIND_ACQUIRE_RANGE_LEASE: 28
+          COMMAND_KIND_RENEW_RANGE_LEASE: 29
+          COMMAND_KIND_REPORT_PROMOTION_OUTCOME: 30
+          COMMAND_KIND_COMMIT_GROUP_CURSOR_FENCED: 31
+          COMMAND_KIND_ENSURE_GROUP_MEMBER_FOR_RANGE: 32
+          COMMAND_KIND_COMMIT_GROUP_CURSOR_COORDINATED: 33
+          COMMAND_KIND_ENSURE_GROUP_MEMBER_COORDINATED: 34
+          COMMAND_KIND_SPLIT_RANGE: 35
+          COMMAND_KIND_SET_FEATURE_LEVEL: 36
+          COMMAND_KIND_SET_RANGE_REPLICA_SET: 37
+          COMMAND_KIND_REPORT_NODE_VERSION: 38
+          COMMAND_KIND_ATTEST_UNPROVEN_PROMOTION: 39
     one_way:
       - "raising the feature level (vtopctl meta enable-features): permanent; a voter older than the level refuses a log that holds its kinds"
 
@@ -232,8 +283,59 @@ formats:
       - {file: crates/vtop-meta/src/state.rs, name: VALUE_TAG_NODE_VERSION, value: '24'}
       - {file: crates/vtop-meta/src/keys.rs, name: CATEGORY_NODE_VERSION, value: '21'}
     tag_sets:
-      - {file: crates/vtop-meta/src/state.rs, prefix: VALUE_TAG_, max: 25}
-      - {file: crates/vtop-meta/src/keys.rs, prefix: CATEGORY_, max: 22}
+      - file: crates/vtop-meta/src/state.rs
+        prefix: VALUE_TAG_
+        tags:
+          VALUE_TAG_NODE: 1
+          VALUE_TAG_TOPIC: 2
+          VALUE_TAG_TOPIC_NAME: 3
+          VALUE_TAG_RANGE: 4
+          VALUE_TAG_SEGMENT: 5
+          VALUE_TAG_KEY: 6
+          VALUE_TAG_GROUP: 7
+          VALUE_TAG_GROUP_NAME: 8
+          VALUE_TAG_GROUP_MEMBER: 9
+          VALUE_TAG_GROUP_CURSOR: 10
+          VALUE_TAG_GROUP_MEMBER_V2: 11
+          VALUE_TAG_NODE_V2: 12
+          VALUE_TAG_SEGMENT_PLACEMENT: 13
+          VALUE_TAG_REPLACEMENT_PROOF: 14
+          VALUE_TAG_REBALANCE_INTENT: 15
+          VALUE_TAG_RANGE_V2: 16
+          VALUE_TAG_SEGMENT_TIER_COPY: 17
+          VALUE_TAG_TOPIC_RETENTION_POLICY: 18
+          VALUE_TAG_RANGE_TRANSITION: 19
+          VALUE_TAG_RANGE_V3: 20
+          VALUE_TAG_LINEAGE_TRANSITION: 21
+          VALUE_TAG_CLUSTER_CONFIG: 22
+          VALUE_TAG_RANGE_REPLICA_SET: 23
+          VALUE_TAG_NODE_VERSION: 24
+          VALUE_TAG_PROMOTION_ATTESTATION: 25
+      - file: crates/vtop-meta/src/keys.rs
+        prefix: CATEGORY_
+        tags:
+          CATEGORY_CLUSTER_CONFIG: 1
+          CATEGORY_NODE: 2
+          CATEGORY_TOPIC_BY_NAME: 3
+          CATEGORY_TOPIC: 4
+          CATEGORY_RANGE: 5
+          CATEGORY_SEGMENT: 6
+          CATEGORY_KEY: 7
+          CATEGORY_REQUEST: 8
+          CATEGORY_GROUP: 9
+          CATEGORY_GROUP_BY_NAME: 10
+          CATEGORY_GROUP_MEMBER: 11
+          CATEGORY_GROUP_CURSOR: 12
+          CATEGORY_SEGMENT_PLACEMENT: 13
+          CATEGORY_SEGMENT_REPLACEMENT_PROOF: 14
+          CATEGORY_SEGMENT_REBALANCE_INTENT: 15
+          CATEGORY_SEGMENT_TIER_COPY: 16
+          CATEGORY_TOPIC_RETENTION_POLICY: 17
+          CATEGORY_RANGE_TRANSITION: 18
+          CATEGORY_LINEAGE_TRANSITION: 19
+          CATEGORY_RANGE_REPLICA_SET: 20
+          CATEGORY_NODE_VERSION: 21
+          CATEGORY_PROMOTION_ATTESTATION: 22
 
   - id: 18
     name: Metadata hard state, applied, purged, membership log id
@@ -285,6 +387,8 @@ formats:
     constants:
       - {file: crates/vtop-meta/src/transport/wire.rs, name: VTPM_MAGIC, value: 'b"VTPM"'}
       - {file: crates/vtop-meta/src/transport/wire.rs, name: VTPM_VERSION, value: '1'}
+      - {file: crates/vtop-meta/src/transport/wire.rs, name: KIND_ADMIN_READ_CLUSTER_VERSIONS_REQ, value: '29'}
+      - {file: crates/vtop-meta/src/transport/wire.rs, name: KIND_ADMIN_READ_CLUSTER_VERSIONS_RESP, value: '30'}
 
   - id: 22
     name: "Kafka gateway: advertised APIs and version ranges"

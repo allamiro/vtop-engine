@@ -18,8 +18,16 @@ fails when:
 * the inventory table on docs/reference/compatibility.md differs from what
   the registry generates.
 
-Test code is not scanned: ``crates/*/tests``, ``benches``, and everything
-after a file's first ``#[cfg(test)]`` module.
+Test code is not scanned: ``crates/*/tests``, ``benches``, and every
+``#[cfg(test)]`` module (its braces matched, skipping strings, raw and byte
+strings, char literals and nested comments).
+
+Not covered, so a reviewer still has to look: native protocol and VTPM
+message kinds (match arms, not constants), ``effective_version`` (a literal
+in the JSON it prints), ``FORMAT_NAME``, and magics or versions written in
+other shapes than a ``b"VT..."`` literal or a constant whose name carries
+one of the tokens above. A ``marker`` may quote one of its entry's constants
+as ``{NAME}``, so the table follows the value.
 
 Usage:
     check-format-registry.py           check
@@ -48,10 +56,14 @@ CONST = re.compile(
     re.M,
 )
 MAGIC = re.compile(r'b"(VT[A-Z0-9]{2,6})"')
-TOKENS = ({"VERSION"}, {"SCHEMA"}, {"MAGIC"}, {"PROTOCOL"}, {"FEATURE", "LEVEL"})
-RAW_STRING = re.compile(r'r(#*)"')
+TOKENS = (
+    {"VERSION"}, {"VERSIONS"}, {"SCHEMA"}, {"SCHEMAS"}, {"SCHEME"}, {"MAGIC"},
+    {"PROTOCOL"}, {"FEATURE", "LEVEL"},
+)
+# A raw string, also as a byte or C string (br"..", cr#".."#).
+RAW_STRING = re.compile(r'[bc]?r(#*)"')
 CHAR_LITERAL = re.compile(r"'(\\.|[^\\'])'")
-TEST_MODULE = re.compile(r"^#\[cfg\(test\)\]\s*\n\s*(?:pub(?:\([^)]*\))?\s+)?mod\s", re.M)
+TEST_MODULE = re.compile(r"^#\[cfg\(test\)\]\s*\n\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*", re.M)
 
 
 def _block_end(text: str, opening: int) -> int:
@@ -67,10 +79,19 @@ def _block_end(text: str, opening: int) -> int:
                 return len(text)
             continue
         if text.startswith("/*", i):
-            i = text.find("*/", i)
-            if i < 0:
-                return len(text)
-            i += 2
+            # Block comments nest in Rust.
+            nesting = 0
+            while i < len(text):
+                if text.startswith("/*", i):
+                    nesting += 1
+                    i += 2
+                elif text.startswith("*/", i):
+                    nesting -= 1
+                    i += 2
+                    if nesting == 0:
+                        break
+                else:
+                    i += 1
             continue
         raw = RAW_STRING.match(text, i)
         if raw and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
@@ -106,6 +127,11 @@ def production_source(text: str) -> str:
         match = TEST_MODULE.search(text)
         if not match:
             return text
+        if text.startswith(";", match.end()):
+            # `mod tests;`: the module lives in its own file (whose
+            # contents are skipped by this check when it is a test file).
+            text = text[: match.start()] + text[match.end() + 1:]
+            continue
         opening = text.find("{", match.end())
         if opening < 0:
             return text[: match.start()]
@@ -118,7 +144,18 @@ def is_format_name(name: str) -> bool:
 
 
 def normalise(value: str) -> str:
-    return " ".join(str(value).split())
+    """A value as written, with line breaks (and the indentation after them)
+    folded to one space, so a multi-line value compares stably while the
+    spaces inside a one-line string literal still count."""
+    return re.sub(r"\s*\n\s*", " ", str(value).strip())
+
+
+def int_value(value: str) -> int | None:
+    """An integer literal (decimal or hex, with an optional type suffix)."""
+    match = re.fullmatch(r"(0x[0-9a-fA-F_]+|[0-9_]+)(?:[ui](?:8|16|32|64|128|size))?", value.strip())
+    if not match:
+        return None
+    return int(match.group(1).replace("_", ""), 0)
 
 
 def scan(root: pathlib.Path):
@@ -143,14 +180,13 @@ def scan(root: pathlib.Path):
     return constants, magics, sources
 
 
-def tag_max(text: str, prefix: str) -> int | None:
-    values = [
-        int(value)
-        for name, value in ((m.group(1), m.group(2)) for m in CONST.finditer(text))
-        if name.startswith(prefix) and value.strip().isdigit()
-        for value in [value.strip()]
-    ]
-    return max(values) if values else None
+def tag_set(text: str, prefix: str) -> dict[str, str]:
+    """Every constant named ``prefix*`` and its value as written."""
+    return {
+        m.group(1): normalise(m.group(2))
+        for m in CONST.finditer(text)
+        if m.group(1).startswith(prefix)
+    }
 
 
 def load(root: pathlib.Path) -> dict:
@@ -188,15 +224,36 @@ def check_source(root: pathlib.Path, registry: dict) -> list[str]:
             claimed_magics.add((item["file"], item["magic"]))
         for item in entry.get("tag_sets") or []:
             text = sources.get(item["file"])
-            highest = tag_max(text, item["prefix"]) if text is not None else None
-            if highest is None:
+            found = tag_set(text, item["prefix"]) if text is not None else {}
+            want = {name: int(value) for name, value in (item.get("tags") or {}).items()}
+            if not found:
                 problems.append(f"{label}: no {item['prefix']}* constants in {item['file']}")
-            elif highest != item["max"]:
-                problems.append(
-                    f"{label}: the highest {item['prefix']}* in {item['file']} is {highest}; "
-                    f"the registry says {item['max']}. A new tag is a format change: "
-                    "edit scripts/compat/formats.yaml in the same change"
-                )
+                continue
+            seen: dict[int, str] = {}
+            for name, written in sorted(found.items()):
+                value = int_value(written)
+                if value is None:
+                    problems.append(
+                        f"{item['file']}: {name} = {written} is not an integer literal; a tag must "
+                        "be written as one, so this check can compare it"
+                    )
+                    continue
+                if value in seen:
+                    problems.append(f"{item['file']}: {name} and {seen[value]} are both tag {value}")
+                seen[value] = name
+                if name not in want:
+                    problems.append(
+                        f"{item['file']}: {name} = {written} is not in the registry's "
+                        f"{item['prefix']}* set. A new tag is a format change: edit "
+                        "scripts/compat/formats.yaml in the same change"
+                    )
+                elif want[name] != value:
+                    problems.append(
+                        f"{item['file']}: {name} is {value}; the registry says {want[name]}. A tag is "
+                        "never renumbered (ddia-encoding-evolution rule 1)"
+                    )
+            for name in sorted(set(want) - set(found)):
+                problems.append(f"{label}: {name} is in the registry but not in {item['file']}")
         for fixture in entry.get("fixtures") or []:
             if not (root / fixture).exists():
                 problems.append(f"{label}: fixture {fixture} does not exist")
@@ -206,6 +263,12 @@ def check_source(root: pathlib.Path, registry: dict) -> list[str]:
     for item in registry.get("not_formats") or []:
         if not item.get("why"):
             problems.append(f"not_formats {item.get('name')}: needs a why")
+        if (item["file"], item["name"]) in claimed_constants:
+            problems.append(
+                f"not_formats {item['name']} in {item['file']}: listed both as a format constant "
+                "and as not one"
+            )
+            continue
         claimed_constants[(item["file"], item["name"])] = None  # type: ignore[assignment]
 
     for key, value in sorted(constants.items()):
@@ -240,6 +303,13 @@ def render(registry: dict) -> str:
         "|---|---|---|---|---|---|",
     ]
     for entry in sorted(registry["formats"], key=lambda e: e["id"]):
+        values = {
+            item["name"]: normalise(item["value"]).strip('"')
+            for item in entry.get("constants") or []
+        }
+        entry = dict(entry, marker=re.sub(
+            r"\{([A-Z][A-Z0-9_]*)\}", lambda m: values.get(m.group(1), m.group(0)), entry["marker"]
+        ))
         lines.append(
             "| {id} | {name} | {marker} | {cls} | {status} | {at} |".format(
                 id=entry["id"],
