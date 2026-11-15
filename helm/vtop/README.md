@@ -17,6 +17,7 @@ one fate. Default: 3 replicas — the smallest quorum that survives one failure.
 | PodDisruptionBudget | `maxUnavailable: 1` — quorum protection for voluntary disruption. |
 | NetworkPolicy (optional) | Default-deny with the topology's exact allowances. |
 | ServiceMonitor (optional) | Requires the Prometheus Operator CRDs; render fails clearly without them. |
+| PrometheusRule (optional) | The engine's alert rules from `files/vtop-rules.yaml` (a CI-checked copy of `observability/prometheus/vtop-rules.yaml`), behind `metrics.prometheusRule.enabled`; same CRD requirement. |
 
 ## Deployment mode: co-located, or separated tiers (#287)
 

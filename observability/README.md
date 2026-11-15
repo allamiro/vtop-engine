@@ -105,26 +105,10 @@ GET /readyz    readiness
 A failed multipart upload keeps its session and completed parts so the replay
 resumes it (#668). They are billed storage until the upload completes or is
 aborted, so watch that kept sessions are resumed or swept rather than piling
-up. An example rule:
-
-```yaml
-groups:
-  - name: vtop-multipart
-    rules:
-      # Sessions kept after failures, with none resumed and none swept, for
-      # longer than the abandon window (24 h by default): replays are not
-      # resuming them and the sweep is not reaching them. Check the engine's
-      # multipart_sweep_failed events and the bucket's lifecycle rule.
-      - alert: VtopMultipartSessionsPilingUp
-        expr: |
-          sum(increase(vtop_multipart_sessions_total{outcome="kept_after_failure"}[26h])) > 0
-          and on()
-          sum(increase(vtop_multipart_sessions_total{outcome=~"resumed|swept"}[26h])) == 0
-        for: 1h
-        labels: { severity: warning }
-        annotations:
-          summary: Incomplete multipart uploads are kept and never resumed or swept
-```
+up: the shipped rule `VtopMultipartSessionsPiling` (see
+[Alert rules](#alert-rules)) fires when a session was kept 30 to 36 hours ago, past the 24 h abandon window
+and the 6 h sweep interval, and none was resumed and none swept for 36 hours.
+A session the sweep is not yet due to abort does not raise it.
 
 ### Retention loss
 
@@ -355,6 +339,32 @@ produces.
   identical to a broken scrape. An incident counter must read `0`, not blank.
 - **Telemetry can never break the data path.** A bad `VTOP_METRICS_ADDR`, a port
   clash, or a registry failure logs an error and the engine keeps archiving.
+
+## Alert rules
+
+[`prometheus/vtop-rules.yaml`](prometheus/vtop-rules.yaml) is the engine's
+Prometheus rule set (#720): verification failures, no commits while data is
+waiting, a replay-rate spike, Kafka lag growth (from kafka-exporter), size-only
+verification, failed Object Lock checks, retention loss, refused replays, a
+state store refusing recovery's replay decisions, and piling multipart
+sessions. Each alert has a firing and a quiet promtool unit
+test in [`prometheus/tests/`](prometheus/tests/vtop-rules.test.yaml) and a
+`runbook_url` to its section of
+[`docs/operate/runbooks.md`](../docs/operate/runbooks.md); the objectives they
+protect are in [`docs/operate/slos.md`](../docs/operate/slos.md). The Helm
+chart ships a copy as a `PrometheusRule` (`metrics.prometheusRule.enabled`),
+kept identical by CI.
+
+```bash
+docker run --rm --network none -v "$PWD/observability/prometheus:/rules:ro" -w /rules \
+  --entrypoint promtool prom/prometheus:v3.15.1 test rules tests/vtop-rules.test.yaml
+python3 scripts/check-alert-runbooks.py   # every alert: a runbook section and both tests
+```
+
+The lab does not run Prometheus or Alertmanager; Mimir stores the metrics and
+Grafana evaluates its own provisioned rules (see the scope list below). The
+two sets are described side by side on
+[Metrics and alerts](../docs/operate/monitoring.md#alerts).
 
 ## The audit trail
 
