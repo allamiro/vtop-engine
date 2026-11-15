@@ -5,6 +5,7 @@
 //! tests; [`commands`] wires it to the CLI.
 
 pub mod audit;
+mod bucket_versioning;
 pub mod commands;
 pub mod coverage;
 pub mod engine;
