@@ -46,6 +46,7 @@ pub fn sample_record(id: &str) -> BatchRecord {
         manifest_version_id: None,
         object_size_bytes: None,
         verification_class: None,
+        sealed_at: None,
         record_count: None,
         error_message: None,
         owner: None,
@@ -84,6 +85,7 @@ pub async fn run_all(store: &dyn StateStore) {
     committed_kafka_offsets_are_the_newest_row_of_each_partition_and_group(store).await;
     claims_respect_live_leases_and_take_over_expired_ones(store).await;
     committed_cursors_by_file_answer_each_file_that_lived_at_a_path(store).await;
+    the_seal_instant_is_written_with_the_row_and_read_back_by_every_read(store).await;
     // Last: it claims every claimable row on the shared store.
     a_superseded_row_is_terminal_and_never_recovery_work(store).await;
 }
@@ -468,6 +470,72 @@ async fn a_retired_row_keeps_its_class_and_is_never_recovery_work(store: &dyn St
         incomplete.iter().all(|row| row.batch_id != id),
         "a retired row is never recovery work: {incomplete:?}"
     );
+}
+
+/// #626: the instant a batch's contents were fixed is written with the row's
+/// first write and read back by every read that returns whole rows - the
+/// claim recovery makes above all, which is where a replay takes it from. A
+/// row written without one (every release before #626, which never names
+/// the column) reads `None`, and a later transition leaves the instant as
+/// it was.
+async fn the_seal_instant_is_written_with_the_row_and_read_back_by_every_read(
+    store: &dyn StateStore,
+) {
+    const SEALED: &str = "2026-03-04T05:59:59.900+00:00";
+    const NOW: &str = "2090-01-01T00:00:00+00:00";
+    const LEASE: &str = "2090-01-01T00:05:00+00:00";
+    let mut sealed = sample_record("sealed-at-recorded");
+    sealed.sealed_at = Some(SEALED.into());
+    store.save_batch_state(&sealed).await.unwrap();
+    store
+        .save_batch_state(&sample_record("sealed-at-legacy"))
+        .await
+        .unwrap();
+    for id in ["sealed-at-recorded", "sealed-at-legacy"] {
+        for st in &LEGAL_WALK[..3] {
+            store
+                .update_batch_state(id, *st, &BatchPatch::default())
+                .await
+                .unwrap();
+        }
+    }
+    let expect = |id: &str| (id == "sealed-at-recorded").then(|| SEALED.to_string());
+    for id in ["sealed-at-recorded", "sealed-at-legacy"] {
+        let got = store.get_batch(id).await.unwrap().unwrap();
+        assert_eq!(got.sealed_at, expect(id), "get_batch {id}");
+    }
+    let all = store.list_batches().await.unwrap();
+    let incomplete = store.list_incomplete_batches().await.unwrap();
+    for rows in [&all, &incomplete] {
+        for id in ["sealed-at-recorded", "sealed-at-legacy"] {
+            let row = rows
+                .iter()
+                .find(|row| row.batch_id == id)
+                .unwrap_or_else(|| panic!("{id} missing: {rows:?}"));
+            assert_eq!(row.sealed_at, expect(id), "{id}");
+        }
+    }
+    store
+        .mark_failed("sealed-at-recorded", "upload failed")
+        .await
+        .unwrap();
+    let failed = store.list_failed_batches().await.unwrap();
+    let row = failed
+        .iter()
+        .find(|row| row.batch_id == "sealed-at-recorded")
+        .unwrap();
+    assert_eq!(row.sealed_at.as_deref(), Some(SEALED), "kept across FAILED");
+    let claimed = store
+        .claim_incomplete_batches("engine-sealed-at", NOW, LEASE)
+        .await
+        .unwrap();
+    for id in ["sealed-at-recorded", "sealed-at-legacy"] {
+        let row = claimed
+            .iter()
+            .find(|row| row.batch_id == id)
+            .unwrap_or_else(|| panic!("the claim did not return {id}: {claimed:?}"));
+        assert_eq!(row.sealed_at, expect(id), "claimed {id}");
+    }
 }
 
 /// Rows for [`every_read_path_returns_whole_rows`]: one VERIFIED with a class,

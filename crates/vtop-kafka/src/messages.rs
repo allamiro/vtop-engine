@@ -15,6 +15,34 @@
 
 use crate::wire::{Decoder, Encoder, WireError};
 
+/// What a refusal of an unserved api key says the gateway does serve.
+pub const SERVED_APIS: &str = "Produce, Fetch, ListOffsets, Metadata, ApiVersions, \
+     InitProducerId, and the group protocol: FindCoordinator, JoinGroup, SyncGroup, Heartbeat, \
+     LeaveGroup, OffsetCommit, OffsetFetch";
+
+/// The topic and config administration api keys this gateway does not
+/// serve, by name (#596), for the gateway's log line. A stock tool checks
+/// ApiVersions first and refuses on its own side ("The node does not support
+/// CREATE_TOPICS"), so only a client that skips or ignores ApiVersions sends
+/// one. A client's key is never a metric label. A VTOP topic is created and
+/// configured on the metadata plane instead.
+pub const UNSERVED_API_NAMES: [(i16, &str); 6] = [
+    (19, "CreateTopics"),
+    (20, "DeleteTopics"),
+    (32, "DescribeConfigs"),
+    (33, "AlterConfigs"),
+    (37, "CreatePartitions"),
+    (44, "IncrementalAlterConfigs"),
+];
+
+/// The name of an unserved api key this gateway knows by name, if any.
+pub fn unserved_api_name(key: i16) -> Option<&'static str> {
+    UNSERVED_API_NAMES
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, name)| *name)
+}
+
 /// The phase-1 API surface. Everything outside it is refused by name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiKey {
@@ -356,12 +384,7 @@ impl RequestHeader {
                     client_id: None,
                 },
                 code: ErrorCode::UnsupportedVersion,
-                reason: format!(
-                    "api key {api_key} is not served by this gateway (Produce, Fetch, \
-                     ListOffsets, Metadata, ApiVersions, InitProducerId, and the group protocol: \
-                     FindCoordinator, JoinGroup, SyncGroup, Heartbeat, LeaveGroup, OffsetCommit, \
-                     OffsetFetch)"
-                ),
+                reason: format!("api key {api_key} is not served by this gateway ({SERVED_APIS})"),
             });
         };
 

@@ -229,6 +229,7 @@ jobs:
               # Executable CI test code (#291), linted like the rest.
               - 'scripts/upgrade-compat.sh'
               - 'scripts/manifest-compat.sh'
+              - 'scripts/ledger-compat.sh'
               # The live-chaos harness is executable shell that gates every
               # distributed-systems claim this project makes, and it was
               # unlinted: a change to lib.sh — sourced by every scenario —
@@ -341,6 +342,7 @@ jobs:
               - '.cargo/**'
               - 'rust-toolchain*'
               - 'scripts/manifest-compat.sh'
+              - 'scripts/ledger-compat.sh'
               - '.github/workflows/ci.yml'
   build-and-test:
     name: fmt + clippy + test + build
@@ -1125,7 +1127,7 @@ jobs:
           docker run --rm -v "$PWD:/mnt" -w /mnt \
             koalaman/shellcheck:v0.11.0 docker/*.sh scripts/release-notes.sh \
             scripts/k8s-smoke.sh scripts/e2e-smoke.sh scripts/upgrade-compat.sh \
-            scripts/manifest-compat.sh \
+            scripts/manifest-compat.sh scripts/ledger-compat.sh \
             scripts/traffic-snapshot.sh scripts/test-progress.sh \
             scripts/check-naming.sh scripts/check-egress-claims.sh
 
@@ -1660,12 +1662,25 @@ jobs:
               scripts/manifest-compat.sh target/debug/vtopctl "$tag" \
                 "released/$tag/vtop-engine-$v-x86_64-unknown-linux-gnu/vtopctl" "$expect"
           done
+      # The previous release (N-1, the only one that may share a ledger with
+      # HEAD, #743) on a SQLite ledger HEAD opened, wrote and pruned (#626):
+      # it must keep archiving and auditing, and ignore the sealed_at column
+      # and the digests' sealed_at. The release binaries have no `postgres`
+      # feature, so the PostgreSQL half runs where one is built from the tag.
+      - name: The previous release keeps working on a ledger HEAD opened
+        run: |
+          set -euo pipefail
+          tag="$(printf '%s\n' ${{ steps.tags.outputs.list }} | sort -V | tail -n 1)"
+          v="${tag#v}"
+          LEDGER_COMPAT_KEEP=1 LEDGER_COMPAT_WORKDIR="$GITHUB_WORKSPACE/manifest-compat-ledger-$tag" \
+            scripts/ledger-compat.sh target/debug/vtopctl "$tag" \
+              "released/$tag/vtop-engine-$v-x86_64-unknown-linux-gnu/vtopctl"
       - name: Upload the logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: manifest-compat-logs
-          path: manifest-compat-v*/logs
+          path: manifest-compat-*/logs
           if-no-files-found: ignore
           retention-days: 7
 
