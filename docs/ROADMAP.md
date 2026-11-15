@@ -942,7 +942,8 @@ notes:
 - **Rows written before this release** carry no seal instant. A replay of one
   of them is filed under the hour it is replayed in, as before, so it may
   still write a second object once.
-- **A replay over a file or spool that grew is rebuilt as first cut.** Its
+- **A replay over a file, spool or Kafka partition that grew is rebuilt as
+  first cut.** Its
   re-read stops at the failed window's recorded end, the window is sealed
   there (not by a threshold, its age or a forced flush), and the bytes after
   it are the next window. A range over 4x the current batching limits is not
@@ -950,8 +951,9 @@ notes:
   before (`refused`); a stop inside a rebuild drops the partial window, which
   the next start reads again (`dropped_at_stop`). The new trait method
   `SourceAdapter::bound_replays` defaults to bounding nothing.
-- **Not changed yet:** a Kafka replay over a partition that grew; a range
-  whose row a power loss rolled back has nothing to rebuild from.
+- **Not changed:** a range whose row a power loss rolled back has nothing to
+  rebuild from, and a Kafka range whose records retention or compaction
+  removed is read on from where the log starts (`refused`).
 
 The theme is **the gateway at the speed its durability allows**: wire the
 broker's group commit into the gateway path and close the compatibility

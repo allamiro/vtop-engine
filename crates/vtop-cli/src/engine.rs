@@ -3044,6 +3044,19 @@ impl Engine {
         let mut discontinued: Vec<PendingBuffer> = Vec::new();
         // Rebuilt windows a read carried past their recorded end (#626).
         let mut overshot: Vec<(ProgressMarker, i128)> = Vec::new();
+        // Rebuilt windows whose buffer went over the cap while held (#626,
+        // review of PR 3): where each starts and its recorded end. A Kafka
+        // row records no uncompressed size, so the cap `bound_windows`
+        // applies before the hold sees only its record count; this is where
+        // its bytes are known.
+        let mut too_big: Vec<(ProgressMarker, i128)> = Vec::new();
+        let rebuild_cap = {
+            let cap = crate::rebuild::REBUILD_CAP_FACTOR as usize;
+            (
+                cap.saturating_mul(self.config.batching.max_records),
+                cap.saturating_mul(self.config.batching.max_bytes),
+            )
+        };
         let read_started = Instant::now();
         match adapter
             .read_all_batch_candidates(
@@ -3200,6 +3213,18 @@ impl Engine {
                         buf.append(read);
                         if held.is_some() && buf.rebuild_end.is_none() {
                             overshot.push((window_start, held.unwrap_or_default()));
+                        } else if let (Some(end), Some(first)) =
+                            (buf.rebuild_end, buf.batcher.first_marker())
+                        {
+                            if buf.rebuilding()
+                                && (buf.batcher.len() > rebuild_cap.0
+                                    || buf.batcher.byte_len() > rebuild_cap.1)
+                            {
+                                // Released: sealed by the thresholds from
+                                // here, so the memory it holds stays bounded.
+                                too_big.push((first.clone(), end));
+                                buf.rebuild_end = None;
+                            }
                         }
                     }
                 }
@@ -3216,6 +3241,7 @@ impl Engine {
             }
         }
         self.settle_refused_cuts(adapter, source_type, overshot);
+        self.release_too_large(source_type, too_big);
 
         let read_phase_ms = cycle_started.elapsed().as_millis() as u64;
         // Logged once per cycle per source type. The ratio that matters is
@@ -3706,9 +3732,21 @@ impl Engine {
         } else if let Some(spools) = any.downcast_mut::<SyslogSpoolSource>() {
             refused.extend(spools.take_refused_cuts());
         }
-        let mut gone: Vec<(String, u64, u64, String)> = refused
+        #[cfg(feature = "kafka")]
+        if let Some(kafka) = adapter.as_any_mut().downcast_mut::<KafkaSource>() {
+            refused.extend(kafka.take_refused_cuts());
+        }
+        let mut gone: Vec<(String, Option<i32>, u64, u64, String)> = refused
             .into_iter()
-            .map(|cut| (cut.path, cut.start, cut.end, cut.reason.to_owned()))
+            .map(|cut| {
+                (
+                    cut.path,
+                    cut.partition,
+                    cut.start,
+                    cut.end,
+                    cut.reason.to_owned(),
+                )
+            })
             .collect();
         for (start, end) in overshot {
             let source = match &start {
@@ -3721,18 +3759,28 @@ impl Engine {
             let to = u64::try_from(end).unwrap_or_default();
             gone.push((
                 source,
+                crate::rebuild::partition_of(&start),
                 from,
                 to,
                 "the source read past the recorded end".to_owned(),
             ));
         }
-        for (source, start, end, why) in gone {
+        for (source, partition, start, end, why) in gone {
             for buf in self.pending.values_mut() {
-                if buf.source.source_name == source && buf.rebuild_end == Some(i128::from(end)) {
+                // A topic's partitions are buffered apart and can rebuild
+                // windows over the same offsets: release only this one's.
+                let unit = buf
+                    .latest_end
+                    .as_ref()
+                    .and_then(crate::rebuild::partition_of);
+                if buf.source.source_name == source
+                    && unit == partition
+                    && buf.rebuild_end == Some(i128::from(end))
+                {
                     buf.rebuild_end = None;
                 }
             }
-            if let Some(window) = self.recorded.unbind(&source, start, end) {
+            if let Some(window) = self.recorded.unbind(&source, partition, start, end) {
                 let (tenant, format) = self.replay_labels(source_type, &source);
                 let suppressed = self.key_notices.admit("replay_bound_refused", &source);
                 crate::rebuild::note_refused(
@@ -3740,6 +3788,40 @@ impl Engine {
                     &why,
                     [tenant.as_str(), source_type.as_str(), format],
                     suppressed,
+                );
+            }
+        }
+    }
+
+    /// Stop holding the rebuilt windows whose buffer went over
+    /// [`crate::rebuild::REBUILD_CAP_FACTOR`] times the current limits while
+    /// held (review of #626 PR 3), each counted `too_large` as the windows
+    /// `bound_windows` does not offer are.
+    fn release_too_large(
+        &mut self,
+        source_type: &SourceType,
+        windows: Vec<(ProgressMarker, i128)>,
+    ) {
+        let limits = (
+            self.config.batching.max_records,
+            self.config.batching.max_bytes,
+        );
+        for (start, end) in windows {
+            let source = match &start {
+                ProgressMarker::Kafka { topic, .. } => topic.clone(),
+                ProgressMarker::File { path, .. } | ProgressMarker::SyslogSpool { path, .. } => {
+                    path.clone()
+                }
+            };
+            let from = u64::try_from(start_position(&start)).unwrap_or_default();
+            let to = u64::try_from(end).unwrap_or_default();
+            let partition = crate::rebuild::partition_of(&start);
+            if let Some(window) = self.recorded.unbind(&source, partition, from, to) {
+                let (tenant, format) = self.replay_labels(source_type, &source);
+                crate::rebuild::note_too_large(
+                    &window,
+                    limits,
+                    [tenant.as_str(), source_type.as_str(), format],
                 );
             }
         }
