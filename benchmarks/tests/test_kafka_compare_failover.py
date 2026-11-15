@@ -524,11 +524,11 @@ def test_readback_sentence_comes_from_the_rows():
 
 
 def test_footer_renders_unknown_host_memory():
-    from kafka_compare import failover_report
+    from kafka_compare import footer
 
     env = json.load(open(os.path.join(COMMITTED_RUN, "environment.json")))
     env["comparable"]["host_memory_bytes"] = ""
-    assert "logical CPUs, unknown)" in failover_report.footer_text(env)
+    assert footer.parse(footer.footer_text(env))["RAM"] == "unknown"
 
 
 def test_the_latency_caveat_is_derived_and_absent_for_a_run_with_the_fixed_producer():
