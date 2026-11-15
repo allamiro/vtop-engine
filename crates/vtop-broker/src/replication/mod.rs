@@ -209,6 +209,15 @@ pub struct InProcessFollower {
     /// Records a fence disputed but KEPT (#611): the epoch of that fence and
     /// the first offset in dispute. See [`KeptDispute`].
     kept_dispute: Mutex<Option<KeptDispute>>,
+    /// The newest mark a leader sent that passed the fencing check (#787).
+    /// [`Self::observe_hwm`] never shows a mark above local durability, so a
+    /// mark that arrives before the records under it (a fresh session sends
+    /// the current mark first, then the records the replica lacks) is shown
+    /// only up to what the replica held then. Each successful append shows
+    /// it again, through the same checks, so the records it covers become
+    /// visible without waiting for a new mark, which a quiet range never
+    /// sends.
+    last_mark: Mutex<Option<CommittedHwmUpdate>>,
     /// Whether the journal holds a leader lineage the appends have not yet
     /// caught up with (#640): the fast path that keeps a follower in steady
     /// state from taking the journal lock on every append.
@@ -347,6 +356,7 @@ impl InProcessFollower {
             online: AtomicBool::new(true),
             hold_fsync: AtomicBool::new(false),
             kept_dispute: Mutex::new(None),
+            last_mark: Mutex::new(None),
             lineage_following: AtomicBool::new(false),
             #[cfg(test)]
             before_dispute_install: Mutex::new(None),
@@ -2036,6 +2046,38 @@ impl InProcessFollower {
         &self,
         request: &ReplicaAppendRequest,
     ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
+        let applied = self.apply_append_unmarked(request);
+        if applied.is_ok() {
+            self.show_last_mark();
+        }
+        applied
+    }
+
+    /// Show the last mark a leader sent over records appended since it
+    /// arrived (#787). The leader could re-send that same mark at any moment
+    /// and this replica would apply it the same way: it goes through
+    /// [`Self::observe_hwm`] in full, so the fencing check refuses it once the
+    /// epoch has moved on, a kept dispute is settled first, and nothing is
+    /// shown above local durability.
+    fn show_last_mark(&self) {
+        let Some(update) = self
+            .last_mark
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        else {
+            return;
+        };
+        let shown = self.cluster_committed.get();
+        if update.committed_high_watermark > shown && self.local_committed_offset() > shown {
+            let _ = self.observe_hwm(&update);
+        }
+    }
+
+    fn apply_append_unmarked(
+        &self,
+        request: &ReplicaAppendRequest,
+    ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
         if !self.is_online() {
             return Err((
                 ErrorCode::Overloaded,
@@ -2213,13 +2255,24 @@ impl InProcessFollower {
         &self,
         requests: &[ReplicaAppendRequest],
     ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
+        let applied = self.apply_append_batch_unmarked(requests);
+        if applied.is_ok() {
+            self.show_last_mark();
+        }
+        applied
+    }
+
+    fn apply_append_batch_unmarked(
+        &self,
+        requests: &[ReplicaAppendRequest],
+    ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
         if requests.is_empty() {
             return Ok(ReplicaAppendResponse {
                 local_committed_offset: self.replication_status().0,
             });
         }
         if requests.len() == 1 {
-            return self.apply_append(&requests[0]);
+            return self.apply_append_unmarked(&requests[0]);
         }
         if !self.is_online() {
             return Err((
@@ -2420,6 +2473,21 @@ impl InProcessFollower {
         // kept records as committed and put them below a mark no truncation
         // may cross, wedging the replica.
         self.settle_kept_dispute(update.fencing_epoch, update.committed_high_watermark)?;
+        // Kept for the appends that follow (#787): the newest epoch's
+        // newest mark.
+        {
+            let mut last = self
+                .last_mark
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let newer = last.as_ref().is_none_or(|kept| {
+                (update.fencing_epoch, update.committed_high_watermark)
+                    > (kept.fencing_epoch, kept.committed_high_watermark)
+            });
+            if newer {
+                *last = Some(update.clone());
+            }
+        }
         #[cfg(test)]
         Self::run_test_hook(&self.after_mark_settle);
         // Never advertise above local durability.
