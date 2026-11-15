@@ -149,7 +149,7 @@ def _key_int(row: dict[str, str], column: str, line: int) -> int:
 def read_rows(csv_path: str) -> list[dict[str, str]]:
     if not os.path.isfile(csv_path):
         raise ReportRefused(f"no results CSV at {csv_path}")
-    with open(csv_path, newline="") as handle:
+    with open(csv_path, newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         if tuple(reader.fieldnames or ()) != COLUMNS:
             raise ReportRefused(
@@ -320,7 +320,7 @@ def load_run(run_dir: str) -> Run:
     env_path = os.path.join(run_dir, "environment.json")
     if not os.path.isfile(env_path):
         raise ReportRefused(f"no environment.json in {run_dir}")
-    with open(env_path) as handle:
+    with open(env_path, encoding="utf-8") as handle:
         try:
             environment = json.load(handle)
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
