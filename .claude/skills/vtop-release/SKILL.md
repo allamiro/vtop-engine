@@ -27,7 +27,7 @@ Ground truth: `.github/workflows/release.yml` (a push of a `v*` tag publishes), 
 
 ## 1. The bump PR
 
-Branch from `origin/main` (`release/vX.Y.Z-bump` was used for 0.8.0, `release/0.7.0` for 0.7.0). Title `release: bump the workspace to X.Y.Z`. Four files, plus the citation file:
+Branch from `origin/main` (`release/vX.Y.Z-bump` was used for 0.8.0, `release/0.7.0` for 0.7.0). Title `release: bump the workspace to X.Y.Z`. Four files, plus the citation file, and on a minor release `SECURITY.md`:
 
 | File | Change |
 |---|---|
@@ -35,6 +35,7 @@ Branch from `origin/main` (`release/vX.Y.Z-bump` was used for 0.8.0, `release/0.
 | `Cargo.lock` | `cargo update --workspace`. The diff must be exactly the **twelve** `vtop-*` entries and no third-party package; if anything else moved, revert it. Then `cargo check --workspace --locked`. |
 | `helm/vtop/Chart.yaml` | `appVersion: "X.Y.Z"` (it must track the workspace version; GHCR tags follow it). The chart's own `version` follows its contract, not the app: **patch** bump when no template or values changed since the last tag, **minor** when they did (a values-contract change). Check with `git diff vPREV..origin/main --stat -- helm/vtop/templates helm/vtop/values.yaml helm/vtop/ci`. Add the matching comment line above `version:` (0.5.1 for 0.8.0: "no template or values change — the bump carries appVersion 0.8.0"). Nothing in CI ties `appVersion` to `Cargo.toml`, so review it by eye. |
 | `docs/ROADMAP.md` | A section for the release (below), and the forward section renamed to the next release. |
+| `SECURITY.md` | **Minor releases only:** the "Supported versions" row becomes `X.Y.x` (only the latest minor receives security fixes). `scripts/check-security-policy.py` fails the docs build until it matches `Cargo.toml`. |
 | `CITATION.cff` | `version` and `date-released` (the day the tag is pushed, as `YYYY-MM-DD`; v0.8.0 is `2026-11-12`). If the tag goes out on another day, fix the date in a follow-up PR; the tag does not move. |
 
 ### The ROADMAP section
