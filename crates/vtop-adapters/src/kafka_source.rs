@@ -56,6 +56,12 @@ fn require_password_env(
 /// that will not answer has not lost records, it has declined to say.
 const WATERMARK_TIMEOUT_SECONDS: u64 = 5;
 
+/// The time one pass may spend, in all, asking the low watermarks of the
+/// partitions that have a replay cut (#626, review of PR 3): one query's
+/// timeout, not one per partition. The partitions not reached are asked
+/// first by the next pass.
+const CUT_CHECK_BUDGET: Duration = Duration::from_secs(WATERMARK_TIMEOUT_SECONDS);
+
 /// How often the retention check runs. Retention moves on the scale of hours;
 /// a minute is free and keeps a broker round trip off the per-pass path.
 const RETENTION_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -135,6 +141,43 @@ fn expired_cuts(
         })
         .map(|(&end, &start)| (end, start))
         .collect()
+}
+
+/// One round of low-watermark queries over `keys` (#626, review of PR 3),
+/// starting at `start_at` and wrapping, under ONE deadline `budget` away:
+/// each query gets `per_query` or what is left of the round, whichever is
+/// less, and the round stops when the deadline passes. So partitions whose
+/// leaders do not answer cost the pass at most `budget`, however many there
+/// are, and the poll that follows is not held up behind them. Returns the
+/// answers and where the next round starts (after the last key asked), so
+/// every key is asked in turn.
+fn watermark_round<K: Clone>(
+    keys: &[K],
+    start_at: usize,
+    budget: Duration,
+    per_query: Duration,
+    mut query: impl FnMut(&K, Duration) -> Option<i64>,
+) -> (Vec<(K, i64)>, usize) {
+    let n = keys.len();
+    if n == 0 {
+        return (Vec::new(), 0);
+    }
+    let deadline = Instant::now() + budget;
+    let mut found = Vec::new();
+    let mut asked = 0;
+    while asked < n {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let key = &keys[(start_at + asked) % n];
+        asked += 1;
+        let timeout = per_query.min(deadline.saturating_duration_since(now));
+        if let Some(low) = query(key, timeout) {
+            found.push((key.clone(), low));
+        }
+    }
+    (found, (start_at + asked) % n)
 }
 
 fn retention_gap(desired_offset: Option<i64>, low_watermark: i64) -> Option<u64> {
@@ -957,6 +1000,10 @@ pub struct KafkaSource {
     cuts: HashMap<(String, i32), BTreeMap<i64, i64>>,
     /// Windows a read could not rebuild as cut, for the engine to count.
     refused_cuts: Vec<crate::file_source::RefusedCut>,
+    /// Where the next round of cut watermark checks starts, in the sorted
+    /// list of partitions with a cut, so a round cut short by its budget is
+    /// continued rather than restarted (#626).
+    cut_check_cursor: usize,
     /// Which assigned partitions have stopped delivering, and since when
     /// (#623).
     ///
@@ -1051,6 +1098,7 @@ impl KafkaSource {
             paused: Vec::new(),
             cuts: HashMap::new(),
             refused_cuts: Vec::new(),
+            cut_check_cursor: 0,
             liveness: PartitionLiveness::default(),
             stall_reassigns: 0,
             partitions: PartitionCache::default(),
@@ -1234,20 +1282,28 @@ impl KafkaSource {
         let Some(consumer) = self.consumer.as_ref() else {
             return;
         };
-        let keys: Vec<(String, i32)> = self
+        let mut keys: Vec<(String, i32)> = self
             .cuts
             .keys()
             .filter(|key| self.assigned.contains(key))
             .cloned()
             .collect();
-        for key in keys {
-            let Ok((low_watermark, _)) = consumer.fetch_watermarks(
-                &key.0,
-                key.1,
-                std::time::Duration::from_secs(WATERMARK_TIMEOUT_SECONDS),
-            ) else {
-                continue;
-            };
+        // A stable order, so the rotation reaches every partition in turn.
+        keys.sort();
+        let (answers, next_round) = watermark_round(
+            &keys,
+            self.cut_check_cursor,
+            CUT_CHECK_BUDGET,
+            Duration::from_secs(WATERMARK_TIMEOUT_SECONDS),
+            |key, timeout| {
+                consumer
+                    .fetch_watermarks(&key.0, key.1, timeout)
+                    .ok()
+                    .map(|(low, _)| low)
+            },
+        );
+        self.cut_check_cursor = next_round;
+        for (key, low_watermark) in answers {
             let next = self.delivered.get(&key).copied();
             let Some(cuts) = self.cuts.get_mut(&key) else {
                 continue;
@@ -5201,6 +5257,55 @@ mod tests {
     /// the log no longer holds is refused from the low watermark alone, so an
     /// idle partition does not hold it for ever. A cut whose remaining range
     /// is still held, or that the read has passed, is left alone.
+    /// Review of #626 PR 3: partitions whose leaders do not answer cost a
+    /// pass at most the round's budget, however many there are, so the poll
+    /// of the healthy partitions that follows is not held up behind them; and
+    /// the rotation reaches every partition, the healthy one included, in a
+    /// few rounds. Five of six queries stall for the whole timeout they are
+    /// given.
+    #[test]
+    fn a_round_of_stalled_watermark_queries_is_bounded_and_rotates() {
+        let keys: Vec<(String, i32)> = (0..6).map(|p| ("t".to_owned(), p)).collect();
+        let per_query = Duration::from_millis(200);
+        let budget = Duration::from_millis(250);
+        let stalled = |key: &(String, i32), timeout: Duration| {
+            if key.1 == 5 {
+                Some(7)
+            } else {
+                std::thread::sleep(timeout);
+                None
+            }
+        };
+        let started = Instant::now();
+        let (found, next) = watermark_round(&keys, 0, budget, per_query, stalled);
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(500),
+            "the round stops at its budget, not at 5 x the query timeout: {took:?}"
+        );
+        assert!(found.is_empty());
+        assert!(
+            next > 0,
+            "the next round goes on from where this one stopped"
+        );
+
+        // Rounds continue where the last stopped, so the healthy partition is
+        // asked within a few rounds, each still bounded.
+        let mut at = next;
+        let mut healthy = None;
+        for _ in 0..4 {
+            let started = Instant::now();
+            let (found, next) = watermark_round(&keys, at, budget, per_query, stalled);
+            assert!(started.elapsed() < Duration::from_millis(500));
+            at = next;
+            if let Some(answer) = found.into_iter().find(|(k, _)| k.1 == 5) {
+                healthy = Some(answer.1);
+                break;
+            }
+        }
+        assert_eq!(healthy, Some(7), "every partition is asked in turn");
+    }
+
     #[test]
     fn expired_cuts_are_found_from_the_low_watermark() {
         let cuts: BTreeMap<i64, i64> = [(19, 0), (39, 20)].into_iter().collect();
