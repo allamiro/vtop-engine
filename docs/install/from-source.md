@@ -117,7 +117,7 @@ request; the workflow is [`.github/workflows/ci.yml`](../../.github/workflows/ci
 |---|---|
 | `Library not loaded: .../libsasl2.3.dylib` or `libssl.3.dylib` (macOS) | A v0.8.0 or earlier binary. Run `brew install openssl@3 cyrus-sasl`, or build from source. |
 | `error while loading shared libraries: libsasl2.so.3` or `libssl.so.3` (Linux) | A v0.8.0 or earlier binary. Install the run-time packages listed in [binaries.md](binaries.md#run-time-libraries). |
-| ``version `GLIBC_2.38' not found`` (Linux) | A release archive of v0.8.0 to v0.10.0 on a host with glibc older than 2.39. Use a later release (see [binaries.md](binaries.md#supported-platforms)), or the container image. |
+| ``version `GLIBC_2.38' not found`` (Linux) | A release archive of v0.8.0 to v0.10.0 on a host with glibc older than 2.39. Use v0.10.1 or later (see [binaries.md](binaries.md#supported-platforms)), or the container image. |
 | `Can't locate FindBin.pm` or `IPC/Cmd.pm` during the build | The OpenSSL build needs those Perl modules. Install `perl-core` (RHEL family, Fedora) or `perl` (Debian/Ubuntu). |
 | `failed to run custom build command for rdkafka-sys` mentioning `cmake` | Install CMake (see [Native prerequisites](#native-prerequisites)). |
 | `fatal error: curl/curl.h: No such file or directory` (Linux) | Install `libcurl4-openssl-dev` or `libcurl-devel` (header only; see above). |
