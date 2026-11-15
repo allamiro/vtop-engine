@@ -116,6 +116,32 @@ fn batch_traces(requests: &[&Received]) -> std::collections::HashMap<String, Str
     traced
 }
 
+/// Every span in the exports, whatever its name.
+fn span_count(requests: &[&Received]) -> usize {
+    use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+    use prost::Message;
+    requests
+        .iter()
+        .map(|r| {
+            ExportTraceServiceRequest::decode(r.body.as_slice())
+                .unwrap()
+                .resource_spans
+                .iter()
+                .flat_map(|rs| &rs.scope_spans)
+                .map(|ss| ss.spans.len())
+                .sum::<usize>()
+        })
+        .sum()
+}
+
+/// The number in the child's `OpenTelemetry trace flush: flushed N spans`.
+fn flushed_spans(log: &str) -> Option<usize> {
+    log.lines().find_map(|line| {
+        let (_, rest) = line.split_once("OpenTelemetry trace flush: flushed ")?;
+        rest.split_whitespace().next()?.parse().ok()
+    })
+}
+
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
@@ -293,6 +319,28 @@ async fn export_on_sends_traces_and_metrics_and_says_so() {
             "record content was exported"
         );
     }
+    // Three counts, checked in the order the spans travel, so a failure names
+    // the stage that lost one (#798): the engine committed two batches; the
+    // collector decoded at least what the child's shutdown flush says it
+    // sent; and the two batch spans are among them.
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(
+        stdout.matches("committed=true").count(),
+        2,
+        "the engine did not commit two batches: {stdout}; vtopctl said: {log}"
+    );
+    // At least, not exactly: the flush line counts only what the shutdown
+    // flush sent, and a scheduled export (OTEL_BSP_SCHEDULE_DELAY, 5 s after
+    // the first span) on a slow runner sends spans before it that the
+    // collector decodes but that line does not count.
+    let flushed = flushed_spans(&log);
+    let decoded = span_count(&traces);
+    assert!(
+        flushed.is_some_and(|n| n <= decoded),
+        "the child flushed {flushed:?} spans in the shutdown flush, the collector decoded \
+         {decoded} in {} trace requests; vtopctl said: {log}",
+        traces.len()
+    );
     // Each batch's log line carries ITS batch's trace id: the two batches
     // run together, and a line filed under the other's trace would pass a
     // check for "has a trace id" (review of #693).
@@ -300,7 +348,8 @@ async fn export_on_sends_traces_and_metrics_and_says_so() {
     assert_eq!(
         traced.len(),
         2,
-        "two batch spans expected: {traced:?}, in {} trace requests; vtopctl said: {log}",
+        "two batch spans expected: {traced:?} among {decoded} spans in {} trace requests; \
+         vtopctl said: {log}",
         traces.len()
     );
     let mut sealed = 0;
