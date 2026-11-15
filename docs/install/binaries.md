@@ -19,7 +19,7 @@ releases in that list are expected to work by the same symbol versions but
 are not run. Distributions built on musl instead of glibc, such as Alpine,
 are not supported; use the container image there.
 
-The Linux archives of v0.10.0 and earlier were built against glibc 2.39.
+The Linux archives of v0.8.0 to v0.10.0 were built on glibc 2.39 hosts.
 Their `vtopctl` needs glibc 2.39 and stops with
 ``version `GLIBC_2.38' not found`` on Debian 12, Ubuntu 22.04 and RHEL 8 or
 9; their `vtop-node` needs glibc 2.34. On those systems, use a later release.

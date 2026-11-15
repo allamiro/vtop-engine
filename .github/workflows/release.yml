@@ -244,8 +244,14 @@ jobs:
               # source (ssl-vendored, which needs perl); the -devel packages
               # are what librdkafka probes for, and the floor check below
               # fails if one of them ends up linked.
-              dnf -y -q install gcc gcc-c++ make cmake perl \
-                openssl-devel cyrus-sasl-devel libcurl-devel zlib-devel
+              # Retried: the only step that needs the distribution mirrors,
+              # and one hiccup would otherwise fail a 10 to 20 minute leg.
+              for i in 1 2 3; do
+                dnf -y -q install gcc gcc-c++ make cmake perl \
+                  openssl-devel cyrus-sasl-devel libcurl-devel zlib-devel && break
+                [ "$i" = 3 ] && { echo "dnf install failed 3 times" >&2; exit 1; }
+                sleep 15
+              done
               # Hand the root-owned outputs back to the runner user.
               trap "chown -R \"\$HOST_UID:\$HOST_GID\" /src/target /cargo/registry /cargo/git 2>/dev/null || true" EXIT
               export PATH="/cargo/bin:$PATH"
@@ -391,7 +397,12 @@ jobs:
           EXPECTED_VERSION: ${{ needs.verify.outputs.version }}
         run: |
           set -euo pipefail
-          dir="$RUNNER_TEMP/archive/$(basename "$ARCHIVE" .tar.gz)"
+          # Its own extraction, so this step does not depend on the floor
+          # check above having run.
+          x="$RUNNER_TEMP/smoke-archive"
+          rm -rf "$x" && mkdir -p "$x"
+          tar -xzf "$ARCHIVE" -C "$x"
+          dir="$x/$(basename "$ARCHIVE" .tar.gz)"
           smoke="$RUNNER_TEMP/smoke.sh"
           cat >"$smoke" <<'SMOKE'
           set -euo pipefail
