@@ -216,7 +216,7 @@ fn map_sqlx(e: sqlx::Error) -> VtopError {
     VtopError::State(e.to_string())
 }
 
-/// A `(path, inode, end_byte, file_size, content, tail)` row of a cursor
+/// A `(path, inode, end_byte, file_size, content, tail, mtime, ctime)` row of a cursor
 /// query. The inode is read as the JSON token and parsed here: `json_extract`
 /// turns a u64 above i64::MAX into a lossy REAL, and an unparseable value must
 /// read as "unknown", not as a wrong identity. So must a malformed stored
@@ -229,6 +229,7 @@ fn committed_cursor_of(r: &sqlx::sqlite::SqliteRow) -> Option<CommittedCursor> {
     let content: Option<String> = r.get("content");
     let mtime: Option<String> = r.get("mtime");
     let tail: Option<String> = r.get("tail");
+    let ctime: Option<String> = r.get("ctime");
     Some(CommittedCursor {
         path: path?,
         inode: inode.and_then(|i| i.parse().ok()),
@@ -237,6 +238,7 @@ fn committed_cursor_of(r: &sqlx::sqlite::SqliteRow) -> Option<CommittedCursor> {
         content_fingerprint: content.as_deref().and_then(parse_content_fingerprint),
         observed_mtime: mtime.filter(|m| !m.is_empty()),
         tail_fingerprint: tail.as_deref().and_then(parse_content_fingerprint),
+        observed_ctime: ctime.filter(|c| vtop_core::types::plausible_timestamp(c)),
     })
 }
 
@@ -700,14 +702,15 @@ impl StateStore for SqliteStateStore {
                         CAST(progress_end_json -> '$.content_fingerprint' AS TEXT) AS content, \
                         CAST(progress_end_json -> '$.tail_fingerprint' AS TEXT) AS tail, \
                         json_extract(progress_end_json, '$.mtime') AS mtime, \
+                        CAST(json_extract(progress_end_json, '$.ctime') AS TEXT) AS ctime, \
                         created_at, batch_id \
                  FROM batches WHERE state = ? AND source_type = ? \
              ), latest AS ( \
-                 SELECT path, inode, end_byte, file_size, content, tail, mtime, ROW_NUMBER() OVER ( \
+                 SELECT path, inode, end_byte, file_size, content, tail, mtime, ctime, ROW_NUMBER() OVER ( \
                             PARTITION BY path ORDER BY created_at DESC, batch_id DESC) AS rn \
                  FROM committed \
              ) \
-             SELECT path, inode, end_byte, file_size, content, tail, mtime FROM latest WHERE rn = 1",
+             SELECT path, inode, end_byte, file_size, content, tail, mtime, ctime FROM latest WHERE rn = 1",
         )
         .bind(BatchState::SourceCommitted.as_str())
         .bind(source_type.as_str())
@@ -733,15 +736,16 @@ impl StateStore for SqliteStateStore {
                         CAST(progress_end_json -> '$.content_fingerprint' AS TEXT) AS content, \
                         CAST(progress_end_json -> '$.tail_fingerprint' AS TEXT) AS tail, \
                         json_extract(progress_end_json, '$.mtime') AS mtime, \
+                        CAST(json_extract(progress_end_json, '$.ctime') AS TEXT) AS ctime, \
                         created_at, batch_id \
                  FROM batches WHERE state = ? AND source_type = ? \
              ), latest AS ( \
-                 SELECT path, inode, end_byte, file_size, content, tail, mtime, \
+                 SELECT path, inode, end_byte, file_size, content, tail, mtime, ctime, \
                         created_at, batch_id, ROW_NUMBER() OVER ( \
                             PARTITION BY path, inode ORDER BY created_at DESC, batch_id DESC) AS rn \
                  FROM committed \
              ) \
-             SELECT path, inode, end_byte, file_size, content, tail, mtime FROM latest \
+             SELECT path, inode, end_byte, file_size, content, tail, mtime, ctime FROM latest \
              WHERE rn = 1 ORDER BY path, created_at DESC, batch_id DESC",
         )
         .bind(BatchState::SourceCommitted.as_str())
