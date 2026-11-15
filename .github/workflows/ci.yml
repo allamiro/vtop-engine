@@ -185,7 +185,13 @@ jobs:
               # measurements they are drawn from, the output, and the README
               # whose prose quotes the same figures.
               - 'benchmarks/readme_charts.py'
+              # The tests this job runs: a change to a test alone must run
+              # it (tests/test_benchmark_charts_job.py checks the list).
               - 'benchmarks/tests/test_readme_charts.py'
+              - 'benchmarks/tests/test_kafka_compare_*.py'
+              - 'benchmarks/tests/test_benchmark_charts_job.py'
+              # The hand-written page that links the generated reports.
+              - 'docs/COMPARISON.md'
               - 'benchmarks/measurements/483-tcp-baseline/**'
               - 'benchmarks/measurements/663-policed-uplink/**'
               - 'docs/assets/readme/**'
@@ -2032,8 +2038,8 @@ jobs:
   # arm64, Linux arm64 and Linux x86_64, different files). regenerate.py puts
   # back the committed bytes of a PNG whose decoded pixels, size, mode and
   # metadata are unchanged, so `git diff` sees a PNG only when it looks
-  # different. The plotting stack is pinned exactly in requirements-report.txt
-  # and regenerate.py refuses any other, and refuses a DejaVu Sans from outside
+  # different. The plotting stack is pinned exactly, with hashes, in
+  # requirements-report.txt and regenerate.py refuses any other, and refuses a DejaVu Sans from outside
   # matplotlib's own bundled copy.
   benchmark-charts:
     name: benchmark charts (regenerate + no drift)
@@ -2043,16 +2049,34 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # The patch version is pinned: a floating "3.12" moves with the runner
+      # image, and the charts are checked byte for byte.
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.12"
+          python-version: "3.12.16"
+      # Hash-checked, as docs/requirements.txt is: pip refuses a file whose
+      # hash is not in the lock. The test runner has its own lock, compiled
+      # against the plotting stack's, so the stack's lock stays the stack.
       - name: Install the pinned plotting stack
-        run: pip install --disable-pip-version-check -r benchmarks/kafka_compare/requirements-report.txt pytest==9.2.0
-      # The benchmarks job runs without matplotlib, so the report tests that
-      # need it skip there; here they run.
+        run: |
+          pip install --disable-pip-version-check --require-hashes -r benchmarks/kafka_compare/requirements-report.txt
+          pip install --disable-pip-version-check --require-hashes -r benchmarks/kafka_compare/requirements-report-test.txt
+      # The benchmarks job runs without matplotlib or Pillow, so every test
+      # file that needs them skips there and runs here;
+      # tests/test_benchmark_charts_job.py fails when one is missing below.
+      # That check reads this file as text, so the run checks too: a test
+      # that skipped here for want of matplotlib or Pillow fails the job.
       - name: Report and drift-check tests, with matplotlib
         working-directory: benchmarks
-        run: python -m pytest tests/test_kafka_compare_report.py tests/test_kafka_compare_regenerate.py tests/test_readme_charts.py
+        # A step with no `shell:` runs as `bash -e {0}`, without pipefail:
+        # without this line the pipe into tee would hide a failing test.
+        run: |
+          set -o pipefail
+          python -m pytest -rs tests/test_kafka_compare_report.py tests/test_kafka_compare_regenerate.py tests/test_kafka_compare_failover.py tests/test_kafka_compare_footer.py tests/test_kafka_compare_colours.py tests/test_readme_charts.py tests/test_benchmark_charts_job.py | tee "$RUNNER_TEMP/chart-tests.log"
+          if grep -E "SKIPPED.*(matplotlib|PIL)" "$RUNNER_TEMP/chart-tests.log"; then
+            echo "::error::A chart test skipped for want of matplotlib or Pillow, in the one job that installs them."
+            exit 1
+          fi
       - name: Regenerate every chart and report and fail on drift
         run: |
           python3 benchmarks/kafka_compare/regenerate.py
@@ -2061,7 +2085,7 @@ jobs:
           # ignore the untracked file and pass.
           drift="$(git status --porcelain -- docs/benchmarks/)"
           if [ -n "$drift" ]; then
-            echo "::error::Committed benchmark charts or reports differ from what the committed CSVs produce. Run 'python3 -m pip install -r benchmarks/kafka_compare/requirements-report.txt && python3 benchmarks/kafka_compare/regenerate.py' and commit the result."
+            echo "::error::Committed benchmark charts or reports differ from what the committed CSVs produce. Run 'python3 -m pip install --require-hashes -r benchmarks/kafka_compare/requirements-report.txt && python3 benchmarks/kafka_compare/regenerate.py' and commit the result."
             echo "$drift"
             git diff --stat -- docs/benchmarks/
             exit 1
@@ -2071,7 +2095,7 @@ jobs:
           python3 benchmarks/readme_charts.py
           drift="$(git status --porcelain -- docs/assets/readme/)"
           if [ -n "$drift" ]; then
-            echo "::error::The README's charts differ from what the committed measurements produce. Run 'python3 -m pip install -r benchmarks/kafka_compare/requirements-report.txt && python3 benchmarks/readme_charts.py' and commit the result."
+            echo "::error::The README's charts differ from what the committed measurements produce. Run 'python3 -m pip install --require-hashes -r benchmarks/kafka_compare/requirements-report.txt && python3 benchmarks/readme_charts.py' and commit the result."
             echo "$drift"
             exit 1
           fi

@@ -153,6 +153,7 @@ nav:
       - How it works: concepts/how-it-works.md
       - Architecture: concepts/architecture.md
       - Security: concepts/security.md
+      - Security policy: security-policy.md
   - Getting started:
       - getting-started/index.md
       - Quick start (Docker lab): getting-started/quickstart.md
@@ -196,6 +197,7 @@ nav:
       - CLI (vtopctl): reference/cli.md
       - Archive path: reference/archive-path.md
       - Known limitations: reference/limitations.md
+      - Compatibility and upgrade policy: reference/compatibility.md
       - Data-safety register: reference/data-safety-register.md
       - Protocol (normative draft): VTOP_PROTOCOL_DRAFT.md
       - Design documents:
