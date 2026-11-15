@@ -2595,3 +2595,69 @@ async fn a_replay_whose_range_the_log_no_longer_holds_is_refused_and_read_on() {
     assert_eq!(mock.version_count(&orphan), 1, "the orphan is untouched");
     assert!(refused() > before, "the bound is counted refused");
 }
+
+/// Review of #626 PR 3, against a live broker: a rebuild that takes two
+/// passes (the limits were lowered to ten records) has read `[0, 9]` of the
+/// failed window `[0, 19]` when the log loses the rest of the range (records
+/// deleted below offset 20, as retention would), and nothing new is produced.
+/// The partition then delivers nothing, so only its low watermark can tell
+/// the window will never be complete. The bound is refused and counted, the
+/// half already read is no longer held, and it is archived on its own.
+/// Before, it was held as rebuilding for as long as the partition stayed
+/// idle.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn a_rebuild_whose_remaining_range_expires_on_an_idle_partition_is_refused() {
+    use rdkafka::admin::{AdminClient, AdminOptions};
+    use rdkafka::{Offset, TopicPartitionList};
+    let (topic, _cleanup) = fresh_topic("expired_rebuild", 20).await;
+    let dir = tempfile::tempdir().unwrap();
+    let db = format!("sqlite://{}", dir.path().join("state.db").display());
+    let group = unique_group("expired-rebuild");
+    let mut engine = engine_on(&db, dir.path(), &topic, &group).await;
+    let mock = std::sync::Arc::new(vtop_upload::MockBackend::new().with_throttled_manifest_puts(1));
+    let (_, end, orphan) = fail_first_window(&mut engine, &mock).await;
+    assert_eq!(end, 19);
+
+    engine.config.batching.max_records = 10;
+    let held = through_warm_up!(
+        "a read pass",
+        engine
+            .process_once(vtop_core::types::SourceType::Kafka)
+            .await
+    );
+    assert!(held.is_empty(), "half the window is held: {held:?}");
+
+    let admin: AdminClient<_> = build_client_config(&kafka_cfg(&bootstrap(), "vtop-it-admin"))
+        .unwrap()
+        .create()
+        .expect("admin client");
+    let mut below = TopicPartitionList::new();
+    below
+        .add_partition_offset(&topic, 0, Offset::Offset(20))
+        .unwrap();
+    admin
+        .delete_records(&below, &AdminOptions::new())
+        .await
+        .expect("delete_records");
+    let refused = || {
+        vtop_core::telemetry::init()
+            .unwrap()
+            .replay_rebuilds_total
+            .with_label_values(&["default", "kafka", "raw", "refused"])
+            .get()
+    };
+    let before = refused();
+    let committed = commit_through(&mut engine, 9).await;
+    assert_eq!(
+        committed
+            .iter()
+            .map(|(s, e, _)| (*s, *e))
+            .collect::<Vec<_>>(),
+        vec![(0, 9)],
+        "the half already read is archived on its own"
+    );
+    assert_ne!(committed[0].2, orphan, "it is not the failed window");
+    assert_eq!(mock.version_count(&orphan), 1, "the orphan is untouched");
+    assert!(refused() > before, "the bound is counted refused");
+}

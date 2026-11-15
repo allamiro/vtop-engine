@@ -118,6 +118,25 @@ fn rewind_frontier(known: Option<i64>, in_memory: Option<i64>, broker: Option<i6
 /// `None` for a partition with no committed cursor. Nothing has been read, so
 /// nothing can have been missed, and reporting a "gap" the size of the whole
 /// topic on first assignment is the fastest way to make this signal useless.
+/// The cuts (#626: last offset -> first offset of a window being rebuilt) a
+/// partition can no longer complete: the log starts above the next offset the
+/// window still needs, because retention or compaction moved past it. `next`
+/// is the offset this process reads next, if it has one. A cut the read has
+/// already passed is not this check's: the pass forgets it.
+fn expired_cuts(
+    cuts: &BTreeMap<i64, i64>,
+    next: Option<i64>,
+    low_watermark: i64,
+) -> Vec<(i64, i64)> {
+    cuts.iter()
+        .filter(|&(&end, &start)| {
+            let from = next.map_or(start, |n| n.max(start));
+            from <= end && low_watermark > from
+        })
+        .map(|(&end, &start)| (end, start))
+        .collect()
+}
+
 fn retention_gap(desired_offset: Option<i64>, low_watermark: i64) -> Option<u64> {
     let desired = desired_offset?;
     // A NEGATIVE OFFSET IS A SENTINEL, NOT A POSITION. librdkafka spells
@@ -1194,6 +1213,54 @@ impl KafkaSource {
                 .entry(key)
                 .or_insert(low_watermark);
             *entry = (*entry).max(low_watermark);
+        }
+    }
+
+    /// Refuse the cuts whose remaining range the log no longer holds (#626,
+    /// review of PR 3), from each partition's low watermark. A pass that
+    /// delivers an offset above the cut finds out by itself
+    /// (`MultiTopicAcc::unreachable`); an idle partition delivers nothing, so
+    /// without this its window would be held as rebuilding for as long as it
+    /// stays idle. Only partitions with a cut are asked, each query bounded,
+    /// so a pass without a rebuild makes no call.
+    fn refuse_expired_cuts(&mut self) {
+        if self.cuts.is_empty() {
+            return;
+        }
+        let Some(consumer) = self.consumer.as_ref() else {
+            return;
+        };
+        let keys: Vec<(String, i32)> = self
+            .cuts
+            .keys()
+            .filter(|key| self.assigned.contains(key))
+            .cloned()
+            .collect();
+        for key in keys {
+            let Ok((low_watermark, _)) = consumer.fetch_watermarks(
+                &key.0,
+                key.1,
+                std::time::Duration::from_secs(WATERMARK_TIMEOUT_SECONDS),
+            ) else {
+                continue;
+            };
+            let next = self.delivered.get(&key).copied();
+            let Some(cuts) = self.cuts.get_mut(&key) else {
+                continue;
+            };
+            for (end, start) in expired_cuts(cuts, next, low_watermark) {
+                cuts.remove(&end);
+                self.refused_cuts.push(crate::file_source::RefusedCut {
+                    path: key.0.clone(),
+                    partition: Some(key.1),
+                    start: u64::try_from(start).unwrap_or_default(),
+                    end: u64::try_from(end + 1).unwrap_or_default(),
+                    reason: "the partition's log no longer holds the range (retention or compaction moved past it)",
+                });
+            }
+            if cuts.is_empty() {
+                self.cuts.remove(&key);
+            }
         }
     }
 
@@ -2977,6 +3044,9 @@ impl SourceAdapter for KafkaSource {
         // the case the check exists for, and the restart is the case where the
         // state it reads has not been built yet.
         self.report_retention_gaps();
+        // Before the pass bounds its partitions: a cut the log no longer
+        // holds is not bounded this pass (#626).
+        self.refuse_expired_cuts();
         // The check takes `&mut self` (it advances its own clock), which ends
         // the borrow the assignment block held — so the poll loop takes its
         // own.
@@ -5082,6 +5152,25 @@ mod tests {
         let p0 = parts.iter().find(|(_, p, _)| *p == 0).unwrap();
         assert_eq!((p0.2.start_offset, p0.2.end_offset), (10, 11));
         assert_eq!(p0.2.records.len(), 2);
+    }
+
+    /// Review of #626 PR 3: a window being rebuilt whose remaining offsets
+    /// the log no longer holds is refused from the low watermark alone, so an
+    /// idle partition does not hold it for ever. A cut whose remaining range
+    /// is still held, or that the read has passed, is left alone.
+    #[test]
+    fn expired_cuts_are_found_from_the_low_watermark() {
+        let cuts: BTreeMap<i64, i64> = [(19, 0), (39, 20)].into_iter().collect();
+        // Ten of the first window read; the log now starts at 20.
+        assert_eq!(expired_cuts(&cuts, Some(10), 20), vec![(19, 0)]);
+        // The log still holds offset 10 on: nothing expired.
+        assert_eq!(expired_cuts(&cuts, Some(10), 10), vec![]);
+        // Nothing read yet, the log starts at 5: the first window is short.
+        assert_eq!(expired_cuts(&cuts, None, 5), vec![(19, 0)]);
+        // The log starts at 25: both windows' remaining ranges are short.
+        assert_eq!(expired_cuts(&cuts, Some(10), 25), vec![(19, 0), (39, 20)]);
+        // The read is past the first window: only the second is judged.
+        assert_eq!(expired_cuts(&cuts, Some(30), 31), vec![(39, 20)]);
     }
 
     #[test]
