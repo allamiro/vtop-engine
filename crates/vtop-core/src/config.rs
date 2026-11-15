@@ -782,8 +782,9 @@ pub struct UploadConfig {
     #[serde(default = "default_true")]
     pub require_strong_verification: bool,
     /// Hardened manifest profile (#135): require the backend to expose
-    /// immutable object versions, confirm bucket versioning is enabled before
-    /// the first upload to each bucket, and refuse to advance a batch whose
+    /// immutable object versions, confirm bucket versioning is enabled (at
+    /// startup for a literal bucket, #722; before the first upload to each
+    /// bucket a template names), and refuse to advance a batch whose
     /// manifest upload returned no version to pin. Recovery then reads the
     /// exact stored version, so overwriting or deleting the current manifest
     /// key cannot roll a batch back to an older validly-authenticated

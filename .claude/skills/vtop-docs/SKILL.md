@@ -57,7 +57,7 @@ How the chart generators stay trustworthy:
 To add a chart or a measured page:
 1. Commit the measurement files first, with their environment record (the substantiation rule: conditions beside every number).
 2. Extend the generator, never a hand-drawn image. Add its facts to `facts()` and to the test.
-3. Run `python3 -m pip install -r benchmarks/kafka_compare/requirements-report.txt`, then the generator, then `git status --porcelain -- docs/benchmarks/ docs/assets/readme/`; commit what it wrote.
+3. Run `python3 -m pip install --require-hashes -r benchmarks/kafka_compare/requirements-report.txt`, then the generator, then `git status --porcelain -- docs/benchmarks/ docs/assets/readme/`; commit what it wrote.
 4. In the README, use a `<picture>` with the light and dark SVG so both GitHub themes work; add the page to `mkdocs.yml` `nav` if it is a page.
 5. Say in the PR which command regenerates it and that CI's drift step passed on the exact head.
 
