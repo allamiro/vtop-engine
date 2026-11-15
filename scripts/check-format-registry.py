@@ -63,7 +63,7 @@ TOKENS = (
 # A raw string, also as a byte or C string (br"..", cr#".."#).
 RAW_STRING = re.compile(r'[bc]?r(#*)"')
 CHAR_LITERAL = re.compile(r"'(\\.|[^\\'])'")
-TEST_MODULE = re.compile(r"^#\[cfg\(test\)\]\s*\n\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*", re.M)
+TEST_MODULE = re.compile(r"^#\[cfg\(test\)\]\s*\n\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*", re.M)
 
 
 def _block_end(text: str, opening: int) -> int:
@@ -121,15 +121,19 @@ def _block_end(text: str, opening: int) -> int:
     return len(text)
 
 
-def production_source(text: str) -> str:
-    """The file without its ``#[cfg(test)]`` modules."""
+def production_source(text: str, out_of_line: list[str] | None = None) -> str:
+    """The file without its ``#[cfg(test)]`` modules. The names of test
+    modules declared out of line (``mod tests;``) are appended to
+    ``out_of_line``, so their files can be skipped too."""
     while True:
         match = TEST_MODULE.search(text)
         if not match:
             return text
         if text.startswith(";", match.end()):
-            # `mod tests;`: the module lives in its own file (whose
-            # contents are skipped by this check when it is a test file).
+            # `mod tests;`: only the declaration goes; the module's own
+            # file is skipped by the caller.
+            if out_of_line is not None:
+                out_of_line.append(match.group(1))
             text = text[: match.start()] + text[match.end() + 1:]
             continue
         opening = text.find("{", match.end())
@@ -168,9 +172,23 @@ def scan(root: pathlib.Path):
     constants: dict[tuple[str, str], str] = {}
     magics: set[tuple[str, str]] = set()
     sources: dict[str, str] = {}
-    for path in sorted(root.glob("crates/*/src/**/*.rs")):
+    paths = sorted(root.glob("crates/*/src/**/*.rs"))
+    texts: dict[pathlib.Path, str] = {}
+    test_files: set[pathlib.Path] = set()
+    for path in paths:
+        names: list[str] = []
+        texts[path] = production_source(path.read_text(encoding="utf-8"), names)
+        # A child module's file sits beside a mod.rs, lib.rs or main.rs, and
+        # in a directory named after any other file.
+        base = path.parent if path.name in ("mod.rs", "lib.rs", "main.rs") else path.with_suffix("")
+        for name in names:
+            test_files.update({base / f"{name}.rs", base / name / "mod.rs"})
+    for path in paths:
+        if path in test_files or any(parent in {f.parent for f in test_files if f.name == "mod.rs"}
+                                     for parent in path.parents):
+            continue
         rel = path.relative_to(root).as_posix()
-        text = production_source(path.read_text(encoding="utf-8"))
+        text = texts[path]
         sources[rel] = text
         for match in CONST.finditer(text):
             if is_format_name(match.group(1)):

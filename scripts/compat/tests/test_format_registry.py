@@ -120,6 +120,18 @@ class RegistryCheck(unittest.TestCase):
         self.source(SOURCE.replace("#[cfg(test)]\nmod tests {", "#[cfg(test)]\nmod extra_tests;\nconst NEW_VERSION: u8 = 1;\nfn f() {}\n\n#[cfg(test)]\nmod tests {"))
         self.assertIn("NEW_VERSION", " ".join(self.problems()))
 
+    def test_the_file_of_an_out_of_line_test_module_is_not_scanned(self):
+        self.source(SOURCE.replace("#[cfg(test)]\nmod tests {", "#[cfg(test)]\nmod race_tests;\n\n#[cfg(test)]\nmod tests {"))
+        (self.root / "crates/demo/src/race_tests.rs").write_text(
+            'const FIXTURE_VERSION: u8 = 7;\nconst FIXTURE: &[u8; 8] = b"VTOPTEST";\n')
+        self.assertEqual(self.problems(), [])
+        # A nested module's file sits in the parent module's directory.
+        (self.root / "crates/demo/src/race_tests.rs").unlink()
+        (self.root / "crates/demo/src/sub").mkdir()
+        (self.root / "crates/demo/src/sub.rs").write_text("#[cfg(test)]\nmod fence_tests;\n")
+        (self.root / "crates/demo/src/sub/fence_tests.rs").write_text("const FIXTURE_VERSION: u8 = 7;\n")
+        self.assertEqual(self.problems(), [])
+
     def test_byte_raw_strings_and_nested_comments_in_a_test_module_hide_nothing_after_it(self):
         for literal in ('let _ = br#"a" { "#;', 'let _ = br"\\";', "/* /* */ { */"):
             body = SOURCE.replace('const FOREIGN', literal + "\n        const FOREIGN")
