@@ -263,6 +263,9 @@ jobs:
               - 'scripts/check-naming.sh'
               - 'scripts/check-egress-claims.sh'
               - 'scripts/naming-denylist.txt'
+              # The check that no shipped build carries the failpoints
+              # feature (#725), listed here and in the shellcheck step.
+              - 'scripts/check-failpoints-absent.sh'
               - 'scripts/tests/**'
               # The test-progress runner: developer tooling, but shell that people
               # will paste and rely on, so it is linted like the rest — listed here
@@ -1133,7 +1136,8 @@ jobs:
             scripts/upgrade-compat.sh \
             scripts/manifest-compat.sh scripts/ledger-compat.sh \
             scripts/traffic-snapshot.sh scripts/test-progress.sh \
-            scripts/check-naming.sh scripts/check-egress-claims.sh
+            scripts/check-naming.sh scripts/check-egress-claims.sh \
+            scripts/check-failpoints-absent.sh
 
       # `-P scripts/live-chaos/scenarios` resolves the scenarios' dynamic
       # `source "$(dirname …)/../lib.sh"`. Without it every scenario reports
@@ -1146,7 +1150,8 @@ jobs:
             scripts/live-chaos/lib.sh \
             scripts/live-chaos/run-all.sh \
             scripts/live-chaos/gen-certs.sh \
-            scripts/live-chaos/scenarios/*.sh
+            scripts/live-chaos/scenarios/*.sh \
+            scripts/live-chaos/engine/*.sh
 
       - name: bats
         run: |

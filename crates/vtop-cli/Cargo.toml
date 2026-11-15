@@ -23,6 +23,12 @@ kafka-gssapi = ["kafka", "vtop-adapters/kafka-gssapi"]
 # Keep PostgreSQL optional in the CLI while providing a discoverable feature
 # for production builds and the separate `vtopctl migrate` deployment step.
 postgres = ["vtop-state/postgres"]
+# TEST BUILDS ONLY (#725): `VTOP_FAILPOINT=<point>` makes the engine kill
+# itself with SIGKILL at that line, for the engine crash sweep
+# (scripts/live-chaos/engine/run-sweep.sh). Off by default; no release
+# archive, container image or chart enables it, and
+# scripts/check-failpoints-absent.sh fails CI if one does.
+failpoints = ["dep:bytes", "rustix/process"]
 
 [dependencies]
 blake3 = { workspace = true }
@@ -49,6 +55,8 @@ async-trait = { workspace = true }
 uuid = { workspace = true }
 rustix = { workspace = true }
 rdkafka = { workspace = true, optional = true }
+# The multipart part type the failpoint decorator passes through.
+bytes = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -89,6 +97,12 @@ path = "../../tests/integration_manifest_rollback.rs"
 name = "integration_kafka_to_minio"
 path = "../../tests/integration_kafka_to_minio.rs"
 required-features = ["kafka"]
+
+# Every failpoint kills the real binary where it says it does (#725).
+[[test]]
+name = "failpoints"
+path = "tests/failpoints.rs"
+required-features = ["failpoints"]
 
 [[test]]
 name = "integration_metrics_endpoint"
