@@ -160,11 +160,23 @@ jobs:
               - 'rust-toolchain*'
               - '.github/workflows/ci.yml'
 
-            # `cargo test -p vtop-state --features postgres,test-support
-            #  --test pg_battery`. Closure is vtop-state + vtop-core.
+            # The PostgreSQL legs (postgres-matrix.yml, #723): the battery
+            # (vtop-state + vtop-core), `vtopctl migrate` (implemented in
+            # vtop-state; vtop-cli only calls it), a restore and the engine's
+            # recovery on PostgreSQL. vtop-cli has no code behind its
+            # `postgres` feature (it only turns on vtop-state's), so its
+            # Cargo.toml and the two test files are what it adds here. Not
+            # vtop-cli's whole closure: that put the legs, each building
+            # vtopctl, on nearly every Rust PR. A change elsewhere in the
+            # closure is tested on every major by the nightly run of
+            # postgres-matrix.yml. That file is not listed: a change to it
+            # runs all five majors through its own pull_request trigger.
             postgres:
               - 'crates/vtop-state/**'
               - 'crates/vtop-core/**'
+              - 'crates/vtop-cli/Cargo.toml'
+              - 'crates/vtop-cli/tests/postgres_migrate_restore.rs'
+              - 'tests/integration_state_recovery.rs'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '.cargo/**'
@@ -2374,47 +2386,96 @@ jobs:
           fi
 
   # The Postgres backend (Phase 3) must pass the SAME behavioural battery as
-  # SQLite, and its DB-level invariant trigger must reject a bypass. Runs against
-  # a real Postgres service. Gated on rust changes like the other Rust jobs.
+  # SQLite, and its DB-level invariant trigger must reject a bypass, with
+  # `vtopctl migrate`, a ledger restore and the engine's recovery (#723).
+  # The jobs and the pinned images live in postgres-matrix.yml, which also
+  # runs all five supported majors nightly. Here, on a change the `postgres`
+  # filter matches, it runs the oldest and the newest: their checks are
+  # named `postgres / postgres backend (battery) (pg 14)` and `(pg 18)`.
   postgres:
-    name: postgres backend (battery)
+    name: postgres
+    needs: changes
+    if: needs.changes.outputs.postgres == 'true'
+    uses: ./.github/workflows/postgres-matrix.yml
+    with:
+      majors: '["14","18"]'
+
+  # #723, opt-in: the same tests against a managed PostgreSQL service (RDS,
+  # Cloud SQL, ...). It needs a throwaway instance and repository secrets,
+  # which a maintainer sets up (docs/POSTGRES_DEPLOYMENT.md, "Managed-service
+  # smoke test"); without them the job reports that it skipped and passes. A
+  # fork's pull request never sees secrets, so it always skips there. The
+  # `secrets` context cannot gate a job, so the first step reads the secret
+  # and every later step is gated on its output.
+  postgres-managed:
+    name: postgres managed smoke (opt-in)
     needs: changes
     if: needs.changes.outputs.postgres == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: vtop
-          POSTGRES_PASSWORD: vtop
-          POSTGRES_DB: vtop
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U vtop"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
+    timeout-minutes: 30
+    # Every run, from every branch, shares the one managed instance and the
+    # fixed `vtop_test_*` databases and roles, and the workflow's concurrency
+    # group is per ref. One at a time across the repository; a run waits
+    # rather than cancel another's half-done restore.
+    concurrency:
+      group: postgres-managed-smoke
+      cancel-in-progress: false
+    env:
+      VTOP_TEST_POSTGRES: ${{ secrets.VTOP_MANAGED_POSTGRES_URL }}
+      VTOP_TEST_POSTGRES_RUNTIME: ${{ secrets.VTOP_MANAGED_POSTGRES_RUNTIME_URL }}
+      CLIENT_IMAGE: ${{ vars.VTOP_MANAGED_POSTGRES_CLIENT_IMAGE }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+      - name: Is a managed database configured?
+        id: gate
+        run: |
+          if [ -z "$VTOP_TEST_POSTGRES" ]; then
+            echo "::notice title=postgres managed smoke skipped::No VTOP_MANAGED_POSTGRES_URL secret, so nothing ran against a managed service. See docs/POSTGRES_DEPLOYMENT.md, 'Managed-service smoke test'."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          missing=""
+          [ -n "$VTOP_TEST_POSTGRES_RUNTIME" ] || missing="$missing secret:VTOP_MANAGED_POSTGRES_RUNTIME_URL"
+          [ -n "$CLIENT_IMAGE" ] || missing="$missing variable:VTOP_MANAGED_POSTGRES_CLIENT_IMAGE"
+          if [ -n "$missing" ]; then
+            echo "::error::VTOP_MANAGED_POSTGRES_URL is set, but the managed smoke also needs:$missing. Nothing was run. See docs/POSTGRES_DEPLOYMENT.md, 'Managed-service smoke test'."
+            exit 1
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+      - if: steps.gate.outputs.enabled == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - if: steps.gate.outputs.enabled == 'true'
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - if: steps.gate.outputs.enabled == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
           key: ${{ runner.os }}-pg-${{ hashFiles('**/Cargo.lock') }}
-      # vtop-state depends only on vtop-core (no librdkafka), so no system deps.
-      - name: Run the Postgres StateStore battery
+      # A private CA (RDS, Cloud SQL) for `sslmode=verify-full`: the URLs
+      # name this path in `sslrootcert`, and the client container sees the
+      # file at the same path.
+      - name: Write the database CA
+        if: steps.gate.outputs.enabled == 'true'
         env:
-          VTOP_TEST_POSTGRES: postgres://vtop:vtop@localhost:5432/vtop
-          VTOP_TEST_POSTGRES_RUNTIME: postgres://vtop_runtime_test:vtop-runtime-test@localhost:5432/vtop
+          CA: ${{ secrets.VTOP_MANAGED_POSTGRES_CA }}
+        run: printf '%s\n' "$CA" > /tmp/vtop-managed-postgres-ca.pem
+      - name: Run the Postgres StateStore battery
+        if: steps.gate.outputs.enabled == 'true'
         run: cargo test -p vtop-state --features postgres,test-support --test pg_battery
-      # No database involved: a socket that accepts and never answers must fail
-      # the connect within its bound instead of hanging startup (#556).
-      - name: Postgres connect is bounded
-        run: cargo test -p vtop-state --features postgres --test connect_deadline
+      - name: vtopctl migrate twice, and a restore into a migrated schema
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          export VTOP_TEST_PG_EXEC="docker run --rm -i --network host -v /tmp/vtop-managed-postgres-ca.pem:/tmp/vtop-managed-postgres-ca.pem:ro $CLIENT_IMAGE"
+          cargo test -p vtop-cli --no-default-features --features postgres --test postgres_migrate_restore
+      - name: Engine recovery on PostgreSQL
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          set -o pipefail
+          cargo test -p vtop-cli --no-default-features --features postgres \
+            --test integration_state_recovery -- --exact \
+            on_postgres_a_recovered_commit_is_counted_by_its_stored_class 2>&1 | tee recovery.log
+          grep -q 'test result: ok. 1 passed' recovery.log
