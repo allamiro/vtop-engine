@@ -1237,6 +1237,36 @@ readers verify (ARCHITECTURE.md, "Ledger format note: ctime").
   attempt among the causes, and is removed by hand. A stored ctime that is
   not a timestamp reads as absent, and arms as a pre-v0.10.0 row does.
 
+## v0.10.1 — the Linux archives run on glibc 2.28
+
+v0.10.0's Linux archives did not start on Debian 12, Ubuntu 22.04 or RHEL 8 and 9. This release fixes that and carries what else merged since: test fixes, the release pipeline's `latest` rule, the alert rules, and CI. VTOP is still a prototype: the bar for calling it more is #714.
+
+- **The Linux archives.**
+  - The archives of v0.8.0 to v0.10.0 were built on Ubuntu 24.04 (glibc 2.39). v0.10.0's `vtopctl` needs `GLIBC_2.39` and its `vtop-node` `GLIBC_2.34`, so on a host with an older glibc `vtopctl` stopped with ``version `GLIBC_2.38' not found`` (#808).
+  - Both Linux archives (x86_64 and aarch64) are now built inside AlmaLinux 8, so the floor is glibc 2.28: Debian 10 and later, Ubuntu 20.04 and later, RHEL, AlmaLinux and Rocky Linux 8 and later (#809).
+  - Before anything is uploaded, the release workflow fails if either binary asks for a newer symbol version than that floor or links a library a base install lacks, then runs both binaries from each archive on Debian 12, Ubuntu 22.04 and AlmaLinux 8, with nothing installed, through a file-to-local-directory round trip and a scrub (#809). The other distributions in the list are expected to work by the same symbol versions and are not run. musl distributions such as Alpine are not supported; use the container image.
+  - The container image is unchanged: it is built from `docker/Dockerfile` in its own Debian 12 base (`rust:1-bookworm`, run on `debian:bookworm-slim`), never on the runner's glibc.
+- **Release pipeline.**
+  - `latest` (the image tag and GitHub's "Latest release") follows the newest final release, so a fix for an older line no longer moves it back; the image-manifest job checks the registry after the push (#804).
+  - The container page pulls the current release and shows `latest` beside the pinned tag (#803); a check fails the docs workflow when the version copied into the container page, the README's citation, `CITATION.cff` or the chart's `appVersion` is not the workspace version (#804).
+- **Operating it.** The engine's Prometheus alert rules ship as `observability/prometheus/vtop-rules.yaml`, tested with `promtool`, with a runbook section per alert and the SLOs they protect; the Helm chart can render them as a `PrometheusRule` (#720, #772).
+- **Tests and CI.**
+  - A produce-phase timing test no longer depends on the runner's speed (#799, #805); the OpenTelemetry export test says which stage lost a batch span, diagnostics only (#798, #806); `ledger compat` expects `sealed_at` from a previous release that writes it (#807).
+  - A PostgreSQL 14 to 18 matrix runs `vtopctl migrate`, a ledger restore and recovery on each major: 14 and 18 on pull requests, all five nightly (#723, #761).
+  - Decoders are fuzzed nightly from a persisted corpus, and a mutation gate covers the commit path (`state_machine.rs`, `replay.rs`) (#729, #766).
+  - Two small parsing helpers (`parse_digest`, `parse_cursor`) were split out of their readers so the fuzz targets reach the same code; behaviour and error text are unchanged (#766).
+
+**Upgrading from v0.10.0.** Downgrade is not supported.
+
+- **A drop-in replacement.** Replace the binaries; start order does not matter, and v0.10.0 and v0.10.1 engines, voters and data nodes can run side by side. This release changes no schema (PostgreSQL stays at marker 3, SQLite at `user_version` 1), no on-disk or wire format, no `config.yaml` key and no cluster feature level (it stays 8). No one-way step is added; the one-way steps of v0.10.0 (feature level 8, `manifest.write_version: "0.4"`, `manifest.mac`, `upload.object_lock`) are unchanged. No config key is newly ignored by an older engine, and there is no new behaviour to check first.
+- **Hosts that could not run v0.10.0's `vtopctl`.** Install the v0.10.1 archive; `vtopctl` and `vtop-node` need nothing beyond the base system libraries. Verify the download as before ([release verification](RELEASE_VERIFICATION.md)).
+- **Helm chart 0.6.0** (from 0.5.3; `appVersion` 0.10.1). The new values `metrics.prometheusRule.enabled` (default `false`), `labels` and `runbookBaseUrl` are optional, and an existing values file renders as before. Turning it on needs the Prometheus Operator CRDs: the chart refuses to render without them, naming the alternative (load `observability/prometheus/vtop-rules.yaml` with `rule_files`). The chart runs the cluster plane, not the engine: the rules fire for engines the same Prometheus scrapes.
+- **Known open.**
+  - #798: an OpenTelemetry message test (`otel_messages`) fails intermittently in CI. #806 only makes the next failure say which stage lost the span; the cause is not found. Moved to v0.11.0.
+  - #729: the nightly fuzzing and the commit-path mutation gate are in; the gate on the verify, recovery and file-continuity code is not.
+  - #724: build, test and smoke the release archives on every supported platform. This release checks the floor and runs three distributions; the full matrix is not done.
+  - Everything under v0.10.0's "Known open" still stands, except #799, which is fixed: #709, #773, #774, #706, #752, #751, #743, #733, and #714, the bar for calling VTOP production-ready. VTOP remains a prototype.
+
 ## v0.11.0 and beyond
 
 The theme is **the gateway at the speed its durability allows, and the road
