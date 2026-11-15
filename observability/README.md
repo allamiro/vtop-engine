@@ -229,6 +229,19 @@ and a group that retention has already passed pages on the first rule, not the
 second. Groups that commit through the Kafka gateway (#457) are metadata
 cursors and appear here.
 
+### Kafka gateway refusals
+
+A data node's Kafka gateway counts what it refuses in
+`vtop_kafka_requests_refused_total{api,reason}` (#596); its log lines for
+the same refusals repeat only at powers of two, with the running total.
+Both labels are a fixed set, and on a node that runs a gateway every series
+is exported from the first scrape at zero:
+
+| `api` | `reason` | What it means, and what to do |
+|---|---|---|
+| `offset_commit` | `no_offset_store` | A consumer committed offsets to a node with no metadata plane (a static leader or a standalone node). Nothing was stored; the client was answered `INVALID_REQUEST`. A consumer with auto-commit on logs it and keeps reading; an explicit commit fails. Run the node as a leased leader on a metadata plane, or set `enable.auto.commit=false` on consumers that do not need committed offsets. |
+| `unserved` | `unserved_api` | A client sent a request the gateway does not serve (CreateTopics, DescribeConfigs, ...), and the connection was closed. The log line names the api key. Topics are created on the metadata plane (`vtopctl meta create-topic`), not through the Kafka API. |
+
 ### Archive scrub
 
 `vtopctl scrub` (#628) reads committed objects back and verifies them again:
