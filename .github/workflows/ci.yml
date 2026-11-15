@@ -207,7 +207,13 @@ jobs:
               # measurements they are drawn from, the output, and the README
               # whose prose quotes the same figures.
               - 'benchmarks/readme_charts.py'
+              # The tests this job runs: a change to a test alone must run
+              # it (tests/test_benchmark_charts_job.py checks the list).
               - 'benchmarks/tests/test_readme_charts.py'
+              - 'benchmarks/tests/test_kafka_compare_*.py'
+              - 'benchmarks/tests/test_benchmark_charts_job.py'
+              # The hand-written page that links the generated reports.
+              - 'docs/COMPARISON.md'
               - 'benchmarks/measurements/483-tcp-baseline/**'
               - 'benchmarks/measurements/663-policed-uplink/**'
               - 'docs/assets/readme/**'
@@ -233,6 +239,8 @@ jobs:
               # The smoke script IS the kind job's test (#416): a change to it
               # that did not run it would be judged by shellcheck alone.
               - 'scripts/k8s-smoke.sh'
+              # Its port-forward helpers, sourced by it (#786).
+              - 'scripts/k8s-forward.sh'
               - '.github/workflows/ci.yml'
               # The chart's appVersion has to track the workspace version, and
               # the workspace version can only change HERE. Without this the
@@ -245,6 +253,7 @@ jobs:
               # Executable CI test code (#291), linted like the rest.
               - 'scripts/upgrade-compat.sh'
               - 'scripts/manifest-compat.sh'
+              - 'scripts/ledger-compat.sh'
               # The live-chaos harness is executable shell that gates every
               # distributed-systems claim this project makes, and it was
               # unlinted: a change to lib.sh — sourced by every scenario —
@@ -260,6 +269,7 @@ jobs:
               # against the files it was added for, which is the same
               # unlinted-shell hole the live-chaos entry below exists to close.
               - 'scripts/k8s-smoke.sh'
+              - 'scripts/k8s-forward.sh'
               - 'scripts/e2e-smoke.sh'
               # The traffic collector, for the same reason and by the same
               # mistake: it was added to the shellcheck step without being
@@ -357,6 +367,7 @@ jobs:
               - '.cargo/**'
               - 'rust-toolchain*'
               - 'scripts/manifest-compat.sh'
+              - 'scripts/ledger-compat.sh'
               - '.github/workflows/ci.yml'
   build-and-test:
     name: fmt + clippy + test + build
@@ -1140,8 +1151,9 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/mnt" -w /mnt \
             koalaman/shellcheck:v0.11.0 docker/*.sh scripts/release-notes.sh \
-            scripts/k8s-smoke.sh scripts/e2e-smoke.sh scripts/upgrade-compat.sh \
-            scripts/manifest-compat.sh \
+            scripts/k8s-smoke.sh scripts/k8s-forward.sh scripts/e2e-smoke.sh \
+            scripts/upgrade-compat.sh \
+            scripts/manifest-compat.sh scripts/ledger-compat.sh \
             scripts/traffic-snapshot.sh scripts/test-progress.sh \
             scripts/check-naming.sh scripts/check-egress-claims.sh
 
@@ -1676,12 +1688,26 @@ jobs:
               scripts/manifest-compat.sh target/debug/vtopctl "$tag" \
                 "released/$tag/vtop-engine-$v-x86_64-unknown-linux-gnu/vtopctl" "$expect"
           done
+      # The previous release (N-1, the only one that may share a ledger with
+      # HEAD, #743) on a SQLite ledger HEAD opened, wrote and pruned (#626):
+      # it must keep archiving and auditing. A release before v0.10.0 ignores
+      # the sealed_at column and the digests' sealed_at; one from v0.10.0 on
+      # writes it too (#755). The release binaries have no `postgres`
+      # feature, so the PostgreSQL half runs where one is built from the tag.
+      - name: The previous release keeps working on a ledger HEAD opened
+        run: |
+          set -euo pipefail
+          tag="$(printf '%s\n' ${{ steps.tags.outputs.list }} | sort -V | tail -n 1)"
+          v="${tag#v}"
+          LEDGER_COMPAT_KEEP=1 LEDGER_COMPAT_WORKDIR="$GITHUB_WORKSPACE/manifest-compat-ledger-$tag" \
+            scripts/ledger-compat.sh target/debug/vtopctl "$tag" \
+              "released/$tag/vtop-engine-$v-x86_64-unknown-linux-gnu/vtopctl"
       - name: Upload the logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: manifest-compat-logs
-          path: manifest-compat-v*/logs
+          path: manifest-compat-*/logs
           if-no-files-found: ignore
           retention-days: 7
 
@@ -2146,8 +2172,8 @@ jobs:
   # arm64, Linux arm64 and Linux x86_64, different files). regenerate.py puts
   # back the committed bytes of a PNG whose decoded pixels, size, mode and
   # metadata are unchanged, so `git diff` sees a PNG only when it looks
-  # different. The plotting stack is pinned exactly in requirements-report.txt
-  # and regenerate.py refuses any other, and refuses a DejaVu Sans from outside
+  # different. The plotting stack is pinned exactly, with hashes, in
+  # requirements-report.txt and regenerate.py refuses any other, and refuses a DejaVu Sans from outside
   # matplotlib's own bundled copy.
   benchmark-charts:
     name: benchmark charts (regenerate + no drift)
@@ -2157,16 +2183,34 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # The patch version is pinned: a floating "3.12" moves with the runner
+      # image, and the charts are checked byte for byte.
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.12"
+          python-version: "3.12.16"
+      # Hash-checked, as docs/requirements.txt is: pip refuses a file whose
+      # hash is not in the lock. The test runner has its own lock, compiled
+      # against the plotting stack's, so the stack's lock stays the stack.
       - name: Install the pinned plotting stack
-        run: pip install --disable-pip-version-check -r benchmarks/kafka_compare/requirements-report.txt pytest==9.2.0
-      # The benchmarks job runs without matplotlib, so the report tests that
-      # need it skip there; here they run.
+        run: |
+          pip install --disable-pip-version-check --require-hashes -r benchmarks/kafka_compare/requirements-report.txt
+          pip install --disable-pip-version-check --require-hashes -r benchmarks/kafka_compare/requirements-report-test.txt
+      # The benchmarks job runs without matplotlib or Pillow, so every test
+      # file that needs them skips there and runs here;
+      # tests/test_benchmark_charts_job.py fails when one is missing below.
+      # That check reads this file as text, so the run checks too: a test
+      # that skipped here for want of matplotlib or Pillow fails the job.
       - name: Report and drift-check tests, with matplotlib
         working-directory: benchmarks
-        run: python -m pytest tests/test_kafka_compare_report.py tests/test_kafka_compare_regenerate.py tests/test_readme_charts.py
+        # A step with no `shell:` runs as `bash -e {0}`, without pipefail:
+        # without this line the pipe into tee would hide a failing test.
+        run: |
+          set -o pipefail
+          python -m pytest -rs tests/test_kafka_compare_report.py tests/test_kafka_compare_regenerate.py tests/test_kafka_compare_failover.py tests/test_kafka_compare_footer.py tests/test_kafka_compare_colours.py tests/test_readme_charts.py tests/test_benchmark_charts_job.py | tee "$RUNNER_TEMP/chart-tests.log"
+          if grep -E "SKIPPED.*(matplotlib|PIL)" "$RUNNER_TEMP/chart-tests.log"; then
+            echo "::error::A chart test skipped for want of matplotlib or Pillow, in the one job that installs them."
+            exit 1
+          fi
       - name: Regenerate every chart and report and fail on drift
         run: |
           python3 benchmarks/kafka_compare/regenerate.py
@@ -2175,7 +2219,7 @@ jobs:
           # ignore the untracked file and pass.
           drift="$(git status --porcelain -- docs/benchmarks/)"
           if [ -n "$drift" ]; then
-            echo "::error::Committed benchmark charts or reports differ from what the committed CSVs produce. Run 'python3 -m pip install -r benchmarks/kafka_compare/requirements-report.txt && python3 benchmarks/kafka_compare/regenerate.py' and commit the result."
+            echo "::error::Committed benchmark charts or reports differ from what the committed CSVs produce. Run 'python3 -m pip install --require-hashes -r benchmarks/kafka_compare/requirements-report.txt && python3 benchmarks/kafka_compare/regenerate.py' and commit the result."
             echo "$drift"
             git diff --stat -- docs/benchmarks/
             exit 1
@@ -2185,7 +2229,7 @@ jobs:
           python3 benchmarks/readme_charts.py
           drift="$(git status --porcelain -- docs/assets/readme/)"
           if [ -n "$drift" ]; then
-            echo "::error::The README's charts differ from what the committed measurements produce. Run 'python3 -m pip install -r benchmarks/kafka_compare/requirements-report.txt && python3 benchmarks/readme_charts.py' and commit the result."
+            echo "::error::The README's charts differ from what the committed measurements produce. Run 'python3 -m pip install --require-hashes -r benchmarks/kafka_compare/requirements-report.txt && python3 benchmarks/readme_charts.py' and commit the result."
             echo "$drift"
             exit 1
           fi

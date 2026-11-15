@@ -15,7 +15,10 @@
 //!   that returns no lock headers (one that ignored them) fails it;
 //! - the bucket preflight tells "Object Lock is not enabled" (S3's
 //!   `ObjectLockConfigurationNotFoundError`) from a check that could not be
-//!   made.
+//!   made;
+//! - a store that does not implement Object Lock or versioning at all (HTTP
+//!   501 `NotImplemented`, Garage's documented answer) is told from both
+//!   (#722): no bucket setting can change it, and a 503 still proves nothing.
 //!
 //! Its own test binary because it sets credentials in the process
 //! environment.
@@ -27,8 +30,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use vtop_upload::s3_native::{S3NativeBackend, S3NativeConfig};
 use vtop_upload::{
-    ObjectChecksum, ObjectLockMode, ObjectLockPolicy, RequestedRetention, RetentionCheck,
-    RetentionExpectation, UploadBackend,
+    BucketFeature, ObjectChecksum, ObjectLockMode, ObjectLockPolicy, RequestedRetention,
+    RetentionCheck, RetentionExpectation, UploadBackend,
 };
 
 /// One request as the store saw it.
@@ -59,6 +62,7 @@ impl Seen {
 struct Answers {
     head_headers: Vec<(String, String)>,
     lock_config: Option<(&'static str, &'static str)>,
+    versioning: Option<(&'static str, &'static str)>,
 }
 
 #[derive(Clone, Default)]
@@ -82,6 +86,9 @@ impl Store {
     }
     fn answer_lock_config(&self, status: &'static str, body: &'static str) {
         self.answers.lock().unwrap().lock_config = Some((status, body));
+    }
+    fn answer_versioning(&self, status: &'static str, body: &'static str) {
+        self.answers.lock().unwrap().versioning = Some((status, body));
     }
 
     async fn start(&self) -> String {
@@ -174,10 +181,15 @@ impl Store {
             ];
             h.extend(answers.head_headers.clone());
             ("200 OK", h, String::new())
-        } else if method == "GET" && target.contains("object-lock") {
-            let (status, body) = answers
-                .lock_config
-                .unwrap_or(("500 Internal Server Error", ""));
+        } else if method == "GET"
+            && (target.contains("object-lock") || target.contains("versioning"))
+        {
+            let answer = if target.contains("object-lock") {
+                answers.lock_config
+            } else {
+                answers.versioning
+            };
+            let (status, body) = answer.unwrap_or(("500 Internal Server Error", ""));
             (
                 status,
                 vec![("content-type".into(), "application/xml".into())],
@@ -508,10 +520,13 @@ async fn the_bucket_preflight_tells_not_enabled_from_could_not_check() {
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ObjectLockConfiguration>\
          <ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>",
     );
-    assert!(backend
-        .bucket_object_lock_enabled("telemetry-locked")
-        .await
-        .unwrap());
+    assert_eq!(
+        backend
+            .bucket_object_lock("telemetry-locked")
+            .await
+            .unwrap(),
+        BucketFeature::Enabled
+    );
     let request = store.seen().pop().unwrap();
     assert!(request.target.contains("object-lock"), "{request:?}");
 
@@ -521,11 +536,9 @@ async fn the_bucket_preflight_tells_not_enabled_from_could_not_check() {
          <Code>ObjectLockConfigurationNotFoundError</Code>\
          <Message>Object Lock configuration does not exist for this bucket</Message></Error>",
     );
-    assert!(
-        !backend
-            .bucket_object_lock_enabled("telemetry-plain")
-            .await
-            .unwrap(),
+    assert_eq!(
+        backend.bucket_object_lock("telemetry-plain").await.unwrap(),
+        BucketFeature::NotEnabled,
         "S3's answer for a bucket without Object Lock is a definite no"
     );
 
@@ -535,7 +548,124 @@ async fn the_bucket_preflight_tells_not_enabled_from_could_not_check() {
          <Message>Access Denied</Message></Error>",
     );
     let err = backend
-        .bucket_object_lock_enabled("telemetry-locked")
+        .bucket_object_lock("telemetry-locked")
+        .await
+        .expect_err("a refused check proves nothing either way");
+    assert!(err.to_string().contains("403"), "{err}");
+}
+
+/// #722: a store that does not implement Object Lock answers
+/// `GetObjectLockConfiguration` with 501 `NotImplemented` (Garage documents
+/// all six Object Lock calls as missing). That is a definite answer about the
+/// store, not a check that could not be made: no bucket setting changes it,
+/// so the engine refuses rather than starting and failing every batch.
+#[tokio::test]
+async fn a_store_without_object_lock_is_told_from_one_that_could_not_answer() {
+    let store = Store::default();
+    let endpoint = store.start().await;
+    let backend = backend(endpoint, None).await;
+
+    for (status, body, what) in [
+        (
+            "501 Not Implemented",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>NotImplemented</Code>\
+             <Message>A header you provided implies functionality that is not implemented\
+             </Message></Error>",
+            "S3's NotImplemented",
+        ),
+        (
+            "501 Not Implemented",
+            "",
+            "a bare 501 with no error document",
+        ),
+        (
+            "400 Bad Request",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>NotImplemented</Code>\
+             <Message>not implemented</Message></Error>",
+            "the NotImplemented code under another status",
+        ),
+    ] {
+        store.answer_lock_config(status, body);
+        assert_eq!(
+            backend
+                .bucket_object_lock("telemetry-locked")
+                .await
+                .unwrap_or_else(|e| panic!("{what}: a definite answer, not a failed check: {e}")),
+            BucketFeature::NotSupported,
+            "{what}"
+        );
+    }
+
+    // A store that is down says nothing about what it implements.
+    store.answer_lock_config(
+        "503 Service Unavailable",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>ServiceUnavailable</Code>\
+         <Message>try again</Message></Error>",
+    );
+    let err = backend
+        .bucket_object_lock("telemetry-locked")
+        .await
+        .expect_err("a 503 proves nothing either way");
+    assert!(err.to_string().contains("503"), "{err}");
+}
+
+/// #722: the versioning preflight tells enabled, not enabled (suspended, or
+/// never turned on), not implemented, and a check that could not be made
+/// apart, so the engine can refuse the first two definite answers at
+/// startup and leave the last for the first upload.
+#[tokio::test]
+async fn the_versioning_preflight_tells_its_four_answers_apart() {
+    let store = Store::default();
+    let endpoint = store.start().await;
+    let backend = backend(endpoint, None).await;
+
+    store.answer_versioning(
+        "200 OK",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><VersioningConfiguration>\
+         <Status>Enabled</Status></VersioningConfiguration>",
+    );
+    assert_eq!(
+        backend.bucket_versioning("telemetry-raw").await.unwrap(),
+        BucketFeature::Enabled
+    );
+    let request = store.seen().pop().unwrap();
+    assert!(request.target.contains("versioning"), "{request:?}");
+
+    for body in [
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><VersioningConfiguration>\
+         <Status>Suspended</Status></VersioningConfiguration>",
+        // Garage's documented stub, and S3's answer for a bucket versioning
+        // was never turned on for: no status at all.
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><VersioningConfiguration/>",
+    ] {
+        store.answer_versioning("200 OK", body);
+        assert_eq!(
+            backend.bucket_versioning("telemetry-raw").await.unwrap(),
+            BucketFeature::NotEnabled,
+            "{body}"
+        );
+    }
+
+    store.answer_versioning(
+        "501 Not Implemented",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>NotImplemented</Code>\
+         <Message>not implemented</Message></Error>",
+    );
+    assert_eq!(
+        backend
+            .bucket_versioning("telemetry-raw")
+            .await
+            .expect("a 501 is a definite answer about the store"),
+        BucketFeature::NotSupported
+    );
+
+    store.answer_versioning(
+        "403 Forbidden",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>AccessDenied</Code>\
+         <Message>Access Denied</Message></Error>",
+    );
+    let err = backend
+        .bucket_versioning("telemetry-raw")
         .await
         .expect_err("a refused check proves nothing either way");
     assert!(err.to_string().contains("403"), "{err}");
@@ -614,9 +744,20 @@ async fn a_locked_blake3_write_carries_a_checksum_value_even_when_calculation_is
         .await
         .unwrap();
     let request = store.seen().pop().unwrap();
-    assert!(
-        request.header("x-amz-checksum-crc32").is_some()
-            || request.header("x-amz-trailer").is_some(),
+    // The value is the whole body's SHA-256, sent as a header by the backend
+    // itself (#778), never left to an SDK trailer.
+    assert_eq!(
+        request.header("x-amz-checksum-sha256"),
+        Some(
+            aws_smithy_types::base64::encode(
+                hex::decode(vtop_core::checksum::sha256_bytes(b"hello")).unwrap()
+            )
+            .as_str()
+        ),
         "a locked write carries a checksum value, not only an algorithm name: {request:#?}"
+    );
+    assert_eq!(
+        request.header("x-amz-sdk-checksum-algorithm"),
+        Some("SHA256")
     );
 }

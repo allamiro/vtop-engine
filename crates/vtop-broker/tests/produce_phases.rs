@@ -36,6 +36,22 @@ const PROPAGATE_DELAY: Duration = Duration::from_millis(300);
 struct DelayedReplicaSet {
     inner: InProcessReplicaSet,
     rounds: AtomicU64,
+    /// Nanoseconds spent inside `replicate_append_batch`, summed over rounds:
+    /// what the broker's `Replicate` timer encloses. The test compares the
+    /// recorded phase against this instead of against a fixed wall-clock.
+    round_nanos: AtomicU64,
+    /// The same for `propagate_committed_hwm`, which the `Commit` timer encloses.
+    propagate_nanos: AtomicU64,
+}
+
+impl DelayedReplicaSet {
+    fn round(&self) -> Duration {
+        Duration::from_nanos(self.round_nanos.load(Ordering::SeqCst))
+    }
+
+    fn propagation(&self) -> Duration {
+        Duration::from_nanos(self.propagate_nanos.load(Ordering::SeqCst))
+    }
 }
 
 impl ReplicaSet for DelayedReplicaSet {
@@ -48,15 +64,23 @@ impl ReplicaSet for DelayedReplicaSet {
         requests: &[ReplicaAppendRequest],
         leader_committed_offset: u64,
     ) -> ReplicaQuorumResult {
+        let started = Instant::now();
         self.rounds.fetch_add(1, Ordering::SeqCst);
         thread::sleep(REPLICATION_DELAY);
-        self.inner
-            .replicate_append_batch(requests, leader_committed_offset)
+        let quorum = self
+            .inner
+            .replicate_append_batch(requests, leader_committed_offset);
+        let spent = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.round_nanos.fetch_add(spent, Ordering::SeqCst);
+        quorum
     }
 
     fn propagate_committed_hwm(&self, update: &CommittedHwmUpdate) {
+        let started = Instant::now();
         thread::sleep(PROPAGATE_DELAY);
         self.inner.propagate_committed_hwm(update);
+        let spent = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.propagate_nanos.fetch_add(spent, Ordering::SeqCst);
     }
 }
 
@@ -90,7 +114,9 @@ fn open_segment(dir: &TempDir, segment_id: u128) -> ActiveSegment {
     .unwrap()
 }
 
-fn replicated_leader(group_commit: Option<GroupCommitConfig>) -> (Arc<LocalBroker>, Vec<TempDir>) {
+fn replicated_leader(
+    group_commit: Option<GroupCommitConfig>,
+) -> (Arc<LocalBroker>, Arc<DelayedReplicaSet>, Vec<TempDir>) {
     let meta = MetaFencingEpoch::new(EPOCH);
     let mut dirs = Vec::new();
     let mut followers = Vec::new();
@@ -118,6 +144,8 @@ fn replicated_leader(group_commit: Option<GroupCommitConfig>) -> (Arc<LocalBroke
     let replicas = Arc::new(DelayedReplicaSet {
         inner: InProcessReplicaSet::new(followers),
         rounds: AtomicU64::new(0),
+        round_nanos: AtomicU64::new(0),
+        propagate_nanos: AtomicU64::new(0),
     });
     let mut broker = LocalBroker::with_replication(
         segment,
@@ -127,14 +155,14 @@ fn replicated_leader(group_commit: Option<GroupCommitConfig>) -> (Arc<LocalBroke
         meta,
         LEADER,
         Some(ClusterCommittedOffset::new(0)),
-        Some(replicas as Arc<dyn ReplicaSet>),
+        Some(Arc::clone(&replicas) as Arc<dyn ReplicaSet>),
     )
     .unwrap();
     if let Some(config) = group_commit {
         broker = broker.with_group_commit(config).unwrap();
     }
     dirs.push(leader_dir);
-    (Arc::new(broker), dirs)
+    (Arc::new(broker), replicas, dirs)
 }
 
 fn produce(producer: u128, durability: WireDurability) -> WireFrame {
@@ -173,7 +201,7 @@ fn spent(broker: &LocalBroker, phase: ProducePhase) -> Duration {
 /// commit or the other way round. Together they fit inside the request.
 #[test]
 fn a_quorum_produce_splits_its_time_into_fsync_replicate_and_commit() {
-    let (broker, _dirs) = replicated_leader(None);
+    let (broker, replicas, _dirs) = replicated_leader(None);
     let started = Instant::now();
     expect_ack(broker.handle(Role::Producer, produce(0xB1, WireDurability::Quorum)));
     let request = started.elapsed();
@@ -182,15 +210,26 @@ fn a_quorum_produce_splits_its_time_into_fsync_replicate_and_commit() {
     let replicate = spent(&broker, ProducePhase::Replicate);
     let commit = spent(&broker, ProducePhase::Commit);
     assert!(fsync > Duration::ZERO, "the leader fsynced: {fsync:?}");
+    // Each phase's timer encloses its own call into the replica set, so it
+    // reads at least what the call took (measured, not assumed) and the other
+    // phase's call is not in it: the round's floor is the propagation's
+    // injected delay below, and the other way round. Both sides move together
+    // on a slow runner.
+    let round = replicas.round();
+    let propagation = replicas.propagation();
     assert!(
-        replicate >= REPLICATION_DELAY && replicate < REPLICATION_DELAY + PROPAGATE_DELAY,
-        "the replication round took at least {REPLICATION_DELAY:?} and must not hold the \
-         propagation's {PROPAGATE_DELAY:?}: {replicate:?}"
+        round >= REPLICATION_DELAY && propagation >= PROPAGATE_DELAY,
+        "the injected delays ran: {round:?}, {propagation:?}"
     );
     assert!(
-        commit >= PROPAGATE_DELAY && commit < PROPAGATE_DELAY + REPLICATION_DELAY,
-        "the commit holds the mark's propagation ({PROPAGATE_DELAY:?}) and not the round: \
-         {commit:?}"
+        replicate >= round && replicate - round < propagation,
+        "the replicate phase holds the round ({round:?}) and not the propagation \
+         ({propagation:?}): {replicate:?}"
+    );
+    assert!(
+        commit >= propagation && commit - propagation < round,
+        "the commit holds the mark's propagation ({propagation:?}) and not the round \
+         ({round:?}): {commit:?}"
     );
     assert!(
         fsync + replicate + commit <= request,
@@ -216,7 +255,7 @@ fn a_local_produce_spends_only_the_local_fsync() {
 /// path, not the refusals.
 #[test]
 fn a_refused_produce_is_not_timed() {
-    let (broker, _dirs) = replicated_leader(None);
+    let (broker, _replicas, _dirs) = replicated_leader(None);
     // LocalFsync on a replicated range is refused before the append.
     let refused = broker.handle(Role::Producer, produce(0xB1, WireDurability::LocalFsync));
     assert!(matches!(refused.message, Message::Error(_)), "{refused:?}");
@@ -229,7 +268,7 @@ fn a_refused_produce_is_not_timed() {
 /// and the totals count the group's round once, not once per member.
 #[test]
 fn a_commit_group_is_timed_once_not_once_per_member() {
-    let (broker, _dirs) = replicated_leader(Some(GroupCommitConfig {
+    let (broker, replicas, _dirs) = replicated_leader(Some(GroupCommitConfig {
         // Seals on the fourth request; the delay is a backstop.
         max_delay: Duration::from_secs(10),
         max_records: 4,
@@ -254,9 +293,29 @@ fn a_commit_group_is_timed_once_not_once_per_member() {
         handle.join().unwrap();
     }
     assert_eq!(broker.group_commit().unwrap().metrics().commits_total(), 1);
+    // One group is one call into the replica set: counted, not timed.
+    assert_eq!(
+        replicas.rounds.load(Ordering::SeqCst),
+        1,
+        "four members of one group must share one replication round"
+    );
+    // The broker's timer encloses the call, so it can never read less than
+    // the call took, and a phase booked once reads that plus the few
+    // instructions around the call. Booked once per member it would read
+    // four times the round. Both sides move together with a slow runner, so
+    // the check holds however slow the round was.
+    let round = replicas.round();
     let replicate = spent(&broker, ProducePhase::Replicate);
     assert!(
-        replicate >= REPLICATION_DELAY && replicate < REPLICATION_DELAY * 2,
-        "one group is one replication round, timed once: {replicate:?}"
+        round >= REPLICATION_DELAY,
+        "the round ran its injected delay: {round:?}"
+    );
+    assert!(
+        replicate >= round,
+        "the phase encloses the round ({round:?}): {replicate:?}"
+    );
+    assert!(
+        replicate < round * 2,
+        "one group is one replication round ({round:?}), timed once: {replicate:?}"
     );
 }

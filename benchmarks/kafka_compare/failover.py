@@ -144,8 +144,8 @@ def ensure_vtop_image(rebuild: bool) -> str:
     return image
 
 
-def capture_environment(run_id: str, matrix: dict, vtop_image: str, limits: dict) -> dict:
-    env = phase1.capture_environment(run_id, matrix, vtop_image, limits)
+def capture_environment(run_id: str, matrix: dict, vtop_image: str, limits: dict, disk: str) -> dict:
+    env = phase1.capture_environment(run_id, matrix, vtop_image, limits, disk)
     c = env["comparable"]
     c["vtop_commit"] = engine_commit()
     c["harness_commit"] = phase1.git("rev-parse", "HEAD")
@@ -812,6 +812,7 @@ def main(argv: list[str] | None = None) -> int:
         running = sh(["docker", "ps", "-q", "--filter", f"label=com.docker.compose.project={SPEC[system]['project']}"])
         if running.stdout.strip():
             raise SystemExit(f"{SPEC[system]['project']} is already running; stop it first (one system at a time)")
+    disk = phase1.probe_host_disk()
     sh(["docker", "pull", "-q", KAFKA_IMAGE], timeout=1800)
     sh(["docker", "pull", "-q", PYTHON_IMAGE], timeout=1800)
     vtop_image = ensure_vtop_image(args.rebuild)
@@ -832,7 +833,7 @@ def main(argv: list[str] | None = None) -> int:
               "timeline_from_ms": TIMELINE_FROM_MS, "timeline_to_ms": TIMELINE_TO_MS,
               "drain_deadline_s": DRAIN_DEADLINE_S, "vtop_batch": args.vtop_batch,
               "vtop_value_bytes": args.vtop_value_bytes, "order": "per fault, per repetition: kafka then vtop"}
-    env = capture_environment(run_id, matrix, vtop_image, limits)
+    env = capture_environment(run_id, matrix, vtop_image, limits, disk)
     ctx = {"run_id": run_id, "run_dir": run_dir, "work": work, "certs": certs, "env": env,
            "fingerprint": schema.fingerprint(env), "vtop_image": vtop_image, "rate": args.rate, "total": total,
            "vtop_batch": args.vtop_batch, "vtop_value_bytes": args.vtop_value_bytes, "keep_raw": args.keep_raw,

@@ -27,7 +27,7 @@ Ground truth: `.github/workflows/release.yml` (a push of a `v*` tag publishes), 
 
 ## 1. The bump PR
 
-Branch from `origin/main` (`release/vX.Y.Z-bump` was used for 0.8.0, `release/0.7.0` for 0.7.0). Title `release: bump the workspace to X.Y.Z`. Four files, plus the citation file:
+Branch from `origin/main` (`release/vX.Y.Z-bump` was used for 0.8.0, `release/0.7.0` for 0.7.0). Title `release: bump the workspace to X.Y.Z`. Four files, plus the citation file, and on a minor release `SECURITY.md`:
 
 | File | Change |
 |---|---|
@@ -35,6 +35,7 @@ Branch from `origin/main` (`release/vX.Y.Z-bump` was used for 0.8.0, `release/0.
 | `Cargo.lock` | `cargo update --workspace`. The diff must be exactly the **twelve** `vtop-*` entries and no third-party package; if anything else moved, revert it. Then `cargo check --workspace --locked`. |
 | `helm/vtop/Chart.yaml` | `appVersion: "X.Y.Z"` (it must track the workspace version; GHCR tags follow it). The chart's own `version` follows its contract, not the app: **patch** bump when no template or values changed since the last tag, **minor** when they did (a values-contract change). Check with `git diff vPREV..origin/main --stat -- helm/vtop/templates helm/vtop/values.yaml helm/vtop/ci`. Add the matching comment line above `version:` (0.5.1 for 0.8.0: "no template or values change — the bump carries appVersion 0.8.0"). Nothing in CI ties `appVersion` to `Cargo.toml`, so review it by eye. |
 | `docs/ROADMAP.md` | A section for the release (below), and the forward section renamed to the next release. |
+| `SECURITY.md` | **Minor releases only:** the "Supported versions" row becomes `X.Y.x` (only the latest minor receives security fixes). `scripts/check-security-policy.py` fails the docs build until it matches `Cargo.toml`. |
 | `CITATION.cff` | `version` and `date-released` (the day the tag is pushed, as `YYYY-MM-DD`; v0.8.0 is `2026-11-12`). If the tag goes out on another day, fix the date in a follow-up PR; the tag does not move. |
 
 ### The ROADMAP section
@@ -129,6 +130,7 @@ Also: the image's `latest` tag moved (only for a non-pre-release), `helm/vtop/Ch
 - [ ] Bump PR touches only Cargo.toml (11 edits), Cargo.lock (12 `vtop-*` entries), Chart.yaml, ROADMAP.md, CITATION.cff.
 - [ ] Chart version bump matches whether templates or values changed.
 - [ ] ROADMAP: upgrade order, one-way changes with reasons, silently ignored keys, known open, no downgrade.
+- [ ] Before the bump PR, on Linux, the ignored delete stress test run by hand on tmpfs, ext4 and overlay, once each (`TMPDIR=<dir on that filesystem> cargo test -p vtop-adapters --lib --locked -- --ignored delete_race_stress --nocapture`; in Docker, `/dev/shm` is tmpfs, the container's `/tmp` is overlay, a named volume is ext4). It must report 0 lines lost; record its summary line (lines written, archived, kept on disk unarchived, deletes, `opened_at_unlink`) in the bump PR. Not a CI gate: a lease behaves by filesystem, and the run is a few minutes of writers racing deletes (#619).
 - [ ] CI green on the exact head; head contains current `main`; merged by REST with `sha` pinned.
 - [ ] Tag is annotated, on the merge commit, and matches `Cargo.toml`.
 - [ ] `release.yml` green; ten assets; `SHA256SUMS`, every Sigstore bundle and the image signature verified; macOS `otool` clean and `minos 11.0`.
