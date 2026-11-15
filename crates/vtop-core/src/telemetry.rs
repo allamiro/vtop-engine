@@ -109,15 +109,19 @@ pub const RECEIPT_WRITE_RESULTS: [&str; 3] = ["written", "failed", "repaired"];
 pub const OBJECT_LOCK_MODES: [&str; 3] = ["off", "governance", "compliance"];
 
 /// The values of `outcome` on `vtop_file_delete_decisions_total` (#619):
-/// `deleted`, or why `delete_after_commit` kept a fully archived file.
-pub const FILE_DELETE_OUTCOMES: [&str; 16] = [
+/// `deleted`, `deleted_unchecked` (deleted under `delete_without_open_check`
+/// with no lease to prove no process had it open), or why
+/// `delete_after_commit` kept a fully archived file.
+pub const FILE_DELETE_OUTCOMES: [&str; 18] = [
     "deleted",
+    "deleted_unchecked",
     "appended",
     "shorter",
     "other_file",
     "rewritten",
     "unprovable",
     "metadata_changed",
+    "links_changed",
     "gone",
     "symlink",
     "open",
@@ -302,15 +306,19 @@ pub struct Metrics {
     pub upload_egress_bytes_total: IntCounterVec,
 
     /// Every decision `sources.file.delete_after_commit` takes about a fully
-    /// archived file (#619), by `outcome`: `deleted`, or why it was kept -
-    /// `appended`, `shorter`, `other_file`, `rewritten`, `unprovable`,
-    /// `metadata_changed`, `gone`, `symlink`, `open`, `no_open_check`,
-    /// `rename_refused`, `failed`, `stale_commit` - plus `leftover_archived`
-    /// for a file found under a delete's hidden name, and
-    /// `opened_at_unlink` for a delete a late open slipped past. A fixed set,
+    /// archived file (#619), by `outcome`: `deleted`, `deleted_unchecked`
+    /// (deleted under `delete_without_open_check` with no lease, so nothing
+    /// proved no process had it open), or why it was kept - `appended`,
+    /// `shorter`, `other_file`, `rewritten`, `unprovable`,
+    /// `metadata_changed`, `links_changed`, `gone`, `symlink`, `open`,
+    /// `no_open_check`, `rename_refused`, `failed`, `stale_commit` - plus
+    /// `leftover_archived` for a file found under a delete's hidden name, and
+    /// `opened_at_unlink` for a delete a late open slipped past (also counted
+    /// as `deleted`, so the two are not added). A fixed set,
     /// never the path: the path is in the log line beside each count. A
     /// rising `no_open_check` or `rename_refused` means files that will not
-    /// be deleted until the operator acts.
+    /// be deleted until the operator acts; any `deleted_unchecked` means the
+    /// operator is living with the opt-in's two windows.
     pub file_delete_decisions_total: IntCounterVec,
 
     /// Changes to a Kafka topic's partition list seen while reading, and what
