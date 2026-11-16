@@ -107,3 +107,10 @@ required-features = ["failpoints"]
 [[test]]
 name = "integration_metrics_endpoint"
 path = "tests/integration_metrics_endpoint.rs"
+
+# The schema on one PostgreSQL major (#723): `vtopctl migrate` twice, and a
+# ledger restore into a migrated schema. Needs a throwaway server
+# (VTOP_TEST_POSTGRES) and its client tools (VTOP_TEST_PG_EXEC); skips without.
+[[test]]
+name = "postgres_migrate_restore"
+required-features = ["postgres"]

@@ -45,7 +45,9 @@ Stop every engine first.
   engine starts: a schema restored from an older backup carries an older
   trigger function, and the engine refuses it. A data-only restore into a
   migrated schema is refused by the commit-rule trigger unless triggers are
-  disabled for the restore; the two ways to do that are in
+  disabled for the restore, and into a database `vtopctl migrate` has just
+  created it also needs that migration's two audit records cleared first;
+  both steps are in
   [PostgreSQL in depth](../POSTGRES_DEPLOYMENT.md#upgrades-and-rollback).
 
 Then check the result:

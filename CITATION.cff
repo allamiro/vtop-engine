@@ -12,7 +12,7 @@ authors:
 repository-code: "https://github.com/allamiro/vtop-engine"
 url: "https://github.com/allamiro/vtop-engine"
 license: MIT
-version: "0.10.0"
+version: "0.10.1"
 date-released: "2026-11-15"
 keywords:
   - telemetry
