@@ -16,11 +16,41 @@
 #   2. a cargo build in release.yml or docker/Dockerfile names the feature,
 #      or turns on every feature with --all-features.
 #
+# With --binary it checks a built vtopctl instead: the line the failpoint
+# prints just before the kill is compiled only into a `failpoints` build, so
+# a binary that contains it can kill itself. The text is read from
+# crates/vtop-cli/src/failpoints.rs first, so rewording the message cannot
+# make this check search for a string that no longer exists.
+# --expect-present is the positive control, run on the sweep's own build.
+#
 #   scripts/check-failpoints-absent.sh   (needs cargo; reads the lock file)
+#   scripts/check-failpoints-absent.sh --binary target/release/vtopctl
+#   scripts/check-failpoints-absent.sh --binary target/debug/vtopctl --expect-present
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 fail() { printf 'check-failpoints-absent: FAIL: %s\n' "$*" >&2; exit 1; }
+
+if [[ "${1:-}" == "--binary" ]]; then
+  binary="${2:-}"
+  expect="${3:-}"
+  [[ -n "$binary" && -f "$binary" ]] || fail "--binary needs the path of a built vtopctl, got '${binary}'"
+  [[ -z "$expect" || "$expect" == "--expect-present" ]] || fail "unknown argument '$expect'"
+  marker="is being killed here on purpose"
+  grep -qF "$marker" crates/vtop-cli/src/failpoints.rs \
+    || fail "crates/vtop-cli/src/failpoints.rs no longer prints '$marker' before a kill; update this check to the new text"
+  # grep -c, not -q: -q stops reading at the first match and the pipe's
+  # writer can then fail with SIGPIPE under pipefail.
+  found="$(LC_ALL=C grep -caF "$marker" "$binary" || true)"
+  if [[ "$expect" == "--expect-present" ]]; then
+    (( found > 0 )) || fail "$binary was meant to be a failpoints build, but it does not contain '$marker'; this check could not tell the two apart"
+    echo "check-failpoints-absent: $binary is a failpoints build (the positive control)"
+  else
+    (( found == 0 )) || fail "$binary contains the failpoint kill ('$marker'): it was built with the failpoints feature and can kill itself on request"
+    echo "check-failpoints-absent: $binary has no failpoint code"
+  fi
+  exit 0
+fi
 
 features() { # <extra cargo args...> — vtop-cli's resolved features, one per line
   cargo tree --locked --workspace -e normal,build,features -i vtop-cli --prefix none "$@" \

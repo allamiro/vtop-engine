@@ -13,8 +13,9 @@
 # Invariants, checked for every point:
 #   safety   the commit rule: the consumer group's committed offset on the
 #            broker never passes the end of the highest range the ledger
-#            records as VERIFIED (checked at the kill, and again after the
-#            restart has drained)
+#            records as VERIFIED, and no SOURCE_COMMITTED row in the ledger
+#            lacks what the VERIFIED write leaves (checked at the kill, and
+#            again after the restart has drained)
 #   safety   no hole: `audit-coverage --check-storage` passes, `scrub` reads
 #            every committed object back clean, and every produced record is
 #            found in the objects the store holds, counted by this harness
@@ -56,8 +57,9 @@
 #   ENGINE_SWEEP_BUCKET       bucket (default telemetry-sweep; created by the
 #                             engine)
 #
-# Budget: 9 to 12 s a point with a debug build, measured locally (238 s for
-# all 21 points); the measurement is in docs/LIVE_CHAOS_VALIDATION.md. The
+# Budget: 11 to 12 s a point with a debug build, measured locally (239 s for
+# all 21 points, 55 s for the five pull-request points); the measurement is
+# in docs/LIVE_CHAOS_VALIDATION.md. The
 # workflow's per-point wait is bounded by ENGINE_SWEEP_POINT_TIMEOUT_SECONDS.
 #
 # Not covered here (#725 PR 2): PostgreSQL, the file source, a store outage

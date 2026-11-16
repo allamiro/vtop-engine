@@ -14,8 +14,10 @@ import sweep_checks as sc
 
 SCHEMA = (
     "CREATE TABLE batches (batch_id TEXT PRIMARY KEY, source_type TEXT, state TEXT, "
-    "progress_end_json TEXT, created_at TEXT)"
+    "progress_end_json TEXT, created_at TEXT, verification_class TEXT, "
+    "object_uri TEXT, manifest_uri TEXT)"
 )
+INSERT = "INSERT INTO batches VALUES (?, 'kafka', ?, ?, ?, ?, ?, ?)"
 
 
 def marker(end, topic="t", partition=0, group="g"):
@@ -51,15 +53,14 @@ class LedgerTest(unittest.TestCase):
         self.db = str(Path(self.dir.name) / "state.db")
         conn = sqlite3.connect(self.db)
         conn.execute(SCHEMA)
+        ok = ("strong", "s3://b/o", "s3://b/m")
         rows = [
-            ("b1", "source_committed", marker(19), "1"),
-            ("b2", "verified", marker(39), "2"),
-            ("b3", "checksummed", marker(49), "3"),
-            ("other", "source_committed", marker(999, group="other"), "4"),
+            ("b1", "source_committed", marker(19), "1", *ok),
+            ("b2", "verified", marker(39), "2", *ok),
+            ("b3", "checksummed", marker(49), "3", None, None, None),
+            ("other", "source_committed", marker(999, group="other"), "4", None, None, None),
         ]
-        conn.executemany(
-            "INSERT INTO batches VALUES (?, 'kafka', ?, ?, ?)", rows
-        )
+        conn.executemany(INSERT, rows)
         conn.commit()
         conn.close()
 
@@ -74,6 +75,25 @@ class LedgerTest(unittest.TestCase):
         self.assertEqual(
             [r["state"] for r in s["in_flight"]], ["VERIFIED", "CHECKSUMMED"]
         )
+
+    def test_a_committed_row_without_the_verified_evidence_is_named(self):
+        conn = sqlite3.connect(self.db)
+        conn.execute(INSERT, ("b4", "source_committed", marker(59), "5", None, "s3://b/o", None))
+        conn.commit()
+        conn.close()
+        s = sc.ledger_summary(self.db, "t", 0, "g")
+        self.assertEqual(
+            s["committed_unverified"],
+            [
+                {
+                    "batch_id": "b4",
+                    "end_offset": 59,
+                    "lacking": ["verification_class", "manifest_uri"],
+                }
+            ],
+        )
+        # The other group's unverified committed row is not this sweep's.
+        self.assertNotIn("other", json.dumps(s["committed_unverified"]))
 
     def test_a_missing_ledger_has_no_rows(self):
         s = sc.ledger_summary(str(Path(self.dir.name) / "absent.db"), "t", 0, "g")
@@ -98,6 +118,20 @@ class CommitRuleTest(unittest.TestCase):
         self.assertIn("COMMIT RULE VIOLATED", msg)
         self.assertIn("is 50", msg)
         self.assertIn("ends at 39", msg)
+
+    def test_a_committed_row_that_skipped_verified_is_a_violation(self):
+        ledger = {
+            "verified_end": 19,
+            "states": {"SOURCE_COMMITTED": 1},
+            "committed_unverified": [
+                {"batch_id": "b1", "end_offset": 19, "lacking": ["verification_class"]}
+            ],
+        }
+        ok, msg = sc.commit_rule("20", ledger, "p", "after the restart")
+        self.assertFalse(ok)
+        self.assertIn("COMMIT RULE VIOLATED", msg)
+        self.assertIn("without the VERIFIED write's evidence", msg)
+        self.assertIn("b1", msg)
 
     def test_a_commit_with_nothing_verified_is_a_violation(self):
         ok, msg = sc.commit_rule("1", {"verified_end": None, "states": {}}, "p", "at kill")

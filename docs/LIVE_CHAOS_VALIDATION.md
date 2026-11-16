@@ -183,7 +183,10 @@ hook is an empty inline function and the variable is not read. No release
 archive, container image or chart enables it, and
 `scripts/check-failpoints-absent.sh` (the `failpoints absent from release
 builds` job) fails if the workspace's default features, `release.yml` or the
-Dockerfile ever would. An unknown point refuses to start and lists the valid
+Dockerfile ever would. The same script, given a built binary, looks for the
+line the failpoint prints before the kill: ci.yml's test job runs it on its
+release build of `vtopctl` (it must be absent), and the sweep runs it on its
+own build (it must be present, the positive control). An unknown point refuses to start and lists the valid
 ones; the sweep reads its point list from that refusal, so the list lives in
 one place (`crates/vtop-cli/src/failpoints.rs`) and a full run fails if it
 did not run every entry.
@@ -212,7 +215,8 @@ ledger, work directory and object prefix over one seeded topic.
 
 | Invariant | Kind | How |
 |---|---|---|
-| The commit rule: the group's committed offset never passes the end of the highest range the ledger records as VERIFIED | safety | read from the broker (`kafka-consumer-groups.sh`) and from the ledger (opened read-only, so the WAL the kill left is not checkpointed), at the kill and again after the restart |
+| The commit rule at the source: the group's committed offset never passes the end of the highest range the ledger records as VERIFIED | safety | read from the broker (`kafka-consumer-groups.sh`) and from the ledger (opened read-only, so the WAL the kill left is not checkpointed), at the kill and again after the restart |
+| The commit rule in the ledger: no SOURCE_COMMITTED row lacks what the VERIFIED write leaves (the verification class, which only `mark_verified` sets, the object and the manifest) | safety | the same read-only ledger read, at the kill and after the restart |
 | No hole | safety | `vtopctl audit-coverage --check-storage` passes, `vtopctl scrub` is clean, and every produced record is found in the objects the store holds, copied out with `mc` and counted by the harness, not by the engine |
 | Duplicates only where the at-least-once window is open | safety | the extra copies are counted against the table below |
 | The restart commits every record and stops cleanly | liveness | bounded poll on the group's committed offset and the ledger, then `SIGTERM` and exit 0 |
@@ -251,11 +255,17 @@ commit-boundary points (`mid_object_put`, `after_object_put_before_ledger`,
 engine, the ledger, the upload path, the adapters or the harness.
 
 **Measured.** A full local run (21 points, 50 records each, batches of 20, a
-debug build, `apache/kafka:4.3.1` and the lab's MinIO on one CPU each) took
-238 s, 9 to 12 s a point, with no duplicate at any point. With the source
-commit moved ahead of the VERIFIED write (a deliberate mutation), the sweep
-fails at `after_source_commit_before_ledger`, naming the committed offset and
-the ledger's states.
+debug build in a container capped at two CPUs, `apache/kafka:4.3.1` capped
+at one, and the lab's MinIO, all on one laptop) took 239 s, 11 to 12 s a
+point, with no duplicate at any point. The five pull-request points took
+55 s. With `mark_verified` moved behind the source commit (a deliberate
+mutation: the ledger's transitions stay legal, so only the comparison with
+the broker can see it), the five pull-request points fail at
+`after_source_commit_before_ledger`: "COMMIT RULE VIOLATED: the consumer
+group's committed offset is 20, but in the ledger no range is recorded as
+VERIFIED or SOURCE_COMMITTED, so offsets 0..19 were committed at the source
+before they were verified. Ledger states: {"MANIFEST_UPLOADED": 1}". With
+the mutation reverted they pass.
 
 **Not covered yet.** PostgreSQL as the ledger, the file source, a store
 outage before the kill and ENOSPC (the second part of #725); the syslog

@@ -15,13 +15,17 @@ the store holds.
   ledger DB TOPIC PARTITION GROUP
       The ledger's rows for one Kafka partition and consumer group: state
       counts, the highest end offset of a VERIFIED or SOURCE_COMMITTED row,
-      the highest end offset of a SOURCE_COMMITTED row, and the rows in an
-      in-flight state.
+      the highest end offset of a SOURCE_COMMITTED row, the rows in an
+      in-flight state, and the SOURCE_COMMITTED rows that carry no evidence
+      of having been VERIFIED (no verification class, which only the VERIFIED
+      write sets, or no object or manifest).
   commit-rule COMMITTED LEDGER_JSON POINT WHEN
-      The commit rule at one instant: the group's committed offset on the
-      broker (`-` for none) never passes the end of the highest VERIFIED
-      range, i.e. committed <= verified_end + 1 (Kafka commits the NEXT
-      offset to read). Exits 1 naming both numbers when it does.
+      The commit rule at one instant, from both sides. At the source: the
+      group's committed offset on the broker (`-` for none) never passes the
+      end of the highest VERIFIED range, i.e. committed <= verified_end + 1
+      (Kafka commits the NEXT offset to read). In the ledger: no
+      SOURCE_COMMITTED row lacks the VERIFIED write's evidence. Exits 1
+      naming the numbers or the rows when either fails.
   readback DIR RECORDS PREFIX
       Every record id PREFIX%06d for 0 <= i < RECORDS found in the objects
       under DIR, counted: missing ids, duplicated ids and the extra copies.
@@ -73,6 +77,7 @@ def ledger_summary(db: str, topic: str, partition: int, group: str) -> dict:
         "verified_end": None,
         "committed_end": None,
         "in_flight": [],
+        "committed_unverified": [],
     }
     if not os.path.exists(db):
         return summary
@@ -80,7 +85,8 @@ def ledger_summary(db: str, topic: str, partition: int, group: str) -> dict:
     conn = sqlite3.connect(uri, uri=True)
     try:
         rows = conn.execute(
-            "SELECT batch_id, state, progress_end_json FROM batches "
+            "SELECT batch_id, state, progress_end_json, verification_class, "
+            "object_uri, manifest_uri FROM batches "
             "WHERE source_type = 'kafka' ORDER BY created_at, batch_id"
         ).fetchall()
     except sqlite3.OperationalError as err:
@@ -92,7 +98,7 @@ def ledger_summary(db: str, topic: str, partition: int, group: str) -> dict:
     finally:
         conn.close()
     states: Counter = Counter()
-    for batch_id, state, end_json in rows:
+    for batch_id, state, end_json, verification_class, object_uri, manifest_uri in rows:
         # The ledger stores states in lower case.
         state = state.upper()
         marker = json.loads(end_json)
@@ -109,6 +115,21 @@ def ledger_summary(db: str, topic: str, partition: int, group: str) -> dict:
             summary["verified_end"] = max(summary["verified_end"] or -1, offset)
         if state == "SOURCE_COMMITTED":
             summary["committed_end"] = max(summary["committed_end"] or -1, offset)
+            # Only the VERIFIED write sets the class (mark_verified), so a
+            # committed row without one reached SOURCE_COMMITTED without it.
+            lacking = [
+                name
+                for name, value in (
+                    ("verification_class", verification_class),
+                    ("object_uri", object_uri),
+                    ("manifest_uri", manifest_uri),
+                )
+                if not value
+            ]
+            if lacking:
+                summary["committed_unverified"].append(
+                    {"batch_id": batch_id, "end_offset": offset, "lacking": lacking}
+                )
         if state in IN_FLIGHT:
             summary["in_flight"].append({"batch_id": batch_id, "state": state})
     summary["states"] = dict(sorted(states.items()))
@@ -116,6 +137,13 @@ def ledger_summary(db: str, topic: str, partition: int, group: str) -> dict:
 
 
 def commit_rule(committed: str, ledger: dict, point: str, when: str) -> tuple[bool, str]:
+    unverified = ledger.get("committed_unverified") or []
+    if unverified:
+        return False, (
+            f"{point} ({when}): COMMIT RULE VIOLATED: {len(unverified)} ledger row(s) are "
+            f"SOURCE_COMMITTED without the VERIFIED write's evidence: "
+            f"{json.dumps(unverified)}. Ledger states: {json.dumps(ledger['states'])}"
+        )
     if committed in ("", "-"):
         return True, f"{point} ({when}): the group has no committed offset"
     committed_at = int(committed)

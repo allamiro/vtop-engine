@@ -11,14 +11,16 @@ name: engine crash sweep
 #   workflow_dispatch  every point, or the ones named
 #   pull_request       the five commit-boundary points, and only when the
 #                      engine, the ledger, the upload path, the adapters or
-#                      the harness change (about 5 minutes after the build)
+#                      the harness change (55 s measured locally, after
+#                      the build)
 # A scheduled workflow runs only from the default branch, so the nightly
 # itself is first proven on main; a pull request proves the same job with
 # fewer points.
 #
 # The failpoints-absent job checks that no shipped build carries the
 # feature that lets the engine kill itself. It runs whenever a file that
-# decides a release build's features changes.
+# decides a release build's features changes. The test job in ci.yml also
+# checks its release build of vtopctl for the kill itself.
 
 on:
   schedule:
@@ -159,6 +161,11 @@ jobs:
       - name: The harness checks (unit tests)
         run: python3 -m unittest discover -s scripts/live-chaos/engine -p 'test_*.py' -v
 
+      # The workspace clippy in ci.yml builds without the feature, so the
+      # code behind it (the decorators, the kill) is linted only here.
+      - name: Clippy with failpoints (deny warnings)
+        run: cargo clippy -p vtop-cli --features failpoints --all-targets --locked -- -D warnings
+
       # Every point kills the real binary where it says, with a local file
       # source and store: seconds, and it pins the placement the live sweep
       # relies on.
@@ -167,6 +174,11 @@ jobs:
 
       - name: Build vtopctl with failpoints
         run: cargo build -p vtop-cli --features failpoints --locked --bin vtopctl
+
+      # The positive control for the release-binary check in ci.yml's test
+      # job: the same search finds the kill in a build that has it.
+      - name: The failpoints build carries the kill
+        run: bash scripts/check-failpoints-absent.sh --binary target/debug/vtopctl --expect-present
 
       # A fresh broker creates the group coordinator lazily, on the first
       # group operation; until then a consumer gets NotCoordinator. Consuming
