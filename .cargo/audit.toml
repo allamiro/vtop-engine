@@ -4,45 +4,33 @@
 # actionable vulnerabilities block the build. The advisories below are
 # unfixable transitive entries with documented justification; each MUST be
 # re-evaluated when its upstream ships a fix (see docs/SECURITY_MODEL.md §13).
+#
+# Every id carries `# reviewed: YYYY-MM-DD` on its own line: the day someone
+# last re-checked it (is a fix released, does `cargo update -p <crate>` reach
+# it, is the crate still in the graph). scripts/check-advisory-review.py fails
+# CI when a date is more than 90 days old, and warns from day 75. deny.toml
+# mirrors each id with the same date; docs/SECURITY_MODEL.md §13 lists it.
 
 [advisories]
 ignore = [
-    # rsa — Marvin timing side-channel. No fixed upgrade exists upstream.
-    # `rsa` is pulled ONLY by sqlx's optional MySQL driver, which this project
-    # does not enable (sqlite-only). It is a Cargo.lock entry and is NOT
-    # compiled or executed in any VTOP build (`cargo tree -i rsa` is empty).
-    "RUSTSEC-2023-0071",
-
-    # rkyv 0.7.46 — archive validation can permit out-of-bounds reads for
-    # archived Rc/Arc values. It is an optional rust_decimal feature pulled
-    # into Cargo.lock through openraft -> byte-unit, but the feature is not
-    # enabled and the crate is absent from every build graph
-    # (`cargo tree --target all -i rkyv@0.7.46` is empty). rust_decimal 1.42.1
-    # still pins the vulnerable major; remove this when upstream adopts
-    # rkyv >=0.8.17.
-    "RUSTSEC-2026-0235",
-
-    # rustls-webpki 0.101.x (3 advisories). Pulled transitively by
-    # aws-smithy-http-client 1.1.13, whose `__rustls` feature hard-depends on
-    # the legacy hyper-rustls 0.24 -> rustls 0.21 -> rustls-webpki 0.101 stack.
-    # No feature flag or `cargo update` removes it in the current AWS SDK; it
-    # requires an upstream aws-smithy-http-client release that drops
-    # hyper-rustls 0.24. Re-check and remove these on the next AWS SDK bump.
-    "RUSTSEC-2026-0098", # name constraints accepted for URI names
-    "RUSTSEC-2026-0099", # name constraints accepted for wildcard certs
-    "RUSTSEC-2026-0104", # reachable panic parsing a CRL
-
     # lru 0.16.4 — potential use-after-free from a lack of panic safety in
     # `LruCache::pop()`. UNSOUNDNESS, not a vulnerability, and it is reachable
     # only if a cached value's `Drop` panics during eviction.
     #
-    # No fixed release exists: 0.16.4 IS the newest published version, so there
-    # is nothing to upgrade to (`cargo update -p lru` moves nothing, and
-    # `--precise 0.16.5` reports no such package). It reaches this build solely
-    # through aws-sdk-s3 1.137.0, whose cached values are SDK-internal types
-    # this project neither supplies nor controls. Re-evaluate when upstream
-    # publishes a fix, and on the next AWS SDK bump.
-    "RUSTSEC-2026-0253",
+    # Fixed in lru >=0.18.2, a semver-incompatible line. It reaches this build
+    # solely through aws-sdk-s3 1.137.0, which requires lru ^0.16, so
+    # `cargo update -p lru` moves nothing; aws-sdk-s3 1.159.0 requires
+    # lru ^0.18.2, but `cargo update -p aws-sdk-s3` keeps 1.137.0, so the fix
+    # needs a deliberate AWS SDK bump. The cached values are SDK-internal types
+    # this project neither supplies nor controls. Remove this when aws-sdk-s3
+    # moves to a release that depends on lru >=0.18.2.
+    #
+    # Audit-only: deny.toml does not list it. cargo-deny's default
+    # `unsound = "workspace"` reports an unsound advisory only for a direct
+    # dependency of a workspace crate, so it never raises this one and would
+    # print `advisory-not-detected` for an ignore. cargo-audit reads every
+    # Cargo.lock entry and prints it as a warning without this ignore.
+    "RUSTSEC-2026-0253", # reviewed: 2026-11-16
 
     # unsafe-libyaml 0.2.11 — unmaintained (the upstream repository is archived).
     # UNMAINTAINED, not a vulnerability: no exploitable defect is reported, but
@@ -52,7 +40,7 @@ ignore = [
     # The advisory points at safe-Rust YAML parsers (saphyr / serde-saphyr);
     # moving to one is a deliberate migration of every config type, not a
     # version bump, and is follow-up work. Re-evaluate when it lands.
-    "RUSTSEC-2024-0449",
+    "RUSTSEC-2024-0449", # reviewed: 2026-11-16
 
     # crypto-bigint 0.5.5 — multiple timing-variability issues in operations
     # intended to be constant-time. Fixed in crypto-bigint >=0.7.6, a major
@@ -64,7 +52,7 @@ ignore = [
     # only for AWS SigV4/SigV4a request signing. Remove this exception when the
     # AWS signing / RustCrypto stack adopts crypto-bigint >=0.7.6
     # (elliptic-curve >=0.14).
-    "RUSTSEC-2026-0387",
+    "RUSTSEC-2026-0387", # reviewed: 2026-11-16
 
     # libsqlite3-sys 0.30.1 — bundles a SQLite affected by CVE-2026-119375.
     # Fixed in libsqlite3-sys >=0.39.0 (SQLite 3.54), reachable only through a
@@ -73,7 +61,7 @@ ignore = [
     # state-store database (operator-owned, on the host), never network input,
     # so a crafted-database CVE is not reachable by a remote party. Remove this
     # exception when sqlx ships a release depending on libsqlite3-sys >=0.39.
-    "RUSTSEC-2026-0459",
+    "RUSTSEC-2026-0459", # reviewed: 2026-11-16
 
     # pin-utils 0.1.0 — UNMAINTAINED (upstream repository archived; 0.1.1 is the
     # final release and no fix will be published). Not a vulnerability.
@@ -82,5 +70,5 @@ ignore = [
     # RUSTSEC-2024-0449 above). It reaches the build only through
     # aws-smithy-http / aws-smithy-runtime. Remove when the AWS SDK drops its
     # dependency on pin-utils.
-    "RUSTSEC-2026-0441",
+    "RUSTSEC-2026-0441", # reviewed: 2026-11-16
 ]
