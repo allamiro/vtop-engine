@@ -102,7 +102,15 @@ fn create_dirs_durably(
     // Deepest first: a directory is synced before the entry that names it.
     for d in &todo {
         sync.sync_dir(d)?;
-        if let Some(parent) = d.parent().filter(|p| !p.as_os_str().is_empty()) {
+        // The parent of a relative top directory is the working directory
+        // (`Path::parent` says "" for it), whose entry for `d` is the one
+        // that makes a new relative root survive.
+        if let Some(parent) = d.parent() {
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
             sync.sync_dir(parent)?;
         }
         unsynced.lock().unwrap_or_else(|p| p.into_inner()).remove(d);
@@ -693,6 +701,31 @@ mod tests {
                 .mode()
                 & 0o777;
             assert_eq!(got, mode);
+        }
+    }
+
+    /// A new relative root (`upload.local_path: archive`) is named by an entry
+    /// in the working directory; that directory is synced too, not skipped
+    /// because `Path::parent` of `archive` is empty.
+    #[tokio::test]
+    async fn a_new_relative_root_syncs_the_working_directory() {
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let name = PathBuf::from(format!("vtop-relroot-test-{}", std::process::id()));
+        let _cleanup = Cleanup(name.clone());
+        let rec = Recorder::default();
+        let unsynced = Mutex::default();
+        create_dirs_durably(&name.join("bkt"), &rec, &unsynced).unwrap();
+        let ev = rec.events();
+        for want in [format!("dir {} ", name.display()), "dir . ".to_string()] {
+            assert!(
+                ev.iter().any(|e| e.starts_with(&want)),
+                "{want:?} not in {ev:?}"
+            );
         }
     }
 }
