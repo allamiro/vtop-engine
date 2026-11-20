@@ -1,0 +1,224 @@
+"""The lab's parsers and the calls it makes, with no Docker (#726)."""
+
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import soak_lab  # noqa: E402
+
+DESCRIBE = """
+Consumer group 'vtop-soak' has no active members.
+
+GROUP      TOPIC        PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG  CONSUMER-ID  HOST  CLIENT-ID
+vtop-soak  soak-topic   0          1200            1500            300  -            -     -
+vtop-soak  soak-topic   1          -               900             -    -            -     -
+vtop-soak  other-topic  0          7               9               2    -            -     -
+"""
+
+
+def test_parse_probe_reads_the_engine_process():
+    text = "comm vtopctl\nrss_kb 204800\nfds 61\nwork_kb 1024\nledger_bytes 262144\n"
+    assert soak_lab.parse_probe(text) == {
+        "rss_bytes": 204800 * 1024,
+        "open_fds": 61,
+        "work_dir_bytes": 1024 * 1024,
+        "ledger_bytes": 262144,
+    }
+
+
+def test_parse_probe_refuses_a_pid_one_that_is_not_the_engine():
+    with pytest.raises(ValueError, match="not vtopctl"):
+        soak_lab.parse_probe("comm sh\nrss_kb 1\nfds 1\nwork_kb 1\nledger_bytes 1\n")
+
+
+def test_parse_probe_names_what_is_missing():
+    with pytest.raises(ValueError, match="rss_kb"):
+        soak_lab.parse_probe("comm vtopctl\nfds 1\n")
+
+
+def test_parse_describe_reads_committed_and_end_per_partition_of_the_topic():
+    rows = soak_lab.parse_describe(DESCRIBE, "vtop-soak", "soak-topic")
+    assert rows == {0: {"committed": 1200, "end": 1500}, 1: {"committed": None, "end": 900}}
+
+
+def test_parse_describe_treats_a_body_without_the_table_as_an_error_not_an_empty_answer():
+    with pytest.raises(ValueError, match="no offsets table"):
+        soak_lab.parse_describe(
+            "Error: Executing consumer group command failed due to timeout", "vtop-soak", "soak-topic"
+        )
+
+
+def test_lag_totals_sums_and_requires_every_partition():
+    rows = {0: {"committed": 10, "end": 20}, 1: {"committed": None, "end": 5}}
+    assert soak_lab.lag_totals(rows, 2) == {"end": 25, "committed": 10}
+    with pytest.raises(ValueError, match="expected 3 partitions"):
+        soak_lab.lag_totals(rows, 3)
+
+
+def test_parse_json_report_finds_the_object_after_log_lines():
+    text = 'INFO starting\n{\n  "checked": 4,\n  "passed": true,\n  "findings": []\n}\n'
+    assert soak_lab.parse_json_report(text)["checked"] == 4
+    with pytest.raises(ValueError, match="no JSON report"):
+        soak_lab.parse_json_report("just logs")
+
+
+def test_scrub_summary_counts_findings():
+    s = soak_lab.scrub_summary(
+        {"mode": "all", "checked": 12, "committed_rows": 12, "passed": False, "findings": [{}, {}]}
+    )
+    assert s == {"report_mode": "all", "batches_checked": 12, "committed_rows": 12, "findings": 2, "passed": False}
+
+
+def test_parse_pruned_reads_the_status_or_the_sentence():
+    assert soak_lab.parse_pruned('{"status": "ok", "deleted": 17, "digest": null}') == 17
+    assert soak_lab.parse_pruned("pruned 3 committed ledger row(s); digest /x; audit record a") == 3
+    assert soak_lab.parse_pruned("garbage") is None
+
+
+def test_the_shim_source_is_the_one_live_chaos_scenario_07_embeds():
+    source = soak_lab.extract_skew_shim_source()
+    assert "VTOP_SKEW_SECONDS" in source and "clock_gettime" in source and "VTOP_SKEW_LOADED_MARKER" in source
+    scenario = soak_lab.SKEW_SCENARIO.read_text()
+    assert source.strip() in scenario
+
+
+def test_a_scenario_without_the_shim_is_an_error(tmp_path):
+    other = tmp_path / "x.sh"
+    other.write_text("echo nothing here\n")
+    with pytest.raises(soak_lab.LabError, match="cannot find the clock-skew shim"):
+        soak_lab.extract_skew_shim_source(other)
+
+
+def test_shim_names_match_what_the_dockerfile_builds():
+    assert soak_lab.shim_name(3600) == "skew+3600.so"
+    assert soak_lab.shim_name(-3600) == "skew-3600.so"
+    dockerfile = (soak_lab.SOAK_DIR / "Dockerfile.engine").read_text()
+    assert "skew$(printf '%+d'" in dockerfile
+
+
+class Recorder:
+    def __init__(self, replies=None):
+        self.calls = []
+        self.replies = replies or {}
+
+    def __call__(self, argv, timeout):
+        self.calls.append(list(argv))
+        for key, reply in self.replies.items():
+            if key in " ".join(map(str, argv)):
+                return reply
+        return soak_lab.Result(0, "", "")
+
+
+def make_lab(tmp_path, runner=None, http=None, data_dir=None):
+    (tmp_path / "ctl").mkdir(exist_ok=True)
+    return soak_lab.Lab(
+        "vtop-t",
+        tmp_path,
+        "img:1",
+        toxiproxy_port=18999,
+        data_dir=data_dir,
+        load={"SOAK_RATE": 300},
+        runner=runner or Recorder(),
+        sleep=lambda s: None,
+        http=http,
+    )
+
+
+def test_compose_calls_carry_the_project_the_run_directory_and_the_load(tmp_path):
+    runner = Recorder()
+    lab = make_lab(tmp_path, runner)
+    lab.up("kafka", "minio")
+    argv = runner.calls[0]
+    assert argv[0] == "env"
+    assert "SOAK_PROJECT=vtop-t" in argv and f"SOAK_RUN_DIR={tmp_path}" in argv and "SOAK_RATE=300" in argv
+    assert argv[argv.index("-p") + 1] == "vtop-t"
+    assert argv[-4:] == ["up", "-d", "--wait", "kafka"] or argv[-2:] == ["kafka", "minio"]
+
+
+def test_the_engines_data_directories_are_handed_to_the_user_the_image_runs_as(tmp_path):
+    runner = Recorder()
+    make_lab(tmp_path, runner).prepare_data_dirs()
+    argv = runner.calls[0]
+    assert "run" in argv and "chown" in argv and "10001:10001" in argv
+    assert argv[-2:] == ["/data/state", "/data/work"]
+
+
+def test_a_data_dir_turns_the_volumes_into_bind_mounts(tmp_path):
+    env = make_lab(tmp_path, data_dir=tmp_path / "d").compose_env
+    assert env["SOAK_MINIO_DATA"] == str(tmp_path / "d" / "minio")
+    assert "SOAK_MINIO_DATA" not in make_lab(tmp_path).compose_env
+
+
+def test_state_parses_inspect_output(tmp_path):
+    runner = Recorder({"inspect": soak_lab.Result(0, "false|137|2026-01-01T00:00:00Z||false\n", "")})
+    state = make_lab(tmp_path, runner).state("engine")
+    assert state == {
+        "running": False,
+        "exit_code": 137,
+        "started_at": "2026-01-01T00:00:00Z",
+        "health": "",
+        "oom_killed": False,
+    }
+
+
+def test_state_is_empty_for_a_container_that_does_not_exist(tmp_path):
+    runner = Recorder({"inspect": soak_lab.Result(1, "", "No such object")})
+    assert make_lab(tmp_path, runner).state("engine") == {}
+
+
+def test_set_preload_writes_and_clears_the_file_the_entrypoint_reads(tmp_path):
+    lab = make_lab(tmp_path)
+    lab.set_preload(-3600)
+    assert (tmp_path / "ctl" / "ld_preload").read_text().strip() == "/opt/soak/shims/skew-3600.so"
+    lab.set_preload(None)
+    assert not (tmp_path / "ctl" / "ld_preload").exists()
+
+
+def test_skew_marker_reads_the_time_the_shim_recorded(tmp_path):
+    lab = make_lab(tmp_path)
+    assert lab.skew_marker() is None
+    (tmp_path / "ctl" / "skew-loaded").write_text("1700003600\n")
+    assert lab.skew_marker() == 1700003600
+    lab.clear_skew_marker()
+    assert lab.skew_marker() is None
+
+
+def test_toxiproxy_calls_go_to_the_proxy_api_and_a_refusal_is_an_error(tmp_path):
+    seen = []
+
+    def http(method, path, body):
+        seen.append((method, path, body))
+        return (200, json.dumps({"enabled": False})) if method == "GET" else (200, "{}")
+
+    lab = make_lab(tmp_path, http=http)
+    lab.set_proxy("kafka", False)
+    assert seen[0] == ("POST", "/proxies/kafka", b'{"enabled": false}')
+    assert lab.proxy_enabled("kafka") is False
+    refusing = make_lab(tmp_path, http=lambda m, p, b: (404, "proxy not found"))
+    with pytest.raises(soak_lab.LabError, match="proxy not found"):
+        refusing.set_proxy("kafka", False)
+
+
+def test_engine_reachability_is_a_tcp_connect_from_inside_the_engine_container(tmp_path):
+    runner = Recorder()
+    assert make_lab(tmp_path, runner).engine_can_reach("minio") is True
+    assert runner.calls[0][:3] == ["docker", "exec", "vtop-t-engine"]
+    assert runner.calls[0][3:5] == ["nc", "-z"] and runner.calls[0][-1] == "19000"
+    failing = Recorder({"nc": soak_lab.Result(1, "", "")})
+    assert make_lab(tmp_path, failing).engine_can_reach("minio") is False
+
+
+def test_a_failed_lab_call_says_what_failed_and_what_it_printed(tmp_path):
+    runner = Recorder({"start": soak_lab.Result(1, "", "Error response from daemon: boom")})
+    with pytest.raises(soak_lab.LabError, match="docker start engine failed.*boom"):
+        make_lab(tmp_path, runner).start_engine()
+
+
+def test_the_subprocess_runner_reports_a_timeout_as_124_and_a_missing_binary_as_127():
+    timed_out = soak_lab.subprocess_runner(["sleep", "5"], 0.2)
+    assert timed_out.code == 124 and "timed out" in timed_out.err
+    assert soak_lab.subprocess_runner(["definitely-not-a-binary-xyz"], 5).code == 127

@@ -1,0 +1,59 @@
+{
+  "name": "ci-smoke",
+  "description": "A short run that exercises the whole harness (lab, load, each fault kind, prune, scrub, evaluator, evidence tarball) in about fifteen minutes. Its trend limits are loose: it proves the machinery works, not that the engine is leak-free.",
+  "duration_s": 540,
+  "rate_records_per_s": 300,
+  "record_bytes": 700,
+  "partitions": 2,
+  "sample_interval_s": 5,
+  "lag_interval_s": 15,
+  "raw_snapshot_interval_s": 120,
+  "prune_interval_s": 60,
+  "scrub_interval_s": 150,
+  "scrub_sample_batches": 5,
+  "fault_interval_s": 75,
+  "first_fault_after_s": 60,
+  "quiet_tail_s": 90,
+  "fault_cycle": ["kill9", "broker_restart", "partition", "store_outage", "clock_step"],
+  "fault_hold_s": {
+    "kill9": 0,
+    "broker_restart": 0,
+    "partition": 20,
+    "store_outage": 25,
+    "clock_step": 25
+  },
+  "clock_step_seconds": [3600, -3600],
+  "recovery_timeout_s": 180,
+  "drain_timeout_s": 300,
+  "check_timeout_s": 300,
+  "min_free_gib": 10,
+  "kafka_retention_hours": 2,
+  "engine": {
+    "max_records": 3000,
+    "max_bytes": 67108864,
+    "max_batch_age_seconds": 10,
+    "max_concurrent_batches": 2,
+    "compression": "gzip",
+    "compression_level": 1,
+    "memory_limit": "2g"
+  },
+  "criteria": {
+    "trend_window_fraction": 0.8,
+    "trend_min_pairs": 3,
+    "trend": {
+      "rss_bytes": {"max_growth_pct": 200, "min_abs_growth": 268435456},
+      "open_fds": {"max_growth_pct": 200, "min_abs_growth": 64},
+      "ledger_bytes": {"max_growth_pct": 200, "min_abs_growth": 33554432},
+      "work_dir_bytes": {"max_growth_pct": 200, "min_abs_growth": 268435456},
+      "batch_seconds": {"max_growth_pct": 200, "min_abs_growth": 30},
+      "lag_seconds": {"max_growth_pct": 200, "min_abs_growth": 60}
+    },
+    "min_rate_fraction": 0.7,
+    "max_steady_lag_p95_s": 120,
+    "min_samples_fraction": 0.8,
+    "max_sample_gap_s": 60,
+    "min_free_gib_floor": 2,
+    "min_scrub_batches": 5,
+    "min_prune_fraction": 0.7
+  }
+}
