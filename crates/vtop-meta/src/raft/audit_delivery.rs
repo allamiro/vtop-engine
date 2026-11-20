@@ -364,9 +364,19 @@ impl MetaRaftStore {
     /// the same range as a gap from the log: `readable_from` never reads
     /// below a snapshot the log does not agree with, so the stale branch the
     /// snapshot replaced is never read either way.
-    pub(crate) fn snapshot_installed(&self, delivery: &mut DeliveryState, snapshot_index: u64) {
+    ///
+    /// Fails when the install floor cannot be saved, and the install fails
+    /// with it, which stops Raft on this node: going on would let a local
+    /// snapshot built later make the stale branch below this one read as the
+    /// committed log, with no durable boundary left to say otherwise (review
+    /// of #767). The restart recovers the floor when the store opens.
+    pub(crate) fn snapshot_installed(
+        &self,
+        delivery: &mut DeliveryState,
+        snapshot_index: u64,
+    ) -> crate::storage::MetaStoreResult<()> {
         if snapshot_index <= delivery.delivered {
-            return;
+            return Ok(());
         }
         // A newer snapshot's gap starts at the same frontier and covers an
         // older one still owed (review of #767: it was sent twice).
@@ -376,13 +386,15 @@ impl MetaRaftStore {
         // lives in memory only, and a later local snapshot can make a stale
         // branch below it look like the committed log.
         if let Err(error) = self.lock().storage.save_audited_floor(snapshot_index) {
-            crate::transport::warn_rate_limited(
-                "audit-floor-save",
-                &format!(
-                    "could not save the audit install floor at {snapshot_index} ({error}); a \
-                     restart may re-derive the range from the log's newest snapshot instead"
-                ),
+            eprintln!(
+                "error: meta node {} could not save the audit install floor at log index \
+                 {snapshot_index} ({error}). The snapshot install fails and Raft stops on this \
+                 node, so no later snapshot can hide the range it replaced. Fix the data \
+                 directory's disk (space, permissions) and restart the node: it saves the floor \
+                 when it opens",
+                describe_node(delivery.node_id)
             );
+            return Err(error);
         }
         let from = delivery.delivered + 1;
         let gap = AuditRecord::gap(
@@ -406,6 +418,7 @@ impl MetaRaftStore {
             }
         }
         self.save_frontier(delivery, true);
+        Ok(())
     }
 
     /// Deliver up to [`AUDIT_CATCH_UP_CHUNK`] entries above the frontier

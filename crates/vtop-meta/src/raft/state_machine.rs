@@ -227,7 +227,8 @@ impl RaftStateMachine<MetaRaftTypeConfig> for MetaRaftStateMachine {
         // The entries the snapshot replaced were never applied here one by
         // one, so their applied records cannot be re-derived (#706).
         self.store
-            .snapshot_installed(&mut delivery, installed_through);
+            .snapshot_installed(&mut delivery, installed_through)
+            .map_err(sto_err_snapshot)?;
         Ok(())
     }
 
