@@ -418,9 +418,11 @@ formats:
   - id: 25
     name: "`vtopctl` JSON output and exit codes"
     class: D
-    marker: none yet (`report_version` planned)
+    marker: "`report_version` `{REPORT_VERSION}` on every object report"
     status: evolving
     at_1_0: classified at the freeze
+    constants:
+      - {file: crates/vtop-cli/src/report.rs, name: REPORT_VERSION, value: '1'}
 
   - id: 26
     name: Metric names and labels

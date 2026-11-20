@@ -764,7 +764,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             )
             .await?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&report.json)?);
+                println!("{}", crate::report::pretty(&report.json)?);
             } else {
                 for line in &report.lines {
                     println!("{line}");
@@ -843,7 +843,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             if cli.json {
                 println!(
                     "{}",
-                    serde_json::json!({"status": "ok", "warnings": warnings})
+                    crate::report::report_json!({"status": "ok", "warnings": warnings})
                 );
             } else {
                 for warning in &warnings {
@@ -918,7 +918,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 if cli.json {
                     println!(
                         "{}",
-                        serde_json::json!({"status": "ok", "backend": backend, "audit_id": done.audit_id})
+                        crate::report::report_json!({"status": "ok", "backend": backend, "audit_id": done.audit_id})
                     );
                 } else {
                     println!(
@@ -974,7 +974,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 )?;
             }
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                println!("{}", crate::report::pretty(&report)?);
             } else {
                 for line in report.lines() {
                     println!("{line}");
@@ -1089,7 +1089,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 // The report first, so the findings reach stdout whatever happens
                 // to the metrics file.
                 if cli.json {
-                    println!("{}", serde_json::to_string_pretty(&report)?);
+                    println!("{}", crate::report::pretty(&report)?);
                 } else {
                     for line in report.lines() {
                         println!("{line}");
@@ -1245,7 +1245,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 if cli.json {
                     println!(
                         "{}",
-                        serde_json::json!({"status": "ok", "deleted": deleted, "digest": digest, "audit_id": done.audit_id})
+                        crate::report::report_json!({"status": "ok", "deleted": deleted, "digest": digest, "audit_id": done.audit_id})
                     );
                 } else {
                     match digest {

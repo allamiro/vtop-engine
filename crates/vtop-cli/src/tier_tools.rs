@@ -628,7 +628,7 @@ async fn run_inner(command: TierCommand, json: bool) -> Result<(), String> {
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({
+                    crate::report::report_json!({
                         "rehydrated": true,
                         "object_uri": args.object_uri,
                         "object_version_id": args.object_version_id,
@@ -663,7 +663,7 @@ async fn run_inner(command: TierCommand, json: bool) -> Result<(), String> {
                 .await
                 .map_err(|error| error.to_string())?;
             if json {
-                println!("{}", serde_json::json!({ "cleaned": cleaned }));
+                println!("{}", crate::report::report_json!({ "cleaned": cleaned }));
             } else {
                 println!("cleaned {cleaned} abandoned multipart session(s)");
             }

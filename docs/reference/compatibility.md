@@ -189,10 +189,18 @@ What an older binary does with newer data, by case:
   unknown keys are planned.
   Until then, each release's notes list the new keys an older engine
   silently ignores.
-- **JSON output.** `validate --print-effective` carries
-  `effective_version: 1`, audit records carry `audit_version: 1` and ledger
-  digests carry `vtop_ledger_digest: 1`. The other `--json` reports will
-  gain a `report_version` field, an additive change (planned for v0.11.0).
+- **JSON output.** Every `vtopctl --json` report that is a JSON object
+  carries `report_version`, currently `1`: an additive field, added in
+  v0.11.0, so a script can tell which shape of a report it reads. A report
+  that changes incompatibly bumps the number. Output that is not an object
+  has nowhere to put the field without changing shape, and is versioned by
+  what it is: `validate --print-effective` carries `effective_version: 1`,
+  audit records `audit_version: 1`, receipts `receipt_version: 1`, ledger
+  digests `vtop_ledger_digest: 1` and a chunk proof its `scheme`; `discover`,
+  `process-once`, `list-batches` and `segment verify` print arrays of rows
+  (a row may gain a field), and `status` prints a map from batch state to
+  count. The list is in `crates/vtop-cli/src/report.rs`, and a test fails for
+  a command that prints JSON and is neither stamped nor listed there.
 - **Native protocol.** The rule that a new message kind needs a minor bump,
   and a sender that checks the peer's minor, starts at 1.0. Until then, a
   new kind is added under minor 0, an N-1 peer rejects it as unknown, and it
@@ -247,7 +255,7 @@ table differs from what the registry generates. Edit the registry and run
 | 22 | Kafka gateway: advertised APIs and version ranges | none | C | experimental | experimental |
 | 23 | `config.yaml` | none (`config_version` planned) | D | evolving | classified at the freeze |
 | 24 | `vtopctl validate --print-effective` | `effective_version` `1` | D | JSON stable, text for people | JSON stable |
-| 25 | `vtopctl` JSON output and exit codes | none yet (`report_version` planned) | D | evolving | classified at the freeze |
+| 25 | `vtopctl` JSON output and exit codes | `report_version` `1` on every object report | D | evolving | classified at the freeze |
 | 26 | Metric names and labels | none | D | evolving | a stable subset |
 | 27 | Helm values | the chart `version` | D | evolving | classified at the freeze |
 <!-- inventory:end -->
