@@ -2147,6 +2147,35 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # The group-commit coordinator's model test (#752). The coordinator hands
+  # the lead from one waiting producer thread to the next over a Mutex and
+  # Condvars; a lost wake-up there hangs every producer on the range, and a
+  # stress test only finds one by luck. loom explores every interleaving of a
+  # small model instead. `vtop_loom`, not `loom`: a plain `--cfg loom` turns
+  # on tokio's own loom paths and the tree no longer builds.
+  loom:
+    name: loom model (group commit)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-loom-${{ hashFiles('**/Cargo.lock') }}
+      - name: Explore the coordinator's interleavings
+        env:
+          RUSTFLAGS: --cfg vtop_loom
+        run: cargo test -p vtop-broker --lib --release --locked loom_model
+
   # Mutation testing on the commit path (#729): GATED. A mutant of the
   # state machine (`transition`, `can_transition`, `is_committable`) or of
   # replay that the tests do not catch is a way to reach SOURCE_COMMITTED
