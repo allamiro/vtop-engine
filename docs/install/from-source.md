@@ -135,8 +135,8 @@ request; the workflow is [`.github/workflows/ci.yml`](../../.github/workflows/ci
 |---|---|
 | `Library not loaded: .../libsasl2.3.dylib` or `libssl.3.dylib` (macOS) | A v0.8.0 or earlier binary. Run `brew install openssl@3 cyrus-sasl`, or build from source. |
 | `error while loading shared libraries: libsasl2.so.3` or `libssl.so.3` (Linux) | A v0.8.0 or earlier binary. Install the run-time packages listed in [binaries.md](binaries.md#run-time-libraries). |
-| ``version `GLIBC_2.38' not found`` (Linux) | A release archive of v0.8.0 to v0.10.0 on a host with glibc older than 2.39. Use v0.11.0 or later (see [binaries.md](binaries.md#supported-platforms)), or the container image. |
-| ``version `GLIBC_2.28' not found`` (Linux) | A v0.10.1 archive on a host with glibc older than 2.28, such as Amazon Linux 2 or RHEL 7. Use v0.11.0 or later. |
+| ``version `GLIBC_2.38' not found`` (Linux) | A release archive of v0.8.0 to v0.10.0 on a host with glibc older than 2.39. Use v0.10.2 or later (see [binaries.md](binaries.md#supported-platforms)), or the container image. |
+| ``version `GLIBC_2.28' not found`` (Linux) | A v0.10.1 archive on a host with glibc older than 2.28, such as Amazon Linux 2 or RHEL 7. Use v0.10.2 or later. |
 | `vtopctl: not found` although the file is there (Alpine) | A `-linux-gnu` archive on a musl system: the glibc loader it asks for does not exist. Take the `-linux-musl` archive (see [binaries.md](binaries.md#which-linux-archive-to-pick)). |
 | `Can't locate FindBin.pm` or `IPC/Cmd.pm` during the build | The OpenSSL build needs those Perl modules. Install `perl-core` (RHEL family, Fedora) or `perl` (Debian/Ubuntu). |
 | `failed to run custom build command for rdkafka-sys` mentioning `cmake` | Install CMake (see [Native prerequisites](#native-prerequisites)). |
