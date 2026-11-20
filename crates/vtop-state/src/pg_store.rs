@@ -106,19 +106,36 @@ const MAX_CONFLICT_RETRIES: u32 = 5;
 
 /// The prune predicate over a candidate row `b`, shared by the prune, the
 /// candidate listing and the listed delete (#560) so the three cannot drift.
-/// A row is deletable only when a newer committed row - ordered by
-/// (created_at, batch_id), the order committed_cursors reads - exists for
-/// its source path, so the restart cursor's row always survives (#564) - and,
-/// for a Kafka row, of its partition and consumer group, where that
-/// partition resumes (#614; see the SQLite predicate). The
-/// successor probe's expressions must stay identical to
-/// idx_batches_commit_newest in migrations/postgres/0001_state_store.sql.
-/// A SUPERSEDED row ($4, #567) is deletable on age alone: it is never a
+/// A row is deletable only when a BETTER committed row exists for its unit, so
+/// the row the restart reads from always survives: for a file or spool row, a
+/// newer one - ordered by (created_at, batch_id), the order committed_cursors
+/// reads - for its source path (#564); for a Kafka row, one of its (topic,
+/// partition, consumer group) that ends HIGHER, ties broken by (created_at,
+/// batch_id), which is the row committed_kafka_offsets resumes from (#614; see
+/// the SQLite predicate for why that is not the newest-created row). The
+/// probes' expressions must stay identical to idx_batches_commit_newest and
+/// idx_batches_kafka_max_end in migrations/postgres/0001_state_store.sql. The
+/// Kafka literal is `'kafka'` so the partial index's WHERE is implied by the
+/// query. A SUPERSEDED row ($4, #567) is deletable on age alone: it is never a
 /// restart cursor.
 macro_rules! pg_prune_predicate_sql {
     () => {
         "b.updated_at < $2 AND (b.state = $4 OR (b.state = $1 \
-          AND EXISTS ( \
+          AND CASE WHEN b.source_type = 'kafka' THEN EXISTS ( \
+            SELECT 1 FROM batches n \
+            WHERE n.state = $1 \
+              AND n.source_type = 'kafka' \
+              AND (n.progress_end_json::jsonb ->> 'topic') \
+                  = (b.progress_end_json::jsonb ->> 'topic') \
+              AND (n.progress_end_json::jsonb ->> 'partition') \
+                  = (b.progress_end_json::jsonb ->> 'partition') \
+              AND (n.progress_end_json::jsonb ->> 'consumer_group') \
+                  = (b.progress_end_json::jsonb ->> 'consumer_group') \
+              AND ((n.progress_end_json::jsonb ->> 'end_offset')::bigint, \
+                   n.created_at, n.batch_id) \
+                > ((b.progress_end_json::jsonb ->> 'end_offset')::bigint, \
+                   b.created_at, b.batch_id) \
+          ) ELSE EXISTS ( \
             SELECT 1 FROM batches n \
             WHERE n.state = $1 \
               AND n.source_type = b.source_type \
@@ -130,7 +147,7 @@ macro_rules! pg_prune_predicate_sql {
                   IS NOT DISTINCT FROM (b.progress_end_json::jsonb ->> 'consumer_group') \
               AND (n.created_at > b.created_at \
                    OR (n.created_at = b.created_at AND n.batch_id > b.batch_id)) \
-          )))"
+          ) END))"
     };
 }
 
@@ -843,23 +860,16 @@ impl StateStore for PgStateStore {
     }
 
     async fn committed_kafka_offsets(&self) -> Result<Vec<CommittedKafkaOffset>, VtopError> {
-        // See the SQLite implementation: the newest committed row per (topic,
-        // partition, consumer group), in the order pruning keeps.
+        // See the SQLite implementation: per (topic, partition, consumer
+        // group), the HIGHEST end offset any committed row reached, not the
+        // newest-created row's.
         let rows = sqlx::query(
-            "WITH committed AS ( \
-                 SELECT progress_end_json::jsonb ->> 'topic' AS topic, \
-                        (progress_end_json::jsonb ->> 'partition')::bigint AS part, \
-                        progress_end_json::jsonb ->> 'consumer_group' AS grp, \
-                        (progress_end_json::jsonb ->> 'end_offset')::bigint AS end_offset, \
-                        created_at, batch_id \
-                 FROM batches WHERE state = $1 AND source_type = $2 \
-             ), latest AS ( \
-                 SELECT topic, part, grp, end_offset, ROW_NUMBER() OVER ( \
-                            PARTITION BY topic, part, grp \
-                            ORDER BY created_at DESC, batch_id DESC) AS rn \
-                 FROM committed \
-             ) \
-             SELECT topic, part, grp, end_offset FROM latest WHERE rn = 1",
+            "SELECT progress_end_json::jsonb ->> 'topic' AS topic, \
+                    (progress_end_json::jsonb ->> 'partition')::bigint AS part, \
+                    progress_end_json::jsonb ->> 'consumer_group' AS grp, \
+                    MAX((progress_end_json::jsonb ->> 'end_offset')::bigint) AS end_offset \
+             FROM batches WHERE state = $1 AND source_type = $2 \
+             GROUP BY 1, 2, 3",
         )
         .bind(BatchState::SourceCommitted.as_str())
         .bind(SourceType::Kafka.as_str())
@@ -946,12 +956,12 @@ impl StateStore for PgStateStore {
         limit: u32,
     ) -> Result<u64, VtopError> {
         // Same predicate as the SQLite store: a row is deletable only when a
-        // newer committed row — ordered by (created_at, batch_id), the order
-        // committed_cursors reads — exists for its source path, so the
-        // restart cursor's row always survives (review of #564). The
-        // successor probe's expressions must stay identical to
-        // idx_batches_commit_newest in migrations/postgres/0001_state_store.sql,
-        // which bounds it.
+        // better committed row exists for its unit - a newer one for a file
+        // or spool path (review of #564), a higher-ending one for a Kafka
+        // (topic, partition, consumer group) - so the restart cursor's row
+        // always survives. The probes' expressions must stay identical to
+        // idx_batches_commit_newest and idx_batches_kafka_max_end in
+        // migrations/postgres/0001_state_store.sql, which bound them.
         let result = with_retry(|| {
             sqlx::query(concat!(
                 "DELETE FROM batches WHERE batch_id IN ( \

@@ -82,7 +82,8 @@ pub async fn run_all(store: &dyn StateStore) {
     max_committed_end_bytes_aggregates_in_store(store).await;
     committed_cursors_never_mix_the_offsets_of_two_files(store).await;
     committed_cursors_carry_the_newest_rows_content_fingerprint(store).await;
-    committed_kafka_offsets_are_the_newest_row_of_each_partition_and_group(store).await;
+    committed_kafka_offsets_are_the_highest_committed_end_of_each_partition_and_group(store).await;
+    a_kafka_range_committed_below_a_newer_one_never_lowers_the_resume_point(store).await;
     claims_respect_live_leases_and_take_over_expired_ones(store).await;
     committed_cursors_by_file_answer_each_file_that_lived_at_a_path(store).await;
     the_seal_instant_is_written_with_the_row_and_read_back_by_every_read(store).await;
@@ -296,6 +297,7 @@ pub async fn run_fencing_battery(a: &dyn StateStore, b: &dyn StateStore) {
 /// by design and must keep failing it.
 pub async fn run_prune_battery(store: &dyn StateStore) {
     prune_preserves_cursor_seeds_and_bounds_deletion(store).await;
+    prune_keeps_the_kafka_row_with_the_highest_end(store).await;
     listed_prune_deletes_only_what_was_listed(store).await;
     superseded_rows_are_pruned_like_committed_history(store).await;
     prune_never_touches_the_audit_table(store).await;
@@ -1030,10 +1032,14 @@ async fn superseded_rows_are_pruned_like_committed_history(store: &dyn StateStor
 /// #614: the Kafka adapter resumes each partition from the ledger, not from
 /// the group's committed offset, which an engine whose claim has moved on can
 /// still overwrite. The answer is per (topic, partition, consumer group), and
-/// it is the NEWEST committed row's end offset: not a row of another
-/// partition or group, not a row that is only VERIFIED, and not the highest
-/// offset - a recreated topic numbers its records from zero again.
-async fn committed_kafka_offsets_are_the_newest_row_of_each_partition_and_group(
+/// it is the HIGHEST end offset any committed row reached: not a row of
+/// another partition or group, and not a row that is only VERIFIED.
+///
+/// Highest, not newest-created: a window created earlier can be committed
+/// above one created later (see
+/// [`a_kafka_range_committed_below_a_newer_one_never_lowers_the_resume_point`]),
+/// and resuming from the newer, lower row re-archives the range between.
+async fn committed_kafka_offsets_are_the_highest_committed_end_of_each_partition_and_group(
     store: &dyn StateStore,
 ) {
     let topic = "kafka_resume_614";
@@ -1057,9 +1063,9 @@ async fn committed_kafka_offsets_are_the_newest_row_of_each_partition_and_group(
         row("ko-p0-b", 0, "g", 19, "2030-01-01T00:00:02Z"),
         row("ko-p1", 1, "g", 4, "2030-01-01T00:00:03Z"),
         row("ko-p0-old-group", 0, "g-old", 99, "2030-01-01T00:00:04Z"),
-        // Partition 2's topic was recreated: the newer row ends LOWER.
-        row("ko-p2-old-topic", 2, "g", 500, "2030-01-01T00:00:05Z"),
-        row("ko-p2-new-topic", 2, "g", 7, "2030-01-01T00:00:06Z"),
+        // Created in the opposite order to their ends.
+        row("ko-p2-high", 2, "g", 500, "2030-01-01T00:00:05Z"),
+        row("ko-p2-low", 2, "g", 7, "2030-01-01T00:00:06Z"),
     ];
     for rec in &committed {
         store.save_batch_state(rec).await.unwrap();
@@ -1100,9 +1106,99 @@ async fn committed_kafka_offsets_are_the_newest_row_of_each_partition_and_group(
             want(0, "g", 19),
             want(0, "g-old", 99),
             want(1, "g", 4),
-            want(2, "g", 7),
+            want(2, "g", 500),
         ],
-        "one resume point per (topic, partition, consumer group): the newest committed row's"
+        "one resume point per (topic, partition, consumer group): the highest committed end"
+    );
+}
+
+/// The Kafka window ranges and rows of the sequence a state-machine model
+/// found reachable on one unit, shared by the resume and the prune checks.
+/// `r0` is offsets 0..=9, `r1` is 10..=19.
+///
+/// 1. A (r0) reaches VERIFIED and its source commit fails; B (r1) reaches
+///    VERIFIED. Crash.
+/// 2. A's stored object is damaged while the engine is down.
+/// 3. Recovery's re-check of A fails: A is FAILED, then REPLAY_REQUIRED, the
+///    rewind goes to r0, and B is held.
+/// 4. r0 is re-read as a NEW row C, created after B. C verifies and commits.
+/// 5. Recovery retires A (SUPERSEDED) and commits B.
+///
+/// B (end 19) is committed with the higher end and was created earlier; C
+/// (end 9) is committed with the lower end and was created later.
+async fn commit_the_a_b_c_sequence(store: &dyn StateStore, topic: &str, partition: i32) {
+    let row = |id: &str, start: i64, end: i64, created: &str| {
+        let marker = ProgressMarker::Kafka {
+            topic: topic.into(),
+            partition,
+            start_offset: start,
+            end_offset: end,
+            consumer_group: "g".into(),
+        };
+        let mut r = sample_record(id);
+        r.source_name = topic.into();
+        r.progress_start = marker.clone();
+        r.progress_end = marker;
+        r.created_at = created.into();
+        r
+    };
+    let p = BatchPatch::default();
+    let a = format!("{topic}-a");
+    let b = format!("{topic}-b");
+    let c = format!("{topic}-c");
+    // 1. A and B both reach VERIFIED; A's source commit failed.
+    for (id, start, end, created) in [
+        (&a, 0, 9, "2030-02-01T00:00:01Z"),
+        (&b, 10, 19, "2030-02-01T00:00:02Z"),
+    ] {
+        store
+            .save_batch_state(&row(id, start, end, created))
+            .await
+            .unwrap();
+        for st in &LEGAL_WALK[..6] {
+            store.update_batch_state(id, *st, &p).await.unwrap();
+        }
+    }
+    // 3. A fails its re-check and is rewound.
+    store.mark_failed(&a, "object damaged").await.unwrap();
+    // 4. r0 is re-read as a new row, created after B, and commits.
+    store
+        .save_batch_state(&row(&c, 0, 9, "2030-02-01T00:00:03Z"))
+        .await
+        .unwrap();
+    for st in LEGAL_WALK {
+        store.update_batch_state(&c, st, &p).await.unwrap();
+    }
+    // 5. Recovery retires A and commits B.
+    store
+        .update_batch_state(&a, BatchState::Superseded, &p)
+        .await
+        .unwrap();
+    store
+        .update_batch_state(&b, BatchState::SourceCommitted, &p)
+        .await
+        .unwrap();
+}
+
+/// The resume point after the A, B, C sequence is B's end, not C's. Resuming
+/// from C re-archives r1, which B already committed.
+async fn a_kafka_range_committed_below_a_newer_one_never_lowers_the_resume_point(
+    store: &dyn StateStore,
+) {
+    let topic = "kafka_resume_a_b_c";
+    commit_the_a_b_c_sequence(store, topic, 0).await;
+    let offset = store
+        .committed_kafka_offsets()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|o| o.topic == topic && o.partition == 0 && o.consumer_group == "g")
+        .map(|o| o.end_offset);
+    assert_eq!(
+        offset,
+        Some(19),
+        "B committed r1 (end 19) although C, created after it, ended at 9: the adapter resumes \
+         at end + 1, so 20 is right and 10 re-archives r1"
     );
 }
 
@@ -2198,6 +2294,99 @@ async fn prune_preserves_cursor_seeds_and_bounds_deletion(store: &dyn StateStore
         assert!(
             store.get_batch(deleted).await.unwrap().is_none(),
             "{deleted} must be pruned"
+        );
+    }
+}
+
+/// Pruning keeps the row the Kafka restart resumes from, which is the one with
+/// the HIGHEST end offset, not the newest-created. After the A, B, C sequence
+/// the newest-created committed row (C, end 9) ends below B (end 19); pruning
+/// by creation order kept C and deleted B, and the next restart resumed below
+/// what was archived.
+async fn prune_keeps_the_kafka_row_with_the_highest_end(store: &dyn StateStore) {
+    let topic = "kafka_prune_a_b_c";
+    commit_the_a_b_c_sequence(store, topic, 0).await;
+    // An older committed row below both: no row of its unit needs it.
+    let mut old = sample_record("kafka_prune_a_b_c-old");
+    let marker = ProgressMarker::Kafka {
+        topic: topic.into(),
+        partition: 0,
+        start_offset: 0,
+        end_offset: 4,
+        consumer_group: "g".into(),
+    };
+    old.source_name = topic.into();
+    old.progress_start = marker.clone();
+    old.progress_end = marker;
+    old.created_at = "2030-02-01T00:00:00Z".into();
+    store.save_batch_state(&old).await.unwrap();
+    for st in LEGAL_WALK {
+        store
+            .update_batch_state(&old.batch_id, st, &BatchPatch::default())
+            .await
+            .unwrap();
+    }
+    let offset = || async {
+        store
+            .committed_kafka_offsets()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|o| o.topic == topic && o.partition == 0 && o.consumer_group == "g")
+            .map(|o| o.end_offset)
+    };
+    assert_eq!(
+        offset().await,
+        Some(19),
+        "the resume point before the prune"
+    );
+
+    let future = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+    let ours = |rows: Vec<BatchRecord>| -> Vec<String> {
+        let mut ids: Vec<String> = rows
+            .into_iter()
+            .map(|r| r.batch_id)
+            .filter(|id| id.starts_with(topic))
+            .collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(
+        ours(store.prune_candidates(&future, 10_000).await.unwrap()),
+        [
+            "kafka_prune_a_b_c-a",
+            "kafka_prune_a_b_c-c",
+            "kafka_prune_a_b_c-old"
+        ],
+        "A (superseded), C (created last, ends lower) and the old row are candidates; \
+         B, the highest end, is not"
+    );
+    let mut passes = 0;
+    while store.prune_committed_history(&future, 2).await.unwrap() > 0 {
+        passes += 1;
+        assert!(passes < 64, "pruning must converge");
+    }
+    assert_eq!(
+        offset().await,
+        Some(19),
+        "the resume point is prune-invariant"
+    );
+    assert!(
+        store
+            .get_batch("kafka_prune_a_b_c-b")
+            .await
+            .unwrap()
+            .is_some(),
+        "B holds the highest end and must survive"
+    );
+    for gone in ["a", "c", "old"] {
+        assert!(
+            store
+                .get_batch(&format!("kafka_prune_a_b_c-{gone}"))
+                .await
+                .unwrap()
+                .is_none(),
+            "{gone} must be pruned"
         );
     }
 }

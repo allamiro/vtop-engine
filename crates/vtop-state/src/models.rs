@@ -355,11 +355,18 @@ pub struct CommittedKafkaOffset {
     pub topic: String,
     pub partition: i32,
     pub consumer_group: String,
-    /// The newest committed batch's last offset; the partition resumes at the
-    /// one after it. Newest by `(created_at, batch_id)` - the order the windows
-    /// were read, and the row pruning keeps - not the highest: a topic that
-    /// was deleted and recreated starts its offsets again, and the old topic's
-    /// highest offset would skip the new one's first records.
+    /// The HIGHEST last offset any committed batch of the unit reached; the
+    /// partition resumes at the one after it. Not the newest-created row's:
+    /// recovery can commit a window created earlier above one created later (a
+    /// damaged range re-read as a new row while the window above it waited),
+    /// and resuming from the newer, lower row re-archives the range between.
+    ///
+    /// The cost of the maximum: a topic deleted and recreated numbers its
+    /// offsets from zero again, and the old topic's highest offset is then
+    /// above the new topic's rows. The adapter does not trust the ledger for a
+    /// partition whose group has no committed offset, which deleting the topic
+    /// removes, but once the group has committed on the new topic that guard
+    /// no longer separates the two.
     pub end_offset: i64,
 }
 

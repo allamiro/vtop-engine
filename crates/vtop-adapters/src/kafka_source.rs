@@ -1343,7 +1343,7 @@ impl KafkaSource {
     /// Resume each partition where the LEDGER says it was committed, not where
     /// the consumer group's committed offset on the broker says (#614).
     ///
-    /// `committed` is the ledger's newest committed batch per (topic,
+    /// `committed` is the ledger's highest committed end offset per (topic,
     /// partition, consumer group), as `(topic, partition, consumer_group,
     /// end_offset)`. Rows of another consumer group are ignored: this group
     /// resumes from its own progress, as `foreign_group` requires (#563).
@@ -3661,8 +3661,8 @@ impl SourceAdapter for KafkaSource {
             .map(i128::from)
     }
 
-    /// The known frontier (`known_committed`): the ledger's newest committed
-    /// row for this partition and group, or what this process committed
+    /// The known frontier (`known_committed`): the ledger's highest committed
+    /// end for this partition and group, or what this process committed
     /// since. Never a rewind's landing, and never the broker's group offset,
     /// which an engine whose claim moved on can still write (#614). Another
     /// group's range is not answered: this group's frontier says nothing

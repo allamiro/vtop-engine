@@ -161,6 +161,22 @@ CREATE INDEX IF NOT EXISTS idx_batches_commit_newest ON batches(
     batch_id
 );
 
+-- Bounds the Kafka branch of the prune predicate: a Kafka row is deletable
+-- once a row of its (topic, partition, consumer group) ends HIGHER, and that
+-- probe seeks to the group's rows above this one's end offset. Partial, so a
+-- file or spool ledger pays nothing for it. The expressions must stay
+-- identical to the ones in the prune query. Without it (a database not yet
+-- migrated by this release) the prune is correct and slower.
+CREATE INDEX IF NOT EXISTS idx_batches_kafka_max_end ON batches(
+    state,
+    (progress_end_json::jsonb ->> 'topic'),
+    (progress_end_json::jsonb ->> 'partition'),
+    (progress_end_json::jsonb ->> 'consumer_group'),
+    ((progress_end_json::jsonb ->> 'end_offset')::bigint),
+    created_at,
+    batch_id
+) WHERE source_type = 'kafka';
+
 -- Database-level backstop for the verify-before-source-commit invariant.
 --
 -- A row is also born only as batching (#625): born verified, it could be
