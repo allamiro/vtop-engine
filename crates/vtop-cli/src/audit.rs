@@ -480,14 +480,29 @@ async fn all_rows(store: &dyn StateStore) -> Result<Vec<vtop_state::AuditRow>, V
     Ok(rows)
 }
 
+/// The non-empty lines of an audit file.
+///
+/// A line that is not UTF-8 is reported and skipped, as a line that is not
+/// JSON is: an append cut by a crash inside a multibyte character leaves
+/// such a fragment, and the sink keeps it and starts the next record on a
+/// line of its own rather than cutting a shared file at open. Failing the
+/// whole read on it hid every record after it (review of #767).
 fn read_file(path: &Path) -> Result<Vec<String>, VtopError> {
     let file = std::fs::File::open(path)
         .map_err(|e| VtopError::Other(format!("read {}: {e}", path.display())))?;
     let mut lines = Vec::new();
-    for line in std::io::BufReader::new(file).lines() {
+    for (number, line) in std::io::BufReader::new(file).split(b'\n').enumerate() {
         let line = line.map_err(|e| VtopError::Other(format!("read {}: {e}", path.display())))?;
-        if !line.trim().is_empty() {
-            lines.push(line);
+        match String::from_utf8(line) {
+            Ok(line) if line.trim().is_empty() => {}
+            Ok(line) => lines.push(line),
+            Err(error) => eprintln!(
+                "warning: line {} of {} is not UTF-8 ({}), as a write cut part-way by a \
+                 crash leaves it; skipped. The records after it are listed",
+                number + 1,
+                path.display(),
+                error.utf8_error()
+            ),
         }
     }
     Ok(lines)
@@ -596,6 +611,53 @@ mod tests {
         let mut out = Vec::new();
         print_records(args, &fixture(), json, &mut out);
         String::from_utf8(out).unwrap()
+    }
+
+    /// Review of #767: a crash inside a multibyte character leaves a
+    /// fragment that is not UTF-8. The next run's sink puts its record on a
+    /// line of its own after it, but the reader failed on the fragment and
+    /// listed nothing, not even the records after it. It is reported and
+    /// skipped, like a fragment that is not JSON.
+    #[test]
+    fn a_file_cut_inside_a_character_still_lists_every_whole_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let event = || {
+            AuditEvent::new(
+                Action::ClusterPropose,
+                Stage::Applied,
+                Actor::replica("meta-é"),
+                Target::new("cluster", None),
+                Outcome::Success,
+            )
+        };
+        let sink = audit::AuditSink::default();
+        sink.open_file(&path).unwrap();
+        let first = sink.record(&event()).unwrap();
+        drop(sink);
+        // A crash part-way through the next append: cut inside the two
+        // bytes of the "é" in the actor's name.
+        let whole = event().to_json();
+        let cut = whole.find('é').unwrap() + 1;
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(&whole.as_bytes()[..cut]).unwrap();
+        }
+        assert!(std::str::from_utf8(&std::fs::read(&path).unwrap()).is_err());
+        // The next run reopens the file and appends.
+        let sink = audit::AuditSink::default();
+        sink.open_file(&path).unwrap();
+        let second = sink.record(&event()).unwrap();
+
+        let lines = read_file(&path).unwrap();
+        assert_eq!(lines, vec![first.json, second.json]);
+        let mut out = Vec::new();
+        print_records(&args(&[]), &lines, true, &mut out);
+        assert_eq!(String::from_utf8(out).unwrap().lines().count(), 2);
     }
 
     /// The fixture is records as v0.10.0 writes them; a later release must
