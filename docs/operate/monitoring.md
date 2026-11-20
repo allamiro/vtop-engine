@@ -43,6 +43,7 @@ These carry the commit rule:
 | `vtop_verification_mode{mode="size_only"}` | `1` means `upload.require_strong_verification` is off: same-size corruption is accepted. |
 | `vtop_verification_backend_limited_total` | Batches committed on a size-only check. |
 | `vtop_object_lock_checks_total{result}` | With `upload.object_lock`: any result but `ok` is a batch that failed because the store did not keep the retention asked for (or its bucket has no Object Lock, `bucket_not_locked`, or the store does not implement Object Lock, `store_unsupported`). See [S3 Object Lock](../OBJECT_LOCK_DEPLOYMENT.md). |
+| `vtop_object_key_decisions_total{decision}` | With `upload.object_lock`: `fallback_unlocked`, `fallback_lock_mode`, `fallback_hold_missing` and `lock_withheld` mean an object that should be locked is not, or the store is not keeping locks (#709). `fallback_lock_elapsed` is storage cost only. |
 | `vtop_retention_lost_records_total` | Kafka records deleted by broker retention before the engine read them. Never archived; any increase is an incident. |
 | `vtop_source_replay_refused_total` | A failed range its source could not hand back, so it is missing from the archive. |
 | `vtop_recovery_held_total{reason}` | A range recovery held instead of rewinding (#782). `reason="ledger_write_failed"`: the state store refused the replay decision; check its disk, permissions and connectivity. The range is read again with the ranges above it, so nothing is lost. |
@@ -77,6 +78,7 @@ test, a runbook section, and an objective on [Service level objectives](slos.md)
 | [VtopSourceLagGrowing](runbooks.md#vtopsourcelaggrowing) | ticket | `kafka_consumergroup_lag` (kafka-exporter) rising for 30 minutes |
 | [VtopSizeOnlyVerification](runbooks.md#vtopsizeonlyverification) | ticket | `vtop_verification_mode{mode="size_only"} == 1` |
 | [VtopObjectLockCheckFailed](runbooks.md#vtopobjectlockcheckfailed) | page | Any increase of `vtop_object_lock_checks_total` with a result other than `ok`, or such a series first appearing non-zero |
+| [VtopObjectLockFallback](runbooks.md#vtopobjectlockfallback) | ticket | Any increase of `vtop_object_key_decisions_total` with `decision` `fallback_unlocked`, `fallback_lock_mode`, `fallback_hold_missing` or `lock_withheld` over an hour, or such a series first appearing non-zero (#709). `fallback_lock_elapsed` is left out: storage cost, not a finding |
 | [VtopRetentionLoss](runbooks.md#vtopretentionloss) | page | Any increase of `vtop_retention_lost_records_total` |
 | [VtopSourceReplayRefused](runbooks.md#vtopsourcereplayrefused) | page | Any increase of `vtop_source_replay_refused_total`, or the series first appearing non-zero |
 | [VtopRecoveryLedgerWriteFailed](runbooks.md#vtoprecoveryledgerwritefailed) | page | `vtop_recovery_held_total{reason="ledger_write_failed"}` above zero: at startup the state store refused recovery's replay decision (the series appears with the first hold, so the rule fires on the value, until a restart that holds nothing) |

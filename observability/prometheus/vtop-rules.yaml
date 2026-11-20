@@ -28,6 +28,7 @@
 #   lag_rising_hold              30m      VtopSourceLagGrowing
 #   lag_consumer_group           vtop-engine  VtopSourceLagGrowing (sources.kafka.consumer_group)
 #   object_lock_window           15m      VtopObjectLockCheckFailed
+#   object_lock_fallback_window  1h       VtopObjectLockFallback
 #   retention_loss_window        15m      VtopRetentionLoss
 #   replay_refused_window        15m      VtopSourceReplayRefused
 #   multipart_kept_offset        30h      VtopMultipartSessionsPiling (24 h abandon window + 6 h sweep interval)
@@ -153,6 +154,27 @@ groups:
           summary: "Object Lock check failed ({{ $labels.result }}) for tenant {{ $labels.tenant }} on {{ $labels.instance }}"
           description: "A written or reused object or manifest is not under the retention upload.object_lock asks for, or its bucket has no Object Lock. The batch failed and will be replayed. Read the object_lock_check_failed or object_lock_bucket_refused ERROR line, then fix the bucket or the credentials' retention permissions."
           runbook_url: "https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopobjectlockcheckfailed"
+
+      # A replay found the object already archived for its range not locked
+      # as configured and wrote a fresh locked one under its attempt key, or
+      # withheld that write because the fresh object it wrote moments ago is
+      # not usable either (#709). Nothing failed to be archived, so a ticket,
+      # not a page: but an object that should be locked is not, or the store
+      # is not keeping locks. fallback_lock_elapsed (a lock that ended before
+      # its range was replayed) is storage cost, not a finding, and is left
+      # out. The counter is not primed (its series appears at the first
+      # decision), so the second branch catches a series first seen non-zero.
+      - alert: VtopObjectLockFallback
+        expr: |
+          increase(vtop_object_key_decisions_total{decision=~"fallback_unlocked|fallback_lock_mode|fallback_hold_missing|lock_withheld"}[1h]) > 0
+          or
+          (vtop_object_key_decisions_total{decision=~"fallback_unlocked|fallback_lock_mode|fallback_hold_missing|lock_withheld"} > 0 unless vtop_object_key_decisions_total{decision=~"fallback_unlocked|fallback_lock_mode|fallback_hold_missing|lock_withheld"} offset 1h)
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Object Lock fallback ({{ $labels.decision }}) for tenant {{ $labels.tenant }} on {{ $labels.instance }}"
+          description: "A replay found the object already archived for its range not locked as upload.object_lock asks (no lock, the other mode, or no legal hold) and wrote a fresh locked object under its attempt key, leaving the old one as it is; or (lock_withheld) the fresh object it wrote is not usable either, so nothing was written and the batch failed. Read the object_key_fallback WARN line for the two keys and the reason, then check the bucket's Object Lock configuration and the credentials' retention and legal-hold permissions."
+          runbook_url: "https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopobjectlockfallback"
 
       # Records Kafka retention deleted before the engine read them: never
       # archived. Primed at zero at startup; the second branch also catches a

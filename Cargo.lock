@@ -3999,6 +3999,7 @@ dependencies = [
  "async-trait",
  "aws-sdk-s3",
  "blake3",
+ "bytes",
  "chrono",
  "clap",
  "futures",
