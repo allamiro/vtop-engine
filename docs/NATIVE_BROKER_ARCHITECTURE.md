@@ -579,6 +579,31 @@ stays bounded under overload. Quorum loss still fails closed with
 `Overloaded`. Client session backpressure remains bounded bytes and sessions,
 with fetch-response queue budgets layered on top of per-session send credit.
 
+**Group commit (#752).** A leader, candidate or standalone data node can let
+concurrent produce requests on one range share a barrier: the node's
+`group_commit:` section (`enabled`, `max_delay_ms`, `max_records`,
+`max_bytes`, `max_pending_requests`) attaches the broker's coordinator when
+the leader is built, in `run_leader` and in a candidate's promotion alike. The
+sequence above is unchanged for the group: one local fsync, one
+`ReplicaAppend` round for the whole group, one commit advance, and only then
+does each member get its acknowledgement, each judged for its own lease
+epoch and producer sequence. Nothing is acknowledged earlier, and a failed
+fsync or a quorum miss fails the whole group closed. A group the log refuses
+for something one member caused (a sequence, fencing or size refusal) is
+re-run request by request, so only that member fails. `max_delay_ms`
+defaults to 0 (natural batching): the leader seals what is queued when it
+takes the lead, and requests that arrive during its barrier form the next
+group, so a lone request pays nothing; a non-zero window is latency added to
+every request that arrives alone, and is refused at a second or more. The
+settings are judged at startup, before a port is bound or a lease taken: zero
+bounds, an over-long window, and a group the replica plane could not frame in
+one append (`max_bytes` and `max_records` with the per-request overhead
+against the frame limit) stop the node, and the section on a follower is
+refused. It is off by default until the evidence gates in #752 hold; a node
+that has it on logs its settings at INFO and exports
+`vtop_broker_group_commit_enabled` and the `vtop_broker_group_commit_*`
+series (see [node observability](NODE_OBSERVABILITY.md)).
+
 ### 8.2 Consumer committed visibility
 
 ```mermaid

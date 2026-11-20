@@ -1370,6 +1370,156 @@ pub struct DataNodeConfig {
     /// the disk does not.
     #[serde(default)]
     pub retention: Option<RetentionConfig>,
+    /// Group commit (#752): concurrent produce requests on this range share
+    /// one fsync and one replication round. Absent = each request has its
+    /// own barrier, the behaviour before this section existed. Leader,
+    /// candidate and standalone only: a follower never takes a produce
+    /// request, so the section there is refused rather than ignored.
+    #[serde(default)]
+    pub group_commit: Option<GroupCommitSection>,
+}
+
+/// Whether group commit is on when the section does not say. Off until the
+/// evidence gates in #752 hold; turning it on by default is this one line.
+pub const GROUP_COMMIT_ON_BY_DEFAULT: bool = false;
+
+/// The longest window a group may wait for company. A leader's produce
+/// request is answered after the window, the fsync and the replication round,
+/// and the Kafka gateway gives up on a request after `max_produce_wait`
+/// (30 s): a window of a second or more is a latency bug, not a tuning.
+pub const GROUP_COMMIT_MAX_DELAY_MS: u64 = 999;
+
+/// The `group_commit:` section of a data node (#752). Every key but
+/// `enabled` mirrors `vtop_broker::group_commit::GroupCommitConfig`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GroupCommitSection {
+    /// Turns group commit on or off for this node's range.
+    #[serde(default = "default_group_commit_enabled")]
+    pub enabled: bool,
+    /// How long a group leader waits for more requests before it seals the
+    /// group. 0 (the default) is natural batching: the leader seals what is
+    /// queued when it takes the lead, and requests that arrive during its
+    /// fsync and replication round form the next group, so a lone request
+    /// pays nothing. A non-zero window is latency added to EVERY request
+    /// that arrives alone.
+    #[serde(default)]
+    pub max_delay_ms: u64,
+    /// Records that seal a group.
+    #[serde(default = "default_group_commit_max_records")]
+    pub max_records: usize,
+    /// Payload bytes (keys plus values) that seal a group.
+    #[serde(default = "default_group_commit_max_bytes")]
+    pub max_bytes: u64,
+    /// Produce requests that may wait for a group; one more is answered
+    /// `Overloaded` (retryable), with nothing appended.
+    #[serde(default = "default_group_commit_max_pending_requests")]
+    pub max_pending_requests: usize,
+}
+
+fn default_group_commit_enabled() -> bool {
+    GROUP_COMMIT_ON_BY_DEFAULT
+}
+
+fn default_group_commit_max_records() -> usize {
+    vtop_broker::group_commit::GroupCommitConfig::default().max_records
+}
+
+fn default_group_commit_max_bytes() -> u64 {
+    vtop_broker::group_commit::GroupCommitConfig::default().max_bytes
+}
+
+fn default_group_commit_max_pending_requests() -> usize {
+    vtop_broker::group_commit::GroupCommitConfig::default().max_pending_requests
+}
+
+impl Default for GroupCommitSection {
+    fn default() -> Self {
+        Self {
+            enabled: default_group_commit_enabled(),
+            max_delay_ms: 0,
+            max_records: default_group_commit_max_records(),
+            max_bytes: default_group_commit_max_bytes(),
+            max_pending_requests: default_group_commit_max_pending_requests(),
+        }
+    }
+}
+
+impl GroupCommitSection {
+    /// The coordinator's settings this section names.
+    pub fn coordinator_config(&self) -> vtop_broker::group_commit::GroupCommitConfig {
+        vtop_broker::group_commit::GroupCommitConfig {
+            max_delay: std::time::Duration::from_millis(self.max_delay_ms),
+            max_records: self.max_records,
+            max_bytes: self.max_bytes,
+            max_pending_requests: self.max_pending_requests,
+        }
+    }
+}
+
+/// The settings group commit runs with on this node, or `None` when it is
+/// off. The one place a node's section becomes the coordinator's config, so
+/// `run_leader` and a candidate's `build_leader_phase` cannot differ.
+pub fn group_commit_in_force(
+    section: Option<&GroupCommitSection>,
+) -> Option<vtop_broker::group_commit::GroupCommitConfig> {
+    let section = section.cloned().unwrap_or_default();
+    section.enabled.then(|| section.coordinator_config())
+}
+
+/// The refusals of the `group_commit:` section (#752), judged from the
+/// config before a port is bound or a lease is acquired: a follower never
+/// takes a produce request, a setting the coordinator cannot run with, and,
+/// on a replicated range, a group the replica plane could not frame. Each
+/// message says what is wrong, that the node did not start, and what to
+/// change.
+pub fn refuse_group_commit_misuse(
+    role: DataRole,
+    range: &RangeIdentity,
+    section: Option<&GroupCommitSection>,
+) -> Result<(), String> {
+    let Some(section) = section else {
+        return Ok(());
+    };
+    if role == DataRole::Follower {
+        return Err(
+            "`group_commit` is configured on a follower node: a follower never takes a produce \
+             request, so the section would change nothing. The node did not start. Remove the \
+             section from this follower's config; it belongs to the leader, standalone and \
+             candidate configs"
+                .to_owned(),
+        );
+    }
+    let config = section.coordinator_config();
+    if let Err(problem) = config.validate() {
+        return Err(format!(
+            "`group_commit` is invalid: {problem}. The node did not start. Set `group_commit`              to values above zero (or remove the key to take its default)"
+        ));
+    }
+    if section.max_delay_ms > GROUP_COMMIT_MAX_DELAY_MS {
+        return Err(format!(
+            "`group_commit.max_delay_ms: {}` is above {GROUP_COMMIT_MAX_DELAY_MS}: every produce \
+             request that arrives alone would wait that long before its fsync, and the Kafka \
+             gateway gives up on a request after 30 s. The node did not start. Use 0 (natural \
+             batching, the default) or a window under a second",
+            section.max_delay_ms
+        ));
+    }
+    // A candidate builds a replicated leader when it wins the range, so it is
+    // judged as one; a standalone node has no replica plane to frame for.
+    if section.enabled && matches!(role, DataRole::Leader | DataRole::Candidate) {
+        if let Err(problem) = vtop_broker::refuse_unframeable_group_commit(range, &config) {
+            let what = match problem {
+                vtop_broker::BrokerError::InvalidConfig(text) => text,
+                other => other.to_string(),
+            };
+            return Err(format!(
+                "`group_commit` is invalid: {what}. The node did not start. Lower \
+                 `group_commit.max_bytes` or `group_commit.max_records`"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// What a range keeps on disk before its oldest sealed segments are
@@ -2866,5 +3016,175 @@ mod tests {
         let refused = serde_yaml::from_str::<DataNodeConfig>(&data_yaml("segment_format: v3\n"))
             .expect_err("an unknown format is a config error");
         assert!(refused.to_string().contains("v3"), "{refused}");
+    }
+
+    fn group_commit_range() -> RangeIdentity {
+        data_config("").range.identity()
+    }
+
+    fn data_config(extra: &str) -> DataNodeConfig {
+        serde_yaml::from_str(&data_yaml(extra)).unwrap()
+    }
+
+    /// Group commit (#752): the section's defaults are D1's natural
+    /// batching, a window of zero, with the coordinator's own bounds. A
+    /// config without the section, and one with an empty section, both leave
+    /// it off while `GROUP_COMMIT_ON_BY_DEFAULT` says so; naming
+    /// `enabled: true` is all it takes to turn it on.
+    #[test]
+    fn group_commit_defaults_are_natural_batching() {
+        assert!(data_config("").group_commit.is_none());
+        assert_eq!(
+            group_commit_in_force(None).is_some(),
+            GROUP_COMMIT_ON_BY_DEFAULT,
+            "an absent section follows the default"
+        );
+        let empty = data_config("group_commit: {}\n");
+        assert_eq!(
+            group_commit_in_force(empty.group_commit.as_ref()).is_some(),
+            GROUP_COMMIT_ON_BY_DEFAULT,
+            "an empty section follows the default too"
+        );
+
+        let on = data_config("group_commit: { enabled: true }\n");
+        let settings =
+            group_commit_in_force(on.group_commit.as_ref()).expect("enabled: true is on");
+        assert_eq!(
+            settings.max_delay,
+            std::time::Duration::ZERO,
+            "natural batching: a lone request waits for nothing"
+        );
+        assert_eq!(settings.max_records, 1_024);
+        assert_eq!(settings.max_bytes, 1024 * 1024);
+        assert_eq!(settings.max_pending_requests, 256);
+
+        let off = data_config("group_commit: { enabled: false, max_delay_ms: 3 }\n");
+        assert!(
+            group_commit_in_force(off.group_commit.as_ref()).is_none(),
+            "enabled: false turns it off whatever else is set"
+        );
+
+        let tuned = data_config(
+            "group_commit: { enabled: true, max_delay_ms: 2, max_records: 64, \
+             max_bytes: 4096, max_pending_requests: 8 }\n",
+        );
+        let settings = group_commit_in_force(tuned.group_commit.as_ref()).unwrap();
+        assert_eq!(settings.max_delay, std::time::Duration::from_millis(2));
+        assert_eq!(
+            (
+                settings.max_records,
+                settings.max_bytes,
+                settings.max_pending_requests
+            ),
+            (64, 4096, 8)
+        );
+
+        let typo = serde_yaml::from_str::<DataNodeConfig>(&data_yaml(
+            "group_commit: { enabled: true, max_delay: 2 }\n",
+        ))
+        .expect_err("an unknown key is a config error, not a setting that does nothing");
+        assert!(typo.to_string().contains("max_delay"), "{typo}");
+    }
+
+    /// A follower never takes a produce request, so the section there is
+    /// refused (naming what to do), not ignored, whether it is on or off.
+    #[test]
+    fn group_commit_on_a_follower_is_refused() {
+        let range = group_commit_range();
+        for extra in [
+            "group_commit: { enabled: true }\n",
+            "group_commit: { enabled: false }\n",
+            "group_commit: {}\n",
+        ] {
+            let section = data_config(extra).group_commit;
+            let refusal = refuse_group_commit_misuse(DataRole::Follower, &range, section.as_ref())
+                .expect_err("a follower with the section is refused");
+            for part in [
+                "`group_commit` is configured on a follower node",
+                "The node did not start",
+                "Remove the section",
+            ] {
+                assert!(refusal.contains(part), "missing {part:?}: {refusal}");
+            }
+            for role in [DataRole::Leader, DataRole::Candidate, DataRole::Standalone] {
+                refuse_group_commit_misuse(role, &range, section.as_ref())
+                    .unwrap_or_else(|why| panic!("{role:?} takes the section: {why}"));
+            }
+        }
+        refuse_group_commit_misuse(DataRole::Follower, &range, None)
+            .expect("a follower without the section is fine");
+    }
+
+    /// A group the replica plane could not frame in one append would lose
+    /// quorum after the leader's append; the node refuses to start with the
+    /// frame arithmetic in the message instead of building such a leader.
+    /// A standalone node has no replica plane, so nothing is framed.
+    #[test]
+    fn an_oversized_group_commit_is_refused_with_the_frame_arithmetic() {
+        let range = group_commit_range();
+        let oversized = data_config(
+            "group_commit: { enabled: true, max_bytes: 268435456, max_records: 1000000 }\n",
+        )
+        .group_commit;
+        for role in [DataRole::Leader, DataRole::Candidate] {
+            let refusal = refuse_group_commit_misuse(role, &range, oversized.as_ref())
+                .expect_err("a group the plane cannot frame is refused");
+            for part in [
+                "`group_commit` is invalid",
+                "could seal a group of up to",
+                "more than the replica plane frames per append",
+                "The node did not start",
+                "`group_commit.max_bytes`",
+            ] {
+                assert!(
+                    refusal.contains(part),
+                    "{role:?}: missing {part:?}: {refusal}"
+                );
+            }
+        }
+        refuse_group_commit_misuse(DataRole::Standalone, &range, oversized.as_ref())
+            .expect("no replicas, no frame to exceed");
+        // Off, the same numbers are not judged: nothing would seal such a group.
+        let off = data_config(
+            "group_commit: { enabled: false, max_bytes: 268435456, max_records: 1000000 }\n",
+        )
+        .group_commit;
+        refuse_group_commit_misuse(DataRole::Leader, &range, off.as_ref())
+            .expect("a disabled section seals nothing");
+        // The defaults sit well inside the frame.
+        let defaults = data_config("group_commit: { enabled: true }\n").group_commit;
+        refuse_group_commit_misuse(DataRole::Leader, &range, defaults.as_ref())
+            .expect("the defaults fit one replica frame");
+    }
+
+    /// Values the coordinator cannot run with, and a window that would add
+    /// its own latency to every lone request, are refused at startup.
+    #[test]
+    fn invalid_group_commit_settings_are_refused_at_startup() {
+        let range = group_commit_range();
+        for (extra, part) in [
+            ("max_records: 0", "max_records must be greater than zero"),
+            ("max_bytes: 0", "max_bytes must be greater than zero"),
+            (
+                "max_pending_requests: 0",
+                "max_pending_requests must be greater than zero",
+            ),
+            (
+                "max_delay_ms: 1000",
+                "`group_commit.max_delay_ms: 1000` is above 999",
+            ),
+        ] {
+            let section =
+                data_config(&format!("group_commit: {{ enabled: true, {extra} }}\n")).group_commit;
+            let refusal =
+                refuse_group_commit_misuse(DataRole::Standalone, &range, section.as_ref())
+                    .expect_err(extra);
+            assert!(refusal.contains(part), "{extra}: {refusal}");
+            assert!(refusal.contains("The node did not start"), "{refusal}");
+        }
+        let widest =
+            data_config("group_commit: { enabled: true, max_delay_ms: 999 }\n").group_commit;
+        refuse_group_commit_misuse(DataRole::Standalone, &range, widest.as_ref())
+            .expect("a window just under a second is allowed");
     }
 }
