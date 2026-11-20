@@ -35,7 +35,7 @@ whose performance under load has not been measured here.
 
 ### glibc floor
 
-The `-linux-gnu` binaries of v0.11.0 and later need glibc 2.17. They are built
+The `-linux-gnu` binaries of v0.10.2 and later need glibc 2.17. They are built
 inside manylinux2014 (CentOS 7, glibc 2.17), and the release workflow fails
 if either binary asks for a symbol version newer than glibc 2.17, or than the
 `libgcc_s` and `libstdc++` of gcc 4.8 that the glibc 2.17 distributions ship,
@@ -83,7 +83,7 @@ not run.
   ``version `GLIBC_2.38' not found`` on Debian 12, Ubuntu 22.04 and RHEL 8 or
   9; their `vtop-node` needs glibc 2.34 (#808).
 
-On those systems, use v0.11.0 or later, or the container image.
+On those systems, use v0.10.2 or later, or the container image.
 
 ## Verify the download
 
