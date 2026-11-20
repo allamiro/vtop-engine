@@ -1260,7 +1260,7 @@ impl NetworkedReplicaSet {
         leader_committed_offset: u64,
     ) -> ReplicaQuorumResult {
         let rf = self.replication_factor();
-        let majority_followers = (rf / 2 + 1).saturating_sub(1);
+        let majority_followers = super::write_quorum_followers(rf);
         if self.followers.is_empty() {
             return ReplicaQuorumResult {
                 follower_acks: 0,
