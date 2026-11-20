@@ -1266,6 +1266,53 @@ impl UploadBackend for S3NativeBackend {
         Ok(judge_retention(&stored, expected))
     }
 
+    async fn confirm_lock_absent(
+        &self,
+        object_uri: &str,
+        version_id: Option<&str>,
+        part: crate::base::LockPart,
+    ) -> Result<bool, VtopError> {
+        let (bucket, key) = parse_s3_uri(object_uri)?;
+        let version = version_id.map(str::to_owned);
+        // Unlike a HEAD, these requests answer a caller without the
+        // permission with AccessDenied, and an object that has no lock with
+        // NoSuchObjectLockConfiguration (#709).
+        let absent = |code: Option<&str>| code == Some("NoSuchObjectLockConfiguration");
+        match part {
+            crate::base::LockPart::Retention => match self
+                .client
+                .get_object_retention()
+                .bucket(&bucket)
+                .key(&key)
+                .set_version_id(version)
+                .send()
+                .await
+            {
+                Ok(out) => Ok(out
+                    .retention()
+                    .is_none_or(|r| r.mode().is_none() && r.retain_until_date().is_none())),
+                Err(SdkError::ServiceError(context)) if absent(context.err().code()) => Ok(true),
+                Err(e) => Err(sdk_failure("get_object_retention", object_uri, e)),
+            },
+            crate::base::LockPart::LegalHold => match self
+                .client
+                .get_object_legal_hold()
+                .bucket(&bucket)
+                .key(&key)
+                .set_version_id(version)
+                .send()
+                .await
+            {
+                Ok(out) => Ok(!out
+                    .legal_hold()
+                    .and_then(|h| h.status())
+                    .is_some_and(|s| *s == ObjectLockLegalHoldStatus::On)),
+                Err(SdkError::ServiceError(context)) if absent(context.err().code()) => Ok(true),
+                Err(e) => Err(sdk_failure("get_object_legal_hold", object_uri, e)),
+            },
+        }
+    }
+
     async fn get_object(&self, object_uri: &str) -> Result<Vec<u8>, VtopError> {
         let (bucket, key) = parse_s3_uri(object_uri)?;
         // The body's deadline counts from HERE (review of #568): the time

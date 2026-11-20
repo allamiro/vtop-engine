@@ -185,11 +185,53 @@ batch id, the object and the result.
 [S3 Object Lock: what the engine says](../OBJECT_LOCK_DEPLOYMENT.md#what-the-engine-says)
 gives each message and its fix: the bucket's Object Lock configuration, and the
 credentials' `s3:PutObjectRetention` and `s3:GetObjectRetention` permissions.
-A reused object without the lock fails its range on every replay until its
-retention is extended or that version is deleted.
+A replay no longer stalls on an object already archived without the lock
+asked for (#709): it writes a fresh locked object instead, which
+[VtopObjectLockFallback](#vtopobjectlockfallback) reports.
 
 **When it is safe to ignore.** Never under a compliance requirement: until it
 is fixed, batches of that tenant are not archived under retention.
+
+## VtopObjectLockFallback
+
+**What it means.** With `upload.object_lock` set, a replay found the object
+already archived for its range under its derived key, holding the batch's
+bytes, but not locked as configured: it has no lock (`fallback_unlocked`: it
+was stored before the profile was enabled, or by a store that dropped the lock
+headers), a lock in the other mode (`fallback_lock_mode`), or no legal hold
+while `legal_hold: true` (`fallback_hold_missing`). Or (`lock_withheld`) the
+fresh object this engine wrote for the same range moments ago is not usable
+either, which means the store is not keeping the lock it is asked for.
+
+**What the engine already did.** For a `fallback_*` decision it wrote the
+batch as a fresh object under its attempt key, under the configured lock, and
+committed it only once that lock was read back on the exact version written.
+The old object was left as it is: not written over, deleted or re-locked. For
+`lock_withheld` it wrote nothing, failed the batch and will replay it; after
+five minutes a replay writes one more fresh object. The WARN line is an
+`object_key_fallback` event with the batch id, the old `key`, the new
+`fallback_key`, the `reason` and a `suppressed` count (at most one a minute
+per source and decision). An ended lock (`fallback_lock_elapsed`) does the
+same but does not fire this alert: it is storage cost, not a finding.
+
+**What to check.** Whether objects were archived before the profile was
+enabled (expected once per such range), the bucket's default retention and
+Object Lock configuration, and that the store keeps the retention and legal
+hold it is sent. [`vtopctl scrub --check-retention`](scrub-and-audit.md)
+lists every committed object whose lock is missing, short or in the other
+mode.
+
+**What to do.** For `fallback_unlocked` on objects from before the profile:
+nothing; each range moves to a locked object on its next replay. For
+`fallback_lock_mode`, `fallback_hold_missing` or `lock_withheld`: fix the
+store or the bucket so that it keeps the lock as configured (see
+[S3 Object Lock: what the engine says](../OBJECT_LOCK_DEPLOYMENT.md#what-the-engine-says)).
+The old objects can be retired by your own retention process once their
+ranges are committed elsewhere.
+
+**When it is safe to ignore.** Right after enabling the profile on a bucket
+that already holds archived objects, while the replays of those ranges move
+them to locked objects.
 
 ## VtopRetentionLoss
 

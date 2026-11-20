@@ -41,7 +41,16 @@ pub const STAGES: [&str; 7] = [
 ];
 
 /// The values of `decision` on `vtop_object_key_decisions_total` (#626).
-pub const OBJECT_KEY_DECISIONS: [&str; 8] = [
+/// The last five (#709) are taken only under the S3 Object Lock profile. The
+/// four `fallback_*` among them: an object already at the derived key holds
+/// the batch's bytes, but it has no lock, its lock has ended, it is in the
+/// other mode, or it lacks the configured legal hold, so the batch is written
+/// as a fresh locked object under its attempt key instead of reusing it.
+/// `lock_withheld`: the fresh object written for the same range a moment ago
+/// is not usable either (a store that does not keep the lock), so nothing is
+/// written and the batch fails; outside the `fallback_` prefix on purpose,
+/// since no second object was written.
+pub const OBJECT_KEY_DECISIONS: [&str; 13] = [
     "derived",
     "reused",
     "fallback_differs",
@@ -50,6 +59,11 @@ pub const OBJECT_KEY_DECISIONS: [&str; 8] = [
     "fallback_unchecked",
     "probe_throttled",
     "per_attempt",
+    "fallback_lock_elapsed",
+    "fallback_unlocked",
+    "fallback_lock_mode",
+    "fallback_hold_missing",
+    "lock_withheld",
 ];
 
 /// The values of `result` on `vtop_replay_rebuilds_total` (#626): what a
@@ -311,7 +325,10 @@ pub struct Metrics {
     pub upload_throttled_total: IntCounterVec,
     /// How each batch's object key was decided (#626). `decision` is the
     /// bounded set [`OBJECT_KEY_DECISIONS`]: a rising `fallback_*` or
-    /// `per_attempt` rate means replays are writing second objects.
+    /// `per_attempt` rate means replays are writing second objects. Under
+    /// the Object Lock profile, `fallback_unlocked`, `fallback_lock_mode`,
+    /// `fallback_hold_missing` and `lock_withheld` mean an object that should
+    /// be locked is not (#709).
     pub object_key_decisions_total: IntCounterVec,
     /// What each replay of a window an earlier attempt sealed came to (#626),
     /// by the bounded set [`REPLAY_REBUILD_RESULTS`]. Any result but `exact`
@@ -551,7 +568,7 @@ impl Metrics {
         )?;
         let object_key_decisions_total = cv(
             "object_key_decisions_total",
-            "How each batch's object key was decided (#626): derived (uploaded under its content-derived key), reused (the verified object was already stored, no upload), fallback_differs / fallback_size_only / fallback_unreadable (an object is at the derived key and does not verify, verifies by size only, or could not be read) and fallback_unchecked (the store refused or failed the check of the key): the batch was written under its per-attempt key instead of overwriting anything, probe_throttled (the batch failed and was handed back), per_attempt (no checksum, or a backend that cannot report an absent key)",
+            "How each batch's object key was decided (#626): derived (uploaded under its content-derived key), reused (the verified object was already stored, no upload), fallback_differs / fallback_size_only / fallback_unreadable (an object is at the derived key and does not verify, verifies by size only, or could not be read) and fallback_unchecked (the store refused or failed the check of the key): the batch was written under its per-attempt key instead of overwriting anything, probe_throttled (the batch failed and was handed back), per_attempt (no checksum, or a backend that cannot report an absent key); under the Object Lock profile (#709) fallback_unlocked / fallback_lock_elapsed / fallback_lock_mode / fallback_hold_missing (the verified object at the derived key has no lock, an ended one, the other mode, or no legal hold: a fresh locked object was written under the per-attempt key) and lock_withheld (the fresh object written for the range moments ago is not usable either; nothing was written and the batch failed)",
             vec!["tenant", "source_type", "format", "decision"],
         )?;
         let replay_rebuilds_total = cv(

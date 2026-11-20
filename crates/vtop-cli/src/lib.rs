@@ -9,6 +9,7 @@ mod bucket_versioning;
 pub mod commands;
 pub mod coverage;
 pub mod engine;
+pub mod failpoints;
 pub mod meta_tools;
 pub mod metrics_server;
 pub mod node_tools;

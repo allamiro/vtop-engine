@@ -292,8 +292,9 @@ The full table, with what is done and what is planned, is in
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | crates, the engine's runtime flow, recovery, implementation status |
 | [Archive path reference](docs/reference/archive-path.md) | sources, formats, the manifest, verification, recovery, metrics |
 | [PRODUCTION_HA.md](docs/PRODUCTION_HA.md) | engine HA: status, design and phased roadmap |
-| [ROADMAP.md](docs/ROADMAP.md) | cluster-plane releases and per-release limitations |
+| [ROADMAP.md](docs/ROADMAP.md) | engine and cluster-plane releases, per-release limitations and upgrade notes |
 | [Compatibility policy](docs/reference/compatibility.md) | what each format promises, upgrade and downgrade rules, deprecation |
+| [SUPPORT.md](docs/SUPPORT.md) | versioning, which releases get fixes, and the 1.x support window |
 | [SECURITY_MODEL.md](docs/SECURITY_MODEL.md) | the security model and its normative rules |
 | [SECURITY.md](SECURITY.md) | reporting a vulnerability: the private channel, response times, supported versions |
 | [RELEASE_VERIFICATION.md](docs/RELEASE_VERIFICATION.md) | checking a release's signatures, SBOM and provenance |

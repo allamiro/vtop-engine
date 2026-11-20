@@ -222,5 +222,6 @@ nav:
       - Live chaos validation: LIVE_CHAOS_VALIDATION.md
   - Roadmap and releases:
       - Roadmap: ROADMAP.md
+      - Versioning and support: SUPPORT.md
       - Releases: https://github.com/allamiro/vtop-engine/releases
   - Contributing: contributing.md

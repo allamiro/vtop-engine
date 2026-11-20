@@ -174,5 +174,6 @@ pub fn pipeline<'a>(
         provisioned_buckets: std::sync::Arc::default(),
         key_notices: std::sync::Arc::default(),
         locked_buckets: std::sync::Arc::default(),
+        lock_fallbacks: std::sync::Arc::default(),
     }
 }
