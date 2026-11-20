@@ -491,7 +491,8 @@ case "$MODE" in
     log "backup while the engine runs"
     T=$(now_us)
     sqlite3 "$DB" ".timeout 10000" ".backup '$BK/state.db'"
-    cp -a "$DIGESTS" "$BK/digests"
+    mkdir -p "$BK/digests"
+    cp -a "$DIGESTS/." "$BK/digests/"
     BACKUP_MS=$(ms_since "$T")
     [[ "$(sqlite3 "$BK/state.db" 'PRAGMA integrity_check')" == ok ]] || fail "the backup fails integrity_check"
 
@@ -508,7 +509,8 @@ case "$MODE" in
     log "restore"
     T_RESTORE=$(now_us)
     cp "$BK/state.db" "$DB"
-    cp -a "$BK/digests" "$DIGESTS"
+    mkdir -p "$DIGESTS"
+    cp -a "$BK/digests/." "$DIGESTS/"
     chmod 0600 "$DB"
     [[ "$(sqlite3 "$DB" 'PRAGMA integrity_check')" == ok ]] || fail "the restored ledger fails integrity_check"
     RESTORE_MS=$(ms_since "$T_RESTORE")
@@ -534,7 +536,8 @@ case "$MODE" in
     log "backup while the engine runs (pg_dump)"
     T=$(now_us)
     docker exec "$PG_CONT" pg_dump -U vtop -d vtop --format=custom > "$BK/ledger.dump"
-    cp -a "$DIGESTS" "$BK/digests"
+    mkdir -p "$BK/digests"
+    cp -a "$DIGESTS/." "$BK/digests/"
     BACKUP_MS=$(ms_since "$T")
     [[ -s "$BK/ledger.dump" ]] || fail "pg_dump wrote nothing"
     docker exec -i "$PG_CONT" pg_restore -l < "$BK/ledger.dump" > /dev/null || fail "the dump's table of contents does not read"
@@ -554,7 +557,8 @@ case "$MODE" in
       -c 'CREATE DATABASE vtop' > /dev/null
     docker exec -i "$PG_CONT" pg_restore -U vtop -d vtop --exit-on-error < "$BK/ledger.dump" \
       > "$LOGS/pg_restore.log" 2>&1 || fail "pg_restore failed; see $LOGS/pg_restore.log"
-    cp -a "$BK/digests" "$DIGESTS"
+    mkdir -p "$DIGESTS"
+    cp -a "$BK/digests/." "$DIGESTS/"
     # Always, before any engine starts: it re-creates the commit rule's
     # trigger from this release's function.
     ctl migrate-after-restore migrate --config "$CFG"
@@ -596,7 +600,8 @@ case "$MODE" in
     T=$(now_us)
     docker exec "$PG_CONT" pg_basebackup -U vtop -D /basebackup/base -X stream -c fast \
       > "$LOGS/pg_basebackup.log" 2>&1 || fail "pg_basebackup failed; see $LOGS/pg_basebackup.log"
-    cp -a "$DIGESTS" "$BK/digests"
+    mkdir -p "$BK/digests"
+    cp -a "$DIGESTS/." "$BK/digests/"
     BACKUP_MS=$(ms_since "$T")
 
     # A moment between the backup and the disaster to recover to, with the
@@ -635,7 +640,8 @@ case "$MODE" in
     log "restore to the end of the archive"
     T_RESTORE=$(now_us)
     pitr_server "$P-restored" "$P-data-restored"
-    cp -a "$BK/digests" "$DIGESTS"
+    mkdir -p "$DIGESTS"
+    cp -a "$BK/digests/." "$DIGESTS/"
     ctl migrate-after-restore migrate --config "$CFG"
     RESTORE_MS=$(ms_since "$T_RESTORE")
     read_restored

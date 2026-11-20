@@ -125,7 +125,8 @@ which copies a consistent snapshot even while the engine writes:
 ```bash
 umask 077
 sqlite3 /var/lib/vtop/state.db ".timeout 10000" ".backup '/backup/state.db'"
-cp -a /var/lib/vtop/state.db.ledger-digests /backup/digests     # after the database
+mkdir -p /backup/digests
+cp -a /var/lib/vtop/state.db.ledger-digests/. /backup/digests/  # after the database
 sqlite3 /backup/state.db 'PRAGMA integrity_check'               # prints: ok
 ```
 
@@ -140,7 +141,8 @@ rm -f /var/lib/vtop/state.db /var/lib/vtop/state.db-wal /var/lib/vtop/state.db-s
 cp /backup/state.db /var/lib/vtop/state.db
 chmod 0600 /var/lib/vtop/state.db
 rm -rf /var/lib/vtop/state.db.ledger-digests
-cp -a /backup/digests /var/lib/vtop/state.db.ledger-digests
+mkdir -p /var/lib/vtop/state.db.ledger-digests
+cp -a /backup/digests/. /var/lib/vtop/state.db.ledger-digests/
 vtopctl run --config /etc/vtop/config.yaml
 ```
 
@@ -161,12 +163,14 @@ which is the way back from a mistake rather than from a lost host.
 ```bash
 # Back up while the engine runs. pg_dump reads one snapshot.
 pg_dump --format=custom --file=/backup/ledger.dump "$VTOP_STATE_STORE"
-cp -a /var/lib/vtop/ledger-digests /backup/digests              # after the dump
+mkdir -p /backup/digests
+cp -a /var/lib/vtop/ledger-digests/. /backup/digests/           # after the dump
 
 # Restore, with every engine stopped, into an empty database.
 createdb vtop
 pg_restore --exit-on-error --dbname=vtop /backup/ledger.dump
-cp -a /backup/digests /var/lib/vtop/ledger-digests
+mkdir -p /var/lib/vtop/ledger-digests
+cp -a /backup/digests/. /var/lib/vtop/ledger-digests/
 vtopctl migrate --config /etc/vtop/config.yaml                  # always, before any engine starts
 vtopctl run --config /etc/vtop/config.yaml
 ```
