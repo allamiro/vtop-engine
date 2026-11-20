@@ -34,7 +34,7 @@ stricter and better check for a deployment.
 
 The image also has a GitHub build provenance attestation (SLSA), which says
 which workflow, tag and commit built it. Check it with the GitHub CLI
-(`gh attestation`, version 2.49 or newer), signed in to the registry if your
+(`gh attestation`, version 2.68 or newer, the first with `--source-ref`), signed in to the registry if your
 setup needs it:
 
 ```
