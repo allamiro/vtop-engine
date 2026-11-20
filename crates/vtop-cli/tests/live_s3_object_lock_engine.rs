@@ -351,7 +351,7 @@ async fn live_the_engine_archives_a_batch_under_the_configured_lock() {
 #[ignore = "requires an S3-compatible endpoint with Object Lock"]
 async fn live_a_replay_over_an_ended_lock_commits_a_fresh_locked_object() {
     let live = LiveS3::from_env();
-    live.case(
+    live.case_with_refusal(
         "engine.object_lock.a_replay_over_an_ended_lock_commits_a_fresh_object",
         &[Capability::Versioning, Capability::ObjectLock],
         || async {
@@ -487,6 +487,7 @@ async fn live_a_replay_over_an_ended_lock_commits_a_fresh_locked_object() {
                     .unwrap_or_else(|e| panic!("cleaning up {:?}: {e:?}", v.key()));
             }
         },
+        refused_at_startup,
     )
     .await;
 }
