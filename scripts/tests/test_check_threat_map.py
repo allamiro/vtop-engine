@@ -46,6 +46,20 @@ SOURCES = {
         "    #[test]\n    fn the_control_holds_longer() {}\n"
         "}\n"
     ),
+    "crates/a/src/layouts.rs": (
+        "#[cfg(test)]\nmod tests {\n"
+        "    /* a block comment\n    #[test]\n    fn removed_in_a_block() {}\n    */\n"
+        "    /* outer /* nested */ still a comment\n    fn removed_in_a_nested_block() {}\n    */\n"
+        "    #[test]\n    fn kept_after_the_comments() {}\n"
+        "    #[test]\n    #[ignore]\n    #[tokio::test(\n        flavor = \"multi_thread\",\n        worker_threads = 2\n    )]\n"
+        "    fn ignored_with_a_multiline_attribute() {}\n"
+        "    #[ignore]\n    /// a doc comment between attributes\n    #[test]\n    fn ignored_above_a_doc_comment() {}\n"
+        "    // #[ignore]\n    #[test]\n    fn not_ignored_by_a_comment() {}\n"
+        "    #[tokio::test(\n        flavor = \"multi_thread\",\n    )]\n    fn multiline_attribute_and_run() {}\n"
+        "    const S: &str = \"/* not a comment\";\n    #[test]\n    fn after_a_string_with_a_comment_opener() {}\n"
+        "    const C: char = '\"';\n    #[test]\n    fn after_a_quote_char() {}\n"
+        "}\n"
+    ),
     "scripts/tests/test_x.py": "class T:\n    def test_it_holds(self):\n        pass\n",
     ".github/workflows/ci.yml": "jobs:\n  audit:\n    name: supply-chain (cargo audit)\n",
     "scripts/scenario.sh": "#!/usr/bin/env bash\necho ok\n",
@@ -161,6 +175,24 @@ class CheckTests(unittest.TestCase):
         for name in ("a_skipped_test", "a_skipped_test_with_a_reason"):
             rows = good_rows()
             rows["K1"] = row("K1", test=f"`crates/a/src/lib.rs::{name}`")
+            self.assert_fails(self.repo(document(rows)), "K1", "#[ignore]d")
+
+    def test_a_block_commented_test_is_not_a_test_even_when_nested(self):
+        for name in ("removed_in_a_block", "removed_in_a_nested_block"):
+            rows = good_rows()
+            rows["K1"] = row("K1", test=f"`crates/a/src/layouts.rs::{name}`")
+            self.assert_fails(self.repo(document(rows)), "K1", "no test function")
+
+    def test_comment_stripping_does_not_hide_tests_after_strings_and_chars(self):
+        for name in ("kept_after_the_comments", "after_a_string_with_a_comment_opener", "after_a_quote_char", "not_ignored_by_a_comment", "multiline_attribute_and_run"):
+            rows = good_rows()
+            rows["K1"] = row("K1", test=f"`crates/a/src/layouts.rs::{name}`")
+            self.assertEqual(self.repo(document(rows)).problems(), [], name)
+
+    def test_an_ignore_is_found_through_multiline_attributes_and_doc_comments(self):
+        for name in ("ignored_with_a_multiline_attribute", "ignored_above_a_doc_comment"):
+            rows = good_rows()
+            rows["K1"] = row("K1", test=f"`crates/a/src/layouts.rs::{name}`")
             self.assert_fails(self.repo(document(rows)), "K1", "#[ignore]d")
 
     def test_a_python_test_is_found_by_def(self):

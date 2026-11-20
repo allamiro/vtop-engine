@@ -168,18 +168,82 @@ def _test_pattern(path: str, symbol: str) -> re.Pattern | None:
     return None
 
 
+def strip_rust_comments(text: str) -> str:
+    """`text` with every comment blanked and every newline kept.
+
+    Line comments, block comments (which nest in Rust) and doc comments go;
+    string and character literals are copied through, so a `/*` inside a
+    string does not start a comment. Line numbers are unchanged. It is a
+    scanner for this check, not a Rust lexer: it does not handle every raw
+    string form, and a miss there can only hide a test from the check, which
+    then fails loudly instead of passing.
+    """
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        two = text[i : i + 2]
+        if two == "//":
+            while i < n and text[i] != "\n":
+                out.append(" ")
+                i += 1
+        elif two == "/*":
+            depth = 0
+            while i < n:
+                if text[i : i + 2] == "/*":
+                    depth += 1
+                    out.append("  ")
+                    i += 2
+                elif text[i : i + 2] == "*/":
+                    depth -= 1
+                    out.append("  ")
+                    i += 2
+                    if depth == 0:
+                        break
+                else:
+                    out.append("\n" if text[i] == "\n" else " ")
+                    i += 1
+        elif c == '"':
+            out.append(c)
+            i += 1
+            while i < n and text[i] != '"':
+                if text[i] == "\\" and i + 1 < n:
+                    out.append(text[i])
+                    i += 1
+                out.append(text[i])
+                i += 1
+            if i < n:
+                out.append('"')
+                i += 1
+        elif c == "'" and (text[i + 2 : i + 3] == "'" or (text[i + 1 : i + 2] == "\\" and "'" in text[i + 2 : i + 6])):
+            end = text.index("'", i + 2 if text[i + 1] != "\\" else i + 3)
+            out.append(text[i : end + 1])
+            i = end + 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+IGNORE = re.compile(r"#\[\s*ignore\b")
+
+
 def _ignored(lines: list[str], index: int) -> bool:
-    """Whether the attributes directly above line `index` include #[ignore]."""
+    """Whether the attributes above line `index` include #[ignore].
+
+    `lines` have their comments blanked. The attribute block is every line
+    back to the end of the previous item (a line ending in `;`, `{` or `}`),
+    so an attribute that spans several lines is read whole.
+    """
+    block: list[str] = []
     j = index - 1
-    while j >= 0:
+    while j >= 0 and len(block) < 60:
         s = lines[j].strip()
-        if s.startswith("#["):
-            if s.startswith("#[ignore"):
-                return True
-        elif s and not s.startswith("//"):
-            return False
+        if s.endswith((";", "{", "}")):
+            break
+        block.append(s)
         j -= 1
-    return False
+    return bool(IGNORE.search(" ".join(reversed(block))))
 
 
 def resolve(root: pathlib.Path, path: str, symbol: str | None, is_test: bool):
@@ -193,11 +257,14 @@ def resolve(root: pathlib.Path, path: str, symbol: str | None, is_test: bool):
         text = file.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as e:
         return f"`{path}` cannot be read: {e}", None
+    # A test that is commented out is not a test; a control may be cited by
+    # the comment or message that states it, so only tests lose their comments.
+    if is_test and path.endswith(".rs"):
+        text = strip_rust_comments(text)
     lines = text.splitlines()
     pattern = (_test_pattern(path, symbol) if is_test else None) or _word(symbol)
     for n, line in enumerate(lines):
-        # A test commented out is not a test.
-        if is_test and line.lstrip().startswith(("//", "#")) and not line.lstrip().startswith("#["):
+        if is_test and path.endswith(".py") and line.lstrip().startswith("#"):
             continue
         if pattern.search(line):
             if is_test and path.endswith(".rs") and _ignored(lines, n):
