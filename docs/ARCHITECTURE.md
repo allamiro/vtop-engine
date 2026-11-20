@@ -1350,7 +1350,7 @@ reality.
 | Upload backends incl. `localfs`, hardened command backends (§8) | ✅ shipped | Verification strength declared per backend (protocol §17). |
 | `StateStore`: SQLite + PostgreSQL, shared battery, DB constraints (§12) | ✅ shipped | Retry-on-`40001`; `vtopctl migrate` privilege split; retention (#128). |
 | Manifest self-hash + keyed BLAKE3 MAC, version pinning (§9) | ✅ shipped | MAC key rotation through key ids and a keyring shipped (#685, `0.4` manifests). Public-key signatures are future work. |
-| Metrics endpoint + readiness, dashboards-as-code (§14) | ✅ shipped | OpenTelemetry export (traces and metrics over OTLP, idle until configured, #683) shipped too. The lab's Grafana provisions alert rules; a tested Prometheus alert rule set for deployments is #720. |
+| Metrics endpoint + readiness, dashboards-as-code (§14) | ✅ shipped | OpenTelemetry export (traces and metrics over OTLP, idle until configured, #683) shipped too. A Prometheus alert rule set, unit-tested with `promtool`, with a runbook section per alert and documented SLOs, shipped too (#720, `observability/prometheus/vtop-rules.yaml`); wiring it to an Alertmanager is the deployment's. |
 | Deterministic object naming (§11, §13) | ✅ objects (#626) | Object keys derived from source, range and content digest; reused only after strong verification. Narrowed, not closed: manifests stay per attempt, and the limits in §13 item 3 still produce a second object. |
 | Multi-instance fleet (consumer groups + multi-writer recovery) | ⬜ planned | Phase 5; single-instance lock (#66) until then. |
 | Engine Kubernetes chart | ⬜ planned | Phase 7 — `helm/vtop` deploys the cluster plane, not the engine. |

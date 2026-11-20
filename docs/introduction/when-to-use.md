@@ -18,7 +18,7 @@
 |---|---|---|
 | Several engines sharing the load, with failover | Not supported: one engine per ledger. Fleet mode is designed but not built. | One engine, with its ledger in PostgreSQL. See [Several engines](../deploy/ha.md). |
 | A Kafka-compatible broker | The cluster plane's Kafka gateway is a prototype, measured well below Apache Kafka's throughput on the same host. | Apache Kafka, with VTOP archiving from it. See [Measured results](../benchmarks/index.md). |
-| Exactly one object per batch, even across replays | A replay of the same bytes reuses the stored object (#626). A replay over a source that grew, in a later hour under seal-time partitioning, with no checksum or on a command backend writes a second object, so a range can be stored twice (a duplicate, never a gap). | Deduplicate downstream by the manifest's source range. |
+| Exactly one object per batch, even across replays | A replay of the same bytes reuses the stored object, and a replay over a source that grew or in a later hour is rebuilt as first cut (#626). A range that cannot be rebuilt as cut, a later-hour replay of a row from before v0.10.0, or a replay with no checksum or on a command backend writes a second object, so a range can be stored twice (a duplicate, never a gap). | Deduplicate downstream by the manifest's source range. |
 | Lossless UDP syslog | VTOP reads syslog from spool files a collector has written. Data dropped before the spool is outside its reach. | Have rsyslog or syslog-ng spool to disk, and point VTOP at the spool. |
 | A Windows build | Not built. | Linux or macOS, or the container image. |
 

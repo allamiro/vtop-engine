@@ -48,9 +48,10 @@ procedure.
 
 ## Run-time libraries
 
-From v0.9.0, the Linux and macOS binaries need no extra
-libraries. The v0.8.0 binaries and earlier still link OpenSSL 3 and Cyrus
-SASL dynamically:
+From v0.9.0, the Linux and macOS binaries need no library beyond the base
+system's (for the glibc version, see [Supported platforms](#supported-platforms)).
+The v0.8.0 binaries and earlier still link OpenSSL 3 and Cyrus SASL
+dynamically:
 
 === "Debian / Ubuntu"
 

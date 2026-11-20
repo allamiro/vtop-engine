@@ -16,6 +16,60 @@ read the section for the release you are moving to. What each format
 promises, and the rules for changing one, are in the
 [compatibility policy](../reference/compatibility.md).
 
+## Upgrading from v0.10.0 to v0.10.1
+
+v0.10.1 fixes the Linux archives: v0.10.0's did not start on a host with a
+glibc older than 2.39, such as Debian 12, Ubuntu 22.04 or RHEL 8 and 9
+(#808). The full notes are in
+[v0.10.1](../ROADMAP.md#v0101--the-linux-archives-run-on-glibc-228) in the
+roadmap.
+
+- **A drop-in replacement.** Replace the binaries in any order; v0.10.0 and
+  v0.10.1 engines, voters and data nodes can run side by side. No schema,
+  on-disk or wire format, `config.yaml` key or cluster feature level changes.
+- **The Linux archives need glibc 2.28 or later**: Debian 10, Ubuntu 20.04,
+  and RHEL, AlmaLinux and Rocky Linux 8 and later. musl distributions such as
+  Alpine are not supported; use the container image.
+- **Helm chart 0.6.0** (`appVersion` 0.10.1). The new
+  `metrics.prometheusRule` values are optional and off by default, and an
+  existing values file renders as before. Turning `enabled` on needs the
+  Prometheus Operator CRDs; without them, load
+  `observability/prometheus/vtop-rules.yaml` with `rule_files`.
+
+## Upgrading from v0.9.0 to v0.10.0
+
+The full notes, including what an older engine does with each new key, are in
+[v0.10.0](../ROADMAP.md#v0100--an-archive-that-can-be-audited-receipts-object-lock-key-rotation-an-audit-trail-and-replays-that-land-on-the-object-already-archived)
+in the roadmap. The steps that need an operator, in order:
+
+1. **PostgreSQL: run `vtopctl migrate` from v0.10.0, with the migration
+   identity, before starting v0.10.0 engines.** It adds the nullable
+   `sealed_at` column and the append-only `audit_events` table, and v0.10.0
+   engines refuse a schema without them. Grant the runtime and maintenance
+   roles `SELECT, INSERT` on `audit_events` and `USAGE` on
+   `audit_events_seq_seq` ([PostgreSQL deployment](../POSTGRES_DEPLOYMENT.md)).
+   The schema marker stays 3, so v0.9.0 engines keep running on the migrated
+   schema. SQLite adds both on open.
+2. **Upgrade every engine, metadata voter and data node.** On Kubernetes,
+   install chart `0.5.3` from the v0.10.0 checkout (`appVersion` `0.10.0`).
+3. **Raise the cluster feature level to 8 only if you want
+   `vtopctl node promote-unproven`**: `vtopctl meta node-versions --level 8`,
+   then `vtopctl meta enable-features --level 8`. The raise is permanent.
+4. **Then turn on the new settings**, once every engine, `vtopctl` and
+   auditor that reads the archive runs v0.10.0. Older engines silently ignore
+   them, and two are not harmless in a mixed fleet: under `manifest.mac` an
+   older engine keeps signing with its one key and cannot verify manifests
+   signed with a new one, and under `upload.object_lock` it writes unlocked
+   objects. `manifest.write_version: "0.4"` writes manifests that readers
+   before v0.8.0 report as tampered.
+
+Check before upgrading: `vtopctl prune-ledger`, `replay` and `migrate` now
+fail when their audit record cannot be written, and need the manifest MAC key
+in their environment when one is configured; `upload.require_object_versioning`
+against a store without versioning refuses to start; and a delete under
+`delete_without_open_check` with no lease is counted `deleted_unchecked`, not
+`deleted`.
+
 ## Upgrading from v0.8.0 to v0.9.0
 
 v0.9.0 is a bug-fix release. The full notes are in
@@ -102,9 +156,8 @@ read `0.4`, so upgrade every engine and auditor before a later release turns
 `0.4` on. The details are under
 [v0.10.0 in detail](../ROADMAP.md#v0100-in-detail) in the roadmap.
 
-Verification receipts (`manifest.verification_receipts`) are on `main` for
-v0.10.0 and in no release yet. They need no reader upgrade: a reader that
-does not know them never fetches them. Older engines ignore the key and write
+Verification receipts (`manifest.verification_receipts`, from v0.10.0)
+need no reader upgrade: a reader that does not know them never fetches them. Older engines ignore the key and write
 none, so turn on `vtopctl scrub --require-receipts` only once every engine
 writes them; see [Verification receipts](verification-receipts.md).
 

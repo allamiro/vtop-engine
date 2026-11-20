@@ -185,12 +185,13 @@ production cluster daemon.
   still unproven here is automated repair with no operator in the loop.
 - Scenario 04 proves acknowledged durability and same-directory recovery;
   it does not fail over. Lease-driven failover is scenarios 09, 14 and 23.
-- Consumer-group cursors are exercised live through the Kafka gateway
-  (scenarios 19 to 21: a group's committed offset is a cursor on the metadata
-  plane, and a second consumer resumes from it). The native protocol's own
-  cursor commit is covered by the metadata state machine and deterministic
-  Raft tests, not by this harness, so it claims no end-to-end cursor
-  continuity across membership changes.
+- Consumer-group cursors are exercised live through the Kafka gateway:
+  scenario 20 commits a group's offset as a cursor on the metadata plane, and
+  a second consumer resumes from it (scenarios 19 and 21 run groups on nodes
+  with no metadata plane, where every commit is refused by name). The native
+  protocol's own cursor commit is covered by the metadata state machine and
+  deterministic Raft tests, not by this harness, so it claims no end-to-end
+  cursor continuity across membership changes.
 - Offline segment verification applies to scenarios that create data-plane
   artifacts. Metadata-only scenarios have no segment files to verify.
 

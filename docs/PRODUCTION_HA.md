@@ -1733,9 +1733,12 @@ deployment identity; the live battery proves the runtime role cannot run DDL,
   derived key is never written over (`crates/vtop-cli/tests/object_lock.rs`,
   against the mock store); the store's own behaviour, an overwrite that makes
   a new version and a locked version that survives a delete, is tested
-  against the lab's MinIO in CI (`minio-integration`). Not done: reproducing
-  batch boundaries after a power loss, a partition hour stable under
-  `time_source = seal`, and per-range manifests.
+  against the lab's MinIO in CI (`minio-integration`). A replay in a later
+  hour is sealed at the instant its row recorded (#755), and a replay over a
+  source that grew is rebuilt as first cut (#793, #796), so both reuse the
+  object (v0.10.0). Not done: reproducing batch boundaries after a power
+  loss, a stable partition hour for a row written before v0.10.0, and
+  per-range manifests.
   See [ARCHITECTURE.md](ARCHITECTURE.md) §13 item 3.
 
 ### Phase 5 — Kafka consumer-group fleet mode ⬜ NOT STARTED

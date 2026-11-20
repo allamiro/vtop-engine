@@ -55,10 +55,11 @@ past, so recovery stops revisiting it. It is not a commit.
 | After the commit | Nothing: the batch is complete. |
 
 A replay of the same bytes resolves to the object already stored and reuses
-it once it verifies (#626). A replay that produces other bytes (a source that
-grew, a later hour under seal-time partitioning) writes a second object, as
-does any replay with no checksum or on a command backend: a duplicate, never a
-gap.
+it once it verifies (#626). A replay over a source that grew, or in a later
+hour, is rebuilt as the batch that was first cut, so it produces the same
+bytes. A range that cannot be rebuilt as cut, a later-hour replay of a row
+written before v0.10.0, and any replay with no checksum or on a command
+backend still write a second object: a duplicate, never a gap.
 
 ## Where the pieces are set and watched
 

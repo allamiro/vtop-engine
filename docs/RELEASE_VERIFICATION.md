@@ -5,7 +5,7 @@ ceremony: the point of publishing signatures is that somebody checks them, and
 an unverified download from a release page is a download from whoever could
 reach the release page.
 
-Replace `VERSION` with the release you are installing, for example `0.9.0`.
+Replace `VERSION` with the release you are installing, for example `0.10.1`.
 (This is the software release version; the VTOP *protocol* version carried
 inside manifests is separate — see
 [VTOP_PROTOCOL_DRAFT.md §11.2](VTOP_PROTOCOL_DRAFT.md#112-field-reference).
