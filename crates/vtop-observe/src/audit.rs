@@ -736,9 +736,10 @@ struct FileSink {
     /// the next record starts on a new line, so it is not glued to the
     /// fragment and lost to every reader (review of #767).
     needs_newline: bool,
-    /// The file's length after this sink's last append (or when it was
-    /// opened). Another length means another writer - a node, a `vtopctl`
-    /// run - appended since, so the file's last byte is read again.
+    /// The file's length after this sink's last append; `None` before the
+    /// first. Another length (or `None`) means another writer - a node, a
+    /// `vtopctl` run - may have appended since, so the file's last byte is
+    /// read again under the lock.
     end: Option<u64>,
 }
 
@@ -788,9 +789,13 @@ impl FileSink {
 
     fn append_locked(&mut self, json: &str, locked: bool) -> std::io::Result<()> {
         let before = self.file.metadata().map(|m| m.len()).ok();
-        if before.is_some() && before != self.end {
-            // Another writer appended since; it may have left the file
-            // inside a line it could not cut off.
+        if before.is_none() || before != self.end {
+            // The first append, or another writer appended since: the file
+            // may end inside a line (an earlier run that crashed part-way
+            // through an append, or a writer that could not cut its
+            // fragment off), and the record must not be glued to it. Read
+            // under the lock, so no writer can add a fragment between this
+            // read and the write (review of #767).
             self.needs_newline = ends_inside_a_line(&self.path);
         }
         let mut line = String::with_capacity(json.len() + 2);
@@ -857,16 +862,14 @@ impl AuditSink {
             path: path.to_owned(),
             error: e.to_string(),
         })?;
-        // A file that ends inside a line (a crash part-way through an append
-        // by an earlier run) gets a newline before the next record, so that
-        // record is not glued to the fragment (review of #767).
-        let needs_newline = ends_inside_a_line(path);
-        let end = file.metadata().map(|m| m.len()).ok();
+        // The file's tail is not read here, outside the lock: another
+        // writer could leave a fragment between that read and the first
+        // append. The first append reads it under the lock (`end` is None).
         *self.file.lock().unwrap_or_else(|e| e.into_inner()) = Some(FileSink {
             path: path.to_owned(),
             file,
-            needs_newline,
-            end,
+            needs_newline: false,
+            end: None,
         });
         Ok(())
     }
@@ -1350,6 +1353,50 @@ mod tests {
         assert!(
             serde_json::from_str::<AuditEvent>(lines[2]).is_ok(),
             "the record after another writer's fragment is a line of its own: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review of #767: opening the file read its tail and its length
+    /// outside the lock, so another writer could append a fragment between
+    /// the two reads; the first record then matched the remembered length,
+    /// skipped the tail check and was glued to the fragment. Nothing about
+    /// the tail is remembered from the open now: the first append reads it
+    /// under the lock.
+    #[test]
+    fn the_first_append_reads_the_tail_under_the_lock() {
+        let dir = std::env::temp_dir().join(format!("vtop-767o-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        std::fs::write(&path, b"{\"audit_version\":1}\n").unwrap();
+        let sink = AuditSink::default();
+        sink.open_file(&path).unwrap();
+        {
+            let guard = sink.file.lock().unwrap();
+            let file_sink = guard.as_ref().unwrap();
+            assert_eq!(
+                file_sink.end, None,
+                "the length seen at open would let the first append skip the tail check"
+            );
+            assert!(!file_sink.needs_newline);
+        }
+        // The race's outcome: a fragment lands after the open.
+        let mut other = OpenOptions::new().append(true).open(&path).unwrap();
+        other.write_all(br#"{"audit_version":1,"aud"#).unwrap();
+        sink.record(&AuditEvent::new(
+            Action::ClusterPropose,
+            Stage::Applied,
+            Actor::replica("meta-1"),
+            Target::new("cluster", None),
+            Outcome::Success,
+        ))
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(
+            serde_json::from_str::<AuditEvent>(lines[2]).is_ok(),
+            "the first record after a fragment is a line of its own: {text}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
