@@ -171,14 +171,19 @@ def _test_pattern(path: str, symbol: str) -> re.Pattern | None:
     return None
 
 
-def strip_rust_comments(text: str) -> str:
+RAW_OPEN = re.compile(r'r(#*)"')
+
+
+def strip_rust_comments(text: str, blank_literals: bool = False) -> str:
     """`text` with every comment blanked and every newline kept.
 
     Line comments, block comments (which nest in Rust) and doc comments go;
-    string and character literals are copied through, so a `/*` inside a
-    string does not start a comment. Line numbers are unchanged. It is a
-    scanner for this check, not a Rust lexer: it does not handle every raw
-    string form, and a miss there can only hide a test from the check, which
+    string, raw string and character literals are scanned so that a `/*` inside a string
+    does not start a comment; with `blank_literals` their contents are blanked
+    too, so a declaration quoted in a string is not a declaration. Line numbers
+    are unchanged. It is a
+    scanner for this check, not a Rust lexer: it does not handle byte-string
+    prefixes beyond the plain `b""`, and a miss there can only hide a test from the check, which
     then fails loudly instead of passing.
     """
     out: list[str] = []
@@ -206,21 +211,29 @@ def strip_rust_comments(text: str) -> str:
                 else:
                     out.append("\n" if text[i] == "\n" else " ")
                     i += 1
+        elif c == "r" and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")) and (raw := RAW_OPEN.match(text, i)):
+            # A raw string: r"..." or r#"..."# with any number of hashes.
+            close = '"' + "#" * len(raw.group(1))
+            end = text.find(close, raw.end())
+            end = n if end < 0 else end + len(close)
+            for ch in text[i:end]:
+                out.append("\n" if ch == "\n" else " " if blank_literals else ch)
+            i = end
         elif c == '"':
             out.append(c)
             i += 1
             while i < n and text[i] != '"':
                 if text[i] == "\\" and i + 1 < n:
-                    out.append(text[i])
+                    out.append(" " if blank_literals else text[i])
                     i += 1
-                out.append(text[i])
+                out.append("\n" if text[i] == "\n" else " " if blank_literals else text[i])
                 i += 1
             if i < n:
                 out.append('"')
                 i += 1
         elif c == "'" and (text[i + 2 : i + 3] == "'" or (text[i + 1 : i + 2] == "\\" and "'" in text[i + 2 : i + 6])):
             end = text.index("'", i + 2 if text[i + 1] != "\\" else i + 3)
-            out.append(text[i : end + 1])
+            out.append(" " * (end + 1 - i) if blank_literals else text[i : end + 1])
             i = end + 1
         else:
             out.append(c)
@@ -260,10 +273,10 @@ def resolve(root: pathlib.Path, path: str, symbol: str | None, is_test: bool):
         text = file.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as e:
         return f"`{path}` cannot be read: {e}", None
-    # A test that is commented out is not a test; a control may be cited by
+    # A test that is commented out, or quoted in a string, is not a test; a control may be cited by
     # the comment or message that states it, so only tests lose their comments.
     if is_test and path.endswith(".rs"):
-        text = strip_rust_comments(text)
+        text = strip_rust_comments(text, blank_literals=True)
     lines = text.splitlines()
     pattern = (_test_pattern(path, symbol) if is_test else None) or _word(symbol)
     for n, line in enumerate(lines):

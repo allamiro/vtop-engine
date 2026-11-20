@@ -56,6 +56,10 @@ SOURCES = {
         "    #[ignore]\n    /// a doc comment between attributes\n    #[test]\n    fn ignored_above_a_doc_comment() {}\n"
         "    // #[ignore]\n    #[test]\n    fn not_ignored_by_a_comment() {}\n"
         "    #[tokio::test(\n        flavor = \"multi_thread\",\n    )]\n    fn multiline_attribute_and_run() {}\n"
+        "    const QUOTED: &str = \"fn quoted_in_a_string() {}\";\n"
+        "    const MULTI: &str = \"line one\nfn quoted_on_a_second_line() {}\";\n"
+        "    const RAW: &str = r#\"a \"quoted\" fn quoted_in_a_raw_string() {}\n// not a comment\"#;\n"
+        "    #[test]\n    fn after_a_raw_string_with_quotes() {}\n"
         "    const S: &str = \"/* not a comment\";\n    #[test]\n    fn after_a_string_with_a_comment_opener() {}\n"
         "    const C: char = '\"';\n    #[test]\n    fn after_a_quote_char() {}\n"
         "}\n"
@@ -193,8 +197,14 @@ class CheckTests(unittest.TestCase):
             rows["K1"] = row("K1", test=f"`crates/a/src/layouts.rs::{name}`")
             self.assert_fails(self.repo(document(rows)), "K1", "no test function")
 
+    def test_a_declaration_quoted_in_a_string_is_not_a_test(self):
+        for name in ("quoted_in_a_string", "quoted_on_a_second_line", "quoted_in_a_raw_string"):
+            rows = good_rows()
+            rows["K1"] = row("K1", test=f"`crates/a/src/layouts.rs::{name}`")
+            self.assert_fails(self.repo(document(rows)), "K1", "no test function")
+
     def test_comment_stripping_does_not_hide_tests_after_strings_and_chars(self):
-        for name in ("kept_after_the_comments", "after_a_string_with_a_comment_opener", "after_a_quote_char", "not_ignored_by_a_comment", "multiline_attribute_and_run"):
+        for name in ("kept_after_the_comments", "after_a_string_with_a_comment_opener", "after_a_quote_char", "after_a_raw_string_with_quotes", "not_ignored_by_a_comment", "multiline_attribute_and_run"):
             rows = good_rows()
             rows["K1"] = row("K1", test=f"`crates/a/src/layouts.rs::{name}`")
             self.assertEqual(self.repo(document(rows)).problems(), [], name)
