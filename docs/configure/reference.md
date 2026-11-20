@@ -32,6 +32,7 @@ Default column means the key is unset unless you set it.
 | `sources` | **Required** (may be `{}`) | Kafka, file and syslog spool sources. |
 | `upload` | **Required** | Object storage target and upload limits. |
 | `partitioning` | See [partitioning](#partitioning) | Object key layout. |
+| `security` | `{}` | How files other local users can reach are treated; see [`security`](#security). |
 
 ## `engine`
 
@@ -39,7 +40,7 @@ Default column means the key is unset unless you set it.
 |---|---|---|
 | `name` | **Required** | Engine name. |
 | `tenant` | `default` | Tenant used for sources no stream maps. |
-| `state_store` | **Required** | The ledger. A SQLite URL inline (`"sqlite:///data/state/vtop-state.db"`), or for PostgreSQL a secret reference: `{ env: VTOP_STATE_STORE }` or `{ file: /run/secrets/vtop-state-store }`. An inline `postgres://` URL is refused. PostgreSQL also needs a build with `--features postgres`. |
+| `state_store` | **Required** | The ledger. A SQLite URL inline (`"sqlite:///data/state/vtop-state.db"`), or for PostgreSQL a secret reference: `{ env: VTOP_STATE_STORE }` or `{ file: /run/secrets/vtop-state-store }`. An inline `postgres://` URL is refused. PostgreSQL also needs a build with `--features postgres`. A `file:` reference, and a SQLite ledger with its `-wal` and `-shm` files, that other local users can reach is refused at startup ([Secret files](../operate/secrets.md)); a new ledger is created `0600`. |
 | `work_dir` | **Required** | Staging directory for batches in flight. Created if missing. Scratch. |
 | `work_retention_seconds` | `86400` | Staging files left by a crash and older than this are removed. Successful batches remove theirs at once. |
 | `work_max_bytes` | `10737418240` (10 GiB) | Ceiling on VTOP staging files in `work_dir`. Startup removes the oldest until the directory is under it. |
@@ -143,7 +144,7 @@ manifest:
 | `keys` | required | Every key that verifies, the active one included. Each entry has `id`, one of `env` or `file`, and optionally `legacy`. |
 | `keys[].id` | required | 1 to 64 characters from `[A-Za-z0-9._-]`, unique across `keys` and `retired`. `none` and `other` are reserved (they are metric labels). The id appears in manifests, messages and the per-key metrics, so it is a label, never a secret. |
 | `keys[].env` | - | Name of the environment variable holding the key, 64 hex characters. |
-| `keys[].file` | - | Path of a file holding the key, such as a mounted secret. Read once at startup, at most 4 KiB, trimmed. Its permissions are not checked: mount it readable by the engine's user only. |
+| `keys[].file` | - | Path of a file holding the key, such as a mounted secret. Read once at startup, at most 4 KiB, trimmed. Refused before it is read when other local users can write it, or read it outside a Kubernetes Secret mount or a closed directory: see [Secret files](../operate/secrets.md). |
 | `keys[].legacy` | `false` | This key verifies manifests that name no key id: every manifest written before key ids, and any written with `manifest_mac_key_env`. At most one key. |
 | `retired` | `[]` | Tombstoned ids, for a key that was withdrawn or compromised. A manifest naming one fails authentication as "retired". No key material is configured for them. A key rotated out in the normal way is not retired: it stays in `keys` as a verify-only entry. |
 
@@ -167,12 +168,30 @@ and `validate --print-effective` show the keyring by id and source kind
 the keyring release ignore the whole section; see the rotation page for why
 every reader must be upgraded first.
 
+## `security`
+
+How the engine treats a manifest key file, the `engine.state_store` secret
+file, the SQLite ledger (with its `-wal` and `-shm` files) and the
+`VTOP_AUDIT_LOG` file that other local users can reach (#733). The rule is on
+[Secret files and their permissions](../operate/secrets.md).
+
+| Key | Default | Meaning |
+|---|---|---|
+| `allow_loose_secret_permissions` | `false` | Start even when one of those files can be read by other users (it is refused otherwise). Each such file is announced: a WARN, a count on `vtop_secret_file_permission_overrides_total` and a `security.override` audit record. A file other users can **write** is refused whatever this says. |
+
+Unknown keys inside `security` are refused, so a misspelt override fails at
+load rather than leaving the check in a state you did not mean. Engines
+before this release ignore the whole section.
+
 ## `sources`
 
 Each source is optional. A source block that is present but has
 `enabled: false` is not read.
 
 ### `sources.kafka`
+
+The Kafka releases the source is tested against are listed in
+[Supported Kafka brokers](../install/kafka.md).
 
 | Key | Default | Meaning |
 |---|---|---|

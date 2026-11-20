@@ -117,6 +117,7 @@ async fn seed_version(
         mtime: String::new(),
         content_fingerprint: None,
         tail_fingerprint: None,
+        ctime: None,
     };
     let object_bytes = b"archived-bytes";
     let object_digest = vtop_core::checksum::sha256_bytes(object_bytes);
@@ -260,6 +261,7 @@ async fn overwrite_current_manifest(sc: &Scenario, dir: &Path, replayed_count: u
         mtime: String::new(),
         content_fingerprint: None,
         tail_fingerprint: None,
+        ctime: None,
     };
     let (replayed, replayed_path) = build_manifest(
         &attack_work,
@@ -830,6 +832,16 @@ async fn recovery_across_a_key_rotation_commits_old_key_batches_and_replays_unkn
         let dir = tempfile::tempdir().unwrap();
         for (id, hex) in [("q3", "3c".repeat(32)), ("q4", "4d".repeat(32))] {
             std::fs::write(dir.path().join(id), hex).unwrap();
+            // Owner-only, as the engine requires of a key file (#733).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(
+                    dir.path().join(id),
+                    std::fs::Permissions::from_mode(0o400),
+                )
+                .unwrap();
+            }
         }
         let work = dir.path().join("work");
         let url = format!("sqlite://{}", dir.path().join("rotation.db").display());

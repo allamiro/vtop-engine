@@ -56,6 +56,12 @@ fn require_password_env(
 /// that will not answer has not lost records, it has declined to say.
 const WATERMARK_TIMEOUT_SECONDS: u64 = 5;
 
+/// The time one pass may spend, in all, asking the low watermarks of the
+/// partitions that have a replay cut (#626, review of PR 3): one query's
+/// timeout, not one per partition. The partitions not reached are asked
+/// first by the next pass.
+const CUT_CHECK_BUDGET: Duration = Duration::from_secs(WATERMARK_TIMEOUT_SECONDS);
+
 /// How often the retention check runs. Retention moves on the scale of hours;
 /// a minute is free and keeps a broker round trip off the per-pass path.
 const RETENTION_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -118,6 +124,62 @@ fn rewind_frontier(known: Option<i64>, in_memory: Option<i64>, broker: Option<i6
 /// `None` for a partition with no committed cursor. Nothing has been read, so
 /// nothing can have been missed, and reporting a "gap" the size of the whole
 /// topic on first assignment is the fastest way to make this signal useless.
+/// The cuts (#626: last offset -> first offset of a window being rebuilt) a
+/// partition can no longer complete: the log starts above the next offset the
+/// window still needs, because retention or compaction moved past it. `next`
+/// is the offset this process reads next, if it has one. A cut the read has
+/// already passed is not this check's: the pass forgets it.
+fn expired_cuts(
+    cuts: &BTreeMap<i64, i64>,
+    next: Option<i64>,
+    low_watermark: i64,
+) -> Vec<(i64, i64)> {
+    cuts.iter()
+        .filter(|&(&end, &start)| {
+            let from = next.map_or(start, |n| n.max(start));
+            from <= end && low_watermark > from
+        })
+        .map(|(&end, &start)| (end, start))
+        .collect()
+}
+
+/// One round of low-watermark queries over `keys` (#626, review of PR 3),
+/// starting at `start_at` and wrapping, under ONE deadline `budget` away:
+/// each query gets `per_query` or what is left of the round, whichever is
+/// less, and the round stops when the deadline passes. So partitions whose
+/// leaders do not answer cost the pass at most `budget`, however many there
+/// are, and the poll that follows is not held up behind them. Returns the
+/// answers and where the next round starts (after the last key asked), so
+/// every key is asked in turn.
+fn watermark_round<K: Clone>(
+    keys: &[K],
+    start_at: usize,
+    budget: Duration,
+    per_query: Duration,
+    mut query: impl FnMut(&K, Duration) -> Option<i64>,
+) -> (Vec<(K, i64)>, usize) {
+    let n = keys.len();
+    if n == 0 {
+        return (Vec::new(), 0);
+    }
+    let deadline = Instant::now() + budget;
+    let mut found = Vec::new();
+    let mut asked = 0;
+    while asked < n {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let key = &keys[(start_at + asked) % n];
+        asked += 1;
+        let timeout = per_query.min(deadline.saturating_duration_since(now));
+        if let Some(low) = query(key, timeout) {
+            found.push((key.clone(), low));
+        }
+    }
+    (found, (start_at + asked) % n)
+}
+
 fn retention_gap(desired_offset: Option<i64>, low_watermark: i64) -> Option<u64> {
     let desired = desired_offset?;
     // A NEGATIVE OFFSET IS A SENTINEL, NOT A POSITION. librdkafka spells
@@ -248,6 +310,15 @@ struct TopicUsage {
 #[derive(Debug)]
 struct MultiTopicAcc {
     parts: HashMap<(usize, i32), PartAcc>,
+    /// Per partition, the last offset a window being rebuilt may hold (#626):
+    /// offsets above it are rejected without counting against the topic's
+    /// budget, and read again by the next pass as the next window.
+    until: HashMap<(usize, i32), i64>,
+    /// Partitions whose first delivered offset this pass was already above
+    /// their `until`: the log no longer holds the recorded range (retention
+    /// or compaction moved past it), so the bound is dropped and the read
+    /// goes on as before.
+    unreachable: Vec<(usize, i32, i64)>,
     usage: Vec<TopicUsage>,
     full: Vec<bool>,
     full_topics: usize,
@@ -260,6 +331,8 @@ impl MultiTopicAcc {
     fn new(n_topics: usize, max_records: usize, max_bytes: usize) -> Self {
         Self {
             parts: HashMap::new(),
+            until: HashMap::new(),
+            unreachable: Vec::new(),
             usage: (0..n_topics).map(|_| TopicUsage::default()).collect(),
             full: vec![false; n_topics],
             full_topics: 0,
@@ -272,6 +345,20 @@ impl MultiTopicAcc {
     /// Keep `payload` for `(topic_idx, partition)` unless the topic is at
     /// budget. Returns whether the message was kept.
     fn push(&mut self, topic_idx: usize, partition: i32, offset: i64, payload: Vec<u8>) -> bool {
+        if let Some(&until) = self.until.get(&(topic_idx, partition)) {
+            if offset > until {
+                if self.parts.contains_key(&(topic_idx, partition)) {
+                    // Past the end of the window being rebuilt: the next
+                    // window's, read again by the next pass. Not counted
+                    // against the topic, so other partitions keep reading.
+                    return false;
+                }
+                // Nothing of the range was delivered: the log no longer
+                // holds it. Read on as before.
+                self.until.remove(&(topic_idx, partition));
+                self.unreachable.push((topic_idx, partition, until));
+            }
+        }
         if self.full[topic_idx] {
             return false;
         }
@@ -315,6 +402,15 @@ impl MultiTopicAcc {
             acc.min_ts_ms = Some(acc.min_ts_ms.map_or(ts_ms, |m| m.min(ts_ms)));
             acc.max_ts_ms = Some(acc.max_ts_ms.map_or(ts_ms, |m| m.max(ts_ms)));
         }
+    }
+
+    /// Whether a partition being rebuilt has reached the last offset its
+    /// window may hold (#626).
+    fn at_until(&self, topic_idx: usize, partition: i32) -> bool {
+        self.until
+            .get(&(topic_idx, partition))
+            .zip(self.parts.get(&(topic_idx, partition)))
+            .is_some_and(|(until, part)| part.end_offset >= *until)
     }
 
     /// Whether this topic has reached its budget for the pass.
@@ -899,6 +995,15 @@ pub struct KafkaSource {
     /// Partitions paused mid-pass (topic hit its budget); resumed at the
     /// start of the next pass.
     paused: Vec<(String, i32)>,
+    /// Per partition, the ends (inclusive) of the windows handed back to be
+    /// rebuilt exactly (#626), with each window's start.
+    cuts: HashMap<(String, i32), BTreeMap<i64, i64>>,
+    /// Windows a read could not rebuild as cut, for the engine to count.
+    refused_cuts: Vec<crate::file_source::RefusedCut>,
+    /// Where the next round of cut watermark checks starts, in the sorted
+    /// list of partitions with a cut, so a round cut short by its budget is
+    /// continued rather than restarted (#626).
+    cut_check_cursor: usize,
     /// Which assigned partitions have stopped delivering, and since when
     /// (#623).
     ///
@@ -991,6 +1096,9 @@ impl KafkaSource {
             reported_lost_through: HashMap::new(),
             pending_lost: BTreeMap::new(),
             paused: Vec::new(),
+            cuts: HashMap::new(),
+            refused_cuts: Vec::new(),
+            cut_check_cursor: 0,
             liveness: PartitionLiveness::default(),
             stall_reassigns: 0,
             partitions: PartitionCache::default(),
@@ -1157,6 +1265,62 @@ impl KafkaSource {
                 .entry(key)
                 .or_insert(low_watermark);
             *entry = (*entry).max(low_watermark);
+        }
+    }
+
+    /// Refuse the cuts whose remaining range the log no longer holds (#626,
+    /// review of PR 3), from each partition's low watermark. A pass that
+    /// delivers an offset above the cut finds out by itself
+    /// (`MultiTopicAcc::unreachable`); an idle partition delivers nothing, so
+    /// without this its window would be held as rebuilding for as long as it
+    /// stays idle. Only partitions with a cut are asked, each query bounded,
+    /// so a pass without a rebuild makes no call.
+    fn refuse_expired_cuts(&mut self) {
+        if self.cuts.is_empty() {
+            return;
+        }
+        let Some(consumer) = self.consumer.as_ref() else {
+            return;
+        };
+        let mut keys: Vec<(String, i32)> = self
+            .cuts
+            .keys()
+            .filter(|key| self.assigned.contains(key))
+            .cloned()
+            .collect();
+        // A stable order, so the rotation reaches every partition in turn.
+        keys.sort();
+        let (answers, next_round) = watermark_round(
+            &keys,
+            self.cut_check_cursor,
+            CUT_CHECK_BUDGET,
+            Duration::from_secs(WATERMARK_TIMEOUT_SECONDS),
+            |key, timeout| {
+                consumer
+                    .fetch_watermarks(&key.0, key.1, timeout)
+                    .ok()
+                    .map(|(low, _)| low)
+            },
+        );
+        self.cut_check_cursor = next_round;
+        for (key, low_watermark) in answers {
+            let next = self.delivered.get(&key).copied();
+            let Some(cuts) = self.cuts.get_mut(&key) else {
+                continue;
+            };
+            for (end, start) in expired_cuts(cuts, next, low_watermark) {
+                cuts.remove(&end);
+                self.refused_cuts.push(crate::file_source::RefusedCut {
+                    path: key.0.clone(),
+                    partition: Some(key.1),
+                    start: u64::try_from(start).unwrap_or_default(),
+                    end: u64::try_from(end + 1).unwrap_or_default(),
+                    reason: "the partition's log no longer holds the range (retention or compaction moved past it)",
+                });
+            }
+            if cuts.is_empty() {
+                self.cuts.remove(&key);
+            }
         }
     }
 
@@ -1989,6 +2153,12 @@ impl KafkaSource {
 
     fn topic_allowed(&self, topic: &str) -> bool {
         self.include.is_match(topic) && !self.exclude.is_match(topic)
+    }
+
+    /// The windows a read could not rebuild as cut since the last call
+    /// (#626): the engine counts each and reads on as before.
+    pub fn take_refused_cuts(&mut self) -> Vec<crate::file_source::RefusedCut> {
+        std::mem::take(&mut self.refused_cuts)
     }
 
     /// Drop per-topic state for topics that no longer exist, so a broker that
@@ -2945,6 +3115,9 @@ impl SourceAdapter for KafkaSource {
         // the case the check exists for, and the restart is the case where the
         // state it reads has not been built yet.
         self.report_retention_gaps();
+        // Before the pass bounds its partitions: a cut the log no longer
+        // holds is not bounded this pass (#626).
+        self.refuse_expired_cuts();
         // The check takes `&mut self` (it advances its own clock), which ends
         // the borrow the assignment block held — so the poll loop takes its
         // own.
@@ -2956,6 +3129,30 @@ impl SourceAdapter for KafkaSource {
         // in-memory unit. Messages for a full topic are skipped and re-read
         // next pass; the loop stops early once every assigned topic is full.
         let mut acc = MultiTopicAcc::new(sources.len(), max_records, max_bytes);
+        // A partition rebuilding a window handed back stops at its recorded
+        // end (#626). Cuts the cursor has passed are forgotten.
+        for (idx, source) in sources.iter().enumerate() {
+            for &p in &partitions_by_source[idx] {
+                let key = (source.source_name.clone(), p);
+                let next = self
+                    .cursors
+                    .get(&key)
+                    .and_then(|c| c.last_read_offset.map(|o| o + 1).or(c.committed_offset));
+                if let Some(cuts) = self.cuts.get_mut(&key) {
+                    while cuts
+                        .first_key_value()
+                        .is_some_and(|(end, _)| next.is_some_and(|n| *end < n))
+                    {
+                        cuts.pop_first();
+                    }
+                    if let Some((end, _)) = cuts.first_key_value() {
+                        acc.until.insert((idx, p), *end);
+                    } else {
+                        self.cuts.remove(&key);
+                    }
+                }
+            }
+        }
         let mut paused = vec![false; sources.len()];
         // Delivery positions touched THIS pass, keyed by index (no per-message
         // allocation); merged into self.delivered after the loop.
@@ -3023,6 +3220,17 @@ impl SourceAdapter for KafkaSource {
                             }
                         }
                         must_reassign |= !kept;
+                        // A partition whose rebuilt window is complete stops
+                        // fetching for the rest of the pass (#626): what
+                        // follows is the next window, read next pass.
+                        if acc.at_until(idx, msg.partition()) {
+                            let mut ptpl = TopicPartitionList::new();
+                            ptpl.add_partition(&sources[idx].source_name, msg.partition());
+                            if consumer.pause(&ptpl).is_ok() {
+                                self.paused
+                                    .push((sources[idx].source_name.clone(), msg.partition()));
+                            }
+                        }
                     }
                     // A full topic keeps DELIVERING otherwise: rdkafka would
                     // go on fetching its tail, and every discarded message is
@@ -3122,6 +3330,30 @@ impl SourceAdapter for KafkaSource {
         // batches per topic and partition (`buffer_key`), so mixed reads are
         // safe as long as records are handed back grouped.
         let mut per_source: Vec<Vec<ReadResult>> = vec![Vec::new(); sources.len()];
+        // What became of each cut this pass (#626).
+        for &(idx, p, until) in &acc.unreachable {
+            let key = (sources[idx].source_name.clone(), p);
+            if let Some(start) = self.cuts.get_mut(&key).and_then(|c| c.remove(&until)) {
+                self.refused_cuts.push(crate::file_source::RefusedCut {
+                    path: key.0.clone(),
+                    partition: Some(p),
+                    start: u64::try_from(start).unwrap_or_default(),
+                    end: u64::try_from(until + 1).unwrap_or_default(),
+                    reason: "the partition's log no longer holds the range (retention or compaction moved past it)",
+                });
+            }
+        }
+        for (&(idx, p), part) in &acc.parts {
+            if acc.until.get(&(idx, p)) == Some(&part.end_offset) {
+                let key = (sources[idx].source_name.clone(), p);
+                if let Some(cuts) = self.cuts.get_mut(&key) {
+                    cuts.remove(&part.end_offset);
+                    if cuts.is_empty() {
+                        self.cuts.remove(&key);
+                    }
+                }
+            }
+        }
         for (idx, p, part) in acc.into_sorted() {
             let topic = &sources[idx].source_name;
             let cur = self.cursors.entry((topic.clone(), p)).or_default();
@@ -3277,6 +3509,38 @@ impl SourceAdapter for KafkaSource {
             "kafka offset committed (post-verify)"
         );
         Ok(())
+    }
+
+    /// Record each range's last offset as the end its partition's re-read
+    /// stops at (#626). A range read under another consumer group is not
+    /// this engine's to rebuild.
+    fn bound_replays(&mut self, ranges: &[crate::base::ReplayRange]) -> Vec<bool> {
+        ranges
+            .iter()
+            .map(|range| {
+                let (
+                    ProgressMarker::Kafka {
+                        topic,
+                        partition,
+                        start_offset,
+                        ..
+                    },
+                    ProgressMarker::Kafka { end_offset, .. },
+                ) = (&range.start, &range.end)
+                else {
+                    return false;
+                };
+                if self.foreign_group(&range.start).is_some() || end_offset < start_offset {
+                    return false;
+                }
+                let cuts = self.cuts.entry((topic.clone(), *partition)).or_default();
+                cuts.insert(*end_offset, *start_offset);
+                if cuts.len() > 1024 {
+                    cuts.pop_first();
+                }
+                true
+            })
+            .collect()
     }
 
     async fn replay_from_marker(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
@@ -4959,6 +5223,103 @@ mod tests {
     // partition; MultiTopicAcc is the demux that turns that stream back into
     // per-(topic, partition) units. These tests pin the demux and budget logic
     // without a broker.
+
+    /// #626: a partition rebuilding a window stops at the window's last
+    /// offset. Offsets above it are rejected without counting against the
+    /// topic's budget (another partition of the topic keeps reading), the
+    /// kept offsets stay contiguous, and a partition whose first delivered
+    /// offset is already past the end (retention moved past the range) drops
+    /// the bound and reads on.
+    #[test]
+    fn multi_topic_acc_stops_a_rebuilt_partition_at_its_until_offset() {
+        let mut acc = MultiTopicAcc::new(1, 10, usize::MAX);
+        acc.until.insert((0, 0), 11);
+        acc.until.insert((0, 2), 4);
+        assert!(acc.push(0, 0, 10, b"a".to_vec()));
+        assert!(acc.push(0, 0, 11, b"b".to_vec()));
+        assert!(acc.at_until(0, 0));
+        assert!(!acc.push(0, 0, 12, b"next window".to_vec()), "past the end");
+        assert!(!acc.is_full(0), "a rejected offset is not counted");
+        assert!(acc.push(0, 1, 0, b"other partition".to_vec()));
+        // Partition 2's range [.., 4] is gone: its first offset is 9.
+        assert!(!acc.is_full(0));
+        assert_eq!(acc.unreachable, vec![]);
+        let kept_9 = acc.push(0, 2, 9, b"after retention".to_vec());
+        assert!(kept_9, "the bound is dropped, the read goes on");
+        assert_eq!(acc.unreachable, vec![(0, 2, 4)]);
+        let parts = acc.into_sorted();
+        let p0 = parts.iter().find(|(_, p, _)| *p == 0).unwrap();
+        assert_eq!((p0.2.start_offset, p0.2.end_offset), (10, 11));
+        assert_eq!(p0.2.records.len(), 2);
+    }
+
+    /// Review of #626 PR 3: a window being rebuilt whose remaining offsets
+    /// the log no longer holds is refused from the low watermark alone, so an
+    /// idle partition does not hold it for ever. A cut whose remaining range
+    /// is still held, or that the read has passed, is left alone.
+    /// Review of #626 PR 3: partitions whose leaders do not answer cost a
+    /// pass at most the round's budget, however many there are, so the poll
+    /// of the healthy partitions that follows is not held up behind them; and
+    /// the rotation reaches every partition, the healthy one included, in a
+    /// few rounds. Five of six queries stall for the whole timeout they are
+    /// given.
+    #[test]
+    fn a_round_of_stalled_watermark_queries_is_bounded_and_rotates() {
+        let keys: Vec<(String, i32)> = (0..6).map(|p| ("t".to_owned(), p)).collect();
+        let per_query = Duration::from_millis(200);
+        let budget = Duration::from_millis(250);
+        let stalled = |key: &(String, i32), timeout: Duration| {
+            if key.1 == 5 {
+                Some(7)
+            } else {
+                std::thread::sleep(timeout);
+                None
+            }
+        };
+        let started = Instant::now();
+        let (found, next) = watermark_round(&keys, 0, budget, per_query, stalled);
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(500),
+            "the round stops at its budget, not at 5 x the query timeout: {took:?}"
+        );
+        assert!(found.is_empty());
+        assert!(
+            next > 0,
+            "the next round goes on from where this one stopped"
+        );
+
+        // Rounds continue where the last stopped, so the healthy partition is
+        // asked within a few rounds, each still bounded.
+        let mut at = next;
+        let mut healthy = None;
+        for _ in 0..4 {
+            let started = Instant::now();
+            let (found, next) = watermark_round(&keys, at, budget, per_query, stalled);
+            assert!(started.elapsed() < Duration::from_millis(500));
+            at = next;
+            if let Some(answer) = found.into_iter().find(|(k, _)| k.1 == 5) {
+                healthy = Some(answer.1);
+                break;
+            }
+        }
+        assert_eq!(healthy, Some(7), "every partition is asked in turn");
+    }
+
+    #[test]
+    fn expired_cuts_are_found_from_the_low_watermark() {
+        let cuts: BTreeMap<i64, i64> = [(19, 0), (39, 20)].into_iter().collect();
+        // Ten of the first window read; the log now starts at 20.
+        assert_eq!(expired_cuts(&cuts, Some(10), 20), vec![(19, 0)]);
+        // The log still holds offset 10 on: nothing expired.
+        assert_eq!(expired_cuts(&cuts, Some(10), 10), vec![]);
+        // Nothing read yet, the log starts at 5: the first window is short.
+        assert_eq!(expired_cuts(&cuts, None, 5), vec![(19, 0)]);
+        // The log starts at 25: both windows' remaining ranges are short.
+        assert_eq!(expired_cuts(&cuts, Some(10), 25), vec![(19, 0), (39, 20)]);
+        // The read is past the first window: only the second is judged.
+        assert_eq!(expired_cuts(&cuts, Some(30), 31), vec![(39, 20)]);
+    }
 
     #[test]
     fn multi_topic_acc_demuxes_by_topic_and_partition() {

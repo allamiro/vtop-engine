@@ -1,0 +1,23 @@
+rule_files:
+  - rules.yaml
+tests:
+  - name: one fires
+    alert_rule_test:
+      - alertname: VtopFixtureOne
+        eval_time: 1m
+        exp_alerts:
+          - exp_labels: {severity: page}
+  - name: one is quiet
+    alert_rule_test:
+      - alertname: VtopFixtureOne
+        eval_time: 1m
+        exp_alerts: []
+  - name: two fires and is quiet
+    alert_rule_test:
+      - alertname: VtopFixtureTwo
+        eval_time: 1m
+        exp_alerts:
+          - exp_labels: {severity: ticket}
+      - alertname: VtopFixtureTwo
+        eval_time: 2m
+        exp_alerts: []

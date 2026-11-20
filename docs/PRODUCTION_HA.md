@@ -65,7 +65,8 @@
 
 ## 1. Where things stand
 
-As of **August 2026** (repo at v0.3.0):
+This section describes `main`. What each release shipped, and the limits
+it shipped with, are in [ROADMAP.md](ROADMAP.md).
 
 **Done**
 - `StateStore` trait extracted; engine holds `Box<dyn StateStore>`; scheme
@@ -94,13 +95,6 @@ As of **August 2026** (repo at v0.3.0):
   (part of Phase 8's security baseline).
 
 **Not started — the critical path to a fleet**
-- Phase 4: deterministic / content-addressed object keys + idempotent retry.
-  **Objects done (#626):** the object key is derived from the source, the
-  range and the content digest, and an existing object is reused only after
-  it verifies strongly, and a replay in a later hour is sealed at the
-  recorded instant of the window it rebuilds (v0.10.0). Remaining: batch
-  boundaries are not reproduced after a power loss, a row from before
-  v0.10.0 records no seal instant, and manifests stay per attempt ([ARCHITECTURE.md](ARCHITECTURE.md) §13 item 3).
 - Phase 5: Kafka consumer-group fleet mode. The consumer still uses per-read
   `assign()`; no `VTOP_KAFKA_GROUP_MODE` toggle; no multi-writer recovery
   (`FOR UPDATE SKIP LOCKED` / leases, #93).
@@ -108,10 +102,22 @@ As of **August 2026** (repo at v0.3.0):
   the engine.
 
 **Partially done**
-- Phase 6 (observability & ops): metrics, readiness, dashboards and OTLP trace
-  export exist; Alertmanager rules do not.
-- Phase 8 (retention/backup/DR/security): retention shipped; backup/restore
-  runbook, DR drills, and the divergence checker have not been exercised.
+- Phase 4: deterministic / content-addressed object keys + idempotent retry.
+  **Objects done (#626, #688):** the object key is derived from the source,
+  the range and the content digest, and an existing object is reused only
+  after it verifies strongly, and a replay in a later hour is sealed at the
+  recorded instant of the window it rebuilds (v0.10.0). Remaining: batch
+  boundaries are not reproduced after a power loss, a row from before
+  v0.10.0 records no seal instant, and manifests stay per attempt
+  ([ARCHITECTURE.md](ARCHITECTURE.md) §13 item 3).
+- Phase 6 (observability & ops): metrics, readiness, dashboards, OTLP trace
+  export and a unit-tested Prometheus alert rule set with runbooks and
+  documented SLOs exist (#720); a store write-latency SLO and its alert do
+  not.
+- Phase 8 (retention/backup/DR/security): retention shipped, and an
+  attributable audit trail for every state-changing command (#694); a
+  backup/restore runbook (#734), DR drills (#735), and the divergence checker
+  have not been exercised.
 
 **Optional / gated**
 - Phase 9 (file/syslog HA via leases) — only if distributed file/syslog
@@ -138,8 +144,8 @@ transfer engine, **without weakening the core guarantee**:
 - **Replay safety** — a crash at any stage is recoverable with **no data loss**.
 - **Delivery semantics (accurate):** today the system is **at-least-once**. A
   replay of the same bytes reuses the stored object (content-addressed keys,
-  #626), and a file or spool replay is rebuilt as first cut (v0.10.0); a Kafka
-  replay over a grown partition, a replay that could not be rebuilt as cut,
+  #626), and a replay is rebuilt as first cut (v0.10.0); a replay that could
+  not be rebuilt as cut,
   a later seal-time hour for a row from before v0.10.0, no checksum or a
   command backend can still leave a duplicate object (§2.5, §7).
   Protocol §15.1's deterministic naming MUST is narrowed by #626, not closed.
@@ -721,9 +727,15 @@ the retention check but not persisted.
 With `upload.object_lock` (#684, `s3_native`), the engine itself writes
 every object and manifest under the configured retention and fails a batch
 whose stored versions do not carry it. A reused object is checked with the
-weaker bound (still under the configured mode); if its lock has ended, or it
-was stored unlocked, the batch fails on every replay until the operator
-extends its retention or deletes that unprotected version. Objects from failed
+weaker bound (still under the configured mode). Since #709 a replay looks at
+that bound before it reuses the object: if the lock has ended, the object was
+stored unlocked, is in the other mode, or lacks the configured legal hold, the
+batch is written as a fresh object under its per-attempt key, under the
+configured lock, verified on the version written, and committed; the old
+object is never written over, deleted or re-locked (rule 1 falls back to rule
+3, at the cost of one extra object). A retention the store cannot report fails
+the batch and writes nothing, so an outage never multiplies objects. Before
+#709 such a range failed on every replay until an operator acted. Objects from failed
 attempts are locked as well and cannot be removed before their retention ends
 (under `compliance`, by anyone). See
 [OBJECT_LOCK_DEPLOYMENT.md](OBJECT_LOCK_DEPLOYMENT.md).
@@ -1242,10 +1254,19 @@ path needed by the distributed options is already implemented (§6.3).
   as a textfile; the [observability README](../observability/README.md#archive-scrub)
   has an example alert rule set.
 
+- **Alerting rules** (#720): `observability/prometheus/vtop-rules.yaml`, also
+  shipped as the chart's `PrometheusRule`: verification failures, no commits
+  while data waits, replay-rate spike, Kafka lag growth (from kafka-exporter),
+  size-only verification, failed Object Lock checks, retention loss, refused
+  replays, a state store refusing recovery's replay decisions, and piling
+  multipart sessions. Each has a promtool unit test and a
+  section in [Alert runbooks](operate/runbooks.md); the objectives are on
+  [Service level objectives](operate/slos.md).
+
 **Still needed for production [PROPOSED]:**
-- **Alerting rules** (Alertmanager): verification failures > 0; replay-rate
-  spike; lag growth; store write-latency SLO breach; no committed batches in N
-  minutes.
+- **Alerting rules:** a store write-latency SLO breach (the engine has no
+  write-latency objective yet; `vtop_stage_duration_seconds{stage="state_write"}`
+  is the metric it would read).
 - Metric coverage review: **verification-failure rate**, **replay /
   REPLAY_REQUIRED rate**, Kafka **consumer lag**, state-store write latency,
   **duplicate-object rate** (needed until deterministic keys land).
@@ -1267,7 +1288,7 @@ Invariant preserved: source progress is NEVER advanced for unverified data.
 | Failure | Behavior | Why it's safe |
 |---|---|---|
 | Engine crash mid-batch | `recover()`: pre-VERIFIED → replay from last committed source position; VERIFIED-but-not-committed → retry commit | Progress never advanced for unverified data |
-| Replay after crash | **Today (#626):** same bytes → same key, existing verified object = success; file and spool replays rebuilt as first cut and sealed at the recorded instant (v0.10.0); a Kafka replay over a grown partition, a bound refused or too large, or a row from before v0.10.0 → second object (no loss) | At-least-once; idempotent for a replay of the same bytes |
+| Replay after crash | **Today (#626):** same bytes → same key, existing verified object = success; replays rebuilt as first cut and sealed at the recorded instant (v0.10.0); a bound refused or too large, or a row from before v0.10.0 → second object (no loss) | At-least-once; idempotent for a replay of the same bytes |
 | State store unavailable | Cannot transition → stops committing (fails safe) | No commit-before-verify possible |
 | Kafka rebalance (fleet) | Revoked partitions: finish/abandon in-flight, no commit; reassigned replica resumes from committed offset | Offsets commit only post-verify |
 | File-owner replica dies (Tier 3) | Lease expires; another replica resumes from stored byte cursor | Cursor in shared durable store |
@@ -1368,6 +1389,21 @@ Short procedures now; expand into a full ops runbook before go-live.
   remains is the one way to stall the tier - that voter cannot decode the
   raise itself. A node that refuses to start with "written by a newer
   release" is an old binary on a newer log: upgrade it.
+  From level 8 on (#706) the leader checks this itself: before it proposes
+  the raise it asks every metadata voter and learner over the peer plane
+  what release it runs and the highest level it implements, and refuses -
+  proposing nothing - unless each answers that it supports the level. The
+  refusal names each member and what it answered: a release and level,
+  "closed without answering" (v0.9.0 or older has no answer to the question
+  and closes the connection; so does a member that refuses the request), or
+  why it could not be reached. Levels up to 7 are still raised on the
+  operator's word, because v0.8.0 and v0.9.0 implement 7 but cannot answer.
+  The check runs only on a leader on this release or later: raise once
+  `vtopctl meta status` shows one leads, because an older leader proposes
+  the raise unchecked. It runs when the raise is proposed, not when it is
+  applied: what a member answers is not replicated state, so add a voter on
+  an older release after a raise and that voter stalls as before (a
+  membership change while the members are being asked refuses the raise).
 - **Upgrade the data nodes (#634): roll, verify, finalize.** Once metadata
   is at feature level 7, every data node with a `lease` block reports its
   release, the replica protocol it speaks and the feature level it
@@ -1713,9 +1749,17 @@ deployment identity; the live battery proves the runtime role cannot run DDL,
   (`build_object_name`); an object already at the key is reused only after a
   strong verification, and anything else there is never overwritten (the
   batch falls back to its per-attempt key). There is no key-mode toggle: the
-  attempt key is the fallback, not a mode. Not done: reproducing batch
-  boundaries after a power loss, a partition hour stable under
-  `time_source = seal`, per-range manifests, and the Object Lock compose test.
+  attempt key is the fallback, not a mode. Under the Object Lock profile
+  (#684) a reused object must still be locked, and a damaged object at the
+  derived key is never written over (`crates/vtop-cli/tests/object_lock.rs`,
+  against the mock store); the store's own behaviour, an overwrite that makes
+  a new version and a locked version that survives a delete, is tested
+  against the lab's MinIO in CI (`minio-integration`). A replay in a later
+  hour is sealed at the instant its row recorded (#755), and a replay over a
+  source that grew is rebuilt as first cut (#793, #796), so both reuse the
+  object (v0.10.0). Not done: reproducing batch boundaries after a power
+  loss, a stable partition hour for a row written before v0.10.0, and
+  per-range manifests.
   See [ARCHITECTURE.md](ARCHITECTURE.md) §13 item 3.
 
 ### Phase 5 — Kafka consumer-group fleet mode ⬜ NOT STARTED
@@ -1739,11 +1783,17 @@ deployment identity; the live battery proves the runtime role cannot run DDL,
 - **Done:** Prometheus metrics + readiness endpoint (`VTOP_METRICS_ADDR`,
   `vtop-observe`); structured per-stage events; `observability/` compose stack
   (Grafana, Loki, Mimir, Tempo, Alloy) with generated dashboards; OTLP trace
-  export from the engine into that Tempo (#683).
-- **Remaining:** Alertmanager rules (verification failures > 0, replay-rate
-  spike, lag growth, store-latency SLO breach, no-commits-in-N-minutes); metric
-  coverage review (duplicate-object rate until Phase 4 lands, consumer lag,
-  state-store write latency); documented SLOs.
+  export from the engine into that Tempo (#683); Grafana alert rules for the
+  lab (retention loss, replication health, consumer-group eviction: #454,
+  #561, #571).
+- **Done (#720):** Prometheus alert rules (verification failures, replay-rate
+  spike, lag growth, no commits in 30 minutes while data waits, and six more),
+  each unit-tested with promtool in CI and linked to a runbook section;
+  documented SLOs ([operate/slos.md](operate/slos.md)).
+- **Remaining:** a store-latency SLO and its alert; metric coverage review
+  (duplicate-object rate until Phase 4 lands, an engine-side consumer lag,
+  state-store write latency); wiring the rules to an Alertmanager is the
+  deployment's.
 - **Test plan:** force a verification failure and confirm the alert; load test
   and watch lag/replay panels.
 - **Exit criteria:** operators see throughput, lag, replay, failures; alerts
@@ -1827,7 +1877,7 @@ deployment identity; the live battery proves the runtime role cannot run DDL,
 
 | Risk | Impact | Mitigation | Phase | Status |
 |---|---|---|---|---|
-| Object Lock prevents overwrite-based retry | Retries fail / stuck batches | Deterministic keys + "existing verified = success" (#626); the engine writes and verifies the lock itself with `upload.object_lock` (#684) (§7.2) | 4 | mitigated (a reused object whose lock ended fails until the operator acts) |
+| Object Lock prevents overwrite-based retry | Retries fail / stuck batches | Deterministic keys + "existing verified = success" (#626); the engine writes and verifies the lock itself with `upload.object_lock` (#684) (§7.2) | 4 | mitigated (a reused object that is not locked as configured is replaced by a fresh locked object under the attempt key, #709) |
 | Kafka rebalance during in-flight batch | Duplicate work / spurious revocation | Revocation handler; tune poll/session timeouts; cooperative rebalancing (§8.3) | 5 | open |
 | Two engines over one store double-recover | Duplicate ingestion / double-commit | **Same host only:** the startup instance lock (#66) refuses it. **Cross-host over shared Postgres it cannot detect** — unsupported and warned at startup (§19). The ledger now fences a stalled engine (claim generation, #557) so a handover cannot be overwritten, but sources are still not divided between engines; open until Phase 5 | 5 | partially mitigated (same-host lock; ledger fence for handover) |
 | State database unavailable | Engine cannot commit | Fails safe (stops committing); HA store; alerts | 3,6 | mitigated |
@@ -1852,8 +1902,9 @@ Correctness & invariant
   [x] verify-before-commit enforced in core AND database (state-aware CHECKs)
   [x] crash before VERIFIED → replay; crash after VERIFIED/before COMMIT → safe
   [x] require_strong_verification defaults true
-  [ ] deterministic or content-addressed object keys enabled           (Phase 4)
-  [ ] Object Lock behavior tested (retry never overwrites)             (Phase 4)
+  [x] content-addressed object keys (#626, #688)
+  [ ] batch boundaries reproduced after power loss; per-range manifests (Phase 4)
+  [x] Object Lock behavior tested (retry never overwrites; #684)
 
 State store
   [x] StateStore trait + shared test battery green on SQLite AND Postgres
@@ -1875,7 +1926,8 @@ Object storage
 Operability
   [x] Prometheus metrics endpoint + readiness probe (VTOP_METRICS_ADDR)
   [x] dashboards defined (observability/ stack)
-  [ ] Alertmanager rules wired                                         (Phase 6)
+  [x] Prometheus alert rules, unit-tested, with runbooks (#720)       (Phase 6)
+  [ ] Alertmanager routing wired (deployment-side)                    (Phase 6)
   [x] OpenTelemetry traces exported (opt-in, OTEL_EXPORTER_OTLP_ENDPOINT)
   [ ] engine k8s chart: probes, limits, PDB, NetworkPolicy, runbook    (Phase 7)
 
@@ -1948,9 +2000,9 @@ proven by a scenario that drives real processes, not only by unit coverage.
   yet enable the feature).
 - **Two current-behavior caveats the design must still fix for fleet HA:**
   (a) object keys are **deterministic only for the same bytes** (#626) → a replay
-  with other boundaries still makes **duplicates**; file and spool replays
-  reproduce their boundaries since v0.10.0, Kafka's are the rest of #626, and
-  protocol §15.1 stays narrowed until then.
+  that could not be rebuilt as first cut still makes **duplicates**; replays
+  reproduce their boundaries since v0.10.0, and protocol §15.1 is met for
+  objects whenever the ledger row survives.
   (b) the engine is **single-instance by design** until Kafka consumer-group
   fleet mode and multi-writer recovery land (Phase 5).
 - **VERIFIED is defined precisely (§4); strong content-derived verification is

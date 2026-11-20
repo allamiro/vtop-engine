@@ -160,6 +160,12 @@ impl AdaptiveBatcher {
         self.records.is_empty()
     }
 
+    /// How many bytes the buffered records hold (the sum the `max_bytes`
+    /// threshold is checked against).
+    pub fn byte_len(&self) -> usize {
+        self.bytes
+    }
+
     /// Where the buffered window starts: the first record's start marker.
     pub fn first_marker(&self) -> Option<&ProgressMarker> {
         self.progress_start.as_ref()
@@ -391,6 +397,7 @@ mod tests {
             mtime: String::new(),
             content_fingerprint: None,
             tail_fingerprint: None,
+            ctime: None,
         };
         assert_ne!(
             name("e", "/var/log/app.log", &file(Some(1)), &digest),

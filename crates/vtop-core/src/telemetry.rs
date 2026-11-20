@@ -41,7 +41,16 @@ pub const STAGES: [&str; 7] = [
 ];
 
 /// The values of `decision` on `vtop_object_key_decisions_total` (#626).
-pub const OBJECT_KEY_DECISIONS: [&str; 8] = [
+/// The last five (#709) are taken only under the S3 Object Lock profile. The
+/// four `fallback_*` among them: an object already at the derived key holds
+/// the batch's bytes, but it has no lock, its lock has ended, it is in the
+/// other mode, or it lacks the configured legal hold, so the batch is written
+/// as a fresh locked object under its attempt key instead of reusing it.
+/// `lock_withheld`: the fresh object written for the same range a moment ago
+/// is not usable either (a store that does not keep the lock), so nothing is
+/// written and the batch fails; outside the `fallback_` prefix on purpose,
+/// since no second object was written.
+pub const OBJECT_KEY_DECISIONS: [&str; 13] = [
     "derived",
     "reused",
     "fallback_differs",
@@ -50,6 +59,11 @@ pub const OBJECT_KEY_DECISIONS: [&str; 8] = [
     "fallback_unchecked",
     "probe_throttled",
     "per_attempt",
+    "fallback_lock_elapsed",
+    "fallback_unlocked",
+    "fallback_lock_mode",
+    "fallback_hold_missing",
+    "lock_withheld",
 ];
 
 /// The values of `result` on `vtop_replay_rebuilds_total` (#626): what a
@@ -116,6 +130,12 @@ pub const OBJECT_LOCK_CHECK_RESULTS: [&str; 8] = [
 /// back locked), and one recovery `repaired` for a VERIFIED row that had
 /// none.
 pub const RECEIPT_WRITE_RESULTS: [&str; 3] = ["written", "failed", "repaired"];
+
+/// The values of `reason` on `vtop_recovery_held_total` (#782): why recovery
+/// held a range instead of rewinding it. `ledger_write_failed`: the state
+/// store refused the write of its replay decision (#639). `newer_manifest`:
+/// a VERIFIED batch whose manifest a newer release wrote (#671).
+pub const RECOVERY_HOLD_REASONS: [&str; 2] = ["ledger_write_failed", "newer_manifest"];
 
 /// The values of `mode` on `vtop_object_lock_mode` (#684).
 pub const OBJECT_LOCK_MODES: [&str; 3] = ["off", "governance", "compliance"];
@@ -206,6 +226,17 @@ pub struct Metrics {
     /// Non-zero means an engine is older than a writer sharing its ledger,
     /// which the upgrade order rules out: upgrade this engine.
     pub recovery_unsupported_manifest_total: IntCounterVec,
+    /// Ranges recovery held instead of rewinding (#639, #782), by tenant,
+    /// source type and [`RECOVERY_HOLD_REASONS`]. A held range holds back
+    /// every VERIFIED range above it in its source unit, and lowers every
+    /// rewind above it to its start.
+    /// `ledger_write_failed` above zero means the state store is refusing
+    /// writes.
+    pub recovery_held_total: IntCounterVec,
+    /// Rewinds recovery applied at a held start below them instead of their
+    /// own (#782): applied at their own, they moved the read head past the
+    /// held range. Each means the ranges above it are archived twice.
+    pub recovery_rewinds_lowered_total: IntCounterVec,
     /// VERIFIED batches recovery re-checked against storage, by the class the
     /// ledger recorded they were verified with and what the re-check found
     /// (#664). `verification_class="strong", result="size_only"` is the one
@@ -294,7 +325,10 @@ pub struct Metrics {
     pub upload_throttled_total: IntCounterVec,
     /// How each batch's object key was decided (#626). `decision` is the
     /// bounded set [`OBJECT_KEY_DECISIONS`]: a rising `fallback_*` or
-    /// `per_attempt` rate means replays are writing second objects.
+    /// `per_attempt` rate means replays are writing second objects. Under
+    /// the Object Lock profile, `fallback_unlocked`, `fallback_lock_mode`,
+    /// `fallback_hold_missing` and `lock_withheld` mean an object that should
+    /// be locked is not (#709).
     pub object_key_decisions_total: IntCounterVec,
     /// What each replay of a window an earlier attempt sealed came to (#626),
     /// by the bounded set [`REPLAY_REBUILD_RESULTS`]. Any result but `exact`
@@ -370,11 +404,17 @@ pub struct Metrics {
     /// Bytes of kept parts a resumed upload did not send again (#668): what
     /// keeping sessions saves. Unlabelled, like the egress account.
     pub multipart_bytes_reused_total: IntCounter,
+    /// Secret and ledger files accepted only because
+    /// `security.allow_loose_secret_permissions` is true (#733), counted once
+    /// per file per process. Unlabelled: the path and mode are in the WARN
+    /// line and the audit record beside it. Anything above zero is an
+    /// exposure an operator chose to keep.
+    pub secret_file_permission_overrides_total: IntCounter,
 }
 
 /// The values of `action` on `vtop_audit_events_total` (#694); the same set
 /// as `vtop_observe::audit::Action`.
-pub const AUDIT_ACTIONS: [&str; 12] = [
+pub const AUDIT_ACTIONS: [&str; 13] = [
     "ledger.replay",
     "ledger.prune",
     "ledger.migrate",
@@ -387,6 +427,7 @@ pub const AUDIT_ACTIONS: [&str; 12] = [
     "node.repair",
     "node.reconfigure_range",
     "promotion.attest",
+    "security.override",
 ];
 
 /// The values of `outcome` on `vtop_audit_events_total`.
@@ -470,6 +511,16 @@ impl Metrics {
             "VERIFIED batches whose manifest recovery found to be from a newer release than this engine reads (#671); upgrade the engine",
             labels3(),
         )?;
+        let recovery_held_total = cv(
+            "recovery_held_total",
+            "Ranges recovery held instead of rewinding, by reason (ledger_write_failed: the state store refused the replay decision; newer_manifest: a newer release wrote the batch); a held range holds back every VERIFIED range above it in its source unit, and a rewind above it starts at it instead (#782)",
+            vec!["tenant", "source_type", "reason"],
+        )?;
+        let recovery_rewinds_lowered_total = cv(
+            "recovery_rewinds_lowered_total",
+            "Rewinds recovery applied at the start of a held range of the same source unit below them instead of their own, so the held range is read again with them; the ranges above it are archived twice (#782)",
+            vec!["tenant", "source_type"],
+        )?;
         let recovery_rechecks_total = cv(
             "recovery_rechecks_total",
             "VERIFIED batches recovery re-checked against storage, by the class they were verified with (strong, size_only; unknown for a row from before #664 or with a newer release's class) and the re-check's result (strong, size_only, failed, unsupported_version). verification_class=strong with result=size_only: the store can no longer confirm content verified strongly; restore checksum support on the backend, then run vtopctl scrub",
@@ -517,7 +568,7 @@ impl Metrics {
         )?;
         let object_key_decisions_total = cv(
             "object_key_decisions_total",
-            "How each batch's object key was decided (#626): derived (uploaded under its content-derived key), reused (the verified object was already stored, no upload), fallback_differs / fallback_size_only / fallback_unreadable (an object is at the derived key and does not verify, verifies by size only, or could not be read) and fallback_unchecked (the store refused or failed the check of the key): the batch was written under its per-attempt key instead of overwriting anything, probe_throttled (the batch failed and was handed back), per_attempt (no checksum, or a backend that cannot report an absent key)",
+            "How each batch's object key was decided (#626): derived (uploaded under its content-derived key), reused (the verified object was already stored, no upload), fallback_differs / fallback_size_only / fallback_unreadable (an object is at the derived key and does not verify, verifies by size only, or could not be read) and fallback_unchecked (the store refused or failed the check of the key): the batch was written under its per-attempt key instead of overwriting anything, probe_throttled (the batch failed and was handed back), per_attempt (no checksum, or a backend that cannot report an absent key); under the Object Lock profile (#709) fallback_unlocked / fallback_lock_elapsed / fallback_lock_mode / fallback_hold_missing (the verified object at the derived key has no lock, an ended one, the other mode, or no legal hold: a fresh locked object was written under the per-attempt key) and lock_withheld (the fresh object written for the range moments ago is not usable either; nothing was written and the batch failed)",
             vec!["tenant", "source_type", "format", "decision"],
         )?;
         let replay_rebuilds_total = cv(
@@ -578,6 +629,11 @@ impl Metrics {
             "Bytes of kept multipart parts a resumed upload did not send again (#668)",
         ))?;
         registry.register(Box::new(multipart_bytes_reused_total.clone()))?;
+        let secret_file_permission_overrides_total = IntCounter::with_opts(Opts::new(
+            "secret_file_permission_overrides_total",
+            "Key, state-store, ledger and audit files other local users can read, accepted only because security.allow_loose_secret_permissions is true (#733); the path and mode are in the log line and the audit record",
+        ))?;
+        registry.register(Box::new(secret_file_permission_overrides_total.clone()))?;
         let source_replay_refused_total = cv(
             "source_replay_refused_total",
             "Failed ranges the source refused to hand back for re-reading, or whose re-read it then refused; each is a range missing from the archive (see logs for the path). For a file: its file cannot be proven reachable - truncated, replaced or rewritten in place, or rotated away and then removed, compressed, copied by copytruncate, or truncated or rewritten before its re-read",
@@ -649,6 +705,8 @@ impl Metrics {
             replay_required_total,
             failed_total,
             recovery_unsupported_manifest_total,
+            recovery_held_total,
+            recovery_rewinds_lowered_total,
             recovery_rechecks_total,
             manifests_written_total,
             verification_receipts_total,
@@ -675,6 +733,7 @@ impl Metrics {
             multipart_parts_total,
             multipart_sessions_total,
             multipart_bytes_reused_total,
+            secret_file_permission_overrides_total,
         })
     }
 

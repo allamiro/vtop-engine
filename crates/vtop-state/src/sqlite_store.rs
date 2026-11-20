@@ -216,7 +216,7 @@ fn map_sqlx(e: sqlx::Error) -> VtopError {
     VtopError::State(e.to_string())
 }
 
-/// A `(path, inode, end_byte, file_size, content, tail)` row of a cursor
+/// A `(path, inode, end_byte, file_size, content, tail, mtime, ctime)` row of a cursor
 /// query. The inode is read as the JSON token and parsed here: `json_extract`
 /// turns a u64 above i64::MAX into a lossy REAL, and an unparseable value must
 /// read as "unknown", not as a wrong identity. So must a malformed stored
@@ -229,6 +229,7 @@ fn committed_cursor_of(r: &sqlx::sqlite::SqliteRow) -> Option<CommittedCursor> {
     let content: Option<String> = r.get("content");
     let mtime: Option<String> = r.get("mtime");
     let tail: Option<String> = r.get("tail");
+    let ctime: Option<String> = r.get("ctime");
     Some(CommittedCursor {
         path: path?,
         inode: inode.and_then(|i| i.parse().ok()),
@@ -237,6 +238,7 @@ fn committed_cursor_of(r: &sqlx::sqlite::SqliteRow) -> Option<CommittedCursor> {
         content_fingerprint: content.as_deref().and_then(parse_content_fingerprint),
         observed_mtime: mtime.filter(|m| !m.is_empty()),
         tail_fingerprint: tail.as_deref().and_then(parse_content_fingerprint),
+        observed_ctime: ctime.filter(|c| vtop_core::types::plausible_timestamp(c)),
     })
 }
 
@@ -246,6 +248,9 @@ impl SqliteStateStore {
     pub async fn connect(conn_str: &str) -> Result<Self, VtopError> {
         let opts = parse_sqlite_opts(conn_str)?;
         let in_memory = is_in_memory(conn_str);
+        if let Some(file) = vtop_core::config::sqlite_ledger_file(conn_str) {
+            create_owner_only(&file);
+        }
         // A file is migrated on a connection of its own, closed before the
         // pools that serve requests open (#664). Migrating through the pool,
         // a statement at a time, could leave a pool connection that opened
@@ -700,14 +705,15 @@ impl StateStore for SqliteStateStore {
                         CAST(progress_end_json -> '$.content_fingerprint' AS TEXT) AS content, \
                         CAST(progress_end_json -> '$.tail_fingerprint' AS TEXT) AS tail, \
                         json_extract(progress_end_json, '$.mtime') AS mtime, \
+                        CAST(json_extract(progress_end_json, '$.ctime') AS TEXT) AS ctime, \
                         created_at, batch_id \
                  FROM batches WHERE state = ? AND source_type = ? \
              ), latest AS ( \
-                 SELECT path, inode, end_byte, file_size, content, tail, mtime, ROW_NUMBER() OVER ( \
+                 SELECT path, inode, end_byte, file_size, content, tail, mtime, ctime, ROW_NUMBER() OVER ( \
                             PARTITION BY path ORDER BY created_at DESC, batch_id DESC) AS rn \
                  FROM committed \
              ) \
-             SELECT path, inode, end_byte, file_size, content, tail, mtime FROM latest WHERE rn = 1",
+             SELECT path, inode, end_byte, file_size, content, tail, mtime, ctime FROM latest WHERE rn = 1",
         )
         .bind(BatchState::SourceCommitted.as_str())
         .bind(source_type.as_str())
@@ -733,15 +739,16 @@ impl StateStore for SqliteStateStore {
                         CAST(progress_end_json -> '$.content_fingerprint' AS TEXT) AS content, \
                         CAST(progress_end_json -> '$.tail_fingerprint' AS TEXT) AS tail, \
                         json_extract(progress_end_json, '$.mtime') AS mtime, \
+                        CAST(json_extract(progress_end_json, '$.ctime') AS TEXT) AS ctime, \
                         created_at, batch_id \
                  FROM batches WHERE state = ? AND source_type = ? \
              ), latest AS ( \
-                 SELECT path, inode, end_byte, file_size, content, tail, mtime, \
+                 SELECT path, inode, end_byte, file_size, content, tail, mtime, ctime, \
                         created_at, batch_id, ROW_NUMBER() OVER ( \
                             PARTITION BY path, inode ORDER BY created_at DESC, batch_id DESC) AS rn \
                  FROM committed \
              ) \
-             SELECT path, inode, end_byte, file_size, content, tail, mtime FROM latest \
+             SELECT path, inode, end_byte, file_size, content, tail, mtime, ctime FROM latest \
              WHERE rn = 1 ORDER BY path, created_at DESC, batch_id DESC",
         )
         .bind(BatchState::SourceCommitted.as_str())
@@ -1120,6 +1127,43 @@ async fn migrate_in_transaction(
     Ok(added)
 }
 
+/// Create a new database file readable and writable by its owner only
+/// (#733), before SQLite would create it under the process umask (normally
+/// `0644`). SQLite gives the `-wal` and `-shm` files the database file's
+/// mode, so a new ledger is owner-only throughout. An empty file is a valid
+/// new database. An existing file is left as it is: the engine checks its
+/// mode at startup and refuses rather than changing it. Any other failure
+/// (a missing directory, say) is left for SQLite to report when it opens the
+/// same path.
+fn create_owner_only(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A symlink whose target does not exist yet (review): `create_new`
+        // refuses the link itself, and SQLite would then create the target
+        // under the umask. Create the target the link names instead.
+        let mut target = path.to_path_buf();
+        for _ in 0..40 {
+            match std::fs::read_link(&target) {
+                Ok(next) => {
+                    target = match target.parent() {
+                        Some(parent) if next.is_relative() => parent.join(next),
+                        _ => next,
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&target);
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 fn is_in_memory(conn_str: &str) -> bool {
     conn_str == "sqlite::memory:" || conn_str == ":memory:"
 }
@@ -1198,6 +1242,66 @@ fn row_to_record(row: sqlx::sqlite::SqliteRow) -> Result<BatchRecord, VtopError>
 mod tests {
     use super::*;
     use crate::test_battery;
+
+    /// #733: a new ledger is owner-only, and so are the `-wal` and `-shm`
+    /// files SQLite creates beside it, whatever the umask lets through; an
+    /// existing file keeps its mode (the engine refuses it at startup rather
+    /// than change it behind the operator's back).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_new_ledger_and_its_wal_and_shm_are_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("new.db");
+        let store = SqliteStateStore::connect(&format!("sqlite://{}", db.display()))
+            .await
+            .unwrap();
+        store
+            .save_batch_state(&test_battery::sample_record("b-733"))
+            .await
+            .unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let path = format!("{}{suffix}", db.display());
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{path} was created {mode:04o}");
+        }
+        drop(store);
+
+        let old = dir.path().join("old.db");
+        std::fs::write(&old, "").unwrap();
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o644)).unwrap();
+        SqliteStateStore::connect(&format!("sqlite://{}", old.display()))
+            .await
+            .unwrap();
+        let mode = std::fs::metadata(&old).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "an existing file's mode was changed");
+
+        // A `file:` URI is created owner-only at the path it names, and no
+        // file named after the URI text appears in the working directory.
+        let uri = dir.path().join("uri.db");
+        SqliteStateStore::connect(&format!("sqlite:file:{}?cache=private", uri.display()))
+            .await
+            .unwrap();
+        let mode = std::fs::metadata(&uri).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{} was created {mode:04o}", uri.display());
+        let stray = std::fs::read_dir(".")
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("file:"))
+            .count();
+        assert_eq!(stray, 0, "a file named after the URI text was created");
+
+        // A symlink to a ledger that does not exist yet: the target is
+        // created owner-only, not by SQLite under the umask (review).
+        let target = dir.path().join("target.db");
+        let link = dir.path().join("link.db");
+        std::os::unix::fs::symlink("target.db", &link).unwrap();
+        SqliteStateStore::connect(&format!("sqlite://{}", link.display()))
+            .await
+            .unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the link's target was created {mode:04o}");
+    }
 
     /// #557: two handles on one database file stand for two engines.
     #[tokio::test]

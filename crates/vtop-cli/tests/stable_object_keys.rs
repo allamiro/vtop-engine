@@ -107,6 +107,13 @@ impl Logs {
             .with_max_level(tracing::Level::INFO)
             .with_writer(logs.clone())
             .finish();
+        // A second dispatcher, kept for the life of the process, so a callsite
+        // another test reaches first, with no subscriber of its own, is not
+        // cached as never wanted and missed here (as `otel` does for spans,
+        // #791).
+        static ALWAYS_A_SECOND: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        ALWAYS_A_SECOND
+            .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
         (logs.clone(), tracing::subscriber::set_default(subscriber))
     }
 
@@ -497,6 +504,7 @@ async fn an_archive_with_per_attempt_keys_still_recovers_scrubs_and_audits() {
         mtime: String::new(),
         content_fingerprint: None,
         tail_fingerprint: None,
+        ctime: None,
     };
     let manifest = ManifestBuilder {
         batch_id: batch_id.clone(),

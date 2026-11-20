@@ -5,7 +5,7 @@ description: Rust conventions and review checklist tuned to vtop-engine — edit
 
 # Rust practices for vtop-engine
 
-Ground truth for this repo, checked against the tree: workspace `edition = "2021"`, `rust-version = "1.94.1"` (a CI job builds on exactly that toolchain), CI runs `cargo clippy --workspace --all-targets --locked -- -D warnings`, `thiserror` in library crates and `anyhow` only in `vtop-cli`, `proptest` in `vtop-core`, `cargo-mutants` (report-only) and fuzz smoke in CI. Complements `vtop-contributing` (process) and the `ddia-*` skills (design). Part of the checklist is adapted from the ideas in the MIT-licensed `rust-systems` skill in [iliaal/ai-skills](https://github.com/iliaal/ai-skills), rewritten for this codebase.
+Ground truth for this repo, checked against the tree: workspace `edition = "2021"`, `rust-version = "1.94.1"` (a CI job builds on exactly that toolchain), CI runs `cargo clippy --workspace --all-targets --locked -- -D warnings`, `thiserror` in library crates and `anyhow` only in `vtop-cli`, `proptest` in `vtop-core`, `cargo-mutants` (gated on `state_machine.rs` and `replay.rs` since #729, report-only elsewhere), a fuzz smoke on every PR and nightly fuzzing with a persisted corpus (`fuzz/README.md`). Complements `vtop-contributing` (process) and the `ddia-*` skills (design). Part of the checklist is adapted from the ideas in the MIT-licensed `rust-systems` skill in [iliaal/ai-skills](https://github.com/iliaal/ai-skills), rewritten for this codebase.
 
 ## Toolchain: two compilers, one tree
 
@@ -69,7 +69,7 @@ A default build must not depend on what the host happens to have installed, and 
 | `loom` or `shuttle` | Interleavings in hand-rolled concurrency: group commit's mutex/condvar queue, the readiness gate, metrics gauges. Deterministic exploration instead of hoping a stress test hits the race. |
 | `turmoil` (or similar deterministic network simulation for tokio) | Partitions, delays and reordering in the replica plane and lease agent without real sockets; pairs with the storage `sim`. |
 | `miri` | UB in any future `unsafe`; cheap to run on the few crates that would contain it. |
-| `cargo-mutants` (already report-only) | Promote from report-only on `vtop-core` state machine paths once the surviving-mutant list is short. |
+| `cargo-mutants` (gated on the commit path since #729) | Extend the gate to the verify, recovery and file-continuity code once the nightly report-only job has a measured score. |
 
 ## Review checklist
 

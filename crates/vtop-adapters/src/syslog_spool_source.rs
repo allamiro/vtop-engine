@@ -127,6 +127,7 @@ impl SyslogSpoolSource {
             (Some((start, _)), Some(reason)) => {
                 self.refused_cuts.push(RefusedCut {
                     path: path.to_string(),
+                    partition: None,
                     start,
                     end,
                     reason,

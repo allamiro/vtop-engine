@@ -14,11 +14,21 @@ archive is complete, then the procedures you will need less often.
 
     [:octicons-arrow-right-24: Monitoring](monitoring.md)
 
+-   **Alert runbooks and objectives**
+
+    ---
+
+    What each shipped alert means, what the engine already did, and what to
+    do; the objectives the alerts protect.
+
+    [:octicons-arrow-right-24: Runbooks](runbooks.md) ·
+    [Service level objectives](slos.md)
+
 -   **Logs and auditing**
 
     ---
 
-    Log format and levels, where audit evidence lives, and what is planned.
+    Log format and levels, the audit trail, and where the other evidence lives.
 
     [:octicons-arrow-right-24: Logs and auditing](logs-and-auditing.md)
 

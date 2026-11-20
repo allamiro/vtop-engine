@@ -289,9 +289,16 @@ impl RecordedWindows {
         }
     }
 
-    /// Stop holding the window of `source` recorded from `start` to `end`:
-    /// its re-read could not stop at its end. Returns it, if it was held.
-    pub(crate) fn unbind(&mut self, source: &str, start: u64, end: u64) -> Option<RecordedWindow> {
+    /// Stop holding the window of `source` (of its Kafka `partition`, for a
+    /// topic) recorded from `start` to `end`: its re-read could not stop at
+    /// its end. Returns it, if it was held.
+    pub(crate) fn unbind(
+        &mut self,
+        source: &str,
+        partition: Option<i32>,
+        start: u64,
+        end: u64,
+    ) -> Option<RecordedWindow> {
         let w = self
             .by_unit
             .values_mut()
@@ -300,6 +307,7 @@ impl RecordedWindows {
             .find(|w| {
                 w.bounded
                     && w.source() == source
+                    && partition_of(&w.start) == partition
                     && start_position(&w.start) == i128::from(start)
                     && end_position(&w.end) == i128::from(end)
             })?;
@@ -432,6 +440,15 @@ pub(crate) fn note_rebuilt(
     }
 }
 
+/// The Kafka partition a marker is in; `None` for a file or spool, whose
+/// path names the unit on its own.
+pub(crate) fn partition_of(marker: &ProgressMarker) -> Option<i32> {
+    match marker {
+        ProgressMarker::Kafka { partition, .. } => Some(*partition),
+        ProgressMarker::File { .. } | ProgressMarker::SyslogSpool { .. } => None,
+    }
+}
+
 /// How much larger than the current batching limits a recorded window may be
 /// and still be rebuilt exactly (#626). A rebuilt window is held, whatever
 /// the thresholds say, until it reaches its recorded end; the cap keeps that
@@ -537,6 +554,7 @@ mod tests {
             end_byte: end,
             file_size: end,
             mtime: String::new(),
+            ctime: None,
             content_fingerprint: None,
             tail_fingerprint: None,
         }
@@ -619,6 +637,7 @@ mod tests {
             end_byte: 10,
             file_size: 10,
             mtime: String::new(),
+            ctime: None,
             content_fingerprint: None,
             tail_fingerprint: vtop_core::types::ContentFingerprint::of(bytes),
         };
@@ -646,6 +665,7 @@ mod tests {
                 end_byte: 0,
                 file_size: 0,
                 mtime: String::new(),
+                ctime: None,
                 content_fingerprint: None,
                 tail_fingerprint: None,
             };
@@ -674,5 +694,42 @@ mod tests {
             parse_sealed_at("2026-01-02T03:04:05+00:00").map(|t| t.to_rfc3339()),
             Some("2026-01-02T03:04:05+00:00".to_owned())
         );
+    }
+
+    /// #626 (Kafka): a refused cut names its topic, partition and offsets.
+    /// Two partitions of one topic can hold windows over the same offsets
+    /// (a store outage fails both), and only the refused partition's window
+    /// stops being held.
+    #[test]
+    fn a_refused_kafka_cut_unbinds_only_its_own_partition() {
+        let kafka = |partition: i32, start: i64, end: i64| ProgressMarker::Kafka {
+            topic: "events".into(),
+            partition,
+            start_offset: start,
+            end_offset: end,
+            consumer_group: "g".into(),
+        };
+        let mut windows = RecordedWindows::default();
+        for partition in [0, 1] {
+            windows.remember(RecordedWindow {
+                start: kafka(partition, 0, 0),
+                end: kafka(partition, 0, 19),
+                sealed_at: None,
+                digest: None,
+                batch_id: Some(format!("p{partition}")),
+                record_count: Some(20),
+                bounded: false,
+            });
+            windows.set_bounded(&kafka(partition, 0, 0), true);
+        }
+        let unbound = windows.unbind("events", Some(1), 0, 20).unwrap();
+        assert_eq!(unbound.batch_id.as_deref(), Some("p1"));
+        assert_eq!(
+            windows.bounded_end(&kafka(0, 0, 0)),
+            Some(20),
+            "partition 0 is still rebuilding its window"
+        );
+        assert_eq!(windows.bounded_end(&kafka(1, 0, 0)), None);
+        assert!(windows.unbind("events", Some(1), 0, 20).is_none());
     }
 }
