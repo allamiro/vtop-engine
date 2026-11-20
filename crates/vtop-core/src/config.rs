@@ -3461,6 +3461,14 @@ upload:
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         let path = dir.join(name);
+        // A previous call may have left this file 0400, which only root can
+        // open for writing again: replace it rather than rewrite it, so the
+        // test means the same thing as root and as an ordinary user (CI).
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("removing {}: {e}", path.display()),
+        }
         std::fs::write(&path, contents).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
         path
