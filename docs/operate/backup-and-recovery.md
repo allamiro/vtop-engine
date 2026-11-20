@@ -330,6 +330,10 @@ kept as a workflow artifact, and into the run's summary.
 
 ### What the drill does not cover
 
+- **A prune after the last digest copy.** The drill copies the digest directory
+  once, after the backup, as the page says to for a dump or SQLite. For WAL
+  archiving the page says to copy it after every prune; the drill does not
+  prune again after its copy, so that rule is the page's, not the drill's.
 - **A ledger of any size.** The drill's ledger holds a few dozen rows. The
   restore step of RTO grows with the ledger and, for WAL archiving, with the
   WAL between the base backup and the end of the archive; measure it on a copy
