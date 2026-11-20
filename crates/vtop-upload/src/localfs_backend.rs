@@ -158,6 +158,7 @@ impl UploadBackend for LocalFsBackend {
             // The .vtopck file is written by this engine. It is useful as an
             // inventory hint, but cannot prove what bytes are in `path`.
             checksum_sha256: None,
+            encryption: None,
         })
     }
 

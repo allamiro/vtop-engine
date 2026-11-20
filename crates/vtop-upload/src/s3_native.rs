@@ -103,6 +103,11 @@ pub struct S3NativeConfig {
     /// upload is created with (#684), from `upload.object_lock`. `None` sends
     /// no lock header, exactly as before the profile existed.
     pub object_lock: Option<crate::base::ObjectLockPolicy>,
+    /// The server-side encryption every object, manifest, receipt and
+    /// multipart upload is created with, from `upload.server_side_encryption`.
+    /// `None`, or a config whose mode is `none`, sends no encryption header
+    /// and checks none, exactly as before the key existed.
+    pub server_side_encryption: Option<vtop_core::config::ServerSideEncryptionConfig>,
 }
 
 /// How long a connection attempt may take. A store that is up accepts in
@@ -214,6 +219,10 @@ pub struct S3NativeBackend {
     request_min_bytes_per_second: u64,
     /// See [`S3NativeConfig::object_lock`] (#684).
     object_lock: Option<crate::base::ObjectLockPolicy>,
+    /// See [`S3NativeConfig::server_side_encryption`]; `Some` only for a mode
+    /// other than `none`. Every write carries it and every verification
+    /// checks the store's HeadObject against it.
+    sse: Option<vtop_core::config::ServerSideEncryptionConfig>,
     /// Whether a write the engine has no SHA-256 for (the BLAKE3 and
     /// no-checksum paths) carries a whole-object `x-amz-checksum-sha256` the
     /// backend computes itself (#778). True wherever the SDK would otherwise
@@ -737,6 +746,16 @@ impl S3NativeBackend {
                 aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported,
             );
         }
+        // Its own shape is checked here too, not only at config load: a bare
+        // S3NativeConfig (`vtopctl tier`, tests) reaches this constructor
+        // without a VtopConfig.
+        let sse = match &cfg.server_side_encryption {
+            Some(sse) => {
+                sse.validate()?;
+                sse.is_requested().then(|| sse.clone())
+            }
+            None => None,
+        };
         let body_sha256_header = cfg.object_lock.is_some()
             || !matches!(
                 shared.request_checksum_calculation(),
@@ -754,6 +773,7 @@ impl S3NativeBackend {
             request_timeout_seconds: cfg.request_timeout_seconds,
             request_min_bytes_per_second: cfg.request_min_bytes_per_second,
             object_lock: cfg.object_lock,
+            sse,
             body_sha256_header,
         })
     }
@@ -898,6 +918,10 @@ impl S3NativeBackend {
                 req = req.object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On);
             }
             req = lock_integrity(req, engine_sha256.is_some() || self_sha256.is_some());
+        }
+        // Encryption at rest: every object, manifest and receipt write.
+        if let Some(sse) = &self.sse {
+            req = crate::encryption::on_put(req, sse);
         }
 
         let out = req
@@ -1393,6 +1417,12 @@ impl UploadBackend for S3NativeBackend {
             size_bytes: out.content_length().map(|v| v as u64),
             etag: out.e_tag().map(|s| s.to_string()),
             checksum_sha256,
+            encryption: out
+                .server_side_encryption()
+                .map(|alg| crate::base::StoredEncryption {
+                    algorithm: alg.as_str().to_owned(),
+                    kms_key_id: out.ssekms_key_id().map(str::to_owned),
+                }),
         })
     }
 
@@ -1412,6 +1442,15 @@ impl UploadBackend for S3NativeBackend {
             }
         } else {
             return Ok(VerificationResult::failed("object size unavailable"));
+        }
+
+        // Encryption at rest, as the store reports it for the stored object:
+        // a write that should be encrypted and is not, or is under another
+        // key, fails like a checksum mismatch, before any read-back.
+        if let Some(sse) = &self.sse {
+            if let Err(why) = crate::encryption::judge(sse, head.encryption.as_ref()) {
+                return Ok(VerificationResult::failed(why));
+            }
         }
 
         // Checksums disabled: size + existence is all we can confirm.
@@ -1582,6 +1621,11 @@ impl UploadBackend for S3NativeBackend {
             if asked.legal_hold {
                 req = req.object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On);
             }
+        }
+        // S3 fixes a multipart object's encryption here too; UploadPart and
+        // CompleteMultipartUpload carry none.
+        if let Some(sse) = &self.sse {
+            req = crate::encryption::on_create_multipart(req, sse);
         }
         let out = req
             .send()
@@ -1833,6 +1877,10 @@ pub fn config_from_upload(upload: &vtop_core::config::UploadConfig) -> S3NativeC
             .object_lock
             .as_ref()
             .map(crate::base::ObjectLockPolicy::from_config),
+        server_side_encryption: upload
+            .server_side_encryption
+            .is_requested()
+            .then(|| upload.server_side_encryption.clone()),
     }
 }
 
@@ -3301,6 +3349,7 @@ mod tests {
             request_timeout_seconds: 300,
             request_min_bytes_per_second: 4 * 1024,
             object_lock: None,
+            server_side_encryption: None,
         };
         let err = match S3NativeBackend::new(&cfg).await {
             Err(err) => err,
@@ -3611,6 +3660,7 @@ mod egress_ceiling {
             request_timeout_seconds: 300,
             request_min_bytes_per_second: 4 * 1024,
             object_lock: None,
+            sse: None,
             body_sha256_header: true,
         };
         let payload = Bytes::from_static(b"bytes the process ceiling must see");
@@ -3737,6 +3787,7 @@ mod egress_ceiling {
             request_timeout_seconds: 300,
             request_min_bytes_per_second: 4 * 1024,
             object_lock: None,
+            server_side_encryption: None,
         };
         let unset = S3NativeBackend::new(&build(None)).await.unwrap();
         assert!(
@@ -3806,6 +3857,7 @@ mod egress_ceiling {
             request_timeout_seconds: 300,
             request_min_bytes_per_second: 4 * 1024,
             object_lock: None,
+            sse: None,
             body_sha256_header: true,
         };
         let payload = Bytes::from_static(b"the pipeline an unset cap must not touch");
@@ -3911,6 +3963,7 @@ mod egress_ceiling {
             request_timeout_seconds: 300,
             request_min_bytes_per_second: 4 * 1024,
             object_lock: None,
+            sse: None,
             body_sha256_header: true,
         }
     }
@@ -4153,6 +4206,7 @@ mod body_deadline {
             request_timeout_seconds: 300,
             request_min_bytes_per_second: 0,
             object_lock: None,
+            server_side_encryption: None,
         })
         .await
         {

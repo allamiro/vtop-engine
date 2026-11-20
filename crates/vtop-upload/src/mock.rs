@@ -979,6 +979,7 @@ impl UploadBackend for MockBackend {
             } else {
                 None
             },
+            encryption: None,
         })
     }
 

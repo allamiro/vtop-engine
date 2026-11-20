@@ -1501,6 +1501,7 @@ jobs:
             --test transport_conformance \
             --test live_s3_multipart_resume \
             --test live_s3_object_lock \
+            --test live_s3_sse \
             -- --ignored --test-threads=1
 
       # The S3 Object Lock profile end to end (#684): the engine refuses a

@@ -9,6 +9,7 @@
 pub mod awscli_backend;
 pub mod base;
 mod command;
+pub mod encryption;
 pub mod localfs_backend;
 pub mod minio_backend;
 pub mod mock;
@@ -21,8 +22,8 @@ pub use vtop_core::effective_config::{verification_method, VerificationMethod};
 pub use base::{
     format_unix_secs, judge_retention, BucketFeature, CreatedUpload, LockPart, ObjectChecksum,
     ObjectHead, ObjectLockMode, ObjectLockPolicy, RequestedRetention, RetentionCheck,
-    RetentionExpectation, StoredManifest, StoredObject, StoredRetention, UploadBackend,
-    UploadedPart, VerificationResult,
+    RetentionExpectation, StoredEncryption, StoredManifest, StoredObject, StoredRetention,
+    UploadBackend, UploadedPart, VerificationResult,
 };
 pub use base::{is_throttle_code, is_throttle_status, looks_throttled, THROTTLE_ERROR_CODES};
 pub use mock::{HeadFault, LockFault, MockBackend, PartFault};
@@ -57,6 +58,9 @@ pub async fn build_backend(cfg: &UploadConfig) -> Result<Arc<dyn UploadBackend>,
     // The Object Lock profile (#684): its rules, including which backend
     // can honour it, before anything is built or probed.
     cfg.validate_object_lock()?;
+    // And the encryption block (`upload.server_side_encryption`): its rules and
+    // which backend can honour it, before anything is built or probed.
+    cfg.validate_server_side_encryption()?;
     let backend: Arc<dyn UploadBackend> = match cfg.backend.as_str() {
         "s3_native" => {
             let s3cfg = s3_native::config_from_upload(cfg);
@@ -297,6 +301,56 @@ mod object_lock_construction {
                 cfg.validate_object_lock().is_ok(),
                 "[{name}] no profile, no refusal"
             );
+        }
+    }
+
+    fn encrypted(backend: &str, mode: &str) -> UploadConfig {
+        let mut cfg: UploadConfig = serde_json::from_str(&format!(
+            r#"{{"bucket":"b","server_side_encryption":{{"mode":"{mode}"}}}}"#
+        ))
+        .expect("parses");
+        cfg.backend = backend.to_owned();
+        cfg
+    }
+
+    /// Encryption at rest: every backend but s3_native refuses a mode other
+    /// than `none` at construction, naming the key and itself, and none may
+    /// accept it and write plaintext the operator believes is encrypted. The
+    /// table is read from `build_backend`'s own list, so a new backend joins it.
+    #[tokio::test]
+    async fn a_backend_that_cannot_encrypt_refuses_the_setting_naming_the_key() {
+        for name in every_backend_name().await {
+            for mode in ["sse-s3", "sse-kms"] {
+                let cfg = encrypted(&name, mode);
+                let verdict = cfg.validate_server_side_encryption();
+                if name == "s3_native" {
+                    assert!(verdict.is_ok(), "s3_native sends it: {verdict:?}");
+                    continue;
+                }
+                let msg = verdict
+                    .expect_err(&format!("[{name} {mode}] cannot encrypt and must refuse"))
+                    .to_string();
+                assert!(
+                    msg.contains("upload.server_side_encryption")
+                        && msg.contains(&name)
+                        && msg.contains("s3_native"),
+                    "[{name}] the refusal names the key, the backend and the one that can: {msg}"
+                );
+                let msg = match build_backend(&cfg).await {
+                    Ok(_) => {
+                        panic!("[{name}] build_backend accepted an encryption it cannot write")
+                    }
+                    Err(err) => err.to_string(),
+                };
+                assert!(
+                    msg.contains("upload.server_side_encryption"),
+                    "[{name}] {msg}"
+                );
+            }
+            // `none` is the default, not a request.
+            assert!(encrypted(&name, "none")
+                .validate_server_side_encryption()
+                .is_ok());
         }
     }
 

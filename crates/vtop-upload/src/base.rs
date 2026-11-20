@@ -343,6 +343,21 @@ pub struct ObjectHead {
     /// Engine-written user metadata and local sidecars MUST NOT populate this
     /// field: they describe what the uploader claimed, not what is stored.
     pub checksum_sha256: Option<String>,
+    /// How the store reports the object is encrypted at rest, from the
+    /// response's `x-amz-server-side-encryption` headers; `None` when it
+    /// reports none, and for a backend that cannot read them.
+    pub encryption: Option<StoredEncryption>,
+}
+
+/// The server-side encryption a store reports for a stored object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredEncryption {
+    /// `x-amz-server-side-encryption` as the store spelled it: `AES256`,
+    /// `aws:kms`, `aws:kms:dsse`.
+    pub algorithm: String,
+    /// `x-amz-server-side-encryption-aws-kms-key-id`: S3 reports the key's
+    /// ARN, never the alias a request named; other stores may report less.
+    pub kms_key_id: Option<String>,
 }
 
 /// Outcome of an object verification attempt.
