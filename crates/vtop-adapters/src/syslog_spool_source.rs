@@ -6,9 +6,10 @@
 //! verification, replay state, and the commit rule.
 
 use crate::base::{
-    AdapterReadReport, DiscoveredSource, ReadResult, SourceAdapter, SourceReadOutcome,
+    AdapterReadReport, DiscoveredSource, ReadResult, ReplayRange, SourceAdapter, SourceReadOutcome,
 };
 use crate::continuity::{self, Discontinuity, Observed};
+use crate::file_source::{CutOutcome, RefusedCut};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::Path;
@@ -65,13 +66,127 @@ impl SpoolSeen {
 pub struct SyslogSpoolSource {
     paths: Vec<String>,
     cursors: HashMap<String, SpoolCursor>,
+    /// Per spool, the recorded ends its re-reads stop at (#626), as the file
+    /// source keeps them: end -> (start, inode).
+    cuts: HashMap<String, std::collections::BTreeMap<u64, (u64, Option<u64>)>>,
+    /// Windows a read could not rebuild as cut, for the engine to count.
+    refused_cuts: Vec<RefusedCut>,
 }
+
+/// How many cuts one spool keeps; the lowest is dropped beyond it.
+const MAX_CUTS_PER_SPOOL: usize = 1024;
 
 impl SyslogSpoolSource {
     pub fn new(paths: Vec<String>) -> Self {
         Self {
             paths,
             cursors: HashMap::new(),
+            cuts: HashMap::new(),
+            refused_cuts: Vec::new(),
+        }
+    }
+
+    /// The windows a read could not rebuild as cut since the last call (#626).
+    pub fn take_refused_cuts(&mut self) -> Vec<RefusedCut> {
+        std::mem::take(&mut self.refused_cuts)
+    }
+
+    /// The recorded end the next read of `path` from `start` stops at; cuts
+    /// at or below `start` are forgotten.
+    fn next_cut(&mut self, path: &str, start: u64) -> Option<(u64, Option<u64>)> {
+        let cuts = self.cuts.get_mut(path)?;
+        while cuts.first_key_value().is_some_and(|(end, _)| *end <= start) {
+            cuts.pop_first();
+        }
+        let next = cuts
+            .first_key_value()
+            .map(|(end, (_, inode))| (*end, *inode));
+        if cuts.is_empty() {
+            self.cuts.remove(path);
+        }
+        next
+    }
+
+    /// Fold a read's cut into the adapter; `true` when the read stopped at
+    /// it, so the next window can be read on in the same pass.
+    fn settle_cut(&mut self, path: &str, cut: CutOutcome) -> bool {
+        let (end, refused) = match cut {
+            CutOutcome::None => return false,
+            CutOutcome::Reached(end) => (end, None),
+            CutOutcome::Refused(end, reason) => (end, Some(reason)),
+        };
+        let Some(cuts) = self.cuts.get_mut(path) else {
+            return false;
+        };
+        let taken = cuts.remove(&end);
+        if cuts.is_empty() {
+            self.cuts.remove(path);
+        }
+        match (taken, refused) {
+            (Some(_), None) => true,
+            (Some((start, _)), Some(reason)) => {
+                self.refused_cuts.push(RefusedCut {
+                    path: path.to_string(),
+                    partition: None,
+                    start,
+                    end,
+                    reason,
+                });
+                false
+            }
+            (None, _) => false,
+        }
+    }
+
+    /// Read on from a cut a read stopped at, in the same pass, within what is
+    /// left of the budgets (#626; as `FileSource::read_on_after_cuts`).
+    async fn read_on_after_cuts(
+        &mut self,
+        path: &str,
+        reads: &mut Vec<ReadResult>,
+        max_records: usize,
+        max_bytes: usize,
+    ) {
+        for _ in 0..16 {
+            let records: usize = reads.iter().map(|r| r.records.len()).sum();
+            let bytes: usize = reads
+                .iter()
+                .flat_map(|r| r.records.iter())
+                .map(|r| r.len() + 1)
+                .sum();
+            if records >= max_records || bytes >= max_bytes {
+                return;
+            }
+            let cursor = self.cursors.entry(path.to_string()).or_default();
+            let start = cursor.read_byte;
+            let last_seen = cursor.seen.as_ref().map(SpoolSeen::observed);
+            let cut = self.next_cut(path, start);
+            match Self::read_slice(
+                path.to_string(),
+                start,
+                max_records - records,
+                max_bytes - bytes,
+                last_seen,
+                cut,
+            )
+            .await
+            {
+                Ok(slice) => {
+                    let reached = self.settle_cut(path, slice.cut);
+                    let read = self.apply_slice(path, slice);
+                    if !read.is_empty() {
+                        reads.push(read);
+                    }
+                    if !reached {
+                        return;
+                    }
+                }
+                Err(failed) => {
+                    let error = self.apply_failed_read(path, failed);
+                    tracing::debug!(path, error = %error, "read after a cut failed; retried next pass");
+                    return;
+                }
+            }
         }
     }
 
@@ -141,6 +256,7 @@ impl SyslogSpoolSource {
             end,
             seen,
             discontinuity,
+            cut: _,
         } = slice;
         let progress_start = Self::marker(path, &seen, start, start);
         let progress_end = Self::marker(path, &seen, start, end);
@@ -270,6 +386,7 @@ impl SyslogSpoolSource {
         max_records: usize,
         max_bytes: usize,
         last_seen: Option<Observed>,
+        cut: Option<(u64, Option<u64>)>,
     ) -> Result<SpoolSlice, SpoolReadError> {
         let mut file = tokio::fs::File::open(&path)
             .await
@@ -297,15 +414,32 @@ impl SyslogSpoolSource {
         // A failure from here still restarts the cursor on what the judgement
         // found (see `FileSource::read_slice`, review of #564).
         let restart = discontinuity.map(|why| Box::new((why, opened.clone())));
-        Self::read_opened(file, &path, start, max_records, max_bytes, discontinuity)
-            .await
-            .map(|mut slice| {
-                // Size and mtime after the read; the content as it was at
-                // open, which an append cannot change.
-                slice.seen.content = opened.content;
-                slice
-            })
-            .map_err(|error| SpoolReadError { error, restart })
+        // A cut applies only to the spool the window was read from, at the
+        // cursor's position (#626).
+        let cut_refused = cut.filter(|(_, inode)| {
+            discontinuity.is_some() || (inode.is_some() && *inode != opened.inode)
+        });
+        let bound = cut.filter(|_| cut_refused.is_none()).map(|(end, _)| end);
+        Self::read_opened(
+            file,
+            &path,
+            start,
+            max_records,
+            max_bytes,
+            discontinuity,
+            bound,
+        )
+        .await
+        .map(|mut slice| {
+            // Size and mtime after the read; the content as it was at
+            // open, which an append cannot change.
+            slice.seen.content = opened.content;
+            if let Some((end, _)) = cut_refused {
+                slice.cut = CutOutcome::Refused(end, "the spool under the range was replaced");
+            }
+            slice
+        })
+        .map_err(|error| SpoolReadError { error, restart })
     }
 
     async fn read_opened(
@@ -315,6 +449,7 @@ impl SyslogSpoolSource {
         max_records: usize,
         max_bytes: usize,
         discontinuity: Option<Discontinuity>,
+        cut: Option<u64>,
     ) -> Result<SpoolSlice, VtopError> {
         file.seek(std::io::SeekFrom::Start(start)).await?;
         // Put the whole-call byte limiter BELOW BufReader. If Take wrapped the
@@ -329,8 +464,15 @@ impl SyslogSpoolSource {
         let mut records = Vec::new();
         let mut bytes_read: u64 = 0;
         let mut pos = start;
+        let mut cut_outcome = CutOutcome::None;
 
         loop {
+            // A window handed back to be rebuilt exactly ends where the
+            // failed attempt's did (#626).
+            if let Some(c) = cut.filter(|c| pos >= *c) {
+                cut_outcome = CutOutcome::Reached(c);
+                break;
+            }
             if records.len() >= max_records || bytes_read as usize >= max_bytes {
                 break;
             }
@@ -354,6 +496,11 @@ impl SyslogSpoolSource {
             if n == 0 || !line.ends_with(b"\n") {
                 break;
             }
+            if let Some(c) = cut.filter(|c| pos + n as u64 > *c) {
+                cut_outcome =
+                    CutOutcome::Refused(c, "a line crosses the recorded end of the range");
+                break;
+            }
             pos += n as u64;
             bytes_read += n as u64;
             line.pop();
@@ -365,12 +512,18 @@ impl SyslogSpoolSource {
         // not only the inode: what the read OBSERVED is what the next
         // cycle's skip decision must compare against (#101).
         let seen = Self::seen_of(&reader.get_ref().get_ref().metadata().await?);
+        if let (CutOutcome::None, Some(c)) = (&cut_outcome, cut) {
+            if pos == c {
+                cut_outcome = CutOutcome::Reached(c);
+            }
+        }
         Ok(SpoolSlice {
             records,
             start,
             end: pos,
             seen,
             discontinuity,
+            cut: cut_outcome,
         })
     }
 }
@@ -400,6 +553,8 @@ struct SpoolSlice {
     end: u64,
     seen: SpoolSeen,
     discontinuity: Option<Discontinuity>,
+    /// What became of the cut the read was given (#626).
+    cut: CutOutcome,
 }
 
 /// How many spool files are read concurrently in one pass.
@@ -455,8 +610,17 @@ impl SourceAdapter for SyslogSpoolSource {
             .get(&path)
             .and_then(|c| c.seen.as_ref())
             .map(SpoolSeen::observed);
-        match Self::read_slice(path.clone(), start, max_records, max_bytes, last_seen).await {
-            Ok(slice) => Ok(vec![self.apply_slice(&path, slice)]),
+        let cut = self.next_cut(&path, start);
+        match Self::read_slice(path.clone(), start, max_records, max_bytes, last_seen, cut).await {
+            Ok(slice) => {
+                let reached = self.settle_cut(&path, slice.cut);
+                let mut reads = vec![self.apply_slice(&path, slice)];
+                if reached {
+                    self.read_on_after_cuts(&path, &mut reads, max_records, max_bytes)
+                        .await;
+                }
+                Ok(reads)
+            }
             Err(failed) => Err(self.apply_failed_read(&path, failed)),
         }
     }
@@ -478,7 +642,13 @@ impl SourceAdapter for SyslogSpoolSource {
         // identity unchanged since the read that caught it up — are
         // separated out here and never opened; what is left is the work the
         // pass actually has to do.
-        let mut jobs: Vec<(usize, String, u64, Option<Observed>)> = Vec::new();
+        let mut jobs: Vec<(
+            usize,
+            String,
+            u64,
+            Option<Observed>,
+            Option<(u64, Option<u64>)>,
+        )> = Vec::new();
         let mut skipped: Vec<(usize, String, u64, SpoolSeen)> = Vec::new();
         for (i, s) in sources.iter().enumerate() {
             let path = s.source_name.clone();
@@ -490,7 +660,8 @@ impl SourceAdapter for SyslogSpoolSource {
                 }
                 _ => {
                     let last_seen = cursor.seen.as_ref().map(SpoolSeen::observed);
-                    jobs.push((i, path, start, last_seen));
+                    let cut = self.next_cut(&path, start);
+                    jobs.push((i, path, start, last_seen, cut));
                 }
             }
         }
@@ -507,20 +678,20 @@ impl SourceAdapter for SyslogSpoolSource {
         }
 
         let mut results: Vec<(usize, String, Result<SpoolSlice, SpoolReadError>)> =
-            futures::stream::iter(
-                jobs.into_iter()
-                    .map(|(i, path, start, last_seen)| async move {
-                        let res = Self::read_slice(
-                            path.clone(),
-                            start,
-                            max_records,
-                            max_bytes,
-                            last_seen,
-                        )
-                        .await;
-                        (i, path, res)
-                    }),
-            )
+            futures::stream::iter(jobs.into_iter().map(
+                |(i, path, start, last_seen, cut)| async move {
+                    let res = Self::read_slice(
+                        path.clone(),
+                        start,
+                        max_records,
+                        max_bytes,
+                        last_seen,
+                        cut,
+                    )
+                    .await;
+                    (i, path, res)
+                },
+            ))
             .buffer_unordered(SPOOL_READ_CONCURRENCY)
             .collect()
             .await;
@@ -555,7 +726,13 @@ impl SourceAdapter for SyslogSpoolSource {
             let result = match res {
                 Ok(slice) => {
                     any_records |= !slice.records.is_empty();
-                    Ok(vec![self.apply_slice(&path, slice)])
+                    let reached = self.settle_cut(&path, slice.cut);
+                    let mut reads = vec![self.apply_slice(&path, slice)];
+                    if reached {
+                        self.read_on_after_cuts(&path, &mut reads, max_records, max_bytes)
+                            .await;
+                    }
+                    Ok(reads)
                 }
                 Err(failed) => {
                     any_failed = true;
@@ -827,6 +1004,40 @@ impl SourceAdapter for SyslogSpoolSource {
         proven.then(|| i128::from(c.committed_byte))
     }
 
+    /// Record each range's end as a cut its re-read stops at (#626).
+    fn bound_replays(&mut self, ranges: &[ReplayRange]) -> Vec<bool> {
+        ranges
+            .iter()
+            .map(|range| {
+                let (
+                    ProgressMarker::SyslogSpool {
+                        path,
+                        inode,
+                        start_byte,
+                        ..
+                    },
+                    ProgressMarker::SyslogSpool {
+                        path: end_path,
+                        end_byte,
+                        ..
+                    },
+                ) = (&range.start, &range.end)
+                else {
+                    return false;
+                };
+                if path != end_path || end_byte <= start_byte {
+                    return false;
+                }
+                let cuts = self.cuts.entry(path.clone()).or_default();
+                cuts.insert(*end_byte, (*start_byte, *inode));
+                if cuts.len() > MAX_CUTS_PER_SPOOL {
+                    cuts.pop_first();
+                }
+                true
+            })
+            .collect()
+    }
+
     fn source_type(&self) -> SourceType {
         SourceType::SyslogSpool
     }
@@ -996,6 +1207,50 @@ mod tests {
             None,
             "the spool at the path no longer starts with what both recorded"
         );
+    }
+
+    /// #626: a spool re-read bounded to a recorded range stops at its end,
+    /// and the lines after it are read on in the same pass as their own read.
+    #[tokio::test]
+    async fn a_bounded_spool_re_read_stops_at_the_recorded_end_and_reads_on() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "<13>one").unwrap();
+        writeln!(f, "<13>two").unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_string_lossy().into_owned();
+        let mut s = SyslogSpoolSource::new(vec![path.clone()]);
+        let src = DiscoveredSource {
+            source_type: SourceType::SyslogSpool,
+            source_name: path.clone(),
+            format: TelemetryFormat::Syslog,
+        };
+        let first = s
+            .read_batch_candidates(&src, 10, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(first[0].records.len(), 2);
+        writeln!(f, "<13>three").unwrap();
+        f.flush().unwrap();
+        s.replay_from_marker(&first[0].progress_start)
+            .await
+            .unwrap();
+        let range = ReplayRange {
+            start: first[0].progress_start.clone(),
+            end: first[0].progress_end.clone(),
+        };
+        assert_eq!(s.bound_replays(&[range]), [true]);
+        let again = s
+            .read_batch_candidates(&src, 10, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            again.len(),
+            2,
+            "the rebuilt window, then the new line: {again:?}"
+        );
+        assert_eq!(again[0].records, first[0].records);
+        assert_eq!(again[1].records, vec![b"<13>three".to_vec()]);
+        assert!(s.take_refused_cuts().is_empty());
     }
 
     #[tokio::test]

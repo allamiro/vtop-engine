@@ -24,6 +24,7 @@ act, and are refused when it cannot be written.
 | `promotion.attest` | `vtopctl node promote-unproven` (#636); the admin endpoint; every replica | Including a refusal before anything was sent (no `--i-accept-data-loss`). |
 | `node.repair` | `vtopctl node repair` (`params.side: client`); the leader serving the transfer (`params.side: serving`) | The client's outcome; the leader's grant or refusal of the listing that starts a transfer, its refusal of any chunk, and the outcome of a `seal_tail`. |
 | `node.reconfigure_range` | `vtopctl node reconfigure-range` | The thresholds written, or the failure. |
+| `security.override` | Any `vtopctl` command that reads a key, state-store, ledger or audit file other local users can read, accepted only because `security.allow_loose_secret_permissions` is true (#733) | Once per file per process, outcome `success`. The target is the file; `params` are `file_kind`, `mode`, `exposed_to` and `setting`. See [Secret files](secrets.md#the-override). |
 
 Not audited: the archive path itself (`vtopctl run` and `process-once`
 archive and commit batches; that is the batch lifecycle, in the ledger and
@@ -99,7 +100,7 @@ log is a format change of its own, not part of this release.
 | Sink | When | Notes |
 |---|---|---|
 | The log stream, target `vtop::audit` | Always | Written whatever `RUST_LOG` or `--log-level` say, never sampled or rate-limited. INFO for `attempt` and `success`, WARN for `failure` and `refused`. The message is `audit: <action> <outcome>` (closed sets, so a pipeline may index it); `summary` says who did it and on what, and `audit_id`, `action`, `outcome` and `actor` sit beside the full record in `record`. A sink's own error line on this target carries `audit_sink_error=true` and no `record`. |
-| An append-only JSONL file | `VTOP_AUDIT_LOG=/path` | One record per line, synced before the command goes on. Created with mode `0600` (an existing file keeps its mode). A set but unwritable path stops the command (or the node) at startup, naming the path. Rotate it by moving the file away while nothing writes to it (between `vtopctl` runs; for a node, at a restart); `logrotate`'s `copytruncate` can lose a record appended between the copy and the truncate. |
+| An append-only JSONL file | `VTOP_AUDIT_LOG=/path` | One record per line, synced before the command goes on. Created with mode `0600` (an existing file keeps its mode). A set but unwritable path stops the command (or the node) at startup, naming the path. `vtopctl` also refuses an existing file group or other can write, or other users can read outside a closed directory; group read is accepted, for a log shipper (#733, [Secret files](secrets.md)). Rotate it by moving the file away while nothing writes to it (between `vtopctl` runs; for a node, at a restart); `logrotate`'s `copytruncate` can lose a record appended between the copy and the truncate. |
 | The state store's `audit_events` table | The ledger commands | Append only, hash-chained (below). `prune-ledger` never touches it; there is no retention for it yet. |
 
 `vtopctl meta`, `node` and `tier` now install a log subscriber: WARN and

@@ -91,6 +91,18 @@ impl ClusterCommittedOffset {
     }
 }
 
+/// Followers whose durable acks, with the leader's own, make a write quorum
+/// of `replication_factor` replicas: a majority, less the leader.
+///
+/// One definition for the two places that must agree on it (#750): the
+/// fan-out stops waiting once this many followers have acked, and a newly
+/// built leader starts serving once this many replica streams are up.
+/// Waiting for more than this before serving is waiting for a stream a
+/// failover has, by definition, lost.
+pub fn write_quorum_followers(replication_factor: usize) -> usize {
+    (replication_factor / 2 + 1).saturating_sub(1)
+}
+
 /// Result of fanning a locally durable leader append out to followers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplicaQuorumResult {
@@ -108,6 +120,51 @@ impl ReplicaQuorumResult {
     /// Leader local durability counts as one ack.
     pub fn has_quorum(&self) -> bool {
         1 + self.follower_acks >= self.majority()
+    }
+}
+
+#[cfg(test)]
+mod write_quorum_tests {
+    use super::*;
+
+    /// The serving threshold and the ack threshold are the same number
+    /// (#750): exactly `write_quorum_followers(rf)` follower acks make a
+    /// quorum, and one fewer does not.
+    #[test]
+    fn the_write_quorum_is_the_number_of_acks_that_makes_a_quorum() {
+        for rf in 1..=7 {
+            let needed = write_quorum_followers(rf);
+            let at = ReplicaQuorumResult {
+                follower_acks: needed,
+                replication_factor: rf,
+            };
+            assert!(
+                at.has_quorum(),
+                "rf {rf}: {needed} follower acks must be a quorum"
+            );
+            if needed > 0 {
+                let below = ReplicaQuorumResult {
+                    follower_acks: needed - 1,
+                    replication_factor: rf,
+                };
+                assert!(
+                    !below.has_quorum(),
+                    "rf {rf}: {} acks must not be",
+                    needed - 1
+                );
+            }
+        }
+        assert_eq!(
+            write_quorum_followers(3),
+            1,
+            "three replicas: the leader and one peer"
+        );
+        assert_eq!(write_quorum_followers(5), 2);
+        assert_eq!(
+            write_quorum_followers(1),
+            0,
+            "a lone leader needs no stream"
+        );
     }
 }
 
@@ -209,6 +266,15 @@ pub struct InProcessFollower {
     /// Records a fence disputed but KEPT (#611): the epoch of that fence and
     /// the first offset in dispute. See [`KeptDispute`].
     kept_dispute: Mutex<Option<KeptDispute>>,
+    /// The newest mark a leader sent that passed the fencing check (#787).
+    /// [`Self::observe_hwm`] never shows a mark above local durability, so a
+    /// mark that arrives before the records under it (a fresh session sends
+    /// the current mark first, then the records the replica lacks) is shown
+    /// only up to what the replica held then. Each successful append shows
+    /// it again, through the same checks, so the records it covers become
+    /// visible without waiting for a new mark, which a quiet range never
+    /// sends.
+    last_mark: Mutex<Option<CommittedHwmUpdate>>,
     /// Whether the journal holds a leader lineage the appends have not yet
     /// caught up with (#640): the fast path that keeps a follower in steady
     /// state from taking the journal lock on every append.
@@ -347,6 +413,7 @@ impl InProcessFollower {
             online: AtomicBool::new(true),
             hold_fsync: AtomicBool::new(false),
             kept_dispute: Mutex::new(None),
+            last_mark: Mutex::new(None),
             lineage_following: AtomicBool::new(false),
             #[cfg(test)]
             before_dispute_install: Mutex::new(None),
@@ -2036,6 +2103,38 @@ impl InProcessFollower {
         &self,
         request: &ReplicaAppendRequest,
     ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
+        let applied = self.apply_append_unmarked(request);
+        if applied.is_ok() {
+            self.show_last_mark();
+        }
+        applied
+    }
+
+    /// Show the last mark a leader sent over records appended since it
+    /// arrived (#787). The leader could re-send that same mark at any moment
+    /// and this replica would apply it the same way: it goes through
+    /// [`Self::observe_hwm`] in full, so the fencing check refuses it once the
+    /// epoch has moved on, a kept dispute is settled first, and nothing is
+    /// shown above local durability.
+    fn show_last_mark(&self) {
+        let Some(update) = self
+            .last_mark
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        else {
+            return;
+        };
+        let shown = self.cluster_committed.get();
+        if update.committed_high_watermark > shown && self.local_committed_offset() > shown {
+            let _ = self.observe_hwm(&update);
+        }
+    }
+
+    fn apply_append_unmarked(
+        &self,
+        request: &ReplicaAppendRequest,
+    ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
         if !self.is_online() {
             return Err((
                 ErrorCode::Overloaded,
@@ -2213,13 +2312,24 @@ impl InProcessFollower {
         &self,
         requests: &[ReplicaAppendRequest],
     ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
+        let applied = self.apply_append_batch_unmarked(requests);
+        if applied.is_ok() {
+            self.show_last_mark();
+        }
+        applied
+    }
+
+    fn apply_append_batch_unmarked(
+        &self,
+        requests: &[ReplicaAppendRequest],
+    ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
         if requests.is_empty() {
             return Ok(ReplicaAppendResponse {
                 local_committed_offset: self.replication_status().0,
             });
         }
         if requests.len() == 1 {
-            return self.apply_append(&requests[0]);
+            return self.apply_append_unmarked(&requests[0]);
         }
         if !self.is_online() {
             return Err((
@@ -2420,6 +2530,21 @@ impl InProcessFollower {
         // kept records as committed and put them below a mark no truncation
         // may cross, wedging the replica.
         self.settle_kept_dispute(update.fencing_epoch, update.committed_high_watermark)?;
+        // Kept for the appends that follow (#787): the newest epoch's
+        // newest mark.
+        {
+            let mut last = self
+                .last_mark
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let newer = last.as_ref().is_none_or(|kept| {
+                (update.fencing_epoch, update.committed_high_watermark)
+                    > (kept.fencing_epoch, kept.committed_high_watermark)
+            });
+            if newer {
+                *last = Some(update.clone());
+            }
+        }
         #[cfg(test)]
         Self::run_test_hook(&self.after_mark_settle);
         // Never advertise above local durability.

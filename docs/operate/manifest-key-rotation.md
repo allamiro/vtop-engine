@@ -45,9 +45,12 @@ metric labels. Pick ids an operator can read in a runbook, such as
   (every reader on v0.8.0 or later); see
   [`manifest`](../configure/reference.md#manifest).
 - **Keys come from environment variables or files.** Each is 32 bytes, 64
-  hex characters, for example `openssl rand -hex 32`. Key files are not
-  permission-checked: mount them readable by the engine's user only
-  (`defaultMode: 0400` for a Kubernetes secret).
+  hex characters, for example `openssl rand -hex 32`. A key file other
+  local users can write is refused, and so is one they can read, unless it
+  is a Kubernetes Secret mounted with `defaultMode: 0400` and `fsGroup`, or
+  sits in a directory closed to them. Mount each key readable by the
+  engine's user only; the rule and the recipes are in
+  [Secret files and their permissions](secrets.md).
 
 ## The procedure
 
@@ -184,7 +187,8 @@ result: they are all `unauthenticated`, and the detail names the key.
 
 `key_id` is never an id read from a manifest: that comes from storage and
 would be unbounded. Alert on any `result="unknown_key"`: it means a process
-is missing a key that signed part of the archive.
+is missing a key that signed part of the archive. The rule below is an
+example; it is not in the [shipped rule set](monitoring.md#alerts).
 
 ```yaml
 - alert: VtopManifestKeyUnknown

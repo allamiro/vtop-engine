@@ -28,6 +28,15 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # promtool for the alert rules (#720), used by the prometheus-rules and helm
+  # jobs. Pinned by digest, resolved with `docker manifest inspect
+  # prom/prometheus:v3.15.1` (the multi-arch index; quay.io/prometheus/
+  # prometheus:v3.15.1 serves the same digest), not by the mutable tag. The
+  # tag is in the trailing comment and PROMETHEUS_VERSION; the prometheus-rules
+  # job fails when the comment, the variable and what the image reports
+  # disagree, so a retag or a half-done bump is caught. Bump all three.
+  PROMETHEUS_IMAGE: prom/prometheus@sha256:fa3302279710be2f21a8301ec17a8b4f2301fd829bd113839b3b6b02b6f191a2 # v3.15.1
+  PROMETHEUS_VERSION: "3.15.1"
 
 # Cancel superseded runs on the same ref to save CI minutes.
 concurrency:
@@ -53,11 +62,13 @@ jobs:
       minio: ${{ steps.filter.outputs.minio }}
       postgres: ${{ steps.filter.outputs.postgres }}
       fuzz: ${{ steps.filter.outputs.fuzz }}
+      mutants_gate: ${{ steps.filter.outputs.mutants_gate }}
       chaos: ${{ steps.filter.outputs.chaos }}
       upgrade: ${{ steps.filter.outputs.upgrade }}
       manifest_compat: ${{ steps.filter.outputs.manifest_compat }}
       helm: ${{ steps.filter.outputs.helm }}
       file_source: ${{ steps.filter.outputs.file_source }}
+      prometheus_rules: ${{ steps.filter.outputs.prometheus_rules }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Pinned to a full commit SHA (v3), not the mutable tag, so an upstream
@@ -153,30 +164,74 @@ jobs:
               - 'rust-toolchain*'
               - '.github/workflows/ci.yml'
 
-            # `cargo test -p vtop-state --features postgres,test-support
-            #  --test pg_battery`. Closure is vtop-state + vtop-core.
+            # The PostgreSQL legs (postgres-matrix.yml, #723): the battery
+            # (vtop-state + vtop-core), `vtopctl migrate` (implemented in
+            # vtop-state; vtop-cli only calls it), a restore and the engine's
+            # recovery on PostgreSQL. vtop-cli has no code behind its
+            # `postgres` feature (it only turns on vtop-state's), so its
+            # Cargo.toml and the two test files are what it adds here. Not
+            # vtop-cli's whole closure: that put the legs, each building
+            # vtopctl, on nearly every Rust PR. A change elsewhere in the
+            # closure is tested on every major by the nightly run of
+            # postgres-matrix.yml. That file is not listed: a change to it
+            # runs all five majors through its own pull_request trigger.
             postgres:
               - 'crates/vtop-state/**'
               - 'crates/vtop-core/**'
+              - 'crates/vtop-cli/Cargo.toml'
+              - 'crates/vtop-cli/tests/postgres_migrate_restore.rs'
+              - 'tests/integration_state_recovery.rs'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '.cargo/**'
               - 'rust-toolchain*'
               - '.github/workflows/ci.yml'
 
-            # The fuzz targets (detect_batch, detect_record, manifest_parse)
-            # exercise vtop-core only, and need a pinned nightly toolchain.
+            # The fuzz crate's closure (`cargo tree --manifest-path
+            # fuzz/Cargo.toml -e normal`): every decoder of untrusted bytes
+            # it fuzzes (#729) lives in one of these, and vtop-cli (built
+            # without its kafka feature) pulls in the rest. Only vtop-node is
+            # outside it. It needs a pinned nightly toolchain.
             fuzz:
               - 'fuzz/**'
+              - 'crates/vtop-adapters/**'
+              - 'crates/vtop-broker/**'
+              - 'crates/vtop-cli/**'
               - 'crates/vtop-core/**'
+              - 'crates/vtop-kafka/**'
+              - 'crates/vtop-log/**'
+              - 'crates/vtop-meta/**'
+              - 'crates/vtop-observe/**'
+              - 'crates/vtop-protocol/**'
+              - 'crates/vtop-state/**'
+              - 'crates/vtop-upload/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '.cargo/**'
               - 'rust-toolchain*'
+              - '.github/workflows/ci.yml'
+
+            # The gate script and its test: the gated mutation job runs the
+            # test first, so a change to either must run it even when no
+            # Rust changed.
+            mutants_gate:
+              - 'scripts/mutants-gate.py'
+              - 'scripts/tests/test_mutants_gate.py'
               - '.github/workflows/ci.yml'
 
             dashboards:
               - 'observability/**'
+            # The engine's alert rules (#720): the rules and their promtool
+            # tests, the chart's copy (which must equal them), the runbook page
+            # every runbook_url points into, and the checker with its tests.
+            prometheus_rules:
+              - 'observability/prometheus/**'
+              - 'helm/vtop/files/**'
+              - 'docs/operate/runbooks.md'
+              - 'scripts/check-alert-runbooks.py'
+              - 'scripts/tests/test_check_alert_runbooks.py'
+              - 'scripts/tests/fixtures/alert-runbooks/**'
+              - '.github/workflows/ci.yml'
             benchmarks:
               - 'benchmarks/**'
             # The Kafka-comparison charts and reports: their generators, the
@@ -189,7 +244,13 @@ jobs:
               # measurements they are drawn from, the output, and the README
               # whose prose quotes the same figures.
               - 'benchmarks/readme_charts.py'
+              # The tests this job runs: a change to a test alone must run
+              # it (tests/test_benchmark_charts_job.py checks the list).
               - 'benchmarks/tests/test_readme_charts.py'
+              - 'benchmarks/tests/test_kafka_compare_*.py'
+              - 'benchmarks/tests/test_benchmark_charts_job.py'
+              # The hand-written page that links the generated reports.
+              - 'docs/COMPARISON.md'
               - 'benchmarks/measurements/483-tcp-baseline/**'
               - 'benchmarks/measurements/663-policed-uplink/**'
               - 'docs/assets/readme/**'
@@ -215,6 +276,8 @@ jobs:
               # The smoke script IS the kind job's test (#416): a change to it
               # that did not run it would be judged by shellcheck alone.
               - 'scripts/k8s-smoke.sh'
+              # Its port-forward helpers, sourced by it (#786).
+              - 'scripts/k8s-forward.sh'
               - '.github/workflows/ci.yml'
               # The chart's appVersion has to track the workspace version, and
               # the workspace version can only change HERE. Without this the
@@ -227,6 +290,7 @@ jobs:
               # Executable CI test code (#291), linted like the rest.
               - 'scripts/upgrade-compat.sh'
               - 'scripts/manifest-compat.sh'
+              - 'scripts/ledger-compat.sh'
               # The live-chaos harness is executable shell that gates every
               # distributed-systems claim this project makes, and it was
               # unlinted: a change to lib.sh — sourced by every scenario —
@@ -242,6 +306,7 @@ jobs:
               # against the files it was added for, which is the same
               # unlinted-shell hole the live-chaos entry below exists to close.
               - 'scripts/k8s-smoke.sh'
+              - 'scripts/k8s-forward.sh'
               - 'scripts/e2e-smoke.sh'
               # The traffic collector, for the same reason and by the same
               # mistake: it was added to the shellcheck step without being
@@ -257,11 +322,18 @@ jobs:
               - 'scripts/check-naming.sh'
               - 'scripts/check-egress-claims.sh'
               - 'scripts/naming-denylist.txt'
+              # The check that no shipped build carries the failpoints
+              # feature (#725), listed here and in the shellcheck step.
+              - 'scripts/check-failpoints-absent.sh'
               - 'scripts/tests/**'
               # The test-progress runner: developer tooling, but shell that people
               # will paste and rely on, so it is linted like the rest — listed here
               # AND in the shellcheck step, for the reason the comment above gives.
               - 'scripts/test-progress.sh'
+              # The Kafka broker helper the kafka matrix (#721) starts every
+              # broker with. Its own workflow runs on a change to it; this
+              # entry is the lint.
+              - 'scripts/kafka-broker.sh'
               # The release-notes generator only ever runs during a tag build,
               # where a failure means a published release with a broken body and
               # no second chance to get it right before people see it. Lint it
@@ -343,6 +415,7 @@ jobs:
               - '.cargo/**'
               - 'rust-toolchain*'
               - 'scripts/manifest-compat.sh'
+              - 'scripts/ledger-compat.sh'
               - '.github/workflows/ci.yml'
   build-and-test:
     name: fmt + clippy + test + build
@@ -393,6 +466,12 @@ jobs:
 
       - name: Release build
         run: cargo build --release --bin vtopctl --locked
+
+      # The engine crash sweep's failpoints (#725) kill the process on
+      # request; a release build must not contain them. The sweep's own
+      # build is the positive control (engine-crash-sweep.yml).
+      - name: Release build carries no failpoint
+        run: bash scripts/check-failpoints-absent.sh --binary target/release/vtopctl
 
   docker:
     name: docker image build
@@ -465,7 +544,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Prebuilt cargo-audit binary (fast; no compile).
       - name: Install cargo-audit
-        uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
           tool: cargo-audit
       # Reads .cargo/audit.toml: fails on any advisory NOT documented there,
@@ -488,7 +567,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.3
 
@@ -567,7 +646,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.3
 
@@ -600,6 +679,7 @@ jobs:
           helm lint helm/vtop -f helm/vtop/ci/default-values.yaml
           helm lint helm/vtop -f helm/vtop/ci/separated-values.yaml
           helm lint helm/vtop -f helm/vtop/ci/plaintext-values.yaml
+          helm lint helm/vtop -f helm/vtop/ci/external-secret-values.yaml
 
       # The plaintext shape (#294): every plane without TLS renders WITHOUT a
       # Secret, as the node's spelled-out any-interface form, and never a tls
@@ -659,6 +739,75 @@ jobs:
           manifests=$(grep -c '^kind:' /tmp/rendered.yaml)
           echo "rendered $manifests manifests"
           test "$manifests" -ge 5
+
+      # A secret file from an external manager (#733) goes in through
+      # extraVolumes as a whole Secret volume at defaultMode 0400 (256), which
+      # the kubelet makes 0440 under the chart's fsGroup: the form the archive
+      # engine accepts. Asserted on the rendered pod, so the documented
+      # example cannot drift from what the chart does with it.
+      - name: An external secret renders as a whole volume at 0400
+        run: |
+          set -euo pipefail
+          helm template vtop helm/vtop -f helm/vtop/ci/external-secret-values.yaml > /tmp/external.yaml
+          # toYaml sorts the keys: defaultMode comes before secretName.
+          grep -A3 'name: external-secret$' /tmp/external.yaml | grep -q 'secretName: vtop-external-secret'
+          grep -B2 -A2 'secretName: vtop-external-secret' /tmp/external.yaml | grep -q 'defaultMode: 256'
+          grep -B1 -A2 'mountPath: /etc/vtop/external' /tmp/external.yaml | grep -q 'readOnly: true'
+          grep -q 'fsGroup: 10001' /tmp/external.yaml
+          if grep -q 'subPath' /tmp/external.yaml; then
+            echo "the external secret must be mounted whole, never with subPath" >&2
+            exit 1
+          fi
+          echo "external secret mounted whole at 0400 with fsGroup 10001"
+
+      # The engine's alert rules as a PrometheusRule (#720): off by default,
+      # refused like the ServiceMonitor where the Operator's CRDs are absent,
+      # and when on, its spec is helm/vtop/files/vtop-rules.yaml verbatim (the
+      # prometheus-rules job proves that copy equals the rules file and that
+      # every runbook link in it resolves), valid to promtool, with
+      # runbookBaseUrl moving every runbook link and keeping its #section.
+      - name: The PrometheusRule serves the shipped rules, and only when asked
+        run: |
+          set -euo pipefail
+          values=helm/vtop/ci/default-values.yaml
+          if helm template vtop helm/vtop -f "$values" | grep -q '^kind: PrometheusRule'; then
+            echo "::error::a PrometheusRule rendered with metrics.prometheusRule.enabled unset; it must be opt-in"
+            exit 1
+          fi
+          if output=$(helm template vtop helm/vtop -f "$values" --set metrics.prometheusRule.enabled=true 2>&1); then
+            echo "::error::the PrometheusRule rendered without monitoring.coreos.com/v1; it must refuse as the ServiceMonitor does"
+            exit 1
+          fi
+          printf '%s' "$output" | grep -qF 'does not expose monitoring.coreos.com/v1' \
+            || { echo "::error::refused without the CRDs, but not with the CRD message"; printf '%s\n' "$output" | tail -5; exit 1; }
+          helm template vtop helm/vtop -f "$values" --set metrics.prometheusRule.enabled=true \
+            --api-versions monitoring.coreos.com/v1 > /tmp/prometheusrule.yaml
+          python3 - /tmp/prometheusrule.yaml helm/vtop/files/vtop-rules.yaml /tmp/prometheusrule-groups.yaml <<'PYEOF'
+          import sys
+          docs = [d for d in open(sys.argv[1]).read().split('\n---\n') if d.strip()]
+          rules = [d for d in docs if '\nkind: PrometheusRule\n' in '\n' + d + '\n']
+          assert len(rules) == 1, f'expected one PrometheusRule, rendered {len(rules)}'
+          body = rules[0].split('\nspec:\n', 1)[1].split('\n')
+          assert all(not line.strip() or line.startswith('  ') for line in body), 'spec is not indented under spec:'
+          spec = '\n'.join(line[2:] for line in body).strip('\n')
+          shipped = open(sys.argv[2]).read().strip('\n')
+          assert spec == shipped, 'the PrometheusRule spec is not helm/vtop/files/vtop-rules.yaml verbatim'
+          open(sys.argv[3], 'w').write(spec + '\n')
+          print(f'the PrometheusRule spec is the shipped rules file ({len(spec.splitlines())} lines)')
+          PYEOF
+          docker run --rm --network none -v /tmp/prometheusrule-groups.yaml:/rules/vtop-rules.yaml:ro \
+            --entrypoint promtool "$PROMETHEUS_IMAGE" check rules /rules/vtop-rules.yaml
+          helm template vtop helm/vtop -f "$values" --set metrics.prometheusRule.enabled=true \
+            --set metrics.prometheusRule.runbookBaseUrl=https://runbooks.example.internal/vtop/ \
+            --api-versions monitoring.coreos.com/v1 > /tmp/prometheusrule-base.yaml
+          shipped=$(grep -c 'runbook_url: "https://allamiro.github.io/vtop-engine/operate/runbooks/#' helm/vtop/files/vtop-rules.yaml)
+          moved=$(grep -c 'runbook_url: "https://runbooks.example.internal/vtop/#' /tmp/prometheusrule-base.yaml)
+          if [ "$shipped" -eq 0 ] || [ "$moved" -ne "$shipped" ] \
+            || grep -q 'allamiro.github.io/vtop-engine/operate/runbooks' /tmp/prometheusrule-base.yaml; then
+            echo "::error::runbookBaseUrl moved $moved of $shipped runbook links (or left one on the default page)"
+            exit 1
+          fi
+          echo "runbookBaseUrl moved all $moved runbook links, each keeping its section"
 
       # Stdlib only, deliberately. A YAML library would have to be installed,
       # and an install step that quietly fails leaves a check that no longer
@@ -1126,10 +1275,12 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/mnt" -w /mnt \
             koalaman/shellcheck:v0.11.0 docker/*.sh scripts/release-notes.sh \
-            scripts/k8s-smoke.sh scripts/e2e-smoke.sh scripts/upgrade-compat.sh \
-            scripts/manifest-compat.sh \
+            scripts/k8s-smoke.sh scripts/k8s-forward.sh scripts/e2e-smoke.sh \
+            scripts/upgrade-compat.sh \
+            scripts/manifest-compat.sh scripts/ledger-compat.sh \
             scripts/traffic-snapshot.sh scripts/test-progress.sh \
             scripts/check-naming.sh scripts/check-egress-claims.sh \
+            scripts/check-failpoints-absent.sh scripts/kafka-broker.sh \
             scripts/s3-lab.sh docker/s3-servers/init/bootstrap.sh
 
       # `-P scripts/live-chaos/scenarios` resolves the scenarios' dynamic
@@ -1143,7 +1294,8 @@ jobs:
             scripts/live-chaos/lib.sh \
             scripts/live-chaos/run-all.sh \
             scripts/live-chaos/gen-certs.sh \
-            scripts/live-chaos/scenarios/*.sh
+            scripts/live-chaos/scenarios/*.sh \
+            scripts/live-chaos/engine/*.sh
 
       - name: bats
         run: |
@@ -1157,7 +1309,7 @@ jobs:
   # capable of failing by scripts/tests/naming-and-claims.bats in the shell
   # job; this job is the enforcement itself.
   claims:
-    name: naming + substantiation
+    name: naming + substantiation + format registry
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -1168,6 +1320,21 @@ jobs:
 
       - name: substantiation lint (every measurement row carries its conditions)
         run: bash scripts/check-egress-claims.sh
+
+      # The format registry (#743): every magic and version constant in the
+      # sources has an entry in scripts/compat/formats.yaml with the value
+      # written there, and the inventory on docs/reference/compatibility.md
+      # is what the registry generates. A version bump, a new magic, feature
+      # level or command kind therefore always edits the reviewed registry.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install the pinned PyYAML
+        run: python -m pip install --disable-pip-version-check --require-hashes -r scripts/compat/requirements.txt
+      - name: the registry check can fail for each drift it exists to catch
+        run: python -m unittest discover -s scripts/compat/tests -p 'test_format_registry.py' -v
+      - name: format registry (every magic and version constant has an entry)
+        run: python scripts/check-format-registry.py
 
   # Kafka was entirely untested in CI, which is how a P0 shipped: every read
   # returned zero records (a subscribe() per read forced a rebalance that
@@ -1261,6 +1428,18 @@ jobs:
         env:
           VTOP_TEST_KAFKA: localhost:9092
         run: cargo test -p vtop-cli --test integration_kafka_to_minio -- --ignored
+
+  # The same live-broker tests on the oldest Kafka release the docs declare
+  # supported (#721, docs/install/kafka.md). The job above stays the newest
+  # line's check; kafka-matrix.yml runs every pinned release nightly. Its
+  # check is named `kafka matrix / kafka integration (3.7.2)`.
+  kafka-matrix:
+    name: kafka matrix
+    needs: changes
+    if: needs.changes.outputs.kafka == 'true'
+    uses: ./.github/workflows/kafka-matrix.yml
+    with:
+      brokers: '["3.7.2"]'
 
   # The S3 compatibility matrix (#722): the live S3 tests, built once, run
   # against each server in docker/s3-servers/ with its capability file
@@ -1422,7 +1601,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
           tool: cargo-deny
       - run: cargo deny check
@@ -1674,12 +1853,25 @@ jobs:
           key: ${{ runner.os }}-manifest-compat-${{ hashFiles('**/Cargo.lock') }}
       # v0.7.0, the last release before the 0.4 reader, and the newest patch
       # of every minor series from v0.8.0, DERIVED from the tags so a new
-      # release joins the day its tag exists. Finals only, as upgrade-compat.
+      # release joins the day its assets are published. Finals only, as
+      # upgrade-compat. Only tags with a published GitHub release count: a
+      # release tag is pushed right after its bump merges, and main's CI on
+      # that merge starts while release.yml is still building the assets
+      # (about 35 minutes), so the newest patch falls back to the previous
+      # one of its series until it is published (v0.10.1 failed main with
+      # "release not found" this way).
       - name: Select the released readers
         id: tags
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          published="$(gh release list --limit 200 --exclude-drafts --json tagName --jq '.[].tagName')"
+          for t in $(git tag --list 'v[0-9]*'); do
+            grep -qx "$t" <<< "$published" || echo "::notice::$t has no published release yet; its series uses the previous patch"
+          done
           tags="$(git tag --list 'v[0-9]*' --sort=version:refname \
+            | grep -Fx -f <(printf '%s\n' "$published") \
             | awk -F. '/^v[0-9]+\.[0-9]+\.[0-9]+$/ { latest[$1 "." $2] = $0 } END { for (m in latest) print latest[m] }' \
             | sort -V \
             | awk -F. '{ maj = substr($1, 2) + 0; min = $2 + 0; if (maj > 0 || min >= 7) print }' \
@@ -1718,12 +1910,26 @@ jobs:
               scripts/manifest-compat.sh target/debug/vtopctl "$tag" \
                 "released/$tag/vtop-engine-$v-x86_64-unknown-linux-gnu/vtopctl" "$expect"
           done
+      # The previous release (N-1, the only one that may share a ledger with
+      # HEAD, #743) on a SQLite ledger HEAD opened, wrote and pruned (#626):
+      # it must keep archiving and auditing. A release before v0.10.0 ignores
+      # the sealed_at column and the digests' sealed_at; one from v0.10.0 on
+      # writes it too (#755). The release binaries have no `postgres`
+      # feature, so the PostgreSQL half runs where one is built from the tag.
+      - name: The previous release keeps working on a ledger HEAD opened
+        run: |
+          set -euo pipefail
+          tag="$(printf '%s\n' ${{ steps.tags.outputs.list }} | sort -V | tail -n 1)"
+          v="${tag#v}"
+          LEDGER_COMPAT_KEEP=1 LEDGER_COMPAT_WORKDIR="$GITHUB_WORKSPACE/manifest-compat-ledger-$tag" \
+            scripts/ledger-compat.sh target/debug/vtopctl "$tag" \
+              "released/$tag/vtop-engine-$v-x86_64-unknown-linux-gnu/vtopctl"
       - name: Upload the logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: manifest-compat-logs
-          path: manifest-compat-v*/logs
+          path: manifest-compat-*/logs
           if-no-files-found: ignore
           retention-days: 7
 
@@ -1817,7 +2023,7 @@ jobs:
         with:
           toolchain: stable
           components: llvm-tools-preview
-      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
           tool: cargo-llvm-cov
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -1941,17 +2147,17 @@ jobs:
         if: failure()
         run: docker compose logs --tail=100 vtop-engine 2>/dev/null || echo "stack already torn down; see the smoke output above"
 
-  # Fuzzing (issue #25): detect.rs and manifest deserialization both parse
-  # UNTRUSTED bytes, so they must never panic. This is a bounded SMOKE run - a
-  # short campaign from the committed seed corpus that fails the build if any
-  # target crashes. It is not a substitute for long out-of-band fuzzing, but it
-  # catches regressions on every PR. cargo-fuzz needs nightly + libFuzzer.
+  # Fuzzing (issues #25, #729): every decoder of untrusted bytes must never
+  # panic. This is a bounded SMOKE run - a short campaign per target from the
+  # committed seed corpus that fails the build if any target crashes. The
+  # long campaigns, with a corpus that persists between nights, are
+  # .github/workflows/fuzz-nightly.yml. cargo-fuzz needs nightly + libFuzzer.
   fuzz:
-    name: fuzz smoke (detect + manifest)
+    name: fuzz smoke (every target)
     needs: changes
     if: needs.changes.outputs.fuzz == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -1959,13 +2165,14 @@ jobs:
           # Pinned: the floating "nightly" channel broke on 2026-07-24 with an
           # ICE compiling tokio under ASAN (rustc 89c61a754). Pin the last
           # known-good nightly; bump deliberately when a newer one is verified.
+          # fuzz-nightly.yml pins the same one.
           toolchain: nightly-2026-07-22
           # ASAN (which libFuzzer builds with) is incompatible with a statically
           # linked libc, so the fuzz build must target the GNU (dynamic-libc)
           # triple explicitly - otherwise a musl default fails with
           # "sanitizer is incompatible with statically linked libc".
           targets: x86_64-unknown-linux-gnu
-      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
           tool: cargo-fuzz
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -1975,18 +2182,160 @@ jobs:
             ~/.cargo/git
             fuzz/target
           key: ${{ runner.os }}-fuzz-${{ hashFiles('**/Cargo.lock', 'fuzz/Cargo.toml') }}
-      - name: Smoke-fuzz each target (fails on any crash)
+      # The fuzz crate is its own workspace with no committed lockfile.
+      # Starting it from the workspace's lockfile builds the same, audited
+      # versions the engine ships, rather than whatever resolves today.
+      - name: Seed the fuzz lockfile from the workspace
+        run: cp Cargo.lock fuzz/Cargo.lock
+      # The list comes from the crate, not from this file, so a target added
+      # to fuzz/Cargo.toml is fuzzed here and nightly without a workflow edit.
+      - name: List the targets
+        id: targets
         run: |
-          for t in detect_record detect_batch manifest_parse; do
-            echo "::group::fuzz $t"
-            cargo +nightly-2026-07-22 fuzz run "$t" --target x86_64-unknown-linux-gnu -- \
-              -max_total_time=60 -print_final_stats=1
+          targets=$(cargo +nightly-2026-07-22 fuzz list | tr '\n' ' ')
+          echo "targets: $targets"
+          test -n "$targets"
+          echo "list=$targets" >> "$GITHUB_OUTPUT"
+      - name: Build every target
+        run: cargo +nightly-2026-07-22 fuzz build --target x86_64-unknown-linux-gnu
+      # Each committed seed is decoded once (-runs=0 runs the corpus and
+      # stops), so a seed that panics names itself before the campaign.
+      - name: Replay every committed seed
+        env:
+          TARGETS: ${{ steps.targets.outputs.list }}
+        run: |
+          for t in $TARGETS; do
+            echo "::group::seeds $t"
+            cargo +nightly-2026-07-22 fuzz run "$t" --target x86_64-unknown-linux-gnu -- -runs=0
             echo "::endgroup::"
           done
+      # 30 s per target. The filter puts this job on most Rust PRs, and at
+      # 60 s the eleven targets alone took 11 of its 19 minutes. A PR smoke
+      # catches a decoder that panics on inputs near the seeds, which shows
+      # in seconds; the deep search is the nightly's hour per target.
+      - name: Smoke-fuzz each target (fails on any crash)
+        env:
+          TARGETS: ${{ steps.targets.outputs.list }}
+        run: |
+          for t in $TARGETS; do
+            echo "::group::fuzz $t"
+            cargo +nightly-2026-07-22 fuzz run "$t" --target x86_64-unknown-linux-gnu -- \
+              -max_total_time=30 -print_final_stats=1
+            echo "::endgroup::"
+          done
+      - name: Upload crash inputs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-smoke-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
 
-  # Mutation testing (issue #25): measure whether the suite actually catches
-  # injected faults. REPORT ONLY - never gates the build (continue-on-error) -
-  # and scoped to the highest-value modules so a run finishes in CI time.
+  # The group-commit coordinator's model test (#752). The coordinator hands
+  # the lead from one waiting producer thread to the next over a Mutex and
+  # Condvars; a lost wake-up there hangs every producer on the range, and a
+  # stress test only finds one by luck. loom explores every interleaving of a
+  # small model instead. `vtop_loom`, not `loom`: a plain `--cfg loom` turns
+  # on tokio's own loom paths and the tree no longer builds.
+  loom:
+    name: loom model (group commit)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-loom-${{ hashFiles('**/Cargo.lock') }}
+      - name: Explore the coordinator's interleavings
+        env:
+          RUSTFLAGS: --cfg vtop_loom
+        run: cargo test -p vtop-broker --lib --release --locked loom_model
+
+  # Mutation testing on the commit path (#729): GATED. A mutant of the
+  # state machine (`transition`, `can_transition`, `is_committable`) or of
+  # replay that the tests do not catch is a way to reach SOURCE_COMMITTED
+  # before VERIFIED that nothing would notice, so the build fails when the
+  # score drops below MUTANTS_MIN_SCORE. scripts/mutants-gate.py computes
+  # caught / (caught + missed + timeout) from mutants.out/outcomes.json
+  # (unviable mutants do not compile and are left out, as cargo-mutants
+  # leaves them out), names every survivor, and refuses a run that is not
+  # evidence (failed baseline, no viable mutant, a file with none).
+  mutants-gate:
+    name: mutation testing (commit path)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.mutants_gate == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # The maintainer's rule (#729): a gate is the measured score minus 5
+      # points, never below 0.80. These two files measured 22 of 22 (1.00),
+      # but stay at 0.90 until the nightly runs show no flaky timeouts: a
+      # mutant that times out on a loaded runner counts against the score,
+      # and at 1.00 one would fail an unrelated PR. Then this goes to 1.00.
+      MUTANTS_MIN_SCORE: "0.90"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      # The gate is only as good as its arithmetic: prove it on crafted
+      # outcomes (pass, fail, unviable excluded, timeouts counted, empty and
+      # failed-baseline runs refused) before trusting it with a real one.
+      - name: Test the gate script
+        run: python3 -m unittest discover -s scripts/tests -p 'test_mutants_gate.py' -v
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+        with:
+          tool: cargo-mutants
+      - name: Install librdkafka build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang libssl-dev libsasl2-dev libcurl4-openssl-dev zlib1g-dev pkg-config
+      # cargo-mutants exits non-zero when a mutant survives; the gate script,
+      # not that exit code, decides, so the run's result is kept for it.
+      - name: Run cargo-mutants on the commit path
+        run: |
+          cargo mutants --package vtop-core \
+            --file 'crates/vtop-core/src/state_machine.rs' \
+            --file 'crates/vtop-core/src/replay.rs' \
+            --timeout 120 --no-shuffle | tee /tmp/mutants.txt || true
+      - name: Gate on the mutation score
+        run: |
+          python3 scripts/mutants-gate.py \
+            --outcomes mutants.out/outcomes.json \
+            --min-score "$MUTANTS_MIN_SCORE" \
+            --expect-file crates/vtop-core/src/state_machine.rs \
+            --expect-file crates/vtop-core/src/replay.rs \
+            --title 'Mutation testing (commit path, gated)' \
+            --summary "$GITHUB_STEP_SUMMARY"
+      - name: Upload the outcomes
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mutants-commit-path
+          path: |
+            mutants.out/outcomes.json
+            mutants.out/missed.txt
+            mutants.out/timeout.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # Mutation testing (issue #25): REPORT ONLY - never gates the build
+  # (continue-on-error) - for the classifier and the batcher, which are not
+  # on the commit path. The commit-path files moved to the gated job above.
   mutants:
     name: mutation testing (report only)
     needs: changes
@@ -1999,7 +2348,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
-      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
           tool: cargo-mutants
       - name: Install librdkafka build dependencies
@@ -2011,7 +2360,6 @@ jobs:
         run: |
           cargo mutants --package vtop-core \
             --file 'crates/vtop-core/src/detect.rs' \
-            --file 'crates/vtop-core/src/state_machine.rs' \
             --file 'crates/vtop-core/src/batch.rs' \
             --timeout 120 --no-shuffle | tee /tmp/mutants.txt || true
       - name: Publish summary
@@ -2029,6 +2377,69 @@ jobs:
   # or the e2e lab. This job lints the generators, re-runs them and fails if the
   # committed JSON is stale (the exact drift that shipped once), and checks the
   # JSON parses. Seconds, not tens of minutes.
+  # The engine's alert rules (#720). promtool runs from the pinned image with
+  # the rules mounted read-only and no network; the checker proves every alert
+  # has a runbook section its link resolves to, and a firing and a quiet test.
+  prometheus-rules:
+    name: prometheus rules (promtool + runbooks)
+    needs: changes
+    if: needs.changes.outputs.prometheus_rules == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      # A digest pin stops the image moving under us, but a pin bumped
+      # halfway (a new digest under the old comment) or a registry that no
+      # longer serves the digest would otherwise only show as a confusing
+      # failure later. Check the pin itself first.
+      - name: The pinned promtool image exists and is the version its pin names
+        run: |
+          set -euo pipefail
+          comment=$(sed -n 's/^  PROMETHEUS_IMAGE: [^ ]* # v\([0-9][^ ]*\)$/\1/p' .github/workflows/ci.yml)
+          if [ "$comment" != "$PROMETHEUS_VERSION" ]; then
+            echo "::error::the PROMETHEUS_IMAGE pin comment names v$comment but PROMETHEUS_VERSION is $PROMETHEUS_VERSION; bump them together"
+            exit 1
+          fi
+          docker pull --quiet "$PROMETHEUS_IMAGE" \
+            || { echo "::error::$PROMETHEUS_IMAGE could not be pulled; the registry no longer serves the pinned digest"; exit 1; }
+          reported=$(docker run --rm --network none --entrypoint promtool "$PROMETHEUS_IMAGE" --version \
+            | sed -n 's/^promtool, version \([^ ]*\) .*/\1/p')
+          if [ "$reported" != "$PROMETHEUS_VERSION" ]; then
+            echo "::error::the pinned image reports promtool '$reported', but the pin names $PROMETHEUS_VERSION"
+            exit 1
+          fi
+          echo "pinned promtool is $reported"
+
+      - name: The chart's copy of the rules is the rules file
+        run: |
+          if ! diff -u observability/prometheus/vtop-rules.yaml helm/vtop/files/vtop-rules.yaml; then
+            echo "::error::helm/vtop/files/vtop-rules.yaml differs from observability/prometheus/vtop-rules.yaml (diff above). Edit the rules file, then copy it: cp observability/prometheus/vtop-rules.yaml helm/vtop/files/vtop-rules.yaml"
+            exit 1
+          fi
+
+      - name: promtool check rules
+        run: |
+          docker run --rm --network none -v "$PWD/observability/prometheus:/rules:ro" -w /rules \
+            --entrypoint promtool "$PROMETHEUS_IMAGE" check rules vtop-rules.yaml
+
+      - name: promtool test rules
+        run: |
+          docker run --rm --network none -v "$PWD/observability/prometheus:/rules:ro" -w /rules \
+            --entrypoint promtool "$PROMETHEUS_IMAGE" test rules tests/vtop-rules.test.yaml
+
+      - name: Install the runbook checker's dependency (hash-pinned)
+        run: python -m pip install --disable-pip-version-check --require-hashes -r observability/prometheus/requirements.txt
+
+      - name: The runbook checker can fail
+        run: python -m unittest discover -s scripts/tests -p 'test_check_alert_runbooks.py' -v
+
+      - name: Every alert has a runbook section, a working link and both unit tests
+        run: python scripts/check-alert-runbooks.py
+
   dashboards:
     name: dashboards (generators + no drift)
     needs: changes
@@ -2081,8 +2492,8 @@ jobs:
   # arm64, Linux arm64 and Linux x86_64, different files). regenerate.py puts
   # back the committed bytes of a PNG whose decoded pixels, size, mode and
   # metadata are unchanged, so `git diff` sees a PNG only when it looks
-  # different. The plotting stack is pinned exactly in requirements-report.txt
-  # and regenerate.py refuses any other, and refuses a DejaVu Sans from outside
+  # different. The plotting stack is pinned exactly, with hashes, in
+  # requirements-report.txt and regenerate.py refuses any other, and refuses a DejaVu Sans from outside
   # matplotlib's own bundled copy.
   benchmark-charts:
     name: benchmark charts (regenerate + no drift)
@@ -2092,16 +2503,34 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # The patch version is pinned: a floating "3.12" moves with the runner
+      # image, and the charts are checked byte for byte.
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.12"
+          python-version: "3.12.16"
+      # Hash-checked, as docs/requirements.txt is: pip refuses a file whose
+      # hash is not in the lock. The test runner has its own lock, compiled
+      # against the plotting stack's, so the stack's lock stays the stack.
       - name: Install the pinned plotting stack
-        run: pip install --disable-pip-version-check -r benchmarks/kafka_compare/requirements-report.txt pytest==9.2.0
-      # The benchmarks job runs without matplotlib, so the report tests that
-      # need it skip there; here they run.
+        run: |
+          pip install --disable-pip-version-check --require-hashes -r benchmarks/kafka_compare/requirements-report.txt
+          pip install --disable-pip-version-check --require-hashes -r benchmarks/kafka_compare/requirements-report-test.txt
+      # The benchmarks job runs without matplotlib or Pillow, so every test
+      # file that needs them skips there and runs here;
+      # tests/test_benchmark_charts_job.py fails when one is missing below.
+      # That check reads this file as text, so the run checks too: a test
+      # that skipped here for want of matplotlib or Pillow fails the job.
       - name: Report and drift-check tests, with matplotlib
         working-directory: benchmarks
-        run: python -m pytest tests/test_kafka_compare_report.py tests/test_kafka_compare_regenerate.py tests/test_readme_charts.py
+        # A step with no `shell:` runs as `bash -e {0}`, without pipefail:
+        # without this line the pipe into tee would hide a failing test.
+        run: |
+          set -o pipefail
+          python -m pytest -rs tests/test_kafka_compare_report.py tests/test_kafka_compare_regenerate.py tests/test_kafka_compare_failover.py tests/test_kafka_compare_footer.py tests/test_kafka_compare_colours.py tests/test_readme_charts.py tests/test_benchmark_charts_job.py | tee "$RUNNER_TEMP/chart-tests.log"
+          if grep -E "SKIPPED.*(matplotlib|PIL)" "$RUNNER_TEMP/chart-tests.log"; then
+            echo "::error::A chart test skipped for want of matplotlib or Pillow, in the one job that installs them."
+            exit 1
+          fi
       - name: Regenerate every chart and report and fail on drift
         run: |
           python3 benchmarks/kafka_compare/regenerate.py
@@ -2110,7 +2539,7 @@ jobs:
           # ignore the untracked file and pass.
           drift="$(git status --porcelain -- docs/benchmarks/)"
           if [ -n "$drift" ]; then
-            echo "::error::Committed benchmark charts or reports differ from what the committed CSVs produce. Run 'python3 -m pip install -r benchmarks/kafka_compare/requirements-report.txt && python3 benchmarks/kafka_compare/regenerate.py' and commit the result."
+            echo "::error::Committed benchmark charts or reports differ from what the committed CSVs produce. Run 'python3 -m pip install --require-hashes -r benchmarks/kafka_compare/requirements-report.txt && python3 benchmarks/kafka_compare/regenerate.py' and commit the result."
             echo "$drift"
             git diff --stat -- docs/benchmarks/
             exit 1
@@ -2120,53 +2549,110 @@ jobs:
           python3 benchmarks/readme_charts.py
           drift="$(git status --porcelain -- docs/assets/readme/)"
           if [ -n "$drift" ]; then
-            echo "::error::The README's charts differ from what the committed measurements produce. Run 'python3 -m pip install -r benchmarks/kafka_compare/requirements-report.txt && python3 benchmarks/readme_charts.py' and commit the result."
+            echo "::error::The README's charts differ from what the committed measurements produce. Run 'python3 -m pip install --require-hashes -r benchmarks/kafka_compare/requirements-report.txt && python3 benchmarks/readme_charts.py' and commit the result."
             echo "$drift"
             exit 1
           fi
 
   # The Postgres backend (Phase 3) must pass the SAME behavioural battery as
-  # SQLite, and its DB-level invariant trigger must reject a bypass. Runs against
-  # a real Postgres service. Gated on rust changes like the other Rust jobs.
+  # SQLite, and its DB-level invariant trigger must reject a bypass, with
+  # `vtopctl migrate`, a ledger restore and the engine's recovery (#723).
+  # The jobs and the pinned images live in postgres-matrix.yml, which also
+  # runs all five supported majors nightly. Here, on a change the `postgres`
+  # filter matches, it runs the oldest and the newest: their checks are
+  # named `postgres / postgres backend (battery) (pg 14)` and `(pg 18)`.
   postgres:
-    name: postgres backend (battery)
+    name: postgres
+    needs: changes
+    if: needs.changes.outputs.postgres == 'true'
+    uses: ./.github/workflows/postgres-matrix.yml
+    with:
+      majors: '["14","18"]'
+
+  # #723, opt-in: the same tests against a managed PostgreSQL service (RDS,
+  # Cloud SQL, ...). It needs a throwaway instance and repository secrets,
+  # which a maintainer sets up (docs/POSTGRES_DEPLOYMENT.md, "Managed-service
+  # smoke test"); without them the job reports that it skipped and passes. A
+  # fork's pull request never sees secrets, so it always skips there. The
+  # `secrets` context cannot gate a job, so the first step reads the secret
+  # and every later step is gated on its output.
+  postgres-managed:
+    name: postgres managed smoke (opt-in)
     needs: changes
     if: needs.changes.outputs.postgres == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: vtop
-          POSTGRES_PASSWORD: vtop
-          POSTGRES_DB: vtop
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U vtop"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
+    timeout-minutes: 30
+    # Every run, from every branch, shares the one managed instance and the
+    # fixed `vtop_test_*` databases and roles, and the workflow's concurrency
+    # group is per ref. One at a time across the repository; a run waits
+    # rather than cancel another's half-done restore.
+    #
+    # GitHub keeps one PENDING job per concurrency group and cancels the older
+    # pending one when a third arrives, whatever cancel-in-progress says, so a
+    # shared group cancels (and reddens) other PRs' runs while two or more
+    # wait. When no managed database is configured the job does nothing, so
+    # it then gets a group of its own per run and never queues. The client
+    # image variable is required whenever the smoke is enabled (the gate step
+    # refuses without it), and unlike a secret, `vars` may name a group.
+    concurrency:
+      group: ${{ vars.VTOP_MANAGED_POSTGRES_CLIENT_IMAGE != '' && 'postgres-managed-smoke' || format('postgres-managed-smoke-off-{0}-{1}', github.run_id, github.run_attempt) }}
+      cancel-in-progress: false
+    env:
+      VTOP_TEST_POSTGRES: ${{ secrets.VTOP_MANAGED_POSTGRES_URL }}
+      VTOP_TEST_POSTGRES_RUNTIME: ${{ secrets.VTOP_MANAGED_POSTGRES_RUNTIME_URL }}
+      CLIENT_IMAGE: ${{ vars.VTOP_MANAGED_POSTGRES_CLIENT_IMAGE }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+      - name: Is a managed database configured?
+        id: gate
+        run: |
+          if [ -z "$VTOP_TEST_POSTGRES" ]; then
+            echo "::notice title=postgres managed smoke skipped::No VTOP_MANAGED_POSTGRES_URL secret, so nothing ran against a managed service. See docs/POSTGRES_DEPLOYMENT.md, 'Managed-service smoke test'."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          missing=""
+          [ -n "$VTOP_TEST_POSTGRES_RUNTIME" ] || missing="$missing secret:VTOP_MANAGED_POSTGRES_RUNTIME_URL"
+          [ -n "$CLIENT_IMAGE" ] || missing="$missing variable:VTOP_MANAGED_POSTGRES_CLIENT_IMAGE"
+          if [ -n "$missing" ]; then
+            echo "::error::VTOP_MANAGED_POSTGRES_URL is set, but the managed smoke also needs:$missing. Nothing was run. See docs/POSTGRES_DEPLOYMENT.md, 'Managed-service smoke test'."
+            exit 1
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+      - if: steps.gate.outputs.enabled == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - if: steps.gate.outputs.enabled == 'true'
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - if: steps.gate.outputs.enabled == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
           key: ${{ runner.os }}-pg-${{ hashFiles('**/Cargo.lock') }}
-      # vtop-state depends only on vtop-core (no librdkafka), so no system deps.
-      - name: Run the Postgres StateStore battery
+      # A private CA (RDS, Cloud SQL) for `sslmode=verify-full`: the URLs
+      # name this path in `sslrootcert`, and the client container sees the
+      # file at the same path.
+      - name: Write the database CA
+        if: steps.gate.outputs.enabled == 'true'
         env:
-          VTOP_TEST_POSTGRES: postgres://vtop:vtop@localhost:5432/vtop
-          VTOP_TEST_POSTGRES_RUNTIME: postgres://vtop_runtime_test:vtop-runtime-test@localhost:5432/vtop
+          CA: ${{ secrets.VTOP_MANAGED_POSTGRES_CA }}
+        run: printf '%s\n' "$CA" > /tmp/vtop-managed-postgres-ca.pem
+      - name: Run the Postgres StateStore battery
+        if: steps.gate.outputs.enabled == 'true'
         run: cargo test -p vtop-state --features postgres,test-support --test pg_battery
-      # No database involved: a socket that accepts and never answers must fail
-      # the connect within its bound instead of hanging startup (#556).
-      - name: Postgres connect is bounded
-        run: cargo test -p vtop-state --features postgres --test connect_deadline
+      - name: vtopctl migrate twice, and a restore into a migrated schema
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          export VTOP_TEST_PG_EXEC="docker run --rm -i --network host -v /tmp/vtop-managed-postgres-ca.pem:/tmp/vtop-managed-postgres-ca.pem:ro $CLIENT_IMAGE"
+          cargo test -p vtop-cli --no-default-features --features postgres --test postgres_migrate_restore
+      - name: Engine recovery on PostgreSQL
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          set -o pipefail
+          cargo test -p vtop-cli --no-default-features --features postgres \
+            --test integration_state_recovery -- --exact \
+            on_postgres_a_recovered_commit_is_counted_by_its_stored_class 2>&1 | tee recovery.log
+          grep -q 'test result: ok. 1 passed' recovery.log

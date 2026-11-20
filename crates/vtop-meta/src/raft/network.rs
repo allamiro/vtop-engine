@@ -302,6 +302,67 @@ impl TlsRaftNetworkFactory {
     }
 }
 
+impl TlsRaftNetworkFactory {
+    /// How this node asks the other metadata members what they run (#706):
+    /// over the same peer plane, with the same identity and directory, as
+    /// its Raft RPCs.
+    pub fn member_probe(&self) -> Arc<dyn crate::raft::consensus::MemberVersionProbe> {
+        Arc::new(PeerMemberProbe {
+            directory: self.directory.clone(),
+            material: self.material.clone(),
+            source: self.source,
+        })
+    }
+}
+
+/// [`crate::raft::consensus::MemberVersionProbe`] over the peer plane.
+struct PeerMemberProbe {
+    directory: PeerDirectory,
+    material: Option<Arc<TlsMaterialOwned>>,
+    source: NodeId,
+}
+
+#[async_trait]
+impl crate::raft::consensus::MemberVersionProbe for PeerMemberProbe {
+    async fn ask(&self, member: MetaNodeId) -> crate::versions::MemberVersion {
+        use crate::transport::peer::VersionAskError;
+        use crate::transport::wire::PeerVersionRequest;
+        use crate::versions::MemberVersion;
+        let Some(endpoint) = self.directory.get(member.0) else {
+            // A name that has not resolved yet: look again for next time,
+            // and say so now.
+            let directory = self.directory.clone();
+            tokio::spawn(async move { directory.re_resolve(member.0).await });
+            return MemberVersion::Unreachable("no peer address in the directory".to_owned());
+        };
+        let client = match &self.material {
+            Some(material) => {
+                match PeerClient::new(material.to_material(), endpoint.server_name, member) {
+                    Ok(client) => client,
+                    Err(error) => return MemberVersion::Unreachable(error.to_string()),
+                }
+            }
+            None => PeerClient::plaintext(endpoint.server_name, member),
+        };
+        let request = PeerVersionRequest {
+            from: MetaNodeId(self.source),
+        };
+        match client.version(endpoint.addr, &request).await {
+            Ok(answer) => MemberVersion::Reported {
+                node_id: answer.node_id,
+                release: answer.release,
+                supported_feature_level: answer.supported_feature_level,
+            },
+            Err(VersionAskError::NoAnswer) => MemberVersion::NoAnswer,
+            Err(VersionAskError::Unreachable(error)) => {
+                let directory = self.directory.clone();
+                tokio::spawn(async move { directory.re_resolve(member.0).await });
+                MemberVersion::Unreachable(error.to_string())
+            }
+        }
+    }
+}
+
 impl RaftNetworkFactory<MetaRaftTypeConfig> for TlsRaftNetworkFactory {
     type Network = TlsRaftNetwork;
 
@@ -885,5 +946,70 @@ mod tests {
             endpoint(9300),
             "a name that stopped answering must not cost us the address that did"
         );
+    }
+
+    /// A handler for a peer server whose Raft RPCs this test never sends.
+    struct Unused;
+
+    #[async_trait]
+    impl PeerRpcHandler for Unused {
+        async fn handle_vote(&self, _: PeerVoteRequest) -> TransportResult<PeerVoteResponse> {
+            Err(TransportError::Protocol("unused".into()))
+        }
+        async fn handle_append(&self, _: PeerAppendRequest) -> TransportResult<PeerAppendResponse> {
+            Err(TransportError::Protocol("unused".into()))
+        }
+        async fn handle_install(
+            &self,
+            _: PeerInstallRequest,
+        ) -> TransportResult<PeerInstallResponse> {
+            Err(TransportError::Protocol("unused".into()))
+        }
+    }
+
+    /// Review of #758: the live probe asks a real peer server over the peer
+    /// plane, through the directory, and maps every outcome: an answer, a
+    /// member with no address, and a member whose port answers nothing.
+    #[tokio::test]
+    async fn the_member_probe_asks_over_the_peer_plane() {
+        use crate::versions::MemberVersion;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = crate::transport::peer::PeerServer::plaintext(MetaNodeId(2), Arc::new(Unused));
+        let task = tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_addr = closed.local_addr().unwrap();
+        drop(closed);
+
+        let directory = PeerDirectory::new();
+        for (id, addr) in [(2, addr), (4, closed_addr)] {
+            directory.insert(
+                id,
+                PeerEndpoint {
+                    addr,
+                    server_name: "localhost".to_owned(),
+                },
+            );
+        }
+        let probe = TlsRaftNetworkFactory::new(1, directory, None).member_probe();
+        assert_eq!(
+            probe.ask(MetaNodeId(2)).await,
+            MemberVersion::Reported {
+                node_id: MetaNodeId(2),
+                release: env!("CARGO_PKG_VERSION").to_owned(),
+                supported_feature_level: crate::command::SUPPORTED_FEATURE_LEVEL,
+            }
+        );
+        assert!(matches!(
+            probe.ask(MetaNodeId(3)).await,
+            MemberVersion::Unreachable(reason) if reason.contains("no peer address")
+        ));
+        assert!(matches!(
+            probe.ask(MetaNodeId(4)).await,
+            MemberVersion::Unreachable(_)
+        ));
+        task.abort();
     }
 }

@@ -256,9 +256,11 @@ The limits that matter most when evaluating it:
 
 - **A replay reuses the stored object only when it produces the same bytes.**
   Objects are named by source, range and content digest (#626), so a replay of
-  the same bytes reuses what is stored and never overwrites anything. A replay
-  over a source that grew, in a later hour under seal-time partitioning, with
-  no checksum, or on a command backend still writes a second object (no data
+  the same bytes reuses what is stored and never overwrites anything, and a
+  replay is rebuilt as first cut. A replay that cannot be rebuilt as cut (the
+  source rewrote or dropped the range), a replay of a row from before v0.10.0 in a later hour under
+  seal-time partitioning, with no checksum, or on a command backend still
+  writes a second object (no data
   is lost), so the protocol's deterministic naming rule
   ([§15.1](docs/VTOP_PROTOCOL_DRAFT.md#151-object-key)) is narrowed, not met.
 - **Size-only verification is an opt-out, and it accepts same-size
@@ -290,14 +292,26 @@ The full table, with what is done and what is planned, is in
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | crates, the engine's runtime flow, recovery, implementation status |
 | [Archive path reference](docs/reference/archive-path.md) | sources, formats, the manifest, verification, recovery, metrics |
 | [PRODUCTION_HA.md](docs/PRODUCTION_HA.md) | engine HA: status, design and phased roadmap |
-| [ROADMAP.md](docs/ROADMAP.md) | cluster-plane releases and per-release limitations |
+| [ROADMAP.md](docs/ROADMAP.md) | engine and cluster-plane releases, per-release limitations and upgrade notes |
+| [Compatibility policy](docs/reference/compatibility.md) | what each format promises, upgrade and downgrade rules, deprecation |
+| [SUPPORT.md](docs/SUPPORT.md) | versioning, which releases get fixes, and the 1.x support window |
 | [SECURITY_MODEL.md](docs/SECURITY_MODEL.md) | the security model and its normative rules |
+| [SECURITY.md](SECURITY.md) | reporting a vulnerability: the private channel, response times, supported versions |
 | [RELEASE_VERIFICATION.md](docs/RELEASE_VERIFICATION.md) | checking a release's signatures, SBOM and provenance |
 | [LIVE_CHAOS_VALIDATION.md](docs/LIVE_CHAOS_VALIDATION.md) | the live-chaos suite: real processes, real TLS, injected faults |
 | [benchmarks/README.md](benchmarks/README.md) | the benchmark harness, its scenarios and its calibration gate |
 | [INVENTION_DISCLOSURE_DRAFT.md](docs/INVENTION_DISCLOSURE_DRAFT.md) | the candidate-invention disclosure draft |
 | [PRIOR_ART_SEARCH_PLAN.md](docs/PRIOR_ART_SEARCH_PLAN.md) | the prior-art search plan |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | how changes get in, and the naming and claims rules |
+
+---
+
+## Security
+
+Report a vulnerability privately, through
+[GitHub's private vulnerability reporting](https://github.com/allamiro/vtop-engine/security/advisories/new),
+never in a public issue. [SECURITY.md](SECURITY.md) gives the response times,
+the supported versions and the disclosure rule.
 
 ---
 
@@ -310,7 +324,7 @@ If you use VTOP Engine in research, please cite it. GitHub's **Cite this reposit
   author  = {Suliman, Tamir},
   title   = {{VTOP Engine: Verified Telemetry Object Protocol Engine}},
   year    = {2026},
-  version = {0.8.0},
+  version = {0.10.1},
   url     = {https://github.com/allamiro/vtop-engine},
   license = {MIT}
 }
