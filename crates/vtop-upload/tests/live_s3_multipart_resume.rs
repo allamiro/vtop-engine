@@ -15,7 +15,7 @@
 //! `telemetry-raw`, created if missing). Each test aborts or deletes what it
 //! creates.
 //!
-//! CI runs it in the `minio-integration` job, against the lab's MinIO.
+//! CI runs it in the `s3-compat` matrix (#722), against the lab's MinIO.
 //! `VTOP_TEST_S3_SERVER` names the server and its capability file (#722);
 //! the forwarder speaks plain HTTP, so the endpoint must be `http://`.
 

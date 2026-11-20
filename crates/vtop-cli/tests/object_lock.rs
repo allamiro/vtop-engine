@@ -9,6 +9,10 @@
 //!
 //! - a bucket without Object Lock refuses startup (a literal bucket name) or
 //!   the first batch for it (a templated one), with a message naming it;
+//! - a store that does not implement Object Lock at all (#722: 501
+//!   `NotImplemented`, as Garage documents) refuses startup the same way,
+//!   saying no bucket setting can change it, and is not mistaken for a store
+//!   that could not answer;
 //! - with the profile unset nothing is checked, as before;
 //! - a lock the store kept passes, and a longer bucket default passes;
 //! - a lock the store dropped, kept in another mode, kept shorter, or kept
@@ -123,6 +127,163 @@ async fn a_templated_bucket_without_object_lock_fails_its_first_batch_and_upload
         ],
     );
     assert_eq!(checks(tenant, "bucket_not_locked"), refused_before + 1);
+}
+
+/// #722: a store that answers "not implemented" to the Object Lock check is
+/// refused at startup. Before, the answer was taken for a store that could
+/// not answer: a WARN, the engine started, and every batch failed later.
+#[tokio::test]
+async fn a_store_that_does_not_implement_object_lock_refuses_startup_saying_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 2);
+    let lock = governance();
+    let backend = Arc::new(locked_mock(&lock).with_object_lock_not_implemented());
+    let engine = engine(
+        config(dir.path(), "lock-not-implemented", "telemetry-raw", &input),
+        Some(lock),
+        &backend,
+    )
+    .await;
+
+    let err = engine
+        .preflight_object_lock()
+        .await
+        .expect_err("a store without Object Lock must refuse startup")
+        .to_string();
+    assert_says(
+        &err,
+        &[
+            // What happened.
+            "the store does not implement S3 Object Lock",
+            "bucket telemetry-raw",
+            // What the engine did.
+            "the engine did not start",
+            // What to do.
+            "use a store that implements S3 Object Lock, or remove upload.object_lock",
+        ],
+    );
+    assert!(
+        !err.contains("could not be read"),
+        "a definite answer is not a failed check: {err}"
+    );
+    assert_eq!(backend.object_lock_config_calls(), 1);
+}
+
+/// #722: a templated bucket on such a store fails its first batch with the
+/// same words, counted as `store_unsupported`, not as a check that could not
+/// be made, and nothing is uploaded.
+#[tokio::test]
+async fn a_templated_bucket_on_a_store_without_object_lock_fails_its_first_batch_saying_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 2);
+    let tenant = "lock-templated-not-implemented";
+    let lock = governance();
+    let backend = Arc::new(locked_mock(&lock).with_object_lock_not_implemented());
+    let mut engine = engine(
+        config(dir.path(), tenant, "telemetry-{format}", &input),
+        Some(lock),
+        &backend,
+    )
+    .await;
+    let (unsupported_before, error_before) =
+        (checks(tenant, "store_unsupported"), checks(tenant, "error"));
+
+    engine
+        .preflight_object_lock()
+        .await
+        .expect("a templated bucket is checked at first use, not at startup");
+    let out = engine.process_once(SourceType::File).await.unwrap();
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert!(!out[0].committed, "{out:?}");
+    let failed = row(&engine, &out[0].batch_id).await;
+    assert_eq!(failed.state, BatchState::ReplayRequired);
+    assert!(
+        failed.object_uri.is_none(),
+        "nothing was uploaded: {failed:?}"
+    );
+    assert_says(
+        &failed.error_message.unwrap_or_default(),
+        &[
+            "the store does not implement S3 Object Lock",
+            "bucket telemetry-raw",
+            "the batch was not uploaded and will be replayed",
+            "use a store that implements S3 Object Lock, or remove upload.object_lock",
+        ],
+    );
+    assert_eq!(
+        (checks(tenant, "store_unsupported"), checks(tenant, "error")),
+        (unsupported_before + 1, error_before),
+        "counted as the store's answer, not as a failed check"
+    );
+}
+
+/// Review of #770: a store without Object Lock usually has no versioning
+/// either (Garage's GetBucketVersioning is a stub answering "not enabled").
+/// The batch is refused for the Object Lock it lacks, which no bucket setting
+/// can add, not for the versioning, whose advice the operator cannot follow.
+/// Startup runs the two checks in the same order.
+#[tokio::test]
+async fn a_store_without_object_lock_or_versioning_is_refused_for_the_lock_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 2);
+    let tenant = "lock-and-versioning-missing";
+    let lock = governance();
+    let backend = Arc::new(
+        locked_mock(&lock)
+            .with_object_lock_not_implemented()
+            .with_bucket_versioning(vtop_upload::BucketFeature::NotEnabled),
+    );
+    let mut templated = engine(
+        config(dir.path(), tenant, "telemetry-{format}", &input),
+        Some(lock.clone()),
+        &backend,
+    )
+    .await;
+    let unsupported_before = checks(tenant, "store_unsupported");
+    templated.preflight_buckets().await.unwrap();
+    let out = templated.process_once(SourceType::File).await.unwrap();
+    assert!(!out[0].committed, "{out:?}");
+    let message = row(&templated, &out[0].batch_id)
+        .await
+        .error_message
+        .unwrap_or_default();
+    assert_says(&message, &["the store does not implement S3 Object Lock"]);
+    assert!(!message.contains("versioning"), "{message}");
+    assert_eq!(checks(tenant, "store_unsupported"), unsupported_before + 1);
+
+    // A literal bucket: the same order at startup.
+    let backend = Arc::new(
+        locked_mock(&lock)
+            .with_object_lock_not_implemented()
+            .with_bucket_versioning(vtop_upload::BucketFeature::NotEnabled),
+    );
+    let literal = engine(
+        config(
+            dir.path(),
+            "lock-and-versioning-literal",
+            "telemetry-raw",
+            &input,
+        ),
+        Some(lock),
+        &backend,
+    )
+    .await;
+    let err = literal.preflight_buckets().await.unwrap_err().to_string();
+    assert_says(
+        &err,
+        &[
+            "the store does not implement S3 Object Lock",
+            "the engine did not start",
+        ],
+    );
+    assert_eq!(
+        backend.versioning_calls(),
+        0,
+        "refused before versioning: {err}"
+    );
 }
 
 #[tokio::test]
@@ -348,10 +509,14 @@ async fn a_failed_check_hands_the_range_back_for_the_replay() {
 }
 
 /// A store that dropped the lock leaves an unlocked object at the derived
-/// key, and a replay of the same bytes reuses it (#626) and fails again: the
-/// message says so and what to do.
+/// key. Before #709 a replay of the same bytes reused it and failed again on
+/// every pass, so the range stalled until an operator acted. Now the replay
+/// sees the missing lock before it commits to reuse, writes the batch as a
+/// fresh object under its attempt key, locked as configured, verifies that
+/// lock on the version it wrote, and commits; the unlocked object is left as
+/// it is.
 #[tokio::test]
-async fn a_replay_that_reuses_an_unlocked_object_fails_again_and_says_what_to_do() {
+async fn a_replay_that_finds_an_unlocked_object_writes_a_fresh_locked_one_and_commits() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("app.log");
     write_lines(&input, "app", 3);
@@ -364,28 +529,32 @@ async fn a_replay_that_reuses_an_unlocked_object_fails_again_and_says_what_to_do
         &backend,
     )
     .await;
+    let unlocked_before = decisions(tenant, "fallback_unlocked");
 
     let first = engine.process_once(SourceType::File).await.unwrap();
     assert!(!first[0].committed);
+    let derived = row(&engine, &first[0].batch_id).await.object_uri.unwrap();
+    let old = Snapshot::of(&backend, &derived).await;
+    assert_eq!(old.retention, StoredRetention::default(), "stored unlocked");
     backend.set_lock_fault(None);
+
     let second = engine.process_once(SourceType::File).await.unwrap();
-    assert!(!second[0].committed, "{second:?}");
-    let failed = row(&engine, &second[0].batch_id).await;
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert!(second[0].committed, "the replay commits: {second:?}");
+    assert_fell_back(&engine, &backend, &second[0], &derived, &old).await;
     assert_eq!(
-        failed.object_uri,
-        row(&engine, &first[0].batch_id).await.object_uri,
-        "the replay reused the object at the derived key"
+        decisions(tenant, "fallback_unlocked"),
+        unlocked_before + 1,
+        "counted as a fallback from an unlocked object"
     );
-    assert_says(
-        &failed.error_message.unwrap_or_default(),
-        &[
-            "reused from an earlier attempt",
-            "is not under the requested retention",
-            "the batch was marked failed and will be replayed",
-            "delete that version",
-        ],
+    assert_eq!(decisions(tenant, "reused"), 0, "nothing was reused");
+    assert_eq!(
+        checks(tenant, "missing"),
+        1,
+        "only the first attempt's own object failed a check; the replay's \
+         look at the old object is a key decision, not a failed check"
     );
-    assert_eq!(checks(tenant, "missing"), 2);
+    assert_eq!(checks(tenant, "ok"), 2, "the fresh object and its manifest");
 }
 
 #[tokio::test]
@@ -472,87 +641,527 @@ async fn a_reused_object_still_locked_passes_and_the_new_manifest_is_checked_str
     );
 }
 
+/// A reused object whose lock has ended (#709): before, the replay reused it
+/// and failed on every pass; now it falls back to a fresh locked object
+/// under the attempt key and commits, and the old object is untouched.
 #[tokio::test]
-async fn a_reused_object_whose_lock_has_ended_fails() {
+async fn a_reused_object_whose_lock_has_ended_falls_back_to_a_fresh_locked_object() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("app.log");
     write_lines(&input, "app", 3);
     let tenant = "lock-reuse-elapsed";
     let lock = governance();
-    // A one-second lock, which configuration cannot express: it has ended by
-    // the time the replay reuses the object. The dates are whole seconds,
-    // rounded up when asked for, so the wait is three seconds.
-    let backend = Arc::new(
-        MockBackend::new()
-            .with_object_lock(ObjectLockPolicy::with_retention_for_tests(
-                ObjectLockMode::Governance,
-                Duration::from_secs(1),
-                false,
-            ))
-            .with_throttled_manifest_puts(1),
-    );
-    let mut engine = engine(
-        config(dir.path(), tenant, "telemetry-raw", &input),
-        Some(lock),
-        &backend,
+    let (mut engine, backend, derived) = first_attempt_leaves_the_derived_object(
+        dir.path(),
+        tenant,
+        &input,
+        &lock,
+        locked_mock(&lock).with_throttled_manifest_puts(1),
     )
     .await;
+    // The lock it got has ended: a governance retention a minute in the past.
+    backend.set_stored_retention(
+        &derived,
+        None,
+        StoredRetention {
+            mode: Some("GOVERNANCE".into()),
+            retain_until_unix_secs: Some(unix_now() - 60),
+            legal_hold: Some(false),
+        },
+    );
+    let old = Snapshot::of(&backend, &derived).await;
+    let elapsed_before = decisions(tenant, "fallback_lock_elapsed");
 
-    let first = engine.process_once(SourceType::File).await.unwrap();
-    assert!(!first[0].committed);
-    tokio::time::sleep(Duration::from_millis(3_100)).await;
     let second = engine.process_once(SourceType::File).await.unwrap();
-    assert!(!second[0].committed, "{second:?}");
-    let failed = row(&engine, &second[0].batch_id).await;
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert!(second[0].committed, "the replay commits: {second:?}");
+    assert_fell_back(&engine, &backend, &second[0], &derived, &old).await;
     assert_eq!(
-        failed.object_uri,
-        row(&engine, &first[0].batch_id).await.object_uri,
-        "the replay reused the object the first attempt locked"
+        decisions(tenant, "fallback_lock_elapsed"),
+        elapsed_before + 1
     );
-    assert_says(
-        &failed.error_message.unwrap_or_default(),
-        &["reused from an earlier attempt", "found retain-until"],
-    );
-    assert_eq!(checks(tenant, "too_short"), 1);
+    assert_eq!(decisions(tenant, "reused"), 0);
+    assert_eq!(checks(tenant, "too_short"), 0, "no check failed");
+    assert_eq!(checks(tenant, "ok"), 2, "the fresh object and its manifest");
+    // The replay rebuilt the recorded window (#626), but the object it
+    // committed is not at the derived key, so the rebuild is a `fallback`
+    // (a second object), never `exact`.
+    assert_eq!(rebuilds(tenant, "fallback"), 1, "the rebuild fell back");
+    assert_eq!(rebuilds(tenant, "exact"), 0, "not claimed as exact");
 }
 
+/// Decision 5 of #709: a reused object locked in the OTHER mode falls back
+/// too, in both directions. The committed object must be under the mode the
+/// profile configures; a compliance lock where governance is configured is
+/// stronger, but it is not the profile the operator chose.
 #[tokio::test]
-async fn a_damaged_object_at_the_derived_key_is_not_written_over_and_the_batch_lands_locked() {
+async fn a_reused_object_locked_in_the_other_mode_falls_back_to_the_configured_mode() {
+    for (configured, found) in [
+        (ObjectLockMode::Governance, "COMPLIANCE"),
+        (ObjectLockMode::Compliance, "GOVERNANCE"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("app.log");
+        write_lines(&input, "app", 3);
+        let tenant = format!("lock-reuse-mode-{found}");
+        let lock = lock(configured, false);
+        let (mut engine, backend, derived) = first_attempt_leaves_the_derived_object(
+            dir.path(),
+            &tenant,
+            &input,
+            &lock,
+            locked_mock(&lock).with_throttled_manifest_puts(1),
+        )
+        .await;
+        backend.set_stored_retention(
+            &derived,
+            None,
+            StoredRetention {
+                mode: Some(found.into()),
+                retain_until_unix_secs: Some(unix_now() + 86_400),
+                legal_hold: Some(false),
+            },
+        );
+        let old = Snapshot::of(&backend, &derived).await;
+
+        let second = engine.process_once(SourceType::File).await.unwrap();
+        assert!(second[0].committed, "[{found}] {second:?}");
+        assert_fell_back(&engine, &backend, &second[0], &derived, &old).await;
+        let landed = second[0].object_uri.clone().unwrap();
+        assert_eq!(
+            backend.stored_retention(&landed, None).mode.as_deref(),
+            Some(configured.as_s3()),
+            "[{found}] the fresh object is under the configured mode"
+        );
+        assert_eq!(decisions(&tenant, "fallback_lock_mode"), 1, "[{found}]");
+        assert_eq!(checks(&tenant, "mode_mismatch"), 0, "[{found}]");
+    }
+}
+
+/// A reused object whose retention cannot be read (a store error) is NOT a
+/// reason to fall back (#709): falling back on errors would write a second
+/// object for every replay during an outage. The batch fails at the reuse
+/// decision, before writing anything, and says why.
+#[tokio::test]
+async fn a_retention_read_that_fails_at_the_reuse_decision_writes_nothing_and_does_not_fall_back() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("app.log");
     write_lines(&input, "app", 3);
-    let tenant = "lock-fallback";
+    let tenant = "lock-reuse-store-error";
     let lock = governance();
-    let backend = Arc::new(locked_mock(&lock).with_throttled_manifest_puts(1));
+    // Every retention read fails: attempt 1 writes its object and manifest
+    // under the derived key and fails at the check before the commit.
+    let backend = Arc::new(
+        locked_mock(&lock).with_retention_error("mock head_object: ServiceUnavailable (http 503)"),
+    );
     let mut engine = engine(
         config(dir.path(), tenant, "telemetry-raw", &input),
         Some(lock),
         &backend,
     )
     .await;
+    let first = engine.process_once(SourceType::File).await.unwrap();
+    assert!(!first[0].committed, "{first:?}");
+    let derived = row(&engine, &first[0].batch_id).await.object_uri.unwrap();
+    let old = Snapshot::of(&backend, &derived).await;
+    let error_before = checks(tenant, "error");
 
+    let second = engine.process_once(SourceType::File).await.unwrap();
+    assert!(!second[0].committed, "{second:?}");
+    let failed = row(&engine, &second[0].batch_id).await;
+    assert_eq!(failed.state, BatchState::ReplayRequired);
+    assert!(
+        failed.object_uri.is_none() && failed.manifest_uri.is_none(),
+        "attempt 2 wrote no object and no manifest: {failed:?}"
+    );
+    assert_says(
+        &failed.error_message.unwrap_or_default(),
+        &[
+            &derived,
+            "could not be read",
+            "it was neither reused nor replaced by a fresh object",
+            "no object or manifest was written",
+            "the batch was marked failed and will be replayed",
+            "s3:GetObjectRetention",
+        ],
+    );
+    for decision in FALLBACKS.iter().chain(["reused", "lock_withheld"].iter()) {
+        assert_eq!(decisions(tenant, decision), 0, "no {decision}");
+    }
+    assert_eq!(checks(tenant, "error"), error_before + 1);
+    assert_eq!(Snapshot::of(&backend, &derived).await, old);
+}
+
+/// Review of #757: a fallback whose upload never landed is not an extra
+/// object. The next replay, inside the cooldown, finds the attempt key
+/// absent and writes a fresh object at once instead of withholding.
+#[tokio::test]
+async fn a_fallback_whose_upload_failed_is_retried_at_once_not_withheld() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 3);
+    let tenant = "lock-fallback-put-failed";
+    let lock = governance();
+    let (mut engine, backend, derived) = first_attempt_leaves_the_derived_object(
+        dir.path(),
+        tenant,
+        &input,
+        &lock,
+        locked_mock(&lock).with_throttled_manifest_puts(1),
+    )
+    .await;
+    backend.set_stored_retention(&derived, None, StoredRetention::default());
+    let old = Snapshot::of(&backend, &derived).await;
+    // Every object put fails; the derived key is never put again.
+    let ext = derived
+        .rsplit_once('/')
+        .unwrap()
+        .1
+        .split_once('.')
+        .unwrap()
+        .1;
+    backend.set_failing_put_suffix(Some(&format!(".{ext}")));
+
+    let second = engine.process_once(SourceType::File).await.unwrap();
+    assert!(!second[0].committed, "{second:?}");
+    assert_eq!(decisions(tenant, "fallback_unlocked"), 1);
+
+    backend.set_failing_put_suffix(None);
+    let third = engine.process_once(SourceType::File).await.unwrap();
+    assert!(third[0].committed, "{third:?}");
+    assert_eq!(decisions(tenant, "lock_withheld"), 0, "not withheld");
+    assert_eq!(decisions(tenant, "fallback_unlocked"), 2);
+    assert_fell_back(&engine, &backend, &third[0], &derived, &old).await;
+}
+
+/// Review of #757: credentials that lost s3:GetObjectRetention get a HEAD
+/// with no lock headers, which reads as an unlocked object. That must not
+/// authorize a fresh object: the absence is confirmed with a request the
+/// store refuses, and a refusal fails the batch with nothing written, on
+/// every replay, rather than writing an object per cooldown window.
+#[tokio::test]
+async fn a_lost_lock_read_permission_never_writes_a_fallback_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 3);
+    let tenant = "lock-reuse-denied";
+    let lock = governance();
+    let (mut engine, backend, derived) = first_attempt_leaves_the_derived_object(
+        dir.path(),
+        tenant,
+        &input,
+        &lock,
+        locked_mock(&lock)
+            .without_lock_read_permission()
+            .with_throttled_manifest_puts(1),
+    )
+    .await;
+    // The object IS locked; the engine just cannot see it.
+    assert_eq!(
+        backend.stored_retention(&derived, None).mode.as_deref(),
+        Some("GOVERNANCE")
+    );
+    engine.set_lock_fallback_cooldown(Duration::ZERO);
+    let error_before = checks(tenant, "error");
+
+    for attempt in 2..=3 {
+        let out = engine.process_once(SourceType::File).await.unwrap();
+        assert!(!out[0].committed, "[{attempt}] {out:?}");
+        let failed = row(&engine, &out[0].batch_id).await;
+        assert!(
+            failed.object_uri.is_none() && failed.manifest_uri.is_none(),
+            "[{attempt}] nothing written: {failed:?}"
+        );
+        assert_says(
+            &failed.error_message.unwrap_or_default(),
+            &[
+                &derived,
+                "could not be read",
+                "confirming that was refused or failed",
+                "AccessDenied",
+                "s3:GetObjectRetention",
+                "it was neither reused nor replaced by a fresh object",
+            ],
+        );
+    }
+    for decision in FALLBACKS.iter().chain(["reused", "lock_withheld"].iter()) {
+        assert_eq!(decisions(tenant, decision), 0, "no {decision}");
+    }
+    assert_eq!(checks(tenant, "error"), error_before + 2);
+    assert_eq!(backend.version_count(&derived), 1);
+}
+
+/// The commit rule is unchanged by the fallback (#709): nothing commits
+/// before the retention check passes on the object the manifest names. A
+/// fresh object the store does not keep under the lock asked for (no lock,
+/// or the other mode) fails its batch like any other write. And D8 bounds the
+/// cost of such a store: the next replay finds that fresh object unusable
+/// and writes nothing (`lock_withheld`) until the cooldown has passed, then
+/// one more.
+#[tokio::test]
+async fn a_fallback_object_whose_retention_read_back_fails_does_not_commit() {
+    for (case, fault) in [
+        ("dropped", LockFault::Ignored),
+        ("mode", LockFault::Mode(ObjectLockMode::Compliance)),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("app.log");
+        write_lines(&input, "app", 3);
+        let tenant = format!("lock-fallback-readback-{case}");
+        let lock = governance();
+        let (mut engine, backend, derived) = first_attempt_leaves_the_derived_object(
+            dir.path(),
+            &tenant,
+            &input,
+            &lock,
+            locked_mock(&lock).with_throttled_manifest_puts(1),
+        )
+        .await;
+        // The old object is unlocked, so the replay falls back; the store
+        // then mishandles the fresh object's lock.
+        backend.set_stored_retention(&derived, None, StoredRetention::default());
+        let old = Snapshot::of(&backend, &derived).await;
+        backend.set_lock_fault(Some(fault));
+
+        let second = engine.process_once(SourceType::File).await.unwrap();
+        assert!(!second[0].committed, "[{case}] {second:?}");
+        assert!(committed(&engine).await.is_empty(), "[{case}]");
+        let failed = row(&engine, &second[0].batch_id).await;
+        assert_eq!(failed.state, BatchState::ReplayRequired, "[{case}]");
+        let fresh = failed.object_uri.clone().unwrap();
+        assert!(fresh.contains(&second[0].batch_id), "[{case}] fell back");
+        assert_says(
+            &failed.error_message.unwrap_or_default(),
+            &[&fresh, "is not under the requested retention"],
+        );
+        assert_eq!(decisions(&tenant, "fallback_unlocked"), 1, "[{case}]");
+
+        // The next replay finds the fresh object unusable too, moments
+        // later: it writes nothing.
+        let third = engine.process_once(SourceType::File).await.unwrap();
+        assert!(!third[0].committed, "[{case}] {third:?}");
+        let withheld = row(&engine, &third[0].batch_id).await;
+        assert!(
+            withheld.object_uri.is_none(),
+            "[{case}] nothing written: {withheld:?}"
+        );
+        assert_says(
+            &withheld.error_message.unwrap_or_default(),
+            &[
+                &derived,
+                &fresh,
+                "is not usable either",
+                "nothing was written",
+                "the batch was marked failed and will be replayed",
+                "s3:PutObjectRetention",
+            ],
+        );
+        assert_eq!(decisions(&tenant, "lock_withheld"), 1, "[{case}]");
+        assert_eq!(decisions(&tenant, "fallback_unlocked"), 1, "[{case}]");
+
+        // Once the cooldown has passed (zero here) and the store keeps the
+        // lock again, one more fresh object is written, and it commits.
+        engine.set_lock_fallback_cooldown(Duration::ZERO);
+        backend.set_lock_fault(None);
+        let fourth = engine.process_once(SourceType::File).await.unwrap();
+        assert!(fourth[0].committed, "[{case}] {fourth:?}");
+        assert_fell_back(&engine, &backend, &fourth[0], &derived, &old).await;
+        assert_eq!(decisions(&tenant, "fallback_unlocked"), 2, "[{case}]");
+        assert_eq!(Snapshot::of(&backend, &derived).await, old, "[{case}]");
+    }
+}
+
+/// The restart variant (#709): a new engine over the same ledger and store
+/// has no memory of earlier fallbacks, and the store still keeps no lock.
+/// The replay falls back again, the fresh object fails its check, and
+/// nothing commits.
+#[tokio::test]
+async fn a_fresh_object_that_is_not_locked_either_is_never_committed() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 3);
+    let tenant = "lock-fallback-restart";
+    let lock = governance();
+    let backend = Arc::new(locked_mock(&lock).with_lock_fault(LockFault::Ignored));
+    let cfg = config(dir.path(), tenant, "telemetry-raw", &input);
+    let mut engine = engine(cfg.clone(), Some(lock.clone()), &backend).await;
     let first = engine.process_once(SourceType::File).await.unwrap();
     assert!(!first[0].committed);
     let derived = row(&engine, &first[0].batch_id).await.object_uri.unwrap();
-    backend.corrupt(&derived);
+    drop(engine);
+
+    let mut restarted = support::engine(cfg, Some(lock), &backend).await;
+    restarted.recover().await.unwrap();
+    let second = restarted.process_once(SourceType::File).await.unwrap();
+    assert!(second.iter().all(|o| !o.committed), "{second:?}");
+    assert!(committed(&restarted).await.is_empty());
+    let fresh = second[0].object_uri.clone();
+    let failed = row(&restarted, &second[0].batch_id).await;
+    assert_eq!(failed.state, BatchState::ReplayRequired);
+    assert_ne!(
+        failed.object_uri.as_deref(),
+        Some(derived.as_str()),
+        "{fresh:?}"
+    );
+    assert_eq!(decisions(tenant, "fallback_unlocked"), 1);
+    assert_eq!(
+        decisions(tenant, "lock_withheld"),
+        0,
+        "a new process remembers nothing"
+    );
+    assert_eq!(backend.version_count(&derived), 1);
+}
+
+/// D8 of #709: the fallback object landed and its manifest was throttled.
+/// The next replay reuses that fresh, locked object instead of writing a
+/// third one.
+#[tokio::test]
+async fn a_replay_after_a_fallback_reuses_the_fresh_object_and_writes_no_third() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 3);
+    let tenant = "lock-fallback-reuse";
+    let lock = governance();
+    let (mut engine, backend, derived) = first_attempt_leaves_the_derived_object(
+        dir.path(),
+        tenant,
+        &input,
+        &lock,
+        locked_mock(&lock).with_throttled_manifest_puts(2),
+    )
+    .await;
+    backend.set_stored_retention(&derived, None, StoredRetention::default());
+    let old = Snapshot::of(&backend, &derived).await;
 
     let second = engine.process_once(SourceType::File).await.unwrap();
-    assert!(second[0].committed, "{second:?}");
-    let landed = second[0].object_uri.clone().unwrap();
-    assert_ne!(landed, derived, "the batch fell back to its attempt key");
-    assert!(
-        backend
-            .get_object_pinned(&derived, "v2", 1 << 20)
-            .await
-            .is_err(),
-        "nothing was written over the damaged object"
+    assert!(!second[0].committed, "the second manifest is throttled too");
+    let fresh = row(&engine, &second[0].batch_id).await.object_uri.unwrap();
+    assert!(fresh.contains(&second[0].batch_id), "{fresh}");
+    assert_eq!(decisions(tenant, "fallback_unlocked"), 1);
+    let ok_before = checks(tenant, "ok");
+
+    let third = engine.process_once(SourceType::File).await.unwrap();
+    assert!(third[0].committed, "{third:?}");
+    assert_eq!(
+        third[0].object_uri.as_deref(),
+        Some(fresh.as_str()),
+        "the replay reused the fresh object"
     );
-    let kept = backend.stored_retention(&landed, None);
-    assert_eq!(kept.mode.as_deref(), Some("GOVERNANCE"));
-    assert_eq!(checks(tenant, "ok"), 2);
+    assert_eq!(backend.version_count(&fresh), 1, "no second put of it");
+    assert_eq!(decisions(tenant, "reused"), 1);
+    assert_eq!(decisions(tenant, "fallback_unlocked"), 1, "no third object");
+    // Reused, but not at the derived key: a second object of the range, so
+    // the rebuild (#626) is a `fallback`, not `exact`.
+    assert_eq!(rebuilds(tenant, "fallback"), 1, "the rebuild fell back");
+    assert_eq!(rebuilds(tenant, "exact"), 0, "not claimed as exact");
+    assert_eq!(
+        checks(tenant, "ok"),
+        ok_before + 2,
+        "the reused fresh object was read again before the commit, and the manifest"
+    );
+    assert_eq!(Snapshot::of(&backend, &derived).await, old);
 }
 
 // ---- Multipart --------------------------------------------------------------
+
+// ---- Replays that rebuild the recorded window (#626) ------------------------
+
+fn at(rfc3339: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(rfc3339)
+        .unwrap()
+        .with_timezone(&chrono::Utc)
+}
+
+fn rebuilds(tenant: &str, result: &str) -> u64 {
+    vtop_core::telemetry::init()
+        .unwrap()
+        .replay_rebuilds_total
+        .with_label_values(&[tenant, "file", "raw", result])
+        .get()
+}
+
+/// #626 under the profile, where a second object cannot be deleted before its
+/// retention ends: the failed attempt's object is locked, and a replay sealed
+/// in a later hour, with keys that carry the hour, reuses it instead of
+/// writing a second locked object.
+#[tokio::test]
+async fn a_replay_in_a_later_hour_reuses_the_locked_object_and_locks_nothing_new() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 3);
+    let tenant = "lock-rebuild-626";
+    let lock = governance();
+    let backend = Arc::new(locked_mock(&lock).with_throttled_manifest_puts(1));
+    let mut cfg = config(dir.path(), tenant, "telemetry-raw", &input);
+    cfg.partitioning.template = vtop_core::partitioning::DEFAULT_TEMPLATE.into();
+    let mut engine = engine(cfg, Some(lock), &backend).await;
+    let exact_before = rebuilds(tenant, "exact");
+
+    engine.set_seal_clock(|| at("2026-03-04T05:59:59.900Z"));
+    let first = engine.process_once(SourceType::File).await.unwrap();
+    assert!(!first[0].committed, "{first:?}");
+    let orphan = row(&engine, &first[0].batch_id).await.object_uri.unwrap();
+    assert!(
+        backend.stored_retention(&orphan, None).mode.is_some(),
+        "the failed attempt's object is locked"
+    );
+
+    engine.set_seal_clock(|| at("2026-03-04T06:00:30Z"));
+    let second = engine.process_once(SourceType::File).await.unwrap();
+    assert!(second[0].committed, "{second:?}");
+    assert_eq!(second[0].object_uri.as_deref(), Some(orphan.as_str()));
+    assert_eq!(
+        backend.version_count(&orphan),
+        1,
+        "no second locked version of the object"
+    );
+    let objects: Vec<_> = backend
+        .object_uris()
+        .into_iter()
+        .filter(|uri| !uri.ends_with(".manifest.json") && !uri.ends_with(".receipt.json"))
+        .collect();
+    assert_eq!(objects, vec![orphan], "and no second locked object");
+    assert_eq!(rebuilds(tenant, "exact"), exact_before + 1);
+}
+
+/// #626 under the profile: a replay whose bytes differ from the locked
+/// object the failed attempt wrote (compression changed) writes a second
+/// locked object, leaves the first as it is, and is counted `bytes_differ`:
+/// the counter that sizes what replays cost in retained storage.
+#[tokio::test]
+async fn a_replay_whose_bytes_differ_writes_a_second_locked_object_and_is_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 30);
+    let tenant = "lock-bytes-differ-626";
+    let lock = governance();
+    let backend = Arc::new(locked_mock(&lock).with_throttled_manifest_puts(1));
+    let mut cfg = config(dir.path(), tenant, "telemetry-raw", &input);
+    cfg.compression.level = 1;
+    let orphan = {
+        let mut first = engine(cfg.clone(), Some(lock.clone()), &backend).await;
+        let out = first.process_once(SourceType::File).await.unwrap();
+        assert!(!out[0].committed, "{out:?}");
+        row(&first, &out[0].batch_id).await.object_uri.unwrap()
+    };
+    let differ_before = rebuilds(tenant, "bytes_differ");
+
+    cfg.compression.level = 9;
+    let mut restarted = engine(cfg, Some(lock), &backend).await;
+    restarted.recover().await.unwrap();
+    let out = restarted.process_once(SourceType::File).await.unwrap();
+    assert!(out[0].committed, "{out:?}");
+    let written = out[0].object_uri.clone().unwrap();
+    assert_ne!(written, orphan);
+    assert_eq!(backend.version_count(&orphan), 1, "the first is untouched");
+    for uri in [&orphan, &written] {
+        assert!(
+            backend.stored_retention(uri, None).mode.is_some(),
+            "{uri} is locked"
+        );
+    }
+    assert_eq!(rebuilds(tenant, "bytes_differ"), differ_before + 1);
+}
 
 #[tokio::test]
 async fn a_multipart_object_carries_the_lock_its_create_asked_for() {
@@ -580,6 +1189,37 @@ async fn a_multipart_object_carries_the_lock_its_create_asked_for() {
         Some("GOVERNANCE")
     );
     assert_eq!(checks(tenant, "ok"), 2);
+}
+
+/// A multipart-sized batch takes the fallback too (#709): the upload goes to
+/// the attempt key under the lock its create asked for.
+#[tokio::test]
+async fn a_multipart_batch_that_falls_back_is_locked_on_its_attempt_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 400);
+    let tenant = "lock-multipart-fallback";
+    let lock = governance();
+    let backend = Arc::new(locked_mock(&lock).with_throttled_manifest_puts(1));
+    let mut cfg = config(dir.path(), tenant, "telemetry-raw", &input);
+    cfg.compression.kind = vtop_core::types::CompressionType::None;
+    cfg.upload.multipart_part_size_bytes = 1024;
+    cfg.upload.multipart_threshold_bytes = 1024;
+    let mut engine = engine(cfg, Some(lock), &backend).await;
+    let first = engine.process_once(SourceType::File).await.unwrap();
+    assert!(!first[0].committed);
+    let derived = row(&engine, &first[0].batch_id).await.object_uri.unwrap();
+    backend.set_stored_retention(&derived, None, StoredRetention::default());
+    let old = Snapshot::of(&backend, &derived).await;
+    let parts_before = backend.multipart_parts_uploaded();
+
+    let second = engine.process_once(SourceType::File).await.unwrap();
+    assert!(second[0].committed, "{second:?}");
+    assert!(
+        backend.multipart_parts_uploaded() > parts_before + 1,
+        "the fresh object went through multipart"
+    );
+    assert_fell_back(&engine, &backend, &second[0], &derived, &old).await;
 }
 
 // ---- Redaction --------------------------------------------------------------
@@ -1542,35 +2182,156 @@ async fn a_write_that_asked_for_no_lock_fails_the_batch() {
     assert_eq!(checks(tenant, "error"), 1);
 }
 
-/// A reused object without the legal hold the config now asks for needs a
-/// legal hold, not a longer retention: the message says which.
+/// A reused object without the legal hold the config asks for (the hold
+/// was removed, or the object predates `legal_hold: true`). Before #709 the
+/// replay failed on every pass until someone placed a hold; now it falls back
+/// to a fresh object that carries the hold, and commits.
 #[tokio::test]
-async fn a_reused_object_without_the_legal_hold_says_to_place_one() {
+async fn a_reused_object_without_the_legal_hold_falls_back_to_one_that_has_it() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("app.log");
     write_lines(&input, "app", 2);
-    let lock = governance();
-    let backend = Arc::new(locked_mock(&lock).with_throttled_manifest_puts(1));
-    let mut engine = engine(
-        config(dir.path(), "lock-reuse-hold", "telemetry-raw", &input),
-        Some(lock),
-        &backend,
+    let tenant = "lock-reuse-hold";
+    let lock = lock_with_hold();
+    let (mut engine, backend, derived) = first_attempt_leaves_the_derived_object(
+        dir.path(),
+        tenant,
+        &input,
+        &lock,
+        locked_mock(&lock).with_throttled_manifest_puts(1),
     )
     .await;
-    let first = engine.process_once(SourceType::File).await.unwrap();
-    assert!(!first[0].committed);
-    engine.config.upload.object_lock = Some(lock_with_hold());
+    let mut kept = backend.stored_retention(&derived, None);
+    kept.legal_hold = Some(false);
+    backend.set_stored_retention(&derived, None, kept);
+    let old = Snapshot::of(&backend, &derived).await;
+
     let second = engine.process_once(SourceType::File).await.unwrap();
-    assert!(!second[0].committed);
-    assert_says(
-        &row(&engine, &second[0].batch_id)
-            .await
-            .error_message
-            .unwrap_or_default(),
-        &["reused from an earlier attempt", "PutObjectLegalHold"],
+    assert!(second[0].committed, "{second:?}");
+    assert_fell_back(&engine, &backend, &second[0], &derived, &old).await;
+    let landed = second[0].object_uri.clone().unwrap();
+    assert_eq!(
+        backend.stored_retention(&landed, None).legal_hold,
+        Some(true)
     );
+    assert_eq!(decisions(tenant, "fallback_hold_missing"), 1);
+    assert_eq!(checks(tenant, "legal_hold_missing"), 0);
 }
 
 fn lock_with_hold() -> ObjectLockConfig {
     lock(ObjectLockMode::Governance, true)
+}
+
+/// The fallback values #709 adds to `vtop_object_key_decisions_total`.
+const FALLBACKS: [&str; 4] = [
+    "fallback_lock_elapsed",
+    "fallback_unlocked",
+    "fallback_lock_mode",
+    "fallback_hold_missing",
+];
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// The first attempt puts its object, locked, under the derived key and
+/// fails at its manifest (the caller's mock throttles it), so the next pass replays the same
+/// bytes and resolves to that object (#626). Returns the engine, the mock
+/// and the derived key.
+async fn first_attempt_leaves_the_derived_object(
+    dir: &std::path::Path,
+    tenant: &str,
+    input: &std::path::Path,
+    lock: &ObjectLockConfig,
+    mock: MockBackend,
+) -> (Engine, Arc<MockBackend>, String) {
+    let backend = Arc::new(mock);
+    let mut engine = engine(
+        config(dir, tenant, "telemetry-raw", input),
+        Some(lock.clone()),
+        &backend,
+    )
+    .await;
+    let first = engine.process_once(SourceType::File).await.unwrap();
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert!(!first[0].committed, "the throttled manifest fails it");
+    let derived = row(&engine, &first[0].batch_id)
+        .await
+        .object_uri
+        .expect("the first attempt put its object");
+    assert!(
+        !derived.contains(&first[0].batch_id),
+        "{derived} is the derived key, not the attempt key"
+    );
+    (engine, backend, derived)
+}
+
+/// What the store holds at a key: every version's bytes, and the current
+/// version's retention. Equal before and after means untouched: nothing
+/// written over it, deleted, or re-locked.
+#[derive(Debug, PartialEq)]
+struct Snapshot {
+    versions: usize,
+    bytes: Vec<u8>,
+    retention: StoredRetention,
+}
+
+impl Snapshot {
+    async fn of(backend: &MockBackend, uri: &str) -> Self {
+        Self {
+            versions: backend.version_count(uri),
+            bytes: backend.get_object_bounded(uri, 1 << 20).await.unwrap(),
+            retention: backend.stored_retention(uri, None),
+        }
+    }
+}
+
+/// The replay committed on a fresh object under its attempt key (#709):
+/// locked in the configured mode until about `retain_days` from now, named
+/// by the ledger row and the manifest, and the old object unchanged.
+async fn assert_fell_back(
+    engine: &Engine,
+    backend: &MockBackend,
+    outcome: &vtop_cli::BatchOutcome,
+    derived: &str,
+    old: &Snapshot,
+) {
+    let landed = outcome.object_uri.clone().unwrap();
+    assert_ne!(landed, derived, "the replay did not reuse {derived}");
+    assert!(
+        landed.contains(&outcome.batch_id),
+        "{landed} is the batch's attempt key"
+    );
+    let lock = engine.config.upload.object_lock.clone().unwrap();
+    let kept = backend.stored_retention(&landed, None);
+    assert_eq!(kept.mode.as_deref(), Some(lock.mode.as_s3()), "{kept:?}");
+    let until = kept
+        .retain_until_unix_secs
+        .expect("the fresh object is locked");
+    let want = unix_now() + i64::from(lock.retain_days) * 86_400;
+    assert!(
+        (want - 120..=want + 120).contains(&until),
+        "locked for retain_days from now: {until} vs {want}"
+    );
+    let row = row(engine, &outcome.batch_id).await;
+    assert_eq!(row.state, BatchState::SourceCommitted);
+    assert_eq!(row.object_uri.as_deref(), Some(landed.as_str()));
+    let manifest = backend
+        .get_object_bounded(row.manifest_uri.as_deref().unwrap(), 1 << 20)
+        .await
+        .unwrap();
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+    assert_eq!(
+        manifest["object"]["uri"].as_str(),
+        Some(landed.as_str()),
+        "the manifest names the fresh object"
+    );
+    assert_eq!(
+        &Snapshot::of(backend, derived).await,
+        old,
+        "{derived} is untouched: not written over, deleted or re-locked"
+    );
 }

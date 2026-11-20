@@ -5,9 +5,9 @@
 //! committed" path without any external service.
 
 use crate::base::{
-    judge_retention, CreatedUpload, ObjectChecksum, ObjectHead, ObjectLockMode, ObjectLockPolicy,
-    RequestedRetention, RetentionCheck, RetentionExpectation, StoredManifest, StoredObject,
-    StoredRetention, UploadBackend, UploadedPart, VerificationResult,
+    judge_retention, BucketFeature, CreatedUpload, LockPart, ObjectChecksum, ObjectHead,
+    ObjectLockMode, ObjectLockPolicy, RequestedRetention, RetentionCheck, RetentionExpectation,
+    StoredManifest, StoredObject, StoredRetention, UploadBackend, UploadedPart, VerificationResult,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -150,11 +150,22 @@ pub struct MockBackend {
     /// When set, `retention_error` applies only to keys ending with this
     /// suffix (#710), so a test can fail the receipts' reads alone.
     retention_error_suffix: Mutex<Option<String>>,
-    /// Whether the bucket answers that Object Lock is enabled. True unless a
+    /// The engine's credentials lack `s3:GetObjectRetention` and
+    /// `s3:GetObjectLegalHold` (#709): a HEAD answers with no lock headers,
+    /// and `confirm_lock_absent` is refused, as S3 does.
+    lock_read_denied: bool,
+    /// What the bucket answers about Object Lock. Enabled unless a test says
+    /// otherwise.
+    bucket_object_lock: BucketFeature,
+    /// What the bucket answers about versioning (#722). Enabled unless a
     /// test says otherwise.
-    bucket_object_lock: bool,
-    /// `bucket_object_lock_enabled` calls, so a test can pin that a config
-    /// without the profile makes none.
+    bucket_versioning: BucketFeature,
+    /// `bucket_versioning` calls.
+    versioning_calls: AtomicUsize,
+    /// How many upcoming versioning checks fail as a store blip would.
+    versioning_errors: AtomicUsize,
+    /// `bucket_object_lock` calls, so a test can pin that a config without
+    /// the profile makes none.
     lock_config_calls: AtomicUsize,
     /// The buckets those calls named, in order.
     lock_config_buckets: Mutex<Vec<String>>,
@@ -166,6 +177,10 @@ pub struct MockBackend {
     /// (#671 release B): a store refusing verification receipts. Settable on
     /// a shared mock, so one attempt can fail and the next succeed.
     failing_put_suffix: Mutex<Option<String>>,
+    /// Every put (object or manifest) to a key containing this text fails:
+    /// one batch range's puts, which its object key and batch id both name
+    /// (`-b0-7-`), while other ranges' go through (#626).
+    failing_put_containing: Mutex<Option<String>>,
     /// Every put to a key ending with this suffix never answers: a store
     /// that accepts the request and goes quiet (review of #711).
     hanging_put_suffix: Mutex<Option<String>>,
@@ -262,6 +277,14 @@ impl MockBackend {
         self
     }
 
+    /// The credentials lack the permissions to read a lock (#709): every
+    /// object reads as unlocked through a HEAD, and the requests that can
+    /// tell a refusal from an absence are refused.
+    pub fn without_lock_read_permission(mut self) -> Self {
+        self.lock_read_denied = true;
+        self
+    }
+
     /// Every retention read fails with `message`.
     pub fn with_retention_error(self, message: impl Into<String>) -> Self {
         self.set_retention_error(Some(message.into()));
@@ -302,8 +325,32 @@ impl MockBackend {
 
     /// The bucket answers that Object Lock is NOT enabled (#684).
     pub fn without_bucket_object_lock(mut self) -> Self {
-        self.bucket_object_lock = false;
+        self.bucket_object_lock = BucketFeature::NotEnabled;
         self
+    }
+
+    /// The store answers that it does not implement Object Lock at all
+    /// (#722): S3's 501 `NotImplemented`, as Garage documents.
+    pub fn with_object_lock_not_implemented(mut self) -> Self {
+        self.bucket_object_lock = BucketFeature::NotSupported;
+        self
+    }
+
+    /// What the bucket answers about versioning (#722).
+    pub fn with_bucket_versioning(mut self, answer: BucketFeature) -> Self {
+        self.bucket_versioning = answer;
+        self
+    }
+
+    /// The next `times` versioning checks fail with a 503, as a store blip.
+    pub fn with_versioning_errors(self, times: usize) -> Self {
+        self.versioning_errors.store(times, Ordering::SeqCst);
+        self
+    }
+
+    /// How many times the bucket's versioning was asked for.
+    pub fn versioning_calls(&self) -> usize {
+        self.versioning_calls.load(Ordering::SeqCst)
     }
 
     /// How many times the bucket's Object Lock configuration was asked for.
@@ -445,12 +492,17 @@ impl MockBackend {
             retention_error: Mutex::new(None),
             retention_reads: Mutex::new(Vec::new()),
             retention_error_suffix: Mutex::new(None),
-            bucket_object_lock: true,
+            lock_read_denied: false,
+            bucket_object_lock: BucketFeature::Enabled,
+            bucket_versioning: BucketFeature::Enabled,
+            versioning_calls: AtomicUsize::new(0),
+            versioning_errors: AtomicUsize::new(0),
             lock_config_calls: AtomicUsize::new(0),
             lock_config_buckets: Mutex::new(Vec::new()),
             lock_config_errors: AtomicUsize::new(0),
             retention: Mutex::new(HashMap::new()),
             failing_put_suffix: Mutex::new(None),
+            failing_put_containing: Mutex::new(None),
             hanging_put_suffix: Mutex::new(None),
             lock_fault_suffix: Mutex::new(None),
             multipart_fail_after_parts: Arc::new(AtomicUsize::new(usize::MAX)),
@@ -475,21 +527,24 @@ impl MockBackend {
         self
     }
 
-    fn take_throttle(&self, budget: &AtomicUsize, uri: &str) -> Result<(), VtopError> {
-        // Spend one unit of the budget if any is left. A compare-exchange loop
-        // because `fetch_update` is deprecated on current stable and its
-        // replacement is newer than the MSRV.
+    /// Spend one unit of `budget` if any is left. A compare-exchange loop
+    /// because `fetch_update` is deprecated on current stable and its
+    /// replacement is newer than the MSRV.
+    fn take_one(budget: &AtomicUsize) -> bool {
         let mut left = budget.load(Ordering::SeqCst);
-        let refused = loop {
+        loop {
             if left == 0 {
-                break false;
+                return false;
             }
             match budget.compare_exchange_weak(left, left - 1, Ordering::SeqCst, Ordering::SeqCst) {
-                Ok(_) => break true,
+                Ok(_) => return true,
                 Err(observed) => left = observed,
             }
-        };
-        if refused {
+        }
+    }
+
+    fn take_throttle(&self, budget: &AtomicUsize, uri: &str) -> Result<(), VtopError> {
+        if Self::take_one(budget) {
             Err(VtopError::UploadThrottled(format!(
                 "mock put {uri}: SlowDown (http 503): please reduce your request rate"
             )))
@@ -510,6 +565,12 @@ impl MockBackend {
     /// lets every put through again.
     pub fn set_failing_put_suffix(&self, suffix: Option<&str>) {
         *self.failing_put_suffix.lock().unwrap() = suffix.map(str::to_owned);
+    }
+
+    /// Every put to a key containing `text` fails; `None` lets them through
+    /// again.
+    pub fn set_failing_put_containing(&self, text: Option<&str>) {
+        *self.failing_put_containing.lock().unwrap() = text.map(str::to_owned);
     }
 
     /// Every put to a key ending with `suffix` never answers; `None` lets
@@ -537,7 +598,16 @@ impl MockBackend {
     }
 
     fn refuse_put(&self, uri: &str) -> Result<(), VtopError> {
+        let contained = self
+            .failing_put_containing
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|text| uri.contains(text));
         match self.failing_put_suffix.lock().unwrap().as_deref() {
+            _ if contained => Err(VtopError::Upload(format!(
+                "mock put {uri}: InternalError (http 500)"
+            ))),
             Some(suffix) if uri.ends_with(suffix) => {
                 let key = uri.strip_prefix("s3://").unwrap_or(uri);
                 Err(VtopError::Upload(format!(
@@ -684,6 +754,13 @@ impl MockBackend {
 
     pub fn ensure_bucket_calls(&self) -> usize {
         self.bucket_ensures.load(Ordering::SeqCst)
+    }
+
+    /// Every key the mock store holds an object or manifest at, sorted.
+    pub fn object_uris(&self) -> Vec<String> {
+        let mut uris: Vec<String> = self.objects.lock().unwrap().keys().cloned().collect();
+        uris.sort();
+        uris
     }
 
     /// True if the object exists in the mock store.
@@ -1030,35 +1107,30 @@ impl UploadBackend for MockBackend {
         true
     }
 
-    async fn verify_bucket_versioning(&self, _bucket: &str) -> Result<(), VtopError> {
-        Ok(())
+    async fn bucket_versioning(&self, bucket: &str) -> Result<BucketFeature, VtopError> {
+        self.versioning_calls.fetch_add(1, Ordering::SeqCst);
+        if Self::take_one(&self.versioning_errors) {
+            return Err(VtopError::Upload(format!(
+                "mock get_bucket_versioning {bucket}: ServiceUnavailable (http 503)"
+            )));
+        }
+        Ok(self.bucket_versioning)
     }
 
     fn object_lock(&self) -> Option<ObjectLockPolicy> {
         self.object_lock
     }
 
-    async fn bucket_object_lock_enabled(&self, bucket: &str) -> Result<bool, VtopError> {
+    async fn bucket_object_lock(&self, bucket: &str) -> Result<BucketFeature, VtopError> {
         self.lock_config_calls.fetch_add(1, Ordering::SeqCst);
         self.lock_config_buckets
             .lock()
             .unwrap()
             .push(bucket.to_owned());
-        let mut left = self.lock_config_errors.load(Ordering::SeqCst);
-        while left > 0 {
-            match self.lock_config_errors.compare_exchange_weak(
-                left,
-                left - 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => {
-                    return Err(VtopError::Upload(format!(
-                        "mock get_object_lock_configuration {bucket}: ServiceUnavailable (http 503)"
-                    )))
-                }
-                Err(observed) => left = observed,
-            }
+        if Self::take_one(&self.lock_config_errors) {
+            return Err(VtopError::Upload(format!(
+                "mock get_object_lock_configuration {bucket}: ServiceUnavailable (http 503)"
+            )));
         }
         Ok(self.bucket_object_lock)
     }
@@ -1101,10 +1173,34 @@ impl UploadBackend for MockBackend {
                 "{object_uri} (version {version})"
             )));
         }
-        Ok(judge_retention(
-            &self.stored_retention(object_uri, Some(&version)),
-            expected,
-        ))
+        let kept = if self.lock_read_denied {
+            StoredRetention::default()
+        } else {
+            self.stored_retention(object_uri, Some(&version))
+        };
+        Ok(judge_retention(&kept, expected))
+    }
+
+    async fn confirm_lock_absent(
+        &self,
+        object_uri: &str,
+        version_id: Option<&str>,
+        part: LockPart,
+    ) -> Result<bool, VtopError> {
+        if self.lock_read_denied {
+            return Err(VtopError::Upload(format!(
+                "mock get_object_{} {object_uri}: AccessDenied (http 403)",
+                match part {
+                    LockPart::Retention => "retention",
+                    LockPart::LegalHold => "legal_hold",
+                }
+            )));
+        }
+        let kept = self.stored_retention(object_uri, version_id);
+        Ok(match part {
+            LockPart::Retention => kept.mode.is_none() && kept.retain_until_unix_secs.is_none(),
+            LockPart::LegalHold => kept.legal_hold != Some(true),
+        })
     }
 
     /// Overrides the default no-op only to count: the trait's default would

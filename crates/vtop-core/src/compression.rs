@@ -156,6 +156,7 @@ mod tests {
             mtime: "now".into(),
             content_fingerprint: None,
             tail_fingerprint: None,
+            ctime: None,
         };
         TelemetryBatch {
             batch_id: "vtop-test".into(),

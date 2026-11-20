@@ -70,6 +70,14 @@ fn populated() -> String {
         .with_label_values(&[l[0], l[1], l[2], "strong", "size_only"])
         .inc_by(0);
     m.replay_required_total.with_label_values(&l).inc_by(0);
+    for reason in telemetry::RECOVERY_HOLD_REASONS {
+        m.recovery_held_total
+            .with_label_values(&[l[0], l[1], reason])
+            .inc_by(0);
+    }
+    m.recovery_rewinds_lowered_total
+        .with_label_values(&[l[0], l[1]])
+        .inc_by(0);
     m.failed_total.with_label_values(&l).inc_by(0);
     m.records_total.with_label_values(&l).inc_by(10);
     m.bytes_in_total.with_label_values(&l).inc_by(100);
@@ -84,6 +92,11 @@ fn populated() -> String {
     for d in telemetry::OBJECT_KEY_DECISIONS {
         m.object_key_decisions_total
             .with_label_values(&["default", "kafka", "cef", d])
+            .inc_by(0);
+    }
+    for r in telemetry::REPLAY_REBUILD_RESULTS {
+        m.replay_rebuilds_total
+            .with_label_values(&["default", "file", "raw", r])
             .inc_by(0);
     }
     for e in KAFKA_PARTITION_EVENTS {
@@ -158,6 +171,7 @@ fn the_object_lock_metrics_are_exported() {
         "legal_hold_missing",
         "error",
         "bucket_not_locked",
+        "store_unsupported",
     ] {
         let series =
             format!(r#"vtop_object_lock_checks_total{{result="{result}",tenant="default"}}"#);
@@ -296,7 +310,8 @@ fn every_exported_label_is_from_a_bounded_set() {
     // "outcome" those of FILE_DELETE_OUTCOMES (#619), never the path,
     // "event" the seven of KAFKA_PARTITION_EVENTS (#675), and
     // `verification_class` (strong, size_only, unknown) and `result` (strong,
-    // size_only, failed, unsupported_version) are closed sets (#664), and
+    // size_only, failed, unsupported_version) are closed sets (#664), as is
+    // `result` on vtop_replay_rebuilds_total (REPLAY_REBUILD_RESULTS, #626), and
     // "version" is the manifest version, "0.3" or "0.4", the values
     // `manifest.write_version` accepts (#671 release B).
     // "reason" and "signal" label the OpenTelemetry exporter's own counters
@@ -400,6 +415,28 @@ fn the_audit_counters_are_exported_with_bounded_labels() {
     assert_eq!(sinks, telemetry::AUDIT_SINKS);
 }
 
+/// #733: the count of secret files accepted under
+/// `security.allow_loose_secret_permissions` is exported under its name with
+/// no labels at all: the path and mode are in the log line and the audit
+/// record, never a label.
+#[test]
+fn the_secret_file_override_counter_is_exported_without_labels() {
+    let text = populated();
+    let name = "vtop_secret_file_permission_overrides_total";
+    assert!(
+        text.contains(&format!("# TYPE {name} counter")),
+        "{name} is not exported:\n{text}"
+    );
+    let series: Vec<_> = text.lines().filter(|line| line.starts_with(name)).collect();
+    assert_eq!(series.len(), 1, "{series:?}");
+    assert!(
+        series[0].starts_with(&format!("{name} ")),
+        "{name} must carry no labels: {}",
+        series[0]
+    );
+    assert!(telemetry::AUDIT_ACTIONS.contains(&"security.override"));
+}
+
 /// #664: the counter an alert on "verified strong, re-checked size-only" reads
 /// is exported under its name, with the class and result as labels.
 #[test]
@@ -412,6 +449,27 @@ fn the_recovery_recheck_counter_is_exported() {
                 && line.contains(r#"result="size_only""#)),
         "vtop_recovery_rechecks_total{{verification_class, result}} is missing:\n{text}"
     );
+}
+
+/// #782: the counters of a range recovery held and of a rewind it lowered
+/// above one are exported under their names, labelled by tenant, source type
+/// and, for the hold, its reason from a closed set: an alert on a state store
+/// refusing recovery's writes reads `reason="ledger_write_failed"`.
+#[test]
+fn the_recovery_hold_counters_are_exported() {
+    let text = populated();
+    assert_eq!(
+        telemetry::RECOVERY_HOLD_REASONS,
+        ["ledger_write_failed", "newer_manifest"]
+    );
+    for reason in telemetry::RECOVERY_HOLD_REASONS {
+        let series = format!(
+            r#"vtop_recovery_held_total{{reason="{reason}",source_type="kafka",tenant="default"}}"#
+        );
+        assert!(text.contains(&series), "missing {series}:\n{text}");
+    }
+    let series = r#"vtop_recovery_rewinds_lowered_total{source_type="kafka",tenant="default"}"#;
+    assert!(text.contains(series), "missing {series}:\n{text}");
 }
 
 /// The invariant, expressed in metrics: a commit is only ever recorded after a
@@ -621,6 +679,25 @@ fn object_key_decisions_are_exported_by_bounded_decision() {
     }
 }
 
+/// #626: what each replay of a recorded window came to is exported by
+/// `result`, from its bounded set, so an alert can see replays writing
+/// second objects (`bytes_differ`) without parsing logs. No range, key or
+/// path is a label.
+#[test]
+fn replay_rebuilds_are_exported_by_bounded_result() {
+    let text = populated();
+    assert!(text.contains("vtop_replay_rebuilds_total"), "{text}");
+    for r in vtop_core::telemetry::REPLAY_REBUILD_RESULTS {
+        let label = format!(r#"result="{r}""#);
+        assert!(
+            text.lines().any(
+                |line| line.starts_with("vtop_replay_rebuilds_total{") && line.contains(&label)
+            ),
+            "missing vtop_replay_rebuilds_total with {label}"
+        );
+    }
+}
+
 /// #619: every `delete_after_commit` decision is exported by `outcome`, a
 /// fixed set, so a rising `no_open_check` or `rename_refused` - files kept
 /// until the operator acts - can be alerted on without parsing logs.
@@ -632,6 +709,42 @@ fn file_delete_decisions_are_exported_by_bounded_outcome() {
         let label = format!(r#"outcome="{o}""#);
         assert!(text.contains(&label), "missing {label}");
     }
+}
+
+/// #619, v0.10.0: the outcome set is pinned by name. It is the union of the
+/// sixteen values v0.9.0 exported and the two v0.10.0 adds:
+/// `deleted_unchecked` (a delete under `delete_without_open_check` with no
+/// lease, the signal an operator is living with the opt-in's windows) and
+/// `links_changed` (a file kept because its link count changed). A value
+/// dropped or renamed breaks an alert, so a change here is deliberate.
+/// (`file_delete_decisions_are_exported_by_bounded_outcome` checks that
+/// /metrics exports each of them.)
+#[test]
+fn file_delete_outcomes_are_the_released_set_and_the_two_v0_10_0_adds() {
+    let released = [
+        "deleted",
+        "appended",
+        "shorter",
+        "other_file",
+        "rewritten",
+        "unprovable",
+        "metadata_changed",
+        "gone",
+        "symlink",
+        "open",
+        "no_open_check",
+        "rename_refused",
+        "failed",
+        "stale_commit",
+        "leftover_archived",
+        "opened_at_unlink",
+    ];
+    let added = ["deleted_unchecked", "links_changed"];
+    let mut expected: Vec<&str> = released.iter().chain(&added).copied().collect();
+    expected.sort_unstable();
+    let mut got: Vec<&str> = vtop_core::telemetry::FILE_DELETE_OUTCOMES.to_vec();
+    got.sort_unstable();
+    assert_eq!(got, expected, "telemetry::FILE_DELETE_OUTCOMES");
 }
 
 /// #675: Kafka partition-list changes are exported by `event`, a fixed set,

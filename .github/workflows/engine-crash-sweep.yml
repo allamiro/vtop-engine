@@ -1,0 +1,255 @@
+name: engine crash sweep
+
+# Kill the archive engine with SIGKILL at every failpoint against a real
+# Kafka broker, the lab's MinIO and a SQLite ledger, restart it, and check
+# that nothing is lost and nothing is committed at the source before it is
+# verified (#725). The harness is scripts/live-chaos/engine/run-sweep.sh.
+#
+# Three tiers, so a pull request does not pay for the full sweep:
+#   schedule           every point, nightly at 06:37 UTC (after the fuzz
+#                      nightly at 02:37)
+#   workflow_dispatch  every point, or the ones named
+#   pull_request       the five commit-boundary points, and only when the
+#                      engine, the ledger, the upload path, the adapters or
+#                      the harness change (55 s measured locally, after
+#                      the build)
+# A scheduled workflow runs only from the default branch, so the nightly
+# itself is first proven on main; a pull request proves the same job with
+# fewer points.
+#
+# The failpoints-absent job checks that no shipped build carries the
+# feature that lets the engine kill itself. It runs whenever a file that
+# decides a release build's features changes. The test job in ci.yml also
+# checks its release build of vtopctl for the kill itself.
+
+on:
+  schedule:
+    - cron: "37 6 * * *"
+  workflow_dispatch:
+    inputs:
+      points:
+        description: "all, or comma-separated failpoints"
+        required: false
+        default: all
+      records:
+        description: "records produced for each point"
+        required: false
+        default: "50"
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: engine-crash-sweep-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  changes:
+    name: detect changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      sweep: ${{ steps.filter.outputs.sweep }}
+      absent: ${{ steps.filter.outputs.absent }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        if: github.event_name == 'pull_request'
+        id: filter
+        with:
+          filters: |
+            sweep:
+              - '.github/workflows/engine-crash-sweep.yml'
+              - 'scripts/live-chaos/engine/**'
+              - 'scripts/live-chaos/lib.sh'
+              - 'crates/vtop-cli/**'
+              - 'crates/vtop-core/src/state_machine.rs'
+              - 'crates/vtop-core/src/replay.rs'
+              - 'crates/vtop-core/src/manifest.rs'
+              - 'crates/vtop-state/**'
+              - 'crates/vtop-upload/**'
+              - 'crates/vtop-adapters/**'
+              - 'docker/minio/**'
+              - 'docker-compose.yml'
+            absent:
+              - '.github/workflows/engine-crash-sweep.yml'
+              - 'scripts/check-failpoints-absent.sh'
+              - 'Cargo.toml'
+              - 'crates/*/Cargo.toml'
+              - '.github/workflows/release.yml'
+              - 'docker/Dockerfile'
+
+  failpoints-absent:
+    name: failpoints absent from release builds
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.absent == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: The default features, release.yml and the Dockerfile leave failpoints out
+        run: bash scripts/check-failpoints-absent.sh
+
+  sweep:
+    name: engine crash sweep (real Kafka, MinIO)
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.sweep == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      # As the kafka-integration job in ci.yml runs it: the same pinned image,
+      # advertising localhost so the engine on the runner reaches it.
+      kafka:
+        image: apache/kafka:4.3.1
+        ports:
+          - 9092:9092
+        env:
+          KAFKA_NODE_ID: 1
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 12
+          --health-start-period 20s
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+
+      # Restore only, from the kafka-integration job's entry: the same
+      # dependencies in the same profile, so only vtop-cli and rustix
+      # recompile for the feature, and this workflow adds no cache entry of
+      # its own to an Actions cache that is already over its limit.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-kafka-it-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install librdkafka build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang libssl-dev libsasl2-dev libcurl4-openssl-dev zlib1g-dev pkg-config
+
+      - name: The harness checks (unit tests)
+        run: python3 -m unittest discover -s scripts/live-chaos/engine -p 'test_*.py' -v
+
+      # The workspace clippy in ci.yml builds without the feature, so the
+      # code behind it (the decorators, the kill) is linted only here.
+      - name: Clippy with failpoints (deny warnings)
+        run: cargo clippy -p vtop-cli --features failpoints --all-targets --locked -- -D warnings
+
+      # Every point kills the real binary where it says, with a local file
+      # source and store: seconds, and it pins the placement the live sweep
+      # relies on.
+      - name: Every failpoint fires where it says (in-repo test)
+        run: cargo test -p vtop-cli --features failpoints --locked --test failpoints
+
+      - name: Build vtopctl with failpoints
+        run: cargo build -p vtop-cli --features failpoints --locked --bin vtopctl
+
+      # The positive control for the release-binary check in ci.yml's test
+      # job: the same search finds the kill in a build that has it.
+      - name: The failpoints build carries the kill
+        run: bash scripts/check-failpoints-absent.sh --binary target/debug/vtopctl --expect-present
+
+      # A fresh broker creates the group coordinator lazily, on the first
+      # group operation; until then a consumer gets NotCoordinator. Consuming
+      # once under a throwaway group forces it into existence, as the
+      # kafka-integration job does.
+      - name: Warm up the Kafka group coordinator
+        run: |
+          set -euo pipefail
+          cid=$(docker ps --filter "ancestor=apache/kafka:4.3.1" --format '{{.ID}}' | head -1)
+          docker exec "$cid" /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+            --create --if-not-exists --topic sweep_warmup --partitions 1 --replication-factor 1
+          echo warmup | docker exec -i "$cid" /opt/kafka/bin/kafka-console-producer.sh \
+            --bootstrap-server localhost:9092 --topic sweep_warmup
+          docker exec "$cid" /opt/kafka/bin/kafka-console-consumer.sh \
+            --bootstrap-server localhost:9092 --topic sweep_warmup \
+            --group sweep-warmup --from-beginning --max-messages 1 --timeout-ms 30000
+
+      # As the s3-compat-matrix.yml MinIO leg: built from source, started
+      # from docker-compose.yml. The engine creates its own bucket.
+      - name: Build and start the lab's MinIO
+        run: |
+          set -euo pipefail
+          docker compose build minio
+          docker compose up -d --wait minio
+
+      - name: Choose the points
+        id: points
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_POINTS: ${{ inputs.points }}
+          INPUT_RECORDS: ${{ inputs.records }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            pull_request)
+              # The commit boundary and the store writes either side of it.
+              points=mid_object_put,after_object_put_before_ledger,after_manifest_put_before_ledger,before_source_commit,after_source_commit_before_ledger
+              records=50 ;;
+            workflow_dispatch)
+              points="${INPUT_POINTS:-all}"
+              records="${INPUT_RECORDS:-50}" ;;
+            *)
+              points=all
+              records=50 ;;
+          esac
+          echo "points=$points" >> "$GITHUB_OUTPUT"
+          echo "records=$records" >> "$GITHUB_OUTPUT"
+
+      - name: Run the sweep
+        id: sweep
+        env:
+          CHAOS_PROFILE: debug
+          CHAOS_WORKDIR: ${{ runner.temp }}/engine-sweep
+          ENGINE_SWEEP_POINTS: ${{ steps.points.outputs.points }}
+          ENGINE_SWEEP_RECORDS: ${{ steps.points.outputs.records }}
+          ENGINE_SWEEP_KAFKA_BOOTSTRAP: localhost:9092
+          ENGINE_SWEEP_S3_ENDPOINT: http://127.0.0.1:9000
+        run: scripts/live-chaos/engine/run-sweep.sh
+
+      - name: Upload the sweep's logs
+        if: steps.sweep.outcome == 'failure'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: engine-sweep-logs
+          path: |
+            ${{ runner.temp }}/engine-sweep/**/*.log
+            ${{ runner.temp }}/engine-sweep/**/*.json
+            ${{ runner.temp }}/engine-sweep/**/config.yaml
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: MinIO logs on failure
+        if: failure()
+        run: docker compose logs --tail=200 minio || true

@@ -7,7 +7,7 @@ about Northguard/Xinfra come from LinkedIn's public materials (their system is
 closed source, so that comparison is necessarily against what they have
 published, not against their code).
 
-VTOP is a **prototype / reference implementation** (0.x pre-releases). This
+VTOP is a **prototype / reference implementation** (0.x releases). This
 document compares architectures and guarantees, not production mileage —
 Kafka and Northguard both carry years of at-scale operation that no design
 argument substitutes for.
@@ -45,9 +45,9 @@ head-on.
 |---|---|---|
 | Epoch-qualified truncation (KIP-101/KIP-279) | Largely closed in v0.2.0: per-replica epoch history, bounded divergence truncation, fence-and-read reconciliation. The §5.4.1-style election restriction shipped in v0.4.0 (`promotion.rs`, per-voter form). The §5.4.2 rule — a new leader publishes its high-water mark only through a quorum-acked marker of its own epoch, so a published mark never regresses — is implemented on `main` for v0.5.0 (`publish_boundary_marker`, driven from the lease publisher; scenarios 09 and 14 assert the non-regression). The remaining piece is the signed leadership-transition record. | #240 remainder |
 | Transactions / EOS | Kafka has cross-partition transactions and exactly-once streams. VTOP has producer idempotency (epoch + sequence dedup) — enough for exactly-once produce per range, no cross-range transactions. | Not scheduled; deliberate scope cut for now |
-| Consumer-group sophistication | Kafka has incremental cooperative rebalancing, static membership, regex subscriptions. VTOP has groups, cursors-in-metadata, heartbeats, and assignment — the minimum honest core. | Grows with #225's needs |
-| Ecosystem | Clients in every language, Connect, Streams, MirrorMaker, ksqlDB, decades of operational tooling. VTOP has `vtopctl` and dashboards-as-code. | #225 (Kafka wire-compatibility gateway) — inherit the client ecosystem instead of rebuilding it |
-| Scale features | Quotas, throttled reassignment, multi-tenancy, tiered storage at scale, thousands-of-partition operations. | Post-v0.2.0; benchmarks tracked in #92/#98/#130 |
+| Consumer-group sophistication | Kafka has incremental cooperative rebalancing, static membership, regex subscriptions. VTOP has groups, cursors-in-metadata, heartbeats, and assignment — the minimum honest core. | Not scheduled |
+| Ecosystem | Clients in every language, Connect, Streams, MirrorMaker, ksqlDB, decades of operational tooling. VTOP has `vtopctl`, dashboards-as-code, and a Kafka wire-compatibility gateway (#225) that stock librdkafka clients produce to and consume from; it is measured slower than Apache Kafka ([benchmarks/kafka-comparison.md](benchmarks/kafka-comparison.md)), and a Kafka client cannot yet follow a VTOP failover. | #225 shipped the gateway; a Kafka client following a failover is #751 (v0.11.0) |
+| Scale features | Quotas, throttled reassignment, multi-tenancy, tiered storage at scale, thousands-of-partition operations. | Not scheduled. The benchmark issues once named here (#92, #98, #130) are closed |
 
 ### Measured
 
@@ -106,10 +106,10 @@ Kafka pain points: fixed partitioning, coupled metadata, opaque rebalancing.
 
 | Gap | Honest state | Closing item |
 |---|---|---|
-| Metadata scale-out | Northguard shards metadata so no central group is a bottleneck. VTOP runs **one** metadata Raft group; saturation characteristics are researched (`METADATA_SATURATION_RESEARCH.md`) but sharding is not built. | Post-v0.2.0 arc; research doc is the seed |
-| Live range splitting / self-balancing | VTOP models lineage and placement but does not yet split ranges under load or self-balance placements live. | Post-v0.2.0; placement plane (#180/#181) is the foundation |
-| Virtualization / migration layer | Xinfra gives LinkedIn topic virtualization and transparent migration between backends. VTOP has nothing equivalent; #225's gateway is the nearest analog (protocol-level rather than address-level). | #225, then revisit |
-| Production mileage | Northguard runs LinkedIn-scale traffic (trillions of records/day, per their materials). VTOP's scale story is a benchmark plan, not a track record. | #92 / #98 / #130 sweep grid and soaks |
+| Metadata scale-out | Northguard shards metadata so no central group is a bottleneck. VTOP runs **one** metadata Raft group; saturation characteristics are researched (`METADATA_SATURATION_RESEARCH.md`) but sharding is not built. | Not scheduled (no open issue); the research doc is the seed |
+| Live range splitting / self-balancing | VTOP models lineage and placement but does not yet split ranges under load or self-balance placements live. | Not scheduled (no open issue); the placement plane (#180/#181) is the foundation |
+| Virtualization / migration layer | Xinfra gives LinkedIn topic virtualization and transparent migration between backends. VTOP has nothing equivalent; #225's gateway is the nearest analog (protocol-level rather than address-level). | Not scheduled |
+| Production mileage | Northguard runs LinkedIn-scale traffic (trillions of records/day, per their materials). VTOP's scale story is a benchmark plan, not a track record. | Soaks (#726, #727) and a 30-day pilot deployment (#738), milestones v0.11.0 and v0.12.0 |
 | Multi-tenancy | Published Northguard material emphasizes tenant isolation. VTOP is single-tenant today (one principal per range in the authorizer). | Identity layer landed with #238 (v0.2.0); per-tenant principals on top of it are the remaining work |
 
 ## What "better" means here, concretely

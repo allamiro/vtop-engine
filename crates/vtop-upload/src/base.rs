@@ -169,6 +169,18 @@ pub struct StoredRetention {
     pub legal_hold: Option<bool>,
 }
 
+/// What a store answered about one bucket feature, versioning or Object Lock
+/// (#722). [`NotSupported`](Self::NotSupported) is the store saying it does
+/// not implement the feature at all (HTTP 501 `NotImplemented`), which no
+/// bucket setting can change; a check that could not be made is an `Err`
+/// instead, and proves nothing either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketFeature {
+    Enabled,
+    NotEnabled,
+    NotSupported,
+}
+
 /// What a stored object's retention must satisfy (#684).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionExpectation {
@@ -176,6 +188,34 @@ pub struct RetentionExpectation {
     /// The earliest acceptable retain-until date, in Unix seconds.
     pub retain_until_at_least_unix_secs: i64,
     pub legal_hold: bool,
+}
+
+/// One part of an object's Object Lock state, for
+/// [`UploadBackend::confirm_lock_absent`] (#709).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockPart {
+    /// The retention mode and date (S3 `GetObjectRetention`).
+    Retention,
+    /// The legal hold (S3 `GetObjectLegalHold`).
+    LegalHold,
+}
+
+impl LockPart {
+    /// The part, for an operator message.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Retention => "retention",
+            Self::LegalHold => "legal hold",
+        }
+    }
+
+    /// The permission a store checks before it answers for this part.
+    pub fn permission(self) -> &'static str {
+        match self {
+            Self::Retention => "s3:GetObjectRetention",
+            Self::LegalHold => "s3:GetObjectLegalHold",
+        }
+    }
 }
 
 /// The outcome of [`UploadBackend::verify_retention`] (#684). Its
@@ -974,15 +1014,17 @@ pub trait UploadBackend: Send + Sync {
 
     /// Whether this backend can return and re-address immutable object
     /// versions. `false` means `put_manifest` never yields a version and
-    /// `get_manifest_pinned`/`verify_bucket_versioning` fail closed.
+    /// `get_manifest_pinned`/`bucket_versioning` fail closed.
     fn supports_object_versions(&self) -> bool {
         false
     }
 
-    /// Preflight for the hardened profile: confirm the bucket keeps immutable
-    /// versions of overwritten objects. Default fails closed for backends
+    /// Preflight for the hardened profile: whether the bucket keeps immutable
+    /// versions of overwritten objects (S3 `GetBucketVersioning`).
+    /// `NotEnabled` and `NotSupported` are the store's answers; `Err` is a
+    /// check that could not be made. The default fails closed for backends
     /// without versioning.
-    async fn verify_bucket_versioning(&self, bucket: &str) -> Result<(), VtopError> {
+    async fn bucket_versioning(&self, bucket: &str) -> Result<BucketFeature, VtopError> {
         Err(VtopError::Upload(format!(
             "backend {} cannot confirm object versioning on bucket {bucket}",
             self.backend_name()
@@ -996,11 +1038,12 @@ pub trait UploadBackend: Send + Sync {
     }
 
     /// Preflight for the Object Lock profile (#684): whether the bucket has
-    /// Object Lock enabled (S3 `GetObjectLockConfiguration`). `Ok(false)` is
-    /// the store's answer that it has not; `Err` is a check that could not be
-    /// made. The default fails closed, like
-    /// [`verify_bucket_versioning`](Self::verify_bucket_versioning).
-    async fn bucket_object_lock_enabled(&self, bucket: &str) -> Result<bool, VtopError> {
+    /// Object Lock enabled (S3 `GetObjectLockConfiguration`). `NotEnabled`
+    /// is the store's answer that it has not, `NotSupported` its answer that
+    /// it does not implement Object Lock at all (#722); `Err` is a check that
+    /// could not be made. The default fails closed, like
+    /// [`bucket_versioning`](Self::bucket_versioning).
+    async fn bucket_object_lock(&self, bucket: &str) -> Result<BucketFeature, VtopError> {
         Err(VtopError::Upload(format!(
             "backend {} cannot read the Object Lock configuration of bucket {bucket}",
             self.backend_name()
@@ -1023,6 +1066,29 @@ pub trait UploadBackend: Send + Sync {
         _expected: &RetentionExpectation,
     ) -> Result<RetentionCheck, VtopError> {
         Ok(RetentionCheck::Unsupported)
+    }
+
+    /// Confirm that one object version really has no retention, or no legal
+    /// hold, with a request that answers a refused permission with an error
+    /// rather than with silence (#709). S3 omits the lock headers from a
+    /// HEAD to a caller without `s3:GetObjectRetention` (the legal hold
+    /// without `s3:GetObjectLegalHold`), so
+    /// [`verify_retention`](Self::verify_retention) reads a lost permission
+    /// as a missing lock;
+    /// the engine asks this before it acts on a missing one by writing a new
+    /// object. `Ok(true)`: the store says there is none. `Ok(false)`: there
+    /// is one after all. `Err`: it could not be read. The default fails
+    /// closed.
+    async fn confirm_lock_absent(
+        &self,
+        object_uri: &str,
+        _version_id: Option<&str>,
+        part: LockPart,
+    ) -> Result<bool, VtopError> {
+        Err(VtopError::Upload(format!(
+            "backend {} cannot confirm the {part:?} of {object_uri}",
+            self.backend_name()
+        )))
     }
 
     /// HEAD/stat an object.

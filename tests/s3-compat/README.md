@@ -98,15 +98,68 @@ test fails once at its end, listing each unexpected case.
 | `VTOP_TEST_S3_LOCKED_BUCKET` | `telemetry-locked` | a bucket created with Object Lock |
 | `VTOP_TEST_S3_SERVERS_DIR` | this directory's `servers/` | for test binaries run from another checkout |
 
-## Running against the lab's MinIO
+## Running a server on a laptop
+
+Every server has `docker/s3-servers/<id>/compose.yml` (a `server` and an
+`init` that creates the buckets with the pinned AWS CLI) and `server.env`
+(how the tests reach it). `scripts/s3-lab.sh` drives them the way the CI leg
+does:
 
 ```bash
-docker compose build minio && docker compose up -d minio && docker compose run --rm minio-init
-VTOP_TEST_S3_SERVER=minio VTOP_TEST_S3_ENDPOINT=http://127.0.0.1:9000 \
-  AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
-  VTOP_TEST_S3_RESULTS=/tmp/results-minio.jsonl \
+scripts/s3-lab.sh build minio      # the lab's MinIO is built from source
+scripts/s3-lab.sh up minio
+eval "$(scripts/s3-lab.sh env minio | sed 's/^/export /')"
+VTOP_TEST_S3_RESULTS=/tmp/results-minio.jsonl \
   cargo test -p vtop-upload --test live_s3_verification -- --ignored --test-threads=1
+scripts/s3-lab.sh summary minio /tmp/results-minio.jsonl
+scripts/s3-lab.sh down minio
 ```
+
+## In CI
+
+`.github/workflows/s3-compat-matrix.yml` builds the live test binaries once
+and runs them in one leg per server. It runs:
+
+- from `ci.yml`, with the lab's MinIO alone, on a pull request (and a push to
+  `main`) that touches the crates the live tests build or the MinIO build;
+- every server, nightly (03:47 UTC) and on `workflow_dispatch` (an optional
+  `servers` list such as `["garage"]` narrows it);
+- every server, on a pull request that changes the workflow, a server's
+  compose file, the lab script or a capability file, so a change to a
+  server's setup is proven on its own head before it merges.
+
+A leg whose server is `gating: false` cannot fail the run; its summary still
+lists every case and every unexpected outcome, and its results are uploaded
+as `s3-compat-results-<id>`. The workflow's `LEGS` table states each server's
+`gating` too (it decides `continue-on-error` before any step runs), and the
+leg fails if the two disagree. A weekly job
+(`.github/workflows/s3-pins.yml`) checks that every pulled server image is
+pinned by digest and that the digest still resolves.
+
+## Probes and the second checksum pass
+
+`crates/vtop-upload/tests/live_s3_probes.rs` asks each server two things
+VTOP's guarantees lean on or may: whether a PUT with a wrong
+`x-amz-checksum-sha256` is refused and nothing stored
+(`checksum_sha256_enforced`; `store_checksum` verification trusts the
+SHA-256 a store reports, so a store that echoed an unchecked header would
+pass corrupt data), and whether `If-None-Match: *` on PUT is honoured
+(`conditional_put`, informational).
+
+Each leg also reruns the verification and Object Lock write tests with
+`AWS_REQUEST_CHECKSUM_CALCULATION=when_required` (D13), into
+`when_required-<id>.jsonl` beside the leg's results. In that pass a PUT
+carries no default CRC32, so `checksum_crc32_default` is dropped from each
+case's capabilities, and every line records its `sdk_checksum` mode.
+
+## Licences
+
+The servers run as unmodified test containers in CI and on a laptop. VTOP
+does not link them, ship them or distribute their images: each leg pulls
+(or, for the lab's MinIO, builds) the image from its own source. That is
+why AGPL-3.0 servers, the MinIO line and Garage, are acceptable as test
+services here; the decision is recorded in #722. A server whose licence
+would forbid even that is not added.
 
 ## Adding a server
 
@@ -115,6 +168,15 @@ VTOP_TEST_S3_SERVER=minio VTOP_TEST_S3_ENDPOINT=http://127.0.0.1:9000 \
    with the moment VTOP refuses them. A case with no refusal body fails on
    an `unsupported` capability ("no refusal path"), which is how a missing
    refusal test shows; add the refusal body to the case in the same PR.
-2. Run the live tests against it with `VTOP_TEST_S3_SERVER=<id>` and
-   `VTOP_TEST_S3_RESULTS` set, and settle each `unknown` from the results.
-3. Commit the settled file in the same PR as the server's CI leg.
+2. Add `docker/s3-servers/<id>/compose.yml` with the two services `server`
+   (its image pinned by digest, the tag in a comment, ports on `127.0.0.1`,
+   `no-new-privileges`, `cap_drop: [ALL]`, a memory limit) and `init` (the
+   pinned AWS CLI running `docker/s3-servers/init/bootstrap.sh`; set
+   `CREATE_LOCKED: "false"` if the server has no Object Lock), and
+   `server.env` with `SERVER_VERSION`, `VTOP_TEST_S3_ENDPOINT` and the lab
+   credentials.
+3. Run the live tests against it (`scripts/s3-lab.sh up <id>`, then the
+   tests with `VTOP_TEST_S3_RESULTS` set), and settle each `unknown` from
+   the results.
+4. Add the leg to the `s3-compat` matrix in `.github/workflows/ci.yml` with
+   the file's `gating`, and commit the settled file in the same PR.

@@ -17,17 +17,68 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Subcommand};
 use vtop_core::errors::VtopError;
 use vtop_core::manifest::ManifestKeyring;
+use vtop_core::secret_file::{self, Override, SecretFile, SecretFileKind, SecretPolicy};
 use vtop_observe::audit::{
     self as audit, Action, Actor, AuditEvent, Outcome, ReadRecord, Sink, Stage, Target, LOG_ENV,
 };
 use vtop_state::{AuditInsert, StateStore};
 
 /// Open the audit file `VTOP_AUDIT_LOG` names, if any. A set but unwritable
-/// path is a startup error naming it.
-pub fn init_sink() -> Result<(), VtopError> {
-    audit::init_file_sink_from_env()
-        .map(|_| ())
-        .map_err(|e| VtopError::Config(e.to_string()))
+/// path is a startup error naming it, and so is an existing file other users
+/// can write, or read beyond its group (#733; group read is the log
+/// shipper's way in and is accepted). `policy` is the engine's
+/// ([`vtop_core::config::VtopConfig::secret_policy`]), or the strict default
+/// for a command with no engine config.
+pub fn init_sink(policy: &SecretPolicy) -> Result<(), VtopError> {
+    let accepted = match audit_file_from_env() {
+        Some(file) => secret_file::inspect(&file, policy)
+            .map_err(|refused| VtopError::Config(refused.to_string()))?,
+        None => None,
+    };
+    audit::init_file_sink_from_env().map_err(|e| VtopError::Config(e.to_string()))?;
+    // Announced once the file is open, so the record of accepting the audit
+    // file is in the audit file.
+    if let Some(accepted) = accepted {
+        secret_file::announce(&accepted);
+    }
+    Ok(())
+}
+
+/// The file `VTOP_AUDIT_LOG` names, as a file to check, when it names one.
+pub fn audit_file_from_env() -> Option<SecretFile> {
+    std::env::var_os(LOG_ENV)
+        .filter(|value| !value.is_empty())
+        .map(|path| {
+            SecretFile::new(
+                SecretFileKind::AuditLog,
+                format!("the audit file ({LOG_ENV})"),
+                PathBuf::from(path),
+            )
+        })
+}
+
+/// The audit record of a file accepted under
+/// `security.allow_loose_secret_permissions` (#733), installed as
+/// [`secret_file::set_override_hook`] before any file is read. Its target is
+/// the file; its parameters what the file holds, its mode and who can read
+/// it, never its contents.
+pub fn record_secret_override(accepted: &Override) {
+    let mut event = AuditEvent::new(
+        Action::SecurityOverride,
+        Stage::Local,
+        Actor::local(),
+        Target::new("file", Some(accepted.file.path.display().to_string())),
+        Outcome::Success,
+    )
+    .param("file_kind", accepted.file.kind.as_str())
+    .param("mode", accepted.mode_text())
+    .param("exposed_to", accepted.exposure.as_str())
+    .param("setting", secret_file::OVERRIDE_SETTING)
+    .request_id(uuid::Uuid::new_v4());
+    if let Some(engine) = &accepted.engine {
+        event = event.engine(engine);
+    }
+    record_best_effort(&event);
 }
 
 /// Count audit records in the engine's registry.
@@ -442,13 +493,16 @@ async fn open_store(
 ) -> Result<(Box<dyn StateStore>, ManifestKeyring), VtopError> {
     let cfg = vtop_core::config::VtopConfig::from_path(config)?;
     cfg.validate()?;
+    // Before any file is read: a key, secret or ledger file accepted under
+    // the override is recorded in the audit file as well as the log (#733).
+    init_sink(&cfg.secret_policy())?;
     let keyring = if with_keyring {
         cfg.resolve_manifest_keyring()?
     } else {
         ManifestKeyring::default()
     };
-    let state_store = cfg.engine.state_store.resolve()?;
-    let store = crate::engine::connect_configured_store(&cfg.engine, &state_store).await?;
+    let state_store = cfg.resolve_state_store()?;
+    let store = crate::engine::connect_configured_store(&cfg, &state_store).await?;
     Ok((store, keyring))
 }
 
