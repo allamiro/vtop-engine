@@ -1753,12 +1753,25 @@ jobs:
           key: ${{ runner.os }}-manifest-compat-${{ hashFiles('**/Cargo.lock') }}
       # v0.7.0, the last release before the 0.4 reader, and the newest patch
       # of every minor series from v0.8.0, DERIVED from the tags so a new
-      # release joins the day its tag exists. Finals only, as upgrade-compat.
+      # release joins the day its assets are published. Finals only, as
+      # upgrade-compat. Only tags with a published GitHub release count: a
+      # release tag is pushed right after its bump merges, and main's CI on
+      # that merge starts while release.yml is still building the assets
+      # (about 35 minutes), so the newest patch falls back to the previous
+      # one of its series until it is published (v0.10.1 failed main with
+      # "release not found" this way).
       - name: Select the released readers
         id: tags
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          published="$(gh release list --limit 200 --exclude-drafts --json tagName --jq '.[].tagName')"
+          for t in $(git tag --list 'v[0-9]*'); do
+            grep -qx "$t" <<< "$published" || echo "::notice::$t has no published release yet; its series uses the previous patch"
+          done
           tags="$(git tag --list 'v[0-9]*' --sort=version:refname \
+            | grep -Fx -f <(printf '%s\n' "$published") \
             | awk -F. '/^v[0-9]+\.[0-9]+\.[0-9]+$/ { latest[$1 "." $2] = $0 } END { for (m in latest) print latest[m] }' \
             | sort -V \
             | awk -F. '{ maj = substr($1, 2) + 0; min = $2 + 0; if (maj > 0 || min >= 7) print }' \
@@ -2444,8 +2457,16 @@ jobs:
     # fixed `vtop_test_*` databases and roles, and the workflow's concurrency
     # group is per ref. One at a time across the repository; a run waits
     # rather than cancel another's half-done restore.
+    #
+    # GitHub keeps one PENDING job per concurrency group and cancels the older
+    # pending one when a third arrives, whatever cancel-in-progress says, so a
+    # shared group cancels (and reddens) other PRs' runs while two or more
+    # wait. When no managed database is configured the job does nothing, so
+    # it then gets a group of its own per run and never queues. The client
+    # image variable is required whenever the smoke is enabled (the gate step
+    # refuses without it), and unlike a secret, `vars` may name a group.
     concurrency:
-      group: postgres-managed-smoke
+      group: ${{ vars.VTOP_MANAGED_POSTGRES_CLIENT_IMAGE != '' && 'postgres-managed-smoke' || format('postgres-managed-smoke-off-{0}-{1}', github.run_id, github.run_attempt) }}
       cancel-in-progress: false
     env:
       VTOP_TEST_POSTGRES: ${{ secrets.VTOP_MANAGED_POSTGRES_URL }}

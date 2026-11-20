@@ -14,7 +14,8 @@ every upgrade.
 The source for this page is the release notes in the [roadmap](../ROADMAP.md);
 read the section for the release you are moving to. What each format
 promises, and the rules for changing one, are in the
-[compatibility policy](../reference/compatibility.md).
+[compatibility policy](../reference/compatibility.md); which releases get
+fixes is in [Versioning and support](../SUPPORT.md).
 
 ## Upgrading from v0.7.0 to v0.8.0
 
