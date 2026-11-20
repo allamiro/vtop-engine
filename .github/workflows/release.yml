@@ -650,15 +650,18 @@ jobs:
   # come from one of these; the job prints each one's version so a run can be
   # read without rebuilding):
   #   - the Rust toolchain: `stable` moves every six weeks;
-  #   - the distribution packages installed into AlmaLinux 8 (gcc, cmake,
-  #     perl and the -devel libraries): the image is pinned by digest, the
-  #     packages are whatever the mirrors serve that day;
+  #   - the distribution packages installed into the build image (manylinux2014:
+  #     perl-core and libcurl-devel from CentOS 7's vault; Alpine: build-base,
+  #     cmake, perl, linux-headers and curl-dev; both images are pinned by
+  #     digest, the packages are whatever the mirrors serve that day);
   #   - macOS: the runner image's Xcode and SDK, and Homebrew's cmake.
   # If a run shows drift, pin the input in this file (the `binaries` job and
   # this one together), never repository-wide.
   #
-  # The two build recipes below are copies of the `binaries` job's: a change
-  # to one must be made in the other, or this job compares unlike builds.
+  # The build recipes below (macOS, Linux glibc inside manylinux2014, Linux
+  # musl inside Alpine, and every matrix `build_image`) are copies of the
+  # `binaries` job's, apart from the lines that record the inputs: a change to
+  # one must be made in the other, or this job compares unlike builds.
   # ---------------------------------------------------------------------------
   reproduce:
     name: reproduce ${{ matrix.target }} (report only)
@@ -670,10 +673,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The same six legs and the same build images (digests included) as
+          # the `binaries` job's matrix.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            build_image: quay.io/pypa/manylinux2014_x86_64@sha256:e6a785657009c612fe2a85fa933051d03a50ba62b1c5e47d62abcab546a2e423
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            build_image: quay.io/pypa/manylinux2014_aarch64@sha256:c2995cae5e2d433fbe757d1466486727b3edd68ba644cd60df253365f35fda9e
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            build_image: rust:1-alpine@sha256:8d0e82abfdf9a38071e07cabc5afba4ddbe077631a80e4e742a760c38beadc33
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            build_image: rust:1-alpine@sha256:8d0e82abfdf9a38071e07cabc5afba4ddbe077631a80e4e742a760c38beadc33
           - os: macos-15
             target: aarch64-apple-darwin
           - os: macos-15-intel
@@ -717,15 +730,18 @@ jobs:
             echo "cmake: $(brew list --versions cmake)"
           } | tee repro/inputs.txt
 
-      - name: Build (Linux, inside AlmaLinux 8)
-        if: runner.os == 'Linux'
+      # The `binaries` job's Linux glibc recipe: the same image, mounts, packages
+      # and build command. Only the `repro/inputs.txt` lines record the inputs.
+      - name: Build (Linux glibc, inside manylinux2014)
+        if: endsWith(matrix.target, '-linux-gnu')
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-          BUILD_IMAGE: almalinux:8@sha256:2d0f2eb2a83cc09dbc2eb92fade4dbe8f709628149e81aa00aec70630406603b
+          BUILD_IMAGE: ${{ matrix.build_image }}
         run: |
           set -euo pipefail
           mkdir -p repro
+          echo "image: $BUILD_IMAGE" > repro/inputs.txt
           docker run --rm \
             -e TARGET -e CARGO_TERM_COLOR -e RUST_BACKTRACE -e CARGO_INCREMENTAL \
             -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
@@ -736,20 +752,63 @@ jobs:
             "$BUILD_IMAGE" bash -c '
               set -euo pipefail
               for i in 1 2 3; do
-                dnf -y -q install gcc gcc-c++ make cmake perl \
-                  openssl-devel cyrus-sasl-devel libcurl-devel zlib-devel && break
-                [ "$i" = 3 ] && { echo "dnf install failed 3 times" >&2; exit 1; }
+                yum -y -q install perl-core libcurl-devel && break
+                [ "$i" = 3 ] && { echo "yum install failed 3 times" >&2; exit 1; }
                 sleep 15
               done
               trap "chown -R \"\$HOST_UID:\$HOST_GID\" /src/target /src/repro /cargo/registry /cargo/git 2>/dev/null || true" EXIT
               export PATH="/cargo/bin:$PATH"
+              echo "$(getconf GNU_LIBC_VERSION), gcc $(gcc -dumpfullversion), $(cmake --version | head -n1)"
+              cargo --version
+              cargo build --release --bin vtop-node --bin vtopctl --target "$TARGET" --locked
               {
                 echo "rustc: $(rustc --version)"
                 echo "cargo: $(cargo --version)"
                 echo "glibc: $(getconf GNU_LIBC_VERSION), gcc $(gcc -dumpfullversion)"
-                rpm -q gcc gcc-c++ make cmake perl openssl-devel cyrus-sasl-devel libcurl-devel zlib-devel
-              } | tee /src/repro/inputs.txt
-              cargo build --release --bin vtop-node --bin vtopctl --target "$TARGET" --locked
+                echo "cmake: $(cmake --version | head -n1)"
+                rpm -q perl-core libcurl-devel
+              } | tee -a /src/repro/inputs.txt
+            '
+
+      # The `binaries` job's Linux musl recipe: the same image, packages,
+      # toolchain install and build command. Only the `repro/inputs.txt` lines
+      # record the inputs.
+      - name: Build (Linux musl, static, inside Alpine)
+        if: endsWith(matrix.target, '-linux-musl')
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          BUILD_IMAGE: ${{ matrix.build_image }}
+        run: |
+          set -euo pipefail
+          mkdir -p repro
+          echo "image: $BUILD_IMAGE" > repro/inputs.txt
+          # The exact version the toolchain step resolved for the other legs.
+          rust_version="$(rustc --version | awk '{ print $2 }')"
+          docker run --rm \
+            -e TARGET -e CARGO_TERM_COLOR -e RUST_BACKTRACE -e CARGO_INCREMENTAL \
+            -e RUST_VERSION="$rust_version" -e LIBZ_SYS_STATIC=1 \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            -v "$GITHUB_WORKSPACE:/src" -w /src \
+            "$BUILD_IMAGE" sh -c '
+              set -eu
+              i=1
+              until apk add --no-cache -q build-base cmake perl linux-headers curl-dev; do
+                [ "$i" = 3 ] && { echo "apk add failed 3 times" >&2; exit 1; }
+                i=$((i + 1)); sleep 15
+              done
+              trap "chown -R \"\$HOST_UID:\$HOST_GID\" /src/target /src/repro 2>/dev/null || true" EXIT
+              rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
+              echo "Alpine $(cat /etc/alpine-release), musl $(apk info -e -v musl | sed "s/^musl-//"), gcc $(gcc -dumpfullversion), $(cmake --version | head -n1)"
+              cargo +"$RUST_VERSION" --version
+              cargo +"$RUST_VERSION" build --release --bin vtop-node --bin vtopctl --target "$TARGET" --locked
+              {
+                echo "rustc: $(rustc +"$RUST_VERSION" --version)"
+                echo "cargo: $(cargo +"$RUST_VERSION" --version)"
+                echo "Alpine $(cat /etc/alpine-release), musl $(apk info -e -v musl | sed "s/^musl-//"), gcc $(gcc -dumpfullversion)"
+                echo "cmake: $(cmake --version | head -n1)"
+                apk info -v build-base cmake perl linux-headers curl-dev
+              } | tee -a /src/repro/inputs.txt
             '
 
       # Reads the original binaries back out of the archive the `binaries` job
@@ -815,7 +874,7 @@ jobs:
             echo '```'
             if [ "$differ" = 1 ]; then
               echo
-              echo "**Drift.** The rebuild differs. Unpinned inputs that can cause it: the Rust toolchain (\`stable\`), the distribution packages installed into the build image, and the macOS runner image with Homebrew's cmake. Details:"
+              echo "**Drift.** The rebuild differs. Unpinned inputs that can cause it: the Rust toolchain (\`stable\`), the distribution packages installed into the build image (manylinux2014 or Alpine), and the macOS runner image with Homebrew's cmake. Details:"
               echo
               echo '```'
               cat repro/differences.txt

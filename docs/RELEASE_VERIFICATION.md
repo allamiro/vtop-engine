@@ -131,9 +131,20 @@ tar -xzf vtop-engine-VERSION-TARGET.tar.gz
 sha256sum vtop-engine-VERSION-TARGET/vtop-node vtop-engine-VERSION-TARGET/vtopctl
 ```
 
-Then build the tag the way `release.yml` does (the `build` steps of its
-`binaries` job: AlmaLinux 8 for the Linux targets, the macOS runner for the
-Apple ones) and hash `target/TARGET/release/vtop-node` and `vtopctl`.
+Then build the tag the way `release.yml` does (the build steps of its
+`binaries` job) and hash `target/TARGET/release/vtop-node` and `vtopctl`. The
+inputs per target:
+
+| Target | Build environment |
+|---|---|
+| `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` | The `quay.io/pypa/manylinux2014_<arch>` image named by digest in the `build_image` field of the `binaries` matrix (CentOS 7, glibc 2.17, gcc 10), with `perl-core` and `libcurl-devel` installed, run natively on that architecture |
+| `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` | The `rust:1-alpine` image named by digest in the same field, with `build-base cmake perl linux-headers curl-dev` installed, `LIBZ_SYS_STATIC=1` set, and the Rust version the workflow resolved installed with `rustup`, run natively on that architecture |
+| `aarch64-apple-darwin`, `x86_64-apple-darwin` | The `macos-15` and `macos-15-intel` runners, `cmake` from Homebrew, `MACOSX_DEPLOYMENT_TARGET=11.0` |
+
+The Rust version is the `stable` the run installed; the job's `inputs.txt`
+(in the `repro-report-<target>` artifact) and the log of the `build <target>`
+job both print it, so build with that version, not with whatever `stable` is
+today.
 
 ### When a rebuild differs
 
@@ -144,9 +155,11 @@ change a binary without any change to the source:
 
 - **The Rust toolchain.** The workflow installs `stable`, which moves every six
   weeks. A rebuild after a new stable release uses a newer compiler.
-- **The distribution packages in the Linux build image.** The AlmaLinux 8 image
-  is pinned by digest; the compiler, cmake, perl and `-devel` packages installed
-  into it are whatever the mirrors serve on the day.
+- **The distribution packages in the Linux build images.** The manylinux2014
+  and Alpine images are pinned by digest; the packages installed into them
+  (`perl-core` and `libcurl-devel` on CentOS 7, `build-base`, `cmake`, `perl`,
+  `linux-headers` and `curl-dev` on Alpine) are whatever the mirrors serve on
+  the day. The job prints each installed version in `inputs.txt`.
 - **The macOS runner image.** Xcode, the SDK and Homebrew's cmake change with
   the runner image.
 
