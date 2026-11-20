@@ -136,12 +136,13 @@ jobs:
               - 'rust-toolchain*'
               - '.github/workflows/ci.yml'
 
-            # The S3 compatibility matrix (#722): the live S3 tests of
-            # vtop-upload and vtop-cli against every server under
-            # docker/s3-servers/. vtop-cli depends on every workspace crate
-            # except vtop-node (as the kafka filter says), plus the test kit,
-            # the capability files, the MinIO build (docker/minio/**), the
-            # servers' compose files and the script every leg runs.
+            # The live S3 tests (#722) of vtop-upload and vtop-cli against the
+            # lab's MinIO. vtop-cli depends on every workspace crate except
+            # vtop-node (as the kafka filter says), plus the test kit and the
+            # MinIO build (docker/minio/**). The capability files, the other
+            # servers' compose files and the lab script are left out: a pull
+            # request that changes them runs every server through
+            # s3-compat-matrix.yml's own trigger, so MinIO is not run twice.
             minio:
               - 'crates/vtop-adapters/**'
               - 'crates/vtop-broker/**'
@@ -154,10 +155,7 @@ jobs:
               - 'crates/vtop-state/**'
               - 'crates/vtop-upload/**'
               - 'crates/vtop-s3-testkit/**'
-              - 'tests/s3-compat/**'
               - 'docker/minio/**'
-              - 'docker/s3-servers/**'
-              - 'scripts/s3-lab.sh'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '.cargo/**'
@@ -1441,193 +1439,17 @@ jobs:
     with:
       brokers: '["3.7.2"]'
 
-  # The S3 compatibility matrix (#722): the live S3 tests, built once, run
-  # against each server in docker/s3-servers/ with its capability file
-  # (tests/s3-compat/servers/<id>.yaml) saying what the server is expected to
-  # do. They are `#[ignore]` and need `VTOP_TEST_S3_ENDPOINT`, so without this
-  # they would run only by hand. It replaces the single MinIO job (#707).
-  #
-  # The binaries are built once (D10): the compile, with librdkafka, is most
-  # of a leg's cost, and the tests themselves take minutes. The checkout path
-  # is the same in every job, so a binary finds the capability files where it
-  # was built; VTOP_TEST_S3_SERVERS_DIR says so explicitly anyway.
-  s3-compat-build:
-    name: s3 compat (build the live test binaries)
+  # The live S3 tests (#722) against the lab's MinIO, the per-PR cost of the
+  # S3 compatibility matrix. s3-compat-matrix.yml runs every server nightly,
+  # on dispatch, and on a pull request that changes a server's setup. Its
+  # checks are named `s3 compat matrix / s3 compat (minio)`.
+  s3-compat:
+    name: s3 compat matrix
     needs: changes
     if: needs.changes.outputs.minio == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
-
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-s3-compat-${{ hashFiles('**/Cargo.lock') }}
-
-      # The engine tests build vtop-cli, which compiles librdkafka.
-      - name: Install librdkafka build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            cmake clang libssl-dev libsasl2-dev libcurl4-openssl-dev zlib1g-dev pkg-config
-
-      # Line tables only: a backtrace still names the line, and the artifact
-      # every leg downloads is a fraction of the size.
-      - name: Build the live test binaries
-        env:
-          CARGO_PROFILE_DEV_DEBUG: line-tables-only
-        run: |
-          set -euo pipefail
-          out="$RUNNER_TEMP/s3-compat-bin"
-          mkdir -p "$out"
-          build() {
-            cargo test --locked --no-run --message-format=json "$@" |
-              jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null)
-                | "\(.target.name) \(.executable)"'
-          }
-          {
-            build -p vtop-upload --test live_s3_verification --test transport_conformance \
-              --test live_s3_multipart_resume --test live_s3_object_lock --test live_s3_probes
-            build -p vtop-cli --test live_s3_object_lock_engine --test live_s3_verification_receipts
-          } | while read -r name exe; do
-            cp "$exe" "$out/$name"
-          done
-          ls -la "$out"
-          test "$(find "$out" -type f | wc -l)" -eq 7
-
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: s3-compat-binaries
-          path: ${{ runner.temp }}/s3-compat-bin
-          retention-days: 1
-          if-no-files-found: error
-
-  # One leg per server, each on its own runner, with nothing shared but the
-  # binaries. A leg whose server's file says `gating: false` cannot fail the
-  # run (D11): its results are still written, summarised and uploaded, and a
-  # difference from its file still shows in the summary. `gating` is stated
-  # here because continue-on-error is decided before any step runs; the first
-  # step fails the leg if it disagrees with the file.
-  s3-compat:
-    name: s3 compat (${{ matrix.server }})
-    needs: [changes, s3-compat-build]
-    if: needs.changes.outputs.minio == 'true'
-    runs-on: ubuntu-latest
-    continue-on-error: ${{ !matrix.gating }}
-    timeout-minutes: ${{ matrix.timeout }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # MinIO is BUILT from source (docker/minio/Dockerfile; no registry
-          # serves its images, #507), which is most of this leg's time.
-          - server: minio
-            gating: true
-            timeout: 30
-          # Pulled, pinned by digest: start in seconds. Measured locally at
-          # under a minute of tests each; twenty minutes is generous.
-          - server: rustfs
-            gating: false
-            timeout: 20
-          - server: garage
-            gating: false
-            timeout: 20
-          - server: seaweedfs
-            gating: false
-            timeout: 20
-          # Second wave: a gateway over a POSIX tree.
-          - server: versity
-            gating: false
-            timeout: 20
-          # Second wave: Scality's metadata and data server. amd64 only.
-          - server: cloudserver
-            gating: false
-            timeout: 20
-    env:
-      RESULTS: ${{ github.workspace }}/s3-compat-out/results-${{ matrix.server }}.jsonl
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - name: The leg's gating agrees with the capability file
-        run: |
-          set -euo pipefail
-          file=$(scripts/s3-lab.sh gating "${{ matrix.server }}")
-          if [ "$file" != "${{ matrix.gating }}" ]; then
-            echo "::error file=tests/s3-compat/servers/${{ matrix.server }}.yaml::gating is $file in the file but ${{ matrix.gating }} in ci.yml's s3-compat matrix; change both together"
-            exit 1
-          fi
-
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: s3-compat-binaries
-          path: ${{ runner.temp }}/s3-compat-bin
-
-      # Built before it is started, so a failed build reads as a build
-      # failure rather than as a store that never came up.
-      - name: Build the server's image, if it is built
-        run: |
-          chmod +x "$RUNNER_TEMP"/s3-compat-bin/*
-          scripts/s3-lab.sh build "${{ matrix.server }}"
-
-      - name: Start the server and create its buckets
-        run: scripts/s3-lab.sh up "${{ matrix.server }}"
-
-      # What each results line names: the server's release, its image digest
-      # (a built image's local id), and the PR's head commit rather than the
-      # merge commit GITHUB_SHA names on a pull request.
-      - name: Label the results
-        run: |
-          set -euo pipefail
-          scripts/s3-lab.sh label "${{ matrix.server }}" >> "$GITHUB_ENV"
-          echo "VTOP_TEST_COMMIT=${{ github.event.pull_request.head.sha || github.sha }}" >> "$GITHUB_ENV"
-
-      - name: Run the live S3 tests
-        run: scripts/s3-lab.sh test "${{ matrix.server }}" "$RUNNER_TEMP/s3-compat-bin" "$RESULTS"
-
-      # D13: the verification and Object Lock write tests again, with the SDK
-      # computing checksums only when an operation requires one, a setting
-      # many deployments use with third-party stores. Recorded beside the
-      # leg's results, not instead of them.
-      - name: Run them again with AWS_REQUEST_CHECKSUM_CALCULATION=when_required
-        if: always()
-        env:
-          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
-        run: |
-          scripts/s3-lab.sh test "${{ matrix.server }}" "$RUNNER_TEMP/s3-compat-bin" \
-            "${RESULTS%/*}/when_required-${{ matrix.server }}.jsonl" \
-            live_s3_verification transport_conformance live_s3_object_lock live_s3_object_lock_engine
-
-      - name: Summarise the results
-        if: always()
-        run: |
-          scripts/s3-lab.sh summary "${{ matrix.server }}" "$RESULTS" >> "$GITHUB_STEP_SUMMARY"
-          {
-            echo
-            echo "With AWS_REQUEST_CHECKSUM_CALCULATION=when_required:"
-            echo
-            scripts/s3-lab.sh summary "${{ matrix.server }}" "${RESULTS%/*}/when_required-${{ matrix.server }}.jsonl"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload the results
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: s3-compat-results-${{ matrix.server }}
-          path: ${{ github.workspace }}/s3-compat-out/
-          if-no-files-found: ignore
-
-      - name: Server logs on failure
-        if: failure()
-        run: scripts/s3-lab.sh logs "${{ matrix.server }}" || true
+    uses: ./.github/workflows/s3-compat-matrix.yml
+    with:
+      servers: '["minio"]'
 
   # cargo-deny covers what cargo-audit does not: license compliance, dependency
   # bans, and source provenance. Advisory decisions are mirrored from

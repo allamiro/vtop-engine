@@ -117,15 +117,24 @@ scripts/s3-lab.sh down minio
 
 ## In CI
 
-`.github/workflows/ci.yml` builds the live test binaries once
-(`s3-compat-build`) and runs them in one `s3-compat` leg per server. A leg
-whose server is `gating: false` cannot fail the run; its summary still lists
-every case and every unexpected outcome, and its results are uploaded as
-`s3-compat-results-<id>`. The matrix states each server's `gating` too
-(it decides `continue-on-error` before any step runs), and the leg fails if
-the two disagree. A weekly job (`.github/workflows/s3-pins.yml`) checks that
-every pulled server image is pinned by digest and that the digest still
-resolves.
+`.github/workflows/s3-compat-matrix.yml` builds the live test binaries once
+and runs them in one leg per server. It runs:
+
+- from `ci.yml`, with the lab's MinIO alone, on a pull request (and a push to
+  `main`) that touches the crates the live tests build or the MinIO build;
+- every server, nightly (03:47 UTC) and on `workflow_dispatch` (an optional
+  `servers` list such as `["garage"]` narrows it);
+- every server, on a pull request that changes the workflow, a server's
+  compose file, the lab script or a capability file, so a change to a
+  server's setup is proven on its own head before it merges.
+
+A leg whose server is `gating: false` cannot fail the run; its summary still
+lists every case and every unexpected outcome, and its results are uploaded
+as `s3-compat-results-<id>`. The workflow's `LEGS` table states each server's
+`gating` too (it decides `continue-on-error` before any step runs), and the
+leg fails if the two disagree. A weekly job
+(`.github/workflows/s3-pins.yml`) checks that every pulled server image is
+pinned by digest and that the digest still resolves.
 
 ## Probes and the second checksum pass
 
