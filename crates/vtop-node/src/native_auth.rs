@@ -75,7 +75,7 @@ impl PrincipalAuthorizer {
             presented: presented_name.clone(),
             reason,
         };
-        self.check_declaration(declared, role).map_err(&refuse)?;
+        self.check_declaration(declared, role).map_err(refuse)?;
         let Some(read) = presented else {
             return Err(refuse(format!(
                 "the session presented no client certificate. The node refused it. A native client \
@@ -639,9 +639,9 @@ mod tests {
         assert!(!authorizer.authorize(&[], SERVED, Role::Producer));
         assert!(!authorizer.authorize(&[b"not a certificate".to_vec()], SERVED, Role::Producer));
         // The bound certificate, for the roles the plane serves, and no other.
-        assert!(authorizer.authorize(&[right.der.clone()], SERVED, Role::Producer));
-        assert!(authorizer.authorize(&[right.der.clone()], SERVED, Role::Consumer));
-        assert!(!authorizer.authorize(&[right.der.clone()], SERVED, Role::Peer));
+        assert!(authorizer.authorize(std::slice::from_ref(&right.der), SERVED, Role::Producer));
+        assert!(authorizer.authorize(std::slice::from_ref(&right.der), SERVED, Role::Consumer));
+        assert!(!authorizer.authorize(std::slice::from_ref(&right.der), SERVED, Role::Peer));
         assert!(!authorizer.authorize(&[right.der], SERVED, Role::Administrator));
     }
 
