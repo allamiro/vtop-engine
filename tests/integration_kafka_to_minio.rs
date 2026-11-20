@@ -10,6 +10,11 @@
 //!   cargo test -p vtop-cli --test integration_kafka_to_minio -- --ignored
 //! ```
 //!
+//! The same suite runs through a TLS or SASL listener when the
+//! `VTOP_TEST_KAFKA_*` variables of `kafka_broker_env.rs` are set;
+//! `scripts/kafka-broker.sh` starts such a broker and prints the variables
+//! (#721, docs/install/kafka.md).
+//!
 //! Why this file matters: the Kafka path had a P0 where every read returned zero
 //! records (a `subscribe()` per read forced a rebalance that reseeked to earliest
 //! and consumed the whole poll window), so no batch ever sealed and no offset
@@ -24,6 +29,12 @@
 
 use vtop_adapters::kafka_source::build_client_config;
 use vtop_core::config::KafkaSourceConfig;
+
+// Where the broker is and how to authenticate to it: environment hooks, so the
+// same suite runs through a plaintext, TLS or SASL listener (#721).
+#[path = "kafka_broker_env.rs"]
+mod broker_env;
+use broker_env::bootstrap;
 
 /// Run `$op` (an expression ending in `.await` that yields a `Result`),
 /// waiting out a group coordinator that is not ready yet (#665): a warm-up
@@ -56,7 +67,7 @@ macro_rules! through_warm_up {
 }
 
 fn kafka_cfg(bootstrap: &str, group: &str) -> KafkaSourceConfig {
-    KafkaSourceConfig {
+    let mut cfg = KafkaSourceConfig {
         enabled: true,
         bootstrap_servers: vec![bootstrap.to_string()],
         consumer_group: group.to_string(),
@@ -69,7 +80,9 @@ fn kafka_cfg(bootstrap: &str, group: &str) -> KafkaSourceConfig {
         sasl_username: None,
         sasl_password_env: None,
         ssl_ca_location: None,
-    }
+    };
+    broker_env::apply(&mut cfg);
+    cfg
 }
 
 /// Always-on guard: the Kafka client config must never enable auto-commit,
@@ -90,10 +103,6 @@ use std::collections::HashMap;
 use vtop_adapters::base::{DiscoveredSource, SourceAdapter};
 use vtop_adapters::KafkaSource;
 use vtop_core::types::{ProgressMarker, TelemetryFormat};
-
-fn bootstrap() -> String {
-    std::env::var("VTOP_TEST_KAFKA").unwrap_or_else(|_| "kafka:9092".into())
-}
 
 /// A unique consumer group per test, so a re-run never inherits offsets from a
 /// previous run — which would silently mask a broken read.
