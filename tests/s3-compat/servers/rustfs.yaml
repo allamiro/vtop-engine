@@ -22,4 +22,5 @@ capabilities:
   versioning: pass
   object_lock: pass
   object_lock_enforced: pass
+  object_lock_retention_clear: pass
   conditional_put: pass

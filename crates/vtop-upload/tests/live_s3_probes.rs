@@ -13,9 +13,10 @@
 //!   `If-None-Match: *` to an existing key must be refused with 412.
 //!
 //! - `probe.the_sdks_default_crc32_trailer_is_accepted`
-//!   (`checksum_crc32_default`, informational): a PUT with no checksum of its
-//!   own, under the SDK's default `AWS_REQUEST_CHECKSUM_CALCULATION`, goes out
-//!   as an `aws-chunked` body with a CRC32 trailer. Garage and Zenko
+//!   (`checksum_crc32_default`, informational): a PUT of a file with no
+//!   checksum of its own, under the SDK's default
+//!   `AWS_REQUEST_CHECKSUM_CALCULATION`, goes out as an `aws-chunked` body
+//!   with a CRC32 trailer. Garage and Zenko
 //!   CloudServer refuse it. VTOP no longer sends it (#778: BLAKE3 and
 //!   no-checksum writes carry a SHA-256 header), so no VTOP write depends on
 //!   it; it stays asked so a store's answer is on the page, and because
@@ -181,14 +182,18 @@ async fn live_the_sdks_default_crc32_trailer_is_accepted() {
         || async {
             let c = client(s).await;
             let key = key("sdk-default-crc32");
-            let body = b"a body with no checksum of its own";
-            // No checksum value on the request: under the SDK's default the
-            // SDK computes a CRC32 and sends it as a trailer.
+            // A file body, as the backend sends one: the SDK cannot hash a
+            // streamed body ahead of the request, so under its default it
+            // sends the CRC32 as an aws-chunked trailer. (An in-memory body
+            // gets the CRC32 as a plain header, which every store takes.)
+            let mut f = tempfile::NamedTempFile::new().unwrap();
+            std::io::Write::write_all(&mut f, &vec![b'x'; 256 * 1024]).unwrap();
+            let body = ByteStream::from_path(f.path()).await.unwrap();
             let put = c
                 .put_object()
                 .bucket(&s.bucket)
                 .key(&key)
-                .body(ByteStream::from_static(body))
+                .body(body)
                 .send()
                 .await;
             if let Err(e) = put {

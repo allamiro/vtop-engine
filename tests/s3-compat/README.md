@@ -24,6 +24,7 @@ capability. The run is compared with it, case by case, by the test kit in
 | `versioning` | version ids on PUT, HEAD and GET by `versionId` |
 | `object_lock` | the Object Lock configuration read, retention and legal hold written and read back |
 | `object_lock_enforced` | a locked version cannot be deleted |
+| `object_lock_retention_clear` | a governance retention can be cleared with the bypass header (an empty `PutObjectRetention`); VTOP never does, the live tests do to tamper with a receipt and see the scrub report it |
 | `conditional_put` | `If-None-Match: *` on PUT; informational, VTOP does not use it |
 
 Every case adds the addressing it ran with (`path_style` or `virtual_host`)
