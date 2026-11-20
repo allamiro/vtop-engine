@@ -22,6 +22,10 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/compat/cells/lib.sh
 source "$here/lib.sh"
 
+case "$EXPECT" in
+  pass | refuse) ;;
+  *) fail "the ledger cell expects pass or refuse, not $EXPECT" ;;
+esac
 DIR="$WORKDIR/ledger"
 rm -rf "$DIR"
 mkdir -p "$WORKDIR"
@@ -31,6 +35,7 @@ case "$DIRECTION" in
     [[ "$EXPECT" == pass ]] || fail "an upgrade cell expects pass, not $EXPECT"
     (umask 022 && "$here/../ledger-scenario.sh" "$RELEASED" "$DIR") > /dev/null 2> "$WORKDIR/scenario.log" \
       || { cat "$WORKDIR/scenario.log" >&2; fail "the released $TAG could not write the ledger"; }
+    require_ledger "$DIR" "the released $TAG"
     adopt_ledger "$HEAD" "$DIR"
     batch_states "$DIR/state.db" > "$WORKDIR/before.txt"
     [[ -s "$WORKDIR/before.txt" ]] || fail "the release wrote no rows"
@@ -68,6 +73,7 @@ case "$DIRECTION" in
   forward)
     "$here/../ledger-scenario.sh" "$HEAD" "$DIR" > /dev/null 2> "$WORKDIR/scenario.log" \
       || { cat "$WORKDIR/scenario.log" >&2; fail "this build could not write the ledger"; }
+    require_ledger "$DIR" "this build"
     batch_states "$DIR/state.db" > "$WORKDIR/before.txt"
     before_digest="$(ledger_digest "$DIR/state.db")"
     log "this build left $(wc -l < "$WORKDIR/before.txt") rows, schema version $(user_version "$DIR/state.db")"

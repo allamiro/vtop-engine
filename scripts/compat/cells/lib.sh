@@ -107,3 +107,9 @@ adopt_ledger() {
     if [[ -e "$f" ]]; then chmod 0600 "$f"; fi
   done
 }
+
+# require_ledger <dir> <who>: the scenario left a SQLite ledger with rows. A
+# binary that runs and archives nothing must fail the cell, not pass it.
+require_ledger() {
+  [[ -s "$1/state.db" ]] || fail "$2 wrote no ledger (no state.db after the scenario)"
+}

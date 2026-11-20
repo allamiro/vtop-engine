@@ -27,6 +27,10 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/compat/cells/lib.sh
 source "$here/lib.sh"
 
+case "$EXPECT" in
+  pass | refuse) ;;
+  *) fail "the digests-audit cell expects pass or refuse, not $EXPECT" ;;
+esac
 DIR="$WORKDIR/ledger"
 rm -rf "$DIR"
 mkdir -p "$WORKDIR"
@@ -42,6 +46,7 @@ esac
 if [[ "$DIRECTION" == upgrade ]]; then
   adopt_ledger "$HEAD" "$DIR"
 fi
+require_ledger "$DIR" "the writer"
 ls "$DIR"/state.db.ledger-digests/ledger-digest-*.jsonl > /dev/null \
   || fail "prune-ledger wrote no digest"
 digest_rows="$(cat "$DIR"/state.db.ledger-digests/ledger-digest-*.jsonl | grep -c '"batch_id"' || true)"
