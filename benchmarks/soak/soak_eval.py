@@ -353,13 +353,22 @@ def check_samples(profile: dict, samples: list[dict]) -> Criterion:
     engine's memory, open files, ledger and work directory, one record each
     `sample_interval_s`) and the lag samples (the topic and the group, one each
     `lag_interval_s`) share a file, and one kind must not stand in for the
-    other."""
+    other. A record that observed nothing (the engine was down, a query failed)
+    is not a sample of either."""
     criteria = profile["criteria"]
     duration = float(profile["duration_s"])
     limit = criteria["max_sample_gap_s"]
     fraction = criteria["min_samples_fraction"]
-    resource = [s["elapsed_s"] for s in samples if "engine_up" in s]
-    lag = [s["elapsed_s"] for s in samples if "lag" in s]
+    # An observation counts when it observed something: a resource record with
+    # the engine's measurements (not one written while the engine was down or
+    # unreachable), and a lag record with both offsets (not one a failed query
+    # left empty).
+    resource = [s["elapsed_s"] for s in samples if s.get("engine_up") is True and s.get("rss_bytes") is not None]
+    lag = [
+        s["elapsed_s"]
+        for s in samples
+        if isinstance(s.get("lag"), dict) and s["lag"].get("end") is not None and s["lag"].get("committed") is not None
+    ]
     ok_resource, said_resource = _coverage(
         resource, fraction * duration / profile["sample_interval_s"], limit, duration
     )

@@ -455,6 +455,23 @@ def test_lag_records_cannot_stand_in_for_missing_resource_samples():
     assert not criterion["passed"] and "resource samples" in criterion["observed"]
 
 
+def test_records_that_observed_nothing_are_not_samples():
+    # Four of five resource records say the engine could not be probed, and the
+    # lag queries failed as often: the file is full of rows, and the run is not
+    # observed.
+    samples, events, finals = healthy_run()
+    for i, s in enumerate(samples):
+        if i % 5:
+            for key in ("rss_bytes", "open_fds", "work_dir_bytes", "ledger_bytes", "metrics"):
+                s.pop(key, None)
+            s["engine_up"] = False
+            s["sample_error"] = "engine probe exit 1"
+            s["lag"] = None
+    v = verdict_of(samples, events, finals)
+    criterion = next(c for c in v["criteria"] if c["id"] == "samples")
+    assert not criterion["passed"]
+
+
 def test_missing_lag_samples_fail_the_sampling_criterion_on_their_own():
     samples, events, finals = healthy_run()
     for i, s in enumerate(samples):

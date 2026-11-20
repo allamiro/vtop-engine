@@ -84,7 +84,7 @@ sampled nothing, or ran no scrub does not pass.
 | Criterion | Passes when |
 |---|---|
 | `run_completed` | the run ended without being aborted, and sampled to the profile's duration |
-| `samples` | the resource samples (every 30 s) and the lag samples (every 60 s) are each counted on their own over the run's duration: at least 90% of each kind's expected number exist, and none is more than 5 minutes after the one before |
+| `samples` | the resource samples (every 30 s) and the lag samples (every 60 s) are each counted on their own over the run's duration: at least 90% of each kind's expected number exist and observed something (a resource record the engine could not be probed for, or a lag record whose query failed, is not a sample), and none is more than 5 minutes after the one before |
 | `faults_executed` | every fault in the plan was injected, landed, and the engine recovered from it |
 | `recovery_time` | the slowest recovery was within the timeout (15 minutes) |
 | `no_unplanned_exit` | the engine never exited except when a fault stopped it |
