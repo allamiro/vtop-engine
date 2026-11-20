@@ -404,11 +404,17 @@ pub struct Metrics {
     /// Bytes of kept parts a resumed upload did not send again (#668): what
     /// keeping sessions saves. Unlabelled, like the egress account.
     pub multipart_bytes_reused_total: IntCounter,
+    /// Secret and ledger files accepted only because
+    /// `security.allow_loose_secret_permissions` is true (#733), counted once
+    /// per file per process. Unlabelled: the path and mode are in the WARN
+    /// line and the audit record beside it. Anything above zero is an
+    /// exposure an operator chose to keep.
+    pub secret_file_permission_overrides_total: IntCounter,
 }
 
 /// The values of `action` on `vtop_audit_events_total` (#694); the same set
 /// as `vtop_observe::audit::Action`.
-pub const AUDIT_ACTIONS: [&str; 12] = [
+pub const AUDIT_ACTIONS: [&str; 13] = [
     "ledger.replay",
     "ledger.prune",
     "ledger.migrate",
@@ -421,6 +427,7 @@ pub const AUDIT_ACTIONS: [&str; 12] = [
     "node.repair",
     "node.reconfigure_range",
     "promotion.attest",
+    "security.override",
 ];
 
 /// The values of `outcome` on `vtop_audit_events_total`.
@@ -622,6 +629,11 @@ impl Metrics {
             "Bytes of kept multipart parts a resumed upload did not send again (#668)",
         ))?;
         registry.register(Box::new(multipart_bytes_reused_total.clone()))?;
+        let secret_file_permission_overrides_total = IntCounter::with_opts(Opts::new(
+            "secret_file_permission_overrides_total",
+            "Key, state-store, ledger and audit files other local users can read, accepted only because security.allow_loose_secret_permissions is true (#733); the path and mode are in the log line and the audit record",
+        ))?;
+        registry.register(Box::new(secret_file_permission_overrides_total.clone()))?;
         let source_replay_refused_total = cv(
             "source_replay_refused_total",
             "Failed ranges the source refused to hand back for re-reading, or whose re-read it then refused; each is a range missing from the archive (see logs for the path). For a file: its file cannot be proven reachable - truncated, replaced or rewritten in place, or rotated away and then removed, compressed, copied by copytruncate, or truncated or rewritten before its re-read",
@@ -721,6 +733,7 @@ impl Metrics {
             multipart_parts_total,
             multipart_sessions_total,
             multipart_bytes_reused_total,
+            secret_file_permission_overrides_total,
         })
     }
 

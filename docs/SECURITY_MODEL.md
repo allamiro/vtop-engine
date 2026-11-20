@@ -375,6 +375,10 @@ Normative rules:
 Additional guidance:
 
 - Configuration files containing secrets **SHOULD** have restrictive filesystem permissions.
+- On Unix, the engine **MUST** refuse, before reading it, a secret or ledger file that group or other can write: a manifest MAC key file (`manifest.mac.keys[].file`), the `engine.state_store` secret file, the SQLite ledger and its `-wal` and `-shm` files, and the `VTOP_AUDIT_LOG` file (#733). No setting accepts such a file.
+- The engine **MUST** refuse such a file that other users can read, unless the directory holding it is owned by the engine's user and closed to group and other, or (for group read only) the file is a read-only Kubernetes Secret mount: reached through the kubelet's `..data` layout, on `tmpfs`, and not writable by the engine. The audit file may be group-readable. `security.allow_loose_secret_permissions: true` accepts the readable cases only; each file accepted that way **MUST** be announced by a WARN, `vtop_secret_file_permission_overrides_total` and an audit record (§10). `vtopctl validate` reports every such file at once. Recipes for external secret managers: [Secret files and their permissions](operate/secrets.md).
+- New SQLite ledgers and audit files are created with mode `0600`; the engine never changes the mode of an existing file.
+- Not yet checked: TLS private keys, and the files `vtop-node` reads. On platforms without Unix permission bits nothing is checked.
 - Credentials **SHOULD NOT** be passed as plaintext command-line arguments where avoidable, since arguments may be visible to other processes.
 - The engine **SHOULD** support loading credentials from external secret managers without persisting them to disk.
 - Inline SQLite paths remain valid. PostgreSQL URLs **MUST** be referenced as `engine.state_store: { env: VTOP_STATE_STORE }` or `engine.state_store: { file: /run/secrets/vtop-state-store }`; inline PostgreSQL URLs are rejected before startup.
@@ -585,9 +589,11 @@ key-aware:
   and `vtop_scrub_manifest_keys_total` label by a configured id, `none` or
   `other`. An id read from a manifest comes from storage and is never a label;
   messages quote it escaped and cut to 64 characters.
-- **Key files** (`file:`) are read once at startup, at most 4 KiB, and their
-  permissions are not checked, as for `engine.state_store` files. Mount them
-  readable by the engine's user only (`defaultMode: 0400` for a Kubernetes
+- **Key files** (`file:`) are read once at startup, at most 4 KiB, and
+  refused before they are read when other local users can write them, or
+  read them outside a Kubernetes Secret mount or a closed directory (§3,
+  #733), as for `engine.state_store` files. Mount them readable by the
+  engine's user only (`defaultMode: 0400` and `fsGroup` for a Kubernetes
   secret).
 - **An older reader cannot follow a rotation.** v0.8.0 and earlier hold one
   key and ignore the id: they verify a manifest only if their key signed it,
@@ -659,6 +665,7 @@ Resource exhaustion controls are part of the security boundary:
 - The actor of a local command is the process's uid, its `/etc/passwd` name, the host and `$SUDO_USER`: as strong as the host's logins, and not authentication. The actor of a cluster command is the admin endpoint's verified certificate identity, or `anonymous` on a plaintext endpoint.
 - `audit_events` is hash-chained; with a manifest MAC key configured the chain is keyed (a key derived from the signing key, §16.1), so a writer who can edit the table cannot recompute it. `vtopctl audit verify` recomputes it. A chain cannot show rows removed from its end.
 - Audit parameters are an allowlist per action and pass through the redaction of §11; no audit record or audit metric label carries a credential, a connection string, a key, a key variable's value or a URL with its path or query.
+- A secret or ledger file accepted only because `security.allow_loose_secret_permissions` is true **MUST** leave a `security.override` record (target: the file; parameters: what it holds, its mode, who can read it), once per file per process (#733). The audit file itself **MUST NOT** be writable by group or other, and **MUST NOT** be world-readable unless its directory is closed; it is created `0600`.
 
 **Batch lifecycle and failure logs:**
 
@@ -753,6 +760,7 @@ Removing an ignore removes it from both files and this table together.
 | Public-key manifest signing | Not yet | MAC keys are shared secrets: an auditor needs the key to verify. |
 | Multipart upload integrity for very large objects | Yes, on `s3_native` | Above `upload.multipart_threshold_bytes` the engine uploads in parts (#482); a failed part is retried alone and the replay of the same bytes resumes the session (#668). Part ETags are never evidence: the whole stored object is verified before `VERIFIED`, as for a single-part upload. The command backends (`awscli`, `s3cmd`, `minio`) hand the whole object to their tool, which may split it internally but cannot resume a failed upload; `localfs` writes one file. |
 | Authorization / multi-tenant isolation | Not by VTOP | Relies on storage-side IAM and least-privilege credentials. |
+| Refusing secret files other local users can reach | Yes, on Unix (#733) | Manifest key files, the state-store secret file, the SQLite ledger and the audit file; not yet TLS keys or `vtop-node`'s files (§3). |
 
 ## 15. Summary of normative rules
 
@@ -780,6 +788,8 @@ Removing an ignore removes it from both files and this table together.
 | With `upload.object_lock`: bucket Object Lock preflight, lock headers on every write, stored retention verified before `VERIFIED` | **MUST** |
 | Bucket default retention as the floor under `upload.object_lock` | **SHOULD** (operator) |
 | Secret redaction in logs | **MUST** |
+| Refuse a key, state-store, ledger or audit file group or other can write (no override) | **MUST** |
+| Refuse such a file other users can read, outside a closed directory or a read-only Kubernetes Secret mount, unless the documented override is set, and announce and audit each override | **MUST** |
 | Native broker transport restricted to TLS 1.3 with client certificates | **MUST** by default; a node config knob selects plaintext per plane, loopback-only unless acknowledged by name (§2) |
 | Native broker sessions authorized by an explicit `SessionAuthorizer` | **MUST** |
 | Native clients validate the broker certificate and expected server identity | **MUST** (deployed clients; the loopback lab client may omit `tls` and connect plaintext, see §2) |

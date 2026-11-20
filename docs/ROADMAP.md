@@ -9,6 +9,34 @@ what each release does **not** yet do.
 
 ---
 
+## Next release — key, state-store, ledger and audit files other local users can reach are refused
+
+- **[#733](https://github.com/allamiro/vtop-engine/issues/733)** — key,
+  state-store, ledger and audit files other local users can reach are
+  refused before they are read: a manifest MAC key file, the
+  `engine.state_store` secret file, the SQLite ledger and its `-wal` and
+  `-shm` files, and the `VTOP_AUDIT_LOG` file. Group- or world-writable is
+  always refused; world-readable and group-readable are refused unless the
+  file's directory is closed to other users, or (group read only) the file
+  is a read-only Kubernetes Secret mount, which is how `defaultMode: 0400`
+  appears once the pod sets `fsGroup`. The audit file may be group-readable.
+  `vtopctl validate` reports every such file at once. New SQLite ledgers are
+  created `0600`. `security.allow_loose_secret_permissions: true` accepts
+  the readable cases, each announced by a WARN, an audit record
+  (`security.override`) and `vtop_secret_file_permission_overrides_total`.
+  Mounting recipes for Kubernetes Secrets, External Secrets Operator, the
+  Secrets Store CSI driver, Vault Agent and Docker secrets are in
+  [Secret files and their permissions](operate/secrets.md).
+- **Upgrade note (#733): this refuses at startup what used to start.** A
+  world-readable key file, a state-store secret file others can read, or a
+  `0644` ledger in a directory others can enter stops the engine, naming the
+  file, its mode and the `chmod` that fixes it. Run this release's
+  `vtopctl validate` against each config before upgrading, where the engine runs.
+  An engine of an earlier release ignores the `security` section, so the
+  override can be set ahead of the upgrade; unknown keys inside `security`
+  are refused by this release. TLS private keys and the files `vtop-node`
+  reads are not checked yet.
+
 ## v0.1.0 — a range that fails over
 
 Metadata leases, a lease agent on the data node, verified promotion, and the
@@ -1176,7 +1204,9 @@ Known limitations:
   working. A later release's new key there will be refused by this one.
 - **Manifests are never re-signed.** A retired (tombstoned) key's manifests
   fail on purpose; re-archiving that data is a separate decision.
-- **Key files are not permission-checked,** as for `engine.state_store`.
+- **Key files are permission-checked** since #733, as are
+  `engine.state_store` files: see
+  [Secret files and their permissions](operate/secrets.md).
 
 **The S3 Object Lock profile (#684).** `upload.object_lock` (`mode`,
 `retain_days`, `legal_hold`) makes the `s3_native` backend write every object,
