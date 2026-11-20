@@ -37,6 +37,8 @@ on:
       - 'scripts/compat/**'
       - 'scripts/manifest-compat.sh'
       - 'scripts/ledger-compat.sh'
+      - 'scripts/upgrade-compat.sh'
+      - 'scripts/live-chaos/gen-certs.sh'
       - '.github/workflows/compat.yml'
   push:
     branches: [main]
@@ -49,6 +51,8 @@ on:
       - 'scripts/compat/**'
       - 'scripts/manifest-compat.sh'
       - 'scripts/ledger-compat.sh'
+      - 'scripts/upgrade-compat.sh'
+      - 'scripts/live-chaos/gen-certs.sh'
       - '.github/workflows/compat.yml'
   schedule:
     - cron: '23 4 * * *'
