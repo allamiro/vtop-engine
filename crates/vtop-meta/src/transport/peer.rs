@@ -8,9 +8,10 @@ use super::maybe_tls::{judge_dialect, tls_handshake_hint, DialectVerdict, MaybeT
 use super::tls::{assert_peer_identity, server_name, TlsMaterial};
 use super::wire::{
     read_frame, write_frame, PeerAppendRequest, PeerAppendResponse, PeerInstallRequest,
-    PeerInstallResponse, PeerVoteRequest, PeerVoteResponse, TransportError, TransportResult,
-    VtpmFrame, KIND_APPEND_REQ, KIND_APPEND_RESP, KIND_INSTALL_REQ, KIND_INSTALL_RESP,
-    KIND_VOTE_REQ, KIND_VOTE_RESP,
+    PeerInstallResponse, PeerVersionRequest, PeerVersionResponse, PeerVoteRequest,
+    PeerVoteResponse, TransportError, TransportResult, VtpmFrame, KIND_APPEND_REQ,
+    KIND_APPEND_RESP, KIND_INSTALL_REQ, KIND_INSTALL_RESP, KIND_PEER_VERSION_REQ,
+    KIND_PEER_VERSION_RESP, KIND_VOTE_REQ, KIND_VOTE_RESP,
 };
 use crate::keys::MetaNodeId;
 use crate::storage::hardstate::HardState;
@@ -221,7 +222,7 @@ async fn serve_connection(
     acceptor: Option<TlsAcceptor>,
     tcp: TcpStream,
     handler: Arc<dyn PeerRpcHandler>,
-    _local_id: MetaNodeId,
+    local_id: MetaNodeId,
 ) -> TransportResult<()> {
     // Judged before the handshake or the first frame (#294 slice 6): a peer
     // speaking the other transport is refused by name instead of failing as
@@ -255,7 +256,7 @@ async fn serve_connection(
             Err(TransportError::Closed) => return Ok(()),
             Err(error) => return Err(error),
         };
-        let response = dispatch_peer_rpc(handler.as_ref(), peer_id, frame).await?;
+        let response = dispatch_peer_rpc(handler.as_ref(), peer_id, local_id, frame).await?;
         write_frame(&mut stream, &response).await?;
     }
 }
@@ -313,12 +314,41 @@ fn assert_sender_identity(peer_id: Option<MetaNodeId>, vote: &HardState) -> Tran
     }
 }
 
+/// What this build answers when a leader asks what it runs (#706).
+pub fn local_version(node_id: MetaNodeId) -> PeerVersionResponse {
+    PeerVersionResponse {
+        node_id,
+        release: env!("CARGO_PKG_VERSION").to_owned(),
+        supported_feature_level: crate::command::SUPPORTED_FEATURE_LEVEL,
+    }
+}
+
 async fn dispatch_peer_rpc(
     handler: &dyn PeerRpcHandler,
     peer_id: Option<MetaNodeId>,
+    local_id: MetaNodeId,
     frame: VtpmFrame,
 ) -> TransportResult<VtpmFrame> {
     match frame.kind {
+        KIND_PEER_VERSION_REQ => {
+            let request = PeerVersionRequest::decode(&frame.payload)?;
+            // The asker must be the node its certificate names, as every
+            // other peer request's sender must. Plaintext has no
+            // certificate, and the answer is no secret, so it is answered.
+            if let Some(peer_id) = peer_id {
+                if peer_id != request.from {
+                    return Err(TransportError::Identity(format!(
+                        "certificate CN maps to node {peer_id}, but the version request \
+                         claims sender {}",
+                        request.from
+                    )));
+                }
+            }
+            Ok(VtpmFrame {
+                kind: KIND_PEER_VERSION_RESP,
+                payload: local_version(local_id).encode()?,
+            })
+        }
         KIND_VOTE_REQ => {
             let request = PeerVoteRequest::decode(&frame.payload)?;
             assert_sender_identity(peer_id, &request.vote)?;
@@ -348,6 +378,17 @@ async fn dispatch_peer_rpc(
         }
         other => Err(TransportError::UnexpectedKind(other)),
     }
+}
+
+/// Why a member's version could not be read (#706).
+#[derive(Debug)]
+pub enum VersionAskError {
+    /// The member accepted the connection and the request, then closed it
+    /// without an answer: a release that predates the question (v0.9.0 and
+    /// earlier have no arm for the kind), or one that stopped mid-request.
+    NoAnswer,
+    /// It could not be reached, or answered with something unreadable.
+    Unreachable(TransportError),
 }
 
 /// Client-side peer RPC helper: connect, exchange one request/response, close.
@@ -448,14 +489,57 @@ impl PeerClient {
         Ok(PeerInstallResponse::decode(&frame.payload)?)
     }
 
-    async fn round_trip(
+    /// Ask a member what it runs (#706). A release that predates the
+    /// question closes the connection without answering: that surfaces here
+    /// as [`TransportError::Closed`] (or a reset), AFTER the connection and
+    /// the request were accepted, which is what tells it apart from a member
+    /// that could not be reached at all.
+    pub async fn version(
         &self,
         addr: SocketAddr,
-        request: VtpmFrame,
-        expected_kind: u16,
-    ) -> TransportResult<VtpmFrame> {
+        request: &PeerVersionRequest,
+    ) -> Result<PeerVersionResponse, VersionAskError> {
+        let mut stream = self
+            .connect(addr)
+            .await
+            .map_err(VersionAskError::Unreachable)?;
+        write_frame(
+            &mut stream,
+            &VtpmFrame {
+                kind: KIND_PEER_VERSION_REQ,
+                payload: request.encode(),
+            },
+        )
+        .await
+        .map_err(VersionAskError::Unreachable)?;
+        let response = match read_frame(&mut stream).await {
+            Ok(frame) => frame,
+            Err(TransportError::Closed) => return Err(VersionAskError::NoAnswer),
+            Err(TransportError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                return Err(VersionAskError::NoAnswer)
+            }
+            Err(error) => return Err(VersionAskError::Unreachable(error)),
+        };
+        if response.kind != KIND_PEER_VERSION_RESP {
+            return Err(VersionAskError::Unreachable(
+                TransportError::UnexpectedKind(response.kind),
+            ));
+        }
+        PeerVersionResponse::decode(&response.payload)
+            .map_err(|error| VersionAskError::Unreachable(error.into()))
+    }
+
+    async fn connect(&self, addr: SocketAddr) -> TransportResult<MaybeTls<TcpStream>> {
         let tcp = TcpStream::connect(addr).await?;
-        let mut stream = match self.connector.as_ref() {
+        let stream = match self.connector.as_ref() {
             Some(connector) => {
                 let name = server_name(&self.server_name)?;
                 let stream = connector.connect(name, tcp).await.map_err(|error| {
@@ -476,6 +560,16 @@ impl PeerClient {
         if stream.is_encrypted() {
             assert_peer_identity(stream.peer_certificates(), self.expected_peer)?;
         }
+        Ok(stream)
+    }
+
+    async fn round_trip(
+        &self,
+        addr: SocketAddr,
+        request: VtpmFrame,
+        expected_kind: u16,
+    ) -> TransportResult<VtpmFrame> {
+        let mut stream = self.connect(addr).await?;
         write_frame(&mut stream, &request).await?;
         let response = read_frame(&mut stream).await?;
         if response.kind != expected_kind {
@@ -616,6 +710,146 @@ mod tests {
         assert_eq!(response.vote.term, 3);
         assert_eq!(response.last_log_id, Some(WireLogId { term: 2, index: 5 }));
 
+        server_task.abort();
+    }
+
+    /// #706: a member answers what it runs - who it is, its release and the
+    /// highest feature level this build implements.
+    #[tokio::test]
+    async fn a_member_answers_what_it_runs() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = PeerServer::plaintext(MetaNodeId(3), Arc::new(EchoHandler));
+        let server_task = tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let client = PeerClient::plaintext("localhost", MetaNodeId(3));
+        let answer = client
+            .version(
+                addr,
+                &PeerVersionRequest {
+                    from: MetaNodeId(1),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer, local_version(MetaNodeId(3)));
+        assert_eq!(answer.release, env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            answer.supported_feature_level,
+            crate::command::SUPPORTED_FEATURE_LEVEL
+        );
+        server_task.abort();
+    }
+
+    /// #706: a release before the question reads the frame, has no arm for
+    /// its kind and drops the connection (v0.9.0's `dispatch_peer_rpc`
+    /// returns `UnexpectedKind` and `serve_connection` ends). That must read
+    /// as "no answer", which the leader counts as not supporting the level,
+    /// and never as an error that could be retried into a pass.
+    #[tokio::test]
+    async fn a_member_that_predates_the_question_gives_no_answer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let old_member = tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let frame = read_frame(&mut tcp).await.unwrap();
+            assert_eq!(frame.kind, KIND_PEER_VERSION_REQ);
+            // The old dispatch's `other => Err(UnexpectedKind(other))`.
+            drop(tcp);
+        });
+        let client = PeerClient::plaintext("localhost", MetaNodeId(2));
+        let answer = client
+            .version(
+                addr,
+                &PeerVersionRequest {
+                    from: MetaNodeId(1),
+                },
+            )
+            .await;
+        assert!(
+            matches!(answer, Err(VersionAskError::NoAnswer)),
+            "{answer:?}"
+        );
+        old_member.await.unwrap();
+    }
+
+    /// A member nobody can reach is told apart from one that predates the
+    /// question, so the refusal says which.
+    #[tokio::test]
+    async fn an_unreachable_member_is_not_mistaken_for_an_old_one() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let client = PeerClient::plaintext("localhost", MetaNodeId(2));
+        let answer = client
+            .version(
+                addr,
+                &PeerVersionRequest {
+                    from: MetaNodeId(1),
+                },
+            )
+            .await;
+        assert!(
+            matches!(answer, Err(VersionAskError::Unreachable(_))),
+            "{answer:?}"
+        );
+    }
+
+    /// Under mTLS the asker is the node its certificate names; a request
+    /// that claims another sender is not answered.
+    #[tokio::test]
+    async fn mtls_refuses_a_version_request_from_a_spoofed_sender() {
+        let (server_leaf, server_key) = mint_leaf("1");
+        let (client_leaf, client_key) = mint_leaf("2");
+        let mut server_roots = RootCertStore::empty();
+        server_roots.add(client_leaf.clone()).unwrap();
+        let server_material = TlsMaterial {
+            certificate_chain: vec![server_leaf.clone()],
+            private_key: server_key.into(),
+            trust_roots: server_roots,
+        };
+        let mut client_roots = RootCertStore::empty();
+        client_roots.add(server_leaf).unwrap();
+        let client_material = TlsMaterial {
+            certificate_chain: vec![client_leaf],
+            private_key: client_key.into(),
+            trust_roots: client_roots,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server =
+            PeerServer::new(server_material, MetaNodeId(1), Arc::new(EchoHandler)).unwrap();
+        let server_task = tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let client = PeerClient::new(client_material, "localhost", MetaNodeId(1)).unwrap();
+        let spoofed = client
+            .version(
+                addr,
+                &PeerVersionRequest {
+                    from: MetaNodeId(99),
+                },
+            )
+            .await;
+        assert!(
+            matches!(spoofed, Err(VersionAskError::NoAnswer)),
+            "{spoofed:?}"
+        );
+        let honest = client
+            .version(
+                addr,
+                &PeerVersionRequest {
+                    from: MetaNodeId(2),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(honest.node_id, MetaNodeId(1));
         server_task.abort();
     }
 
