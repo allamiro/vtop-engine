@@ -1326,6 +1326,13 @@ jobs:
         run: python -m unittest discover -s scripts/compat/tests -p 'test_format_registry.py' -v
       - name: format registry (every magic and version constant has an entry)
         run: python scripts/check-format-registry.py
+      # The list of config keys an older engine silently ignores, which a
+      # release's notes carry (#743). It reads the schema out of config.rs
+      # and the reference page, so its tests run against fixture refs and
+      # against this tree's config.rs: a change to either that the script no
+      # longer understands fails here, not on release day.
+      - name: the list of new config keys can fail (fixture refs and this tree's schema)
+        run: python -m unittest discover -s scripts/tests -p 'test_config_keys_since.py' -v
 
   # Kafka was entirely untested in CI, which is how a P0 shipped: every read
   # returned zero records (a subscribe() per read forced a rebalance that
