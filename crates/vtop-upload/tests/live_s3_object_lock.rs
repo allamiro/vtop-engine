@@ -313,6 +313,9 @@ async fn live_a_locked_version_survives_delete_and_overwrite_and_reports_elapsed
             Capability::ObjectLock,
             Capability::Versioning,
             Capability::ObjectLockEnforced,
+            // The overwrite is written with no checksum, so the SDK's
+            // default CRC32 goes on it (pinned when_supported under the lock).
+            Capability::ChecksumCrc32Default,
         ],
         || async {
             let bucket = locked_bucket();

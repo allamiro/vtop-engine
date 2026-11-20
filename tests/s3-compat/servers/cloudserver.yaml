@@ -1,0 +1,29 @@
+# Zenko CloudServer 9.5.5 with its file backends (docker/s3-servers/
+# cloudserver). Settled from a first run of every live case, in both SDK
+# checksum modes, with every capability unknown (#722). New to the matrix,
+# so not gating yet (D11).
+id: cloudserver
+name: Zenko CloudServer
+gating: false
+capabilities:
+  put_get_head: pass
+  path_style: pass
+  # The lab is reached by path style only (decision D12).
+  virtual_host: not_applicable
+  checksum_sha256_enforced: pass
+  checksum_sha256_returned: pass
+  checksum_crc32_default:
+    state: xfail
+    issue: 778
+    note: "A PUT carrying the SDK's default CRC32 trailer (aws-chunked) is refused with 400 BadRequest, so a BLAKE3 or no-checksum write fails, locked or not; with AWS_REQUEST_CHECKSUM_CALCULATION=when_required a plain one succeeds."
+  multipart: pass
+  multipart_abort: pass
+  multipart_list_uploads: pass
+  multipart_resume: pass
+  versioning: pass
+  object_lock: pass
+  object_lock_enforced: pass
+  conditional_put:
+    state: xfail
+    issue: 722
+    note: "PutObject ignores If-None-Match: a second PUT overwrites the key. Informational: VTOP does not use conditional writes."
