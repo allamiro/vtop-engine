@@ -53,6 +53,7 @@ pub enum RecoveryAction {
 /// REPLAY_REQUIRED   -> ReplayFromSource
 /// DISCOVERED/BATCHING -> ReplayFromSource    (no durable object yet)
 /// SOURCE_COMMITTED  -> None
+/// SUPERSEDED        -> None                (the source committed past it, #567)
 /// ```
 pub fn next_recovery_action(state: BatchState) -> RecoveryAction {
     use BatchState::*;
@@ -65,14 +66,16 @@ pub fn next_recovery_action(state: BatchState) -> RecoveryAction {
         ManifestUploaded => RecoveryAction::RetryVerification,
         Verified => RecoveryAction::RetrySourceCommit,
         Failed | ReplayRequired => RecoveryAction::ReplayFromSource,
-        SourceCommitted => RecoveryAction::None,
+        SourceCommitted | Superseded => RecoveryAction::None,
     }
 }
 
 /// True if a batch in this state still holds uncommitted source progress that
 /// must remain replayable (i.e. the source offset must NOT be advanced).
+///
+/// A SUPERSEDED range holds none (#567): its source has committed past it.
 pub fn requires_replay_protection(state: BatchState) -> bool {
-    !matches!(state, BatchState::SourceCommitted)
+    !state.is_terminal()
 }
 
 #[cfg(test)]
@@ -116,6 +119,12 @@ mod tests {
     fn committed_needs_nothing() {
         assert_eq!(next_recovery_action(SourceCommitted), RecoveryAction::None);
         assert!(!requires_replay_protection(SourceCommitted));
+    }
+
+    #[test]
+    fn superseded_needs_nothing() {
+        assert_eq!(next_recovery_action(Superseded), RecoveryAction::None);
+        assert!(!requires_replay_protection(Superseded));
     }
 
     #[test]

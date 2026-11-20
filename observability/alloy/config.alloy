@@ -9,8 +9,9 @@
 // high-cardinality detail (batch_id, object URIs) that must never be a metric
 // label.
 //
-// Traces (OTLP -> Tempo) are wired but the engine does not emit spans yet; the
-// receiver simply idles until it does.
+// Traces: the engine exports OTLP over HTTP (#683) to this collector's 4318
+// when OTEL_EXPORTER_OTLP_ENDPOINT is set, which the observability overlay
+// does; the receiver below forwards them to Tempo.
 
 // ---------------------------------------------------------------------------
 // Logs: every container in the lab -> Loki
@@ -164,8 +165,9 @@ prometheus.remote_write "mimir" {
 // ---------------------------------------------------------------------------
 // Traces -> Tempo
 // ---------------------------------------------------------------------------
-// Wired now so that when the engine gains OTLP export (issue #46) traces land
-// with no collector change. Until then this receiver is simply idle.
+// The engine sends OTLP/HTTP protobuf to 4318 (#683): a span per batch with
+// a child per step, plus recovery and scrub. gRPC on 4317 stays open for other
+// senders.
 
 otelcol.receiver.otlp "default" {
   grpc { endpoint = "0.0.0.0:4317" }

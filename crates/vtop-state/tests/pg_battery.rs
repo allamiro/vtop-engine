@@ -13,7 +13,45 @@
 //!
 //! Build with `--features postgres,test-support`.
 
+use tracing::instrument::WithSubscriber;
+
+/// The migration SQL as `vtopctl migrate` applies it, to run it raw.
+const MIGRATION_SQL: &str = include_str!("../migrations/postgres/0001_state_store.sql");
 use vtop_state::pg_store::PgStateStore;
+
+/// Log lines captured as JSON, to assert the messages an operator reads.
+#[derive(Clone, Default)]
+struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl Captured {
+    fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
+        tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(self.clone())
+            .finish()
+    }
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Captured;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
 use vtop_state::test_battery;
 use vtop_state::StateStore;
 
@@ -46,6 +84,22 @@ async fn postgres_backend_passes_battery_and_enforces_invariant_at_db() {
         "missing schema must give migration guidance: {err}"
     );
 
+    // #694: a schema without the audit table is not runtime-ready either,
+    // and the refusal names the table, so the operator knows which release's
+    // migration has not run. Owned by the migration identity, the table can
+    // be dropped by it.
+    PgStateStore::migrate(&migrator_conn).await.unwrap();
+    let admin = PgStateStore::connect(&migrator_conn).await.unwrap();
+    admin.execute_raw("DROP TABLE audit_events").await.unwrap();
+    let err = match PgStateStore::connect(&migrator_conn).await {
+        Ok(_) => panic!("runtime connect must refuse a schema without audit_events"),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        err.contains("audit_events") && err.contains("vtopctl migrate"),
+        "a missing audit table must be named, with migration guidance: {err}"
+    );
+
     // A table without the database invariant is also not runtime-ready.
     PgStateStore::migrate(&migrator_conn).await.unwrap();
     let admin = PgStateStore::connect(&migrator_conn).await.unwrap();
@@ -61,6 +115,283 @@ async fn postgres_backend_passes_battery_and_enforces_invariant_at_db() {
         err.to_string().contains("vtopctl migrate"),
         "missing trigger must give migration guidance: {err}"
     );
+
+    // #567: a state CHECK without SUPERSEDED is not runtime-ready either, even
+    // under the current schema marker: the first retirement would fail
+    // at runtime. `vtopctl migrate` widens the CHECK in place, keeping the
+    // rows, and a second run leaves the constraint alone.
+    PgStateStore::migrate(&migrator_conn).await.unwrap();
+    let admin = PgStateStore::connect(&migrator_conn).await.unwrap();
+    admin
+        .execute_raw(
+            "TRUNCATE batches; \
+             INSERT INTO batches \
+             (batch_id, tenant, source_type, source_name, format, state, \
+              progress_start_json, progress_end_json, created_at, updated_at) \
+             VALUES ('pre-567','default','kafka','app','cef','batching','{}','{}','t','t'); \
+             ALTER TABLE batches DROP CONSTRAINT state_enum; \
+             ALTER TABLE batches ADD CONSTRAINT state_enum CHECK (state IN ( \
+                 'discovered','batching','sealed','compressed','checksummed', \
+                 'object_uploaded','manifest_uploaded','verified','source_committed', \
+                 'failed','replay_required'));",
+        )
+        .await
+        .unwrap();
+    let err = match PgStateStore::connect(&migrator_conn).await {
+        Ok(_) => panic!("runtime connect must reject a state CHECK without 'superseded'"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("vtopctl migrate"),
+        "a pre-#567 state CHECK must give migration guidance: {err}"
+    );
+    PgStateStore::migrate(&migrator_conn).await.unwrap();
+    let admin = PgStateStore::connect(&migrator_conn)
+        .await
+        .expect("migrate widens the state CHECK");
+    admin
+        .execute_raw(
+            "DROP TABLE IF EXISTS vtop_test_state_enum; \
+             CREATE TABLE vtop_test_state_enum AS \
+               SELECT oid FROM pg_catalog.pg_constraint \
+               WHERE conrelid = 'batches'::regclass AND conname = 'state_enum'; \
+             UPDATE batches SET state = 'superseded' WHERE batch_id = 'pre-567'; \
+             DO $chk$ BEGIN \
+               IF (SELECT state FROM batches WHERE batch_id = 'pre-567') IS DISTINCT FROM 'superseded' THEN \
+                 RAISE EXCEPTION 'the migration lost the row, or the CHECK refused superseded'; \
+               END IF; \
+             END $chk$;",
+        )
+        .await
+        .unwrap();
+    let err = admin
+        .execute_raw("UPDATE batches SET state = 'not-a-state' WHERE batch_id = 'pre-567'")
+        .await
+        .expect_err("the widened CHECK still refuses an unknown state");
+    assert!(
+        err.to_string().contains("state_enum"),
+        "expected the state CHECK to refuse it, got: {err}"
+    );
+    PgStateStore::migrate(&migrator_conn).await.unwrap();
+    admin
+        .execute_raw(
+            "DO $chk$ BEGIN \
+               IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c \
+                              JOIN vtop_test_state_enum t ON t.oid = c.oid \
+                              WHERE c.conname = 'state_enum') THEN \
+                 RAISE EXCEPTION 'a second migrate replaced a CHECK that already admits superseded'; \
+               END IF; \
+             END $chk$; \
+             DROP TABLE vtop_test_state_enum;",
+        )
+        .await
+        .unwrap();
+
+    // #664: a schema from before the verification class lacks its column,
+    // and holds rows in every state a ledger has. Startup names every column
+    // it reads, so it refuses the schema with the migrate guidance, naming
+    // the column; `vtopctl migrate` adds the column, says how many rows it
+    // left without a class, and every row reads back as it was, with no class
+    // (unknown), as SQLite reads one.
+    PgStateStore::migrate(&migrator_conn).await.unwrap();
+    let admin = PgStateStore::connect(&migrator_conn).await.unwrap();
+    admin
+        .execute_raw(
+            "TRUNCATE batches; \
+             INSERT INTO batches \
+             (batch_id, tenant, source_type, source_name, format, state, \
+              progress_start_json, progress_end_json, created_at, updated_at) \
+             SELECT id, 'default', 'kafka', 'app', 'cef', 'batching', \
+              '{\"source_type\":\"kafka\",\"topic\":\"app\",\"partition\":0,\"start_offset\":0,\"end_offset\":1,\"consumer_group\":\"g\"}', \
+              '{\"source_type\":\"kafka\",\"topic\":\"app\",\"partition\":0,\"start_offset\":0,\"end_offset\":1,\"consumer_group\":\"g\"}', \
+              't', 't' \
+             FROM unnest(ARRAY['pre-664','pre-664-committed','pre-664-failed','pre-664-batching']) AS id; \
+             UPDATE batches SET state = 'verified' WHERE batch_id IN ('pre-664', 'pre-664-committed'); \
+             UPDATE batches SET state = 'source_committed' WHERE batch_id = 'pre-664-committed'; \
+             UPDATE batches SET state = 'failed', error_message = 'upload failed' WHERE batch_id = 'pre-664-failed'; \
+             ALTER TABLE batches DROP COLUMN verification_class;",
+        )
+        .await
+        .unwrap();
+    let err = match PgStateStore::connect(&migrator_conn).await {
+        Ok(_) => panic!("runtime connect must reject a schema without verification_class"),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        err.contains("vtopctl migrate") && err.contains("verification_class"),
+        "a pre-#664 schema must give migration guidance naming the column: {err}"
+    );
+    let logs = Captured::default();
+    PgStateStore::migrate(&migrator_conn)
+        .with_subscriber(logs.subscriber())
+        .await
+        .unwrap();
+    assert!(
+        logs.text()
+            .contains("added the verification_class column; 4 existing rows left NULL"),
+        "the migration must say what it did to the existing rows: {}",
+        logs.text()
+    );
+    let admin = PgStateStore::connect(&migrator_conn)
+        .await
+        .expect("migrate adds the verification_class column");
+    use vtop_core::state_machine::BatchState;
+    for (id, state) in [
+        ("pre-664", BatchState::Verified),
+        ("pre-664-committed", BatchState::SourceCommitted),
+        ("pre-664-failed", BatchState::Failed),
+        ("pre-664-batching", BatchState::Batching),
+    ] {
+        let legacy = admin.get_batch(id).await.unwrap().unwrap();
+        assert_eq!(
+            (legacy.state, legacy.verification_class),
+            (state, None),
+            "{id}: a row written before #664 keeps its state and has no class"
+        );
+    }
+    // A second migrate adds nothing and says nothing.
+    let logs = Captured::default();
+    PgStateStore::migrate(&migrator_conn)
+        .with_subscriber(logs.subscriber())
+        .await
+        .unwrap();
+    assert!(!logs.text().contains("added the verification_class column"));
+    // A value this build does not know (a newer release's) reads as unknown,
+    // not as an error and not as either class.
+    admin
+        .execute_raw("UPDATE batches SET verification_class = 'quantum' WHERE batch_id = 'pre-664'")
+        .await
+        .unwrap();
+    let newer = admin.get_batch("pre-664").await.unwrap().unwrap();
+    assert_eq!(newer.verification_class, None);
+
+    // #626: a schema from before the seal instant (v0.9.0's) lacks its
+    // column. Startup refuses it with the migrate guidance, naming the
+    // column; `vtopctl migrate` adds it, says how many rows it left without
+    // one, and every row reads back as it was, with none. The marker is not
+    // raised: a v0.9.0 engine keeps running against the migrated schema.
+    admin
+        .execute_raw("ALTER TABLE batches DROP COLUMN sealed_at;")
+        .await
+        .unwrap();
+    let err = match PgStateStore::connect(&migrator_conn).await {
+        Ok(_) => panic!("runtime connect must reject a schema without sealed_at"),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        err.contains("vtopctl migrate") && err.contains("sealed_at"),
+        "a pre-#626 schema must give migration guidance naming the column: {err}"
+    );
+    let logs = Captured::default();
+    PgStateStore::migrate(&migrator_conn)
+        .with_subscriber(logs.subscriber())
+        .await
+        .unwrap();
+    assert!(
+        logs.text()
+            .contains("added the sealed_at column; 4 existing rows left NULL"),
+        "the migration must say what it did to the existing rows: {}",
+        logs.text()
+    );
+    assert!(
+        !logs.text().contains("added the verification_class column"),
+        "only the column that was missing is reported: {}",
+        logs.text()
+    );
+    let admin = PgStateStore::connect(&migrator_conn)
+        .await
+        .expect("migrate adds the sealed_at column");
+    for id in [
+        "pre-664",
+        "pre-664-committed",
+        "pre-664-failed",
+        "pre-664-batching",
+    ] {
+        let legacy = admin.get_batch(id).await.unwrap().unwrap();
+        assert_eq!(legacy.sealed_at, None, "{id}: no seal instant was recorded");
+    }
+    let logs = Captured::default();
+    PgStateStore::migrate(&migrator_conn)
+        .with_subscriber(logs.subscriber())
+        .await
+        .unwrap();
+    assert!(!logs.text().contains("added the sealed_at column"));
+
+    // #664: a schema a NEWER release migrated - its marker above the newest
+    // this release reads - is refused, by startup and by this release's
+    // migrate (which would install its older trigger over it), with the
+    // marker and the versions this release reads in the message. Nothing is
+    // changed: the newer body is still there afterwards.
+    admin
+        .execute_raw(
+            "CREATE OR REPLACE FUNCTION vtop_enforce_commit_after_verify() RETURNS trigger AS $fn$
+-- vtop-state-schema 4
+BEGIN
+    RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql; \
+             ALTER TABLE batches DROP COLUMN verification_class;",
+        )
+        .await
+        .unwrap();
+    // The newer release also dropped a column this one names (review): the
+    // refusal must still be the newer-schema one. Sending the operator to
+    // `vtopctl migrate`, which then refuses, sends them the wrong way first.
+    for (what, refused) in [
+        (
+            "startup",
+            PgStateStore::connect(&migrator_conn)
+                .await
+                .err()
+                .map(|e| e.to_string()),
+        ),
+        (
+            "migrate",
+            PgStateStore::migrate(&migrator_conn)
+                .await
+                .err()
+                .map(|e| e.to_string()),
+        ),
+    ] {
+        let refused = refused.unwrap_or_else(|| panic!("{what} accepted a newer schema marker"));
+        for part in [
+            "schema marker 4",
+            "-- vtop-state-schema 4",
+            "minimum 3",
+            "newest 3",
+            "newer release",
+        ] {
+            assert!(
+                refused.contains(part),
+                "{what}: {part:?} missing from: {refused}"
+            );
+        }
+    }
+    // The migration's own guard (review): the SQL refuses a newer marker in
+    // its transaction, under an advisory lock, so a run that slips past the
+    // pre-check - an older migrate racing a newer one, or the SQL applied by
+    // an external migration system - still cannot overwrite the newer body.
+    let err = admin
+        .execute_raw(MIGRATION_SQL)
+        .await
+        .expect_err("the migration SQL must refuse a newer marker by itself");
+    assert!(
+        err.to_string().contains("vtop-state-schema 4") && err.to_string().contains("newer"),
+        "the migration SQL's own refusal must name the marker: {err}"
+    );
+    admin
+        .execute_raw(
+            "DO $chk$ BEGIN \
+               IF (SELECT prosrc FROM pg_catalog.pg_proc WHERE proname = 'vtop_enforce_commit_after_verify') \
+                  NOT LIKE '%vtop-state-schema 4%' THEN \
+                 RAISE EXCEPTION 'the refused migrate replaced the newer trigger body'; \
+               END IF; \
+             END $chk$; \
+             DROP FUNCTION vtop_enforce_commit_after_verify() CASCADE;",
+        )
+        .await
+        .unwrap();
+    PgStateStore::migrate(&migrator_conn).await.unwrap();
 
     // Nor is a trigger that exists by name but whose function body has no
     // current schema marker, or one a restore left disabled. The old body is
@@ -125,6 +456,50 @@ async fn postgres_backend_passes_battery_and_enforces_invariant_at_db() {
         .await
         .expect("the current schema must pass startup");
 
+    // #567: the other half of the marker/CHECK pair. The release between #625
+    // and #567 installs its marker-2 body with CREATE OR REPLACE and leaves
+    // the state CHECK alone, so a re-run of ITS migrate leaves the widened
+    // CHECK under an older marker. Refused all the same (the reverse, a
+    // current marker over an old CHECK, is refused above).
+    PgStateStore::migrate(&migrator_conn).await.unwrap();
+    let admin = PgStateStore::connect(&migrator_conn).await.unwrap();
+    admin
+        .execute_raw(
+            "CREATE OR REPLACE FUNCTION vtop_enforce_commit_after_verify() RETURNS trigger AS $fn$
+-- vtop-state-schema 2
+BEGIN
+    IF NEW.state = 'source_committed' THEN
+        IF TG_OP = 'INSERT' THEN
+            RAISE EXCEPTION 'commit before verified: batch % inserted directly as source_committed', NEW.batch_id
+                USING ERRCODE = 'check_violation';
+        ELSIF OLD.state <> 'verified' THEN
+            RAISE EXCEPTION 'commit before verified: batch % is %', OLD.batch_id, OLD.state
+                USING ERRCODE = 'check_violation';
+        END IF;
+    END IF;
+    IF TG_OP = 'INSERT' AND NEW.state <> 'batching' THEN
+        RAISE EXCEPTION 'batch % must be inserted as batching, not %', NEW.batch_id, NEW.state
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;",
+        )
+        .await
+        .unwrap();
+    let err = match PgStateStore::connect(&migrator_conn).await {
+        Ok(_) => panic!("runtime connect must reject a marker-2 body over the widened CHECK"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("vtopctl migrate"),
+        "a marker-2 body must give migration guidance: {err}"
+    );
+    PgStateStore::migrate(&migrator_conn).await.unwrap();
+    PgStateStore::connect(&migrator_conn)
+        .await
+        .expect("migrate restores the marker-3 body");
+
     // The deployment identity applies DDL once, then creates a deliberately
     // narrow role. PostgreSQL's default PUBLIC schema privileges are revoked so
     // the test does not accidentally pass through an implicit grant.
@@ -143,7 +518,9 @@ async fn postgres_backend_passes_battery_and_enforces_invariant_at_db() {
              REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM vtop_runtime_test; \
              REVOKE CREATE ON SCHEMA public FROM vtop_runtime_test; \
              GRANT USAGE ON SCHEMA public TO vtop_runtime_test; \
-             GRANT SELECT, INSERT, UPDATE ON TABLE batches TO vtop_runtime_test;",
+             GRANT SELECT, INSERT, UPDATE ON TABLE batches TO vtop_runtime_test; \
+             GRANT SELECT, INSERT ON TABLE audit_events TO vtop_runtime_test; \
+             GRANT USAGE ON SEQUENCE audit_events_seq_seq TO vtop_runtime_test;",
         )
         .await
         .unwrap();
@@ -166,6 +543,13 @@ async fn postgres_backend_passes_battery_and_enforces_invariant_at_db() {
         ),
         ("DELETE FROM batches WHERE FALSE", "DELETE"),
         ("TRUNCATE batches", "TRUNCATE"),
+        // #694: the runtime role appends audit rows and can change none.
+        (
+            "UPDATE audit_events SET outcome = 'success' WHERE FALSE",
+            "UPDATE audit",
+        ),
+        ("DELETE FROM audit_events WHERE FALSE", "DELETE audit"),
+        ("TRUNCATE audit_events", "TRUNCATE audit"),
     ] {
         let err = match store.execute_raw(sql).await {
             Ok(()) => panic!("runtime identity unexpectedly gained {operation}"),
@@ -183,6 +567,34 @@ async fn postgres_backend_passes_battery_and_enforces_invariant_at_db() {
 
     // ---- 2. Same behavioural contract as every backend, using DML only ----
     test_battery::run_all(&store).await;
+    // The audit table (#694), as the runtime role writes it.
+    test_battery::run_audit_battery(&store).await;
+
+    // Append only as a database property, not only a grant: a role that is
+    // GRANTED update and delete on the table (as a maintenance role granted
+    // DELETE for prune-ledger might be) is still refused by the trigger.
+    admin
+        .execute_raw("GRANT UPDATE, DELETE, TRUNCATE ON TABLE audit_events TO vtop_runtime_test")
+        .await
+        .unwrap();
+    for (sql, operation) in [
+        ("UPDATE audit_events SET outcome = 'success'", "UPDATE"),
+        ("DELETE FROM audit_events", "DELETE"),
+        ("TRUNCATE audit_events", "TRUNCATE"),
+    ] {
+        let err = match store.execute_raw(sql).await {
+            Ok(()) => panic!("audit_events allowed {operation} to a non-owner"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains("append-only"),
+            "the trigger must refuse {operation}: {err}"
+        );
+    }
+    admin
+        .execute_raw("REVOKE UPDATE, DELETE, TRUNCATE ON TABLE audit_events FROM vtop_runtime_test")
+        .await
+        .unwrap();
 
     // ---- 2a. The claim fence (#557): two runtime connections stand for two
     // engines on one shared ledger.
@@ -199,6 +611,30 @@ async fn postgres_backend_passes_battery_and_enforces_invariant_at_db() {
         .prune_committed_history("2100-01-01T00:00:00+00:00", 10)
         .await
         .expect_err("the runtime identity must be denied ledger pruning");
+
+    // ---- 2c. #664: the verification class survives a restart ----
+    // A second runtime connection, with no claims of its own, stands for the
+    // engine after a restart. Last of the batteries: it claims every
+    // claimable row.
+    test_battery::verification_class_before_restart(&store).await;
+    let restarted = PgStateStore::connect(&runtime_conn).await.unwrap();
+    test_battery::verification_class_after_restart(&restarted).await;
+
+    // ---- 2d. Review of #664: `vtopctl migrate` adding a column while an
+    // engine runs. The runtime store's statements are prepared and cached
+    // per connection; the migration identity adds a column; the same store
+    // must keep reading whole rows. The column is dropped again after.
+    test_battery::seed_rows_for_every_read_path(&store).await;
+    test_battery::every_read_path_returns_whole_rows(&store).await;
+    maintenance
+        .execute_raw("ALTER TABLE batches ADD COLUMN vtop_test_later TEXT")
+        .await
+        .unwrap();
+    test_battery::every_read_path_returns_whole_rows(&store).await;
+    maintenance
+        .execute_raw("ALTER TABLE batches DROP COLUMN vtop_test_later")
+        .await
+        .unwrap();
 
     // ---- 3. Defense in depth: the DB trigger rejects a bypass ----
     // Write straight to the table (skipping update_batch_state's guard) to force

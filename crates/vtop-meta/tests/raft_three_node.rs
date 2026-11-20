@@ -515,7 +515,7 @@ async fn spawn_node_on(
     let env = sim.env(seed ^ id);
     let store = MetaRaftStore::open_tiny(&env, &root, CLUSTER).map_err(|e| e.to_string())?;
     let log_store = MetaRaftLogStore::new(store.clone());
-    let state_machine = MetaRaftStateMachine::new(store.clone());
+    let state_machine = MetaRaftStateMachine::new(store.clone()).with_node_id(id);
     let network = NetworkFactory {
         router: router.clone(),
         source: id,
@@ -565,6 +565,93 @@ async fn three_node_bootstrap_converges_to_byte_identical_snapshots() {
         );
     }
     cluster.assert_converged_snapshots();
+}
+
+/// #694: every replica writes one applied audit record per audited
+/// command, with the same request id and log index, from the state-machine
+/// wrapper; a node-initiated command writes none; and a restarted replica
+/// replaying its log at open writes nothing again.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn every_replica_writes_one_applied_audit_record_per_audited_command() {
+    use vtop_meta::audit::{AuditAction, AuditActor, AuditOutcome, AuditStage, Recording};
+    let audit = Recording::installed();
+    let seed = SEED ^ 0x694;
+    let mut cluster = Cluster::boot(seed).await;
+    // Request ids of this test only: the recording auditor is process-wide.
+    let envelope = || CommandEnvelope {
+        request_id: Uuid::new_v4(),
+        issued_at_ms: 1_750_000_000_000,
+    };
+    let audited = envelope();
+    cluster
+        .write(register_cmd(audited, Uuid::from_u128(0x694)))
+        .await;
+    let records = audit.for_request(audited.request_id);
+    assert_eq!(
+        records.len(),
+        3,
+        "one applied record per replica: {records:?}"
+    );
+    let mut replicas: Vec<_> = records
+        .iter()
+        .map(|r| match r.actor {
+            AuditActor::Replica(Some(id)) => id,
+            ref other => panic!("an applied record names its replica, not {other:?}"),
+        })
+        .collect();
+    replicas.sort_unstable();
+    assert_eq!(replicas, vec![1, 2, 3]);
+    let index = records[0]
+        .log_index
+        .expect("an applied record has its index");
+    for record in &records {
+        assert_eq!(record.stage, AuditStage::Applied);
+        assert_eq!(record.action, AuditAction::ClusterPropose);
+        assert_eq!(record.outcome, AuditOutcome::Success);
+        assert_eq!(
+            record.log_index,
+            Some(index),
+            "the same index on every replica"
+        );
+        assert!(record
+            .params
+            .contains(&("command", "RegisterNode".to_owned())));
+    }
+
+    // Rejected by the state machine (a generation that does not match): a
+    // failure on every replica, with the reason.
+    let rejected = envelope();
+    cluster
+        .write(MetadataCommand::RegisterNode {
+            env: rejected,
+            node_uuid: Uuid::from_u128(0x694),
+            addr: "10.0.0.94:9200".to_owned(),
+            expected_generation: Some(999),
+        })
+        .await;
+    let records = audit.for_request(rejected.request_id);
+    assert_eq!(records.len(), 3, "{records:?}");
+    assert!(records.iter().all(|r| r.outcome == AuditOutcome::Failure
+        && r.reason.as_deref().unwrap_or_default().contains("rejected")));
+
+    // A replica restarted from its disk replays its log at open and writes
+    // no record for what it had applied before.
+    let follower = [1u64, 2, 3]
+        .into_iter()
+        .find(|id| *id != cluster.leader_id())
+        .unwrap();
+    let (sim, root) = cluster.take_and_shutdown(follower).await;
+    cluster.restart_node(follower, sim, root).await;
+    let after = envelope();
+    cluster
+        .write(register_cmd(after, Uuid::from_u128(0x695)))
+        .await;
+    assert_eq!(
+        audit.for_request(audited.request_id).len(),
+        3,
+        "a restart must not write the applied records again"
+    );
+    assert_eq!(audit.for_request(after.request_id).len(), 3);
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -1249,7 +1336,8 @@ async fn a_command_newer_than_the_clusters_feature_level_never_reaches_the_log()
     let seed = SEED ^ 0x554;
     let mut cluster = Cluster::boot(seed).await;
     let consensus = OpenraftConsensus::new(cluster.leader().raft.clone())
-        .with_store(cluster.leader().store.clone());
+        .with_store(cluster.leader().store.clone())
+        .with_member_probe(this_build());
     let split = |env: CommandEnvelope| MetadataCommand::SplitRange {
         env,
         topic_uuid: Uuid::from_u128(0x20),
@@ -1404,6 +1492,7 @@ async fn a_lineage_carrying_report_never_reaches_an_old_level_log() {
         ],
         votes: 1,
         required: 2,
+        attestation: None,
     };
     let last_log = |cluster: &Cluster| {
         cluster
@@ -1478,5 +1567,592 @@ async fn a_lineage_carrying_report_never_reaches_an_old_level_log() {
         matches!(judged.response, MetadataResponse::Rejected(_)),
         "{:?}",
         judged.response
+    );
+}
+
+/// #634: a data node's version report is a command kind no release before
+/// it can decode, so a tier at the previous release's level - every voter
+/// may still be on it - must never get one into its log, while a data node
+/// upgraded ahead of the tier keeps asking. Once the level is raised, the
+/// report is recorded on every voter, and the cluster-versions read serves
+/// it back with the level in force.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_version_report_never_reaches_a_log_below_its_level() {
+    use vtop_meta::transport::AdminReadClusterVersionsRequest;
+    use vtop_meta::{
+        Consensus, ConsensusError, OpenraftConsensus, LINEAGE_VERDICTS_FEATURE_LEVEL,
+        NODE_VERSION_REPORTS_FEATURE_LEVEL,
+    };
+
+    let seed = SEED ^ 0x634;
+    let mut cluster = Cluster::boot(seed).await;
+    let consensus = OpenraftConsensus::new(cluster.leader().raft.clone())
+        .with_store(cluster.leader().store.clone());
+    let data_node = Uuid::from_u128(0x10);
+    let report = |env: CommandEnvelope| MetadataCommand::ReportNodeVersion {
+        env,
+        node_uuid: data_node,
+        release: "0.8.0".to_owned(),
+        max_replica_protocol: 2,
+        supported_feature_level: NODE_VERSION_REPORTS_FEATURE_LEVEL,
+    };
+    let last_log = |cluster: &Cluster| {
+        cluster
+            .leader()
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .unwrap_or(0)
+    };
+    let env = cluster.envelope();
+    consensus
+        .propose(register_cmd(env, data_node))
+        .await
+        .unwrap();
+
+    // The highest level a tier of the previous release can be at.
+    let previous = LINEAGE_VERDICTS_FEATURE_LEVEL;
+    assert!(previous < NODE_VERSION_REPORTS_FEATURE_LEVEL);
+    let env = cluster.envelope();
+    consensus
+        .propose(MetadataCommand::SetFeatureLevel {
+            env,
+            feature_level: previous,
+        })
+        .await
+        .unwrap();
+
+    let before = last_log(&cluster);
+    for _ in 0..3 {
+        let env = cluster.envelope();
+        match consensus.propose(report(env)).await {
+            Err(ConsensusError::FeatureNotEnabled { needed, enabled }) => {
+                assert_eq!(
+                    (needed, enabled),
+                    (NODE_VERSION_REPORTS_FEATURE_LEVEL, previous)
+                );
+            }
+            other => panic!(
+                "a version report was not refused at level {previous} (seed={seed:#x}): {other:?}"
+            ),
+        }
+    }
+    assert_eq!(
+        last_log(&cluster),
+        before,
+        "a refused version report reached the log an older voter must decode"
+    );
+
+    let env = cluster.envelope();
+    consensus
+        .propose(MetadataCommand::SetFeatureLevel {
+            env,
+            feature_level: NODE_VERSION_REPORTS_FEATURE_LEVEL,
+        })
+        .await
+        .unwrap();
+    let env = cluster.envelope();
+    let recorded = consensus.propose(report(env)).await.unwrap();
+    assert_eq!(
+        recorded.response,
+        MetadataResponse::Ack {
+            generation: u64::from(NODE_VERSION_REPORTS_FEATURE_LEVEL)
+        },
+        "the report answers with the level in force"
+    );
+    let _ = cluster.leader().raft.trigger().heartbeat().await;
+    cluster
+        .wait_applied_at_least(recorded.log_id.index - 1)
+        .await;
+    for (id, node) in &cluster.nodes {
+        let versions = node.store.with_storage(|s| s.state().cluster_versions());
+        let entry = versions
+            .nodes
+            .iter()
+            .find(|entry| entry.node_uuid == data_node)
+            .unwrap_or_else(|| panic!("node {id} lost the data node (seed={seed:#x})"));
+        assert_eq!(
+            entry.report.as_ref().map(|r| r.release.as_str()),
+            Some("0.8.0"),
+            "node {id} (seed={seed:#x})"
+        );
+    }
+
+    let read = vtop_meta::transport::AdminHandler::read_cluster_versions(
+        &consensus,
+        AdminReadClusterVersionsRequest {
+            include_nodes: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read.versions.feature_level,
+        NODE_VERSION_REPORTS_FEATURE_LEVEL
+    );
+    assert!(!read.truncated);
+    assert!(read
+        .versions
+        .nodes
+        .iter()
+        .any(|entry| entry.node_uuid == data_node && entry.report.is_some()));
+    let level_only = vtop_meta::transport::AdminHandler::read_cluster_versions(
+        &consensus,
+        AdminReadClusterVersionsRequest {
+            include_nodes: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(level_only.versions.nodes.is_empty());
+    assert_eq!(
+        level_only.versions.feature_level,
+        NODE_VERSION_REPORTS_FEATURE_LEVEL
+    );
+}
+
+/// #636: below feature level 8 the operator's override cannot enter the log
+/// - neither the attestation nor a report that used one - and the
+/// lineage-unproven refusal reason is held back with them. An older voter
+/// could decode none of the three. At level 8 all three pass the gate.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn the_promotion_override_never_reaches_a_log_below_level_8() {
+    use vtop_meta::{
+        AnswerLineage, Consensus, ConsensusError, OpenraftConsensus, PromotionAttestation,
+        PromotionOutcome, PromotionRefusal, QuorumAnswer, PROMOTE_UNPROVEN_FEATURE_LEVEL,
+    };
+
+    let seed = SEED ^ 0x636;
+    let mut cluster = Cluster::boot(seed).await;
+    let consensus = OpenraftConsensus::new(cluster.leader().raft.clone())
+        .with_store(cluster.leader().store.clone())
+        .with_member_probe(this_build());
+    let topic_uuid = Uuid::from_u128(0x20);
+    let range_uuid = Uuid::from_u128(0x21);
+    let attest = |env: CommandEnvelope| MetadataCommand::AttestUnprovenPromotion {
+        env,
+        topic_uuid,
+        range_uuid,
+        replica_node_uuid: Uuid::from_u128(0x10),
+        operator: "oncall".to_owned(),
+    };
+    let report =
+        |env: CommandEnvelope, outcome: PromotionOutcome| MetadataCommand::ReportPromotionOutcome {
+            env,
+            topic_uuid,
+            range_uuid,
+            holder_node_uuid: Uuid::from_u128(0x10),
+            fencing_epoch: 1,
+            outcome,
+        };
+    let attested = PromotionOutcome::Established {
+        boundary_offset: Some(5),
+        sealed_prefix_end: None,
+        quorum: vec![
+            QuorumAnswer {
+                node_uuid: Uuid::from_u128(0x10),
+                offset: 5,
+                lineage: Some(AnswerLineage::Unknown),
+            },
+            QuorumAnswer {
+                node_uuid: Uuid::from_u128(0x11),
+                offset: 5,
+                lineage: Some(AnswerLineage::Unknown),
+            },
+        ],
+        votes: 2,
+        required: 2,
+        attestation: Some(PromotionAttestation {
+            attestation_id: Uuid::from_u128(0x636),
+            replica_node_uuid: Uuid::from_u128(0x10),
+            operator: "oncall".to_owned(),
+            attested_at_ms: 0,
+        }),
+    };
+    let unproven_refusal = PromotionOutcome::Refused {
+        reason: PromotionRefusal::LineageUnproven,
+    };
+    let last_log = |cluster: &Cluster| {
+        cluster
+            .leader()
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .unwrap_or(0)
+    };
+
+    // Everything below the override's level is enabled, so each refusal is
+    // about the override and nothing else.
+    let below = PROMOTE_UNPROVEN_FEATURE_LEVEL - 1;
+    let env = cluster.envelope();
+    consensus
+        .propose(MetadataCommand::SetFeatureLevel {
+            env,
+            feature_level: below,
+        })
+        .await
+        .unwrap();
+
+    let commands = |cluster: &mut Cluster| {
+        vec![
+            ("the attestation", attest(cluster.envelope())),
+            (
+                "an attested report",
+                report(cluster.envelope(), attested.clone()),
+            ),
+            (
+                "the lineage-unproven refusal",
+                report(cluster.envelope(), unproven_refusal.clone()),
+            ),
+        ]
+    };
+    for (what, command) in commands(&mut cluster) {
+        let before = last_log(&cluster);
+        match consensus.propose(command).await {
+            Err(error @ ConsensusError::FeatureNotEnabled { needed, enabled }) => {
+                assert_eq!((needed, enabled), (PROMOTE_UNPROVEN_FEATURE_LEVEL, below));
+                // The refusal tells the operator what to do.
+                assert!(
+                    error.to_string().contains("enable-features --level 8"),
+                    "{error}"
+                );
+            }
+            other => panic!("{what} was not refused at level {below} (seed={seed:#x}): {other:?}"),
+        }
+        assert_eq!(last_log(&cluster), before, "{what} reached the log");
+    }
+    // Below the level the refusal goes as it always did.
+    let env = cluster.envelope();
+    let legacy = consensus
+        .propose(report(env, unproven_refusal.without_unproven_refusal()))
+        .await
+        .unwrap();
+    assert!(
+        matches!(legacy.response, MetadataResponse::Rejected(_)),
+        "no such range here, so the state machine judges it: {:?}",
+        legacy.response
+    );
+
+    let env = cluster.envelope();
+    consensus
+        .propose(MetadataCommand::SetFeatureLevel {
+            env,
+            feature_level: PROMOTE_UNPROVEN_FEATURE_LEVEL,
+        })
+        .await
+        .unwrap();
+    for (what, command) in commands(&mut cluster) {
+        let judged = consensus.propose(command).await.unwrap_or_else(|error| {
+            panic!("{what} was refused at level 8 (seed={seed:#x}): {error}")
+        });
+        // No such range here: each is judged by the state machine, which
+        // is what passing the gate means.
+        assert!(
+            matches!(judged.response, MetadataResponse::Rejected(_)),
+            "{what}: {:?}",
+            judged.response
+        );
+    }
+}
+
+/// Every metadata member answers as this build (#706): what a raise judged
+/// on the members' own word sees once every voter is upgraded.
+struct ThisBuild;
+
+#[async_trait::async_trait]
+impl vtop_meta::MemberVersionProbe for ThisBuild {
+    async fn ask(&self, member: vtop_meta::MetaNodeId) -> vtop_meta::MemberVersion {
+        let mine = vtop_meta::transport::local_version(member);
+        vtop_meta::MemberVersion::Reported {
+            node_id: mine.node_id,
+            release: mine.release,
+            supported_feature_level: mine.supported_feature_level,
+        }
+    }
+}
+
+fn this_build() -> Arc<dyn vtop_meta::MemberVersionProbe> {
+    Arc::new(ThisBuild)
+}
+
+/// #706: a raise to 8 or above waits for every metadata member to show it
+/// implements the level. Data nodes are judged from their replicated
+/// reports (#634); members are asked by the leader before it proposes,
+/// because a v0.9.0 voter (which implements 7) cannot report, and its state
+/// machine would reject the level deterministically - a diverged view and,
+/// at the first command of that level, a voter that appends nothing more.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_raise_to_level_8_waits_for_every_metadata_member() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use vtop_meta::{
+        Consensus, ConsensusError, MemberVersion, MemberVersionProbe, MetaNodeId,
+        OpenraftConsensus, FIRST_MEMBER_CHECKED_FEATURE_LEVEL, NODE_VERSION_REPORTS_FEATURE_LEVEL,
+    };
+
+    /// Answers for each member as the test says, counting the questions. A
+    /// member with no answer listed never answers at all.
+    struct Members {
+        answers: BTreeMap<u64, MemberVersion>,
+        asked: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl MemberVersionProbe for Members {
+        async fn ask(&self, member: MetaNodeId) -> MemberVersion {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            match self.answers.get(&member.0) {
+                Some(answer) => answer.clone(),
+                None => std::future::pending().await,
+            }
+        }
+    }
+    let reported = |id: u64, level: u32| MemberVersion::Reported {
+        node_id: MetaNodeId(id),
+        release: "0.10.0".to_owned(),
+        supported_feature_level: level,
+    };
+    let level = FIRST_MEMBER_CHECKED_FEATURE_LEVEL;
+    assert_eq!(level, 8);
+
+    let seed = SEED ^ 0x706;
+    let mut cluster = Cluster::boot(seed).await;
+    let leader = cluster.leader_id();
+    let others: Vec<u64> = cluster
+        .nodes
+        .keys()
+        .copied()
+        .filter(|id| *id != leader)
+        .collect();
+    let (upgraded, old) = (others[0], others[1]);
+    let last_log = |cluster: &Cluster| {
+        cluster
+            .leader()
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .unwrap_or(0)
+    };
+    let level_on = |cluster: &Cluster| {
+        cluster
+            .leader()
+            .store
+            .with_storage(|s| s.state().feature_level())
+    };
+    let raise = |env: CommandEnvelope, level: u32| MetadataCommand::SetFeatureLevel {
+        env,
+        feature_level: level,
+    };
+
+    // One member upgraded, one still on v0.9.0: it closes the connection on
+    // a question it has no arm for.
+    let mixed = Arc::new(Members {
+        answers: BTreeMap::from([
+            (upgraded, reported(upgraded, level)),
+            (old, MemberVersion::NoAnswer),
+        ]),
+        asked: AtomicUsize::new(0),
+    });
+    let consensus = OpenraftConsensus::new(cluster.leader().raft.clone())
+        .with_store(cluster.leader().store.clone())
+        .with_member_probe(mixed.clone());
+
+    // Up to 7 the members are not asked: v0.8.0 and v0.9.0 implement 7 and
+    // cannot answer, so asking would refuse a raise they can apply.
+    let env = cluster.envelope();
+    consensus
+        .propose(raise(env, NODE_VERSION_REPORTS_FEATURE_LEVEL))
+        .await
+        .unwrap();
+    assert_eq!(mixed.asked.load(Ordering::SeqCst), 0, "seed={seed:#x}");
+    assert_eq!(level_on(&cluster), NODE_VERSION_REPORTS_FEATURE_LEVEL);
+
+    // 8 is refused while the old member is there, naming it, and nothing
+    // reaches the log.
+    let before = last_log(&cluster);
+    let env = cluster.envelope();
+    match consensus.propose(raise(env, level)).await {
+        Err(error @ ConsensusError::MembersNotReady { .. }) => {
+            let text = error.to_string();
+            assert!(text.contains("feature level 8 not raised"), "{text}");
+            assert!(text.contains("the level stays 7"), "{text}");
+            assert!(
+                text.contains(&format!("{old} (closed without answering")),
+                "{text}"
+            );
+            assert!(
+                !text.contains(&format!("{upgraded} (")),
+                "the upgraded member is not a blocker: {text}"
+            );
+            assert!(
+                !text.contains(&format!("{leader} (")),
+                "the leader implements 8 and is not a blocker: {text}"
+            );
+        }
+        other => panic!("a raise past an old member was not refused (seed={seed:#x}): {other:?}"),
+    }
+    assert_eq!(mixed.asked.load(Ordering::SeqCst), 2, "both others asked");
+    assert_eq!(
+        last_log(&cluster),
+        before,
+        "the refused raise reached the log"
+    );
+    assert_eq!(level_on(&cluster), NODE_VERSION_REPORTS_FEATURE_LEVEL);
+
+    // The admin plane carries it as a refusal, not an unknown outcome.
+    match vtop_meta::transport::AdminHandler::propose(&consensus, raise(cluster.envelope(), level))
+        .await
+    {
+        Err(vtop_meta::TransportError::Refused(text)) => {
+            assert!(text.contains("Upgrade them, then raise again"), "{text}")
+        }
+        other => panic!("not carried as a refusal (seed={seed:#x}): {other:?}"),
+    }
+
+    // A member that never answers is named once the deadline passes, and
+    // the raise does not hang.
+    let silent = Arc::new(Members {
+        answers: BTreeMap::from([(upgraded, reported(upgraded, level))]),
+        asked: AtomicUsize::new(0),
+    });
+    let waiting = OpenraftConsensus::new(cluster.leader().raft.clone())
+        .with_store(cluster.leader().store.clone())
+        .with_member_probe(silent);
+    let env = cluster.envelope();
+    match waiting.propose(raise(env, level)).await {
+        Err(error @ ConsensusError::MembersNotReady { .. }) => {
+            let text = error.to_string();
+            assert!(
+                text.contains(&format!("{old} (unreachable: no answer within 2s)")),
+                "{text}"
+            );
+        }
+        other => panic!("a silent member did not block (seed={seed:#x}): {other:?}"),
+    }
+
+    // A node that cannot ask refuses rather than trusting.
+    let blind = OpenraftConsensus::new(cluster.leader().raft.clone())
+        .with_store(cluster.leader().store.clone());
+    let env = cluster.envelope();
+    let unasked = blind.propose(raise(env, level)).await;
+    assert!(
+        matches!(
+            unasked,
+            Err(ConsensusError::MembersNotReady { ref blockers, .. })
+                if others.iter().all(|other| blockers.iter().any(|blocker| {
+                    blocker.member == MetaNodeId(*other)
+                        && matches!(blocker.answer, MemberVersion::Unreachable(_))
+                }))
+        ),
+        "seed={seed:#x}: {unasked:?}"
+    );
+
+    // A follower does not judge or write: it sends the caller to the leader.
+    let on_follower = OpenraftConsensus::new(cluster.nodes[&upgraded].raft.clone())
+        .with_store(cluster.nodes[&upgraded].store.clone())
+        .with_member_probe(mixed.clone());
+    let asked = mixed.asked.load(Ordering::SeqCst);
+    let env = cluster.envelope();
+    assert!(
+        matches!(
+            on_follower.propose(raise(env, level)).await,
+            Err(ConsensusError::NotLeader { leader: Some(id) }) if id == MetaNodeId(leader)
+        ),
+        "seed={seed:#x}"
+    );
+    assert_eq!(mixed.asked.load(Ordering::SeqCst), asked);
+    assert_eq!(last_log(&cluster), before);
+
+    // Every member upgraded: the leader judges itself too, and the raise is
+    // proposed and applied.
+    let ready = Arc::new(Members {
+        answers: BTreeMap::from([
+            (upgraded, reported(upgraded, level)),
+            (old, reported(old, level)),
+        ]),
+        asked: AtomicUsize::new(0),
+    });
+    let consensus = OpenraftConsensus::new(cluster.leader().raft.clone())
+        .with_store(cluster.leader().store.clone())
+        .with_member_probe(ready.clone());
+    let env = cluster.envelope();
+    let raised = consensus.propose(raise(env, level)).await.unwrap();
+    assert_eq!(
+        raised.response,
+        MetadataResponse::Ack {
+            generation: u64::from(level)
+        }
+    );
+    assert_eq!(ready.asked.load(Ordering::SeqCst), 2);
+
+    // Once in force, a raise to it again asks nobody: it is the no-op Ack.
+    let env = cluster.envelope();
+    let again = blind.propose(raise(env, level)).await.unwrap();
+    assert_eq!(
+        again.response,
+        MetadataResponse::Ack {
+            generation: u64::from(level)
+        }
+    );
+}
+
+/// Review of #758: the members' answers hold only for the membership they
+/// were asked under. A member added while they were asked is not judged by
+/// them, so the raise is refused and nothing is proposed.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_membership_change_during_the_check_refuses_the_raise() {
+    use vtop_meta::{
+        Consensus, ConsensusError, MemberVersion, MemberVersionProbe, MetaNodeId,
+        OpenraftConsensus, FIRST_MEMBER_CHECKED_FEATURE_LEVEL,
+    };
+
+    /// Answers as this build, after adding a learner the first time.
+    struct AddsALearner {
+        raft: MemRaft,
+        added: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl MemberVersionProbe for AddsALearner {
+        async fn ask(&self, member: MetaNodeId) -> MemberVersion {
+            if !self.added.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                self.raft
+                    .add_learner(4, EmptyNode {}, false)
+                    .await
+                    .expect("add learner");
+            }
+            ThisBuild.ask(member).await
+        }
+    }
+
+    let seed = SEED ^ 0x758;
+    let mut cluster = Cluster::boot(seed).await;
+    let probe = Arc::new(AddsALearner {
+        raft: cluster.leader().raft.clone(),
+        added: std::sync::atomic::AtomicBool::new(false),
+    });
+    let consensus = OpenraftConsensus::new(cluster.leader().raft.clone())
+        .with_store(cluster.leader().store.clone())
+        .with_member_probe(probe);
+    let env = cluster.envelope();
+    match consensus
+        .propose(MetadataCommand::SetFeatureLevel {
+            env,
+            feature_level: FIRST_MEMBER_CHECKED_FEATURE_LEVEL,
+        })
+        .await
+    {
+        Err(ConsensusError::Refused(text)) => {
+            assert!(text.contains("membership changed"), "{text}");
+            assert!(text.contains("Nothing was proposed"), "{text}");
+        }
+        other => panic!("a raise judged on a stale membership went on (seed={seed:#x}): {other:?}"),
+    }
+    assert_ne!(
+        cluster
+            .leader()
+            .store
+            .with_storage(|s| s.state().feature_level()),
+        FIRST_MEMBER_CHECKED_FEATURE_LEVEL
     );
 }

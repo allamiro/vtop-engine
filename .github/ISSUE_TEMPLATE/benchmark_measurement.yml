@@ -1,0 +1,63 @@
+name: Benchmark or measurement
+description: A question to answer with a measurement of the engine, its upload path or the cluster.
+labels: ["testing"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Title it `benchmarks: the question`, for example `benchmarks: upload goodput on a policed 10 Mbit/s uplink`.
+
+        Results here are held to the substantiation rule in CONTRIBUTING.md: every number carries its conditions, the baseline is named and tuned, and nothing is claimed about a system that wasn't measured. Read *What may and may not be said* in [docs/EGRESS_TRANSPORT_RESEARCH.md](https://github.com/allamiro/vtop-engine/blob/main/docs/EGRESS_TRANSPORT_RESEARCH.md) before writing a comparison. Raw results go under `benchmarks/measurements/<issue>-<slug>/`, with the environment recorded beside them.
+
+        A performance bug you have already measured goes in a *Bug report*.
+
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: What the measurement should answer, and what decision or claim depends on it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: compared
+    attributes:
+      label: What is measured, and against what
+      description: The system under test (version or commit, binary sha256) and the baseline, with how the baseline is tuned. If there is no baseline, say why the absolute number is enough.
+    validations:
+      required: true
+
+  - type: textarea
+    id: method
+    attributes:
+      label: Method
+      description: |
+        - harness: `benchmarks/run_benchmark.py`, `run_matrix.py`, `kafka_compare`, the live-chaos scenarios, or something new;
+        - workload: record and object sizes, volume, partitions or files, batch settings;
+        - link: rate, RTT, loss, shaper or policer, queue or bucket depth;
+        - runs: how many, warm-up, what is discarded;
+        - what is recorded, and how (engine metrics, client timings, `ss -ti`, pcap).
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment and noise
+      description: Hosts or VMs, CPU, memory, disk, kernel, and whether anything else shares them. How noise is bounded and reported (repeated runs, spread, pinned CPUs, a quiet host).
+    validations:
+      required: true
+
+  - type: textarea
+    id: done
+    attributes:
+      label: Done when
+      description: The acceptance criteria, as checks someone else can tick. For example, every configuration run 3 times, results reported with their spread, raw CSVs committed, the README table updated.
+    validations:
+      required: true
+
+  - type: textarea
+    id: related
+    attributes:
+      label: Related
+      description: Earlier measurements, issues and PRs (`Refs #N`).

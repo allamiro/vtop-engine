@@ -44,7 +44,7 @@ This mattered enough to check rather than assume:
 
 | Component | Metrics | Logs | Traces |
 |---|---|---|---|
-| **VTOP engine** | ✅ **native Prometheus** (`/metrics`, opt-in via `VTOP_METRICS_ADDR`) | ✅ structured events | ⏳ wired, not emitted yet |
+| **VTOP engine** | ✅ **native Prometheus** (`/metrics`, opt-in via `VTOP_METRICS_ADDR`) | ✅ structured events | ✅ **OTLP spans** per batch, recovery row and scrub check, plus OTLP metrics (opt-in via `OTEL_EXPORTER_OTLP_ENDPOINT`, [below](#opentelemetry)) |
 | MinIO | ✅ native Prometheus | ✅ | — |
 | Kafka | ⚠️ JMX only → `kafka-exporter` sidecar translates it | ✅ | — |
 | rsyslog | ⚠️ `impstats` only | ✅ | — |
@@ -69,9 +69,20 @@ GET /readyz    readiness
 | `vtop_verified_total` | counter | Batches that passed verification |
 | `vtop_commits_total` | counter | **Must never exceed `verified_total`** — the invariant, measurable |
 | `vtop_verification_failures_total` | counter | **Any non-zero value is an incident** |
-| `vtop_verification_backend_limited_total` | counter | Verified by size only, no checksum |
+| `vtop_verification_backend_limited_total` | counter | Size-only verification acceptances under `upload.require_strong_verification: false`, counted where `vtop_verified_total` counts verifications: when the running engine marks a batch VERIFIED on a size-only result, and when recovery (or a later pass settling a row it held back) commits a row the ledger records as verified `size_only` - even if the opt-out has been turned off since, as long as its re-check still lets it commit (#664; a row from before #664, with no class, is counted by recovery's storage re-check, as before; a row recovery holds back under a lower incomplete range is logged, not counted). Each is also a WARN with its batch id, and each **accepts same-size corruption** (#629) |
+| `vtop_verification_mode{tenant,mode}` | gauge | Set once at startup: `mode="size_only"` is 1 when `upload.require_strong_verification` is false, `mode="strong"` is 1 otherwise. Alert on `vtop_verification_mode{mode="size_only"} == 1` to catch a lab setting left in production before any batch moves. Exported by `vtopctl run` only, like every series here; the one-shot `process-once` and `replay` serve no endpoint and log the startup WARN instead (#629) |
+| `vtop_object_lock_mode{tenant,mode}` | gauge | The S3 Object Lock profile the engine started with (#684): `mode="governance"` or `mode="compliance"` is 1 with `upload.object_lock` set, `mode="off"` is 1 without it; the others read 0. Set once at startup by `run`, like `vtop_verification_mode` |
+| `vtop_object_lock_checks_total{tenant,result}` | counter | Object Lock checks (#684), primed at zero at startup: one per object and per manifest a batch wrote or reused under the profile, by `result` (a replay's look at an object before reusing it, #709, is a key decision in `vtop_object_key_decisions_total` and is counted here only when the read fails, as `error`): `ok`; `missing`, `mode_mismatch`, `too_short`, `legal_hold_missing` (the store did not keep the retention asked for: the batch failed, is replayed, and `vtop_verification_failures_total` counts it too); `error` (the retention could not be read, or the backend asked for none); `bucket_not_locked` (a batch refused at the first upload to a templated bucket without Object Lock); `store_unsupported` (the same, on a store that answered "not implemented" to the Object Lock check, #722). **Alert on any increase of a result other than `ok`.** Each failure is an ERROR `object_lock_check_failed` (or `object_lock_bucket_refused`) event with the batch id, URI and result |
 | `vtop_replay_required_total` | counter | Work being repeated |
+| `vtop_file_delete_decisions_total{outcome}` | counter | Every `sources.file.delete_after_commit` decision about a fully archived file (#619): `deleted`, `deleted_unchecked` (deleted under `sources.file.delete_without_open_check` with no lease, so nothing proved that no process had it open), or why it was kept - `appended`, `shorter`, `other_file`, `rewritten`, `unprovable`, `metadata_changed`, `links_changed` (its link count changed: another name of it was deleted, or a hard link made), `gone`, `symlink`, `open`, `no_open_check`, `rename_refused`, `failed`, `stale_commit` - plus `leftover_archived` (a file found under a delete's hidden name, archived as its own source) and `opened_at_unlink` (an open reached the file between the final check and the unlink; an error is logged, and what that process writes is not archived - or a warning, when the file keeps another hard link that is a source this engine reads). An `opened_at_unlink` delete is also counted as `deleted`, so do not add the two to count deletes. Each count has a log line naming the path, what happened and what to do. A rising `no_open_check` or `rename_refused` means files that stay until the operator acts. Alert on `increase(vtop_file_delete_decisions_total{outcome="deleted_unchecked"}[1h]) > 0`: an operator is living with the opt-in's two windows (see `delete_without_open_check`) |
+| `vtop_recovery_rechecks_total` | counter | VERIFIED batches recovery re-checked against storage at startup (#664), labelled by `verification_class` - the class the ledger recorded the batch was verified with: `strong`, `size_only`, or `unknown` for a row from before #664 or one carrying a class a newer release wrote - and `result`, what the re-check found: `strong`, `size_only`, `failed`, `unsupported_version`. A row held back is re-checked, and counted, at every restart. Alert on `verification_class="strong", result="size_only"`: content verified strongly that the store can no longer confirm (the commit is still counted as strong, and logged as a WARN with the batch id); restore checksum support on the backend (checksums enabled, a backend that can hash the stored bytes), then run `vtopctl scrub`, which uses the same check |
+| `vtop_recovery_unsupported_manifest_total` | counter | VERIFIED batches whose manifest recovery found to be from a newer release than the engine reads (#671), proven to be the writer's pinned version. They are left VERIFIED (or retired SUPERSEDED once their source has committed past them), never replayed. Non-zero means an engine is older than a writer sharing its ledger, which the upgrade order rules out: upgrade that engine |
+| `vtop_recovery_held_total{tenant,source_type,reason}` | counter | Ranges recovery held instead of rewinding (#639, #782), by `reason`: `ledger_write_failed` (the state store refused the `FAILED` or `REPLAY_REQUIRED` write of the replay decision) or `newer_manifest` (a VERIFIED batch written by a newer release, #671). A held range holds back every VERIFIED range above it in its source unit, and a rewind above it starts at it instead, so nothing is skipped. `ledger_write_failed` above zero means the state store is refusing writes: check its disk, permissions and connectivity. The batch id and the error are in the ERROR line beside it. |
+| `vtop_recovery_rewinds_lowered_total{tenant,source_type}` | counter | Rewinds recovery applied at the start of a held range of the same source unit below them, instead of their own (#782). Applied at their own start, they moved the read head past the held range. Each one means the held range is read again with the ranges above it, which are archived twice; it follows a `vtop_recovery_held_total` increase and needs no action of its own. |
 | `vtop_failed_total` | counter | Batches that hit FAILED |
+| `vtop_manifest_authentications_total{key_id,result}` | counter | Manifest MAC checks (#685): the engine's read-back of each stored manifest, and recovery's re-check. Each configured key's `ok`/`failed` series, each tombstone's `retired_key` and `other`/`unknown_key` are created at zero at startup, so `increase()` catches the first one. `key_id` is a configured key id, `none` (a key with no id, or a manifest with no id where no key is `legacy`) or `other` (an id this process does not hold); never an id read from a manifest. `result` is `ok`, `failed`, `unknown_key` or `retired_key`. `unknown_key` means a process lacks a key that signed part of the archive: add it as verify-only. Unauthenticated, not corrupt: the scrub and recovery treat it as `unauthenticated`, and their messages name the key id |
+| `vtop_manifests_written_total{tenant,version}` | counter | Manifests stored, by the version written (`manifest.write_version`, #671): `0.3` or `0.4`. A `0.4` sample means every reader of the archive must run v0.8.0 or later; v0.7.0 and earlier report those manifests as tampered. The startup INFO line names the version and why |
+| `vtop_verification_receipts_total{tenant,result}` | counter | Verification receipts (#671), with `manifest.verification_receipts` on, primed at zero at startup: `written` (by the engine after a batch is VERIFIED), `failed` (it could not be built, stored or, under the Object Lock profile, read back locked; the batch commits regardless, and the WARN `verification_receipt_failed` says why), `repaired` (written by recovery for a VERIFIED batch that had none). Never a batch failure: alert on `increase(...{result="failed"}[1h]) > 0` as a warning, not a page. |
 | `vtop_records_total`, `vtop_bytes_in_total`, `vtop_bytes_out_total` | counters | Volume; rates via `rate()` |
 | `vtop_stage_duration_seconds{stage}` | histogram | Per-stage latency, p95-able |
 | `vtop_batch_duration_seconds` | histogram | End to end |
@@ -79,8 +90,25 @@ GET /readyz    readiness
 | `vtop_inflight_batches` | gauge | Accumulated but not sealed |
 | `vtop_source_read_errors_total` | counter | An unhealthy source, which is otherwise invisible |
 | `vtop_retention_lost_records_total{tenant,source_type}` | counter | Records the broker's retention removed before the engine read them — **never archived; any increase is an incident** (#98, #454). Charted on the engine dashboard's retention-loss row; the one provisioned alert fires on it. See [retention loss](#retention-loss). |
+| `vtop_source_replay_refused_total{tenant,source_type}` | counter | A failed range its source could not hand back for re-reading, so it is **missing from the archive** (#621). For a file, that is a range whose file cannot be proven reachable: truncated or replaced in place, or rotated away and then removed, compressed, copied by `copytruncate`, or truncated before its re-read. Primed at zero like the read-error counter; recovery counts it again at every restart while the row stays incomplete. The path is in the ERROR line beside it. |
+| `vtop_kafka_partition_events_total{event}` | counter | Kafka partition-list changes seen while reading, and what the source did (#675): `no_partitions` (asked again next pass), `lookup_failed` (last known list served), `grew`, `new_partition_from_beginning`, `start_deferred` (asked again; counted per attempt, at most once per partition every 10s), `pinned_before_renewal`, and `recreated_or_truncated`. **Alert on `recreated_or_truncated`**: the ledger cannot tell a recreated topic from the old one, so an operator must check what was archived. The topic and partition are in the log line beside it. |
 | `vtop_upload_throttled_total{stage}` | counter | The store asking for less concurrency, not more retries (#102) |
 | `vtop_upload_width` | gauge | Uploads in flight this cycle: the configured width, or the adaptive controller's (#102) |
+| `vtop_multipart_parts_total{result}` | counter | Multipart parts (#668), by `result`: `uploaded` (sent in this upload call; a call that restarts on a new upload counts what it sent to each, since both crossed the link), `reused` (kept from an earlier call, matched against the local bytes and not sent again), `retried` (one per extra attempt at a part), `failed` (the part's last attempt in the call failed). Throttled part requests are also in `vtop_upload_throttled_total{stage="object_upload"}`. |
+| `vtop_multipart_sessions_total{outcome}` | counter | Multipart sessions (#668), by `outcome`: `completed`, `resumed` (a replay adopted the session a failed attempt kept), `restarted` (the store could not continue the upload, `NoSuchUpload` or `InvalidPart` on complete; it was abandoned and a new one started; `resumed` stays counted if it had been resumed), `kept_after_failure` (an upload failed and its session and parts were kept for the replay), `swept` (an abandoned session's upload was aborted). **Alert when `kept_after_failure` grows while `resumed` and `swept` do not**: incomplete uploads are piling up in the bucket, where their parts are billed (see `docs/PRODUCTION_HA.md` §7.6). `resumed`, `restarted`, `kept_after_failure` and `swept` are also `multipart_*` log events (`multipart_session_resumed`, `multipart_session_restarted`, `multipart_session_kept`, `multipart_sweep`) with the object `key`; a part retry is a `multipart_part_retry` event, at most one a minute per object with a `suppressed` count. |
+| `vtop_multipart_bytes_reused_total` | counter | Bytes of kept parts a resumed upload did not send again (#668): what keeping sessions saved. |
+| `vtop_object_key_decisions_total{decision}` | counter | How each batch's object key was decided (#626). `derived` and `reused` are the normal path: `reused` is a replay that found its verified object and uploaded nothing. A rising `fallback_differs` (an object at the key does not verify; run `vtopctl scrub`), `fallback_size_only`, `fallback_unreadable` (an object at the key could not be read back), `fallback_unchecked` (the store refused or failed the check of the key; a 403 means a missing list permission) or `per_attempt` (no checksum, or a command backend) means replays write second objects. `probe_throttled` batches failed and were handed back. Under the S3 Object Lock profile (#709), a replay whose verified object at the key is not locked as configured writes a fresh locked object under its attempt key instead: `fallback_lock_elapsed` (its lock ended; if this keeps rising, ranges wait longer than `retain_days` for their replay), `fallback_unlocked` (it has no lock: stored before the profile, or by a store that dropped the headers), `fallback_lock_mode` (the other mode) or `fallback_hold_missing`. The engine remembers the fresh key per range for the process: a replay reuses it when it is usable, and when it is there and not usable either (a store that does not keep the lock) writes nothing for five minutes, counted as `lock_withheld`. These are WARN `object_key_fallback` events naming the batch, the old `key` and the new `fallback_key`, at most once a minute per source and kind. Alert on `increase(...{decision=~"fallback_unlocked|fallback_lock_mode|fallback_hold_missing|lock_withheld"}[1h]) > 0` as a warning; the series is not primed, so the first one in a new series is missed by `increase()`. A retention that cannot be read is not a fallback: the batch fails and `vtop_object_lock_checks_total{result="error"}` counts it. Each decision is also an `object_key_*` log event with `batch_id`, `source`, `range` and `key`; the repeating `per_attempt` and `fallback_unchecked` notices are logged at most once a minute per source with a `suppressed` count. |
+| `vtop_replay_rebuilds_total{tenant,source_type,format,result}` | counter | What each replay of a window an earlier attempt sealed came to (#626). `exact`: the window covers exactly the recorded range and was sealed at the recorded instant, so it is filed under the same hour and names the same key as the failed attempt (the `reused` decision above is what then skipped the upload). `bytes_differ`: the window covers exactly the recorded range, but its digest differs from the object the earlier attempt uploaded, so a second object is written and the first is left untouched (compression, format or checksum settings changed, or the source's content did). `fallback`: the same range and bytes, but the key decision fell back to the per-attempt key (the `fallback_*` or `per_attempt` decision says why), so a second object is written. `refused`: the re-read could not stop at the recorded end (a line crosses it, the file under it was replaced, a rotated file's re-read), so it read to the current end as before. `too_large`: the range is over 4x the current batching limits and was not bounded. `dropped_at_stop`: the engine stopped inside a rebuild and dropped the partial window; the next start reads it again. **Alert on any increase of `bytes_differ`, `fallback`, `refused` or `too_large`**: `increase(vtop_replay_rebuilds_total{result=~"bytes_differ|fallback|refused|too_large"}[1h]) > 0` means replays are likely writing second objects; under the Object Lock profile each is retained until its date. Each result is also a log event with `batch_id`, `earlier_batch_id`, `source`, `range` and `key`: `replay_rebuilt` (INFO), `replay_key_fallback` (INFO), `replay_bytes_differ`, `replay_bound_refused` (rate-limited, with `suppressed`), `replay_bound_too_large` and `replay_window_dropped` (WARN). No range, key or path is a label. `vtop_object_key_decisions_total` keeps its decisions unchanged. |
+
+### Multipart sessions
+
+A failed multipart upload keeps its session and completed parts so the replay
+resumes it (#668). They are billed storage until the upload completes or is
+aborted, so watch that kept sessions are resumed or swept rather than piling
+up: the shipped rule `VtopMultipartSessionsPiling` (see
+[Alert rules](#alert-rules)) fires when a session was kept 30 to 36 hours ago, past the 24 h abandon window
+and the 6 h sweep interval, and none was resumed and none swept for 36 hours.
+A session the sweep is not yet due to abort does not raise it.
 
 ### Retention loss
 
@@ -186,6 +214,115 @@ and a group that retention has already passed pages on the first rule, not the
 second. Groups that commit through the Kafka gateway (#457) are metadata
 cursors and appear here.
 
+### Kafka gateway refusals
+
+A data node's Kafka gateway counts what it refuses in
+`vtop_kafka_requests_refused_total{api,reason}` (#596); its log lines for
+the same refusals repeat only at powers of two, with the running total.
+Both labels are a fixed set, and on a node that runs a gateway every series
+is exported from the first scrape at zero:
+
+| `api` | `reason` | What it means, and what to do |
+|---|---|---|
+| `offset_commit` | `no_offset_store` | A consumer committed offsets to a node with no metadata plane (a static leader or a standalone node). Nothing was stored; the client was answered `INVALID_REQUEST`. A consumer with auto-commit on logs it and keeps reading; an explicit commit fails. Run the node as a leased leader on a metadata plane, or set `enable.auto.commit=false` on consumers that do not need committed offsets. |
+| `unserved` | `unserved_api` | A client sent a request the gateway does not serve (CreateTopics, DescribeConfigs, ...), and the connection was closed. The log line names the api key. Topics are created on the metadata plane (`vtopctl meta create-topic`), not through the Kafka API. |
+
+### Archive scrub
+
+`vtopctl scrub` (#628) reads committed objects back and verifies them again:
+the manifest at its pinned version, its self-hash and MAC and its binding to
+the ledger row, then the object's stored content against the manifest's
+digest, then that the manifest's current key still holds the pinned version.
+It is a scheduled command, not part of the engine (see
+[`PRODUCTION_HA.md`](../docs/PRODUCTION_HA.md) §7.5), so its metrics are not on
+the engine's `/metrics`: `--metrics-file` writes them as a Prometheus text
+file for a node exporter's textfile collector, like `audit-coverage`'s. The
+lab has no textfile collector, so nothing here charts or alerts on them.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `vtop_scrub_objects_total{result}` | counter | Committed batches checked, by `result`: `ok`; `limited` (size-only: present at its size, no digest compared, the same result recovery counts in `vtop_verification_backend_limited_total`; counted, not a finding); `missing`, `mismatched`, `unauthenticated`, `unreadable`, `unsupported_version` (a manifest from a newer release than the scrub's binary reads, #671) (findings). Every result is written, at zero when nothing had it. Carried forward from the file each run replaces, so it counts across runs. |
+| `vtop_scrub_manifest_keys_total{key_id}` | counter | With a manifest key configured: manifests the scrub authenticated, by the configured key id that verified them (`none` for the `manifest_mac_key_env` key), each configured key at zero when it verified nothing (#685). After a key rotation, every key the archive was signed with should be counting. Carried forward like `vtop_scrub_objects_total`, for the keys still configured. |
+| `vtop_scrub_retention_total{result}` | counter | With `--check-retention` only (#684): committed batches whose S3 Object Lock retention (object at its key, manifest at its pinned version; never the receipt's, which is `vtop_scrub_receipt_retention_total`) the scrub read, by `result`: `locked`; `elapsed` (the retention has ended: normal for an old object, not a finding); `missing` and `mode_mismatch` (findings). Carried forward like `vtop_scrub_objects_total`. |
+| `vtop_scrub_receipt_retention_total{result}` | counter | With `--check-retention` while receipts are checked (the config sets `manifest.verification_receipts`, or `--require-receipts`) (#710): verification receipts whose S3 Object Lock retention the scrub read, each at its current key, by `result`, the same set as `vtop_scrub_retention_total`: `locked`; `elapsed` (not a finding); `missing` and `mode_mismatch` (findings: the receipt can be deleted or overwritten). A missing receipt is not counted here; it is `vtop_scrub_receipts_total{result="missing"}`. Nor is a receipt whose retention could not be read (it is counted `unreadable` in `vtop_scrub_receipts_total` when it was otherwise `ok`), or one deleted between its read and its retention read, so the family can sum to fewer than the receipts found. Carried forward like `vtop_scrub_objects_total`. |
+| `vtop_scrub_receipts_total{result}` | counter | When receipts are checked (the config sets `manifest.verification_receipts`, or `--require-receipts`) (#671): committed batches whose verification receipt the scrub read, by `result`: `ok`; `missing` (normal for batches archived before receipts were enabled; a finding only with `--require-receipts`); `invalid` (does not parse, or fails its hash or MAC), `unauthenticated` (signed with a key the scrub does not hold, or a retired one), `mismatched` (not this batch's as the ledger recorded it: batch, manifest digest or version, object, or class) and `unreadable` (findings; with `--check-retention`, also an otherwise `ok` receipt whose retention could not be read). Carried forward like `vtop_scrub_objects_total`. |
+| `vtop_scrub_last_run_findings` | gauge | Findings in the latest run. With a rotating cursor this is one slice's: the next slice can read 0 while damage found earlier in the pass is still there, so alert on the timestamp below. |
+| `vtop_scrub_last_run_timestamp_seconds` | gauge | When the latest run finished. |
+| `vtop_scrub_last_success_timestamp_seconds` | gauge | When a run last finished with no findings; 0 if none has. A run with findings leaves it where it was. |
+| `vtop_scrub_last_pass_complete_timestamp_seconds` | gauge | When a scrub last finished checking every committed batch: a run over all of them, or the cursor run that reached the end of a pass. 0 if none has. |
+| `vtop_scrub_last_finding_timestamp_seconds` | gauge | When a run last found a missing, mismatched, unauthenticated, unreadable or unsupported-version batch; 0 if none has. A clean run leaves it where it was. This is what the findings alert reads: unlike an `increase()` of the counter, it shows damage the very first run found, since that is already in the counter's first sample. |
+
+`result` is the only label: batch ids and URIs are in the command's report and
+its WARN lines. An example rule set, in Prometheus rule format, for a
+deployment whose scrub runs hourly and walks the archive once a week (scale
+the windows to your schedule):
+
+```yaml
+groups:
+  - name: vtop-archive-scrub
+    rules:
+      # Damage to committed data, or data this scrub could not verify. It
+      # keeps paging on `unsupported_version` (#671), a manifest from a newer
+      # release than the scrub's binary reads, which is proven to be the
+      # writer's pinned version (otherwise it is `unauthenticated`). Damage
+      # can hide behind a batch nothing has verified, and the remedy (a scrub
+      # binary of that release) is quick. For damage, the source has usually
+      # aged out, so the engine cannot archive it again: restore the object
+      # or manifest from a replica or backup, or record the loss.
+      # `vtopctl scrub --json` lists each finding with its batch id, URIs
+      # and what was found.
+      #
+      # Fires for a pass window (8d here) after the last run that found
+      # anything. Not `vtop_scrub_last_run_findings`: a rotating scrub checks
+      # a damaged batch once per pass, so the next slice reads 0 while the
+      # damage is still there. Not `increase()` of the result counter either:
+      # the counter is born in the first run's file, so damage that FIRST run
+      # finds is already in the series' first sample and shows no increase,
+      # and the clean slices after it leave the counter flat. The timestamp
+      # is alertable from its first sample. A batch still damaged is found
+      # again next pass and restamps it; after a repair the alert clears one
+      # window after the last finding.
+      - alert: VtopArchiveScrubFindings
+        expr: time() - vtop_scrub_last_finding_timestamp_seconds < 8 * 86400
+        labels:
+          severity: page
+          service: vtop-engine
+        annotations:
+          summary: "The archive scrub found committed batches damaged, unreadable or unverifiable"
+          description: >-
+            A scrub run in the last eight days found a committed batch missing,
+            mismatched, unauthenticated or unreadable - restore it from a
+            replica or backup, or record the loss - or with a manifest from a
+            newer release than the scrub's binary reads (unsupported_version):
+            run a scrub of that release or later. The run logs and
+            vtopctl scrub --json list them; vtop_scrub_objects_total{result}
+            counts them.
+      # The scrub stopped running, or has not passed for two days.
+      # `last_success` is 0 until a run passes, so a scrub that never passed fires too.
+      - alert: VtopArchiveScrubStale
+        expr: time() - vtop_scrub_last_success_timestamp_seconds > 2 * 86400
+        for: 1h
+        labels:
+          severity: ticket
+          service: vtop-engine
+        annotations:
+          summary: "No archive scrub has passed for two days"
+      # A rotating scrub (--cursor-file with --limit) that has not finished a
+      # pass in eight days: the per-run limit is too small for the archive.
+      - alert: VtopArchiveScrubPassOverdue
+        expr: time() - vtop_scrub_last_pass_complete_timestamp_seconds > 8 * 86400
+        for: 1h
+        labels:
+          severity: ticket
+          service: vtop-engine
+        annotations:
+          summary: "The archive scrub has not checked every committed batch in eight days"
+```
+
+The rules are an example, not provisioned: the lab's rules in
+`grafana/provisioning/alerting/vtop-alerts.yaml` are for metrics the lab
+produces.
+
 ### Design decisions worth knowing
 
 - **Labels are bounded**: `tenant`, `source_type`, `format`, `stage`, `state` —
@@ -202,6 +339,242 @@ cursors and appear here.
   identical to a broken scrape. An incident counter must read `0`, not blank.
 - **Telemetry can never break the data path.** A bad `VTOP_METRICS_ADDR`, a port
   clash, or a registry failure logs an error and the engine keeps archiving.
+
+## Alert rules
+
+[`prometheus/vtop-rules.yaml`](prometheus/vtop-rules.yaml) is the engine's
+Prometheus rule set (#720): verification failures, no commits while data is
+waiting, a replay-rate spike, Kafka lag growth (from kafka-exporter), size-only
+verification, failed Object Lock checks, retention loss, refused replays, a
+state store refusing recovery's replay decisions, and piling multipart
+sessions. Each alert has a firing and a quiet promtool unit
+test in [`prometheus/tests/`](prometheus/tests/vtop-rules.test.yaml) and a
+`runbook_url` to its section of
+[`docs/operate/runbooks.md`](../docs/operate/runbooks.md); the objectives they
+protect are in [`docs/operate/slos.md`](../docs/operate/slos.md). The Helm
+chart ships a copy as a `PrometheusRule` (`metrics.prometheusRule.enabled`),
+kept identical by CI.
+
+```bash
+docker run --rm --network none -v "$PWD/observability/prometheus:/rules:ro" -w /rules \
+  --entrypoint promtool prom/prometheus:v3.15.1 test rules tests/vtop-rules.test.yaml
+python3 scripts/check-alert-runbooks.py   # every alert: a runbook section and both tests
+```
+
+The lab does not run Prometheus or Alertmanager; Mimir stores the metrics and
+Grafana evaluates its own provisioned rules (see the scope list below). The
+two sets are described side by side on
+[Metrics and alerts](../docs/operate/monitoring.md#alerts).
+
+## The audit trail
+
+Commands that change engine or cluster state write audit records (#694) on
+the `vtop::audit` log target, which the operator's `RUST_LOG` cannot
+silence, and, with `VTOP_AUDIT_LOG` set, to an append-only JSONL file. Two
+counters, on the engine's and every node's `/metrics`:
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `vtop_audit_events_total` | `action` (`ledger.prune`, `ledger.replay`, `ledger.migrate`, `scrub.cursor`, `cluster.*`, `node.repair`, `node.reconfigure_range`, `promotion.attest`), `outcome` (`attempt`, `success`, `failure`, `refused`) | Records written. |
+| `vtop_audit_write_failures_total` | `sink` (`log`, `file`, `ledger`) | Records a sink could not take. Any increase needs a look: a destructive ledger command was refused, or a record is in fewer places than configured. |
+
+With JSON logs, the records in Loki (the lab's Alloy labels lines by
+`service`):
+
+```logql
+{service=~"vtop.*"} | json | target="vtop::audit" | fields_record != "" | line_format "{{.fields_record}}"
+```
+
+Each line's `fields_record` is the full record; `fields_summary`,
+`fields_action`, `fields_outcome`, `fields_actor` and `fields_audit_id` are
+beside it for filtering. The message (Alloy's `event` label) is only
+`audit: <action> <outcome>`, so the label stays bounded. See [docs/operate/auditing.md](../docs/operate/auditing.md).
+
+## OpenTelemetry
+
+`vtopctl` and `vtop-node` export over OTLP (#683): traces of the batch
+lifecycle, recovery and scrub, the same metrics `/metrics` serves, and log
+lines that carry the trace they belong to. It is compiled into every binary
+and the container image, and **idle until an OTLP endpoint is set**: with none,
+there is no exporter, no export thread or task, and the engine's spans are
+never created (they sit at DEBUG, below the default log level). Startup says
+which it is, in one INFO line:
+
+```text
+OpenTelemetry export disabled (OTEL_EXPORTER_OTLP_ENDPOINT unset)
+OpenTelemetry export enabled: traces to alloy:4318/v1/traces, metrics to alloy:4318/v1/metrics, protocol http/protobuf, sampler parentbased_always_on, service.name vtop-engine
+```
+
+The endpoint is shown as host and path only: never its user-info, query
+string, or the headers.
+
+### Traces
+
+| Span | Parent | One per | Attributes |
+|---|---|---|---|
+| `batch` | — (a trace of its own) | batch | `batch_id`, `source_type`, `source_name`, `tenant`, `format`, `records`, `bytes` (uncompressed), `compressed_bytes`, `checksum_algorithm`, `verification_method` (`store_checksum`, `read_back`, `size_only`), `verification_result` (`strong`, `size_only`), `result`, and `failed_stage` when it failed |
+| `seal`, `compress`, `checksum`, `upload_object`, `upload_manifest`, `verify`, `commit` | `batch` | step the batch reached | `upload_object` adds `multipart` |
+| `recovery` | — | recovery scan (engine start) | `rows`, `committed`, `replay_required`, `superseded`, `still_pending` |
+| `recovery_row` | `recovery` | row recovery claimed | `batch_id`, `source_type`, `source_name`, `tenant`, `state`, `action`, `recheck`, `decision` |
+| `recovery_commit` | `recovery` | VERIFIED row whose re-check passed | the row's identity, `recheck`, `decision` (`committed`, `held_back`, `not_committed`) |
+| `scrub_check` | — | batch `vtopctl scrub` checks | `batch_id`, `source_type`, `source_name`, `tenant`, `origin`, `bytes`, `result` |
+
+`result` on a batch is `committed`, `failed` (a step failed; the batch's range
+is handed back to the source), `commit_failed` (verified, but the source
+commit failed and is retried later), or `incomplete` (a ledger write or a store
+request errored before the batch reached an outcome, or a second stop signal
+abandoned the shutdown flush; a range that had not verified is handed back,
+one that had stays VERIFIED and is committed later). A failure sets an error
+status on the batch and on the step, with the error message redacted (below).
+
+A `recovery_row`'s `decision` is `replay_required`, `superseded` (its source
+already committed past it), `recheck_passed` (a VERIFIED row whose stored
+object still checks out; its `recovery_commit` span follows),
+`held_unsupported_version` or `retired_unsupported_version` (a manifest from a
+newer release), `none`, or, with an error status, `held_ledger_write_failed`
+and `superseded_write_failed` (the decision could not be recorded; the next
+recovery decides again).
+
+A step's span covers the step and the ledger write that records it. In
+`upload_object`, the bucket provisioning and the versioning preflight are
+included: they are that upload's store round trips.
+
+Every span carries the resource attributes `service.name`, `service.version`
+(the release), `service.instance.id` (the engine's `engine.name`; the host
+name for `vtop-node`), `host.name`, and whatever `OTEL_RESOURCE_ATTRIBUTES`
+adds.
+
+### Metrics
+
+When OTLP is on, the process's Prometheus registry is also sent as OTLP every
+`OTEL_METRIC_EXPORT_INTERVAL`: the same names, labels and values as
+`/metrics` (a counter as a cumulative monotonic sum, a gauge as a gauge, a
+histogram as a cumulative histogram with the same bucket bounds). It is a
+bridge from the one registry rather than a second set of instruments, so the
+two cannot disagree. `/metrics` is unchanged and stays the default;
+`OTEL_METRICS_EXPORTER=none` sends traces only.
+
+### Log correlation
+
+With trace export on and JSON logs (`VTOP_LOG_FORMAT=json`), a line written
+inside a batch or a scrub check starts with that span's ids:
+
+```json
+{"trace_id":"2cba1c10e3e5dfef29fd793316c31b82","span_id":"dd6d32e18d43faad","timestamp":"...","level":"INFO","fields":{"message":"batch_sealed",...}}
+```
+
+Lines outside a span, and lines of a trace the sampler did not keep, are
+unchanged: an id that was never exported would link to nothing. Recovery's
+lines carry no ids (its row spans are never entered); find them by
+`batch_id`. In Grafana, Loki's derived field on
+`trace_id` and Tempo's trace-to-logs link connect the two.
+
+### What is never exported or logged
+
+Record content, credentials, keys, MAC values, URLs with their path or query
+string (a presigned S3 URL carries its signature there), and the values of
+`OTEL_EXPORTER_OTLP_HEADERS`. Concretely: no URI is a span attribute; a failed
+batch's error message reaches its span status only after every URL in it is
+cut to `scheme://host`, every run of 32+ hex digits (a MAC or digest) becomes
+`<hex>`, and every AWS access key id becomes `<key-id>`; only spans of the
+processes' own `vtop_*` targets are exported, never a library's; and no log
+event is exported. The tests assert no exported attribute holds record content
+or a `://` URL. Exporting is new network egress;
+[SECURITY_MODEL.md](../docs/SECURITY_MODEL.md#opentelemetry-export-683)
+covers it.
+
+### Configuration
+
+The standard OpenTelemetry variables. A variable that is set to something this
+build cannot honour (an endpoint that is not an `http(s)://` URL with a host,
+an unknown sampler, a protocol other than `http/protobuf`, compression, a
+malformed header list) **stops the process at startup** with an error naming
+the variable and what it accepts; `vtopctl validate` reports the same, and
+`vtopctl validate --print-effective` shows the effective settings.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset: export off | Collector base URL; `/v1/traces` and `/v1/metrics` are appended. With no endpoint set, no other `OTEL_*` variable is read or checked. Put a token in a header, not in the URL: the URL's host and path are printed at startup. |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `..._METRICS_ENDPOINT` | unset | Full URL for one signal, used as given; wins over the base URL. Either alone turns on that signal only. |
+| `OTEL_TRACES_EXPORTER` / `OTEL_METRICS_EXPORTER` | `otlp` | `none` turns that signal off. |
+| `OTEL_SDK_DISABLED` | `false` | `true` turns all export off. |
+| `OTEL_SERVICE_NAME` | `vtop-engine` / `vtop-node` | `service.name`. |
+| `OTEL_RESOURCE_ATTRIBUTES` | none | Extra resource attributes, `key=value,...`. |
+| `OTEL_TRACES_SAMPLER` | `parentbased_always_on` | `always_on`, `always_off`, `traceidratio`, `parentbased_always_on`, `parentbased_always_off`, `parentbased_traceidratio`. |
+| `OTEL_TRACES_SAMPLER_ARG` | `1.0` | The ratio, 0 to 1, for the ratio samplers. |
+| `OTEL_EXPORTER_OTLP_HEADERS` / `..._TRACES_HEADERS` / `..._METRICS_HEADERS` | none | `key=value,...` request headers (values percent-decoded), e.g. a collector token; each must be a valid HTTP header. A secret: supply it like the storage keys; it is never logged or printed. |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` / `..._TRACES_TIMEOUT` | `10000` | Per trace export request, ms. `OTEL_EXPORTER_OTLP_TIMEOUT` also sets the metric export timeout when `OTEL_METRIC_EXPORT_TIMEOUT` is unset. |
+| `OTEL_METRIC_EXPORT_INTERVAL` | `60000` | Between metric exports, ms. |
+| `OTEL_METRIC_EXPORT_TIMEOUT` | `30000` | Per metric export, ms. |
+| `OTEL_BSP_MAX_QUEUE_SIZE` | `2048` | Spans the export queue holds, at most 1 000 000. The memory bound: a span that finds it full is dropped and counted. |
+| `OTEL_BSP_MAX_EXPORT_BATCH_SIZE` | `512` | Spans per export request; at most the queue size. |
+| `OTEL_BSP_SCHEDULE_DELAY` | `5000` | The longest a span waits before its batch is sent, ms. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` (and per signal) | `http/protobuf` | The only value accepted. |
+
+Not supported: the gRPC transport, compression, and HTTP proxies. TLS uses the
+system's root certificates (`SSL_CERT_FILE` or `SSL_CERT_DIR` name others) and
+cannot be switched off.
+
+### What an operator sees
+
+| Condition | Message (stderr) | What the process does |
+|---|---|---|
+| No endpoint set | INFO `OpenTelemetry export disabled (OTEL_EXPORTER_OTLP_ENDPOINT unset)` | Nothing is built; no thread, no task. |
+| Export on | INFO `OpenTelemetry export enabled: traces to <host/path>, metrics to <host/path>, protocol http/protobuf, sampler <s>, service.name <n>` | Exports. |
+| A setting it cannot honour | ERROR naming the variable and the accepted values; exit 1 | Does not start. |
+| Collector unreachable, refusing, or slow past the timeout | WARN `OpenTelemetry trace export failed: ... batches are unaffected`, with the error and `dropped_since_last_warning`; at most one a minute (likewise for metrics) | Drops that export's spans or points, counts them, carries on. |
+| Collector slower than the engine | WARN `OpenTelemetry export queue full ... batches are unaffected ... raise OTEL_BSP_MAX_QUEUE_SIZE`, at most one a minute | Drops new spans while the queue is full, counts them. |
+| Shutdown, collector answering | INFO `OpenTelemetry trace flush: flushed N spans`, `OpenTelemetry metrics flush: exported N data points` | Exits. |
+| Shutdown, collector not answering | WARN `OpenTelemetry trace flush gave up after 5s, N spans dropped` | Exits after 5 s more (6 s at the outside). |
+| Another SIGINT/SIGTERM during that flush | WARN `stop signal during the OpenTelemetry flush` | Exits at once. |
+
+The exporter's own counters are on `/metrics` (and in the OTLP metrics), 0
+until something happens, so a broken collector can be alerted on:
+
+| Metric | Meaning |
+|---|---|
+| `vtop_otel_spans_exported_total` | Spans the collector accepted. |
+| `vtop_otel_spans_dropped_total{reason}` | `queue_full`, `export_failed`, `shutdown`. |
+| `vtop_otel_export_failures_total{signal}` | Failed export requests, `traces` or `metrics`. |
+| `vtop_otel_metric_points_exported_total` / `..._dropped_total` | Metric data points sent, or lost with a failed export. |
+| `vtop_otel_export_queue_length` | Spans waiting: queued plus in flight. At most `OTEL_BSP_MAX_QUEUE_SIZE`. |
+
+**Export never blocks the data path.** A span's end only appends to the
+bounded queue, or drops the span when it is full; one thread sends. Against a
+collector that accepts the connection and never answers, batches commit at the
+rate they commit with export off and memory stays flat
+(`crates/vtop-cli/tests/otel_hung_collector.rs` measures both). On a stop, the
+process waits **5 s** for the last spans and points after its own shutdown
+flush (6 s at the outside: a 1 s backstop over the queue's own bound).
+
+### Tempo in this lab
+
+The stack is wired end to end: the observability overlay points the engine at
+Alloy (`OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4318`, on the storage network
+both share). Alloy's OTLP receiver forwards traces to Tempo; Grafana has Tempo
+as a datasource. Bring the lab up as above, let a few batches run, then in
+Grafana open **Explore → Tempo** and query with TraceQL:
+
+```text
+{ resource.service.name = "vtop-engine" && name = "batch" }
+{ name = "batch" && span.result != "committed" }
+{ name = "upload_object" && duration > 1s }
+{ span.batch_id = "<a batch_id from a log line>" }
+```
+
+The overlay sets `OTEL_METRICS_EXPORTER=none`: Alloy already scrapes the
+engine's `/metrics` into Mimir, and the same series sent again over OTLP would
+be counted twice by every dashboard that sums them. A deployment that does not
+scrape sends metrics over OTLP instead (leave `OTEL_METRICS_EXPORTER` unset).
+Outside the lab, point the engine at any OTLP/HTTP collector (an OpenTelemetry
+Collector, Alloy, or Tempo's own receiver on 4318 for traces):
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://collector.example:4318 vtopctl run --config config.yaml
+```
+
+To run the lab without exporting, set `OTEL_SDK_DISABLED=true` in `.env`; the
+overlay passes it to the engine.
 
 ## Editing dashboards
 
@@ -253,6 +626,8 @@ panel.
 ## Scope: this is a lab, not production
 
 - single-node Mimir/Loki/Tempo on filesystem storage, no retention tuning;
+- the engine exports traces to Alloy over plain HTTP on the lab network; an
+  off-host collector should be reached over `https://`;
 - lab credentials, anonymous Grafana viewing;
 - `MINIO_PROMETHEUS_AUTH_TYPE=public` disables auth on MinIO's metrics endpoint —
   **never do that outside a lab**;

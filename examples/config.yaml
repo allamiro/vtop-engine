@@ -1,5 +1,9 @@
 # VTOP Engine configuration (prototype / reference implementation).
 #
+# Explain the static per-stream settings, origins and preferred verification:
+#   vtopctl validate --config examples/config.yaml --print-effective
+# Add --json for effective_version: 1. No service is contacted or secret resolved.
+#
 # Secrets (access keys, passwords) are NEVER placed in this file. They are read
 # from environment variables or mounted secrets. See docs/SECURITY_MODEL.md.
 
@@ -107,9 +111,42 @@ compression:
 # variable NAME; its value must be a 32-byte key encoded as 64 hex characters.
 # A configured-but-missing/malformed key is a startup error. Enabling it
 # deliberately rejects unsigned pre-cutover manifests during verification and
-# recovery, so verify any backlog before the cutover. Single-key rotation is
-# not implemented yet.
+# recovery, so verify any backlog before the cutover. This is one key with no
+# key id; to rotate keys, use manifest.mac below instead (not both).
 # manifest_mac_key_env: VTOP_MANIFEST_MAC_KEY
+
+# Manifest format (#671). "0.3" (the default) is readable by every release.
+# "0.4" adds verification_plan (the configured verification method and
+# require_strong) and is hashed over the stored document. Enable it only once
+# every engine, `vtopctl scrub` and auditor reading this archive runs v0.8.0 or
+# later: v0.7.0 and earlier report 0.4 manifests as tampered. Engines before
+# this release ignore the section and keep writing 0.3. Quote the value.
+# manifest:
+#   write_version: "0.4"
+#   # Verification receipts (#671): after each batch is verified, write
+#   # <batch_id>.receipt.json beside its manifest, naming the verification
+#   # class and the method the store ran, signed like the manifest. Off by
+#   # default: a consumer listing the prefix sees the extra objects. Never part
+#   # of the commit; `vtopctl scrub` reports missing ones (as findings with
+#   # --require-receipts). Works with either manifest version.
+#   verification_receipts: true
+#   # The manifest MAC keyring (#685), version 0.4 only. The active key signs
+#   # and its id is written in manifest.mac_key_id; every key verifies the
+#   # manifests that name it; the legacy key verifies manifests with no id.
+#   # A rotated-out key stays in keys (verify-only); only a withdrawn key goes
+#   # in retired. Every reader must run the keyring release before the active
+#   # key changes: docs/operate/manifest-key-rotation.md.
+#   mac:
+#     active: q4-2026
+#     keys:
+#       - {id: q3-2026, env: VTOP_MANIFEST_MAC_KEY, legacy: true}
+#       - {id: q4-2026, file: /run/secrets/vtop-manifest-mac-q4}
+#     retired: []
+
+# Global algorithm; streams.yaml may override it per stream via checksum.algorithm.
+# Keep this strong during rolling upgrades: older engines ignore the stream key.
+checksum:
+  algorithm: sha256
 
 sources:
   kafka:
@@ -168,6 +205,20 @@ upload:
   #
   # max_egress_bytes_per_second: 12500000     # e.g. 100 Mbit/s of body bytes
   # max_concurrency_ceiling: 8
+  #
+  # Multipart (objects of at least multipart_threshold_bytes). A failed part is
+  # sent again alone, up to multipart_part_attempts requests with a backoff of
+  # 1 s doubling to 30 s; the parts that completed are kept, and if the batch
+  # still fails under its content-derived object key its session is kept for
+  # the replay of the same bytes, which sends only the missing parts (#668). Sessions nobody resumes are aborted
+  # once older than multipart_abandon_after_secs. Incomplete parts are billed:
+  # add an AbortIncompleteMultipartUpload lifecycle rule with a longer window
+  # (docs/PRODUCTION_HA.md section 7.6).
+  # multipart_part_size_bytes: 8388608
+  # multipart_threshold_bytes: 8388608
+  # multipart_max_parallelism: 4
+  # multipart_part_attempts: 3
+  # multipart_abandon_after_secs: 86400
   # Per-transport egress TUNING (#480): ONE shape, keyed by transport name, so
   # both paths are tuned with the IDENTICAL set of keys — a comparison between
   # them is not tuned-vs-untuned. Only the active `transport` may carry a
@@ -207,8 +258,16 @@ upload:
   # command_timeout_seconds: 300
   # Wall-clock limit for ONE attempt of ONE request on the native S3 backend
   # (#556). Without it a store that accepts a connection and never answers
-  # blocks the engine forever. Size it for the slowest link a part crosses.
+  # blocks the engine forever.
   # request_timeout_seconds: 300
+  # A request that carries a body (an object, a part, a manifest) is allowed
+  # request_timeout_seconds PLUS its size at this rate, per attempt (#663):
+  # the slowest rate one request's body may cross the link at and still be
+  # waited for. Every upload in flight shares the uplink, so this is a
+  # per-request rate: at the default width (8 batches x 4 parts) 4 KiB/s each
+  # is about 1 Mbit/s for the whole link. Lower it for a slower uplink or a
+  # wider configuration. Must be > 0.
+  # request_min_bytes_per_second: 4096
   # command_max_output_bytes: 1048576
   # command_env_allowlist:
   #   - AWS_CONFIG_FILE
@@ -216,8 +275,25 @@ upload:
   create_bucket: true           # auto-create per-format buckets on first use
   # Default true: VERIFIED requires a digest derived from stored content (or a
   # storage-service-computed digest). Set false only for explicit size-only
-  # compatibility/lab operation.
+  # compatibility/lab operation: it accepts same-size corruption, and the
+  # engine says so at startup and in `vtopctl validate`.
   require_strong_verification: true
+  # The S3 Object Lock profile (#684), s3_native only. Unset by default, and
+  # unset sends no lock header and checks nothing. When set, every object,
+  # manifest and multipart upload is written under this retention; the bucket
+  # must have Object Lock enabled (refused at startup for a literal bucket,
+  # at the first batch for a templated one), and a batch whose stored object
+  # or manifest does not carry the retention asked for FAILS and is replayed.
+  # It needs require_object_versioning: true and refuses create_bucket: true
+  # (Object Lock is enabled only when a bucket is created; create it yourself,
+  # with a default retention as the floor for engines older than v0.10.0,
+  # which ignore this block). compliance cannot be shortened by anyone, and
+  # objects of failed attempts are locked too. docs/OBJECT_LOCK_DEPLOYMENT.md.
+  # require_object_versioning: true
+  # object_lock:
+  #   mode: governance            # governance | compliance
+  #   retain_days: 90             # 1..3650, counted from each write
+  #   legal_hold: false           # also place a legal hold on every object
 
 partitioning:
   template: "tenant={tenant}/source={source}/format={format}/year={yyyy}/month={mm}/day={dd}/hour={hh}/"

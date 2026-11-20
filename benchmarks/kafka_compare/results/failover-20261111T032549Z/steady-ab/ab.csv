@@ -1,0 +1,9 @@
+run,round,engine,node_image,node_image_id,client_image,started_at,seconds,records_acked,acks,max_gap_ms,lat_p50_ms,lat_p99_ms,lat_max_ms,rtt_p50_ms,rtt_p99_ms,load1_mean,load1_max,cpu_idle_pct_min,docker_rust_builds_max,note
+r1-A,1,A,vtop-bench:71270e1872f6,sha256:bca88926ac3e3912b59f2a2bcfbe6d650ffc14ffb0cdefe08e3a4dfbbf9c0506,vtop-bench:fa0b16633fdc,2026-11-11T04:49:57+00:00,120,600000,5501,811.7,17.2,506.5,859.9,3.7,13.9,15.08,19.97,1.65,3,
+r1-B,1,B,vtop-bench:fa0b16633fdc,sha256:9e21bb41234fffbb533252f99624aae6c4e5d5e8ef6f6a24bfda7db43c2083cb,vtop-bench:fa0b16633fdc,2026-11-11T04:52:19+00:00,120,600000,5501,264.9,16.5,37.6,269.7,3.6,13.3,8.35,10.48,21.0,1,
+r2-A,2,A,vtop-bench:71270e1872f6,sha256:bca88926ac3e3912b59f2a2bcfbe6d650ffc14ffb0cdefe08e3a4dfbbf9c0506,vtop-bench:fa0b16633fdc,2026-11-11T04:54:30+00:00,120,600000,5501,41.7,16.2,27.9,48.8,3.4,8.9,6.36,6.86,20.41,1,
+r2-B,2,B,vtop-bench:fa0b16633fdc,sha256:9e21bb41234fffbb533252f99624aae6c4e5d5e8ef6f6a24bfda7db43c2083cb,vtop-bench:fa0b16633fdc,2026-11-11T04:56:38+00:00,120,600000,5501,36.7,16.0,27.7,41.7,3.4,8.7,5.87,7.12,32.1,0,
+r3-A,3,A,vtop-bench:71270e1872f6,sha256:bca88926ac3e3912b59f2a2bcfbe6d650ffc14ffb0cdefe08e3a4dfbbf9c0506,vtop-bench:fa0b16633fdc,2026-11-11T04:58:45+00:00,120,600000,5501,44.4,15.7,27.7,49.9,3.4,9.6,5.33,6.51,25.0,0,
+r3-B,3,B,vtop-bench:fa0b16633fdc,sha256:9e21bb41234fffbb533252f99624aae6c4e5d5e8ef6f6a24bfda7db43c2083cb,vtop-bench:fa0b16633fdc,2026-11-11T05:00:56+00:00,120,600000,5501,42.9,14.9,26.4,48.4,3.3,8.2,5.9,6.56,35.93,0,
+r4-A,4,A,vtop-bench:71270e1872f6,sha256:bca88926ac3e3912b59f2a2bcfbe6d650ffc14ffb0cdefe08e3a4dfbbf9c0506,vtop-bench:fa0b16633fdc,2026-11-11T05:03:03+00:00,120,600000,5501,33.2,16.2,27.8,41.3,3.4,8.8,4.98,5.46,30.39,0,
+r4-B,4,B,vtop-bench:fa0b16633fdc,sha256:9e21bb41234fffbb533252f99624aae6c4e5d5e8ef6f6a24bfda7db43c2083cb,vtop-bench:fa0b16633fdc,2026-11-11T05:05:10+00:00,120,600000,5501,40.1,16.0,27.6,45.3,3.3,8.6,6.4,7.77,28.13,0,

@@ -30,11 +30,12 @@
 //!   the count: a claim that returns more rows than any bound still fences
 //!   every one of them. They cost no more than the rows the claim returned.
 //! - **parked** - the work stopped without ending: the batch FAILED (recovery
-//!   writes REPLAY_REQUIRED over it next, and must still be fenced while it
-//!   does), or this process lost the claim (the token is what refuses the
-//!   stalled writer if it tries again). At most [`MAX_PARKED`] are kept; the
-//!   oldest go first, and a write to one that went is refused.
-//! - **released** - committed or handed back for replay: nothing more to write.
+//!   writes REPLAY_REQUIRED, or SUPERSEDED, over it next, and must still be
+//!   fenced while it does), or this process lost the claim (the token is what
+//!   refuses the stalled writer if it tries again). At most [`MAX_PARKED`]
+//!   are kept; the oldest go first, and a write to one that went is refused.
+//! - **released** - committed, handed back for replay, or retired as
+//!   SUPERSEDED (#567): nothing more to write.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -100,7 +101,8 @@ impl ClaimFence {
     /// then be refused (review of #569).
     pub(crate) fn wrote(&self, batch_id: &str, to: BatchState, generation: i64) {
         match to {
-            BatchState::SourceCommitted | BatchState::ReplayRequired => {
+            // SUPERSEDED (#567) is terminal: nothing more is written to it.
+            BatchState::SourceCommitted | BatchState::ReplayRequired | BatchState::Superseded => {
                 self.release(batch_id, generation)
             }
             BatchState::Failed => self.park(batch_id, generation),
@@ -267,6 +269,19 @@ mod tests {
         );
         fence.wrote("b", BatchState::ReplayRequired, 2);
         assert_eq!(fence.held("b"), None);
+    }
+
+    /// #567: a FAILED batch retired as SUPERSEDED is finished - SUPERSEDED is
+    /// terminal - and its token goes, as for SOURCE_COMMITTED.
+    #[test]
+    fn a_failed_batch_retired_as_superseded_releases_its_token() {
+        let fence = ClaimFence::default();
+        fence.claimed("b", 2);
+        fence.wrote("b", BatchState::Failed, 2);
+        assert_eq!(fence.lock().parked, 1);
+        fence.wrote("b", BatchState::Superseded, 2);
+        assert_eq!(fence.held("b"), None, "SUPERSEDED ends the work");
+        assert_eq!(fence.lock().parked, 0, "and frees its parked slot");
     }
 
     /// Review of #569: a write's completion affects only the token it was

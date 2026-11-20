@@ -14,8 +14,9 @@
 //! (backend-limited).
 
 use crate::base::{
-    parse_s3_uri, read_bounded, ObjectChecksum, ObjectHead, StoredManifest, StoredObject,
-    UploadBackend, UploadedPart, VerificationResult,
+    judge_retention, parse_s3_uri, read_bounded, BucketFeature, CreatedUpload, ObjectChecksum,
+    ObjectHead, ObjectLockPolicy, RequestedRetention, RetentionCheck, RetentionExpectation,
+    StoredManifest, StoredObject, StoredRetention, UploadBackend, UploadedPart, VerificationResult,
 };
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
@@ -23,6 +24,7 @@ use aws_sdk_s3::config::Region;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BucketVersioningStatus, ChecksumMode, CompletedMultipartUpload, CompletedPart,
+    ObjectLockEnabled, ObjectLockLegalHoldStatus,
 };
 use aws_sdk_s3::Client;
 use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
@@ -34,6 +36,7 @@ use bytes::Bytes;
 use std::path::Path;
 use std::sync::Arc;
 use vtop_core::checksum::digest_reader;
+use vtop_core::effective_config::VerificationMethod;
 use vtop_core::errors::VtopError;
 use vtop_core::types::ChecksumAlgorithm;
 
@@ -91,6 +94,15 @@ pub struct S3NativeConfig {
     /// Wall-clock limit for one attempt of one request (#556); see
     /// `UploadConfig::request_timeout_seconds`. Must be non-zero.
     pub request_timeout_seconds: u64,
+    /// The slowest rate a request BODY may cross the link at and still be
+    /// waited for (#663); see `UploadConfig::request_min_bytes_per_second`.
+    /// A body-carrying attempt is allowed `request_timeout_seconds` plus its
+    /// size at this rate. Must be non-zero.
+    pub request_min_bytes_per_second: u64,
+    /// The S3 Object Lock retention every object, manifest and multipart
+    /// upload is created with (#684), from `upload.object_lock`. `None` sends
+    /// no lock header, exactly as before the profile existed.
+    pub object_lock: Option<crate::base::ObjectLockPolicy>,
 }
 
 /// How long a connection attempt may take. A store that is up accepts in
@@ -123,6 +135,57 @@ pub fn request_timeouts(request_timeout_seconds: u64) -> aws_smithy_types::timeo
         .build()
 }
 
+/// How long ONE attempt of a request carrying `body_bytes` may take (#663):
+/// the fixed allowance for the exchange, plus the body's size at the slowest
+/// rate the engine still waits for.
+///
+/// A fixed deadline is really a deadline on the request's share of the link.
+/// The engine puts its width times the parts in flight on the uplink at once,
+/// and on a slow link each request gets a small fraction of the rate: on the
+/// policed-uplink profile an 8 MiB part needed far longer than 300 s at its
+/// share, so every attempt was cut at 300 s, sent again from its first byte,
+/// and cut again, and nothing ever committed. A deadline that grows with the
+/// body keeps waiting for a request that is moving its bytes, and still ends
+/// one that is not moving them fast enough to be worth waiting for.
+///
+/// A zero rate is treated as one byte per second rather than dividing by
+/// zero; configuration refuses zero before it gets here.
+pub fn body_attempt_timeout(
+    request_timeout_seconds: u64,
+    body_bytes: u64,
+    min_bytes_per_second: u64,
+) -> std::time::Duration {
+    let body_seconds = body_bytes.div_ceil(min_bytes_per_second.max(1));
+    std::time::Duration::from_secs(request_timeout_seconds.saturating_add(body_seconds))
+}
+
+/// The deadlines for one request that carries a body (#663): the same
+/// connect bound as every request, the attempt allowance from
+/// [`body_attempt_timeout`], and the SDK's three attempts of it for the whole
+/// operation.
+///
+/// The read timeout is DISABLED here, not raised. The SDK's connector starts
+/// it when the request is handed over and stops it at the response head, so
+/// it times the body's transmission too; at the client-wide value it would
+/// cut a slow body at the same fixed point this function exists to remove.
+/// The attempt timeout encloses everything the read timeout bounded, so
+/// nothing is left unbounded, and one disabled value keeps every body request
+/// on one connector rather than one per distinct deadline (the SDK builds and
+/// keeps a connector for each distinct read timeout it is given).
+pub fn body_request_timeouts(
+    request_timeout_seconds: u64,
+    body_bytes: u64,
+    min_bytes_per_second: u64,
+) -> aws_smithy_types::timeout::TimeoutConfig {
+    let attempt = body_attempt_timeout(request_timeout_seconds, body_bytes, min_bytes_per_second);
+    aws_smithy_types::timeout::TimeoutConfig::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .disable_read_timeout()
+        .operation_attempt_timeout(attempt)
+        .operation_timeout(attempt.saturating_mul(OPERATION_ATTEMPTS))
+        .build()
+}
+
 pub struct S3NativeBackend {
     client: Client,
     /// Present only when a cap is configured (#481). The PROCESS's shaper
@@ -144,6 +207,23 @@ pub struct S3NativeBackend {
     /// headers and the body share it - and an object a slow link can still
     /// deliver in that time is not cut off.
     body_deadline: std::time::Duration,
+    /// The fixed per-attempt allowance (#556) and the slowest rate a request
+    /// body is waited for (#663): together they set each body-carrying
+    /// request's deadlines, per request, in [`Self::body_timeouts`].
+    request_timeout_seconds: u64,
+    request_min_bytes_per_second: u64,
+    /// See [`S3NativeConfig::object_lock`] (#684).
+    object_lock: Option<crate::base::ObjectLockPolicy>,
+    /// Whether a write the engine has no SHA-256 for (the BLAKE3 and
+    /// no-checksum paths) carries a whole-object `x-amz-checksum-sha256` the
+    /// backend computes itself (#778). True wherever the SDK would otherwise
+    /// send its CRC32 as an `aws-chunked` trailer, which Garage and Zenko
+    /// CloudServer refuse: under the default
+    /// `AWS_REQUEST_CHECKSUM_CALCULATION=when_supported`, and always under
+    /// the Object Lock profile, which pins that (#708). False only when the
+    /// operator chose `when_required` without the profile: then the SDK sends
+    /// no checksum, and neither does the backend.
+    body_sha256_header: bool,
 }
 
 /// Enforce the transport policy BEFORE any client is built (#75).
@@ -611,6 +691,13 @@ impl S3NativeBackend {
                     .into(),
             ));
         }
+        if cfg.request_min_bytes_per_second == 0 {
+            return Err(VtopError::Config(
+                "upload.request_min_bytes_per_second must be > 0: zero would leave a body \
+                 upload with no deadline at all"
+                    .into(),
+            ));
+        }
         let mut loader = aws_config::defaults(BehaviorVersion::latest())
             .region(Region::new(cfg.region.clone()))
             .timeout_config(request_timeouts(cfg.request_timeout_seconds));
@@ -638,12 +725,25 @@ impl S3NativeBackend {
         // default tcp_tls install is a strict no-op, so the shipping client is
         // `Builder::from(&shared).force_path_style(..)` carrying the #488 scheme
         // gate and nothing else — the seam itself contributes no difference.
-        let s3_conf = install_transport_then_the_last_gate(
-            aws_sdk_s3::config::Builder::from(&shared).force_path_style(cfg.force_path_style),
-            &transport,
-            cfg.verify_tls,
-        )?
-        .build();
+        let mut builder =
+            aws_sdk_s3::config::Builder::from(&shared).force_path_style(cfg.force_path_style);
+        // A write under Object Lock needs an integrity header (#684), and the
+        // BLAKE3 path relies on the SDK computing a CRC32 for it. With
+        // AWS_REQUEST_CHECKSUM_CALCULATION=when_required the SDK names the
+        // algorithm and sends no value, and S3 refuses every locked write
+        // (review of #708), so the profile pins the calculation on.
+        if cfg.object_lock.is_some() {
+            builder = builder.request_checksum_calculation(
+                aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported,
+            );
+        }
+        let body_sha256_header = cfg.object_lock.is_some()
+            || !matches!(
+                shared.request_checksum_calculation(),
+                Some(aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired)
+            );
+        let s3_conf =
+            install_transport_then_the_last_gate(builder, &transport, cfg.verify_tls)?.build();
 
         Ok(Self {
             client: Client::from_conf(s3_conf),
@@ -651,7 +751,39 @@ impl S3NativeBackend {
             process_slot: transport::process_shaper_slot(),
             body_deadline: std::time::Duration::from_secs(cfg.request_timeout_seconds)
                 .saturating_mul(OPERATION_ATTEMPTS),
+            request_timeout_seconds: cfg.request_timeout_seconds,
+            request_min_bytes_per_second: cfg.request_min_bytes_per_second,
+            object_lock: cfg.object_lock,
+            body_sha256_header,
         })
+    }
+
+    /// The per-request override that gives a body-carrying request its own
+    /// deadlines (#663); see [`body_request_timeouts`]. Applied to every
+    /// request that sends object bytes - objects, parts, manifests - and to
+    /// nothing else, so a request without a body keeps the fixed deadline.
+    fn body_timeouts(
+        &self,
+        operation: &str,
+        target: &str,
+        body_bytes: u64,
+    ) -> aws_sdk_s3::config::Builder {
+        let timeouts = body_request_timeouts(
+            self.request_timeout_seconds,
+            body_bytes,
+            self.request_min_bytes_per_second,
+        );
+        tracing::debug!(
+            operation,
+            target,
+            body_bytes,
+            attempt_timeout_s = timeouts
+                .operation_attempt_timeout()
+                .map(|d| d.as_secs())
+                .unwrap_or_default(),
+            "request deadline scaled to its body"
+        );
+        aws_sdk_s3::config::Builder::default().timeout_config(timeouts)
     }
 
     /// The egress shaper, when a cap is configured (#481). `None` is the
@@ -686,17 +818,27 @@ impl S3NativeBackend {
         }
     }
 
+    /// The lock this write asks for, fixed at the moment of the request
+    /// (#684), or `None` without the profile.
+    fn lock_for_this_write(&self) -> Option<RequestedRetention> {
+        self.object_lock
+            .map(|policy| policy.request_at(std::time::SystemTime::now()))
+    }
+
     async fn put(
         &self,
         local_path: &Path,
         uri: &str,
         content_type: &str,
         checksum: Option<ObjectChecksum<'_>>,
-    ) -> Result<Option<String>, VtopError> {
+    ) -> Result<(Option<String>, Option<RequestedRetention>), VtopError> {
         let (bucket, key) = parse_s3_uri(uri)?;
         let body = ByteStream::from_path(local_path)
             .await
             .map_err(|e| VtopError::Upload(format!("reading {}: {e}", local_path.display())))?;
+        // A file body's length is exact; the lower bound is only a fallback.
+        let (low, high) = body.size_hint();
+        let body_bytes = high.unwrap_or(low);
 
         let mut req = self
             .client
@@ -706,34 +848,82 @@ impl S3NativeBackend {
             .content_type(content_type)
             .body(self.egress_body(body));
 
+        // The engine's own SHA-256, when it has one.
+        let engine_sha256 = checksum
+            .filter(|c| c.is_sha256())
+            .and_then(|c| hex_to_b64_sha256(c.hex));
         if let Some(c) = checksum {
             // Always retain the hex digest as user metadata (any algorithm),
             // for tooling and verification of objects from older writers.
             req = req.metadata(CHECKSUM_META_KEY, c.hex);
-            // For SHA-256 only, also request server-validated integrity: S3
-            // recomputes SHA-256 over the body and rejects the upload
-            // (BadDigest) if it does not match, so in-transit corruption fails
-            // the PUT itself. (BLAKE3 is 32 bytes too, so it MUST NOT be sent
-            // here — S3 would recompute SHA-256 and reject it.)
-            if c.is_sha256() {
-                if let Some(b64) = hex_to_b64_sha256(c.hex) {
-                    req = req.checksum_sha256(b64);
-                }
+        }
+        // Server-validated integrity: S3 recomputes SHA-256 over the body and
+        // rejects the upload (BadDigest) if it does not match, so in-transit
+        // corruption fails the PUT itself. The SHA-256 path sends the engine's
+        // own digest. (A BLAKE3 digest is 32 bytes too, so it MUST NOT be sent
+        // here — S3 would recompute SHA-256 and reject it.)
+        //
+        // The BLAKE3 and no-checksum paths send a SHA-256 the backend computes
+        // over the file itself (#778), as a header. Left to the SDK, the
+        // default `when_supported` sends a CRC32 as a trailer in an
+        // `aws-chunked` body, and Garage ("Invalid payload signature") and
+        // Zenko CloudServer (400) refuse every such write. A checksum value on
+        // the request makes the SDK send a plain body with no trailer.
+        // SHA-256 because it is the header the SHA-256 path already sends,
+        // which every store in the #722 matrix accepts. It costs one more
+        // read of the local file, and gains these paths the store-side check.
+        let self_sha256 = match engine_sha256 {
+            Some(_) => None,
+            None if self.body_sha256_header => Some(file_sha256_b64(local_path).await?),
+            None => None,
+        };
+        if let Some(b64) = engine_sha256.clone().or_else(|| self_sha256.clone()) {
+            req = req.checksum_sha256(b64);
+        }
+
+        // The S3 Object Lock profile (#684): every write, object or
+        // manifest, carries the lock. S3 requires an integrity header on a
+        // write under retention (Content-MD5 or x-amz-sdk-checksum-algorithm);
+        // see `lock_integrity` for how each checksum path provides it.
+        let retention = self.lock_for_this_write();
+        if let Some(asked) = retention {
+            req = req
+                .object_lock_mode(lock_mode(asked))
+                .object_lock_retain_until_date(aws_smithy_types::DateTime::from_secs(
+                    asked.retain_until_unix_secs,
+                ));
+            // Only when a hold is asked for: S3 checks s3:PutObjectLegalHold
+            // whenever the header is present, OFF included (review of #708).
+            if asked.legal_hold {
+                req = req.object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On);
             }
+            req = lock_integrity(req, engine_sha256.is_some() || self_sha256.is_some());
         }
 
         let out = req
+            .customize()
+            .config_override(self.body_timeouts("put_object", uri, body_bytes))
             .send()
             .await
-            .map_err(|e| sdk_failure("put_object", uri, e))?;
+            .map_err(|e| {
+                let refused = refused_checksum_header(&e);
+                let failure = sdk_failure("put_object", uri, e);
+                if refused && self_sha256.is_some() {
+                    with_checksum_header_advice(failure, retention.is_some())
+                } else {
+                    failure
+                }
+            })?;
         tracing::info!(uri, "object uploaded via s3_native");
         // A suspended-versioning bucket reports the literal version "null",
         // which later writes overwrite — it is not an immutable pin. Surface
         // it as unversioned so it is never persisted as one (#135).
-        Ok(out
-            .version_id()
-            .filter(|id| *id != "null")
-            .map(str::to_owned))
+        Ok((
+            out.version_id()
+                .filter(|id| *id != "null")
+                .map(str::to_owned),
+            retention,
+        ))
     }
 
     /// Recompute a digest from the bytes returned by S3 without buffering the
@@ -801,6 +991,26 @@ impl S3NativeBackend {
     }
 }
 
+/// A store's definite "I do not implement this operation" (#722): HTTP 501,
+/// or S3's `NotImplemented` error code under whatever status it came with.
+/// Told apart from a check that could not be made (a 403, a 503, a timeout),
+/// which proves nothing either way: the SDK does not retry a 501, so this is
+/// the store's first and only answer. Other codes a store may use for the
+/// same answer are added when a live run shows one, each with a wire test.
+fn not_implemented<E>(error: &SdkError<E, HttpResponse>) -> bool
+where
+    E: ProvideErrorMetadata,
+{
+    let (status, code) = match error {
+        SdkError::ServiceError(context) => {
+            (Some(context.raw().status().as_u16()), context.err().code())
+        }
+        SdkError::ResponseError(context) => (Some(context.raw().status().as_u16()), None),
+        _ => (None, None),
+    };
+    status == Some(501) || code == Some("NotImplemented")
+}
+
 /// The engine's error for a failed SDK call, telling a throttle apart (#102).
 ///
 /// The SDK has already retried a throttle with its own backoff by the time
@@ -842,8 +1052,40 @@ where
         || code.as_deref().is_some_and(crate::base::is_throttle_code);
     if throttled {
         VtopError::UploadThrottled(detail)
+    } else if matches!(
+        code.as_deref(),
+        Some("NoSuchUpload" | "InvalidPart" | "InvalidPartOrder")
+    ) {
+        // The multipart upload this request names cannot be continued
+        // (#668): it is gone (aborted by a lifecycle rule or a sweep, or
+        // completed by an earlier attempt), or the store refuses to complete
+        // it because a part it holds is not the one named, which leaves the
+        // upload in place. Sending the same request again fails the same way
+        // on every replay, so the caller must start a new upload.
+        VtopError::UploadSessionGone(detail)
     } else {
         VtopError::Upload(detail)
+    }
+}
+
+/// A failed HEAD, with an absent key told apart from every other failure
+/// (#626). A HEAD response has no body, so the status is the only evidence:
+/// 404 means the key holds nothing. Anything else - 403 included, which S3
+/// answers for a missing key when the caller may not list the bucket - stays
+/// an error, because the engine must not treat a key it cannot see as free.
+fn head_failure<E>(object_uri: &str, error: SdkError<E, HttpResponse>) -> VtopError
+where
+    E: std::error::Error + ProvideErrorMetadata + Send + Sync + 'static,
+{
+    let status = match &error {
+        SdkError::ServiceError(context) => Some(context.raw().status().as_u16()),
+        SdkError::ResponseError(context) => Some(context.raw().status().as_u16()),
+        _ => None,
+    };
+    if status == Some(404) {
+        VtopError::NotFound(object_uri.to_string())
+    } else {
+        sdk_failure("head_object", object_uri, error)
     }
 }
 
@@ -855,10 +1097,13 @@ impl UploadBackend for S3NativeBackend {
         object_uri: &str,
         checksum: Option<ObjectChecksum<'_>>,
     ) -> Result<StoredObject, VtopError> {
-        let version_id = self
+        let (version_id, retention) = self
             .put(local_path, object_uri, "application/octet-stream", checksum)
             .await?;
-        Ok(StoredObject { version_id })
+        Ok(StoredObject {
+            version_id,
+            retention,
+        })
     }
 
     async fn put_manifest(
@@ -867,10 +1112,13 @@ impl UploadBackend for S3NativeBackend {
         manifest_uri: &str,
         checksum: Option<ObjectChecksum<'_>>,
     ) -> Result<StoredManifest, VtopError> {
-        let version_id = self
+        let (version_id, retention) = self
             .put(local_path, manifest_uri, "application/json", checksum)
             .await?;
-        Ok(StoredManifest { version_id })
+        Ok(StoredManifest {
+            version_id,
+            retention,
+        })
     }
 
     async fn get_manifest_pinned(
@@ -929,20 +1177,139 @@ impl UploadBackend for S3NativeBackend {
         true
     }
 
-    async fn verify_bucket_versioning(&self, bucket: &str) -> Result<(), VtopError> {
-        let out = self
+    async fn bucket_versioning(&self, bucket: &str) -> Result<BucketFeature, VtopError> {
+        let out = match self
             .client
             .get_bucket_versioning()
             .bucket(bucket)
             .send()
             .await
-            .map_err(|e| sdk_failure("get_bucket_versioning", bucket, e))?;
-        match out.status() {
-            Some(BucketVersioningStatus::Enabled) => Ok(()),
-            other => Err(VtopError::Upload(format!(
-                "bucket {bucket} does not have versioning enabled (status: {other:?}); \
-                 the hardened manifest profile requires it"
-            ))),
+        {
+            Ok(out) => out,
+            Err(e) if not_implemented(&e) => return Ok(BucketFeature::NotSupported),
+            Err(e) => return Err(sdk_failure("get_bucket_versioning", bucket, e)),
+        };
+        // Suspended, or no status at all (a bucket versioning was never
+        // turned on for): either way overwritten versions are not kept.
+        Ok(match out.status() {
+            Some(BucketVersioningStatus::Enabled) => BucketFeature::Enabled,
+            _ => BucketFeature::NotEnabled,
+        })
+    }
+
+    fn object_lock(&self) -> Option<ObjectLockPolicy> {
+        self.object_lock
+    }
+
+    async fn bucket_object_lock(&self, bucket: &str) -> Result<BucketFeature, VtopError> {
+        match self
+            .client
+            .get_object_lock_configuration()
+            .bucket(bucket)
+            .send()
+            .await
+        {
+            Ok(out) => Ok(
+                if out
+                    .object_lock_configuration()
+                    .and_then(|c| c.object_lock_enabled())
+                    .is_some_and(|e| *e == ObjectLockEnabled::Enabled)
+                {
+                    BucketFeature::Enabled
+                } else {
+                    BucketFeature::NotEnabled
+                },
+            ),
+            // S3's answer for a bucket that has no Object Lock configuration
+            // at all: a definite "not enabled", not a failed check.
+            Err(SdkError::ServiceError(context))
+                if context.err().code() == Some("ObjectLockConfigurationNotFoundError") =>
+            {
+                Ok(BucketFeature::NotEnabled)
+            }
+            // The store does not implement Object Lock at all (#722; Garage
+            // documents every Object Lock call as missing). No bucket setting
+            // changes that, so it is an answer, not a check that failed.
+            Err(e) if not_implemented(&e) => Ok(BucketFeature::NotSupported),
+            Err(e) => Err(sdk_failure("get_object_lock_configuration", bucket, e)),
+        }
+    }
+
+    async fn verify_retention(
+        &self,
+        object_uri: &str,
+        version_id: Option<&str>,
+        expected: &RetentionExpectation,
+    ) -> Result<RetentionCheck, VtopError> {
+        let (bucket, key) = parse_s3_uri(object_uri)?;
+        // The EXACT version a write returned (#684): another write to the key
+        // after it would otherwise answer for it. S3 returns the lock headers
+        // only to a caller holding s3:GetObjectRetention (and the legal hold
+        // only with s3:GetObjectLegalHold), so a missing permission reads as
+        // a missing lock and fails the batch, loudly, rather than passing it.
+        let out = self
+            .client
+            .head_object()
+            .bucket(&bucket)
+            .key(&key)
+            .set_version_id(version_id.map(str::to_owned))
+            .send()
+            .await
+            .map_err(|e| head_failure(object_uri, e))?;
+        let stored = StoredRetention {
+            mode: out.object_lock_mode().map(|m| m.as_str().to_owned()),
+            retain_until_unix_secs: out.object_lock_retain_until_date().map(|d| d.secs()),
+            legal_hold: out
+                .object_lock_legal_hold_status()
+                .map(|s| *s == ObjectLockLegalHoldStatus::On),
+        };
+        Ok(judge_retention(&stored, expected))
+    }
+
+    async fn confirm_lock_absent(
+        &self,
+        object_uri: &str,
+        version_id: Option<&str>,
+        part: crate::base::LockPart,
+    ) -> Result<bool, VtopError> {
+        let (bucket, key) = parse_s3_uri(object_uri)?;
+        let version = version_id.map(str::to_owned);
+        // Unlike a HEAD, these requests answer a caller without the
+        // permission with AccessDenied, and an object that has no lock with
+        // NoSuchObjectLockConfiguration (#709).
+        let absent = |code: Option<&str>| code == Some("NoSuchObjectLockConfiguration");
+        match part {
+            crate::base::LockPart::Retention => match self
+                .client
+                .get_object_retention()
+                .bucket(&bucket)
+                .key(&key)
+                .set_version_id(version)
+                .send()
+                .await
+            {
+                Ok(out) => Ok(out
+                    .retention()
+                    .is_none_or(|r| r.mode().is_none() && r.retain_until_date().is_none())),
+                Err(SdkError::ServiceError(context)) if absent(context.err().code()) => Ok(true),
+                Err(e) => Err(sdk_failure("get_object_retention", object_uri, e)),
+            },
+            crate::base::LockPart::LegalHold => match self
+                .client
+                .get_object_legal_hold()
+                .bucket(&bucket)
+                .key(&key)
+                .set_version_id(version)
+                .send()
+                .await
+            {
+                Ok(out) => Ok(!out
+                    .legal_hold()
+                    .and_then(|h| h.status())
+                    .is_some_and(|s| *s == ObjectLockLegalHoldStatus::On)),
+                Err(SdkError::ServiceError(context)) if absent(context.err().code()) => Ok(true),
+                Err(e) => Err(sdk_failure("get_object_legal_hold", object_uri, e)),
+            },
         }
     }
 
@@ -1014,7 +1381,7 @@ impl UploadBackend for S3NativeBackend {
             .checksum_mode(ChecksumMode::Enabled)
             .send()
             .await
-            .map_err(|e| sdk_failure("head_object", object_uri, e))?;
+            .map_err(|e| head_failure(object_uri, e))?;
 
         // Only expose the checksum S3 itself computed over the stored body.
         // x-amz-meta-vtop-checksum is written by the uploader and therefore
@@ -1094,7 +1461,8 @@ impl UploadBackend for S3NativeBackend {
                     Ok(VerificationResult::passed(
                         "stored content SHA-256 verified by read-back (no service \
                          whole-object checksum; multipart or unchecked upload)",
-                    ))
+                    )
+                    .by(VerificationMethod::ReadBack))
                 } else {
                     Ok(VerificationResult::failed(
                         "stored content SHA-256 mismatch on read-back",
@@ -1111,7 +1479,8 @@ impl UploadBackend for S3NativeBackend {
                     )));
                 }
                 if actual.eq_ignore_ascii_case(expected.hex) {
-                    Ok(VerificationResult::passed("stored content BLAKE3 verified"))
+                    Ok(VerificationResult::passed("stored content BLAKE3 verified")
+                        .by(VerificationMethod::ReadBack))
                 } else {
                     Ok(VerificationResult::failed("stored content BLAKE3 mismatch"))
                 }
@@ -1166,6 +1535,12 @@ impl UploadBackend for S3NativeBackend {
     fn supports_checksum_verification(&self) -> bool {
         true
     }
+
+    fn reports_absent_objects(&self) -> bool {
+        // head_failure: NotFound only for a 404 (#626).
+        true
+    }
+
     fn supports_multipart(&self) -> bool {
         true
     }
@@ -1179,7 +1554,7 @@ impl UploadBackend for S3NativeBackend {
         object_uri: &str,
         content_type: &str,
         checksum: Option<ObjectChecksum<'_>>,
-    ) -> Result<String, VtopError> {
+    ) -> Result<CreatedUpload, VtopError> {
         let (bucket, key) = parse_s3_uri(object_uri)?;
         let mut req = self
             .client
@@ -1192,14 +1567,34 @@ impl UploadBackend for S3NativeBackend {
             // be sent as x-amz-checksum-sha256.
             req = req.metadata(CHECKSUM_META_KEY, c.hex);
         }
+        // S3 fixes a multipart object's lock HERE, not at complete (#684):
+        // the date asked for now is the date the completed object carries,
+        // however long a resume takes, and the session records it.
+        let retention = self.lock_for_this_write();
+        if let Some(asked) = retention {
+            req = req
+                .object_lock_mode(lock_mode(asked))
+                .object_lock_retain_until_date(aws_smithy_types::DateTime::from_secs(
+                    asked.retain_until_unix_secs,
+                ));
+            // Only when a hold is asked for: S3 checks s3:PutObjectLegalHold
+            // whenever the header is present, OFF included (review of #708).
+            if asked.legal_hold {
+                req = req.object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On);
+            }
+        }
         let out = req
             .send()
             .await
             .map_err(|e| sdk_failure("create_multipart_upload", object_uri, e))?;
-        out.upload_id().map(str::to_owned).ok_or_else(|| {
+        let upload_id = out.upload_id().map(str::to_owned).ok_or_else(|| {
             VtopError::Upload(format!(
                 "create_multipart_upload {object_uri}: service returned no upload id"
             ))
+        })?;
+        Ok(CreatedUpload {
+            upload_id,
+            retention,
         })
     }
 
@@ -1211,6 +1606,8 @@ impl UploadBackend for S3NativeBackend {
         data: Bytes,
     ) -> Result<UploadedPart, VtopError> {
         let (bucket, key) = parse_s3_uri(object_uri)?;
+        let target = format!("{object_uri}#{part_number}");
+        let body_bytes = data.len() as u64;
         let out = self
             .client
             .upload_part()
@@ -1219,9 +1616,11 @@ impl UploadBackend for S3NativeBackend {
             .upload_id(upload_id)
             .part_number(part_number as i32)
             .body(self.egress_body(ByteStream::from(data)))
+            .customize()
+            .config_override(self.body_timeouts("upload_part", &target, body_bytes))
             .send()
             .await
-            .map_err(|e| sdk_failure("upload_part", &format!("{object_uri}#{part_number}"), e))?;
+            .map_err(|e| sdk_failure("upload_part", &target, e))?;
         let etag = out.e_tag().map(str::to_owned).ok_or_else(|| {
             VtopError::Upload(format!(
                 "upload_part {object_uri}#{part_number}: service returned no etag"
@@ -1266,7 +1665,11 @@ impl UploadBackend for S3NativeBackend {
             .filter(|id| *id != "null")
             .map(str::to_owned);
         tracing::info!(uri = object_uri, "object uploaded via s3_native multipart");
-        Ok(StoredObject { version_id })
+        // The retention was fixed at create; the multipart module carries it.
+        Ok(StoredObject {
+            version_id,
+            retention: None,
+        })
     }
 
     async fn abort_multipart_upload(
@@ -1284,6 +1687,101 @@ impl UploadBackend for S3NativeBackend {
             .await
             .map_err(|e| sdk_failure("abort_multipart_upload", object_uri, e))?;
         Ok(())
+    }
+}
+
+fn lock_mode(asked: RequestedRetention) -> aws_sdk_s3::types::ObjectLockMode {
+    match asked.mode {
+        crate::base::ObjectLockMode::Governance => aws_sdk_s3::types::ObjectLockMode::Governance,
+        crate::base::ObjectLockMode::Compliance => aws_sdk_s3::types::ObjectLockMode::Compliance,
+    }
+}
+
+/// The integrity header a write under retention needs (#684): S3 requires
+/// `Content-MD5` or `x-amz-sdk-checksum-algorithm` on it. A write that
+/// carries `x-amz-checksum-sha256` — the engine's own SHA-256, or the one the
+/// backend computed on the BLAKE3 and no-checksum paths (#778) — names that
+/// algorithm, which adds the header S3 asks for without the SDK computing
+/// anything (a checksum value it was given is sent as is). Under the profile
+/// every write carries one, because the profile pins `when_supported`; the
+/// CRC32 arm, the SDK computing its own, is kept for a write that somehow
+/// does not, so no locked write ever goes without the header.
+fn lock_integrity(
+    req: aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder,
+    carries_sha256: bool,
+) -> aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder {
+    if carries_sha256 {
+        req.checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Sha256)
+    } else {
+        req.checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Crc32)
+    }
+}
+
+/// The SHA-256 of a local file, base64 as `x-amz-checksum-sha256` spells
+/// it (#778). Streamed, never buffered whole.
+async fn file_sha256_b64(path: &Path) -> Result<String, VtopError> {
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| VtopError::Upload(format!("reading {}: {e}", path.display())))?;
+    let (hex, _) = digest_reader(ChecksumAlgorithm::Sha256, file)
+        .await?
+        .ok_or_else(|| VtopError::Upload("SHA-256 digest unavailable".into()))?;
+    hex_to_b64_sha256(&hex).ok_or_else(|| VtopError::Upload(format!("not a SHA-256 digest: {hex}")))
+}
+
+/// Whether a failed write may be the store refusing its checksum header
+/// (#778): a 400 that is not `BadDigest` (the store checked the header and
+/// the body did not match it, which is corruption, not a refusal), or a 501.
+/// Garage answers `400 InvalidRequest`, Zenko CloudServer `400 BadRequest`.
+fn refused_checksum_header<E>(error: &SdkError<E, HttpResponse>) -> bool
+where
+    E: ProvideErrorMetadata,
+{
+    let (status, code) = match error {
+        SdkError::ServiceError(context) => {
+            (Some(context.raw().status().as_u16()), context.err().code())
+        }
+        SdkError::ResponseError(context) => (Some(context.raw().status().as_u16()), None),
+        _ => (None, None),
+    };
+    match status {
+        Some(400) => code != Some("BadDigest"),
+        Some(501) => true,
+        _ => false,
+    }
+}
+
+/// A refused write that carried the backend's own `x-amz-checksum-sha256`
+/// (#778), told as what happened, what the engine did and what to do. The
+/// failure stays the kind it was, so retries and the batch's state are as
+/// for any other refused PUT.
+fn with_checksum_header_advice(failure: VtopError, locked: bool) -> VtopError {
+    let what_to_do = if locked {
+        "If this store refuses checksum headers, it cannot hold this engine's \
+         Object Lock writes: S3 requires an integrity header on a write under \
+         retention, so the Object Lock profile always sends one, and \
+         AWS_REQUEST_CHECKSUM_CALCULATION does not change that. Use a store that \
+         accepts x-amz-checksum-sha256 for Object Lock."
+    } else {
+        "If this store refuses checksum headers, set \
+         AWS_REQUEST_CHECKSUM_CALCULATION=when_required in the engine's \
+         environment: no checksum header is sent, and the object is still \
+         verified by read-back after the upload."
+    };
+    let advice = |detail: String| {
+        format!(
+            "{detail}. The write carried a whole-object x-amz-checksum-sha256 \
+             header the engine computed itself (BLAKE3 or no-checksum mode), \
+             and the store may have refused that header. The write failed and \
+             nothing was committed: the batch stays uncommitted, as after any \
+             refused write. {what_to_do}"
+        )
+    };
+    match failure {
+        VtopError::Upload(detail) => VtopError::Upload(advice(detail)),
+        VtopError::UploadThrottled(detail) => VtopError::UploadThrottled(advice(detail)),
+        VtopError::UploadSessionGone(detail) => VtopError::UploadSessionGone(advice(detail)),
+        other => other,
     }
 }
 
@@ -1330,6 +1828,11 @@ pub fn config_from_upload(upload: &vtop_core::config::UploadConfig) -> S3NativeC
         tuning,
         max_egress_bytes_per_second: upload.max_egress_bytes_per_second,
         request_timeout_seconds: upload.request_timeout_seconds,
+        request_min_bytes_per_second: upload.request_min_bytes_per_second,
+        object_lock: upload
+            .object_lock
+            .as_ref()
+            .map(crate::base::ObjectLockPolicy::from_config),
     }
 }
 
@@ -2796,6 +3299,8 @@ mod tests {
             tuning: Default::default(),
             max_egress_bytes_per_second: None,
             request_timeout_seconds: 300,
+            request_min_bytes_per_second: 4 * 1024,
+            object_lock: None,
         };
         let err = match S3NativeBackend::new(&cfg).await {
             Err(err) => err,
@@ -3017,6 +3522,51 @@ mod throttle_classification {
         let error = sdk_failure("upload_part", "s3://b/k", response_error(502));
         assert!(!error.is_upload_throttle(), "{error}");
     }
+
+    /// S3 answers `NoSuchUpload` for an upload id it no longer holds (#668):
+    /// aborted by a lifecycle rule or a sweep, or already completed. That is
+    /// not a failure a retry of the same request can fix, so it is told apart
+    /// from every other error and the caller starts a new upload.
+    #[test]
+    fn no_such_upload_is_a_gone_session_and_nothing_else_is() {
+        let error = sdk_failure(
+            "upload_part",
+            "s3://b/k#2",
+            service_error(404, Some("NoSuchUpload")),
+        );
+        assert!(
+            matches!(error, VtopError::UploadSessionGone(_)),
+            "NoSuchUpload must classify as a gone session: {error:?}"
+        );
+        assert!(error.to_string().contains("NoSuchUpload"), "{error}");
+        assert!(error.to_string().contains("s3://b/k#2"), "{error}");
+        // A complete S3 refuses because a part it holds is not the one named
+        // leaves the upload in place, and completing again fails the same
+        // way (review): it too needs a new upload, not a retry.
+        for code in ["InvalidPart", "InvalidPartOrder"] {
+            let error = sdk_failure(
+                "complete_multipart_upload",
+                "s3://b/k",
+                service_error(400, Some(code)),
+            );
+            assert!(
+                matches!(error, VtopError::UploadSessionGone(_)),
+                "{code} must start a new upload: {error:?}"
+            );
+        }
+        for (status, code) in [
+            (404, Some("NoSuchKey")),
+            (404, None),
+            (400, Some("EntityTooSmall")),
+            (500, Some("InternalError")),
+        ] {
+            let error = sdk_failure("upload_part", "s3://b/k", service_error(status, code));
+            assert!(
+                matches!(error, VtopError::Upload(_)),
+                "{status} {code:?} is not a gone session: {error:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3058,6 +3608,10 @@ mod egress_ceiling {
             shaper,
             process_slot: slot,
             body_deadline: std::time::Duration::from_secs(300).saturating_mul(OPERATION_ATTEMPTS),
+            request_timeout_seconds: 300,
+            request_min_bytes_per_second: 4 * 1024,
+            object_lock: None,
+            body_sha256_header: true,
         };
         let payload = Bytes::from_static(b"bytes the process ceiling must see");
         let untouched = |b: ByteStream| {
@@ -3181,6 +3735,8 @@ mod egress_ceiling {
             tuning: Default::default(),
             max_egress_bytes_per_second: cap,
             request_timeout_seconds: 300,
+            request_min_bytes_per_second: 4 * 1024,
+            object_lock: None,
         };
         let unset = S3NativeBackend::new(&build(None)).await.unwrap();
         assert!(
@@ -3247,6 +3803,10 @@ mod egress_ceiling {
             shaper,
             process_slot: test_slot(),
             body_deadline: std::time::Duration::from_secs(300).saturating_mul(OPERATION_ATTEMPTS),
+            request_timeout_seconds: 300,
+            request_min_bytes_per_second: 4 * 1024,
+            object_lock: None,
+            body_sha256_header: true,
         };
         let payload = Bytes::from_static(b"the pipeline an unset cap must not touch");
 
@@ -3348,6 +3908,10 @@ mod egress_ceiling {
             shaper,
             process_slot: test_slot(),
             body_deadline: std::time::Duration::from_secs(300).saturating_mul(OPERATION_ATTEMPTS),
+            request_timeout_seconds: 300,
+            request_min_bytes_per_second: 4 * 1024,
+            object_lock: None,
+            body_sha256_header: true,
         }
     }
 
@@ -3380,8 +3944,9 @@ mod egress_ceiling {
     /// Through the REAL SDK request path (#481): a capped backend sends the
     /// same body bytes and the same length, payload-hash and checksum headers
     /// as an uncapped one — for a SHA-256-checked object PUT, an unchecked PUT
-    /// the SDK sends aws-chunked with a CRC trailer, and an in-memory multipart
-    /// part — and a 503 the SDK retries is paid for, and counted, twice.
+    /// carrying the SHA-256 the backend computed itself (#778), and an
+    /// in-memory multipart part — and a 503 the SDK retries is paid for, and
+    /// counted, twice.
     #[tokio::test]
     async fn a_capped_backend_sends_the_same_request_as_an_uncapped_one_and_counts_every_attempt() {
         let payload: Vec<u8> = (0..(6 * 1024 * 1024 + 3))
@@ -3455,8 +4020,8 @@ mod egress_ceiling {
             .iter()
             .map(|(_, body)| body.len() as u64)
             .sum::<u64>();
-        // The aws-chunked PUT's wire body carries framing and a trailer; the
-        // account is of PAYLOAD bytes admitted, three payloads' worth.
+        // A wire body may carry framing the payload does not; the account is
+        // of PAYLOAD bytes admitted, three payloads' worth.
         assert!(per_request >= 3 * payload.len() as u64);
         assert_eq!(
             shaper.admitted_bytes(),
@@ -3487,6 +4052,116 @@ mod egress_ceiling {
             shaper.admitted_bytes() - before,
             2 * payload.len() as u64,
             "a retried part crosses the wire twice and must cross the shaper twice"
+        );
+    }
+}
+
+#[cfg(test)]
+mod body_deadline {
+    //! The per-attempt deadline of a request that carries a body (#663).
+    use super::*;
+    use std::time::Duration;
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn the_allowance_grows_with_the_body_at_the_configured_floor() {
+        // The default part (8 MiB) at the default floor (4 KiB/s): the fixed
+        // 300 s plus 2048 s for the body. On the policed uplink a part needed
+        // far longer than 300 s at its share of the link; the fixed 300 s cut
+        // every attempt.
+        assert_eq!(
+            body_attempt_timeout(300, 8 * MIB, 4 * 1024),
+            Duration::from_secs(300 + 2048)
+        );
+        // Twice the body, twice the body's allowance; the fixed part stays.
+        assert_eq!(
+            body_attempt_timeout(300, 16 * MIB, 4 * 1024),
+            Duration::from_secs(300 + 4096)
+        );
+        // A partial second rounds UP: a body is never given less time than it
+        // needs at the floor.
+        assert_eq!(
+            body_attempt_timeout(300, 4097, 4096),
+            Duration::from_secs(302)
+        );
+    }
+
+    #[test]
+    fn a_body_too_small_to_matter_keeps_the_fixed_deadline() {
+        assert_eq!(body_attempt_timeout(300, 0, 4096), Duration::from_secs(300));
+        assert_eq!(body_attempt_timeout(300, 1, 4096), Duration::from_secs(301));
+        // A floor at the body's size per second restores the fixed deadline
+        // plus one second.
+        assert_eq!(
+            body_attempt_timeout(300, 8 * MIB, 8 * MIB),
+            Duration::from_secs(301)
+        );
+    }
+
+    #[test]
+    fn extreme_inputs_saturate_instead_of_overflowing_or_dividing_by_zero() {
+        assert_eq!(
+            body_attempt_timeout(u64::MAX, u64::MAX, 1),
+            Duration::from_secs(u64::MAX)
+        );
+        // Zero is refused by configuration; here it means one byte a second.
+        assert_eq!(body_attempt_timeout(1, 10, 0), Duration::from_secs(11));
+        let timeouts = body_request_timeouts(u64::MAX, u64::MAX, 1);
+        assert_eq!(
+            timeouts.operation_timeout(),
+            Some(Duration::from_secs(u64::MAX).saturating_mul(OPERATION_ATTEMPTS))
+        );
+    }
+
+    #[test]
+    fn a_body_request_is_bounded_per_attempt_and_whole_but_not_by_the_read_timeout() {
+        let timeouts = body_request_timeouts(300, 8 * MIB, 4 * 1024);
+        let attempt = Duration::from_secs(300 + 2048);
+        assert_eq!(timeouts.connect_timeout(), Some(CONNECT_TIMEOUT));
+        assert_eq!(timeouts.operation_attempt_timeout(), Some(attempt));
+        assert_eq!(
+            timeouts.operation_timeout(),
+            Some(attempt * OPERATION_ATTEMPTS),
+            "the whole operation is allowed the SDK's three attempts of the scaled allowance"
+        );
+        // The connector times the body's transmission under the read timeout,
+        // so leaving the client-wide value in place would cut a slow body at
+        // the old fixed point. Disabled - not merely unset, which would let the
+        // client-wide value through - and enclosed by the attempt timeout.
+        assert_eq!(timeouts.read_timeout(), None);
+        let mut merged = timeouts.clone();
+        merged.take_defaults_from(&request_timeouts(300));
+        assert_eq!(
+            merged.read_timeout(),
+            None,
+            "the client-wide read timeout must not fill the disabled one back in"
+        );
+        assert_eq!(merged.operation_attempt_timeout(), Some(attempt));
+    }
+
+    #[tokio::test]
+    async fn the_backend_refuses_a_zero_floor() {
+        let error = match S3NativeBackend::new(&S3NativeConfig {
+            region: "us-east-1".into(),
+            endpoint_url: Some("http://127.0.0.1:9".into()),
+            force_path_style: true,
+            verify_tls: false,
+            transport: "tcp_tls".into(),
+            tuning: Default::default(),
+            max_egress_bytes_per_second: None,
+            request_timeout_seconds: 300,
+            request_min_bytes_per_second: 0,
+            object_lock: None,
+        })
+        .await
+        {
+            Ok(_) => panic!("a zero floor leaves a body upload with no deadline"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("upload.request_min_bytes_per_second"),
+            "the refusal must name the setting: {error}"
         );
     }
 }

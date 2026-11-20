@@ -15,7 +15,7 @@ use vtop_core::errors::VtopError;
 use vtop_core::replay::{next_recovery_action, requires_replay_protection, RecoveryAction};
 use vtop_core::state_machine::{can_transition, transition, BatchState};
 
-const ALL_STATES: [BatchState; 11] = [
+const ALL_STATES: [BatchState; 12] = [
     BatchState::Discovered,
     BatchState::Batching,
     BatchState::Sealed,
@@ -27,6 +27,7 @@ const ALL_STATES: [BatchState; 11] = [
     BatchState::SourceCommitted,
     BatchState::Failed,
     BatchState::ReplayRequired,
+    BatchState::Superseded,
 ];
 
 fn any_state() -> impl Strategy<Value = BatchState> {
@@ -103,22 +104,41 @@ proptest! {
     }
 
     /// SOURCE_COMMITTED is terminal: once progress is committed nothing may move
-    /// it, not even to FAILED (that would reopen a settled batch).
+    /// it, not even to FAILED (that would reopen a settled batch). SUPERSEDED
+    /// (#567) is terminal too: a retired range that could move again would be
+    /// recovery work once more.
     #[test]
-    fn source_committed_is_terminal(to in any_state()) {
-        prop_assert!(
-            !can_transition(BatchState::SourceCommitted, to),
-            "SOURCE_COMMITTED must be terminal, but -> {:?} was allowed",
-            to
+    fn source_committed_and_superseded_are_terminal(to in any_state()) {
+        for from in [BatchState::SourceCommitted, BatchState::Superseded] {
+            prop_assert!(
+                !can_transition(from, to),
+                "{:?} must be terminal, but -> {:?} was allowed",
+                from,
+                to
+            );
+        }
+    }
+
+    /// Anything that is not terminal may fail; a committed or superseded batch
+    /// may not.
+    #[test]
+    fn failure_is_always_available_except_when_terminal(from in any_state()) {
+        prop_assert_eq!(
+            can_transition(from, BatchState::Failed),
+            !matches!(from, BatchState::SourceCommitted | BatchState::Superseded)
         );
     }
 
-    /// Anything that is not already committed may fail; a committed batch may not.
+    /// SUPERSEDED (#567) is entered only from a handed-back range: it can
+    /// never retire a VERIFIED object, or anything in flight, without that
+    /// decision having been recorded first.
     #[test]
-    fn failure_is_always_available_except_when_committed(from in any_state()) {
+    fn superseded_is_entered_only_from_a_handed_back_range(from in any_state()) {
         prop_assert_eq!(
-            can_transition(from, BatchState::Failed),
-            from != BatchState::SourceCommitted
+            can_transition(from, BatchState::Superseded),
+            matches!(from, BatchState::Failed | BatchState::ReplayRequired),
+            "{:?} -> SUPERSEDED",
+            from
         );
     }
 
@@ -135,10 +155,11 @@ proptest! {
                 state
             );
         }
-        // Replay protection is released only once progress is actually committed.
+        // Replay protection is released only once progress is committed - by
+        // this batch, or past it (SUPERSEDED, #567).
         prop_assert_eq!(
             requires_replay_protection(state),
-            state != BatchState::SourceCommitted
+            !matches!(state, BatchState::SourceCommitted | BatchState::Superseded)
         );
     }
 

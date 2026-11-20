@@ -24,7 +24,8 @@
 //!   panel at all.
 
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Opts, Registry, TextEncoder,
+    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry, TextEncoder,
 };
 use std::sync::OnceLock;
 
@@ -37,6 +38,131 @@ pub const STAGES: [&str; 7] = [
     "verify",
     "commit",
     "state_write",
+];
+
+/// The values of `decision` on `vtop_object_key_decisions_total` (#626).
+/// The last five (#709) are taken only under the S3 Object Lock profile. The
+/// four `fallback_*` among them: an object already at the derived key holds
+/// the batch's bytes, but it has no lock, its lock has ended, it is in the
+/// other mode, or it lacks the configured legal hold, so the batch is written
+/// as a fresh locked object under its attempt key instead of reusing it.
+/// `lock_withheld`: the fresh object written for the same range a moment ago
+/// is not usable either (a store that does not keep the lock), so nothing is
+/// written and the batch fails; outside the `fallback_` prefix on purpose,
+/// since no second object was written.
+pub const OBJECT_KEY_DECISIONS: [&str; 13] = [
+    "derived",
+    "reused",
+    "fallback_differs",
+    "fallback_size_only",
+    "fallback_unreadable",
+    "fallback_unchecked",
+    "probe_throttled",
+    "per_attempt",
+    "fallback_lock_elapsed",
+    "fallback_unlocked",
+    "fallback_lock_mode",
+    "fallback_hold_missing",
+    "lock_withheld",
+];
+
+/// The values of `result` on `vtop_replay_rebuilds_total` (#626): what a
+/// replay of a window an earlier attempt sealed came to. `exact`: the window
+/// was rebuilt over exactly the recorded range, filed under the hour it was
+/// first sealed in, with the bytes the earlier attempt uploaded where the
+/// ledger recorded them. `bytes_differ`: rebuilt over exactly the recorded
+/// range, but its digest differs from the object the earlier attempt
+/// uploaded, so a second object is written and the earlier one is left as
+/// it is. `fallback`: rebuilt over exactly the recorded range with the same
+/// bytes, but the key decision fell back to the per-attempt key
+/// (`vtop_object_key_decisions_total` says which fallback), so a second
+/// object is written. `refused`: the source could not stop the re-read at the
+/// recorded end (a line crosses it, the file under it was replaced, a rotated
+/// file's re-read, an adapter that cannot bound), so it is read to the
+/// current end as before. `too_large`: the window is over 4x the current
+/// batching limits and is not bounded. `dropped_at_stop`: the engine stopped
+/// inside a rebuild and dropped the partial window rather than flush it.
+pub const REPLAY_REBUILD_RESULTS: [&str; 6] = [
+    "exact",
+    "bytes_differ",
+    "fallback",
+    "refused",
+    "too_large",
+    "dropped_at_stop",
+];
+
+/// The values of `result` on `vtop_multipart_parts_total` (#668): a part
+/// sent in this upload call, a part an earlier call left in the session and
+/// this one did not send again, an extra attempt at a part, and a part whose
+/// last attempt in the call failed.
+pub const MULTIPART_PART_RESULTS: [&str; 4] = ["uploaded", "reused", "retried", "failed"];
+
+/// The values of `outcome` on `vtop_multipart_sessions_total` (#668).
+pub const MULTIPART_SESSION_OUTCOMES: [&str; 5] = [
+    "completed",
+    "resumed",
+    "restarted",
+    "kept_after_failure",
+    "swept",
+];
+
+/// The values of `result` on `vtop_object_lock_checks_total` (#684): what a
+/// written object's or manifest's retention check found (`ok`, `missing`,
+/// `mode_mismatch`, `too_short`, `legal_hold_missing`, `error` for a check
+/// that could not be made), `bucket_not_locked` for a batch refused
+/// because its bucket does not have Object Lock enabled, and
+/// `store_unsupported` for one refused because the store does not implement
+/// Object Lock at all (#722).
+pub const OBJECT_LOCK_CHECK_RESULTS: [&str; 8] = [
+    "ok",
+    "missing",
+    "mode_mismatch",
+    "too_short",
+    "legal_hold_missing",
+    "error",
+    "bucket_not_locked",
+    "store_unsupported",
+];
+
+/// The values of `result` on `vtop_verification_receipts_total` (#671
+/// release B): a receipt the engine `written` after verifying a batch, one
+/// that `failed` (it could not be built, stored or, under Object Lock, read
+/// back locked), and one recovery `repaired` for a VERIFIED row that had
+/// none.
+pub const RECEIPT_WRITE_RESULTS: [&str; 3] = ["written", "failed", "repaired"];
+
+/// The values of `reason` on `vtop_recovery_held_total` (#782): why recovery
+/// held a range instead of rewinding it. `ledger_write_failed`: the state
+/// store refused the write of its replay decision (#639). `newer_manifest`:
+/// a VERIFIED batch whose manifest a newer release wrote (#671).
+pub const RECOVERY_HOLD_REASONS: [&str; 2] = ["ledger_write_failed", "newer_manifest"];
+
+/// The values of `mode` on `vtop_object_lock_mode` (#684).
+pub const OBJECT_LOCK_MODES: [&str; 3] = ["off", "governance", "compliance"];
+
+/// The values of `outcome` on `vtop_file_delete_decisions_total` (#619):
+/// `deleted`, `deleted_unchecked` (deleted under `delete_without_open_check`
+/// with no lease to prove no process had it open), or why
+/// `delete_after_commit` kept a fully archived file.
+pub const FILE_DELETE_OUTCOMES: [&str; 18] = [
+    "deleted",
+    "deleted_unchecked",
+    "appended",
+    "shorter",
+    "other_file",
+    "rewritten",
+    "unprovable",
+    "metadata_changed",
+    "links_changed",
+    "gone",
+    "symlink",
+    "open",
+    "no_open_check",
+    "rename_refused",
+    "failed",
+    "stale_commit",
+    "leftover_archived",
+    "opened_at_unlink",
 ];
 
 /// The engine's metric set. Cheap to clone (all fields are `Arc` internally).
@@ -61,13 +187,79 @@ pub struct Metrics {
     pub verification_failures_total: IntCounterVec,
 
     /// Verified by size/existence only. The default policy refuses to commit;
-    /// this counter records explicit compatibility/lab opt-outs.
+    /// this counter records explicit compatibility/lab opt-outs. It is
+    /// counted where `verified_total` is: when the running engine marks a
+    /// batch VERIFIED on a size-only result, and when recovery commits a
+    /// VERIFIED row whose storage re-check confirmed only size. A row recovery
+    /// re-checks but holds back is not counted.
     pub verification_backend_limited_total: IntCounterVec,
+
+    /// Which verification results this engine will commit on, set once at
+    /// startup (#629): `mode="size_only"` reads 1 when
+    /// `upload.require_strong_verification` is false, `mode="strong"` reads 1
+    /// otherwise. The counter above only moves when a batch does; this can be
+    /// alerted on before any traffic. Exported only by `vtopctl run` with
+    /// `VTOP_METRICS_ADDR` set, the one process that builds a registry.
+    pub verification_mode: IntGaugeVec,
+
+    /// The S3 Object Lock profile this engine started with (#684): 1 for
+    /// `mode="governance"` or `mode="compliance"` when `upload.object_lock`
+    /// is set, 1 for `mode="off"` otherwise; the other values read 0. Set
+    /// once at startup, like `verification_mode`.
+    pub object_lock_mode: IntGaugeVec,
+    /// Object Lock checks by `result` (#684), the bounded set
+    /// [`OBJECT_LOCK_CHECK_RESULTS`]: one per object and per manifest a
+    /// batch wrote or reused under the profile, plus `bucket_not_locked`
+    /// and `store_unsupported` for a batch refused at its bucket's
+    /// preflight. Anything but `ok` is a
+    /// batch that failed and will be replayed.
+    pub object_lock_checks_total: IntCounterVec,
 
     /// Batches sent back to be re-read from source. Safe by design, but a
     /// sustained rate means work is being repeated.
     pub replay_required_total: IntCounterVec,
     pub failed_total: IntCounterVec,
+
+    /// VERIFIED batches whose stored manifest recovery found to be from a
+    /// newer release than this engine reads (#671): left VERIFIED for an
+    /// upgraded engine, or retired once their source has committed past them.
+    /// Non-zero means an engine is older than a writer sharing its ledger,
+    /// which the upgrade order rules out: upgrade this engine.
+    pub recovery_unsupported_manifest_total: IntCounterVec,
+    /// Ranges recovery held instead of rewinding (#639, #782), by tenant,
+    /// source type and [`RECOVERY_HOLD_REASONS`]. A held range holds back
+    /// every VERIFIED range above it in its source unit, and lowers every
+    /// rewind above it to its start.
+    /// `ledger_write_failed` above zero means the state store is refusing
+    /// writes.
+    pub recovery_held_total: IntCounterVec,
+    /// Rewinds recovery applied at a held start below them instead of their
+    /// own (#782): applied at their own, they moved the read head past the
+    /// held range. Each means the ranges above it are archived twice.
+    pub recovery_rewinds_lowered_total: IntCounterVec,
+    /// VERIFIED batches recovery re-checked against storage, by the class the
+    /// ledger recorded they were verified with and what the re-check found
+    /// (#664). `verification_class="strong", result="size_only"` is the one
+    /// to alert on: content verified strongly that the store can no longer
+    /// confirm.
+    pub recovery_rechecks_total: IntCounterVec,
+
+    /// Manifests stored, by the version they were written in (#671 release
+    /// B): `version` is `0.3` or `0.4`, from `manifest.write_version`. A
+    /// `0.4` sample is the signal that every reader of this archive must run
+    /// v0.8.0 or later; an earlier one reports those manifests as tampered.
+    pub manifests_written_total: IntCounterVec,
+    /// Verification receipts (#671 release B), by tenant and
+    /// [`RECEIPT_WRITE_RESULTS`]. `failed` never fails a batch: a receipt is
+    /// evidence about verification, not a precondition for the commit.
+    pub verification_receipts_total: IntCounterVec,
+    /// Manifest MAC checks (#685), by the key used and what it found.
+    /// `key_id` is a CONFIGURED id, `none` (a key with no id, or a manifest
+    /// naming none where no key is legacy) or `other` (an id this process
+    /// does not hold): never the id read from a manifest, which comes from
+    /// storage and would be unbounded. `result` is `ok`, `failed`,
+    /// `unknown_key` or `retired_key`.
+    pub manifest_authentications_total: IntCounterVec,
 
     /// Volume. Rates are derived from these in PromQL, never exported directly.
     pub records_total: IntCounterVec,
@@ -111,6 +303,18 @@ pub struct Metrics {
     /// this counter, where unbounded detail belongs.
     pub retention_lost_records_total: IntCounterVec,
 
+    /// Ranges handed back for re-reading (a batch that did not reach
+    /// VERIFIED, or an incomplete row at recovery) that the source REFUSED to
+    /// rewind, or whose re-read it then had to refuse (#621). For a file, the
+    /// file the range was read from cannot be proven reachable: truncated or
+    /// replaced in place, or rotated away and then removed, compressed, copied
+    /// by `copytruncate`, or truncated before its re-read. Each is a range
+    /// missing from the archive; recovery counts it again at every restart
+    /// while the row stays incomplete. Labelled by tenant and source_type,
+    /// like `source_read_errors_total`, never by path: the path is in the
+    /// error line beside it.
+    pub source_replay_refused_total: IntCounterVec,
+
     /// Uploads the object store answered with a THROTTLE — HTTP 429 or 503,
     /// or an S3 `SlowDown`/`Throttling` code — after the backend's own
     /// retries were spent (#102). The batch fails and replays like any
@@ -119,6 +323,18 @@ pub struct Metrics {
     /// retrying at the same width is the overload it is complaining about.
     /// `stage` says which upload (`object_upload`, `manifest_upload`).
     pub upload_throttled_total: IntCounterVec,
+    /// How each batch's object key was decided (#626). `decision` is the
+    /// bounded set [`OBJECT_KEY_DECISIONS`]: a rising `fallback_*` or
+    /// `per_attempt` rate means replays are writing second objects. Under
+    /// the Object Lock profile, `fallback_unlocked`, `fallback_lock_mode`,
+    /// `fallback_hold_missing` and `lock_withheld` mean an object that should
+    /// be locked is not (#709).
+    pub object_key_decisions_total: IntCounterVec,
+    /// What each replay of a window an earlier attempt sealed came to (#626),
+    /// by the bounded set [`REPLAY_REBUILD_RESULTS`]. Any result but `exact`
+    /// means a second object is likely: an alert on it sizes what replays
+    /// cost in storage, and under Object Lock in retained storage.
+    pub replay_rebuilds_total: IntCounterVec,
 
     /// Request-body bytes admitted through the egress shaper (#481) — VTOP's
     /// own account of what it handed the wire under
@@ -134,7 +350,91 @@ pub struct Metrics {
     /// process-wide, so the account is too. Unshaped volume is
     /// `bytes_out_total`.
     pub upload_egress_bytes_total: IntCounterVec,
+
+    /// Every decision `sources.file.delete_after_commit` takes about a fully
+    /// archived file (#619), by `outcome`: `deleted`, `deleted_unchecked`
+    /// (deleted under `delete_without_open_check` with no lease, so nothing
+    /// proved no process had it open), or why it was kept - `appended`,
+    /// `shorter`, `other_file`, `rewritten`, `unprovable`,
+    /// `metadata_changed`, `links_changed`, `gone`, `symlink`, `open`,
+    /// `no_open_check`, `rename_refused`, `failed`, `stale_commit` - plus
+    /// `leftover_archived` for a file found under a delete's hidden name, and
+    /// `opened_at_unlink` for a delete a late open slipped past (also counted
+    /// as `deleted`, so the two are not added). A fixed set,
+    /// never the path: the path is in the log line beside each count. A
+    /// rising `no_open_check` or `rename_refused` means files that will not
+    /// be deleted until the operator acts; any `deleted_unchecked` means the
+    /// operator is living with the opt-in's two windows.
+    pub file_delete_decisions_total: IntCounterVec,
+
+    /// Changes to a Kafka topic's partition list seen while reading, and what
+    /// the source did about them (#675), by `event`: `no_partitions` (a topic
+    /// listed without partitions), `lookup_failed`, `grew`,
+    /// `new_partition_from_beginning`, `start_deferred` (where a partition
+    /// starts could not be established; asked again), `pinned_before_renewal`
+    /// and `recreated_or_truncated`. The last one is the one to alert on: the
+    /// ledger cannot tell a recreated topic from the old one. Labelled by
+    /// event only, a fixed set; the topic and partition are in the log line
+    /// beside it.
+    pub kafka_partition_events_total: IntCounterVec,
+
+    /// Audit records written (#694), by `action` (the closed set
+    /// [`AUDIT_ACTIONS`]) and `outcome` (`attempt`, `success`, `failure`,
+    /// `refused`). Never the actor, the target or a path: those are in the
+    /// record. A rising `refused` is the one to look at.
+    pub audit_events_total: IntCounterVec,
+    /// Audit records a sink could not take (#694), by `sink`: `log`, `file`
+    /// (`VTOP_AUDIT_LOG`) or `ledger` (the state store's `audit_events`
+    /// table). A destructive ledger command is refused when its attempt
+    /// record cannot be written, so any increase is a command that did not
+    /// run, or ran with its record in fewer places than configured.
+    pub audit_write_failures_total: IntCounterVec,
+
+    /// Multipart parts by `result` (#668), the bounded set
+    /// [`MULTIPART_PART_RESULTS`]. Per upload a part counts `uploaded` or
+    /// `reused` once, `failed` once if its last attempt failed, and `retried`
+    /// once per attempt after its first. A call that restarts on a new upload
+    /// counts the parts it sent to both, since both crossed the link.
+    pub multipart_parts_total: IntCounterVec,
+    /// Multipart sessions by `outcome` (#668), the bounded set
+    /// [`MULTIPART_SESSION_OUTCOMES`]: `kept_after_failure` growing while
+    /// neither `resumed` nor `swept` does means incomplete uploads are
+    /// piling up in the bucket, where their parts are billed.
+    pub multipart_sessions_total: IntCounterVec,
+    /// Bytes of kept parts a resumed upload did not send again (#668): what
+    /// keeping sessions saves. Unlabelled, like the egress account.
+    pub multipart_bytes_reused_total: IntCounter,
+    /// Secret and ledger files accepted only because
+    /// `security.allow_loose_secret_permissions` is true (#733), counted once
+    /// per file per process. Unlabelled: the path and mode are in the WARN
+    /// line and the audit record beside it. Anything above zero is an
+    /// exposure an operator chose to keep.
+    pub secret_file_permission_overrides_total: IntCounter,
 }
+
+/// The values of `action` on `vtop_audit_events_total` (#694); the same set
+/// as `vtop_observe::audit::Action`.
+pub const AUDIT_ACTIONS: [&str; 13] = [
+    "ledger.replay",
+    "ledger.prune",
+    "ledger.migrate",
+    "scrub.cursor",
+    "cluster.init",
+    "cluster.membership",
+    "cluster.enable_features",
+    "cluster.create_topic",
+    "cluster.propose",
+    "node.repair",
+    "node.reconfigure_range",
+    "promotion.attest",
+    "security.override",
+];
+
+/// The values of `outcome` on `vtop_audit_events_total`.
+pub const AUDIT_OUTCOMES: [&str; 4] = ["attempt", "success", "failure", "refused"];
+
+/// The values of `sink` on `vtop_audit_write_failures_total`.
+pub const AUDIT_SINKS: [&str; 3] = ["log", "file", "ledger"];
 
 fn labels3() -> Vec<&'static str> {
     vec!["tenant", "source_type", "format"]
@@ -177,13 +477,69 @@ impl Metrics {
         )?;
         let verification_backend_limited_total = cv(
             "verification_backend_limited_total",
-            "Size-only verifications committed under an explicit require_strong_verification=false opt-out",
+            "Size-only verifications accepted under an explicit require_strong_verification=false opt-out, counted where vtop_verified_total is (the running engine at VERIFIED, recovery at its commit); each accepts same-size corruption",
             labels3(),
+        )?;
+        let verification_mode = IntGaugeVec::new(
+            Opts::new(
+                "verification_mode",
+                "1 for the verification mode this engine started in: size_only means upload.require_strong_verification is false and same-size corruption is accepted",
+            ),
+            &["tenant", "mode"],
+        )?;
+        registry.register(Box::new(verification_mode.clone()))?;
+        let object_lock_mode = IntGaugeVec::new(
+            Opts::new(
+                "object_lock_mode",
+                "1 for the S3 Object Lock mode this engine writes under (governance, compliance), or for off when upload.object_lock is unset",
+            ),
+            &["tenant", "mode"],
+        )?;
+        registry.register(Box::new(object_lock_mode.clone()))?;
+        let object_lock_checks_total = cv(
+            "object_lock_checks_total",
+            "S3 Object Lock checks of written or reused objects and manifests, by result (ok, missing, mode_mismatch, too_short, legal_hold_missing, error) and bucket_not_locked or store_unsupported for a batch refused at its bucket's preflight; anything but ok failed the batch, which is replayed",
+            vec!["tenant", "result"],
         )?;
         let replay_required_total = cv(
             "replay_required_total",
             "Batches marked REPLAY_REQUIRED and re-read from source",
             labels3(),
+        )?;
+        let recovery_unsupported_manifest_total = cv(
+            "recovery_unsupported_manifest_total",
+            "VERIFIED batches whose manifest recovery found to be from a newer release than this engine reads (#671); upgrade the engine",
+            labels3(),
+        )?;
+        let recovery_held_total = cv(
+            "recovery_held_total",
+            "Ranges recovery held instead of rewinding, by reason (ledger_write_failed: the state store refused the replay decision; newer_manifest: a newer release wrote the batch); a held range holds back every VERIFIED range above it in its source unit, and a rewind above it starts at it instead (#782)",
+            vec!["tenant", "source_type", "reason"],
+        )?;
+        let recovery_rewinds_lowered_total = cv(
+            "recovery_rewinds_lowered_total",
+            "Rewinds recovery applied at the start of a held range of the same source unit below them instead of their own, so the held range is read again with them; the ranges above it are archived twice (#782)",
+            vec!["tenant", "source_type"],
+        )?;
+        let recovery_rechecks_total = cv(
+            "recovery_rechecks_total",
+            "VERIFIED batches recovery re-checked against storage, by the class they were verified with (strong, size_only; unknown for a row from before #664 or with a newer release's class) and the re-check's result (strong, size_only, failed, unsupported_version). verification_class=strong with result=size_only: the store can no longer confirm content verified strongly; restore checksum support on the backend, then run vtopctl scrub",
+            vec!["tenant", "source_type", "format", "verification_class", "result"],
+        )?;
+        let manifests_written_total = cv(
+            "manifests_written_total",
+            "Manifests stored, by manifest version (manifest.write_version); readers before v0.8.0 report version 0.4 manifests as tampered",
+            vec!["tenant", "version"],
+        )?;
+        let verification_receipts_total = cv(
+            "verification_receipts_total",
+            "Verification receipts by result: written (by the engine after VERIFIED), failed (could not be written, or under Object Lock not stored locked; the batch committed regardless, and the WARN verification_receipt_failed says why), repaired (written by recovery for a VERIFIED batch that had none)",
+            vec!["tenant", "result"],
+        )?;
+        let manifest_authentications_total = cv(
+            "manifest_authentications_total",
+            "Manifest MAC checks by key_id (a configured key id; none: a key with no id, or no id and no legacy key; other: an id not in this keyring) and result (ok, failed, unknown_key, retired_key). unknown_key or retired_key: the manifest is unauthenticated, not corrupt; add the key as verify-only, or accept that the id was retired",
+            vec!["key_id", "result"],
         )?;
         let failed_total = cv(
             "failed_total",
@@ -210,6 +566,16 @@ impl Metrics {
             "Source reads that failed and were skipped for this cycle (see logs for the path)",
             vec!["tenant", "source_type"],
         )?;
+        let object_key_decisions_total = cv(
+            "object_key_decisions_total",
+            "How each batch's object key was decided (#626): derived (uploaded under its content-derived key), reused (the verified object was already stored, no upload), fallback_differs / fallback_size_only / fallback_unreadable (an object is at the derived key and does not verify, verifies by size only, or could not be read) and fallback_unchecked (the store refused or failed the check of the key): the batch was written under its per-attempt key instead of overwriting anything, probe_throttled (the batch failed and was handed back), per_attempt (no checksum, or a backend that cannot report an absent key); under the Object Lock profile (#709) fallback_unlocked / fallback_lock_elapsed / fallback_lock_mode / fallback_hold_missing (the verified object at the derived key has no lock, an ended one, the other mode, or no legal hold: a fresh locked object was written under the per-attempt key) and lock_withheld (the fresh object written for the range moments ago is not usable either; nothing was written and the batch failed)",
+            vec!["tenant", "source_type", "format", "decision"],
+        )?;
+        let replay_rebuilds_total = cv(
+            "replay_rebuilds_total",
+            "What each replay of a window an earlier attempt sealed came to (#626): exact (rebuilt over exactly the recorded range, filed under the hour it was first sealed in, with the bytes the earlier attempt uploaded where the ledger recorded them, under the derived key), bytes_differ (rebuilt over exactly the recorded range, but its bytes differ from the object the earlier attempt uploaded: a second object is written and the earlier one is left as it is), fallback (the same bytes, but the key decision fell back to the per-attempt key, see vtop_object_key_decisions_total: a second object is written), refused (the source could not stop the re-read at the recorded end; read to the current end as before), too_large (over 4x the current batching limits; not bounded) or dropped_at_stop (the engine stopped inside a rebuild and dropped the partial window; the next start reads it again)",
+            vec!["tenant", "source_type", "format", "result"],
+        )?;
         let upload_throttled_total = cv(
             "upload_throttled_total",
             "Uploads the object store answered with a throttle (HTTP 429/503 or an S3 SlowDown/Throttling code) after the backend's own retries; a sustained rate means the store wants less concurrency, not more retries",
@@ -223,9 +589,54 @@ impl Metrics {
             "Request-body bytes admitted through the upload egress shaper, retries included; present only when upload.max_egress_bytes_per_second is set. Application-layer accounting, not a host network counter",
             vec![],
         )?;
+        let file_delete_decisions_total = cv(
+            "file_delete_decisions_total",
+            "delete_after_commit decisions about fully archived files, by outcome (deleted, or why kept); the path is in the log line",
+            vec!["outcome"],
+        )?;
         let retention_lost_records_total = cv(
             "retention_lost_records_total",
             "Records source-side retention removed before the engine read them; any increase is data loss upstream of the archive (see logs for topic/partition)",
+            vec!["tenant", "source_type"],
+        )?;
+        let kafka_partition_events_total = cv(
+            "kafka_partition_events_total",
+            "Kafka partition-list changes seen while reading and what the source did (see logs for topic/partition): no_partitions, lookup_failed, grew, new_partition_from_beginning, start_deferred, pinned_before_renewal, recreated_or_truncated",
+            vec!["event"],
+        )?;
+        let audit_events_total = cv(
+            "audit_events_total",
+            "Audit records written, by action (the closed set in docs/operate/auditing.md) and outcome (attempt, success, failure, refused)",
+            vec!["action", "outcome"],
+        )?;
+        let audit_write_failures_total = cv(
+            "audit_write_failures_total",
+            "Audit records that could not be written to a sink (log, file, ledger); a destructive ledger command is refused when its attempt record cannot be written",
+            vec!["sink"],
+        )?;
+        let multipart_parts_total = cv(
+            "multipart_parts_total",
+            "Multipart parts by result (#668): uploaded (sent in this upload call; after a restart, to each upload), reused (kept from an earlier call and not sent again), retried (one per extra attempt at a part), failed (the part's last attempt in the call failed); the object path is in the log line",
+            vec!["result"],
+        )?;
+        let multipart_sessions_total = cv(
+            "multipart_sessions_total",
+            "Multipart sessions by outcome (#668): completed, resumed (an earlier call's session adopted), restarted (the store no longer held the upload; a new one was started), kept_after_failure (an upload failed and its session and parts were kept for the replay), swept (an abandoned session's upload was aborted)",
+            vec!["outcome"],
+        )?;
+        let multipart_bytes_reused_total = IntCounter::with_opts(Opts::new(
+            "multipart_bytes_reused_total",
+            "Bytes of kept multipart parts a resumed upload did not send again (#668)",
+        ))?;
+        registry.register(Box::new(multipart_bytes_reused_total.clone()))?;
+        let secret_file_permission_overrides_total = IntCounter::with_opts(Opts::new(
+            "secret_file_permission_overrides_total",
+            "Key, state-store, ledger and audit files other local users can read, accepted only because security.allow_loose_secret_permissions is true (#733); the path and mode are in the log line and the audit record",
+        ))?;
+        registry.register(Box::new(secret_file_permission_overrides_total.clone()))?;
+        let source_replay_refused_total = cv(
+            "source_replay_refused_total",
+            "Failed ranges the source refused to hand back for re-reading, or whose re-read it then refused; each is a range missing from the archive (see logs for the path). For a file: its file cannot be proven reachable - truncated, replaced or rewritten in place, or rotated away and then removed, compressed, copied by copytruncate, or truncated or rewritten before its re-read",
             vec!["tenant", "source_type"],
         )?;
 
@@ -288,8 +699,18 @@ impl Metrics {
             commits_total,
             verification_failures_total,
             verification_backend_limited_total,
+            verification_mode,
+            object_lock_mode,
+            object_lock_checks_total,
             replay_required_total,
             failed_total,
+            recovery_unsupported_manifest_total,
+            recovery_held_total,
+            recovery_rewinds_lowered_total,
+            recovery_rechecks_total,
+            manifests_written_total,
+            verification_receipts_total,
+            manifest_authentications_total,
             records_total,
             bytes_in_total,
             bytes_out_total,
@@ -300,8 +721,19 @@ impl Metrics {
             upload_width,
             source_read_errors_total,
             retention_lost_records_total,
+            source_replay_refused_total,
             upload_throttled_total,
             upload_egress_bytes_total,
+            file_delete_decisions_total,
+            object_key_decisions_total,
+            replay_rebuilds_total,
+            kafka_partition_events_total,
+            audit_events_total,
+            audit_write_failures_total,
+            multipart_parts_total,
+            multipart_sessions_total,
+            multipart_bytes_reused_total,
+            secret_file_permission_overrides_total,
         })
     }
 

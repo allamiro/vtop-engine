@@ -286,10 +286,21 @@ pub async fn run_tier_copy(
     if request.require_versioning {
         let (bucket, _key) = parse_s3_uri(&request.object_uri)
             .map_err(|error| refuse("versioning preflight", error))?;
-        backend
-            .verify_bucket_versioning(&bucket)
-            .await
-            .map_err(|error| refuse("versioning preflight", error))?;
+        use crate::bucket_versioning::{self as versioning, Refuser};
+        let refusal = if !backend.supports_object_versions() {
+            Some(versioning::backend_without_versions(
+                backend.backend_name(),
+                Refuser::TIER_COPY,
+            ))
+        } else {
+            match backend.bucket_versioning(&bucket).await {
+                Ok(answer) => versioning::refusal(answer, &bucket, Refuser::TIER_COPY),
+                Err(error) => Some(versioning::unreadable(&bucket, Refuser::TIER_COPY, &error)),
+            }
+        };
+        if let Some(message) = refusal {
+            return Err(refuse("versioning preflight", message));
+        }
     }
 
     // 3. Upload segment and manifest, capturing both immutable object
@@ -550,6 +561,26 @@ fn derived_tier_copy_request_id(args: &TierCopyArgs, expected_root: &[u8; 32]) -
     Uuid::from_bytes(bytes)
 }
 
+/// `vtopctl tier copy` refuses `upload.object_lock` (#684).
+///
+/// The copy goes through the same S3 backend as the engine, which would put
+/// the lock on every cold-tier object, but the tier path never reads a
+/// retention back, so the copy would be recorded as evidence of a lock
+/// nobody checked. Refused, naming the key, until locking a tier copy is
+/// designed; rehydrate and cleanup-abandoned write nothing and accept it.
+pub fn refuse_object_lock_for_tier(upload: &vtop_core::config::UploadConfig) -> Result<(), String> {
+    if upload.object_lock.is_none() {
+        return Ok(());
+    }
+    Err(
+        "upload.object_lock is set in the --upload-config file, but vtopctl tier copy does \
+         not check the retention of what it writes; nothing was copied. Remove \
+         upload.object_lock from the tier's --upload-config file (keep a bucket default \
+         retention on the cold-tier bucket if its copies must be locked)"
+            .into(),
+    )
+}
+
 /// Dispatch `vtopctl tier` and return a process exit code.
 pub async fn run(command: TierCommand, json: bool) -> i32 {
     match run_inner(command, json).await {
@@ -569,6 +600,7 @@ async fn run_inner(command: TierCommand, json: bool) -> Result<(), String> {
                 .map_err(|error| format!("read {}: {error}", args.upload_config.display()))?;
             let upload_config: vtop_core::config::UploadConfig = serde_yaml::from_str(&upload_text)
                 .map_err(|error| format!("parse {}: {error}", args.upload_config.display()))?;
+            refuse_object_lock_for_tier(&upload_config)?;
             request.multipart = multipart_config_from_args(args.as_ref(), &upload_config)?;
             let backend = vtop_upload::build_backend(&upload_config)
                 .await
@@ -742,7 +774,7 @@ mod tests {
             checksum: Option<ObjectChecksum<'_>>,
         ) -> Result<vtop_upload::StoredObject, VtopError> {
             self.0.put_object(local_path, object_uri, checksum).await?;
-            Ok(vtop_upload::StoredObject { version_id: None })
+            Ok(vtop_upload::StoredObject::default())
         }
         async fn put_manifest(
             &self,
@@ -753,7 +785,7 @@ mod tests {
             self.0
                 .put_manifest(local_path, manifest_uri, checksum)
                 .await?;
-            Ok(StoredManifest { version_id: None })
+            Ok(StoredManifest::default())
         }
         async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {
             self.0.head_object(object_uri).await
@@ -781,11 +813,18 @@ mod tests {
         async fn delete_object(&self, object_uri: &str) -> Result<(), VtopError> {
             self.0.delete_object(object_uri).await
         }
-        async fn verify_bucket_versioning(&self, _bucket: &str) -> Result<(), VtopError> {
-            Ok(())
+        async fn bucket_versioning(
+            &self,
+            _bucket: &str,
+        ) -> Result<vtop_upload::BucketFeature, VtopError> {
+            Ok(vtop_upload::BucketFeature::Enabled)
         }
         fn backend_name(&self) -> &'static str {
             "mock-unversioned"
+        }
+        // Versioned-looking: it says it addresses versions, then returns none.
+        fn supports_object_versions(&self) -> bool {
+            true
         }
         fn supports_checksum_verification(&self) -> bool {
             true
@@ -997,6 +1036,130 @@ mod tests {
         assert!(error.contains("versioning preflight"), "{error}");
     }
 
+    /// Review of #770: tier copy's versioning refusals name ITS switch
+    /// (`--require-versioning`), not the engine's config key, and its
+    /// credentials, not the engine's; and a backend without object versions
+    /// is told so, not sent to grant s3:GetBucketVersioning.
+    #[tokio::test]
+    async fn tier_copy_versioning_refusals_name_its_own_switch() {
+        let directory = tempfile::tempdir().unwrap();
+        let sealed = seal_bundle(directory.path());
+        let root = sealed_root(&sealed);
+        let cases: [(MockBackend, &[&str]); 3] = [
+            (
+                MockBackend::new().with_bucket_versioning(vtop_upload::BucketFeature::NotEnabled),
+                &[
+                    "bucket tier does not have versioning enabled",
+                    "Enable versioning on the bucket",
+                    "pass --require-versioning false",
+                ],
+            ),
+            (
+                MockBackend::new().with_bucket_versioning(vtop_upload::BucketFeature::NotSupported),
+                &[
+                    "the store does not implement S3 bucket versioning",
+                    "pass --require-versioning false",
+                ],
+            ),
+            (
+                MockBackend::new().with_versioning_errors(1),
+                &[
+                    "could not be read",
+                    "Grant the credentials vtopctl uses s3:GetBucketVersioning",
+                ],
+            ),
+        ];
+        for (backend, parts) in cases {
+            let error = run_tier_copy(&backend, &request(&sealed, root))
+                .await
+                .expect_err("the versioning preflight refuses");
+            for part in parts
+                .iter()
+                .chain(&["refusing at versioning preflight", "nothing was copied"])
+            {
+                assert!(error.contains(part), "{error:?} should say {part:?}");
+            }
+            assert!(
+                !error.contains("upload.require_object_versioning"),
+                "tier copy does not read that key: {error}"
+            );
+        }
+        let error = run_tier_copy(
+            &WithoutVersions(MockBackend::new()),
+            &request(&sealed, root),
+        )
+        .await
+        .expect_err("a backend without versions refuses");
+        for part in [
+            "--require-versioning is set",
+            "cannot address object versions",
+            "nothing was copied",
+            "pass --require-versioning false",
+        ] {
+            assert!(error.contains(part), "{error:?} should say {part:?}");
+        }
+    }
+
+    /// A backend that cannot address object versions at all.
+    struct WithoutVersions(MockBackend);
+
+    #[async_trait]
+    impl UploadBackend for WithoutVersions {
+        async fn put_object(
+            &self,
+            local_path: &Path,
+            object_uri: &str,
+            checksum: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::StoredObject, VtopError> {
+            self.0.put_object(local_path, object_uri, checksum).await
+        }
+        async fn put_manifest(
+            &self,
+            local_path: &Path,
+            manifest_uri: &str,
+            checksum: Option<ObjectChecksum<'_>>,
+        ) -> Result<StoredManifest, VtopError> {
+            self.0
+                .put_manifest(local_path, manifest_uri, checksum)
+                .await
+        }
+        async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {
+            self.0.head_object(object_uri).await
+        }
+        async fn get_object(&self, object_uri: &str) -> Result<Vec<u8>, VtopError> {
+            self.0.get_object(object_uri).await
+        }
+        async fn get_object_bounded(
+            &self,
+            object_uri: &str,
+            max_bytes: usize,
+        ) -> Result<Vec<u8>, VtopError> {
+            self.0.get_object_bounded(object_uri, max_bytes).await
+        }
+        async fn verify_object(
+            &self,
+            object_uri: &str,
+            expected_size: u64,
+            expected: Option<ObjectChecksum<'_>>,
+        ) -> Result<VerificationResult, VtopError> {
+            self.0
+                .verify_object(object_uri, expected_size, expected)
+                .await
+        }
+        async fn delete_object(&self, object_uri: &str) -> Result<(), VtopError> {
+            self.0.delete_object(object_uri).await
+        }
+        fn backend_name(&self) -> &'static str {
+            "without-versions"
+        }
+        fn supports_checksum_verification(&self) -> bool {
+            true
+        }
+        fn supports_multipart(&self) -> bool {
+            false
+        }
+    }
+
     #[tokio::test]
     async fn tier_copy_multipart_path_still_pins_versions_and_commits_evidence() {
         let directory = tempfile::tempdir().unwrap();
@@ -1012,6 +1175,8 @@ mod tests {
             max_parallelism: 2,
             abandon_after_secs: 60,
             state_dir: state.path().to_path_buf(),
+            part_attempts: 3,
+            part_backoff: Default::default(),
         });
         let command = run_tier_copy(&backend, &req)
             .await
@@ -1064,6 +1229,26 @@ mod tests {
         assert_eq!(std::fs::read(&out).unwrap(), data);
     }
 
+    /// #684: `vtopctl tier copy` would apply `upload.object_lock` to the
+    /// cold-tier copy through the same S3 backend and never check it, so it
+    /// refuses the block, naming the key, until locking a tier copy is
+    /// designed.
+    #[test]
+    fn tier_copy_refuses_an_object_lock_block_naming_the_key() {
+        let mut upload: vtop_core::config::UploadConfig = serde_yaml::from_str(
+            "bucket: cold\nbackend: s3_native\nrequire_object_versioning: true\n\
+             object_lock:\n  mode: governance\n  retain_days: 30\n",
+        )
+        .unwrap();
+        let msg = refuse_object_lock_for_tier(&upload)
+            .expect_err("a tier copy must not write locks it never checks");
+        for part in ["upload.object_lock", "vtopctl tier copy", "--upload-config"] {
+            assert!(msg.contains(part), "{msg:?} should say {part:?}");
+        }
+        upload.object_lock = None;
+        refuse_object_lock_for_tier(&upload).expect("no block, no refusal");
+    }
+
     /// One config construction, two callers (#482): the engine builds its
     /// MultipartUploadConfig with MultipartUploadConfig::from_upload, and
     /// so does the tier path — before its CLI overrides — so with no
@@ -1081,6 +1266,7 @@ mod tests {
             verify_tls: false,
             transport: "tcp_tls".into(),
             request_timeout_seconds: 300,
+            request_min_bytes_per_second: 4 * 1024,
             profile: None,
             command_binary: None,
             command_timeout_seconds: 300,
@@ -1094,9 +1280,11 @@ mod tests {
             multipart_threshold_bytes: 8 * 1024 * 1024,
             multipart_max_parallelism: 4,
             multipart_abandon_after_secs: 86_400,
+            multipart_part_attempts: 3,
             transports: Default::default(),
             max_egress_bytes_per_second: None,
             max_concurrency_ceiling: None,
+            object_lock: None,
         };
         let state_dir = PathBuf::from("/work");
         // The engine path: from_upload, no overrides.

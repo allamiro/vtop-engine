@@ -205,8 +205,12 @@ objects=$(grep -vc 'manifest\.json' <<<"$listing" || true)
 manifests=$(grep -c 'manifest\.json' <<<"$listing" || true)
 if [ "${objects:-0}" -gt 0 ]; then pass "objects in MinIO: $objects"; else fail "no data objects in MinIO"; fi
 if [ "${manifests:-0}" -gt 0 ]; then pass "manifests in MinIO: $manifests"; else fail "no manifests in MinIO"; fi
-if [ "${objects:-0}" -ne "${manifests:-0}" ]; then
-  fail "objects ($objects) != manifests ($manifests): every object must have a manifest"
+# Several attempts at one range can name one object since #626 (each attempt
+# writes its own manifest, a replay of the same bytes reuses the object), so
+# manifests may outnumber objects; more objects than manifests means an object
+# no manifest names.
+if [ "${objects:-0}" -gt "${manifests:-0}" ]; then
+  fail "objects ($objects) > manifests ($manifests): every object must have a manifest"
 else
   pass "every object has a manifest"
 fi
@@ -218,10 +222,10 @@ for b in telemetry-cef telemetry-jsonl telemetry-syslog; do
   bucket_lines=$(grep -F "$b" <<<"$listing" || true)
   bobj=$(grep -vc 'manifest\.json' <<<"$bucket_lines" || true)
   bman=$(grep -c 'manifest\.json' <<<"$bucket_lines" || true)
-  if [ "${bobj:-0}" -gt 0 ] && [ "${bman:-0}" -gt 0 ] && [ "${bobj:-0}" -eq "${bman:-0}" ]; then
+  if [ "${bobj:-0}" -gt 0 ] && [ "${bman:-0}" -gt 0 ] && [ "${bobj:-0}" -le "${bman:-0}" ]; then
     pass "bucket $b: $bobj object(s) each with a manifest"
   else
-    fail "bucket $b: objects=$bobj manifests=$bman (need >0 and equal)"
+    fail "bucket $b: objects=$bobj manifests=$bman (need >0 and objects <= manifests)"
   fi
 done
 

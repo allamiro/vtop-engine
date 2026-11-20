@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "backend_id": "mock",
+  "object_uri": "s3://bucket/fixture.raw",
+  "local_path": "/out/fixture.raw",
+  "upload_id": "mpu-1",
+  "part_size_bytes": 1000,
+  "fence": {
+    "expected_segment_generation": 1,
+    "fencing_epoch": 1,
+    "content_digest_hex": "e985e36620c783399fd43a07398efa182421935023f73e4e921b81bcb74ca64c",
+    "content_digest_algorithm": "blake3",
+    "byte_length": 3000
+  },
+  "phase": "completed",
+  "parts": {
+    "1": {
+      "part_number": 1,
+      "etag": "etag-1-1",
+      "size_bytes": 1000,
+      "part_digest_hex": "db6e6e6d2f77f8625d4227b514945036b8506b33fb08b0a62a9ee2571f0e61cc"
+    },
+    "2": {
+      "part_number": 2,
+      "etag": "etag-1-2",
+      "size_bytes": 1000,
+      "part_digest_hex": "db6e6e6d2f77f8625d4227b514945036b8506b33fb08b0a62a9ee2571f0e61cc"
+    },
+    "3": {
+      "part_number": 3,
+      "etag": "etag-1-3",
+      "size_bytes": 1000,
+      "part_digest_hex": "db6e6e6d2f77f8625d4227b514945036b8506b33fb08b0a62a9ee2571f0e61cc"
+    }
+  },
+  "created_at_unix_secs": 1794670585,
+  "updated_at_unix_secs": 1794670585,
+  "completed_version_id": "v-7",
+  "retention": {
+    "mode": "compliance",
+    "retain_until_unix_secs": 1825000000,
+    "legal_hold": true
+  }
+}

@@ -10,21 +10,24 @@ use super::tls::{server_name, TlsMaterial};
 use super::wire::{
     read_frame, write_frame, AdminAddLearnerRequest, AdminChangeMembershipRequest, AdminError,
     AdminInitRequest, AdminMembershipResponse, AdminProposeRequest, AdminProposeResponse,
-    AdminReadGroupCursorRequest, AdminReadGroupCursorResponse, AdminReadRangeLeaseRequest,
-    AdminReadRangeLeaseResponse, AdminReadRangeReplicaSetRequest, AdminReadRangeReplicaSetResponse,
-    AdminReadRangeTransitionsRequest, AdminReadRangeTransitionsResponse,
-    AdminReadSegmentPlacementRequest, AdminReadSegmentPlacementResponse, AdminStatusRequest,
-    AdminStatusResponse, NotLeaderHint, TransportError, TransportResult, VtpmFrame,
-    KIND_ADMIN_ADD_LEARNER_REQ, KIND_ADMIN_CHANGE_MEMBERSHIP_REQ, KIND_ADMIN_ERROR,
-    KIND_ADMIN_INIT_REQ, KIND_ADMIN_MEMBERSHIP_RESP, KIND_ADMIN_PROPOSE_REQ,
-    KIND_ADMIN_PROPOSE_RESP, KIND_ADMIN_READ_GROUP_CURSOR_REQ, KIND_ADMIN_READ_GROUP_CURSOR_RESP,
+    AdminReadGroupCursorRequest, AdminReadGroupCursorResponse,
+    AdminReadPromotionAttestationRequest, AdminReadPromotionAttestationResponse,
+    AdminReadRangeLeaseRequest, AdminReadRangeLeaseResponse, AdminReadRangeReplicaSetRequest,
+    AdminReadRangeReplicaSetResponse, AdminReadRangeTransitionsRequest,
+    AdminReadRangeTransitionsResponse, AdminReadSegmentPlacementRequest,
+    AdminReadSegmentPlacementResponse, AdminStatusRequest, AdminStatusResponse, NotLeaderHint,
+    TransportError, TransportResult, VtpmFrame, KIND_ADMIN_ADD_LEARNER_REQ,
+    KIND_ADMIN_CHANGE_MEMBERSHIP_REQ, KIND_ADMIN_ERROR, KIND_ADMIN_INIT_REQ,
+    KIND_ADMIN_MEMBERSHIP_RESP, KIND_ADMIN_PROPOSE_REQ, KIND_ADMIN_PROPOSE_RESP,
+    KIND_ADMIN_READ_GROUP_CURSOR_REQ, KIND_ADMIN_READ_GROUP_CURSOR_RESP,
+    KIND_ADMIN_READ_PROMOTION_ATTESTATION_REQ, KIND_ADMIN_READ_PROMOTION_ATTESTATION_RESP,
     KIND_ADMIN_READ_RANGE_LEASE_REQ, KIND_ADMIN_READ_RANGE_LEASE_RESP,
     KIND_ADMIN_READ_RANGE_REPLICA_SET_REQ, KIND_ADMIN_READ_RANGE_REPLICA_SET_RESP,
     KIND_ADMIN_READ_RANGE_TRANSITIONS_REQ, KIND_ADMIN_READ_RANGE_TRANSITIONS_RESP,
     KIND_ADMIN_READ_SEGMENT_PLACEMENT_REQ, KIND_ADMIN_READ_SEGMENT_PLACEMENT_RESP,
     KIND_ADMIN_STATUS_REQ, KIND_ADMIN_STATUS_RESP,
 };
-use crate::command::MetadataCommand;
+use crate::command::{MetadataCommand, MetadataResponse};
 use crate::keys::MetaNodeId;
 use async_trait::async_trait;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -93,6 +96,28 @@ pub trait AdminHandler: Send + Sync {
     ) -> TransportResult<AdminReadRangeReplicaSetResponse> {
         Err(TransportError::Protocol(
             "this admin handler does not serve replica set reads".to_owned(),
+        ))
+    }
+    /// Linearizable read of a range's live promotion attestation (#636).
+    /// Defaulted to a refusal, as the transition read is - and a refusal
+    /// is read by every caller as "no attestation", which is the safe
+    /// answer: Unknown answers stay uncounted.
+    async fn read_promotion_attestation(
+        &self,
+        _request: AdminReadPromotionAttestationRequest,
+    ) -> TransportResult<AdminReadPromotionAttestationResponse> {
+        Err(TransportError::Protocol(
+            "this admin handler does not serve promotion attestation reads".to_owned(),
+        ))
+    }
+    /// Linearizable read of the cluster's feature level and what each node
+    /// reported it runs (#634). Defaulted to a refusal, as the others are.
+    async fn read_cluster_versions(
+        &self,
+        _request: crate::transport::wire::AdminReadClusterVersionsRequest,
+    ) -> TransportResult<crate::transport::wire::AdminReadClusterVersionsResponse> {
+        Err(TransportError::Protocol(
+            "this admin handler does not serve cluster version reads".to_owned(),
         ))
     }
 }
@@ -284,12 +309,24 @@ async fn serve_admin_connection(
             ))
         }
     };
+    // Warned once per connection (#694): the audit records of its writes
+    // name no actor, and the operator should know why.
+    let mut warned_anonymous = false;
     loop {
         let frame = match read_frame(&mut stream).await {
             Ok(frame) => frame,
             Err(TransportError::Closed) => return Ok(()),
             Err(error) => return Err(error),
         };
+        if identity == AdminIdentity::Anonymous && !warned_anonymous && is_write(frame.kind) {
+            warned_anonymous = true;
+            eprintln!(
+                "warning: a write on the plaintext admin endpoint: the caller presented no \
+                 certificate, so its audit records name no actor (anonymous). The request is \
+                 handled as before. To attribute admin commands, serve the admin endpoint over \
+                 mTLS (admin_transport: tls) with one certificate per operator"
+            );
+        }
         let response = match dispatch_admin(handler.as_ref(), &authorizer, &identity, frame).await {
             Ok(frame) => frame,
             // The redirect survives the trip to the wire. Building the frame
@@ -317,6 +354,16 @@ async fn serve_admin_connection(
 /// its dispatcher's unknown-kind refusal, from the same Display.
 fn predates_replica_set_read() -> String {
     TransportError::UnexpectedKind(KIND_ADMIN_READ_RANGE_REPLICA_SET_REQ).to_string()
+}
+
+/// Whether `error` is a metadata node refusing the cluster-versions read
+/// because it predates it (#634): its dispatcher's unknown-kind refusal.
+pub fn predates_cluster_versions_read(error: &TransportError) -> bool {
+    matches!(error, TransportError::Protocol(message)
+        if *message == TransportError::UnexpectedKind(
+            crate::transport::wire::KIND_ADMIN_READ_CLUSTER_VERSIONS_REQ
+        )
+        .to_string())
 }
 
 /// Whether metadata refused a promotion report BECAUSE it carries lineage
@@ -361,6 +408,73 @@ pub fn refuses_lineage_verdicts(error: &TransportError) -> bool {
     message.starts_with(gate_prefix) || message.contains(&undecodable)
 }
 
+/// Whether metadata refused a data node's version report (#634) because the
+/// tier is not yet at the level that records it, so the node should simply
+/// ask again later.
+///
+/// Two releases refuse it, each in its own words, both before anything is
+/// replicated: one with feature levels below
+/// [`crate::command::NODE_VERSION_REPORTS_FEATURE_LEVEL`], with the gate's
+/// `FeatureNotEnabled`; and one that cannot decode the command kind at all.
+pub fn refuses_version_report(error: &TransportError) -> bool {
+    let TransportError::Protocol(message) = error else {
+        return false;
+    };
+    let gate = crate::raft::ConsensusError::FeatureNotEnabled {
+        needed: crate::command::NODE_VERSION_REPORTS_FEATURE_LEVEL,
+        enabled: 0,
+    }
+    .to_string();
+    let gate_prefix = gate
+        .split(" and the cluster runs at")
+        .next()
+        .unwrap_or(&gate);
+    let undecodable = crate::wire::CodecError::UnknownTag {
+        what: "command kind",
+        tag: 38,
+    }
+    .to_string();
+    message.starts_with(gate_prefix) || message.contains(&undecodable)
+}
+
+/// Whether metadata refused a promotion report BECAUSE it carries a payload
+/// of the override's level (#636): the lineage-unproven refusal reason, or
+/// an attestation. Recognized as [`refuses_lineage_verdicts`] recognizes its
+/// own payload, by the gate's text below
+/// [`crate::PROMOTE_UNPROVEN_FEATURE_LEVEL`] or by an older codec's
+/// unknown-tag text, and nothing else.
+///
+/// The two payloads need opposite responses. A refusal reason has an older
+/// form (`QuorumUnavailable`, which it was recorded as before), so the
+/// report goes again in that form; an attested promotion has none, and is
+/// simply not recorded - and so never exposed.
+pub fn refuses_promote_unproven(error: &TransportError) -> bool {
+    let TransportError::Protocol(message) = error else {
+        return false;
+    };
+    let gate = crate::raft::ConsensusError::FeatureNotEnabled {
+        needed: crate::command::PROMOTE_UNPROVEN_FEATURE_LEVEL,
+        enabled: 0,
+    }
+    .to_string();
+    let gate_prefix = gate
+        .split(" and the cluster runs at")
+        .next()
+        .unwrap_or(&gate);
+    let undecodable = [
+        crate::wire::CodecError::UnknownTag {
+            what: "promotion refusal",
+            tag: 5,
+        },
+        crate::wire::CodecError::UnknownTag {
+            what: "promotion outcome",
+            tag: 4,
+        },
+    ]
+    .map(|error| error.to_string());
+    message.starts_with(gate_prefix) || undecodable.iter().any(|text| message.contains(text))
+}
+
 fn truncate_error(message: &str) -> String {
     let max = crate::command::MAX_ERROR_DETAIL_BYTES;
     if message.len() <= max {
@@ -378,6 +492,18 @@ pub fn resolve_endpoint(endpoint: &str) -> TransportResult<SocketAddr> {
     endpoint.to_socket_addrs()?.next().ok_or_else(|| {
         TransportError::Protocol(format!("endpoint {endpoint:?} resolved to no addresses"))
     })
+}
+
+/// Whether an admin frame asks for a change: a proposal, bootstrap or a
+/// membership change. Everything else is a read.
+fn is_write(kind: u16) -> bool {
+    matches!(
+        kind,
+        KIND_ADMIN_PROPOSE_REQ
+            | KIND_ADMIN_INIT_REQ
+            | KIND_ADMIN_ADD_LEARNER_REQ
+            | KIND_ADMIN_CHANGE_MEMBERSHIP_REQ
+    )
 }
 
 /// Dispatch one admin frame, authorizing it first.
@@ -460,10 +586,90 @@ async fn dispatch_admin(
                 payload: response.encode()?,
             })
         }
+        KIND_ADMIN_READ_PROMOTION_ATTESTATION_REQ => {
+            let request = AdminReadPromotionAttestationRequest::decode(&frame.payload)?;
+            // A read, like the others: an operator's override on a range is
+            // for anybody entitled to look at the cluster - the audit needs
+            // it most.
+            authorize(authorizer.authorize_read(identity))?;
+            let response = handler.read_promotion_attestation(request).await?;
+            Ok(VtpmFrame {
+                kind: KIND_ADMIN_READ_PROMOTION_ATTESTATION_RESP,
+                payload: response.encode()?,
+            })
+        }
+        crate::transport::wire::KIND_ADMIN_READ_CLUSTER_VERSIONS_REQ => {
+            let request =
+                crate::transport::wire::AdminReadClusterVersionsRequest::decode(&frame.payload)?;
+            // A read, like the others: what each node runs is for anybody
+            // entitled to look at the cluster, and a data node polls the
+            // level with its own identity.
+            authorize(authorizer.authorize_read(identity))?;
+            let response = handler.read_cluster_versions(request).await?;
+            Ok(VtpmFrame {
+                kind: crate::transport::wire::KIND_ADMIN_READ_CLUSTER_VERSIONS_RESP,
+                payload: response.encode()?,
+            })
+        }
         KIND_ADMIN_PROPOSE_REQ => {
             let request = AdminProposeRequest::decode(&frame.payload)?;
-            authorize(authorizer.authorize_command(identity, &request.command))?;
-            let response = handler.propose(request.command).await?;
+            // Every refusal is audited, whatever the command (#694): a
+            // refused write is the record an auditor most needs.
+            if let Err(refusal) = authorizer.authorize_command(identity, &request.command) {
+                crate::audit::emit(&crate::audit::refusal(
+                    identity,
+                    &request.command,
+                    format!("{}; nothing was proposed", refusal.message()),
+                ));
+                return Err(TransportError::Unauthorized(refusal.message()));
+            }
+            // An audited command's edge record: the caller's identity, the
+            // outcome and the index it committed at. Taken before the
+            // command moves into the handler.
+            let audited = crate::audit::command_audit(&request.command).map(|audit| {
+                crate::audit::AuditRecord::for_command(
+                    crate::audit::AuditStage::Edge,
+                    crate::audit::AuditActor::Caller(identity.clone()),
+                    &request.command,
+                    audit,
+                    crate::audit::AuditOutcome::Success,
+                )
+            });
+            let result = handler.propose(request.command).await;
+            // A follower's redirect is not an outcome: the client asks the
+            // leader next, which writes the record that counts (review of
+            // #705).
+            let redirected = matches!(result, Err(TransportError::NotLeader { .. }));
+            if let Some(mut record) = audited.filter(|_| !redirected) {
+                match &result {
+                    Ok(response) => {
+                        record.log_index = Some(response.log_id.index);
+                        if let MetadataResponse::Rejected(error) = &response.response {
+                            record.outcome = crate::audit::AuditOutcome::Failure;
+                            record.reason = Some(format!(
+                                "the state machine rejected it at index {}: {error}",
+                                response.log_id.index
+                            ));
+                        }
+                    }
+                    // Refused before anything was proposed (#706).
+                    Err(TransportError::Refused(reason)) => {
+                        record.outcome = crate::audit::AuditOutcome::Refused;
+                        record.reason = Some(reason.clone());
+                    }
+                    // A transport error, a timeout above all, leaves the
+                    // outcome unknown: the entry may still commit.
+                    Err(error) => {
+                        record.outcome = crate::audit::AuditOutcome::Failure;
+                        record.reason = Some(format!(
+                            "outcome unknown (it may still commit; the applied records say): \
+                             {error}"
+                        ));
+                    }
+                }
+                crate::audit::emit(&record);
+            }
+            let response = result?;
             Ok(VtpmFrame {
                 kind: KIND_ADMIN_PROPOSE_RESP,
                 payload: response.encode()?,
@@ -471,32 +677,63 @@ async fn dispatch_admin(
         }
         KIND_ADMIN_INIT_REQ => {
             let request = AdminInitRequest::decode(&frame.payload)?;
-            authorize(authorizer.authorize_cluster(identity))?;
-            let response = handler.init(request.members).await?;
-            Ok(VtpmFrame {
-                kind: KIND_ADMIN_MEMBERSHIP_RESP,
-                payload: response.encode()?,
+            let members = request
+                .members
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let record = membership_record(
+                identity,
+                crate::audit::AuditAction::ClusterInit,
+                vec![("members", members)],
+            );
+            audited_membership(record, authorizer.authorize_cluster(identity), async {
+                handler.init(request.members).await
             })
+            .await
         }
         KIND_ADMIN_ADD_LEARNER_REQ => {
             let request = AdminAddLearnerRequest::decode(&frame.payload)?;
-            authorize(authorizer.authorize_cluster(identity))?;
-            let response = handler.add_learner(request.node_id).await?;
-            Ok(VtpmFrame {
-                kind: KIND_ADMIN_MEMBERSHIP_RESP,
-                payload: response.encode()?,
+            let record = membership_record(
+                identity,
+                crate::audit::AuditAction::ClusterMembership,
+                vec![
+                    ("operation", "add_learner".to_owned()),
+                    ("node_id", request.node_id.to_string()),
+                ],
+            );
+            audited_membership(record, authorizer.authorize_cluster(identity), async {
+                handler.add_learner(request.node_id).await
             })
+            .await
         }
         KIND_ADMIN_CHANGE_MEMBERSHIP_REQ => {
             let request = AdminChangeMembershipRequest::decode(&frame.payload)?;
-            authorize(authorizer.authorize_cluster(identity))?;
-            let response = handler
-                .change_membership(request.voters, request.retain_removed_as_learners)
-                .await?;
-            Ok(VtpmFrame {
-                kind: KIND_ADMIN_MEMBERSHIP_RESP,
-                payload: response.encode()?,
+            let voters = request
+                .voters
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let record = membership_record(
+                identity,
+                crate::audit::AuditAction::ClusterMembership,
+                vec![
+                    ("operation", "change_membership".to_owned()),
+                    ("voters", voters),
+                    (
+                        "retain_removed_as_learners",
+                        request.retain_removed_as_learners.to_string(),
+                    ),
+                ],
+            );
+            audited_membership(record, authorizer.authorize_cluster(identity), async {
+                handler
+                    .change_membership(request.voters, request.retain_removed_as_learners)
+                    .await
             })
+            .await
         }
         other => Err(TransportError::UnexpectedKind(other)),
     }
@@ -504,6 +741,58 @@ async fn dispatch_admin(
 
 fn authorize(outcome: Result<(), Refusal>) -> TransportResult<()> {
     outcome.map_err(|refusal| TransportError::Unauthorized(refusal.message()))
+}
+
+/// The edge record of a bootstrap or membership request (#694); its outcome
+/// is filled in by [`audited_membership`].
+fn membership_record(
+    identity: &AdminIdentity,
+    action: crate::audit::AuditAction,
+    params: Vec<(&'static str, String)>,
+) -> crate::audit::AuditRecord {
+    crate::audit::AuditRecord {
+        stage: crate::audit::AuditStage::Edge,
+        action,
+        actor: crate::audit::AuditActor::Caller(identity.clone()),
+        target_kind: "cluster",
+        target_id: None,
+        params,
+        outcome: crate::audit::AuditOutcome::Success,
+        reason: None,
+        request_id: None,
+        log_index: None,
+    }
+}
+
+/// Authorize a bootstrap or membership request, run it, and audit what
+/// happened: refused, failed, or done.
+async fn audited_membership(
+    mut record: crate::audit::AuditRecord,
+    authorized: Result<(), Refusal>,
+    run: impl std::future::Future<Output = TransportResult<AdminMembershipResponse>>,
+) -> TransportResult<VtpmFrame> {
+    if let Err(refusal) = authorized {
+        record.outcome = crate::audit::AuditOutcome::Refused;
+        record.reason = Some(format!("{}; nothing was changed", refusal.message()));
+        crate::audit::emit(&record);
+        return Err(TransportError::Unauthorized(refusal.message()));
+    }
+    let result = run.await;
+    match &result {
+        // The leader the client is sent to writes the record (review of #705).
+        Err(TransportError::NotLeader { .. }) => {}
+        Err(error) => {
+            record.outcome = crate::audit::AuditOutcome::Failure;
+            record.reason = Some(error.to_string());
+            crate::audit::emit(&record);
+        }
+        Ok(_) => crate::audit::emit(&record),
+    }
+    let response = result?;
+    Ok(VtpmFrame {
+        kind: KIND_ADMIN_MEMBERSHIP_RESP,
+        payload: response.encode()?,
+    })
 }
 
 /// One metadata node this client may talk to.
@@ -801,6 +1090,41 @@ impl AdminClient {
         }
     }
 
+    /// Linearizable read of a range's live promotion attestation (#636).
+    ///
+    /// Unlike the replica-set read, a metadata node that predates the read
+    /// needs no special handling: it refuses the kind, the caller gets an
+    /// error, and every caller reads an error as "no attestation" - the
+    /// safe answer, since an Unknown answer then stays uncounted. A tier too
+    /// old to serve the read is too old to hold an attestation anyway (the
+    /// command that records one is gated at feature level 8).
+    pub async fn read_promotion_attestation(
+        &self,
+        topic_uuid: uuid::Uuid,
+        range_uuid: uuid::Uuid,
+    ) -> TransportResult<AdminReadPromotionAttestationResponse> {
+        let frame = self
+            .round_trip(VtpmFrame {
+                kind: KIND_ADMIN_READ_PROMOTION_ATTESTATION_REQ,
+                payload: AdminReadPromotionAttestationRequest {
+                    topic_uuid,
+                    range_uuid,
+                }
+                .encode(),
+            })
+            .await?;
+        match frame.kind {
+            KIND_ADMIN_READ_PROMOTION_ATTESTATION_RESP => Ok(
+                AdminReadPromotionAttestationResponse::decode(&frame.payload)?,
+            ),
+            KIND_ADMIN_ERROR => {
+                let error = AdminError::decode(&frame.payload)?;
+                Err(TransportError::Protocol(error.message))
+            }
+            other => Err(TransportError::UnexpectedKind(other)),
+        }
+    }
+
     /// Read a range's transition chain through a linearizable fence
     /// (#240 item 5).
     pub async fn read_range_transitions(
@@ -863,6 +1187,97 @@ impl AdminClient {
             }
             other => Err(TransportError::UnexpectedKind(other)),
         }
+    }
+
+    /// Start the next request at the candidate after the preferred one.
+    ///
+    /// For a caller whose request was CANCELLED at its own deadline (#634
+    /// review): the preferred candidate moves only on an answer, so an
+    /// endpoint that accepts and then never answers would be asked first by
+    /// every later request, and a caller that always times out there would
+    /// never reach the healthy members listed after it.
+    pub fn prefer_next_candidate(&self) {
+        use std::sync::atomic::Ordering;
+        let candidates = self.candidates.len();
+        let current = self.preferred.load(Ordering::Relaxed);
+        self.preferred
+            .store((current % candidates + 1) % candidates, Ordering::Relaxed);
+    }
+
+    /// Linearizable read of the cluster's feature level and, with
+    /// `include_nodes`, every registered node and what it reported it runs
+    /// (#634).
+    ///
+    /// A metadata node that predates the read refuses its kind; that arrives
+    /// as an error [`predates_cluster_versions_read`] recognizes. Nothing
+    /// here reads it as "no reports": a caller that judges a raise on this
+    /// must refuse to judge, and one that only wants the level keeps the one
+    /// it had.
+    pub async fn read_cluster_versions(
+        &self,
+        include_nodes: bool,
+    ) -> TransportResult<crate::transport::wire::AdminReadClusterVersionsResponse> {
+        use std::sync::atomic::Ordering;
+        let request = VtpmFrame {
+            kind: crate::transport::wire::KIND_ADMIN_READ_CLUSTER_VERSIONS_REQ,
+            payload: crate::transport::wire::AdminReadClusterVersionsRequest { include_nodes }
+                .encode(),
+        };
+        let decode = |frame: VtpmFrame| match frame.kind {
+            crate::transport::wire::KIND_ADMIN_READ_CLUSTER_VERSIONS_RESP => Ok(
+                crate::transport::wire::AdminReadClusterVersionsResponse::decode(&frame.payload)?,
+            ),
+            KIND_ADMIN_ERROR => Err(TransportError::Protocol(
+                AdminError::decode(&frame.payload)?.message,
+            )),
+            other => Err(TransportError::UnexpectedKind(other)),
+        };
+        let (first, frame) = self.round_trip_indexed(request.clone()).await?;
+        let refusal = decode(frame);
+        // A node that predates the read refuses it with a plain error, not a
+        // redirect, so the walk above stops at it - an older learner or a
+        // stale endpoint listed first would fail the read the leader can
+        // serve (review). Ask every other member before believing it.
+        if !matches!(&refusal, Err(error) if predates_cluster_versions_read(error)) {
+            return refusal;
+        }
+        let candidates = self.candidates.len();
+        let mut asked = vec![false; candidates];
+        asked[first] = true;
+        let mut next = (0..candidates).find(|index| !asked[*index]);
+        while let Some(index) = next {
+            asked[index] = true;
+            if let Ok(frame) = self.attempt(index, &request).await {
+                match redirect_of(&frame) {
+                    Some(hint) => {
+                        let named = hint
+                            .leader
+                            .and_then(|leader| self.index_of(leader))
+                            .filter(|named| !asked[*named]);
+                        if named.is_some() {
+                            self.redirects.fetch_add(1, Ordering::Relaxed);
+                            next = named;
+                            continue;
+                        }
+                    }
+                    None => {
+                        let answer = decode(frame);
+                        if !matches!(&answer, Err(error) if predates_cluster_versions_read(error)) {
+                            if answer.is_ok() {
+                                // Prefer the member that could answer, not
+                                // the one that refused.
+                                self.preferred.store(index, Ordering::Relaxed);
+                                self.answered(index);
+                            }
+                            return answer;
+                        }
+                    }
+                }
+            }
+            next = (0..candidates).find(|index| !asked[*index]);
+        }
+        // Every member that answered predates the read.
+        refusal
     }
 
     /// Linearizable read of a range's recorded replica set (#553).
@@ -1519,6 +1934,12 @@ mod tests {
     /// error and leave every range unleadable mid-upgrade.
     #[test]
     fn an_older_servers_refusal_of_the_replica_set_read_is_recognized() {
+        assert!(predates_cluster_versions_read(&TransportError::Protocol(
+            "unexpected response kind 29".to_owned()
+        )));
+        assert!(!predates_cluster_versions_read(&TransportError::Protocol(
+            "unexpected response kind 27".to_owned()
+        )));
         assert_eq!(predates_replica_set_read(), "unexpected response kind 27");
     }
 
@@ -1755,6 +2176,46 @@ mod tests {
         addr
     }
 
+    /// #636: the refusals of a report carrying the override's payloads,
+    /// pinned to the texts a gate below level 8 and an older codec emit, and
+    /// nothing else read as one - in particular not the lineage verdicts'
+    /// own refusal, which has a different remedy.
+    #[test]
+    fn a_refusal_of_the_override_payloads_is_recognized_and_nothing_else_is() {
+        let gate = crate::raft::ConsensusError::FeatureNotEnabled {
+            needed: crate::command::PROMOTE_UNPROVEN_FEATURE_LEVEL,
+            enabled: 6,
+        }
+        .to_string();
+        assert_eq!(
+            gate,
+            "this command needs metadata feature level 8 and the cluster runs at 6; finish \
+             upgrading every metadata voter, then raise the level (vtopctl meta enable-features \
+             --level 8)"
+        );
+        assert!(refuses_promote_unproven(&TransportError::Protocol(gate)));
+        assert!(refuses_promote_unproven(&TransportError::Protocol(
+            "unknown promotion refusal tag 5".to_owned()
+        )));
+        assert!(refuses_promote_unproven(&TransportError::Protocol(
+            "unknown promotion outcome tag 4".to_owned()
+        )));
+        for other in [
+            TransportError::Protocol(
+                crate::raft::ConsensusError::FeatureNotEnabled {
+                    needed: crate::command::LINEAGE_VERDICTS_FEATURE_LEVEL,
+                    enabled: 5,
+                }
+                .to_string(),
+            ),
+            TransportError::Protocol("unknown promotion outcome tag 3".to_owned()),
+            TransportError::Protocol("not the metadata leader; no leader is known yet".to_owned()),
+            TransportError::Closed,
+        ] {
+            assert!(!refuses_promote_unproven(&other), "{other}");
+        }
+    }
+
     /// #577: the two refusals of a lineage-carrying promotion report, pinned
     /// to the texts the releases that send them emit - a data node that
     /// stopped recognizing either would leave every promotion on that tier
@@ -1793,6 +2254,37 @@ mod tests {
             TransportError::UnexpectedKind(99),
         ] {
             assert!(!refuses_lineage_verdicts(&other), "{other}");
+        }
+    }
+
+    /// #634: a data node upgraded ahead of its metadata tier keeps asking to
+    /// report, and recognizes both ways a tier says "not yet" - the gate on
+    /// a tier with levels, the codec on one that cannot decode the kind -
+    /// and nothing else.
+    #[test]
+    fn a_refusal_of_a_version_report_is_recognized_and_nothing_else_is() {
+        let gate = crate::raft::ConsensusError::FeatureNotEnabled {
+            needed: crate::command::NODE_VERSION_REPORTS_FEATURE_LEVEL,
+            enabled: 6,
+        }
+        .to_string();
+        assert!(refuses_version_report(&TransportError::Protocol(gate)));
+        assert!(refuses_version_report(&TransportError::Protocol(
+            "unknown command kind tag 38".to_owned()
+        )));
+        for other in [
+            TransportError::Protocol(
+                crate::raft::ConsensusError::FeatureNotEnabled {
+                    needed: crate::command::LINEAGE_VERDICTS_FEATURE_LEVEL,
+                    enabled: 5,
+                }
+                .to_string(),
+            ),
+            TransportError::Protocol("unknown command kind tag 37".to_owned()),
+            TransportError::Protocol("record not found".to_owned()),
+            TransportError::Closed,
+        ] {
+            assert!(!refuses_version_report(&other), "{other}");
         }
     }
 
@@ -1858,6 +2350,74 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// A node answering every frame with one fixed reply.
+    async fn answering(reply: VtpmFrame) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let reply = reply.clone();
+                tokio::spawn(async move {
+                    while let Ok(_request) = read_frame(&mut stream).await {
+                        if write_frame(&mut stream, &reply).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// #634 review: a node that predates the cluster-versions read refuses
+    /// its kind with an ordinary error frame, not a redirect, and the read
+    /// used to take that as the answer - so an older learner or stale
+    /// endpoint listed first failed the read while the leader could serve
+    /// it, and became the preferred endpoint besides. The read now moves
+    /// past such a refusal; only when every node refuses is it reported as
+    /// predating.
+    #[tokio::test]
+    async fn a_cluster_versions_read_walks_past_a_node_that_predates_it() {
+        let predating = answering(VtpmFrame {
+            kind: KIND_ADMIN_ERROR,
+            payload: AdminError {
+                message: TransportError::UnexpectedKind(
+                    crate::transport::wire::KIND_ADMIN_READ_CLUSTER_VERSIONS_REQ,
+                )
+                .to_string(),
+                not_leader: None,
+            }
+            .encode()
+            .unwrap(),
+        })
+        .await;
+        let current = answering(VtpmFrame {
+            kind: crate::transport::wire::KIND_ADMIN_READ_CLUSTER_VERSIONS_RESP,
+            payload: crate::transport::wire::AdminReadClusterVersionsResponse {
+                versions: crate::versions::ClusterVersions {
+                    feature_level: 7,
+                    nodes: Vec::new(),
+                },
+                truncated: false,
+                read_at_applied_index: 3,
+            }
+            .encode()
+            .unwrap(),
+        })
+        .await;
+
+        let client = candidates(&[(1, predating), (2, current)]);
+        let read = client.read_cluster_versions(false).await.unwrap();
+        assert_eq!(read.versions.feature_level, 7);
+        // Asked again, it still reaches the node that can answer.
+        let again = client.read_cluster_versions(false).await.unwrap();
+        assert_eq!(again.read_at_applied_index, 3);
+
+        let only_old = candidates(&[(1, predating)]);
+        let error = only_old.read_cluster_versions(false).await.unwrap_err();
+        assert!(predates_cluster_versions_read(&error), "{error}");
     }
 
     fn candidates(endpoints: &[(u64, SocketAddr)]) -> AdminClient {
@@ -2683,6 +3243,18 @@ mod tests {
         Arc<CountingHandler>,
         tokio::task::JoinHandle<()>,
     ) {
+        live_endpoint_with(authorizer, client_cn, Arc::new(CountingHandler::default())).await
+    }
+
+    /// [`live_endpoint`] over a caller-supplied handler.
+    async fn live_endpoint_with<H>(
+        authorizer: AdminAuthorizer,
+        client_cn: &str,
+        handler: Arc<H>,
+    ) -> (AdminClient, Arc<H>, tokio::task::JoinHandle<()>)
+    where
+        H: AdminHandler + 'static,
+    {
         let (server_leaf, server_key) = mint_leaf("localhost");
         let (client_leaf, client_key) = mint_leaf(client_cn);
 
@@ -2701,7 +3273,6 @@ mod tests {
             trust_roots: client_roots,
         };
 
-        let handler = Arc::new(CountingHandler::default());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = AdminServer::with_authorization(
@@ -2845,6 +3416,290 @@ mod tests {
         assert_eq!(handler.proposals.load(Ordering::SeqCst), 1);
         assert_eq!(handler.membership_changes.load(Ordering::SeqCst), 1);
 
+        task.abort();
+    }
+
+    /// A backend that commits every proposal at index 41 with `reply`, and
+    /// accepts membership changes. Reads as [`CountingHandler`].
+    struct CommittingHandler {
+        reads: CountingHandler,
+        reply: MetadataResponse,
+    }
+
+    impl CommittingHandler {
+        fn replying(reply: MetadataResponse) -> Arc<Self> {
+            Arc::new(Self {
+                reads: CountingHandler::default(),
+                reply,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl AdminHandler for CommittingHandler {
+        async fn status(&self) -> TransportResult<AdminStatusResponse> {
+            self.reads.status().await
+        }
+        async fn read_segment_placement(
+            &self,
+            request: AdminReadSegmentPlacementRequest,
+        ) -> TransportResult<AdminReadSegmentPlacementResponse> {
+            self.reads.read_segment_placement(request).await
+        }
+        async fn propose(&self, _: MetadataCommand) -> TransportResult<AdminProposeResponse> {
+            Ok(AdminProposeResponse {
+                log_id: super::super::wire::WireLogId { term: 3, index: 41 },
+                response: self.reply.clone(),
+            })
+        }
+        async fn init(&self, _: Vec<u64>) -> TransportResult<AdminMembershipResponse> {
+            self.reads.init(Vec::new()).await
+        }
+        async fn add_learner(&self, node_id: u64) -> TransportResult<AdminMembershipResponse> {
+            self.reads.add_learner(node_id).await
+        }
+        async fn change_membership(
+            &self,
+            voters: Vec<u64>,
+            retain: bool,
+        ) -> TransportResult<AdminMembershipResponse> {
+            self.reads.change_membership(voters, retain).await
+        }
+        async fn read_range_lease(
+            &self,
+            request: AdminReadRangeLeaseRequest,
+        ) -> TransportResult<AdminReadRangeLeaseResponse> {
+            self.reads.read_range_lease(request).await
+        }
+    }
+
+    fn create_topic(request_id: Uuid) -> MetadataCommand {
+        MetadataCommand::CreateTopic {
+            env: CommandEnvelope {
+                request_id,
+                issued_at_ms: 0,
+            },
+            name: "events.v1".to_owned(),
+            topic_uuid: Uuid::from_u128(0x694),
+            root_range_uuid: Uuid::from_u128(0x695),
+        }
+    }
+
+    fn with_request_id(mut command: MetadataCommand, request_id: Uuid) -> MetadataCommand {
+        if let MetadataCommand::AcquireRangeLease { env, .. } = &mut command {
+            env.request_id = request_id;
+        }
+        command
+    }
+
+    /// #694: an operator's write is recorded at the edge with the identity
+    /// its certificate carries, the outcome and the index it committed at.
+    #[tokio::test]
+    async fn an_operators_write_is_audited_at_the_edge_with_its_certificate_identity() {
+        let audit = crate::audit::Recording::installed();
+        let (client, _handler, task) = live_endpoint_with(
+            AdminAuthorizer::with_operators(["ops-alice".to_owned()]),
+            "ops-alice",
+            CommittingHandler::replying(MetadataResponse::TopicCreated {
+                topic_uuid: Uuid::from_u128(0x694),
+                topic_epoch: 1,
+                root_range_uuid: Uuid::from_u128(0x695),
+            }),
+        )
+        .await;
+        let request_id = Uuid::new_v4();
+        client.propose(create_topic(request_id)).await.unwrap();
+        let records = audit.for_request(request_id);
+        assert_eq!(records.len(), 1, "exactly one edge record: {records:?}");
+        let record = &records[0];
+        assert_eq!(record.stage, crate::audit::AuditStage::Edge);
+        assert_eq!(record.action, crate::audit::AuditAction::ClusterCreateTopic);
+        assert_eq!(
+            record.actor,
+            crate::audit::AuditActor::Caller(AdminIdentity::Named("ops-alice".to_owned()))
+        );
+        assert_eq!(record.outcome, crate::audit::AuditOutcome::Success);
+        assert_eq!(record.log_index, Some(41));
+        assert!(record.params.contains(&("name", "events.v1".to_owned())));
+
+        // Rejected by the state machine: a failure, with the reason.
+        let (client, _handler, task2) = live_endpoint_with(
+            AdminAuthorizer::with_operators(["ops-alice".to_owned()]),
+            "ops-alice",
+            CommittingHandler::replying(MetadataResponse::Rejected(
+                crate::command::MetadataError::GenerationMismatch {
+                    expected: 1,
+                    actual: 2,
+                },
+            )),
+        )
+        .await;
+        let request_id = Uuid::new_v4();
+        client.propose(create_topic(request_id)).await.unwrap();
+        let records = audit.for_request(request_id);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, crate::audit::AuditOutcome::Failure);
+        let reason = records[0].reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.contains("rejected") && reason.contains("generation mismatch"),
+            "{reason}"
+        );
+        task.abort();
+        task2.abort();
+    }
+
+    /// #694: a refused write is audited whatever the command, naming the
+    /// caller and the refusal, and saying nothing was proposed.
+    #[tokio::test]
+    async fn a_refused_write_is_audited_with_the_refusal_reason() {
+        let audit = crate::audit::Recording::installed();
+        let (client, _handler, task) =
+            live_endpoint(AdminAuthorizer::with_operators([]), &NODE_A.to_string()).await;
+        let request_id = Uuid::new_v4();
+        client
+            .propose(with_request_id(acquire(NODE_B), request_id))
+            .await
+            .unwrap_err();
+        let records = audit.for_request(request_id);
+        assert_eq!(records.len(), 1, "{records:?}");
+        let record = &records[0];
+        assert_eq!(record.outcome, crate::audit::AuditOutcome::Refused);
+        assert_eq!(
+            record.actor,
+            crate::audit::AuditActor::Caller(AdminIdentity::Node(NODE_A))
+        );
+        assert!(record
+            .params
+            .contains(&("command", "AcquireRangeLease".to_owned())));
+        let reason = record.reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.contains(&NODE_A.to_string())
+                && reason.contains(&NODE_B.to_string())
+                && reason.contains("nothing was proposed"),
+            "{reason}"
+        );
+
+        // A refused membership change too.
+        client.add_learner(9_694_001).await.unwrap_err();
+        let refused: Vec<_> = audit
+            .all()
+            .into_iter()
+            .filter(|r| r.params.contains(&("node_id", "9694001".to_owned())))
+            .collect();
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(
+            refused[0].action,
+            crate::audit::AuditAction::ClusterMembership
+        );
+        assert_eq!(refused[0].outcome, crate::audit::AuditOutcome::Refused);
+        assert!(refused[0]
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("nothing was changed"));
+        task.abort();
+    }
+
+    /// Review of #705: a follower that redirects a proposal to the leader
+    /// writes no edge record (the leader writes the one that counts); a
+    /// failure that leaves the outcome unknown says so.
+    #[tokio::test]
+    async fn a_redirect_writes_no_edge_record() {
+        let audit = crate::audit::Recording::installed();
+        let (client, _handler, task) = live_endpoint_with(
+            AdminAuthorizer::permissive(),
+            "ops-alice",
+            Arc::new(NotLeaderHandler {
+                leader: None,
+                asked: AtomicUsize::new(0),
+            }),
+        )
+        .await;
+        let request_id = Uuid::new_v4();
+        client.propose(create_topic(request_id)).await.unwrap_err();
+        assert!(
+            audit.for_request(request_id).is_empty(),
+            "{:?}",
+            audit.for_request(request_id)
+        );
+        task.abort();
+
+        let (client, _handler, task) = live_endpoint_with(
+            AdminAuthorizer::permissive(),
+            "ops-alice",
+            Arc::new(CountingHandler::default()),
+        )
+        .await;
+        let request_id = Uuid::new_v4();
+        client.propose(create_topic(request_id)).await.unwrap_err();
+        let records = audit.for_request(request_id);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, crate::audit::AuditOutcome::Failure);
+        assert!(
+            records[0]
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("outcome unknown"),
+            "{:?}",
+            records[0].reason
+        );
+        task.abort();
+    }
+
+    /// #694: a node's own lease command is authorized and NOT audited: it
+    /// runs continuously and is recorded as a transition already.
+    #[tokio::test]
+    async fn a_nodes_own_lease_command_writes_no_audit_record() {
+        let audit = crate::audit::Recording::installed();
+        let (client, _handler, task) = live_endpoint_with(
+            AdminAuthorizer::with_operators([]),
+            &NODE_A.to_string(),
+            CommittingHandler::replying(MetadataResponse::LeaseGranted { fencing_epoch: 3 }),
+        )
+        .await;
+        let request_id = Uuid::new_v4();
+        client
+            .propose(with_request_id(acquire(NODE_A), request_id))
+            .await
+            .unwrap();
+        assert!(audit.for_request(request_id).is_empty());
+        task.abort();
+    }
+
+    /// #694: a write on a plaintext endpoint is recorded as anonymous: that
+    /// nobody can be identified is the fact an auditor needs.
+    #[tokio::test]
+    async fn a_plaintext_write_is_audited_as_anonymous() {
+        let audit = crate::audit::Recording::installed();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = AdminServer::plaintext(
+            CommittingHandler::replying(MetadataResponse::Ack { generation: 1 })
+                as Arc<dyn AdminHandler>,
+            AdminAuthorizer::permissive(),
+        )
+        .unwrap();
+        let task = tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let client = AdminClient::plaintext(vec![AdminCandidate {
+            node_id: Some(MetaNodeId(1)),
+            endpoint: addr,
+            host: None,
+            server_name: String::new(),
+            plaintext: true,
+        }])
+        .unwrap();
+        let request_id = Uuid::new_v4();
+        client.propose(create_topic(request_id)).await.unwrap();
+        let records = audit.for_request(request_id);
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].actor,
+            crate::audit::AuditActor::Caller(AdminIdentity::Anonymous)
+        );
         task.abort();
     }
 

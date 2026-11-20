@@ -27,6 +27,8 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Captures the messages an operator reads, for the tests that assert them.
+tracing-subscriber = { workspace = true }
 # `start_paused` for the deadline tests: a hang must fail by never finishing in
 # virtual time, not by being slow in real time.
 tokio = { workspace = true, features = ["test-util"] }

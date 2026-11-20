@@ -15,8 +15,15 @@
 //! reports per unit:
 //!
 //! - **holes**: stretches between the first and last committed byte/offset
-//!   that no committed range covers. A hole a FAILED or REPLAY_REQUIRED row
-//!   names is a range that failed and was never re-archived. A hole nothing
+//!   that no committed range covers. A hole a FAILED, REPLAY_REQUIRED or
+//!   SUPERSEDED row names is a range that failed and was never re-archived.
+//!   SUPERSEDED (#567) says only that the source committed PAST the range,
+//!   which is what recovery can check; whether a committed range covers its
+//!   bytes is this audit's question, so a superseded row is never excused:
+//!   below the last committed point it is judged as a failed one, and above
+//!   it - where a FAILED or REPLAY_REQUIRED row is pending, because the
+//!   source will read it again - it is a failed hole, never pending, because
+//!   nothing will. A hole nothing
 //!   names is unexplained: for a file or spool that is lost data (bytes are
 //!   contiguous); for Kafka it may be compaction or transaction markers,
 //!   which occupy offsets but carry no records, so it is reported apart and
@@ -36,6 +43,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use vtop_core::config::sqlite_database_file;
 use vtop_core::errors::VtopError;
 use vtop_core::state_machine::BatchState;
 use vtop_core::types::{ContentFingerprint, ProgressMarker, SourceType};
@@ -497,9 +505,9 @@ impl Generations {
 pub struct Hole {
     pub start: u64,
     pub end: u64,
-    /// The failed or replay-required rows whose ranges overlap the hole:
-    /// the ranges that failed and were never archived again. Empty when
-    /// nothing in the ledger names the hole.
+    /// The failed, replay-required or superseded (#567) rows whose ranges
+    /// overlap the hole: ranges that were handed back and never archived
+    /// again. Empty when nothing in the ledger names the hole.
     pub failed_batches: Vec<String>,
 }
 
@@ -669,6 +677,16 @@ fn uncovered(start: u64, end: u64, spans: &[Span]) -> Vec<(u64, u64)> {
     pieces
 }
 
+/// A range handed back to its source: FAILED, REPLAY_REQUIRED, or retired as
+/// SUPERSEDED once the source committed past it (#567). The audit names any
+/// of them in a hole no committed range covers.
+fn handed_back(state: BatchState) -> bool {
+    matches!(
+        state,
+        BatchState::Failed | BatchState::ReplayRequired | BatchState::Superseded
+    )
+}
+
 /// `None` for a unit with no committed range: there is nothing to tile, and
 /// whatever is pending there will be read from the source's own position.
 fn audit_unit(unit: Unit, rows: Vec<Row>, unproven: &[(u64, u64)]) -> Option<UnitReport> {
@@ -676,10 +694,7 @@ fn audit_unit(unit: Unit, rows: Vec<Row>, unproven: &[(u64, u64)]) -> Option<Uni
         rows.iter()
             .filter(|row| row.state == BatchState::SourceCommitted),
     );
-    let failed = spans(
-        rows.iter()
-            .filter(|row| matches!(row.state, BatchState::Failed | BatchState::ReplayRequired)),
-    );
+    let failed = spans(rows.iter().filter(|row| handed_back(row.state)));
     if committed.is_empty() {
         // Known only through a rotation window's unplaceable stretches:
         // nothing to tile, but the stretches are still reported.
@@ -722,12 +737,10 @@ fn audit_unit(unit: Unit, rows: Vec<Row>, unproven: &[(u64, u64)]) -> Option<Uni
     let audited_from = committed[0].start;
     let committed_through = committed.last().expect("non-empty").end;
     let duplicated = u64::try_from(total - merged).unwrap_or(u64::MAX);
-    let in_flight = spans(rows.iter().filter(|row| {
-        !matches!(
-            row.state,
-            BatchState::Failed | BatchState::ReplayRequired | BatchState::SourceCommitted
-        )
-    }));
+    let in_flight = spans(
+        rows.iter()
+            .filter(|row| !handed_back(row.state) && row.state != BatchState::SourceCommitted),
+    );
 
     let mut report = UnitReport {
         committed: committed_rows,
@@ -827,9 +840,24 @@ fn audit_unit(unit: Unit, rows: Vec<Row>, unproven: &[(u64, u64)]) -> Option<Uni
         .failed_holes
         .first()
         .map_or(audited_from, |hole| hole.start.min(audited_from));
+    // A superseded row above the last commit is not pending - nothing will
+    // read it again - and no commit covers it: a failed hole (#567). Merged
+    // into spans first, so overlapping retired ranges are one hole naming
+    // every row, as overlapping failed ranges below a commit are (review).
+    let superseded_above = spans(
+        rows.iter()
+            .filter(|row| row.state == BatchState::Superseded && row.end > committed_through),
+    );
+    report
+        .failed_holes
+        .extend(superseded_above.iter().map(|span| Hole {
+            start: span.start.max(committed_through),
+            end: span.end,
+            failed_batches: span.rows.iter().map(|row| row.batch_id.clone()).collect(),
+        }));
     report.pending.extend(
         rows.iter()
-            .filter(|row| row.state != BatchState::SourceCommitted && row.end > committed_through)
+            .filter(|row| !row.state.is_terminal() && row.end > committed_through)
             .map(|row| Pending {
                 batch_id: row.batch_id.clone(),
                 state: row.state,
@@ -870,7 +898,8 @@ struct DigestTrailer {
 /// never read each other's digests as their own history; only otherwise
 /// (PostgreSQL, an in-memory SQLite) under `work_dir`, which is scratch and
 /// which a PostgreSQL deployment should override.
-pub fn default_digest_dir(engine: &vtop_core::config::EngineConfig) -> PathBuf {
+pub fn default_digest_dir(config: &vtop_core::config::VtopConfig) -> PathBuf {
+    let engine = &config.engine;
     if let Some(dir) = engine
         .ledger_digest_dir
         .as_deref()
@@ -878,9 +907,8 @@ pub fn default_digest_dir(engine: &vtop_core::config::EngineConfig) -> PathBuf {
     {
         return PathBuf::from(dir);
     }
-    if let Some(database) = engine
-        .state_store
-        .resolve()
+    if let Some(database) = config
+        .resolve_state_store()
         .ok()
         .and_then(|store| sqlite_database_file(store.expose_secret()))
     {
@@ -894,30 +922,6 @@ pub fn default_digest_dir(engine: &vtop_core::config::EngineConfig) -> PathBuf {
         return beside.join(format!("{name}.ledger-digests"));
     }
     Path::new(&engine.work_dir).join("ledger-digests")
-}
-
-/// The file a SQLite connection string names, or `None` for PostgreSQL and
-/// an in-memory database.
-fn sqlite_database_file(conn: &str) -> Option<PathBuf> {
-    let conn = conn.trim();
-    let lower = conn.to_ascii_lowercase();
-    if lower.starts_with("postgres://") || lower.starts_with("postgresql://") {
-        return None;
-    }
-    let rest = conn
-        .strip_prefix("sqlite://")
-        .or_else(|| conn.strip_prefix("sqlite:"))
-        .unwrap_or(conn);
-    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
-    // The `mode=memory` QUERY PARAMETER, exactly - not those characters
-    // anywhere in the string, which a real path can contain (review).
-    let in_memory = query
-        .split('&')
-        .any(|parameter| parameter.eq_ignore_ascii_case("mode=memory"));
-    if path.is_empty() || path == ":memory:" || in_memory {
-        return None;
-    }
-    Some(PathBuf::from(path))
 }
 
 /// Write `rows` as one digest file in `dir`, durably (written, fsynced,
@@ -1054,8 +1058,15 @@ pub fn read_digests(dir: &Path) -> Result<(Vec<BatchRecord>, usize), VtopError> 
 }
 
 fn read_digest(path: &Path) -> Result<Vec<BatchRecord>, VtopError> {
-    let bad = |why: String| VtopError::Other(format!("ledger digest {}: {why}", path.display()));
     let text = std::fs::read_to_string(path)?;
+    parse_digest(&text, &path.display().to_string())
+}
+
+/// Parse a digest's text; `name` is what the errors call it (the path). Split
+/// from reading the file so the `ledger_rows` fuzz target (#729) drives the
+/// same parser on hostile text.
+pub fn parse_digest(text: &str, name: &str) -> Result<Vec<BatchRecord>, VtopError> {
+    let bad = |why: String| VtopError::Other(format!("ledger digest {name}: {why}"));
     let lines: Vec<&str> = text.lines().collect();
     if lines.len() < 2 {
         return Err(bad("no header and trailer (truncated?)".into()));
@@ -1409,6 +1420,7 @@ mod tests {
             mtime: String::new(),
             content_fingerprint: None,
             tail_fingerprint: None,
+            ctime: None,
         }
     }
 
@@ -1431,6 +1443,7 @@ mod tests {
             mtime: String::new(),
             content_fingerprint: None,
             tail_fingerprint: None,
+            ctime: None,
         };
         row(id, state, marker(start), marker(end))
     }
@@ -1461,6 +1474,8 @@ mod tests {
             manifest_sha256: None,
             manifest_version_id: None,
             object_size_bytes: Some(10),
+            verification_class: None,
+            sealed_at: None,
             record_count: Some(1),
             error_message: None,
             owner: None,
@@ -1480,7 +1495,7 @@ mod tests {
         )
     }
 
-    use BatchState::{Failed, ReplayRequired, SourceCommitted as Committed, Verified};
+    use BatchState::{Failed, ReplayRequired, SourceCommitted as Committed, Superseded, Verified};
 
     /// Review of #573: a VERIFIED range covering part of a gap excuses only
     /// that part; the rest of the gap is still lost.
@@ -1542,6 +1557,7 @@ mod tests {
                 mtime: String::new(),
                 content_fingerprint: None,
                 tail_fingerprint: None,
+                ctime: None,
             };
             row(id, Committed, marker(start), marker(start))
         };
@@ -1749,20 +1765,20 @@ mod tests {
             "mock",
         );
         assert_eq!(
-            default_digest_dir(&config.engine),
+            default_digest_dir(&config),
             PathBuf::from("/var/lib/vtop/state.db.ledger-digests"),
             "named for the database, so a neighbour's digests are not read as its own"
         );
         let mut configured = config.clone();
         configured.engine.ledger_digest_dir = Some("/backed-up/digests".into());
         assert_eq!(
-            default_digest_dir(&configured.engine),
+            default_digest_dir(&configured),
             PathBuf::from("/backed-up/digests")
         );
         let memory =
             crate::testkit::file_config("/tmp/scratch", "sqlite::memory:", Vec::new(), "mock");
         assert_eq!(
-            default_digest_dir(&memory.engine),
+            default_digest_dir(&memory),
             PathBuf::from("/tmp/scratch/ledger-digests")
         );
         assert_eq!(
@@ -1860,6 +1876,36 @@ mod tests {
         write_digest(&dir, "c", &rows).unwrap();
     }
 
+    /// #729: the digest parser is what the `ledger_rows` fuzz target drives,
+    /// on text rather than a path. It reads back what `write_digest` wrote,
+    /// and refuses every prefix of it without panicking.
+    #[test]
+    fn parse_digest_reads_a_written_digest_and_refuses_its_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = vec![bytes("a", Committed, 0, 10), bytes("b", Committed, 10, 20)];
+        let path = write_digest(dir.path(), "c", &rows).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let parsed = parse_digest(&text, "digest").unwrap();
+        assert_eq!(
+            parsed
+                .iter()
+                .map(|r| r.batch_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        for end in 0..text.len() - 1 {
+            if text.is_char_boundary(end) {
+                assert!(
+                    parse_digest(&text[..end], "digest").is_err(),
+                    "prefix {end}"
+                );
+            }
+        }
+        for odd in ["\r", "\n\r", "\r\n\r\n", "{}\r\n{}", "\n\n\n"] {
+            assert!(parse_digest(odd, "digest").is_err());
+        }
+    }
+
     /// Review of #573: a one-line file is refused, not a panic.
     #[test]
     fn a_one_line_digest_is_refused() {
@@ -1932,6 +1978,69 @@ mod tests {
                 end: 20,
                 failed_batches: vec!["lost".into()]
             }]
+        );
+    }
+
+    /// #567: SUPERSEDED says the source committed past a range, not that a
+    /// commit covers its bytes. A ledger from before #552 holds exactly the
+    /// difference - a failed range under a later commit - and retiring that
+    /// row must not hide the hole: it is named as the failed row was. Covered,
+    /// it passes; above every commit, nothing reads it again, so it is a
+    /// hole, never pending.
+    #[test]
+    fn a_superseded_row_is_judged_as_a_failed_one_and_never_excused() {
+        let under = audit([
+            bytes("a", Committed, 0, 10),
+            bytes("retired", Superseded, 10, 20),
+            bytes("c", Committed, 20, 30),
+        ]);
+        assert_eq!(
+            under[0].failed_holes,
+            vec![Hole {
+                start: 10,
+                end: 20,
+                failed_batches: vec!["retired".into()]
+            }],
+            "{under:?}"
+        );
+        assert!(under[0].unexplained_holes.is_empty(), "{under:?}");
+
+        let covered = audit([
+            bytes("retired", Superseded, 0, 10),
+            bytes("retry", Committed, 0, 20),
+        ]);
+        assert!(!covered[0].has_findings(), "{covered:?}");
+
+        let above = audit([
+            bytes("a", Committed, 0, 10),
+            bytes("retired", Superseded, 10, 20),
+        ]);
+        assert!(above[0].pending.is_empty(), "{above:?}");
+        assert_eq!(
+            above[0].failed_holes,
+            vec![Hole {
+                start: 10,
+                end: 20,
+                failed_batches: vec!["retired".into()]
+            }],
+            "{above:?}"
+        );
+
+        // Overlapping retired ranges above every commit are one hole naming
+        // both, as overlapping failed ranges below a commit are (review).
+        let overlapping = audit([
+            bytes("a", Committed, 0, 10),
+            bytes("r1", Superseded, 10, 20),
+            bytes("r2", Superseded, 15, 30),
+        ]);
+        assert_eq!(
+            overlapping[0].failed_holes,
+            vec![Hole {
+                start: 10,
+                end: 30,
+                failed_batches: vec!["r1".into(), "r2".into()]
+            }],
+            "{overlapping:?}"
         );
     }
 
@@ -2248,6 +2357,7 @@ mod tests {
                     mtime: String::new(),
                     content_fingerprint: content.clone(),
                     tail_fingerprint: None,
+                    ctime: None,
                 }
             }
         };
@@ -2426,5 +2536,34 @@ mod tests {
             ),
         ]);
         assert_eq!(empty.len(), 1, "{empty:#?}");
+    }
+    /// The `ledger_rows` fuzz target's seeds (#729): a prune digest as
+    /// `write_digest` writes it (rows of every state, a file, a rotated file
+    /// and a Kafka source), and its rows one per seed. The progress markers
+    /// older releases wrote are committed beside them by hand, copied from
+    /// the constants in vtop-core's types.rs tests. Run on purpose:
+    /// `cargo test -p vtop-cli --lib -- --ignored write_fuzz_seeds`.
+    #[test]
+    #[ignore = "writes fuzz/corpus/ledger_rows; run on purpose"]
+    fn write_fuzz_seeds() {
+        let out = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus/ledger_rows");
+        std::fs::create_dir_all(&out).unwrap();
+        let rows = vec![
+            bytes("a", Committed, 0, 10),
+            bytes("held", Verified, 10, 15),
+            bytes("lost", Failed, 15, 20),
+            sized("rotated", Committed, 8, 0, 4096, 4096),
+            row("k", Superseded, kafka(0, 0), kafka(0, 99)),
+            row("r", ReplayRequired, kafka(100, 100), kafka(100, 150)),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_digest(dir.path(), "2026-11-01T00:00:00+00:00", &rows).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(parse_digest(&text, "seed").unwrap().len(), rows.len());
+        std::fs::write(out.join("digest.seed"), &text).unwrap();
+        for row in &rows {
+            let line = serde_json::to_string(row).unwrap();
+            std::fs::write(out.join(format!("row-{}.seed", row.batch_id)), line + "\n").unwrap();
+        }
     }
 }

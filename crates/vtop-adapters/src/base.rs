@@ -84,6 +84,15 @@ pub struct AdapterReadReport {
     pub retention_lost: Vec<SourceRetentionLoss>,
 }
 
+/// A range handed back to its source that the engine wants rebuilt exactly
+/// as it was first cut (#626): from `start` to `end`, the markers of the
+/// window's ledger row.
+#[derive(Debug, Clone)]
+pub struct ReplayRange {
+    pub start: ProgressMarker,
+    pub end: ProgressMarker,
+}
+
 /// A telemetry source adapter.
 #[async_trait]
 pub trait SourceAdapter: Send + Sync {
@@ -191,6 +200,25 @@ pub trait SourceAdapter: Send + Sync {
         None
     }
 
+    /// The committed point of `marker`'s source unit, in the unit the markers
+    /// use (a byte offset; for Kafka the next offset to read, one past the
+    /// last committed), and only when the adapter can show that this point
+    /// belongs to the unit the marker was read from; `None` when it cannot
+    /// (#567). What "the unit" takes is the adapter's: a Kafka partition
+    /// under this engine's consumer group, with the ledger's frontier for it;
+    /// a file or spool proven by inode and content to be the one the marker
+    /// names.
+    ///
+    /// Everything below it has been committed, and a rewind to `marker`
+    /// never lands below it - so a handed-back range that ends at or below it
+    /// would re-read nothing, and recovery retires it instead of planning
+    /// that rewind on every restart. At startup it is the ledger's newest
+    /// committed row of the unit (the restart seed), never a rewind's
+    /// landing or an offset some other engine wrote to the source.
+    fn committed_through(&self, _marker: &ProgressMarker) -> Option<i128> {
+        None
+    }
+
     /// Rewind several ranges at once, one result per marker in the same order.
     ///
     /// The default rewinds one at a time. An adapter whose rewind consults an
@@ -207,6 +235,20 @@ pub trait SourceAdapter: Send + Sync {
             results.push(self.replay_from_marker(marker).await);
         }
         results
+    }
+
+    /// Bound the re-read of ranges already handed back
+    /// ([`Self::replay_from_markers`]) to their recorded ends (#626), one
+    /// answer per range in the same order: `true` when this adapter will stop
+    /// a read at the range's end, so the window it rebuilds ends where the
+    /// failed attempt's did and the bytes after it come as the next read.
+    ///
+    /// The default bounds nothing: the re-read runs to the read budget or the
+    /// end of the source, as before, and the engine treats the range so. An
+    /// adapter that cannot stop exactly at a recorded end must answer `false`
+    /// rather than stop near it.
+    fn bound_replays(&mut self, ranges: &[ReplayRange]) -> Vec<bool> {
+        vec![false; ranges.len()]
     }
 
     fn source_type(&self) -> SourceType;

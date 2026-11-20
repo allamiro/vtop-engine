@@ -1,0 +1,50 @@
+1794371171228158 start total=475000 rate=5000 batch=100 request_timeout_ms=30000
+1794371171242156 attempt=1 produce holder=aaaaaaaa-0000-0000-0000-0000000000a2 epoch=1 addr=vtop-2:9400 first=0
+1794371171251591 attempt=1 exit=1 acked=0 reason=error: tls vtop-2:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794371171362773 attempt=2 produce holder=aaaaaaaa-0000-0000-0000-0000000000a2 epoch=1 addr=vtop-2:9400 first=0
+1794371171373777 attempt=2 exit=1 acked=0 reason=error: tls vtop-2:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794371171485917 attempt=3 produce holder=aaaaaaaa-0000-0000-0000-0000000000a2 epoch=1 addr=vtop-2:9400 first=0
+1794371171493096 attempt=3 exit=1 acked=0 reason=error: tls vtop-2:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794371171604303 attempt=4 produce holder=aaaaaaaa-0000-0000-0000-0000000000a2 epoch=1 addr=vtop-2:9400 first=0
+1794371171611233 attempt=4 exit=1 acked=0 reason=error: tls vtop-2:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794371171720235 attempt=5 produce holder=aaaaaaaa-0000-0000-0000-0000000000a2 epoch=1 addr=vtop-2:9400 first=0
+1794371171726730 attempt=5 exit=1 acked=0 reason=error: tls vtop-2:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794371171838165 attempt=6 produce holder=aaaaaaaa-0000-0000-0000-0000000000a2 epoch=1 addr=vtop-2:9400 first=0
+1794371171846732 attempt=6 exit=1 acked=0 reason=error: tls vtop-2:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794371171958291 attempt=7 produce holder=aaaaaaaa-0000-0000-0000-0000000000a2 epoch=1 addr=vtop-2:9400 first=0
+1794371171965947 attempt=7 exit=1 acked=0 reason=error: tls vtop-2:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794371172079550 attempt=8 produce holder=aaaaaaaa-0000-0000-0000-0000000000a2 epoch=1 addr=vtop-2:9400 first=0
+1794371172088191 attempt=8 exit=1 acked=0 reason=error: tls vtop-2:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794371172201152 attempt=9 produce holder=aaaaaaaa-0000-0000-0000-0000000000a2 epoch=1 addr=vtop-2:9400 first=0
+1794371172209409 attempt=9 exit=1 acked=0 reason=error: tls vtop-2:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794371172321863 attempt=10 produce holder=aaaaaaaa-0000-0000-0000-0000000000a2 epoch=1 addr=vtop-2:9400 first=0
+1794371239121078 attempt=10 exit=3 acked=175100 reason=produce interrupted: no answer to a 100-record batch within 30000 ms 
+1794371239229888 attempt=11 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175100
+1794371240471267 attempt=11 exit=1 acked=201600 reason=error: produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3 
+1794371240589861 attempt=12 lease_unreadable
+1794371240709479 attempt=13 lease_unreadable
+1794371240832004 attempt=14 lease_unreadable
+1794371240953064 attempt=15 lease_unreadable
+1794371241079331 attempt=16 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=201600
+1794371241092745 attempt=16 exit=1 acked=201600 reason=error: produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3 
+1794371241216967 attempt=17 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=201600
+1794371241231820 attempt=17 exit=1 acked=201600 reason=error: produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3 
+1794371241353343 attempt=18 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=201600
+1794371241366967 attempt=18 exit=1 acked=201600 reason=error: produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3 
+1794371241490867 attempt=19 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=201600
+1794371241502794 attempt=19 exit=1 acked=201600 reason=error: produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3 
+1794371241625022 attempt=20 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=201600
+1794371241636080 attempt=20 exit=1 acked=201600 reason=error: produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3 
+1794371241758421 attempt=21 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=201600
+1794371241769569 attempt=21 exit=1 acked=201600 reason=error: produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3 
+1794371241893232 attempt=22 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=201600
+1794371241904829 attempt=22 exit=1 acked=201600 reason=error: produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3 
+1794371242025849 attempt=23 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=201600
+1794371242038861 attempt=23 exit=1 acked=201600 reason=error: produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3 
+1794371242163544 attempt=24 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=201600
+1794371242179346 attempt=24 exit=1 acked=201600 reason=error: produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3 
+1794371242304327 attempt=25 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=201600
+1794371242316616 attempt=25 exit=1 acked=201600 reason=error: produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3 
+1794371242610730 attempt=26 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=201600
+1794371269084737 attempt=26 exit=0 acked=475000 reason=
+1794371269085144 done acked=475000 attempts=26

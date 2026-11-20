@@ -4,6 +4,9 @@
 >
 > Protocol-level behavior referenced here (state machine, commit rule §13, replay rule §14, verification semantics §17, manifest spec §11) is normatively defined in [VTOP_PROTOCOL_DRAFT.md](VTOP_PROTOCOL_DRAFT.md); this document adds the security rules around it.
 
+To report a vulnerability, and for response times and supported versions, see
+the [security policy](../SECURITY.md).
+
 The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normative requirements for conformant behavior.
 
 ## Table of contents
@@ -58,6 +61,7 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normat
 | Engine ↔ state store | The database is trusted for ledger correctness, progress durability, and availability, but not for telemetry-object integrity. Remote PostgreSQL requires hostname-verified TLS; its URL is resolved from an env/file secret reference and never serialized. |
 | Engine ↔ external CLI backends | Version-pinned tools executing outside the Rust dependency graph; stored objects are downloaded and hashed. |
 | Engine ↔ operator/logs | Secret redaction; manifests carry no secrets. |
+| Engine/node ↔ OTLP collector (#683) | Off unless an OTLP endpoint is set. Spans carry identifiers, counts, sizes, method names, outcomes and redacted error messages; metrics are the bounded `/metrics` series. No record content, credentials, keys, MACs, URLs with a path or query, or header values (§2). |
 | Native client ↔ broker | TLS 1.3 with mandatory client certificates, explicit certificate/principal/role authorization, bounded frames/sessions/windows, and range/producer fencing checks. |
 | Build ↔ runtime | Supply-chain auditing; container hardening. |
 
@@ -80,6 +84,78 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normat
 - PostgreSQL over a Unix socket or loopback address **MAY** use plaintext for local development and CI.
 - Every non-loopback PostgreSQL connection **MUST** use `sslmode=verify-full`, which verifies both the issuing CA and the database hostname.
 - A private database CA **MUST** be supplied with `sslrootcert` when it is not in the bundled public trust roots. `sslmode=require` and `verify-ca` are rejected for remote databases because they do not provide the required hostname verification.
+
+### OpenTelemetry export (#683)
+
+OpenTelemetry export is the one network egress the processes open for their
+own telemetry rather than for the data. It is compiled into every `vtopctl`
+and `vtop-node` binary and the image, and **off until configured**: it starts
+only when `OTEL_EXPORTER_OTLP_ENDPOINT` or a per-signal endpoint
+(`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `..._METRICS_ENDPOINT`) is set. Unset,
+no exporter, thread or task exists (`crates/vtop-cli/tests/otel_off.rs`), and
+startup logs one INFO line saying so. `OTEL_SDK_DISABLED=true` turns it off
+with an endpoint set.
+
+- **Destination and transport.** OTLP over HTTP with protobuf bodies, `POST`
+  to the configured endpoints (`/v1/traces`, `/v1/metrics`). No gRPC, no
+  proxy, no compression. `https://` uses rustls with the `ring` provider and
+  the system's root certificates (`SSL_CERT_FILE` / `SSL_CERT_DIR` select
+  others); certificate verification cannot be turned off. An off-host
+  collector **SHOULD** be reached over `https://`; plain `http://` is for a
+  collector on the same host or pod network.
+- **What leaves.**
+  - Traces: spans of the processes' own targets (`vtop_*`) only, never a
+    library's, and never a log event. A batch span carries the batch id,
+    source type and name, tenant, format, record and byte counts, checksum
+    algorithm, verification method and result, the step that failed and the
+    outcome. Recovery and scrub spans carry the same identity plus their
+    decision.
+  - A failed batch's span status carries the error message, **redacted**
+    first (below).
+  - Metrics: the same series `/metrics` serves, whose labels are a bounded set
+    a test enforces (no batch id, no URI).
+  - Both signals carry the resource attributes `service.name`,
+    `service.version`, `service.instance.id` (the engine's name), `host.name`,
+    and any the operator adds through `OTEL_RESOURCE_ATTRIBUTES`.
+- **What never leaves, and is never logged.** Record content, credentials,
+  keys, MAC values, object and manifest URIs, URLs with a path or query string
+  (a presigned URL carries its signature there), and the values of the
+  `OTEL_EXPORTER_OTLP_*HEADERS` variables. The one URL that is printed is the
+  collector endpoint, as host and path (never user-info or query string), in
+  the startup line and `validate --print-effective`: a collector token
+  **MUST** go in a header, not in the endpoint's path or query.
+  - Before an error message becomes a span status or a log line, every URL in
+    it is cut to `scheme://host`, every run of 32 or more hex digits (a MAC, a
+    key, a digest) becomes `<hex>`, and every AWS access key id becomes
+    `<key-id>` (`vtop_observe::otel::redact`).
+  - The OTLP exporter's own debug logging, which quotes request URLs and
+    collector responses, is compiled out.
+  - Tests assert that no exported attribute holds record content or a `://`
+    URL, that no log line or `validate --print-effective` output holds a
+    header value, user-info or query string, and that the redaction above
+    holds.
+  - A source name is an identifier the operator configured (a file path or a
+    topic): a deployment that treats those as sensitive **SHOULD NOT** turn
+    export on.
+- **Credentials.** A collector that needs authentication takes it from
+  `OTEL_EXPORTER_OTLP_HEADERS` (or the per-signal variables). These **MUST** be
+  supplied as a secret like the storage keys (§3). They are never logged:
+  `validate --print-effective` prints "set (values not shown)", and a
+  malformed one is reported by variable name only. Credentials **MUST NOT** be
+  put in the endpoint URL itself, although the processes never print one
+  beyond its host and path.
+- **Failure isolation.**
+  - A setting that cannot be honoured stops the process at startup, naming
+    the variable.
+  - After startup, export never stalls the data path. A span's end appends to
+    a bounded queue (`OTEL_BSP_MAX_QUEUE_SIZE`, 2048) or drops the span when
+    the queue is full. One thread sends. A collector that is down or slow
+    costs spans and data points, which are counted on `/metrics` and warned
+    about at most once a minute.
+  - On a stop, the process flushes for 5 s after its own shutdown flush (6 s
+    at the outside: a 1 s backstop over the queue's own bound), or not at all
+    once another stop signal arrives, then exits whatever the collector is
+    doing.
 
 ### Authentication mechanisms
 
@@ -299,6 +375,10 @@ Normative rules:
 Additional guidance:
 
 - Configuration files containing secrets **SHOULD** have restrictive filesystem permissions.
+- On Unix, the engine **MUST** refuse, before reading it, a secret or ledger file that group or other can write: a manifest MAC key file (`manifest.mac.keys[].file`), the `engine.state_store` secret file, the SQLite ledger and its `-wal` and `-shm` files, and the `VTOP_AUDIT_LOG` file (#733). No setting accepts such a file.
+- The engine **MUST** refuse such a file that other users can read, unless the directory holding it is owned by the engine's user and closed to group and other, or (for group read only) the file is a read-only Kubernetes Secret mount: reached through the kubelet's `..data` layout, on `tmpfs`, and not writable by the engine. The audit file may be group-readable. `security.allow_loose_secret_permissions: true` accepts the readable cases only; each file accepted that way **MUST** be announced by a WARN, `vtop_secret_file_permission_overrides_total` and an audit record (§10). `vtopctl validate` reports every such file at once. Recipes for external secret managers: [Secret files and their permissions](operate/secrets.md).
+- New SQLite ledgers and audit files are created with mode `0600`; the engine never changes the mode of an existing file.
+- Not yet checked: TLS private keys, and the files `vtop-node` reads. On platforms without Unix permission bits nothing is checked.
 - Credentials **SHOULD NOT** be passed as plaintext command-line arguments where avoidable, since arguments may be visible to other processes.
 - The engine **SHOULD** support loading credentials from external secret managers without persisting them to disk.
 - Inline SQLite paths remain valid. PostgreSQL URLs **MUST** be referenced as `engine.state_store: { env: VTOP_STATE_STORE }` or `engine.state_store: { file: /run/secrets/vtop-state-store }`; inline PostgreSQL URLs are rejected before startup.
@@ -319,6 +399,8 @@ Additional guidance:
 - Delete permissions **SHOULD NOT** be granted unless an operational lifecycle policy explicitly requires them.
 - Separate read-only credentials **SHOULD** be used for downstream consumers.
 
+The PostgreSQL state store follows the same rule (#694): the engine's runtime role has `SELECT, INSERT, UPDATE` on `batches` and `SELECT, INSERT` on `audit_events` (with `USAGE` on its sequence), and no `UPDATE`, `DELETE` or `TRUNCATE` on the audit table; a trigger refuses those to every role but the table's owner, so even a maintenance role granted `DELETE` for `prune-ledger` cannot remove an audit row ([POSTGRES_DEPLOYMENT.md](POSTGRES_DEPLOYMENT.md)).
+
 ### 5.1 Per-backend least privilege
 
 | Backend | Minimum permissions | Notes |
@@ -326,6 +408,7 @@ Additional guidance:
 | `s3_native` | `PutObject`, `GetObject`/`HeadObject` (verify), `ListBucket` within prefix | SHA-256 uses a service-computed checksum; BLAKE3 requires read-back. |
 | `awscli` / `s3cmd` / `minio mc` | Same as above | Strong verification downloads and hashes the stored body. |
 | LocalFS | Filesystem write/read on the object tree only | The object tree directory **SHOULD** have restrictive permissions; the engine **SHOULD NOT** require broader filesystem access. |
+| `s3_native` with `upload.object_lock` (#684) | The `s3_native` row, plus `s3:PutObjectRetention`, `s3:GetObjectRetention`, `s3:GetBucketObjectLockConfiguration`, `s3:GetObjectVersion`, `s3:GetBucketVersioning`; with `legal_hold: true` also `s3:PutObjectLegalHold` and `s3:GetObjectLegalHold` | S3 returns the lock headers on `HeadObject` only to a caller holding `s3:GetObjectRetention` (`s3:GetObjectLegalHold` for the legal hold), so without it every batch fails its retention check. The runtime identity **SHOULD NOT** hold `s3:BypassGovernanceRetention`. See [OBJECT_LOCK_DEPLOYMENT.md](OBJECT_LOCK_DEPLOYMENT.md). |
 
 Command compatibility backends (`awscli`, `s3cmd`, `minio mc`) **MUST** use an
 explicit absolute executable path; PATH lookup is forbidden. VTOP resolves the
@@ -363,12 +446,19 @@ Per-format buckets (e.g. `telemetry-{format}`) with optional on-demand creation 
 - A source progress marker **MUST NOT** be committed unless both object and manifest verification succeed (the commit rule, [VTOP_PROTOCOL_DRAFT.md §13](VTOP_PROTOCOL_DRAFT.md#13-commit-rule)).
 - The manifest binds the object hash to the covered source progress markers. Its unkeyed **self-hash** is reproducible corruption detection, not authenticity: a writer who can replace the document can recompute it.
 - When `manifest_mac_key_env` is configured, the stored manifest **MUST** carry a valid keyed BLAKE3 `manifest.mac`; missing or invalid MACs fail pipeline, CLI, and recovery verification.
-- Where only size/existence can be confirmed, verification is **backend-limited** and the engine **MUST** report it as such rather than as cryptographic verification. The engine defaults to rejecting this result; accepting it requires the explicit `require_strong_verification: false` compatibility opt-out.
+- Where only size/existence can be confirmed, verification is **backend-limited** and the engine **MUST** report it as such rather than as cryptographic verification. The engine defaults to rejecting this result; accepting it requires the explicit `require_strong_verification: false` compatibility opt-out. That opt-out accepts same-size corruption, so the engine announces it: one WARN at startup and a `vtopctl validate` warning naming the key, `vtop_verification_mode{mode="size_only"} 1` from `vtopctl run`'s metrics endpoint, and a WARN with the batch id for every size-only verification, counted in `vtop_verification_backend_limited_total` where `vtop_verified_total` counts it (at VERIFIED in the running engine, at the commit in recovery) (#629).
 - A keyed MAC authenticates data among key holders but does not provide public verification or non-repudiation.
+- With `manifest.verification_receipts: true`, a **verification receipt** (`<batch_id>.receipt.json`, [VTOP_PROTOCOL_DRAFT.md §11.3](VTOP_PROTOCOL_DRAFT.md#113-verification-receipt-extension)) records in the archive what the ledger records after `VERIFIED`: the class and the method the backend ran. It is **evidence from the engine, not a commit precondition**: the commit never waits for it, and a receipt that cannot be written is a WARN and a `vtop_verification_receipts_total{result="failed"}` count, never a failed batch. What it proves and does not prove is in §8.4.
 
 ## 7. Data at rest and object immutability
 
-- Object immutability **SHOULD** be supported where the backend allows it ([VTOP_PROTOCOL_DRAFT.md §18](VTOP_PROTOCOL_DRAFT.md#18-security-considerations)). VTOP validates bucket versioning (§8.1); object-lock *configuration* is deployment policy, not automated by the engine.
+- Object immutability **SHOULD** be supported where the backend allows it ([VTOP_PROTOCOL_DRAFT.md §18](VTOP_PROTOCOL_DRAFT.md#18-security-considerations)). VTOP validates bucket versioning (§8.1), and with `upload.object_lock` set (the S3 Object Lock profile, #684, `s3_native` only) it writes every object and manifest under a retention lock and verifies it:
+  - every object PUT, manifest PUT and `CreateMultipartUpload` carries `x-amz-object-lock-mode`, `x-amz-object-lock-retain-until-date` (the write's time plus `retain_days`; for a multipart object, the time of its create) and, with `legal_hold`, `x-amz-object-lock-legal-hold: ON`;
+  - a bucket without Object Lock enabled is refused before anything is written to it: at startup for a literal bucket name, at the first batch for each bucket a template names (and for a literal bucket whose startup check the store could not answer);
+  - before a batch may reach `VERIFIED`, the retention of the object and manifest versions it wrote is read back (the exact versions, except a reused object and a multipart object whose version the store did not report again, which are read at the version whose content was just verified) and compared with what the engine asked for (same mode, a date no earlier, the legal hold). A missing, shorter, other-mode or hold-less lock **fails the batch** (`FAILED` then `REPLAY_REQUIRED`, source progress not committed). An object reused from an earlier attempt (#626) must still be under the configured mode, with a date ahead and the configured legal hold; a replay checks that before it reuses one, and writes a fresh locked object under its per-attempt key instead when it is not, leaving the old object untouched (#709). A retention the replay cannot read fails the batch;
+  - recovery and the scrub never fail a batch for a retention that has ended; `vtopctl scrub --check-retention` reports locked, elapsed, missing and mode_mismatch, the last two as findings.
+  - a verification receipt (§8.4) is written through the manifest write path, so it carries the same retention headers, and its retention is read back the same way. A receipt whose retention does not match is counted as a failed receipt and logged; it never fails the batch. Recovery writes a missing receipt only after the store says none is there, so it never adds a second version beside an existing one. When the scrub checks receipts, `--check-retention` also reads each existing receipt's retention at its current key (#710), counted apart from the batch's in `vtop_scrub_receipt_retention_total`: a receipt with no retention or under another mode is a finding (it can be deleted or overwritten), an ended one is not, and a missing receipt is not a retention finding. Receipts are not pinned in the ledger, so the read is of the receipt's current version.
+- The engine does **not** create a locked bucket, set a bucket default retention, or remove a lock. Object Lock is enabled when a bucket is created, and a bucket default retention **SHOULD** be set as the floor: an engine older than v0.10.0 ignores `upload.object_lock` and writes unlocked objects, which only a bucket default retention locks.
 - Where the backend supports it (e.g., S3 Object Lock / WORM), telemetry objects and manifests **SHOULD** be written as immutable for the configured retention period.
 - Immutability complements verification: verification detects tampering, immutability prevents post-write tampering or accidental overwrite.
 - At-rest encryption (server-side or bucket-default) **MAY** be enabled at the storage layer; it is orthogonal to VTOP's integrity guarantees.
@@ -376,10 +466,10 @@ Per-format buckets (e.g. `telemetry-{format}`) with optional on-demand creation 
 ## 8. Manifest authentication
 
 - VTOP 0.2 supports an optional keyed BLAKE3 authenticator in `manifest.mac` ([VTOP_PROTOCOL_DRAFT.md §11.2](VTOP_PROTOCOL_DRAFT.md#11-manifest-object), §17.3).
-- Config stores only the environment-variable name (`manifest_mac_key_env`); the 32-byte hex key **MUST NOT** appear in config serialization, manifests, or logs.
-- Naming an absent or malformed key **MUST** fail startup rather than silently emit unsigned manifests.
+- Config stores only where a key is read from: an environment-variable name (`manifest_mac_key_env`, or `env:` in a keyring entry) or a file path (`file:`). The 32-byte hex key **MUST NOT** appear in config serialization, manifests, logs, metric labels or `validate --print-effective`, which shows key ids and source kinds (`env`, `file`) only.
+- Naming an absent or malformed key **MUST** fail startup rather than silently emit unsigned manifests. The error names the key id and the variable or file, never the value.
 - Enabling a key deliberately rejects unsigned pre-cutover manifests. Operators **MUST** verify or explicitly migrate their backlog before enabling it.
-- One active key is supported. Rotation and public-key signatures are not implemented.
+- Several keys can be configured, each with an id, so the key can be rotated (§8.3). Public-key signatures are not implemented.
 
 ### 8.1 Freshness: version pinning and the hardened profile (#135)
 
@@ -415,12 +505,137 @@ complementary.
   keeps overwritten versions, and S3 **Object Lock** (compliance or
   governance retention covering the archive's audit window) **SHOULD** be
   configured so a privileged deleter cannot remove the pinned version itself.
-  VTOP validates versioning; object-lock configuration is deployment policy.
+  VTOP validates versioning, and with `upload.object_lock` (#684) it writes
+  each manifest version under that retention and checks the store kept it
+  before the batch is `VERIFIED` (§7). A bucket default retention remains the
+  floor for writers that do not set it.
 - Backends without object versions (`localfs`, the `awscli`/`s3cmd`/`minio`
   command backends) record no version and keep today's current-key behavior
   with ledger hash binding; the hardened profile refuses to run on them.
   Rows written before this feature (no recorded version) are verified the
   same legacy way.
+
+### 8.2 A manifest that claims a newer version (#671)
+
+A reader checks a manifest's `version` before it authenticates anything,
+so it can tell a newer writer's manifest from a damaged one. The version is
+read from bytes nothing has authenticated yet, so it is only a **claim**: a
+storage tamperer can overwrite a manifest with `{"protocol": "VTOP",
+"version": "0.9"}`. Acted on unchecked, that claim would turn an integrity
+finding into "upgrade the binary". Worse, recovery would hold the batch
+VERIFIED for good, when it should replay it. So the claim counts only for
+bytes proven to be what the batch's writer stored:
+
+- The bytes **MUST** be the row's pinned, immutable `manifest_version_id`
+  (§8.1). An overwrite of the key cannot change a pinned version.
+- They **MUST** carry the batch id and the self-hash the ledger recorded.
+  On its own that binds nothing, because the self-hash was computed by a
+  scheme this build cannot reproduce and a tamperer can copy it into a
+  forgery. What it adds is that the pinned version is this batch's.
+
+When both hold, recovery leaves the row VERIFIED and pending. It counts the
+row in `vtop_recovery_unsupported_manifest_total`, and retires it as
+SUPERSEDED once its source has committed past it. The scrub reports
+`unsupported_version`.
+
+When either fails (no pin, or a pin that does not carry the ledger's
+binding), the manifest is **unauthenticated**, exactly as before #671:
+recovery marks the row FAILED and then REPLAY_REQUIRED, and the scrub reports
+`unauthenticated`. A deployment without object versions therefore replays a
+genuine newer-release batch rather than trusting it. That costs duplicates,
+never a gap.
+
+`vtopctl verify-manifest`, run standalone with no ledger to bind the bytes
+to, reports that the manifest at that URI claims a version this build cannot
+authenticate. It never reports it as intact.
+
+### 8.3 Key ids and rotation (#685)
+
+Manifests are immutable and pinned (§8.1), so a rotation cannot re-sign the
+archive. After a rotation the archive holds manifests signed by several keys
+for as long as it is retained. Signing stays simple, and verification is
+key-aware:
+
+- **One active key signs.** `manifest.mac.active` names it, and a version 0.4
+  manifest records its id in `manifest.mac_key_id`. The id sits beside
+  `manifest.mac` and is not blanked for the hash, so the self-hash and the MAC
+  both cover it: editing the id fails both.
+- **The id exists only in version 0.4.** A 0.3 reader re-encodes the decoded
+  manifest before hashing, so it would drop the id and report the manifest as
+  tampered. A keyring therefore requires `manifest.write_version: "0.4"`, and
+  config load refuses the combination otherwise. A legacy (0.1-0.3) reader
+  path ignores an id found in a legacy document, as v0.8.0 does.
+- **The key the manifest names verifies it, never a search.** A reader
+  **MUST NOT** try every key it holds: that would make retiring a key
+  meaningless and hide which key signed what. A manifest with no id (every
+  manifest before key ids, and any written with `manifest_mac_key_env`) is
+  verified with the one key marked `legacy: true`. A process configured with
+  `manifest_mac_key_env` holds one key and no ids: it verifies with that key
+  whatever id a manifest names, as v0.8.0 does. One key is not a search.
+- **Unknown and retired ids are unauthenticated, not corrupt.** A manifest
+  naming an id the reader does not hold, or a tombstoned one
+  (`manifest.mac.retired`), or naming none where no key is legacy, fails
+  authentication with a message that names the id and says which case it is.
+  Recovery treats it like any unauthenticated manifest (FAILED, then
+  REPLAY_REQUIRED: duplicates, never a gap), and the scrub reports
+  `unauthenticated`. The bytes may be intact, so the message never calls them
+  damaged.
+- **Retire means stop signing.** A key rotated out in the normal way stays in
+  `manifest.mac.keys` as a verify-only entry for as long as its manifests are
+  audited. A **tombstone** is for a key that was withdrawn or compromised:
+  manifests under it then fail by design, and the scrub names them. No key
+  material is configured for a tombstone.
+- **Metric labels are configured ids only.** `vtop_manifest_authentications_total`
+  and `vtop_scrub_manifest_keys_total` label by a configured id, `none` or
+  `other`. An id read from a manifest comes from storage and is never a label;
+  messages quote it escaped and cut to 64 characters.
+- **Key files** (`file:`) are read once at startup, at most 4 KiB, and
+  refused before they are read when other local users can write them, or
+  read them outside a Kubernetes Secret mount or a closed directory (§3,
+  #733), as for `engine.state_store` files. Mount them readable by the
+  engine's user only (`defaultMode: 0400` and `fsGroup` for a Kubernetes
+  secret).
+- **An older reader cannot follow a rotation.** v0.8.0 and earlier hold one
+  key and ignore the id: they verify a manifest only if their key signed it,
+  and report the rest as unauthenticated (a live engine replays them). Every
+  engine, scrub and auditor **MUST** run the keyring release before the
+  active key changes. The engine cannot see which releases read the archive,
+  so this gate is the operator's. The procedure is
+  [Rotate the manifest MAC key](operate/manifest-key-rotation.md).
+
+### 8.4 Verification receipts (#671)
+
+A receipt is signed like a version 0.4 manifest: the self-hash and the keyed
+BLAKE3 MAC cover its stored document, canonicalized, and it names the key in
+`receipt.mac_key_id`. A reader verifies it with that key only, and an
+unknown or retired key is unauthenticated, not corrupt (§8.3).
+
+**What a receipt proves**, when a MAC key is configured and the receipt
+verifies with it: a holder of that key wrote it, and it is bound to one
+batch's manifest, by that manifest's self-hash, which the manifest's own MAC
+covers. A receipt copied to another batch's key, or naming another manifest
+digest, version or object, or another class than the ledger's, is reported
+by `vtopctl scrub` as `mismatched`.
+
+**What it does not prove:**
+
+- **Without a MAC key, nothing about who wrote it.** Its self-hash is
+  corruption detection only: anyone who can write the bucket can write a
+  receipt with a correct hash.
+- **Not that the object is intact now.** It records a verification that
+  passed when it was written. The scrub re-verifies the object itself.
+- **Not when, or by whom, beyond the writer's word.** `verified_at` is the
+  engine's clock and `verified_by` its configured name. Both are covered by
+  the MAC, so they are the key holder's statement, not independent facts.
+- **Not that the source was committed.** A receipt is written after
+  `VERIFIED` and before `SOURCE_COMMITTED`; the ledger stays the authority for
+  commit state (§6). A missing receipt never makes a batch suspect, and is
+  reported by the scrub, as a finding only under `--require-receipts`.
+
+The receipt carries no record content, no key material, and no URI with a
+query string, fragment or user info; the writer refuses such a URI rather
+than record it. The warning for a receipt that could not be written strips
+URL query strings and user info from the store's error.
 
 ## 9. Resource exhaustion controls
 
@@ -442,7 +657,19 @@ Resource exhaustion controls are part of the security boundary:
 
 ## 10. Audit and failure logging
 
-- The engine **SHOULD** emit structured audit logs for batch lifecycle events (seal, upload, verify, commit) including `batch_id`, object key, and outcome.
+**Audit records (who changed state, #694)** are a separate obligation from batch lifecycle logs, and are described in [docs/operate/auditing.md](operate/auditing.md):
+
+- Every operator command that changes engine or cluster state (`prune-ledger`, `replay`, `migrate`, `scrub --cursor-file`, the audited `vtopctl meta`, `node` and `tier` commands, and the admin endpoint's and every metadata replica's handling of them) **MUST** write a versioned audit record naming its actor, action, target, parameters and outcome, including failures and refusals. Every refusal by the admin endpoint's authorization policy is recorded, whatever the command.
+- Audit records go to the `vtop::audit` log target, which the operator's log filter cannot silence and which is never sampled or rate-limited; to the append-only file `VTOP_AUDIT_LOG` names (created with mode `0600`, synced per record); and, for the ledger commands, to the state store's append-only `audit_events` table.
+- The destructive ledger commands (`prune-ledger`, `replay`, `migrate`) **MUST** be refused when their attempt record cannot be written. There is no switch to run them unrecorded.
+- The actor of a local command is the process's uid, its `/etc/passwd` name, the host and `$SUDO_USER`: as strong as the host's logins, and not authentication. The actor of a cluster command is the admin endpoint's verified certificate identity, or `anonymous` on a plaintext endpoint.
+- `audit_events` is hash-chained; with a manifest MAC key configured the chain is keyed (a key derived from the signing key, §16.1), so a writer who can edit the table cannot recompute it. `vtopctl audit verify` recomputes it. A chain cannot show rows removed from its end.
+- Audit parameters are an allowlist per action and pass through the redaction of §11; no audit record or audit metric label carries a credential, a connection string, a key, a key variable's value or a URL with its path or query.
+- A secret or ledger file accepted only because `security.allow_loose_secret_permissions` is true **MUST** leave a `security.override` record (target: the file; parameters: what it holds, its mode, who can read it), once per file per process (#733). The audit file itself **MUST NOT** be writable by group or other, and **MUST NOT** be world-readable unless its directory is closed; it is created `0600`.
+
+**Batch lifecycle and failure logs:**
+
+- The engine **SHOULD** emit structured logs for batch lifecycle events (seal, upload, verify, commit) including `batch_id`, object key, and outcome.
 - Failures **SHOULD** be logged with enough context to support replay and forensic review, **without** including secrets or raw sensitive payloads.
 - Audit logs **SHOULD** be append-oriented and suitable for retention alongside the archived objects.
 
@@ -450,6 +677,7 @@ Resource exhaustion controls are part of the security boundary:
 
 - Any log path, error type, or diagnostic that could surface credentials **MUST** redact them.
 - Connection strings, headers, and configuration dumps **MUST** have secret fields masked before logging.
+- The OTLP endpoint is logged as host and path only, never with its user-info or query; the OTLP header values are never logged or printed (§2).
 - PostgreSQL parse/connect errors **MUST NOT** echo the supplied URL. VTOP connects from parsed options and applies URL redaction at the state-store error boundary as defense in depth.
 - The redaction layer **SHOULD** default to redacting unknown sensitive-looking fields rather than printing them.
 
@@ -477,20 +705,42 @@ block merges while known, unfixable transitive advisories are still printed.
 
 Currently tracked (re-evaluate on every dependency bump):
 
-| Advisory | Crate | Why it is accepted for now |
-|----------|-------|----------------------------|
-| RUSTSEC-2023-0071 | `rsa` | Pulled only by sqlx's optional MySQL driver, which is **not enabled** (sqlite-only). Not compiled or executed in any VTOP build. No upstream fix exists. |
-| RUSTSEC-2026-0235 | `rkyv 0.7.46` | Optional `rust_decimal` feature pulled into `Cargo.lock` through `openraft → byte-unit`; the feature is not enabled and `rkyv` is absent from every build graph. Current `rust_decimal 1.42.1` still pins the vulnerable major; remove this exception when upstream adopts `rkyv >=0.8.17`. |
-| RUSTSEC-2026-0098 / -0099 / -0104 | `rustls-webpki 0.101.x` | Transitive via `aws-smithy-http-client`'s legacy `hyper-rustls 0.24` connector. Not removable by feature flags in the current AWS SDK; requires an upstream release. The modern `rustls 0.23` / `rustls-webpki 0.103` stack is also present and used by the default HTTPS path. |
-| RUSTSEC-2026-0253 | `lru 0.16.4` | An **unsoundness**, not a vulnerability: `LruCache::pop()` lacks panic safety, reachable only if a cached value's `Drop` panics during eviction. No fixed release exists — 0.16.4 is the newest published version. Reaches the build solely through `aws-sdk-s3`, whose cached values are SDK-internal types this project neither supplies nor controls. Remove when upstream publishes a fix, or re-evaluate on the next AWS SDK bump. |
-| RUSTSEC-2024-0449 | `unsafe-libyaml 0.2.11` | An **unmaintained** notice, not a vulnerability: the upstream repository is archived, so no fix will arrive. Reached only through `serde_yaml 0.9` (itself deprecated), which parses operator-written YAML configuration, not network input. The advisory points at safe-Rust YAML parsers; moving to one is a deliberate migration of every config type. Remove this exception when that migration lands. |
-| RUSTSEC-2026-0387 | `crypto-bigint 0.5.5` | Timing variability in operations intended to be constant-time. Fixed only in `crypto-bigint >=0.7.6`, a major bump; pinned to the 0.5.x line by `aws-sigv4 1.4.5` and `elliptic-curve 0.13.8`, so no `cargo update` reaches it. Exercised only on the AWS SigV4/SigV4a request-signing path. Remove when the AWS signing / RustCrypto stack adopts `crypto-bigint >=0.7.6` (`elliptic-curve >=0.14`). |
-| RUSTSEC-2026-0459 | `libsqlite3-sys 0.30.1` | Bundles a SQLite affected by CVE-2026-119375. Fixed in `libsqlite3-sys >=0.39.0` (SQLite 3.54), reachable only through a newer sqlx — `sqlx-sqlite 0.9.0` caps it at `<0.38`. SQLite here parses only the engine's **local**, operator-owned state-store database, never network input, so a crafted-database CVE is not reachable by a remote party. Remove when sqlx depends on `libsqlite3-sys >=0.39`. |
-| RUSTSEC-2026-0441 | `pin-utils 0.1.0` | An **unmaintained** notice, not a vulnerability: upstream is archived and no fix will ship. `cargo audit` treats it as a non-failing warning; `cargo deny`'s `unmaintained` check fails on it, so it is tracked in both files. Reaches the build only through `aws-smithy-http` / `aws-smithy-runtime`. Remove when the AWS SDK drops its `pin-utils` dependency. |
+| Advisory | Crate | Why it is accepted for now | Last reviewed |
+|----------|-------|----------------------------|---------------|
+| RUSTSEC-2026-0253 | `lru 0.16.4` | An **unsoundness**, not a vulnerability: `LruCache::pop()` lacks panic safety, reachable only if a cached value's `Drop` panics during eviction. Fixed in `lru >=0.18.2`, a semver-incompatible line; it reaches the build solely through `aws-sdk-s3 1.137.0`, which requires `lru ^0.16`, so `cargo update -p lru` moves nothing. `aws-sdk-s3 1.159.0` requires `lru ^0.18.2`, but `cargo update -p aws-sdk-s3` keeps 1.137.0, so the fix needs a deliberate AWS SDK bump. The cached values are SDK-internal types this project neither supplies nor controls. Ignored by `cargo audit` only: `cargo deny`'s default `unsound = "workspace"` reports unsound advisories only for direct dependencies, so it never raises this one. Remove when `aws-sdk-s3` moves to a release that depends on `lru >=0.18.2`. | 2026-11-16 |
+| RUSTSEC-2024-0449 | `unsafe-libyaml 0.2.11` | An **unmaintained** notice, not a vulnerability: the upstream repository is archived, so no fix will arrive. Reached only through `serde_yaml 0.9` (itself deprecated), which parses operator-written YAML configuration, not network input. The advisory points at safe-Rust YAML parsers; moving to one is a deliberate migration of every config type. Remove this exception when that migration lands. | 2026-11-16 |
+| RUSTSEC-2026-0387 | `crypto-bigint 0.5.5` | Timing variability in operations intended to be constant-time. Fixed only in `crypto-bigint >=0.7.6`, a major bump; pinned to the 0.5.x line by `aws-sigv4 1.4.5` and `elliptic-curve 0.13.8`, so no `cargo update` reaches it. Exercised only on the AWS SigV4/SigV4a request-signing path. Remove when the AWS signing / RustCrypto stack adopts `crypto-bigint >=0.7.6` (`elliptic-curve >=0.14`). | 2026-11-16 |
+| RUSTSEC-2026-0459 | `libsqlite3-sys 0.30.1` | Bundles a SQLite affected by CVE-2026-119375. Fixed in `libsqlite3-sys >=0.39.0` (SQLite 3.54), reachable only through a newer sqlx — `sqlx-sqlite 0.9.0` caps it at `<0.38`. SQLite here parses only the engine's **local**, operator-owned state-store database, never network input, so a crafted-database CVE is not reachable by a remote party. Remove when sqlx depends on `libsqlite3-sys >=0.39`. | 2026-11-16 |
+| RUSTSEC-2026-0441 | `pin-utils 0.1.0` | An **unmaintained** notice, not a vulnerability: upstream is archived and no fix will ship. `cargo audit` treats it as a non-failing warning; `cargo deny`'s `unmaintained` check fails on it, so it is tracked in both files. Reaches the build only through `aws-smithy-http` / `aws-smithy-runtime`. Remove when the AWS SDK drops its `pin-utils` dependency. | 2026-11-16 |
+| RUSTSEC-2026-0543 | `chrono 0.4.45` | An **unmaintained** notice, not a vulnerability; no fixed release exists. `chrono` is a direct workspace dependency for the timestamps the engine writes and reads back (manifests, ledger, audit records, object keys). `cargo audit` warns; `cargo deny`'s `unmaintained` check fails, so it is tracked in both files. Replacing it (`jiff` or `time`) is a migration of every timestamp type, not a bump. Remove when that migration lands or chrono is maintained again. | 2026-11-20 |
 
-When the AWS SDK ships an `aws-smithy-http-client` release that drops
-`hyper-rustls 0.24`, the three `rustls-webpki` entries **MUST** be removed from
-the ignore list and the build re-audited.
+#### Review dates
+
+Every ignored advisory carries the date it was last reviewed, written as
+`# reviewed: YYYY-MM-DD` on its line in `.cargo/audit.toml` and `deny.toml` and
+in the "Last reviewed" column above. An exception that nobody re-checks becomes
+a permanent one, so a date older than 90 days fails CI: the `advisory review
+dates` check (`scripts/check-advisory-review.py`, workflow
+`.github/workflows/advisory-review.yml`) runs on every pull request, on every
+push to `main` and weekly, warns from day 75 and fails from day 91. It also fails
+when an id has no date, a malformed or future date, a different date in the two
+files or in this table, or appears in one place and not the others. The only
+allowed difference is an id that `cargo deny` never reports and so is listed in
+`.cargo/audit.toml` alone; the script names each such id (today only
+RUSTSEC-2026-0253).
+
+The maintainer owns the review. A review of an id means:
+
+1. Read the advisory's patched range (`https://rustsec.org/advisories/<id>`).
+2. Run `cargo update -p <crate> --dry-run`: if the newest version the graph
+   allows crosses the patched range, update the lockfile and remove the ignore.
+3. Run `cargo tree --target all -i <crate>`: if the crate has left the graph,
+   remove the ignore; if the path that pulls it in changed, update the
+   justification.
+4. Otherwise move the date to the day of the review in all three places, in one
+   pull request that says what was checked.
+
+Removing an ignore removes it from both files and this table together.
 
 ## 14. Security properties provided vs. not provided
 
@@ -505,10 +755,12 @@ the ignore list and the build re-audited.
 | PostgreSQL transport authentication | Yes for remote hosts | Non-loopback connections require `sslmode=verify-full`; loopback/socket plaintext is limited to local operation. |
 | Backend-limited verification disclosure | Yes | Size-only mode is labeled and rejected by default. |
 | Data-at-rest encryption | Not by VTOP | Delegated to storage layer (SSE/bucket default). |
-| Object immutability (WORM) | Partial | Bucket versioning is validated and manifest versions pinned under the hardened profile (§8.1); object-lock retention itself is deployment policy, not engine-configured. |
-| Public-key manifest signing / MAC rotation | Not yet | One shared MAC key is supported. |
-| Multipart upload integrity for very large objects | Not yet | Native backend uses single-part `put_object`. |
+| Object immutability (WORM) | Yes, with `upload.object_lock` on `s3_native` | Objects and manifests written under an S3 Object Lock retention, the bucket's Object Lock checked first, and the stored retention of the exact versions verified before `VERIFIED` (§7, #684). The bucket's Object Lock and its default retention are created by the operator; `vtopctl tier copy` refuses the profile. |
+| MAC key rotation | Yes | Key ids in version 0.4 manifests and a keyring (§8.3). |
+| Public-key manifest signing | Not yet | MAC keys are shared secrets: an auditor needs the key to verify. |
+| Multipart upload integrity for very large objects | Yes, on `s3_native` | Above `upload.multipart_threshold_bytes` the engine uploads in parts (#482); a failed part is retried alone and the replay of the same bytes resumes the session (#668). Part ETags are never evidence: the whole stored object is verified before `VERIFIED`, as for a single-part upload. The command backends (`awscli`, `s3cmd`, `minio`) hand the whole object to their tool, which may split it internally but cannot resume a failed upload; `localfs` writes one file. |
 | Authorization / multi-tenant isolation | Not by VTOP | Relies on storage-side IAM and least-privilege credentials. |
+| Refusing secret files other local users can reach | Yes, on Unix (#733) | Manifest key files, the state-store secret file, the SQLite ledger and the audit file; not yet TLS keys or `vtop-node`'s files (§3). |
 
 ## 15. Summary of normative rules
 
@@ -518,6 +770,9 @@ the ignore list and the build re-audited.
 | Credentials printed in logs | **MUST NOT** |
 | Credentials via env vars / mounted secrets / external secret managers | **SHOULD** |
 | TLS for Kafka and S3-compatible endpoints | **SHOULD** |
+| TLS for an off-host OTLP collector (export is off unless configured) | **SHOULD** |
+| Record content, credentials, keys, MACs, URLs with a path or query (the collector endpoint aside, printed as host and path), or OTLP header values in exported telemetry or log lines | **MUST NOT** |
+| Error messages in span statuses redacted (URLs to host, hex runs, key ids) | **MUST** |
 | Hostname-verified TLS for remote PostgreSQL | **MUST** |
 | PostgreSQL URL supplied through an env/file reference | **MUST** |
 | Least-privilege object storage permissions | **SHOULD** |
@@ -525,11 +780,16 @@ the ignore list and the build re-audited.
 | Verify object + manifest before commit | **MUST** |
 | Report backend-limited verification as such (not cryptographic) | **MUST** |
 | Configured manifest MAC verifies without downgrade | **MUST** |
+| A manifest is verified with the key it names (or the legacy key), never by trying every key | **MUST** |
+| Every reader runs the keyring release before the active manifest key changes | **MUST** (operator) |
 | Pinned manifest version unreadable → fail closed (`FAILED` → `REPLAY_REQUIRED`) | **MUST** |
 | Hardened profile: versioned bucket preflight + version on every manifest upload | **MUST** (when `require_object_versioning`) |
 | Object Lock retention on versioned manifest buckets | **SHOULD** |
-| Object lock / immutability | **SHOULD** (later) |
+| With `upload.object_lock`: bucket Object Lock preflight, lock headers on every write, stored retention verified before `VERIFIED` | **MUST** |
+| Bucket default retention as the floor under `upload.object_lock` | **SHOULD** (operator) |
 | Secret redaction in logs | **MUST** |
+| Refuse a key, state-store, ledger or audit file group or other can write (no override) | **MUST** |
+| Refuse such a file other users can read, outside a closed directory or a read-only Kubernetes Secret mount, unless the documented override is set, and announce and audit each override | **MUST** |
 | Native broker transport restricted to TLS 1.3 with client certificates | **MUST** by default; a node config knob selects plaintext per plane, loopback-only unless acknowledged by name (§2) |
 | Native broker sessions authorized by an explicit `SessionAuthorizer` | **MUST** |
 | Native clients validate the broker certificate and expected server identity | **MUST** (deployed clients; the loopback lab client may omit `tls` and connect plaintext, see §2) |
@@ -552,7 +812,8 @@ flagged and collected below the tables.
 
 | Primitive | Where it runs | What it protects | Proposed class |
 |---|---|---|---|
-| BLAKE3 keyed MAC (`manifest_mac_key_env`) | manifest build/verify (`vtop-core/manifest.rs`) | manifest authenticity against an adversary with object-store write access; constant-time compare, fail-closed when keyed | **security function** |
+| BLAKE3 keyed MAC (`manifest_mac_key_env`, or the `manifest.mac` keyring) | manifest build/verify (`vtop-core/manifest.rs`, `manifest/keyring.rs`) | manifest authenticity against an adversary with object-store write access; constant-time compare, fail-closed when keyed; verified with the key the manifest names (`manifest.mac_key_id`, authenticated), never by search | **security function** |
+| BLAKE3 keyed MAC, audit chain (#694): a key derived (`blake3::derive_key`, its own context string) from the manifest signing key | `audit_events` link (`vtop-core/manifest.rs`, `vtop-state/audit.rs`), recomputed by `vtopctl audit verify` | tamper evidence of the audit table against a writer without the key; an unkeyed BLAKE3 chain without a configured key (corruption and casual-edit detection only) | **security function** (keyed); integrity check (unkeyed) |
 | BLAKE3 keyed MAC (segment commit key) | v2 commit statement (`vtop-log/types.rs`, seal/verify/tier) | signed assertion of a sealed segment's identity, boundaries, root and manifest digest | **security function** |
 | BLAKE3 unkeyed content commitments: v2 chunk-tree root + Merkle proofs, v1 `blake3_root`, `manifest_core_digest`, tier-copy whole-file digest gate | seal, offline verify, `vtopctl tier copy/rehydrate`, Raft-pinned `CommitTierEvidence` | tamper-evidence of sealed content **when the root is pinned somewhere the adversary cannot rewrite** (Raft metadata, operator `--expect-root`, cursors); locally, corruption detection | **flagged — Q1 below** |
 | SHA-256 / BLAKE3 object checksum (`checksum.algorithm`, default sha256) | archive-plane object write + read-back verify before commit | stored-object corruption; unkeyed, so substitution is the MAC's job | integrity check |
@@ -571,6 +832,7 @@ flagged and collected below the tables.
 | Cluster-plane TLS (admin, Raft peer, replica, native client; each plane's transport is a node config knob defaulting to TLS; plaintext is selectable per plane, loopback-only unless named, and confidentiality holds only on the planes left at `tls`, §2) | rustls 0.23, **ring pinned at every construction site**, TLS 1.3 only, mutual; CN identity via `x509-parser` after chain validation on the admin, Raft-peer and replica planes — the native-client plane never parses the subject (Q3 below) | peer authentication, confidentiality; authorization input where the CN is read (CN is a Raft **safety** input on the peer plane) — native sessions match the declared hello principal against config, not the certificate | security function |
 | Kafka source transport | librdkafka (vendored C, cmake) + **system OpenSSL** (`ssl`) + **system Cyrus SASL** (`sasl`) | broker TLS + SASL auth; plaintext unless configured (SHOULD-level, §2); missing password env is a hard startup error, never a silent downgrade | security function |
 | S3 upload transport + signing | AWS SDK: hyper 1 + hyper-rustls + rustls 0.23 with the SDK's **aws-lc-rs** provider, system roots; SigV4 HMAC-SHA-256 (SigV4a/P-256 available, never explicitly invoked) | endpoint TLS (scheme floor via `verify_tls`; cert verification not disableable) and per-request authentication | security function |
+| OpenTelemetry export (off until configured, #683) | opentelemetry-otlp (traces) and opentelemetry-proto (metrics), HTTP/protobuf over the hyper 1 + hyper-rustls client already in the tree; rustls 0.23 with **ring pinned** at its one construction site (`crates/vtop-observe/src/otel/http.rs`), system roots | collector TLS for `https://` endpoints (verification not disableable); authentication only as the operator's `OTEL_EXPORTER_OTLP_HEADERS` | security function |
 | Postgres state store (`--features postgres`) | sqlx with `tls-rustls-ring-webpki` (the one place the workspace picks the stack); SCRAM-SHA-256 auth with ChaCha CSPRNG nonces — but the **server** chooses the method: sqlx also answers legacy `md5` (and cleartext) password requests, with no client-side way to refuse | verify-full floor for remote hosts (§2, MUST); database authentication | security function |
 | Release supply chain | cosign keyless (Sigstore), SPDX SBOM, provenance, SHA256SUMS | image + artifact authenticity; SHA256SUMS alone is integrity only, and the release notes say so | security function |
 | Test-only material | `rcgen` (dev-deps), ECDSA P-256 + SHA-256 cert minting in `gen-certs.sh` / `k8s-smoke.sh`, PEM key loading (`TlsMaterial::from_pem_files`) as the production ingestion boundary | throwaway harness PKI; production operators bring their own PEM | security function (test scope) |

@@ -4,7 +4,10 @@
 //! environment variables or mounted secrets and are never serialized.
 
 use crate::errors::VtopError;
-use crate::manifest::ManifestMacKey;
+use crate::manifest::{
+    KeySourceKind, KeyringKey, ManifestKeyring, ManifestMacKey, ManifestWriteVersion,
+};
+use crate::secret_file::{SecretFile, SecretFileKind, SecretPolicy};
 use crate::types::{ChecksumAlgorithm, CompressionType, SourceType, TelemetryFormat};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
@@ -14,6 +17,14 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VtopConfig {
+    /// Dotted paths of the keys the YAML document set (#670), filled in by
+    /// [`VtopConfig::from_path`] / [`VtopConfig::from_yaml_str`]; empty for a
+    /// config built any other way, which then explains every setting as a
+    /// built-in default. Only `vtopctl validate --print-effective` reads it,
+    /// to say where a value came from. Never serialized, and holds key names
+    /// only, never values.
+    #[serde(skip)]
+    pub configured_fields: std::collections::BTreeSet<String>,
     pub engine: EngineConfig,
     pub batching: BatchingConfig,
     pub compression: CompressionConfig,
@@ -21,12 +32,206 @@ pub struct VtopConfig {
     pub checksum: ChecksumConfig,
     /// Name of the environment variable holding a 32-byte hex manifest MAC
     /// key. The secret itself is never part of this serializable config.
+    /// Shorthand for a keyring of one key that writes no key id (#685);
+    /// refused together with `manifest.mac`.
     #[serde(default)]
     pub manifest_mac_key_env: Option<String>,
+    /// How manifests are written (#671 release B). Absent means every
+    /// default. An engine before release B ignores the whole section (this
+    /// struct has no `deny_unknown_fields`) and keeps writing `0.3`, which
+    /// is the safe direction.
+    #[serde(default)]
+    pub manifest: ManifestConfig,
     pub sources: SourcesConfig,
     pub upload: UploadConfig,
     #[serde(default)]
     pub partitioning: PartitioningConfig,
+    /// How the engine treats files other local users can reach (#733).
+    /// Absent means every default.
+    #[serde(default)]
+    pub security: SecurityConfig,
+}
+
+/// The `security:` section (#733). Unknown keys are refused: a misspelt
+/// override must fail loudly, not leave the check on while the operator
+/// believes it off, or the reverse. The cost is that a later release's new
+/// key in this section is refused by this one, which its release note says.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecurityConfig {
+    /// Start even when a manifest key file, the state-store secret file, the
+    /// SQLite ledger or the audit file can be read by other local users. Each
+    /// such file is announced (a WARN, a count on
+    /// `vtop_secret_file_permission_overrides_total` and an audit record).
+    /// Never accepts a file other users can write. Default false.
+    #[serde(default)]
+    pub allow_loose_secret_permissions: bool,
+}
+
+/// The `manifest:` section (#671 release B).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ManifestConfig {
+    /// The manifest version new batches get: `"0.3"` (default) or `"0.4"`,
+    /// which adds `verification_plan`. Anything else is refused at load,
+    /// naming the accepted values. Enable `"0.4"` only once every engine,
+    /// `vtopctl scrub` and auditor reading the archive runs v0.8.0 or later:
+    /// an earlier reader reports a `0.4` manifest as tampered.
+    #[serde(default)]
+    pub write_version: ManifestWriteVersion,
+    /// The manifest MAC keyring (#685): several keys by id, one of them
+    /// signing. Needs `write_version: "0.4"`, the only version that can
+    /// record a key id. Absent means `manifest_mac_key_env` (one key, no id)
+    /// or no key at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<ManifestMacConfig>,
+    /// Write a verification receipt, `<batch_id>.receipt.json`, beside each
+    /// manifest once its batch is VERIFIED (#671 release B): the class the
+    /// ledger recorded and the method the backend ran, signed like a 0.4
+    /// manifest. Off by default, because a consumer that lists the prefix
+    /// sees the extra objects. A receipt that cannot be written never holds
+    /// a batch back. Engines before this release ignore the key.
+    #[serde(default)]
+    pub verification_receipts: bool,
+}
+
+/// `manifest.mac` (#685). Unknown keys are refused, unlike the rest of the
+/// engine config: a misspelt `retired` would otherwise leave a withdrawn key
+/// authenticating, with no error. The cost is that a later release's new key
+/// in this section is refused by this one, which the release note must say.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestMacConfig {
+    /// The id of the key that signs new manifests. Every other key verifies
+    /// only.
+    pub active: String,
+    /// Every key that verifies, the active one included.
+    pub keys: Vec<ManifestKeyConfig>,
+    /// Tombstoned ids: manifests naming one fail authentication, reported as
+    /// a retired key. For a key that was withdrawn or compromised; a key
+    /// rotated out in the normal way stays in `keys`, verify-only. No key
+    /// material is configured for a tombstone.
+    #[serde(default)]
+    pub retired: Vec<String>,
+}
+
+/// One entry of `manifest.mac.keys`: an id and where the 64-hex-character
+/// key is read from, `env` or `file` (exactly one).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestKeyConfig {
+    /// 1 to 64 characters from `[A-Za-z0-9._-]`; `none` and `other` are
+    /// reserved metric labels.
+    pub id: String,
+    /// Name of the environment variable holding the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
+    /// Path of a file holding the key, such as a mounted secret. Refused when
+    /// other local users can write it, or read it (see
+    /// [`crate::secret_file`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// This key verifies manifests that name no key id: every manifest
+    /// written before key ids, and any written with `manifest_mac_key_env`.
+    /// At most one key.
+    #[serde(default)]
+    pub legacy: bool,
+}
+
+impl ManifestMacConfig {
+    /// The keyring with placeholder key material: its shape without reading
+    /// a variable or a file. The cross-entry rules (unique ids, one legacy
+    /// key, an active key that exists) live in one place, the keyring, and
+    /// are checked through this at load; `validate --print-effective`
+    /// describes the keyring through it.
+    fn unresolved_keyring(&self) -> Result<ManifestKeyring, VtopError> {
+        let placeholder = ManifestMacKey::from_hex(&"00".repeat(32))?;
+        let keys = self
+            .keys
+            .iter()
+            .map(|k| {
+                Ok(KeyringKey {
+                    id: k.id.clone(),
+                    key: placeholder.clone(),
+                    source: k.source()?.0,
+                    legacy: k.legacy,
+                })
+            })
+            .collect::<Result<Vec<_>, VtopError>>()?;
+        ManifestKeyring::new(&self.active, keys, self.retired.clone())
+    }
+
+    /// The keyring by id and source kind (`env` or `file`), as
+    /// `validate --print-effective` prints it: never a value, and not the
+    /// variable's name or the file's path either.
+    pub fn describe(&self) -> String {
+        match self.unresolved_keyring() {
+            Ok(keyring) => keyring.describe_config(),
+            Err(e) => format!("invalid ({e})"),
+        }
+    }
+}
+
+/// The longest key file read: a key is 64 hex characters, so anything near
+/// this is not a key, and a path such as `/dev/zero` must not hang startup.
+const MAX_KEY_FILE_BYTES: u64 = 4096;
+
+impl ManifestKeyConfig {
+    fn secret_file(&self, path: &str) -> SecretFile {
+        SecretFile::new(
+            SecretFileKind::ManifestKey,
+            format!("manifest key {:?}", self.id),
+            path,
+        )
+    }
+
+    fn source(&self) -> Result<(KeySourceKind, &str), VtopError> {
+        let id = &self.id;
+        match (self.env.as_deref(), self.file.as_deref()) {
+            (Some(env), None) if !env.trim().is_empty() => Ok((KeySourceKind::Env, env.trim())),
+            (None, Some(file)) if !file.trim().is_empty() => Ok((KeySourceKind::File, file.trim())),
+            (Some(_), Some(_)) => Err(VtopError::Config(format!(
+                "manifest.mac.keys: key {id:?} sets both env and file; set exactly one"
+            ))),
+            (None, None) => Err(VtopError::Config(format!(
+                "manifest.mac.keys: key {id:?} needs env (a variable name) or file (a path)"
+            ))),
+            _ => Err(VtopError::Config(format!(
+                "manifest.mac.keys: key {id:?} names an empty env or file"
+            ))),
+        }
+    }
+
+    /// Read and decode the key. Errors name the id and the variable or file,
+    /// never the value. A key file other users can reach is refused before
+    /// it is opened (#733).
+    fn resolve(&self, policy: &SecretPolicy) -> Result<ManifestMacKey, VtopError> {
+        use std::io::Read;
+        let id = &self.id;
+        let value = match self.source()? {
+            (KeySourceKind::Env, name) => std::env::var(name).map_err(|_| {
+                VtopError::Config(format!(
+                    "manifest key {id:?}: environment variable {name} is missing or not valid \
+                     Unicode"
+                ))
+            })?,
+            (KeySourceKind::File, path) => {
+                crate::secret_file::enforce(&self.secret_file(path), policy)
+                    .map_err(|refused| VtopError::Config(refused.to_string()))?;
+                let mut text = String::new();
+                std::fs::File::open(path)
+                    .and_then(|f| f.take(MAX_KEY_FILE_BYTES).read_to_string(&mut text))
+                    .map_err(|e| {
+                        VtopError::Config(format!("manifest key {id:?}: reading {path}: {e}"))
+                    })?;
+                text
+            }
+        };
+        ManifestMacKey::from_hex(value.trim()).map_err(|_| {
+            VtopError::Config(format!(
+                "manifest key {id:?}: the value must be exactly 32 bytes (64 hex characters)"
+            ))
+        })
+    }
 }
 
 /// Object integrity checksum configuration.
@@ -159,7 +364,10 @@ impl fmt::Debug for ResolvedStateStore {
 }
 
 impl StateStoreConfig {
-    pub fn resolve(&self) -> Result<ResolvedStateStore, VtopError> {
+    /// The connection string. A `file:` reference other users can reach is
+    /// refused before it is read (#733); [`VtopConfig::resolve_state_store`]
+    /// passes the config's policy.
+    pub fn resolve(&self, policy: &SecretPolicy) -> Result<ResolvedStateStore, VtopError> {
         let value = match self {
             Self::Inline(value) => value.clone(),
             Self::Env(reference) => std::env::var(reference.env.trim()).map_err(|_| {
@@ -169,6 +377,15 @@ impl StateStoreConfig {
                 ))
             })?,
             Self::File(reference) => {
+                crate::secret_file::enforce(
+                    &SecretFile::new(
+                        SecretFileKind::StateStoreSecret,
+                        "the state-store secret file",
+                        reference.file.trim(),
+                    ),
+                    policy,
+                )
+                .map_err(|refused| VtopError::Config(refused.to_string()))?;
                 std::fs::read_to_string(reference.file.trim()).map_err(|e| {
                     VtopError::Config(format!(
                         "reading state-store secret file {}: {e}",
@@ -253,6 +470,130 @@ impl Serialize for StateStoreConfig {
             }
         }
     }
+}
+
+/// The file SQLite opens for a state-store connection string, or `None` for
+/// PostgreSQL and an in-memory database: the name the SQLite store hands
+/// SQLite, read as SQLite reads it (#733). The store strips `sqlite://` or
+/// `sqlite:` and passes the rest as the filename with URI handling on, so a
+/// name starting `file:` is a URI (its path, percent-decoded; `mode=memory`
+/// is in memory), and any other name is a literal path, a `?` included. The
+/// permission checks and the store's owner-only creation both use this, so
+/// they always name the file SQLite opens.
+pub fn sqlite_ledger_file(conn: &str) -> Option<std::path::PathBuf> {
+    if is_postgres_url(conn) || conn == "sqlite::memory:" || conn == ":memory:" {
+        return None;
+    }
+    let name = conn
+        .strip_prefix("sqlite://")
+        .or_else(|| conn.strip_prefix("sqlite:"))
+        .unwrap_or(conn);
+    let Some(uri) = name.strip_prefix("file:") else {
+        return (!name.is_empty() && name != ":memory:").then(|| std::path::PathBuf::from(name));
+    };
+    let uri = uri.split('#').next().unwrap_or_default();
+    let (path, query) = uri.split_once('?').unwrap_or((uri, ""));
+    // In memory only when every `mode` parameter says `memory` (review):
+    // SQLite takes the last one, after percent-decoding each key and value
+    // and ending it at a NUL. Requiring all of them, rather than finding the
+    // last, means a misread here can only check a file that is not there,
+    // never skip one that is.
+    let modes: Vec<Vec<u8>> = query
+        .split('&')
+        .filter_map(|parameter| parameter.split_once('='))
+        .filter(|(key, _)| c_decode(key) == b"mode")
+        .map(|(_, value)| c_decode(value))
+        .collect();
+    if !modes.is_empty() && modes.iter().all(|mode| mode == b"memory") {
+        return None;
+    }
+    // `file:///abs` and `file://localhost/abs` name `/abs`; `file:rel` is
+    // relative. SQLite refuses any other authority.
+    let path = match path.strip_prefix("//") {
+        Some(rest) => {
+            let slash = rest.find('/').unwrap_or(rest.len());
+            &rest[slash..]
+        }
+        None => path,
+    };
+    let path = c_decode(path);
+    if path.is_empty() || path == b":memory:" {
+        return None;
+    }
+    // The decoded bytes are the file name, UTF-8 or not (review): on Unix a
+    // name with byte 0xFF is a real file SQLite opens.
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Some(std::path::PathBuf::from(std::ffi::OsString::from_vec(path)))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(path).ok().map(std::path::PathBuf::from)
+    }
+}
+
+/// A URI component as SQLite reads it: percent-decoded, then ended at the
+/// first NUL, since SQLite keeps it as a C string (review: `%00`).
+fn c_decode(text: &str) -> Vec<u8> {
+    let mut bytes = percent_decode(text);
+    if let Some(nul) = bytes.iter().position(|&b| b == 0) {
+        bytes.truncate(nul);
+    }
+    bytes
+}
+
+/// `%XX` escapes as SQLite decodes them in a URI: the bytes, whatever their
+/// encoding.
+fn percent_decode(text: &str) -> Vec<u8> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        match (bytes[i], bytes.get(i + 1), bytes.get(i + 2)) {
+            (b'%', Some(&h), Some(&l)) => match (hex(h), hex(l)) {
+                (Some(h), Some(l)) => {
+                    out.push((h * 16 + l) as u8);
+                    i += 3;
+                }
+                _ => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
+            (b, _, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// The database file a SQLite connection string names, or `None` for
+/// PostgreSQL and an in-memory database. Accepts `sqlite://path`,
+/// `sqlite:path` and a bare path, as the state store does. Used to place
+/// prune digests; the permission checks use [`sqlite_ledger_file`].
+pub fn sqlite_database_file(conn: &str) -> Option<std::path::PathBuf> {
+    let conn = conn.trim();
+    if is_postgres_url(conn) {
+        return None;
+    }
+    let rest = conn
+        .strip_prefix("sqlite://")
+        .or_else(|| conn.strip_prefix("sqlite:"))
+        .unwrap_or(conn);
+    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+    // The `mode=memory` QUERY PARAMETER, exactly - not those characters
+    // anywhere in the string, which a real path can contain (review).
+    let in_memory = query
+        .split('&')
+        .any(|parameter| parameter.eq_ignore_ascii_case("mode=memory"));
+    if path.is_empty() || path == ":memory:" || in_memory {
+        return None;
+    }
+    Some(std::path::PathBuf::from(path))
 }
 
 fn is_postgres_url(value: &str) -> bool {
@@ -444,14 +785,78 @@ pub struct FileSourceConfig {
     #[serde(default)]
     pub enabled: bool,
     pub paths: Vec<String>,
-    /// If true, the source file may be deleted *after* the batch is committed.
+    /// If true, a source file is deleted once a committed batch covers it to
+    /// its end, it has then stayed unwritten - same inode, first page, page
+    /// below the archived end, length, the mtime the batch read and the
+    /// ctime - for `delete_quiet_seconds`, AND no process has it open (#619).
+    ///
+    /// Safe for files nothing writes to any more: whole-file drops, and
+    /// rotated logs once the writer has reopened its new file. A deleted file
+    /// a writer still holds open keeps taking that writer's lines into an
+    /// inode no path names, so the quiet period alone is not enough: a writer
+    /// can be silent for longer than it and then write again. The engine
+    /// proves that no process has the file open with a Linux write lease,
+    /// held from before the file is moved aside until after the unlink, so a
+    /// writer that holds the file open - or opens it while it is being
+    /// deleted - keeps it, however long it has been silent.
+    ///
+    /// The lease needs Linux, a local filesystem (ext2/3/4, xfs, btrfs,
+    /// tmpfs, overlay, f2fs, zfs or bcachefs: on NFS, CIFS, FUSE, 9p,
+    /// virtiofs or CephFS it could not see a writer on another machine, so it
+    /// is not asked for), and the engine running as the files' owner or with
+    /// `CAP_LEASE` in its effective set. Without it there is no check, and a
+    /// fully archived file is KEPT, with a warning naming the reason, unless
+    /// `delete_without_open_check` is set. On a platform without inode
+    /// numbers no file is ever deleted.
+    ///
+    /// Also KEPT, each with a message saying why and what to do: a file whose
+    /// mtime or ctime changed after the commit (a touch cannot be told from a
+    /// same-length rewrite between its first and last pages); a file whose
+    /// link count changed (another name of it deleted, or a hard link made:
+    /// `links_changed`); a configured path that is a symbolic link; and a
+    /// file that cannot be renamed aside within its own directory (`EXDEV`
+    /// for a bind-mounted single file, `EACCES` for a directory the engine
+    /// cannot write).
     #[serde(default)]
     pub delete_after_commit: bool,
+    /// How long, in seconds, a fully archived file must stay unwritten before
+    /// `delete_after_commit` deletes it (#619). Timed on the engine's own
+    /// clock from the commit that covered the file, so a restart starts the
+    /// wait again; the file's mtime is compared, never trusted as a clock. 0
+    /// deletes as soon as a commit covers the file, still only if no process
+    /// has it open (see `delete_after_commit`). Default 3600.
+    #[serde(default = "default_delete_quiet_seconds")]
+    pub delete_quiet_seconds: u64,
+    /// Where the engine can't check that no process holds a file open
+    /// (macOS and other non-Linux platforms, NFS and other non-local
+    /// filesystems, another user's file when the engine lacks `CAP_LEASE`),
+    /// delete the file on `delete_quiet_seconds` alone (#619). Default
+    /// false: such a file is kept. A file a writer still holds open is
+    /// deleted with it: the writer's later lines go into a file no path
+    /// names and nothing archives them. That happens in two cases: the
+    /// writer is silent for longer than the quiet period and then writes, or
+    /// it writes between the engine's final check and the unlink. Where a
+    /// check is possible it is always made, and a file some process has open
+    /// is kept whatever this says. Each unchecked delete is logged and
+    /// counted as `deleted_unchecked`. The engine warns at startup and in
+    /// `vtopctl validate`. Prefer fixing the cause: run the engine as the
+    /// files' owner, on Linux, on a local filesystem.
+    #[serde(default)]
+    pub delete_without_open_check: bool,
     /// Read each file as a single whole-file record instead of line by line.
     /// Required for binary / already-compressed source files (which have no
     /// line structure). Default false (line-oriented).
     #[serde(default)]
     pub whole_file: bool,
+}
+
+/// Default for [`FileSourceConfig::delete_quiet_seconds`]: an hour. A
+/// fully archived file costs only its disk space while it waits, and a live
+/// log is far less often silent for an hour than for a few minutes.
+pub const DEFAULT_DELETE_QUIET_SECONDS: u64 = 3600;
+
+fn default_delete_quiet_seconds() -> u64 {
+    DEFAULT_DELETE_QUIET_SECONDS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -491,11 +896,35 @@ pub struct UploadConfig {
     /// answers blocks the engine forever with the process alive and no error:
     /// the AWS SDK's defaults bound connecting but not waiting for a response.
     /// The SDK's own retries still apply, so one request is bounded by three
-    /// of these. An upload part or object body counts: size it for the
-    /// slowest link a part must cross (a 64 MiB part at 1 MiB/s needs about a
-    /// minute). Compatibility backends use `command_timeout_seconds` instead.
+    /// of these. A request that carries an object or part body is allowed
+    /// this PLUS the time its body takes at
+    /// [`request_min_bytes_per_second`](Self::request_min_bytes_per_second)
+    /// (#663), so a slow link stretches the deadline instead of failing every
+    /// body that cannot cross it in a fixed time. Compatibility backends use
+    /// `command_timeout_seconds` instead.
     #[serde(default = "default_request_timeout_seconds")]
     pub request_timeout_seconds: u64,
+    /// The slowest rate, in bytes per second, at which ONE request's body may
+    /// cross the link and still be waited for (native S3 backend, #663). A
+    /// request that carries a body (an object, a multipart part, a manifest)
+    /// gets `request_timeout_seconds` plus its size at this rate for each
+    /// attempt: an 8 MiB part at the default 4 KiB/s is allowed 300 + 2048 s.
+    ///
+    /// The fixed per-attempt deadline it replaces for bodies failed every
+    /// object on a policed 10 Mbit/s uplink: the engine's default width puts
+    /// two dozen part uploads on the link at once, each got about 11 KB/s, and
+    /// an 8 MiB part needs about 760 s at that share — so every attempt was
+    /// cut at 300 s, re-sent from its first byte, and cut again. The width
+    /// times the parts in flight divides the link, so this is a per-REQUEST
+    /// rate: at the default 32 requests, 4 KiB/s each is about 1 Mbit/s for
+    /// the whole uplink. Lower it for a slower uplink or a wider
+    /// configuration; a value at or above the link's rate restores the fixed
+    /// deadline. A store that stops reading a body is still caught within
+    /// seconds by the SDK's stalled-upload protection; what this lengthens is
+    /// only how long a store that has read a body may take to answer before
+    /// the attempt is abandoned. Must be > 0.
+    #[serde(default = "default_request_min_bytes_per_second")]
+    pub request_min_bytes_per_second: u64,
     /// Optional named profile / alias for command-based backends.
     #[serde(default)]
     pub profile: Option<String>,
@@ -530,15 +959,28 @@ pub struct UploadConfig {
     #[serde(default = "default_true")]
     pub require_strong_verification: bool,
     /// Hardened manifest profile (#135): require the backend to expose
-    /// immutable object versions, confirm bucket versioning is enabled before
-    /// the first upload to each bucket, and refuse to advance a batch whose
+    /// immutable object versions, confirm bucket versioning is enabled (at
+    /// startup for a literal bucket, #722; before the first upload to each
+    /// bucket a template names), and refuse to advance a batch whose
     /// manifest upload returned no version to pin. Recovery then reads the
     /// exact stored version, so overwriting or deleting the current manifest
     /// key cannot roll a batch back to an older validly-authenticated
     /// manifest. Defaults to false because it needs a versioned bucket
-    /// (`mc version enable` / S3 bucket versioning, ideally with Object Lock).
+    /// (`mc version enable` / S3 bucket versioning). The S3 Object Lock
+    /// profile ([`object_lock`](Self::object_lock)) requires it.
     #[serde(default)]
     pub require_object_versioning: bool,
+    /// The S3 Object Lock profile (#684): write every object and manifest
+    /// under this retention, refuse a bucket without Object Lock enabled, and
+    /// fail a batch whose stored object does not carry the retention the
+    /// engine asked for. Unset by default, and unset is exactly the pipeline
+    /// without it: no lock header is sent and no bucket or object is checked.
+    /// `s3_native` only; it requires `require_object_versioning` and refuses
+    /// `create_bucket`. An engine older than v0.10.0 ignores this key and
+    /// writes UNLOCKED objects, so keep a bucket default retention as the
+    /// floor and drain older engines first (docs/OBJECT_LOCK_DEPLOYMENT.md).
+    #[serde(default)]
+    pub object_lock: Option<ObjectLockConfig>,
     /// Byte size of each multipart part (except possibly the last). Used by
     /// resumable uploads for large sealed segments (#191). Default 8 MiB.
     /// Real S3 requires at least 5 MiB for non-final parts; mock/local tests
@@ -557,6 +999,15 @@ pub struct UploadConfig {
     /// abandoned and safe to abort + delete from the state directory.
     #[serde(default = "default_multipart_abandon_after_secs")]
     pub multipart_abandon_after_secs: u64,
+    /// Requests per multipart part before the part, and the upload, fail
+    /// (#668): the first plus the retries, with exponential backoff and full
+    /// jitter between them (1 s doubling to at most 30 s). Only the failed
+    /// part is sent again; the parts that completed are kept. Each request
+    /// also has the backend's own retries and the per-request deadline of
+    /// `request_timeout_seconds` and `request_min_bytes_per_second`, so the
+    /// longest a part can take is this many times that. Default 3; at least 1.
+    #[serde(default = "default_multipart_part_attempts")]
+    pub multipart_part_attempts: u32,
     /// Per-transport egress tuning (#480): ONE shape, keyed by transport name,
     /// so the two paths are tuned with the identical struct rather than each
     /// growing its own knobs. Defaults to an empty map — all-`None` tuning,
@@ -603,6 +1054,70 @@ pub struct UploadConfig {
 /// would expire long before its body finished. A cap that low is a mistake,
 /// refused here rather than discovered as a stalled engine.
 pub const MIN_EGRESS_BYTES_PER_SECOND: u64 = 1024;
+
+/// An S3 Object Lock retention mode (#684).
+///
+/// `governance`: the retention can be shortened or removed by a principal
+/// holding `s3:BypassGovernanceRetention`. `compliance`: it cannot be
+/// shortened or removed by anyone, the account root included, until the
+/// date passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectLockMode {
+    Governance,
+    Compliance,
+}
+
+impl ObjectLockMode {
+    /// The config spelling, and the `mode` label of `vtop_object_lock_mode`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Governance => "governance",
+            Self::Compliance => "compliance",
+        }
+    }
+
+    /// The spelling S3 uses on the wire (`x-amz-object-lock-mode`).
+    pub fn as_s3(self) -> &'static str {
+        match self {
+            Self::Governance => "GOVERNANCE",
+            Self::Compliance => "COMPLIANCE",
+        }
+    }
+}
+
+impl fmt::Display for ObjectLockMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The most days `upload.object_lock.retain_days` accepts (#684): ten years.
+///
+/// Not a limit of S3, which documents no maximum for a per-object
+/// retain-until date (the Object Lock guide mentions 100 years only for a
+/// bucket policy that bounds retention). It is a guard on a value that, in
+/// `compliance` mode, nobody can take back: a typo of an extra digit would
+/// otherwise lock every object for a century.
+pub const MAX_OBJECT_LOCK_RETAIN_DAYS: u32 = 3650;
+
+/// `upload.object_lock` (#684). Unknown keys are refused: a misspelled key in
+/// a retention policy must not fall back to a default silently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectLockConfig {
+    /// `governance` or `compliance`.
+    pub mode: ObjectLockMode,
+    /// Days each object and manifest is retained, counted from its write
+    /// (from CreateMultipartUpload for a multipart object). 1 to
+    /// [`MAX_OBJECT_LOCK_RETAIN_DAYS`].
+    pub retain_days: u32,
+    /// Also place a legal hold on every object and manifest. A legal hold has
+    /// no end date: it stays until a principal holding
+    /// `s3:PutObjectLegalHold` removes it. Default false.
+    #[serde(default)]
+    pub legal_hold: bool,
+}
 
 /// Redundancy / forward-error-correction policy for an egress path (#480).
 ///
@@ -780,6 +1295,67 @@ impl UploadConfig {
         } else {
             EgressTuning::default()
         }
+    }
+
+    /// The S3 Object Lock profile's own rules (#684), on `UploadConfig` and
+    /// called from `build_backend` as well as [`VtopConfig::validate`], for the
+    /// reason `validate_transports` is: not every consumer builds a
+    /// VtopConfig. Each refusal names the keys involved. Which BACKEND can
+    /// honour the block is decided in `vtop-upload`, which knows the backends.
+    pub fn validate_object_lock(&self) -> Result<(), VtopError> {
+        let Some(lock) = &self.object_lock else {
+            return Ok(());
+        };
+        // Only s3_native sends the lock headers on every write and reads the
+        // retention of the exact version back. Refused at config load, so
+        // `vtopctl validate` says so too (review of #708). An unknown name is
+        // left to `build_backend`, which lists the registered ones.
+        let why = match self.backend.as_str() {
+            "s3cmd" | "awscli" | "minio" => Some(
+                "it shells out to an external CLI, which sends the request itself; VTOP cannot \
+                 add the lock headers to it or read the retention of the version it wrote",
+            ),
+            "localfs" => Some("it writes to a local directory, which has no retention lock"),
+            "mock" | "mock_fail" | "mock_limited" => Some("it keeps objects in memory"),
+            _ => None,
+        };
+        if let Some(why) = why {
+            return Err(VtopError::Config(format!(
+                "upload.object_lock is set, but the {} backend cannot write an object under an \
+                 S3 Object Lock: {why}. Nothing was built. Only s3_native supports the profile; \
+                 use s3_native or remove upload.object_lock",
+                self.backend
+            )));
+        }
+        if lock.retain_days == 0 || lock.retain_days > MAX_OBJECT_LOCK_RETAIN_DAYS {
+            return Err(VtopError::Config(format!(
+                "upload.object_lock.retain_days = {} is outside 1..={MAX_OBJECT_LOCK_RETAIN_DAYS}: \
+                 zero would lock nothing, and more than {MAX_OBJECT_LOCK_RETAIN_DAYS} days (ten \
+                 years) is refused as a likely typo because a compliance retention cannot be \
+                 shortened by anyone. Set a value in that range",
+                lock.retain_days
+            )));
+        }
+        if !self.require_object_versioning {
+            return Err(VtopError::Config(
+                "upload.object_lock is set but upload.require_object_versioning is false: \
+                 Object Lock works only on a versioned bucket, and the engine checks the \
+                 retention of the exact version it wrote. Set \
+                 upload.require_object_versioning: true"
+                    .into(),
+            ));
+        }
+        if self.create_bucket {
+            return Err(VtopError::Config(
+                "upload.object_lock is set together with upload.create_bucket: true: Object \
+                 Lock can only be enabled when a bucket is created, and the engine never \
+                 creates a locked bucket (CreateBucket stays out of its permissions). Create \
+                 the bucket with Object Lock enabled yourself and set upload.create_bucket: \
+                 false"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Bounds that belong to the MECHANISM, not to any one backend (#480).
@@ -979,6 +1555,9 @@ fn default_command_timeout_seconds() -> u64 {
 fn default_request_timeout_seconds() -> u64 {
     300
 }
+fn default_request_min_bytes_per_second() -> u64 {
+    4 * 1024
+}
 fn default_command_max_output_bytes() -> usize {
     1024 * 1024
 }
@@ -996,6 +1575,9 @@ fn default_multipart_max_parallelism() -> usize {
 }
 fn default_multipart_abandon_after_secs() -> u64 {
     24 * 60 * 60
+}
+fn default_multipart_part_attempts() -> u32 {
+    3
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1041,13 +1623,118 @@ fn default_template() -> String {
     crate::partitioning::DEFAULT_TEMPLATE.to_string()
 }
 
+/// What `upload.require_strong_verification: false` costs, in the words the
+/// startup log and `vtopctl validate` both print (#629). Before this, the only
+/// sign of the opt-out was a WARN per batch, so an engine left in lab mode in
+/// production said nothing until traffic flowed, and then said it among the
+/// INFO lines.
+pub const SIZE_ONLY_VERIFICATION_WARNING: &str =
+    "upload.require_strong_verification is false: a batch the object store can only \
+     confirm by size and existence is committed as verified, so this engine accepts \
+     same-size corruption (a corrupted or replaced object of the recorded size is \
+     archived and its source progress committed). Set \
+     upload.require_strong_verification: true unless this is a lab or a backend \
+     with no content digest";
+
+/// Said on every start and by `vtopctl validate` when a file source deletes
+/// on the quiet period alone where it cannot check for open writers (#619).
+pub const DELETE_WITHOUT_OPEN_CHECK_WARNING: &str =
+    "sources.file.delete_without_open_check is true: where the engine cannot check that \
+     no process holds a file open (a platform other than Linux, an NFS or FUSE mount, a \
+     file another user owns while the engine lacks CAP_LEASE), delete_after_commit deletes \
+     a fully archived file on delete_quiet_seconds alone, and a writer that still holds it \
+     open loses every line it writes after. Set it to false to keep such files instead";
+
 impl VtopConfig {
+    /// Settings that are valid but unsafe enough to say so on every start
+    /// and in `vtopctl validate` (#629). Never a reason to refuse: each one
+    /// is an explicit, documented opt-out.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if !self.upload.require_strong_verification {
+            let mut w = SIZE_ONLY_VERIFICATION_WARNING.to_string();
+            if !self.checksum.algorithm.is_enabled() {
+                // With no digest at all, the weak path is not a fallback
+                // for an awkward backend: it is every batch.
+                w.push_str(
+                    "; checksum.algorithm is none, so EVERY batch is verified by size alone",
+                );
+            }
+            warnings.push(w);
+        }
+        if self.sources.file.as_ref().is_some_and(|file| {
+            file.enabled && file.delete_after_commit && file.delete_without_open_check
+        }) {
+            warnings.push(DELETE_WITHOUT_OPEN_CHECK_WARNING.to_string());
+        }
+        warnings
+    }
+
+    /// How secret and ledger files are checked (#733): the override and the
+    /// engine's name for the audit record of an override.
+    pub fn secret_policy(&self) -> SecretPolicy {
+        SecretPolicy {
+            allow_loose: self.security.allow_loose_secret_permissions,
+            engine: Some(self.engine.name.clone()),
+        }
+    }
+
+    /// The state-store connection string, a `file:` reference checked under
+    /// [`VtopConfig::secret_policy`].
+    pub fn resolve_state_store(&self) -> Result<ResolvedStateStore, VtopError> {
+        self.engine.state_store.resolve(&self.secret_policy())
+    }
+
+    /// Every file the config names that [`crate::secret_file`] checks,
+    /// without reading any of them: the key files, the state-store secret
+    /// file, and an inline SQLite ledger with its `-wal` and `-shm` files. A
+    /// SQLite ledger named through `env:` or `file:` is checked when the
+    /// engine opens it, since naming it here would mean reading the secret.
+    pub fn secret_files(&self) -> Vec<SecretFile> {
+        let mut files = Vec::new();
+        if let Some(mac) = &self.manifest.mac {
+            for key in &mac.keys {
+                if let Ok((KeySourceKind::File, path)) = key.source() {
+                    files.push(key.secret_file(path));
+                }
+            }
+        }
+        match &self.engine.state_store {
+            StateStoreConfig::File(reference) if !reference.file.trim().is_empty() => {
+                files.push(SecretFile::new(
+                    SecretFileKind::StateStoreSecret,
+                    "the state-store secret file",
+                    reference.file.trim(),
+                ));
+            }
+            StateStoreConfig::Inline(value) => {
+                if let Some(database) = sqlite_ledger_file(value) {
+                    files.extend(crate::secret_file::sqlite_files(&database));
+                }
+            }
+            _ => {}
+        }
+        files
+    }
+
     /// Load and validate config from a YAML file.
     pub fn from_path(path: &Path) -> Result<Self, VtopError> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| VtopError::Config(format!("reading {}: {e}", path.display())))?;
-        let cfg: VtopConfig = serde_yaml::from_str(&text)?;
+        let cfg = Self::from_yaml_str(&text)?;
         cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Parse a YAML document without validating it, recording which keys it
+    /// set in [`VtopConfig::configured_fields`] (#670).
+    ///
+    /// The typed parse runs first and alone decides acceptance and every
+    /// error's text; presence is recorded only after it succeeded, so a refused
+    /// file reads exactly as it did before presence was recorded.
+    pub fn from_yaml_str(text: &str) -> Result<Self, VtopError> {
+        let mut cfg: VtopConfig = serde_yaml::from_str(text)?;
+        cfg.configured_fields = crate::effective_config::present_keys(text);
         Ok(cfg)
     }
 
@@ -1058,6 +1745,15 @@ impl VtopConfig {
         if self.upload.backend == "s3_native" && self.upload.request_timeout_seconds == 0 {
             return Err(VtopError::Config(
                 "upload.request_timeout_seconds must be > 0".into(),
+            ));
+        }
+        // Zero would divide a body by nothing: an attempt with no deadline.
+        if self.upload.backend == "s3_native" && self.upload.request_min_bytes_per_second == 0 {
+            return Err(VtopError::Config(
+                "upload.request_min_bytes_per_second must be > 0: it is the slowest rate a \
+                 request body may cross the link at, and zero would leave a body upload \
+                 with no deadline at all"
+                    .into(),
             ));
         }
         if self.engine.state_store_timeout_seconds == 0 {
@@ -1074,6 +1770,7 @@ impl VtopConfig {
         }
 
         self.engine.state_store.validate()?;
+        self.validate_manifest_mac()?;
         if self
             .manifest_mac_key_env
             .as_deref()
@@ -1123,6 +1820,7 @@ impl VtopConfig {
         // copy ran on the legacy multipart defaults. The checks now live on
         // UploadConfig itself and every consumer runs them.
         self.upload.validate_transports()?;
+        self.upload.validate_object_lock()?;
         if self.upload.multipart_part_size_bytes == 0 {
             return Err(VtopError::Config(
                 "upload.multipart_part_size_bytes must be > 0".into(),
@@ -1159,6 +1857,13 @@ impl VtopConfig {
         if self.upload.multipart_abandon_after_secs == 0 {
             return Err(VtopError::Config(
                 "upload.multipart_abandon_after_secs must be > 0".into(),
+            ));
+        }
+        if self.upload.multipart_part_attempts == 0 {
+            return Err(VtopError::Config(
+                "upload.multipart_part_attempts must be at least 1: it counts the first \
+                 request for a part as well as its retries"
+                    .into(),
             ));
         }
         if matches!(self.upload.backend.as_str(), "awscli" | "s3cmd" | "minio") {
@@ -1313,12 +2018,82 @@ impl VtopConfig {
         Ok(())
     }
 
-    /// Resolve the optional manifest authentication key from its named
-    /// environment variable. A configured-but-missing key is a hard startup
-    /// error, never a silent downgrade to unsigned manifests.
-    pub fn resolve_manifest_mac_key(&self) -> Result<Option<ManifestMacKey>, VtopError> {
+    /// The `manifest.mac` rules that need no key material (#685), checked
+    /// at load. [`VtopConfig::resolve_manifest_keyring`] checks them again,
+    /// so a config built in code cannot skip them.
+    fn validate_manifest_mac(&self) -> Result<(), VtopError> {
+        let Some(mac) = &self.manifest.mac else {
+            return Ok(());
+        };
+        if self.manifest_mac_key_env.is_some() {
+            return Err(VtopError::Config(
+                "manifest.mac and manifest_mac_key_env are both set; use one. To keep the \
+                 manifest_mac_key_env key, list it in manifest.mac.keys with legacy: true"
+                    .into(),
+            ));
+        }
+        if self.manifest.write_version != ManifestWriteVersion::V0_4 {
+            return Err(VtopError::Config(format!(
+                "manifest.mac needs manifest.write_version: \"0.4\" (it is \"{}\"): a key id \
+                 can only be recorded in a version 0.4 manifest; a 0.3 reader drops unknown \
+                 fields and would report the manifest as tampered",
+                self.manifest.write_version
+            )));
+        }
+        for key in &mac.keys {
+            crate::manifest::keyring::validate_key_id(&key.id)
+                .map_err(|why| VtopError::Config(format!("manifest.mac.keys: {why}")))?;
+            key.source()?;
+        }
+        for id in &mac.retired {
+            crate::manifest::keyring::validate_key_id(id)
+                .map_err(|why| VtopError::Config(format!("manifest.mac.retired: {why}")))?;
+        }
+        mac.unresolved_keyring().map(drop)
+    }
+
+    /// The startup line naming the manifest keys by id and source kind
+    /// (#685), from the config alone: no variable or file is read, and no
+    /// value or variable name is printed.
+    pub fn manifest_key_summary(&self) -> String {
+        let shape = match (&self.manifest.mac, &self.manifest_mac_key_env) {
+            (Some(mac), _) => mac.unresolved_keyring(),
+            (None, Some(_)) => {
+                ManifestMacKey::from_hex(&"00".repeat(32)).map(ManifestKeyring::single)
+            }
+            (None, None) => Ok(ManifestKeyring::default()),
+        };
+        match shape {
+            Ok(keyring) => keyring.summary(),
+            Err(e) => format!("manifest MAC: invalid configuration ({e})"),
+        }
+    }
+
+    /// Resolve the manifest keys (#685): `manifest.mac`, the
+    /// `manifest_mac_key_env` shorthand (one key, writing no id), or none. A
+    /// configured key that is missing or malformed is a hard startup error,
+    /// never a silent downgrade to unsigned manifests; the error names the
+    /// variable or file, never its value.
+    pub fn resolve_manifest_keyring(&self) -> Result<ManifestKeyring, VtopError> {
+        self.validate_manifest_mac()?;
+        let policy = self.secret_policy();
+        if let Some(mac) = &self.manifest.mac {
+            let keys = mac
+                .keys
+                .iter()
+                .map(|k| {
+                    Ok(KeyringKey {
+                        id: k.id.clone(),
+                        key: k.resolve(&policy)?,
+                        source: k.source()?.0,
+                        legacy: k.legacy,
+                    })
+                })
+                .collect::<Result<Vec<_>, VtopError>>()?;
+            return ManifestKeyring::new(&mac.active, keys, mac.retired.clone());
+        }
         let Some(name) = self.manifest_mac_key_env.as_deref() else {
-            return Ok(None);
+            return Ok(ManifestKeyring::default());
         };
         let name = name.trim();
         if name.is_empty() {
@@ -1331,13 +2106,22 @@ impl VtopConfig {
                 "manifest MAC key environment variable {name} is missing or not valid Unicode"
             ))
         })?;
-        ManifestMacKey::from_hex(value.trim()).map(Some)
+        ManifestMacKey::from_hex(value.trim()).map(ManifestKeyring::single)
     }
 }
 
 /// A single configured stream mapping from `streams.yaml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamConfig {
+    /// Override the global checksum for this stream. The strong-verification
+    /// floor stays global and cannot be lowered by a stream.
+    #[serde(default)]
+    pub checksum: Option<StreamChecksumConfig>,
+    /// Keys this entry set in `streams.yaml` (#670), filled in by
+    /// [`StreamsConfig::from_path`] / [`StreamsConfig::from_yaml_str`]. Key
+    /// names only; never serialized.
+    #[serde(skip)]
+    pub configured_fields: std::collections::BTreeSet<String>,
     pub source_name: String,
     pub source_type: SourceType,
     pub format: TelemetryFormat,
@@ -1350,19 +2134,122 @@ pub struct StreamConfig {
     pub retention_class: Option<String>,
 }
 
+/// A stream's own `checksum` block (#669). The shape mirrors the global
+/// [`ChecksumConfig`], but `algorithm` is required and no other key is
+/// accepted: an empty block or a misspelled key would otherwise read as an
+/// explicit sha256 override of the global algorithm (#480: a misspelled
+/// knob fails loudly). Omit the block, or set it to null, to inherit.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StreamChecksumConfig {
+    pub algorithm: ChecksumAlgorithm,
+}
+
+/// Resolve the algorithm at the point a new batch is written. Recovery and
+/// scrub instead use the algorithm persisted in that batch's manifest.
+pub fn effective_algorithm(
+    config: &VtopConfig,
+    stream: Option<&StreamConfig>,
+) -> ChecksumAlgorithm {
+    stream
+        .and_then(|stream| stream.checksum.as_ref())
+        .map_or(config.checksum.algorithm, |checksum| checksum.algorithm)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamsConfig {
     pub streams: Vec<StreamConfig>,
 }
 
 impl StreamsConfig {
+    /// Validate cross-file invariants before any source or store is opened.
+    ///
+    /// A stream cannot lower the global strong-verification floor (#669): an
+    /// explicit per-stream `checksum.algorithm: none` while
+    /// `upload.require_strong_verification` is on is refused here, naming the
+    /// stream. A stream that merely inherits the global algorithm is judged
+    /// exactly as before this setting existed. Only applied entries are
+    /// judged ([`StreamsConfig::applied`]): a shadowed one never runs.
+    pub fn validate(&self, config: &VtopConfig) -> Result<(), VtopError> {
+        for stream in self.applied() {
+            let lowers_floor = stream
+                .checksum
+                .as_ref()
+                .is_some_and(|checksum| !checksum.algorithm.is_enabled());
+            if lowers_floor && config.upload.require_strong_verification {
+                return Err(VtopError::Config(format!(
+                    "stream {:?}: checksum.algorithm is none but upload.require_strong_verification is true",
+                    stream.source_name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Global warnings with stream overrides accounted for, followed by each
+    /// applied stream's explicit opt-out. Existing configurations keep their
+    /// old text.
+    pub fn warnings(&self, config: &VtopConfig) -> Vec<String> {
+        let mut warnings = config.warnings();
+        if !config.checksum.algorithm.is_enabled()
+            && self
+                .applied()
+                .any(|stream| effective_algorithm(config, Some(stream)).is_enabled())
+        {
+            for warning in &mut warnings {
+                *warning = warning.replace(
+                    "EVERY batch is verified by size alone",
+                    "every batch inheriting the global algorithm is verified by size alone",
+                );
+            }
+        }
+        warnings.extend(
+            self.applied()
+                .filter(|stream| {
+                    stream.checksum.is_some()
+                        && !effective_algorithm(config, Some(stream)).is_enabled()
+                })
+                .map(|stream| {
+                    format!(
+                        "stream {:?}: checksum.algorithm is none, so EVERY batch of this \
+                         stream is verified by size alone; same-size corruption is not detected",
+                        stream.source_name
+                    )
+                }),
+        );
+        warnings
+    }
+
     pub fn from_path(path: &Path) -> Result<Self, VtopError> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| VtopError::Config(format!("reading {}: {e}", path.display())))?;
-        Ok(serde_yaml::from_str(&text)?)
+        Self::from_yaml_str(&text)
+    }
+
+    /// Parse a `streams.yaml` document, recording which keys each stream set
+    /// in its [`StreamConfig::configured_fields`] (#670). As for
+    /// [`VtopConfig::from_yaml_str`], the typed parse alone decides acceptance
+    /// and error text.
+    pub fn from_yaml_str(text: &str) -> Result<Self, VtopError> {
+        let mut streams: StreamsConfig = serde_yaml::from_str(text)?;
+        let present = crate::effective_config::present_keys(text);
+        for (index, stream) in streams.streams.iter_mut().enumerate() {
+            stream.configured_fields = crate::effective_config::stream_keys(&present, index);
+        }
+        Ok(streams)
     }
 
     /// Find the stream definition that matches a discovered source name.
+    /// The entries the engine applies: the first per `source_name`, as
+    /// [`StreamsConfig::lookup`] resolves them. A later entry with the same
+    /// name is shadowed and never used (#670 lists it as shadowed).
+    pub fn applied(&self) -> impl Iterator<Item = &StreamConfig> {
+        let mut seen = std::collections::HashSet::new();
+        self.streams
+            .iter()
+            .filter(move |s| seen.insert(s.source_name.as_str()))
+    }
+
     pub fn lookup(&self, source_name: &str) -> Option<&StreamConfig> {
         self.streams.iter().find(|s| s.source_name == source_name)
     }
@@ -1371,6 +2258,227 @@ impl StreamsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #629: the size-only opt-out is a warning, never an error, and the
+    /// warning names its consequence and the key that turns it off.
+    #[test]
+    fn size_only_verification_is_warned_about_not_refused() {
+        let yaml = r#"
+engine:
+  name: vtop-engine
+  state_store: "sqlite::memory:"
+  work_dir: /tmp/work
+batching: {}
+compression: {}
+sources: {}
+upload:
+  bucket: telemetry-data
+"#;
+        let strong: VtopConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(
+            strong.warnings().is_empty(),
+            "the default is strong verification and warns about nothing: {:?}",
+            strong.warnings()
+        );
+
+        let mut weak = strong.clone();
+        weak.upload.require_strong_verification = false;
+        weak.validate().expect("the opt-out stays valid config");
+        let warnings = weak.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("accepts same-size corruption")
+                && warnings[0].contains("upload.require_strong_verification"),
+            "{}",
+            warnings[0]
+        );
+        assert!(!warnings[0].contains("EVERY batch"), "{}", warnings[0]);
+
+        weak.checksum.algorithm = ChecksumAlgorithm::None;
+        assert!(
+            weak.warnings()[0].contains("EVERY batch"),
+            "with checksums off every batch is size-only: {:?}",
+            weak.warnings()
+        );
+    }
+
+    /// #619: deleting on the quiet period alone, where no open-file check is
+    /// possible, is an opt-out from a data-loss guard, so it is said on every
+    /// start - and only when it can delete anything.
+    #[test]
+    fn deleting_without_an_open_check_is_warned_about() {
+        let yaml = r#"
+engine:
+  name: vtop-engine
+  state_store: "sqlite::memory:"
+  work_dir: /tmp/work
+batching: {}
+compression: {}
+sources:
+  file:
+    enabled: true
+    paths: ["/var/log/app/*.log"]
+    delete_after_commit: true
+upload:
+  bucket: telemetry-data
+"#;
+        let mut cfg: VtopConfig = serde_yaml::from_str(yaml).unwrap();
+        let file = cfg.sources.file.as_ref().unwrap();
+        assert!(
+            !file.delete_without_open_check,
+            "the default keeps a file no open-file check can clear"
+        );
+        assert!(cfg.warnings().is_empty(), "{:?}", cfg.warnings());
+        cfg.sources.file.as_mut().unwrap().delete_without_open_check = true;
+        cfg.validate().expect("the opt-out stays valid config");
+        assert_eq!(
+            cfg.warnings(),
+            vec![DELETE_WITHOUT_OPEN_CHECK_WARNING.to_string()]
+        );
+        cfg.sources.file.as_mut().unwrap().delete_after_commit = false;
+        assert!(
+            cfg.warnings().is_empty(),
+            "nothing is deleted, so nothing to warn about: {:?}",
+            cfg.warnings()
+        );
+    }
+
+    /// #669: a stream's own algorithm wins, else the global one; only an
+    /// explicit per-stream `none` is refused under the strong floor, and with
+    /// the floor off it is a warning naming the stream.
+    #[test]
+    fn stream_checksum_resolves_and_cannot_lower_the_floor() {
+        let yaml = r#"
+engine:
+  name: vtop-engine
+  state_store: "sqlite::memory:"
+  work_dir: /tmp/work
+batching: {}
+compression: {}
+sources: {}
+upload:
+  bucket: telemetry-data
+checksum:
+  algorithm: blake3
+"#;
+        let mut cfg: VtopConfig = serde_yaml::from_str(yaml).unwrap();
+        let streams: StreamsConfig = serde_yaml::from_str(
+            r#"
+streams:
+  - {source_name: inherits, source_type: file, format: raw}
+  - {source_name: strong, source_type: file, format: raw, checksum: {algorithm: sha256}}
+  - {source_name: lowers, source_type: file, format: raw, checksum: {algorithm: none}}
+"#,
+        )
+        .unwrap();
+        let algo = |i: usize, cfg: &VtopConfig| effective_algorithm(cfg, Some(&streams.streams[i]));
+        assert_eq!(algo(0, &cfg), ChecksumAlgorithm::Blake3);
+        assert_eq!(algo(1, &cfg), ChecksumAlgorithm::Sha256);
+        assert_eq!(algo(2, &cfg), ChecksumAlgorithm::None);
+        assert_eq!(effective_algorithm(&cfg, None), ChecksumAlgorithm::Blake3);
+
+        let err = streams.validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("\"lowers\"") && err.contains("none"), "{err}");
+
+        // Inheriting a global `none` is not a stream lowering the floor: that
+        // case is judged as it was before #669 (refused per batch at run time).
+        let inheriting = StreamsConfig {
+            streams: streams.streams[..2].to_vec(),
+        };
+        cfg.checksum.algorithm = ChecksumAlgorithm::None;
+        inheriting.validate(&cfg).unwrap();
+
+        cfg.checksum.algorithm = ChecksumAlgorithm::Blake3;
+        cfg.upload.require_strong_verification = false;
+        streams.validate(&cfg).unwrap();
+        let warnings = streams.warnings(&cfg);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("\"lowers\"") && w.contains("size alone")),
+            "{warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("\"inherits\"")),
+            "{warnings:?}"
+        );
+    }
+
+    /// #669 review: a stream's `checksum` must name its algorithm. An empty
+    /// block or a misspelled key used to deserialize to sha256 and override
+    /// the global algorithm as if the operator had chosen it (#480: a
+    /// misspelled knob fails loudly).
+    #[test]
+    fn a_stream_checksum_block_must_name_a_known_algorithm() {
+        for block in [
+            "{}",
+            "{algoritm: blake3}",
+            "{algorithm: blake3, read_back: true}",
+        ] {
+            let yaml = format!(
+                "streams:\n  - {{source_name: a, source_type: file, format: raw, checksum: {block}}}\n"
+            );
+            assert!(
+                StreamsConfig::from_yaml_str(&yaml).is_err(),
+                "checksum: {block} must be refused, not read as an override"
+            );
+        }
+        let ok = StreamsConfig::from_yaml_str(
+            "streams:\n  - {source_name: a, source_type: file, format: raw, checksum: {algorithm: blake3}}\n  - {source_name: b, source_type: file, format: raw, checksum: null}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            ok.streams[0].checksum.as_ref().map(|c| c.algorithm),
+            Some(ChecksumAlgorithm::Blake3)
+        );
+        assert!(ok.streams[1].checksum.is_none(), "null inherits");
+    }
+
+    /// #669 review: the engine applies only the first entry per
+    /// `source_name` ([`StreamsConfig::lookup`]), so a shadowed later entry
+    /// must neither refuse the config nor produce a warning about a stream
+    /// that in fact runs with the first entry's algorithm.
+    #[test]
+    fn a_shadowed_stream_entry_neither_warns_nor_refuses() {
+        let mut cfg: VtopConfig = serde_yaml::from_str(
+            r#"
+engine:
+  name: vtop-engine
+  state_store: "sqlite::memory:"
+  work_dir: /tmp/work
+batching: {}
+compression: {}
+sources: {}
+upload:
+  bucket: telemetry-data
+"#,
+        )
+        .unwrap();
+        let streams = StreamsConfig::from_yaml_str(
+            "streams:\n  - {source_name: a, source_type: file, format: raw}\n  - {source_name: a, source_type: kafka, format: raw, checksum: {algorithm: none}}\n",
+        )
+        .unwrap();
+        assert_eq!(streams.applied().count(), 1);
+        assert!(streams.applied().next().unwrap().checksum.is_none());
+        streams.validate(&cfg).unwrap();
+        cfg.upload.require_strong_verification = false;
+        let warnings = streams.warnings(&cfg);
+        assert!(
+            !warnings.iter().any(|w| w.contains("stream \"a\"")),
+            "{warnings:?}"
+        );
+    }
+
+    /// The shipped examples load and pass the cross-file check together, so
+    /// the per-stream keys they document stay valid (#669 review).
+    #[test]
+    fn the_example_streams_file_validates_against_the_example_config() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples");
+        let cfg = VtopConfig::from_path(Path::new(&format!("{dir}/config.yaml"))).unwrap();
+        let streams = StreamsConfig::from_path(Path::new(&format!("{dir}/streams.yaml"))).unwrap();
+        streams.validate(&cfg).unwrap();
+        assert!(streams.streams.iter().any(|s| s.checksum.is_some()));
+    }
 
     #[test]
     fn rejects_kafka_auto_commit() {
@@ -1418,7 +2526,7 @@ upload:
         assert_eq!(cfg.engine.work_retention_seconds, 86_400);
         assert_eq!(cfg.engine.work_max_bytes, 10 * 1024 * 1024 * 1024);
         assert!(cfg.upload.require_strong_verification);
-        assert!(cfg.resolve_manifest_mac_key().unwrap().is_none());
+        assert!(!cfg.resolve_manifest_keyring().unwrap().is_configured());
 
         let mut bad_retention = cfg.clone();
         bad_retention.engine.work_retention_seconds = 0;
@@ -1510,6 +2618,186 @@ upload:
     // ----------------------------------------------------------------------
     // Per-transport egress tuning shape (#480)
     // ----------------------------------------------------------------------
+
+    /// `validate` without `--print-effective` must stay byte-identical (#670),
+    /// and that includes a refused file: recording which keys were present must
+    /// not change a single parse error's text, its path or its line/column.
+    /// The expected strings are what `main` printed before presence existed.
+    #[test]
+    fn recording_present_keys_leaves_every_parse_error_unchanged() {
+        let base = tuning_base();
+        let cases = [
+            (
+                base.replace("  work_dir: /tmp/work\n", ""),
+                "engine: missing field `work_dir` at line 3 column 3",
+            ),
+            (
+                base.replace("batching: {}", "batching: {max_records: lots}"),
+                "batching.max_records: invalid type: string \"lots\", expected usize at line 6 column 25",
+            ),
+            (
+                format!("{base}  transports:\n    tcp_tls:\n      max_concurrancy: 4\n"),
+                "upload.transports.tcp_tls: unknown field `max_concurrancy`, expected one of \
+                 `target_rate_bytes_per_second`, `max_concurrency`, `part_size_bytes`, \
+                 `parts_in_flight`, `redundancy` at line 16 column 7",
+            ),
+            (
+                base.replace("  name: vtop-engine", "  name: vtop-engine\n  name: twice"),
+                "engine: duplicate field `name` at line 3 column 3",
+            ),
+            (
+                base.replace("batching: {}", "batching: [1, 2]"),
+                "batching: invalid type: sequence, expected struct BatchingConfig at line 6 column 11",
+            ),
+            (String::new(), "missing field `engine`"),
+        ];
+        for (doc, expected) in &cases {
+            let err = VtopConfig::from_yaml_str(doc).expect_err("each document is invalid");
+            assert_eq!(err.to_string(), format!("serde_yaml error: {expected}"));
+        }
+        let stream_cases = [
+            (
+                "streams:\n- source_name: a\n  source_type: file\n",
+                "streams[0]: missing field `format` at line 2 column 3",
+            ),
+            (
+                "streams:\n- source_name: a\n  source_type: nope\n  format: raw\n",
+                "streams[0].source_type: unknown variant `nope`, expected one of `kafka`, `file`, \
+                 `syslog_spool` at line 3 column 16",
+            ),
+            (
+                "streams:\n- source_name: a\n  source_type: file\n  format: raw\n  tenant: [x]\n",
+                "streams[0].tenant: invalid type: sequence, expected a string at line 5 column 11",
+            ),
+        ];
+        for (doc, expected) in stream_cases {
+            let err = StreamsConfig::from_yaml_str(doc).expect_err("each document is invalid");
+            assert_eq!(err.to_string(), format!("serde_yaml error: {expected}"));
+        }
+    }
+
+    /// A document the engine accepts is never refused because its keys were
+    /// being recorded: a duplicate key inside a map-typed field is let through
+    /// by the typed parse (last one wins), and a `serde_yaml::Value` walk would
+    /// have refused it.
+    #[test]
+    fn recording_present_keys_never_refuses_an_accepted_document() {
+        let doc = format!(
+            "{}  transports:\n    tcp_tls:\n      max_concurrency: 2\n    tcp_tls:\n      max_concurrency: 3\n",
+            tuning_base()
+        );
+        let typed: VtopConfig = serde_yaml::from_str(&doc).expect("accepted today");
+        let recorded = VtopConfig::from_yaml_str(&doc).expect("still accepted");
+        assert_eq!(
+            format!("{:?}", typed.upload.transports),
+            format!("{:?}", recorded.upload.transports)
+        );
+        assert!(recorded
+            .configured_fields
+            .contains("upload.transports.tcp_tls.max_concurrency"));
+    }
+
+    /// #671 release B: `manifest.write_version` is "0.3" when absent, "0.4"
+    /// only when set, and anything else is refused at load, naming the key
+    /// and the accepted values. An unquoted YAML number is refused too, so
+    /// `0.40` can never pass for a version.
+    #[test]
+    fn manifest_write_version_defaults_to_03_and_refuses_other_values() {
+        let base = tuning_base();
+        let parsed = VtopConfig::from_yaml_str(base).unwrap();
+        assert_eq!(parsed.manifest.write_version, ManifestWriteVersion::V0_3);
+        assert!(!parsed.configured_fields.contains("manifest.write_version"));
+        for (value, expected) in [
+            (r#""0.3""#, ManifestWriteVersion::V0_3),
+            (r#""0.4""#, ManifestWriteVersion::V0_4),
+            ("'0.4'", ManifestWriteVersion::V0_4),
+        ] {
+            let cfg =
+                VtopConfig::from_yaml_str(&format!("{base}manifest:\n  write_version: {value}\n"))
+                    .unwrap();
+            cfg.validate().unwrap();
+            assert_eq!(cfg.manifest.write_version, expected, "{value}");
+            assert!(cfg.configured_fields.contains("manifest.write_version"));
+        }
+        // An empty section is every default.
+        let cfg = VtopConfig::from_yaml_str(&format!("{base}manifest: {{}}\n")).unwrap();
+        assert_eq!(cfg.manifest.write_version, ManifestWriteVersion::V0_3);
+        // The mechanism that lets a v0.8.0 engine start on this section: an
+        // unknown top-level key is ignored, and so is a later release's key
+        // inside the section (#685 plans `manifest.mac_key_id`). Ignoring
+        // leaves 0.3, the safe direction.
+        let cfg = VtopConfig::from_yaml_str(&format!(
+            "{base}future_section:\n  anything: 1\nmanifest:\n  write_version: \"0.4\"\n  mac_key_id: k1\n"
+        ))
+        .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.manifest.write_version, ManifestWriteVersion::V0_4);
+        for value in [
+            r#""0.5""#,
+            r#""0.2""#,
+            r#""""#,
+            r#""0.4.0""#,
+            r#"" 0.4""#,
+            "latest",
+            "0.4",
+            "0.40",
+            "4",
+            "[0.4]",
+        ] {
+            let err =
+                VtopConfig::from_yaml_str(&format!("{base}manifest:\n  write_version: {value}\n"))
+                    .expect_err(value)
+                    .to_string();
+            assert!(err.contains("manifest.write_version"), "{value}: {err}");
+            assert!(err.contains(r#""0.3" or "0.4""#), "{value}: {err}");
+        }
+    }
+
+    /// `manifest.verification_receipts` (#671 release B): off unless set,
+    /// a boolean, recorded as configured, and ignored by the v0.9.0 shape of
+    /// the section (no `deny_unknown_fields`), so an engine that has not been
+    /// upgraded keeps running and writes no receipts.
+    #[test]
+    fn verification_receipts_default_off_and_take_a_boolean() {
+        let base = tuning_base();
+        let parsed = VtopConfig::from_yaml_str(base).unwrap();
+        assert!(!parsed.manifest.verification_receipts);
+        assert!(!parsed
+            .configured_fields
+            .contains("manifest.verification_receipts"));
+        let cfg =
+            VtopConfig::from_yaml_str(&format!("{base}manifest:\n  verification_receipts: true\n"))
+                .unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.manifest.verification_receipts);
+        assert!(cfg
+            .configured_fields
+            .contains("manifest.verification_receipts"));
+        for value in ["\"yes\"", "1", "[true]"] {
+            let err = VtopConfig::from_yaml_str(&format!(
+                "{base}manifest:\n  verification_receipts: {value}\n"
+            ))
+            .expect_err(value)
+            .to_string();
+            assert!(
+                err.contains("manifest.verification_receipts"),
+                "{value}: {err}"
+            );
+        }
+
+        // A test-local copy of the section as v0.9.0 declares it.
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct ManifestV090 {
+            #[serde(default)]
+            write_version: ManifestWriteVersion,
+            #[serde(default)]
+            mac: Option<ManifestMacConfig>,
+        }
+        let old: ManifestV090 =
+            serde_yaml::from_str("write_version: \"0.4\"\nverification_receipts: true\n").unwrap();
+        assert_eq!(old.write_version, ManifestWriteVersion::V0_4);
+    }
 
     fn tuning_base() -> &'static str {
         r#"
@@ -1896,6 +3184,192 @@ upload:
             .contains("command_timeout_seconds"));
     }
 
+    /// A config with a `manifest:` section `section` (YAML at two spaces).
+    fn with_manifest(section: &str) -> String {
+        format!("{}manifest:\n{section}", tuning_base())
+    }
+
+    const KEYRING: &str = r#"  write_version: "0.4"
+  mac:
+    active: q4-2026
+    keys:
+      - {id: q3-2026, env: VTOP_TEST_MAC_Q3, legacy: true}
+      - {id: q4-2026, file: /run/secrets/q4}
+    retired: [q1-2026]
+"#;
+
+    /// #685: a keyring loads with `write_version: "0.4"`, and its shape
+    /// (which key signs, which only verify, which is legacy, the tombstones)
+    /// is what the config says.
+    #[test]
+    fn a_keyring_loads_with_write_version_04() {
+        let cfg = VtopConfig::from_yaml_str(&with_manifest(KEYRING)).unwrap();
+        cfg.validate().unwrap();
+        let mac = cfg.manifest.mac.as_ref().unwrap();
+        assert_eq!(mac.active, "q4-2026");
+        assert_eq!(mac.retired, ["q1-2026"]);
+        assert!(mac.keys[0].legacy && !mac.keys[1].legacy);
+        assert_eq!(
+            cfg.manifest_key_summary(),
+            "manifest MAC keyring: active key q4-2026 (file); verify-only: q3-2026 (env, \
+             legacy); retired: q1-2026"
+        );
+    }
+
+    /// #685: a keyring needs `write_version: "0.4"`, because a key id can
+    /// only be recorded in a 0.4 manifest. Refused at load, naming both keys
+    /// and the reason, whether 0.3 is set or the default.
+    #[test]
+    fn a_keyring_with_write_version_03_is_refused_naming_the_reason() {
+        for version in ["  write_version: \"0.3\"\n", ""] {
+            let section = KEYRING.replace("  write_version: \"0.4\"\n", version);
+            let cfg = VtopConfig::from_yaml_str(&with_manifest(&section)).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            for needle in [
+                "manifest.mac needs manifest.write_version: \"0.4\"",
+                "(it is \"0.3\")",
+                "a key id can only be recorded in a version 0.4 manifest",
+                "would report the manifest as tampered",
+            ] {
+                assert!(err.contains(needle), "{needle}: {err}");
+            }
+            // The engine resolves through the same check.
+            assert!(cfg.resolve_manifest_keyring().is_err());
+        }
+    }
+
+    /// #685: every inconsistent keyring is refused at load with a message
+    /// naming what is wrong.
+    #[test]
+    fn inconsistent_keyrings_are_refused_at_load() {
+        let mac = |body: &str| format!("  write_version: \"0.4\"\n  mac:\n{body}");
+        let cases = [
+            (
+                "    active: q5\n    keys: [{id: q4, env: K4}]\n",
+                "active key id \"q5\" is not one of manifest.mac.keys",
+            ),
+            (
+                "    active: q4\n    keys: [{id: q4, env: K4}, {id: q4, env: K5}]\n",
+                "appears more than once",
+            ),
+            (
+                "    active: q4\n    keys: [{id: q3, env: K3, legacy: true}, {id: q4, env: K4, legacy: true}]\n",
+                "at most one key may be marked legacy",
+            ),
+            (
+                "    active: q4\n    keys: [{id: q4, env: K4}]\n    retired: [q4]\n",
+                "a retired id may not also be a key",
+            ),
+            (
+                "    active: q1\n    keys: [{id: q4, env: K4}]\n    retired: [q1]\n",
+                "is retired; a retired key cannot sign",
+            ),
+            (
+                "    active: \"q 4\"\n    keys: [{id: \"q 4\", env: K4}]\n",
+                "may only contain letters, digits",
+            ),
+            (
+                "    active: q4\n    keys: [{id: q4, env: K4}]\n    retired: [\"\"]\n",
+                "must be 1 to 64 characters",
+            ),
+            (
+                "    active: other\n    keys: [{id: other, env: K4}]\n",
+                "is reserved",
+            ),
+            (
+                "    active: q4\n    keys: [{id: q4, env: K4, file: /k}]\n",
+                "sets both env and file",
+            ),
+            ("    active: q4\n    keys: [{id: q4}]\n", "needs env"),
+            ("    active: q4\n    keys: [{id: q4, env: \" \"}]\n", "names an empty env"),
+        ];
+        for (body, needle) in cases {
+            let cfg = VtopConfig::from_yaml_str(&with_manifest(&mac(body))).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains(needle), "{body}: {err}");
+        }
+        // A misspelt key in the section is refused, not ignored: `retire`
+        // would otherwise leave a withdrawn key authenticating.
+        let err = VtopConfig::from_yaml_str(&with_manifest(&mac(
+            "    active: q4\n    keys: [{id: q4, env: K4}]\n    retire: [q1]\n",
+        )))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown field `retire`"), "{err}");
+        // Both forms of key at once are refused, naming both.
+        let both = format!("manifest_mac_key_env: K0\n{}", with_manifest(KEYRING));
+        let err = VtopConfig::from_yaml_str(&both)
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("manifest.mac and manifest_mac_key_env are both set"),
+            "{err}"
+        );
+    }
+
+    /// #685: keys come from an environment variable or a file. A missing or
+    /// malformed key fails resolution naming the key id and the variable or
+    /// file, never the value; the resolved keyring signs with the active key.
+    #[test]
+    fn keyring_keys_resolve_from_env_and_file_without_leaking_values() {
+        use std::io::Write;
+        let env = format!("VTOP_TEST_KEYRING_{}", uuid::Uuid::new_v4().simple());
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let q4_hex = "4d".repeat(32);
+        writeln!(file, "{q4_hex}").unwrap();
+        let section = KEYRING
+            .replace("VTOP_TEST_MAC_Q3", &env)
+            .replace("/run/secrets/q4", &file.path().to_string_lossy());
+        let cfg = VtopConfig::from_yaml_str(&with_manifest(&section)).unwrap();
+        cfg.validate().unwrap();
+
+        let err = cfg.resolve_manifest_keyring().unwrap_err().to_string();
+        assert!(err.contains("\"q3-2026\""), "{err}");
+        assert!(err.contains(&env) && err.contains("missing"), "{err}");
+
+        let malformed = "zz-not-a-key-but-a-secret-anyway";
+        std::env::set_var(&env, malformed);
+        let err = cfg.resolve_manifest_keyring().unwrap_err().to_string();
+        std::env::remove_var(&env);
+        assert!(err.contains("64 hex characters"), "{err}");
+        assert!(!err.contains(malformed), "the value leaked: {err}");
+
+        let q3_hex = "3c".repeat(32);
+        std::env::set_var(&env, &q3_hex);
+        let keyring = cfg.resolve_manifest_keyring().unwrap();
+        std::env::remove_var(&env);
+        assert_eq!(keyring.active_id(), Some("q4-2026"));
+        assert_eq!(keyring.verify_only_ids(), ["q3-2026"]);
+        assert_eq!(keyring.retired_ids(), ["q1-2026"]);
+        let shown = format!("{keyring:?} {}", keyring.summary());
+        assert!(
+            !shown.contains(&q3_hex) && !shown.contains(&q4_hex),
+            "{shown}"
+        );
+        assert!(
+            !shown.contains(&env),
+            "the variable's name is config, not shown: {shown}"
+        );
+
+        drop(file);
+        let err = {
+            std::env::set_var(&env, &q3_hex);
+            let err = cfg.resolve_manifest_keyring().unwrap_err().to_string();
+            std::env::remove_var(&env);
+            err
+        };
+        assert!(
+            err.contains("\"q4-2026\"") && err.contains("reading"),
+            "{err}"
+        );
+
+        // The config itself serializes names and paths, never values.
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        assert!(yaml.contains(&env) && !yaml.contains(&q3_hex), "{yaml}");
+    }
+
     #[test]
     fn configured_manifest_key_must_exist_without_silent_downgrade() {
         let name = format!("VTOP_TEST_MISSING_MAC_{}", uuid::Uuid::new_v4());
@@ -1919,7 +3393,7 @@ upload:
         );
         let cfg: VtopConfig = serde_yaml::from_str(&yaml).unwrap();
         cfg.validate().unwrap();
-        let err = cfg.resolve_manifest_mac_key().unwrap_err().to_string();
+        let err = cfg.resolve_manifest_keyring().unwrap_err().to_string();
         assert!(err.contains(&name));
         assert!(err.contains("missing"));
     }
@@ -1969,12 +3443,253 @@ upload:
         let reference = StateStoreConfig::File(StateStoreFileRef {
             file: secret.path().to_string_lossy().into_owned(),
         });
-        let resolved = reference.resolve().unwrap();
+        let resolved = reference
+            .resolve(&crate::secret_file::SecretPolicy::strict())
+            .unwrap();
         assert_eq!(
             resolved.expose_secret(),
             "postgres://vtop:password@localhost/vtop?sslmode=disable"
         );
         assert!(!format!("{resolved:?}").contains("password"));
+    }
+
+    /// #733: a directory other users can enter, holding `name` at `mode`.
+    #[cfg(unix)]
+    fn file_in_open_dir(root: &Path, name: &str, contents: &str, mode: u32) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = root.join("open");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.join(name);
+        // A previous call may have left this file 0400, which only root can
+        // open for writing again: replace it rather than rewrite it, so the
+        // test means the same thing as root and as an ordinary user (CI).
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("removing {}: {e}", path.display()),
+        }
+        std::fs::write(&path, contents).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    /// A keyring of one key read from `path`, with the override `loose`.
+    #[cfg(unix)]
+    fn keyring_from_file(path: &Path, loose: bool) -> VtopConfig {
+        let section = format!(
+            "  write_version: \"0.4\"\n  mac:\n    active: q4-2026\n    keys:\n      \
+             - {{id: q4-2026, file: {}}}\n",
+            path.display()
+        );
+        let mut yaml = with_manifest(&section);
+        if loose {
+            yaml.push_str("security:\n  allow_loose_secret_permissions: true\n");
+        }
+        let cfg = VtopConfig::from_yaml_str(&yaml).unwrap();
+        cfg.validate().unwrap();
+        cfg
+    }
+
+    /// #733: a key file other users can read or write is refused before it
+    /// is read, naming the key, the path, the mode, what was done and the
+    /// fix; an owner-only one is read.
+    #[cfg(unix)]
+    #[test]
+    fn a_key_file_others_can_reach_is_refused_and_an_owner_only_one_is_read() {
+        let root = tempfile::tempdir().unwrap();
+        let key = "4d".repeat(32);
+        for (mode, readable) in [
+            (0o644, true),
+            (0o640, true),
+            (0o666, false),
+            (0o620, false),
+            (0o602, false),
+        ] {
+            let path = file_in_open_dir(root.path(), "q4", &key, mode);
+            let err = keyring_from_file(&path, false)
+                .resolve_manifest_keyring()
+                .unwrap_err()
+                .to_string();
+            for needle in [
+                "manifest key \"q4-2026\"".to_owned(),
+                path.display().to_string(),
+                format!("{mode:04o}"),
+                "the file was not read and nothing was started".to_owned(),
+            ] {
+                assert!(err.contains(&needle), "{mode:o}: {needle}: {err}");
+            }
+            let fix = if readable { "chmod 0400" } else { "chmod go-w" };
+            assert!(err.contains(fix), "{mode:o}: {err}");
+            assert!(!err.contains(&key), "the key leaked: {err}");
+        }
+        for mode in [0o400, 0o600] {
+            let path = file_in_open_dir(root.path(), "q4", &key, mode);
+            let keyring = keyring_from_file(&path, false)
+                .resolve_manifest_keyring()
+                .unwrap();
+            assert_eq!(keyring.active_id(), Some("q4-2026"), "{mode:o}");
+        }
+    }
+
+    /// #733: the override accepts a readable key file and never a writable
+    /// one.
+    #[cfg(unix)]
+    #[test]
+    fn the_override_accepts_a_readable_key_file_but_never_a_writable_one() {
+        let root = tempfile::tempdir().unwrap();
+        let key = "4d".repeat(32);
+        let path = file_in_open_dir(root.path(), "q4", &key, 0o644);
+        let keyring = keyring_from_file(&path, true)
+            .resolve_manifest_keyring()
+            .unwrap();
+        assert_eq!(keyring.active_id(), Some("q4-2026"));
+        for mode in [0o664, 0o646, 0o666] {
+            let path = file_in_open_dir(root.path(), "q4", &key, mode);
+            let err = keyring_from_file(&path, true)
+                .resolve_manifest_keyring()
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("no setting accepts it"), "{mode:o}: {err}");
+        }
+    }
+
+    /// #733: the state-store secret file follows the same rule.
+    #[cfg(unix)]
+    #[test]
+    fn a_state_store_secret_file_others_can_read_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let url = "postgres://vtop:password@db/vtop";
+        let path = file_in_open_dir(root.path(), "store", url, 0o644);
+        let mut cfg = VtopConfig::from_yaml_str(tuning_base()).unwrap();
+        cfg.engine.state_store = StateStoreConfig::File(StateStoreFileRef {
+            file: path.to_string_lossy().into_owned(),
+        });
+        let err = cfg.resolve_state_store().unwrap_err().to_string();
+        assert!(
+            err.contains("the state-store secret file") && err.contains("0644"),
+            "{err}"
+        );
+        assert!(!err.contains("password"), "{err}");
+        cfg.security.allow_loose_secret_permissions = true;
+        assert_eq!(cfg.resolve_state_store().unwrap().expose_secret(), url);
+        let path = file_in_open_dir(root.path(), "store", url, 0o400);
+        cfg.security.allow_loose_secret_permissions = false;
+        cfg.engine.state_store = StateStoreConfig::File(StateStoreFileRef {
+            file: path.to_string_lossy().into_owned(),
+        });
+        assert_eq!(cfg.resolve_state_store().unwrap().expose_secret(), url);
+    }
+
+    /// #733 (review): the ledger file is the one SQLite opens. The store
+    /// hands SQLite the name after the scheme with URI handling on, so a `?`
+    /// in a plain name is part of the file name, and only a `file:` name is
+    /// a URI.
+    #[test]
+    fn sqlite_ledger_file_names_the_file_sqlite_opens() {
+        use std::path::PathBuf;
+        let some = |p: &str| Some(PathBuf::from(p));
+        for (conn, want) in [
+            ("sqlite:///data/state.db", some("/data/state.db")),
+            ("sqlite:state.db", some("state.db")),
+            ("/data/state.db", some("/data/state.db")),
+            (
+                "sqlite:///data/state.db?mode=memory",
+                some("/data/state.db?mode=memory"),
+            ),
+            (
+                "sqlite:file:///data/a%20b.db?cache=shared",
+                some("/data/a b.db"),
+            ),
+            ("sqlite:file://localhost/data/x.db", some("/data/x.db")),
+            ("sqlite:file:rel.db#frag", some("rel.db")),
+            ("sqlite:file:state.db?cache=shared&mode=memory", None),
+            // A file unless every `mode` is `memory` (review): SQLite takes
+            // the last, and a mixed list is checked as a file either way.
+            (
+                "sqlite:file:/data/state.db?mode=memory&mode=rwc",
+                some("/data/state.db"),
+            ),
+            (
+                "sqlite:file:/data/state.db?mode=rwc&mode=memory",
+                some("/data/state.db"),
+            ),
+            (
+                "sqlite:file:/data/state.db?mode=memory&mode%00ignored=rwc",
+                some("/data/state.db"),
+            ),
+            (
+                "sqlite:file:/data/state.db?mode=memory&mode=memory%00x",
+                None,
+            ),
+            (
+                "sqlite:file:/data/state.db?mode=Memory",
+                some("/data/state.db"),
+            ),
+            // `%00` ends the name, as it does for SQLite (review).
+            (
+                "sqlite:file:/data/state.db%00ignored",
+                some("/data/state.db"),
+            ),
+            ("sqlite::memory:", None),
+            (":memory:", None),
+            ("sqlite://:memory:", None),
+            ("postgres://u@h/db", None),
+        ] {
+            assert_eq!(sqlite_ledger_file(conn), want, "{conn}");
+        }
+        // A decoded name that is not UTF-8 is still a file (review).
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let path = sqlite_ledger_file("sqlite:file:/data/state%FF.db").unwrap();
+            assert_eq!(path.as_os_str().as_bytes(), b"/data/state\xFF.db");
+        }
+    }
+
+    /// #733: `security` defaults off, and a misspelt key in it is refused.
+    #[test]
+    fn the_security_section_defaults_off_and_refuses_unknown_keys() {
+        let cfg = VtopConfig::from_yaml_str(tuning_base()).unwrap();
+        assert!(!cfg.security.allow_loose_secret_permissions);
+        let err = VtopConfig::from_yaml_str(&format!(
+            "{}security:\n  allow_loose_secret_permission: true\n",
+            tuning_base()
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("allow_loose_secret_permission"), "{err}");
+    }
+
+    /// #733: the files `vtopctl validate` checks, by kind, without reading
+    /// any of them.
+    #[test]
+    fn secret_files_lists_the_key_files_the_secret_file_and_an_inline_sqlite_ledger() {
+        use crate::secret_file::SecretFileKind::*;
+        let section = KEYRING.replace("/run/secrets/q4", "/keys/q4");
+        let mut cfg = VtopConfig::from_yaml_str(&with_manifest(&section)).unwrap();
+        cfg.engine.state_store = StateStoreConfig::Inline("sqlite:///data/s.db".into());
+        let files: Vec<_> = cfg
+            .secret_files()
+            .into_iter()
+            .map(|f| (f.kind, f.path.display().to_string()))
+            .collect();
+        assert_eq!(
+            files,
+            [
+                (ManifestKey, "/keys/q4".to_owned()),
+                (StateStoreDatabase, "/data/s.db".to_owned()),
+                (StateStoreDatabase, "/data/s.db-wal".to_owned()),
+                (StateStoreDatabase, "/data/s.db-shm".to_owned()),
+            ]
+        );
+        cfg.engine.state_store = StateStoreConfig::File(StateStoreFileRef {
+            file: "/run/secrets/store".into(),
+        });
+        let kinds: Vec<_> = cfg.secret_files().into_iter().map(|f| f.kind).collect();
+        assert_eq!(kinds, [ManifestKey, StateStoreSecret]);
+        cfg.engine.state_store = StateStoreConfig::Inline("sqlite::memory:".into());
+        assert_eq!(cfg.secret_files().len(), 1);
     }
 
     #[test]
@@ -2083,6 +3798,34 @@ upload:
         let other = yaml.replace(
             "  backend: s3_native",
             "  backend: mock\n  request_timeout_seconds: 0",
+        );
+        let cfg: VtopConfig = serde_yaml::from_str(&other).unwrap();
+        cfg.validate().unwrap();
+
+        // The body floor (#663): 4 KiB/s unless set, settable, and never zero
+        // on the backend that divides by it.
+        let cfg: VtopConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.upload.request_min_bytes_per_second, 4096);
+        let set = yaml.replace(
+            "  backend: s3_native",
+            "  backend: s3_native\n  request_min_bytes_per_second: 1024",
+        );
+        let cfg: VtopConfig = serde_yaml::from_str(&set).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.upload.request_min_bytes_per_second, 1024);
+        let zero = yaml.replace(
+            "  backend: s3_native",
+            "  backend: s3_native\n  request_min_bytes_per_second: 0",
+        );
+        let cfg: VtopConfig = serde_yaml::from_str(&zero).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("upload.request_min_bytes_per_second") && err.contains("> 0"),
+            "{err}"
+        );
+        let other = yaml.replace(
+            "  backend: s3_native",
+            "  backend: mock\n  request_min_bytes_per_second: 0",
         );
         let cfg: VtopConfig = serde_yaml::from_str(&other).unwrap();
         cfg.validate().unwrap();
@@ -2279,6 +4022,108 @@ upload:
             .expect_err("a zero ceiling admits nothing and must be refused")
             .to_string();
         assert!(msg.contains("max_concurrency_ceiling"), "{msg}");
+    }
+
+    /// #684: the Object Lock profile's config, through the real door
+    /// (`from_yaml_str` then `validate`). Written against YAML only, so the
+    /// same test compiles on a tree without the profile, where the block is
+    /// an unknown key that is silently ignored and every refusal below is
+    /// missing.
+    fn object_lock_config(upload_extra: &str) -> Result<VtopConfig, String> {
+        let yaml = format!(
+            r#"
+engine:
+  name: vtop-engine
+  state_store: "sqlite::memory:"
+  work_dir: /tmp/work
+batching: {{}}
+compression: {{}}
+sources: {{}}
+upload:
+  bucket: telemetry-locked
+{upload_extra}"#
+        );
+        let cfg = VtopConfig::from_yaml_str(&yaml).map_err(|e| e.to_string())?;
+        cfg.validate().map_err(|e| e.to_string())?;
+        Ok(cfg)
+    }
+
+    #[test]
+    fn an_object_lock_block_is_checked_and_refused_naming_its_keys() {
+        let versioned = "  require_object_versioning: true\n";
+        // Accepted at both ends of the range, in either mode.
+        for (mode, days) in [("governance", 1), ("compliance", 3650)] {
+            object_lock_config(&format!(
+                "{versioned}  object_lock:\n    mode: {mode}\n    retain_days: {days}\n"
+            ))
+            .unwrap_or_else(|e| panic!("{mode} for {days} days is valid: {e}"));
+        }
+        // A mode that is not one is refused at the parse, naming both.
+        let msg = object_lock_config(&format!(
+            "{versioned}  object_lock:\n    mode: strict\n    retain_days: 30\n"
+        ))
+        .expect_err("an unknown mode must be refused");
+        assert!(
+            msg.contains("strict") && msg.contains("governance") && msg.contains("compliance"),
+            "the refusal names the bad mode and the valid ones: {msg}"
+        );
+        // retain_days outside 1..=3650.
+        for days in [0, 3651] {
+            let msg = object_lock_config(&format!(
+                "{versioned}  object_lock:\n    mode: governance\n    retain_days: {days}\n"
+            ))
+            .expect_err("a retention outside the range must be refused");
+            assert!(
+                msg.contains(&format!("upload.object_lock.retain_days = {days}"))
+                    && msg.contains("1..=3650"),
+                "the refusal names the key, the value and the range: {msg}"
+            );
+        }
+        // Without versioning: names both keys and what to set.
+        let msg = object_lock_config("  object_lock:\n    mode: governance\n    retain_days: 30\n")
+            .expect_err("Object Lock without versioning must be refused");
+        assert!(
+            msg.contains("upload.object_lock")
+                && msg.contains("upload.require_object_versioning: true"),
+            "{msg}"
+        );
+        // With create_bucket: names both keys and what to do.
+        let msg = object_lock_config(&format!(
+            "{versioned}  create_bucket: true\n  object_lock:\n    mode: governance\n    retain_days: 30\n"
+        ))
+        .expect_err("Object Lock with create_bucket must be refused");
+        assert!(
+            msg.contains("upload.object_lock")
+                && msg.contains("upload.create_bucket")
+                && msg.contains("Create the bucket with Object Lock enabled"),
+            "{msg}"
+        );
+        // A misspelled key inside the block is refused, not ignored.
+        let msg = object_lock_config(&format!(
+            "{versioned}  object_lock:\n    mode: governance\n    retain_day: 30\n"
+        ))
+        .expect_err("a misspelled key in a retention policy must be refused");
+        assert!(msg.contains("retain_day"), "{msg}");
+        // Another backend is refused at config load, as `vtopctl validate`
+        // runs it, not only when the engine builds the backend (review of
+        // #708).
+        let msg = object_lock_config(&format!(
+            "{versioned}  backend: localfs\n  local_path: /tmp/x\n  object_lock:\n    mode: governance\n    retain_days: 30\n"
+        ))
+        .expect_err("a backend that cannot lock must be refused at load");
+        assert!(
+            msg.contains("upload.object_lock")
+                && msg.contains("localfs")
+                && msg.contains("s3_native"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn without_an_object_lock_block_nothing_changes() {
+        // The default: no block, and none of the rules above applies, even
+        // with create_bucket set and versioning off.
+        object_lock_config("  create_bucket: true\n").expect("valid as before");
     }
 
     #[test]

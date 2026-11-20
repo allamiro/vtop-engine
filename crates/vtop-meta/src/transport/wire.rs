@@ -63,6 +63,14 @@ pub const KIND_APPEND_REQ: u16 = 3;
 pub const KIND_APPEND_RESP: u16 = 4;
 pub const KIND_INSTALL_REQ: u16 = 5;
 pub const KIND_INSTALL_RESP: u16 = 6;
+/// A metadata member's release and the highest feature level it implements
+/// (#706): what a leader asks every member before it raises the level to one
+/// the members must all implement (8 and up). A release before this one has no arm for
+/// the kind and closes the connection without an answer, which is itself
+/// the answer: it predates the question, so it supports no level that asks
+/// it.
+pub const KIND_PEER_VERSION_REQ: u16 = 7;
+pub const KIND_PEER_VERSION_RESP: u16 = 8;
 pub const KIND_ADMIN_STATUS_REQ: u16 = 10;
 pub const KIND_ADMIN_STATUS_RESP: u16 = 11;
 pub const KIND_ADMIN_PROPOSE_REQ: u16 = 12;
@@ -90,6 +98,21 @@ pub const KIND_ADMIN_READ_GROUP_CURSOR_RESP: u16 = 26;
 // configured set against before it promotes.
 pub const KIND_ADMIN_READ_RANGE_REPLICA_SET_REQ: u16 = 27;
 pub const KIND_ADMIN_READ_RANGE_REPLICA_SET_RESP: u16 = 28;
+// The cluster's feature level and what each node reported it runs (#634):
+// what `vtopctl meta enable-features` judges a raise on, and how a data node
+// learns the level its replica plane must hold peers to.
+pub const KIND_ADMIN_READ_CLUSTER_VERSIONS_REQ: u16 = 29;
+pub const KIND_ADMIN_READ_CLUSTER_VERSIONS_RESP: u16 = 30;
+
+/// The most nodes one cluster-versions read lists (#634). A cluster with more
+/// is told so (`truncated`), and a caller judging a raise on the list must
+/// then refuse to judge: the state machine still judges the raise itself.
+pub const MAX_CLUSTER_VERSION_NODES: usize = 4096;
+
+// A range's live promotion attestation (#636): what a candidate whose quorum
+// cannot prove its lineage checks before it counts an Unknown answer.
+pub const KIND_ADMIN_READ_PROMOTION_ATTESTATION_REQ: u16 = 31;
+pub const KIND_ADMIN_READ_PROMOTION_ATTESTATION_RESP: u16 = 32;
 
 /// The most transition records one read returns; a longer chain is paged
 /// with `from_epoch`.
@@ -136,6 +159,11 @@ pub enum TransportError {
     Unauthorized(String),
     #[error("{0}")]
     Protocol(String),
+    /// The node refused the request before proposing anything (#706): a
+    /// precondition the operator must fix first. Its own variant so the
+    /// edge audit record says "refused" rather than "outcome unknown".
+    #[error("{0}")]
+    Refused(String),
     /// The peer refused because it does not lead; ask `leader` instead.
     ///
     /// Its own variant rather than a [`TransportError::Protocol`] carrying the
@@ -387,6 +415,85 @@ fn take_log_entry(reader: &mut Reader<'_>) -> Result<MetaLogEntry, CodecError> {
 // ---------------------------------------------------------------------------
 // Peer RPC payloads
 // ---------------------------------------------------------------------------
+
+/// "What do you run?", asked by a metadata leader of a member (#706).
+///
+/// Carries the asking node so an mTLS plane can cross-check it against the
+/// certificate, as every other peer request's claimed sender is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerVersionRequest {
+    pub from: MetaNodeId,
+}
+
+impl PeerVersionRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8);
+        put_u64(&mut out, self.from.0);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let from = MetaNodeId(reader.u64("version request sender")?);
+        reader.finish()?;
+        Ok(Self { from })
+    }
+}
+
+/// A member's answer: who answered, its release, and the highest metadata
+/// feature level it implements.
+///
+/// `node_id` is the ANSWERING node, so a leader that dialled a stale address
+/// (a member replaced under the same name, a plaintext plane with no
+/// certificate to check) does not take another node's word for the one it
+/// asked about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerVersionResponse {
+    pub node_id: MetaNodeId,
+    /// 1..=[`crate::command::MAX_RELEASE_BYTES`] bytes, such as `0.10.0`.
+    pub release: String,
+    pub supported_feature_level: u32,
+}
+
+impl PeerVersionResponse {
+    pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        if self.release.is_empty() {
+            return Err(CodecError::InvalidValue {
+                what: "member release",
+                reason: "a release must not be empty",
+            });
+        }
+        let mut out = Vec::with_capacity(8 + 2 + self.release.len() + 4);
+        put_u64(&mut out, self.node_id.0);
+        put_bounded_str(
+            &mut out,
+            &self.release,
+            crate::command::MAX_RELEASE_BYTES,
+            "member release",
+        )?;
+        put_u32(&mut out, self.supported_feature_level);
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let node_id = MetaNodeId(reader.u64("member node id")?);
+        let release = reader.bounded_str(crate::command::MAX_RELEASE_BYTES, "member release")?;
+        if release.is_empty() {
+            return Err(CodecError::InvalidValue {
+                what: "member release",
+                reason: "a release must not be empty",
+            });
+        }
+        let supported_feature_level = reader.u32("member feature level")?;
+        reader.finish()?;
+        Ok(Self {
+            node_id,
+            release,
+            supported_feature_level,
+        })
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerVoteRequest {
@@ -1206,6 +1313,77 @@ impl AdminReadRangeReplicaSetRequest {
     }
 }
 
+/// Which range's live promotion attestation to read (#636).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdminReadPromotionAttestationRequest {
+    pub topic_uuid: Uuid,
+    pub range_uuid: Uuid,
+}
+
+impl AdminReadPromotionAttestationRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_uuid(&mut out, self.topic_uuid);
+        put_uuid(&mut out, self.range_uuid);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let request = Self {
+            topic_uuid: reader.uuid("topic uuid")?,
+            range_uuid: reader.uuid("range uuid")?,
+        };
+        reader.finish()?;
+        Ok(request)
+    }
+}
+
+/// Whether the range exists, its live promotion attestation if an operator
+/// recorded one no promotion has used yet (#636), and the applied index the
+/// read was served at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminReadPromotionAttestationResponse {
+    pub range_found: bool,
+    pub attestation: Option<crate::command::PromotionAttestation>,
+    pub read_at_applied_index: u64,
+}
+
+impl AdminReadPromotionAttestationResponse {
+    pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        let mut out = Vec::new();
+        put_u8(&mut out, u8::from(self.range_found));
+        match &self.attestation {
+            None => put_u8(&mut out, 0),
+            Some(attestation) => {
+                put_u8(&mut out, 1);
+                attestation.encode_into(&mut out)?;
+            }
+        }
+        put_u64(&mut out, self.read_at_applied_index);
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let range_found = reader.flag("range found")?;
+        let attestation = if reader.flag("attestation presence")? {
+            Some(crate::command::PromotionAttestation::decode_from(
+                &mut reader,
+            )?)
+        } else {
+            None
+        };
+        let response = Self {
+            range_found,
+            attestation,
+            read_at_applied_index: reader.u64("read-at applied index")?,
+        };
+        reader.finish()?;
+        Ok(response)
+    }
+}
+
 /// A recorded replica set as the admin wire carries it: the state machine's
 /// [`crate::state::RangeReplicaSetRecord`], field for field.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1302,6 +1480,131 @@ impl AdminReadRangeReplicaSetResponse {
         };
         reader.finish()?;
         Ok(response)
+    }
+}
+
+/// Read the cluster's feature level, and optionally every node's version
+/// report (#634).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdminReadClusterVersionsRequest {
+    /// `false` reads the level alone: what a data node polls, and it costs
+    /// no walk of the records.
+    pub include_nodes: bool,
+}
+
+impl AdminReadClusterVersionsRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_u8(&mut out, u8::from(self.include_nodes));
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let request = Self {
+            include_nodes: reader.flag("include nodes")?,
+        };
+        reader.finish()?;
+        Ok(request)
+    }
+}
+
+/// The level in force, the registered nodes (when asked for) with what each
+/// reported, and the applied index the read was served at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminReadClusterVersionsResponse {
+    pub versions: crate::versions::ClusterVersions,
+    /// More nodes are registered than [`MAX_CLUSTER_VERSION_NODES`]; the
+    /// list holds the first of them in node order.
+    pub truncated: bool,
+    pub read_at_applied_index: u64,
+}
+
+impl AdminReadClusterVersionsResponse {
+    pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        let nodes = &self.versions.nodes;
+        if nodes.len() > MAX_CLUSTER_VERSION_NODES {
+            return Err(CodecError::BoundExceeded {
+                what: "cluster version nodes",
+                actual: nodes.len(),
+                maximum: MAX_CLUSTER_VERSION_NODES,
+            });
+        }
+        let mut out = Vec::new();
+        put_u32(&mut out, self.versions.feature_level);
+        put_u8(&mut out, u8::from(self.truncated));
+        put_u64(&mut out, self.read_at_applied_index);
+        put_u16(&mut out, nodes.len() as u16);
+        for node in nodes {
+            put_uuid(&mut out, node.node_uuid);
+            put_u8(&mut out, node.state.wire_tag());
+            put_u8(&mut out, u8::from(node.range_member));
+            match &node.report {
+                None => put_u8(&mut out, 0),
+                Some(report) => {
+                    put_u8(&mut out, 1);
+                    put_bounded_str(
+                        &mut out,
+                        &report.release,
+                        crate::command::MAX_RELEASE_BYTES,
+                        "release",
+                    )?;
+                    put_u16(&mut out, report.max_replica_protocol);
+                    put_u32(&mut out, report.supported_feature_level);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let feature_level = reader.u32("feature level")?;
+        let truncated = reader.flag("truncated")?;
+        let read_at_applied_index = reader.u64("read at applied index")?;
+        let count = usize::from(reader.u16("cluster version node count")?);
+        if count > MAX_CLUSTER_VERSION_NODES {
+            return Err(CodecError::BoundExceeded {
+                what: "cluster version nodes",
+                actual: count,
+                maximum: MAX_CLUSTER_VERSION_NODES,
+            });
+        }
+        let mut nodes = Vec::with_capacity(count);
+        for _ in 0..count {
+            let node_uuid = reader.uuid("node uuid")?;
+            let state = crate::command::NodeState::from_wire(reader.u8("node state")?)?;
+            let range_member = reader.flag("range member")?;
+            let report = match reader.u8("report flag")? {
+                0 => None,
+                1 => Some(crate::versions::NodeVersionRecord {
+                    release: reader.bounded_str(crate::command::MAX_RELEASE_BYTES, "release")?,
+                    max_replica_protocol: reader.u16("max replica protocol")?,
+                    supported_feature_level: reader.u32("supported feature level")?,
+                }),
+                _ => {
+                    return Err(CodecError::InvalidValue {
+                        what: "report flag",
+                        reason: "must be 0 or 1",
+                    })
+                }
+            };
+            nodes.push(crate::versions::NodeVersionEntry {
+                node_uuid,
+                state,
+                range_member,
+                report,
+            });
+        }
+        reader.finish()?;
+        Ok(Self {
+            versions: crate::versions::ClusterVersions {
+                feature_level,
+                nodes,
+            },
+            truncated,
+            read_at_applied_index,
+        })
     }
 }
 
@@ -1674,10 +1977,10 @@ impl AdminReadRangeLeaseResponse {
                     _ => None,
                 },
             }),
-            _ => {
-                return Err(CodecError::InvalidValue {
+            other => {
+                return Err(CodecError::UnknownTag {
                     what: "lease presence",
-                    reason: "lease presence byte must be 0, 1, or 2",
+                    tag: u32::from(other),
                 })
             }
         };
@@ -1981,6 +2284,97 @@ impl AdminError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #706: the member version exchange, derived by hand from the layout -
+    /// request `u64 from`; response `u64 node_id | u16 len + release | u32
+    /// level` - so a change to either shape fails here before an older
+    /// leader meets it.
+    #[test]
+    fn the_member_version_exchange_matches_its_golden_bytes() {
+        let request = PeerVersionRequest {
+            from: MetaNodeId(1),
+        };
+        assert_eq!(request.encode(), [0, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(
+            PeerVersionRequest::decode(&request.encode()).unwrap(),
+            request
+        );
+
+        let response = PeerVersionResponse {
+            node_id: MetaNodeId(3),
+            release: "0.10.0".to_owned(),
+            supported_feature_level: 9,
+        };
+        let golden: Vec<u8> = [
+            &[0, 0, 0, 0, 0, 0, 0, 3][..],
+            &[0, 6],
+            b"0.10.0",
+            &[0, 0, 0, 9],
+        ]
+        .concat();
+        assert_eq!(response.encode().unwrap(), golden);
+        assert_eq!(PeerVersionResponse::decode(&golden).unwrap(), response);
+        assert_eq!((KIND_PEER_VERSION_REQ, KIND_PEER_VERSION_RESP), (7, 8));
+    }
+
+    /// Every length is bounded before it is trusted, trailing bytes are
+    /// refused, and an empty release is neither sent nor accepted.
+    #[test]
+    fn the_member_version_exchange_refuses_malformed_frames() {
+        let mut trailing = PeerVersionRequest {
+            from: MetaNodeId(1),
+        }
+        .encode();
+        trailing.push(0);
+        assert!(matches!(
+            PeerVersionRequest::decode(&trailing),
+            Err(CodecError::Trailing(1))
+        ));
+        assert!(matches!(
+            PeerVersionRequest::decode(&[0; 7]),
+            Err(CodecError::Truncated(_))
+        ));
+
+        let over = "9".repeat(crate::command::MAX_RELEASE_BYTES + 1);
+        let refused = PeerVersionResponse {
+            node_id: MetaNodeId(1),
+            release: over.clone(),
+            supported_feature_level: 9,
+        }
+        .encode();
+        assert!(matches!(refused, Err(CodecError::BoundExceeded { .. })));
+        let mut forged = vec![0, 0, 0, 0, 0, 0, 0, 1];
+        put_u16(&mut forged, over.len() as u16);
+        forged.extend_from_slice(over.as_bytes());
+        put_u32(&mut forged, 9);
+        assert!(matches!(
+            PeerVersionResponse::decode(&forged),
+            Err(CodecError::BoundExceeded { .. })
+        ));
+
+        let empty = PeerVersionResponse {
+            node_id: MetaNodeId(1),
+            release: String::new(),
+            supported_feature_level: 9,
+        };
+        assert!(empty.encode().is_err());
+        let mut forged = vec![0, 0, 0, 0, 0, 0, 0, 1, 0, 0];
+        put_u32(&mut forged, 9);
+        assert!(PeerVersionResponse::decode(&forged).is_err());
+
+        let mut trailing = PeerVersionResponse {
+            node_id: MetaNodeId(1),
+            release: "0.10.0".to_owned(),
+            supported_feature_level: 9,
+        }
+        .encode()
+        .unwrap();
+        trailing.push(0);
+        assert!(matches!(
+            PeerVersionResponse::decode(&trailing),
+            Err(CodecError::Trailing(1))
+        ));
+    }
 
     /// The redirect round-trips in all three of its states, and an OLD frame
     /// still decodes.
@@ -2311,6 +2705,7 @@ mod tests {
                     }],
                     votes: 1,
                     required: 1,
+                    attestation: None,
                 },
                 reported_at_ms: 2_500,
                 reported_apply_index: 12,
@@ -2402,6 +2797,101 @@ mod tests {
         let mut bad = none.encode().unwrap();
         bad[1] = 2;
         assert!(AdminReadGroupCursorResponse::decode(&bad).is_err());
+    }
+
+    #[test]
+    fn cluster_versions_read_round_trips_and_bounds_its_nodes() {
+        let request = AdminReadClusterVersionsRequest {
+            include_nodes: true,
+        };
+        assert_eq!(
+            AdminReadClusterVersionsRequest::decode(&request.encode()).unwrap(),
+            request
+        );
+        let response = AdminReadClusterVersionsResponse {
+            versions: crate::versions::ClusterVersions {
+                feature_level: 7,
+                nodes: vec![
+                    crate::versions::NodeVersionEntry {
+                        node_uuid: Uuid::from_u128(1),
+                        state: crate::command::NodeState::Active,
+                        range_member: true,
+                        report: Some(crate::versions::NodeVersionRecord {
+                            release: "0.8.0".to_owned(),
+                            max_replica_protocol: 2,
+                            supported_feature_level: 7,
+                        }),
+                    },
+                    crate::versions::NodeVersionEntry {
+                        node_uuid: Uuid::from_u128(2),
+                        state: crate::command::NodeState::Dead,
+                        range_member: false,
+                        report: None,
+                    },
+                ],
+            },
+            truncated: false,
+            read_at_applied_index: 42,
+        };
+        assert_eq!(
+            AdminReadClusterVersionsResponse::decode(&response.encode().unwrap()).unwrap(),
+            response
+        );
+        let mut too_many = response.clone();
+        too_many.versions.nodes =
+            vec![response.versions.nodes[1].clone(); MAX_CLUSTER_VERSION_NODES + 1];
+        assert!(too_many.encode().is_err());
+        let mut forged = response.encode().unwrap();
+        // The count sits after level (4), truncated (1) and index (8).
+        forged[13..15].copy_from_slice(&((MAX_CLUSTER_VERSION_NODES + 1) as u16).to_be_bytes());
+        assert!(matches!(
+            AdminReadClusterVersionsResponse::decode(&forged),
+            Err(CodecError::BoundExceeded { .. })
+        ));
+    }
+
+    /// #636: the attestation read round-trips its request and both shapes
+    /// of its answer, and refuses a bad presence flag and trailing bytes.
+    #[test]
+    fn promotion_attestation_read_round_trips() {
+        let request = AdminReadPromotionAttestationRequest {
+            topic_uuid: Uuid::from_u128(0x20),
+            range_uuid: Uuid::from_u128(0x21),
+        };
+        assert_eq!(
+            AdminReadPromotionAttestationRequest::decode(&request.encode()).unwrap(),
+            request
+        );
+        let none = AdminReadPromotionAttestationResponse {
+            range_found: true,
+            attestation: None,
+            read_at_applied_index: 9,
+        };
+        assert_eq!(
+            AdminReadPromotionAttestationResponse::decode(&none.encode().unwrap()).unwrap(),
+            none
+        );
+        let live = AdminReadPromotionAttestationResponse {
+            range_found: true,
+            attestation: Some(crate::command::PromotionAttestation {
+                attestation_id: Uuid::from_u128(0x636),
+                replica_node_uuid: Uuid::from_u128(0x10),
+                operator: "oncall".to_owned(),
+                attested_at_ms: 1_700_000_000_000,
+            }),
+            read_at_applied_index: 10,
+        };
+        let bytes = live.encode().unwrap();
+        assert_eq!(
+            AdminReadPromotionAttestationResponse::decode(&bytes).unwrap(),
+            live
+        );
+        let mut bad_flag = none.encode().unwrap();
+        bad_flag[1] = 7;
+        assert!(AdminReadPromotionAttestationResponse::decode(&bad_flag).is_err());
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(AdminReadPromotionAttestationResponse::decode(&trailing).is_err());
     }
 
     #[test]
@@ -2741,6 +3231,312 @@ mod tests {
             future.state_name(),
             None,
             "a tag from a newer leader must read as unknown, not as the nearest known state"
+        );
+    }
+    /// `fuzz/corpus/vtpm_frame`, where the fuzz target's committed seeds live
+    /// (#729).
+    fn fuzz_seed_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus/vtpm_frame")
+    }
+
+    /// The seeds: a frame per kind. Where a payload is simple to build here
+    /// it is a real one (`kind-NN`); the other kinds carry an empty payload
+    /// (`bare-kind-NN`), a valid frame the fuzzer grows a payload into.
+    fn fuzz_seeds() -> Vec<(String, Vec<u8>)> {
+        let ids = |topic: u128, range: u128| (Uuid::from_u128(topic), Uuid::from_u128(range));
+        let (topic_uuid, range_uuid) = ids(7, 8);
+        let membership = MetaMembership {
+            voters: vec![MetaNodeId(1), MetaNodeId(2), MetaNodeId(3)],
+            learners: vec![(MetaNodeId(5), String::new())],
+            joint_outgoing: Some(vec![MetaNodeId(1), MetaNodeId(2)]),
+        };
+        let full: Vec<(u16, Vec<u8>)> = vec![
+            (
+                KIND_VOTE_REQ,
+                PeerVoteRequest {
+                    vote: sample_vote(),
+                    last_log_id: Some(WireLogId { term: 6, index: 2 }),
+                }
+                .encode()
+                .unwrap(),
+            ),
+            (
+                KIND_VOTE_RESP,
+                PeerVoteResponse {
+                    vote: sample_vote(),
+                    vote_granted: true,
+                    last_log_id: Some(WireLogId { term: 1, index: 1 }),
+                }
+                .encode()
+                .unwrap(),
+            ),
+            (
+                KIND_APPEND_REQ,
+                PeerAppendRequest {
+                    vote: sample_vote(),
+                    prev_log_id: Some(WireLogId { term: 7, index: 2 }),
+                    entries: vec![
+                        sample_entry(),
+                        MetaLogEntry {
+                            term: 7,
+                            index: 4,
+                            payload: MetaLogPayload::Membership(membership.clone()),
+                        },
+                    ],
+                    leader_commit: Some(WireLogId { term: 7, index: 2 }),
+                }
+                .encode()
+                .unwrap(),
+            ),
+            (
+                KIND_APPEND_RESP,
+                PeerAppendResponse::PartialSuccess(Some(WireLogId { term: 1, index: 2 }))
+                    .encode()
+                    .unwrap(),
+            ),
+            (
+                KIND_INSTALL_REQ,
+                PeerInstallRequest {
+                    vote: sample_vote(),
+                    last_log_id: Some(WireLogId { term: 7, index: 9 }),
+                    membership_log_id: Some(WireLogId { term: 7, index: 4 }),
+                    last_membership: membership.clone(),
+                    snapshot_id: "snap-1".to_owned(),
+                    offset: 0,
+                    data: vec![1, 2, 3, 4],
+                    done: true,
+                }
+                .encode()
+                .unwrap(),
+            ),
+            (
+                KIND_INSTALL_RESP,
+                PeerInstallResponse {
+                    vote: sample_vote(),
+                }
+                .encode()
+                .unwrap(),
+            ),
+            (KIND_ADMIN_STATUS_REQ, AdminStatusRequest.encode()),
+            (
+                KIND_ADMIN_STATUS_RESP,
+                AdminStatusResponse {
+                    node_id: MetaNodeId(1),
+                    current_term: 4,
+                    vote: sample_vote(),
+                    current_leader: Some(MetaNodeId(1)),
+                    server_state: "Leader".to_owned(),
+                    last_applied: Some(WireLogId { term: 4, index: 10 }),
+                    membership: membership.clone(),
+                }
+                .encode()
+                .unwrap(),
+            ),
+            (
+                KIND_ADMIN_PROPOSE_REQ,
+                AdminProposeRequest {
+                    command: match sample_entry().payload {
+                        MetaLogPayload::Normal(command) => command,
+                        _ => unreachable!(),
+                    },
+                }
+                .encode()
+                .unwrap(),
+            ),
+            (
+                KIND_ADMIN_ERROR,
+                AdminError {
+                    message: "not the leader".to_owned(),
+                    not_leader: Some(NotLeaderHint {
+                        leader: Some(MetaNodeId(7)),
+                    }),
+                }
+                .encode()
+                .unwrap(),
+            ),
+            (
+                KIND_ADMIN_INIT_REQ,
+                AdminInitRequest {
+                    members: vec![1, 2, 3],
+                }
+                .encode()
+                .unwrap(),
+            ),
+            (
+                KIND_ADMIN_ADD_LEARNER_REQ,
+                AdminAddLearnerRequest { node_id: 4 }.encode().unwrap(),
+            ),
+            (
+                KIND_ADMIN_CHANGE_MEMBERSHIP_REQ,
+                AdminChangeMembershipRequest {
+                    voters: vec![1, 2, 3, 4],
+                    retain_removed_as_learners: true,
+                }
+                .encode()
+                .unwrap(),
+            ),
+            (
+                KIND_ADMIN_MEMBERSHIP_RESP,
+                AdminMembershipResponse {
+                    membership: membership.clone(),
+                }
+                .encode()
+                .unwrap(),
+            ),
+            (
+                KIND_ADMIN_READ_RANGE_LEASE_REQ,
+                AdminReadRangeLeaseRequest {
+                    topic_uuid,
+                    range_uuid,
+                }
+                .encode(),
+            ),
+            (
+                KIND_ADMIN_READ_RANGE_LEASE_RESP,
+                AdminReadRangeLeaseResponse {
+                    found: true,
+                    range_generation: 12,
+                    fencing_epoch: 4,
+                    lease: Some(AdminLeaseView {
+                        holder_node_uuid: Uuid::from_u128(9),
+                        fencing_epoch: 4,
+                        expires_at_ms: Some(1_700_000_000_000),
+                    }),
+                    read_at_applied_index: 99,
+                }
+                .encode(),
+            ),
+            (
+                KIND_ADMIN_READ_GROUP_CURSOR_REQ,
+                AdminReadGroupCursorRequest {
+                    group_uuid: Uuid::from_u128(6),
+                    topic_uuid,
+                    range_uuid,
+                }
+                .encode(),
+            ),
+            (
+                KIND_ADMIN_READ_RANGE_REPLICA_SET_REQ,
+                AdminReadRangeReplicaSetRequest {
+                    topic_uuid,
+                    range_uuid,
+                }
+                .encode(),
+            ),
+            (
+                KIND_ADMIN_READ_PROMOTION_ATTESTATION_REQ,
+                AdminReadPromotionAttestationRequest {
+                    topic_uuid,
+                    range_uuid,
+                }
+                .encode(),
+            ),
+            (
+                KIND_ADMIN_READ_CLUSTER_VERSIONS_REQ,
+                AdminReadClusterVersionsRequest {
+                    include_nodes: true,
+                }
+                .encode(),
+            ),
+        ];
+        let bare = [
+            KIND_ADMIN_PROPOSE_RESP,
+            KIND_ADMIN_READ_SEGMENT_PLACEMENT_REQ,
+            KIND_ADMIN_READ_SEGMENT_PLACEMENT_RESP,
+            KIND_ADMIN_READ_RANGE_TRANSITIONS_REQ,
+            KIND_ADMIN_READ_RANGE_TRANSITIONS_RESP,
+            KIND_ADMIN_READ_GROUP_CURSOR_RESP,
+            KIND_ADMIN_READ_RANGE_REPLICA_SET_RESP,
+            KIND_ADMIN_READ_CLUSTER_VERSIONS_RESP,
+            KIND_ADMIN_READ_PROMOTION_ATTESTATION_RESP,
+        ];
+        let frame = |kind: u16, payload: Vec<u8>| VtpmFrame { kind, payload }.encode().unwrap();
+        full.into_iter()
+            .map(|(kind, payload)| (format!("kind-{kind:02}"), frame(kind, payload)))
+            .chain(
+                bare.into_iter()
+                    .map(|kind| (format!("bare-kind-{kind:02}"), frame(kind, Vec::new()))),
+            )
+            .collect()
+    }
+
+    /// Rewrites the committed seeds. Run on purpose after a format change:
+    /// `cargo test -p vtop-meta --lib -- --ignored write_fuzz_seeds`.
+    #[test]
+    #[ignore = "writes fuzz/corpus/vtpm_frame; run on purpose"]
+    fn write_fuzz_seeds() {
+        let dir = fuzz_seed_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, bytes) in fuzz_seeds() {
+            std::fs::write(dir.join(format!("{name}.seed")), bytes).unwrap();
+        }
+    }
+
+    /// #729: every committed seed is a VTPM frame this build decodes, and a
+    /// `kind-NN` seed's payload decodes as that kind, so the fuzzer starts
+    /// inside the payload decoders. Every kind in the closed list has one.
+    #[test]
+    fn the_committed_fuzz_seeds_decode() {
+        let mut kinds = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(fuzz_seed_dir()).unwrap() {
+            let path = entry.unwrap().path();
+            // Only the committed seeds: a local fuzzing run leaves the inputs it
+            // found here too (git-ignored), and those may rightly not decode.
+            if path.extension().and_then(|e| e.to_str()) != Some("seed") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let frame = VtpmFrame::decode(&std::fs::read(&path).unwrap())
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            kinds.insert(frame.kind);
+            if name.starts_with("bare-") {
+                continue;
+            }
+            let payload = &frame.payload;
+            let decoded = match frame.kind {
+                KIND_VOTE_REQ => PeerVoteRequest::decode(payload).map(drop),
+                KIND_VOTE_RESP => PeerVoteResponse::decode(payload).map(drop),
+                KIND_APPEND_REQ => PeerAppendRequest::decode(payload).map(drop),
+                KIND_APPEND_RESP => PeerAppendResponse::decode(payload).map(drop),
+                KIND_INSTALL_REQ => PeerInstallRequest::decode(payload).map(drop),
+                KIND_INSTALL_RESP => PeerInstallResponse::decode(payload).map(drop),
+                KIND_ADMIN_STATUS_REQ => AdminStatusRequest::decode(payload).map(drop),
+                KIND_ADMIN_STATUS_RESP => AdminStatusResponse::decode(payload).map(drop),
+                KIND_ADMIN_PROPOSE_REQ => AdminProposeRequest::decode(payload).map(drop),
+                KIND_ADMIN_ERROR => AdminError::decode(payload).map(drop),
+                KIND_ADMIN_INIT_REQ => AdminInitRequest::decode(payload).map(drop),
+                KIND_ADMIN_ADD_LEARNER_REQ => AdminAddLearnerRequest::decode(payload).map(drop),
+                KIND_ADMIN_CHANGE_MEMBERSHIP_REQ => {
+                    AdminChangeMembershipRequest::decode(payload).map(drop)
+                }
+                KIND_ADMIN_MEMBERSHIP_RESP => AdminMembershipResponse::decode(payload).map(drop),
+                KIND_ADMIN_READ_RANGE_LEASE_REQ => {
+                    AdminReadRangeLeaseRequest::decode(payload).map(drop)
+                }
+                KIND_ADMIN_READ_RANGE_LEASE_RESP => {
+                    AdminReadRangeLeaseResponse::decode(payload).map(drop)
+                }
+                KIND_ADMIN_READ_GROUP_CURSOR_REQ => {
+                    AdminReadGroupCursorRequest::decode(payload).map(drop)
+                }
+                KIND_ADMIN_READ_RANGE_REPLICA_SET_REQ => {
+                    AdminReadRangeReplicaSetRequest::decode(payload).map(drop)
+                }
+                KIND_ADMIN_READ_PROMOTION_ATTESTATION_REQ => {
+                    AdminReadPromotionAttestationRequest::decode(payload).map(drop)
+                }
+                KIND_ADMIN_READ_CLUSTER_VERSIONS_REQ => {
+                    AdminReadClusterVersionsRequest::decode(payload).map(drop)
+                }
+                other => panic!("{name}: kind {other} has no payload check here"),
+            };
+            decoded.unwrap_or_else(|error| panic!("{name}: {error}"));
+        }
+        // The closed list of kinds: 1-6 (peer) and 10-32 (admin).
+        let expected: std::collections::BTreeSet<u16> = (1..=6).chain(10..=32).collect();
+        assert_eq!(
+            kinds, expected,
+            "a VTPM kind has no seed; run write_fuzz_seeds"
         );
     }
 }

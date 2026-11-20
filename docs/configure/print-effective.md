@@ -1,0 +1,62 @@
+# Effective settings (`--print-effective`)
+
+Before you start an engine, ask it what each stream will run with. It is the
+quickest way to catch a stream that did not get the checksum you meant, or a
+misspelled key: most sections ignore a key they do not know, so a listed
+setting you meant to change still shows `(built-in default)`.
+
+```bash
+vtopctl validate --config config.yaml --print-effective
+```
+
+It contacts no service and resolves no secret. For each stream, and for the
+`default` block that unmapped sources get, it prints every effective setting
+with its origin: `stream`, `global` or `built-in default`. Against the example
+files, one stream reads:
+
+```text
+stream /data/input/auth.cef.log:
+  batching.max_age: 60 (global)
+  batching.max_bytes: 104857600 (global)
+  batching.max_concurrent_batches: 8 (global)
+  batching.max_records: 10000 (global)
+  checksum.algorithm: blake3 (stream)
+  format: cef (stream)
+  manifest.verification_receipts: false (built-in default)
+  manifest.write_version: 0.3 (built-in default)
+  manifest_mac: disabled (built-in default)
+  path_template: tenant={tenant}/source={source}/format={format}/year={yyyy}/month={mm}/day={dd}/hour={hh}/ (global)
+  resolved_upload_width: 8 (global)
+  retention_class: standard (stream)
+  s3_source_name: auth (stream)
+  security.allow_loose_secret_permissions: false (built-in default)
+  source_name: /data/input/auth.cef.log (stream)
+  source_type: file (stream)
+  tenant: default (stream)
+  upload.backend: s3_native (global)
+  upload.prefix: "" (global)
+  upload.require_object_versioning: false (built-in default)
+  upload.require_strong_verification: true (global)
+  verification_method: read_back (stream)
+```
+
+`verification_method` is how the stored copy will be checked:
+`store_checksum`, `read_back` or `size_only`. Add `--json` for the same data
+as JSON, with `effective_version: 1`, `status` and `warnings` beside it.
+
+## Reading it
+
+| Field | Meaning |
+|---|---|
+| `checksum.algorithm` | The algorithm new batches of this stream use; see [per-stream checksum](streams.md#per-stream-checksum). |
+| `verification_method` | How the stored copy is checked. |
+| `resolved_upload_width` | Batches uploaded and verified at once, after every ceiling is applied. |
+| `path_template` | The object key layout; see [`partitioning`](reference.md#partitioning). |
+| `upload.require_strong_verification` | The global verification floor no stream can lower. |
+| `manifest_mac` | `enabled` (`manifest_mac_key_env`) or `disabled`, never the key. With a keyring, `keyring:` followed by the active key, the verify-only keys and the retired ids, each key with its source kind (`env` or `file`) and `legacy` where set; never a key, a variable name or a file path. |
+| `manifest.write_version` | The manifest version new batches are written in, `0.3` or `0.4`; see [`manifest`](reference.md#manifest). |
+| `manifest.verification_receipts` | Whether a verification receipt is written beside each manifest; see [Verification receipts](../operate/verification-receipts.md). |
+| `security.allow_loose_secret_permissions` | Whether key, state-store, ledger and audit files other local users can read are accepted (each announced and audited) instead of refused; see [Secret files](../operate/secrets.md). |
+
+The output is an allowlist: it never includes a secret, a secret reference's
+value, or a setting outside the list.

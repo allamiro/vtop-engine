@@ -98,6 +98,15 @@ impl StateStore for DeadlineStore {
             .await
     }
 
+    async fn renew_claim(&self, batch_id: &str, lease_until: &str) -> Result<bool, VtopError> {
+        self.within(
+            "renew_claim",
+            self.point,
+            self.inner.renew_claim(batch_id, lease_until),
+        )
+        .await
+    }
+
     async fn claim_incomplete_batches(
         &self,
         owner: &str,
@@ -145,6 +154,18 @@ impl StateStore for DeadlineStore {
         .await
     }
 
+    async fn committed_cursors_by_file(
+        &self,
+        source_type: SourceType,
+    ) -> Result<Vec<CommittedCursor>, VtopError> {
+        self.within(
+            "committed_cursors_by_file",
+            self.scan,
+            self.inner.committed_cursors_by_file(source_type),
+        )
+        .await
+    }
+
     async fn list_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
         self.within("list_batches", self.scan, self.inner.list_batches())
             .await
@@ -177,11 +198,15 @@ impl StateStore for DeadlineStore {
         .await
     }
 
-    async fn mark_verified(&self, batch_id: &str) -> Result<(), VtopError> {
+    async fn mark_verified(
+        &self,
+        batch_id: &str,
+        class: crate::VerificationClass,
+    ) -> Result<(), VtopError> {
         self.within(
             "mark_verified",
             self.point,
-            self.inner.mark_verified(batch_id),
+            self.inner.mark_verified(batch_id, class),
         )
         .await
     }
@@ -229,6 +254,32 @@ impl StateStore for DeadlineStore {
         )
         .await
     }
+
+    async fn append_audit(
+        &self,
+        row: &crate::audit::AuditInsert,
+        keyring: &vtop_core::manifest::ManifestKeyring,
+    ) -> Result<crate::audit::AuditRow, VtopError> {
+        self.within(
+            "append_audit",
+            self.point,
+            self.inner.append_audit(row, keyring),
+        )
+        .await
+    }
+
+    async fn list_audit(
+        &self,
+        after_seq: i64,
+        limit: u32,
+    ) -> Result<Vec<crate::audit::AuditRow>, VtopError> {
+        self.within(
+            "list_audit",
+            self.scan,
+            self.inner.list_audit(after_seq, limit),
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -270,6 +321,9 @@ mod tests {
         ) -> Result<Vec<BatchRecord>, VtopError> {
             never!()
         }
+        async fn renew_claim(&self, _: &str, _: &str) -> Result<bool, VtopError> {
+            never!()
+        }
         async fn max_committed_end_bytes(
             &self,
             _: SourceType,
@@ -285,6 +339,12 @@ mod tests {
         async fn committed_kafka_offsets(&self) -> Result<Vec<CommittedKafkaOffset>, VtopError> {
             never!()
         }
+        async fn committed_cursors_by_file(
+            &self,
+            _: SourceType,
+        ) -> Result<Vec<CommittedCursor>, VtopError> {
+            never!()
+        }
         async fn list_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
             never!()
         }
@@ -297,7 +357,11 @@ mod tests {
         async fn mark_failed(&self, _: &str, _: &str) -> Result<(), VtopError> {
             never!()
         }
-        async fn mark_verified(&self, _: &str) -> Result<(), VtopError> {
+        async fn mark_verified(
+            &self,
+            _: &str,
+            _: crate::VerificationClass,
+        ) -> Result<(), VtopError> {
             never!()
         }
         async fn mark_source_committed(&self, _: &str) -> Result<(), VtopError> {
@@ -341,7 +405,12 @@ mod tests {
         );
         expired(store.get_batch("b").await, "get_batch");
         expired(store.mark_failed("b", "x").await, "mark_failed");
-        expired(store.mark_verified("b").await, "mark_verified");
+        expired(
+            store
+                .mark_verified("b", crate::VerificationClass::Strong)
+                .await,
+            "mark_verified",
+        );
         expired(
             store.mark_source_committed("b").await,
             "mark_source_committed",
@@ -358,6 +427,10 @@ mod tests {
         expired(
             store.committed_kafka_offsets().await,
             "committed_kafka_offsets",
+        );
+        expired(
+            store.committed_cursors_by_file(SourceType::File).await,
+            "committed_cursors_by_file",
         );
         expired(store.list_batches().await, "list_batches");
         expired(

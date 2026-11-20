@@ -1,0 +1,171 @@
+name: Data safety
+description: Suspected data loss, unexpected duplicates, or a source committed past data that was never verified.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The engine's core rule is that a source's progress is committed only after its batch is VERIFIED. This form is for anything that looks like a break in that rule, or in what the archive claims to hold. Title it `area: what was lost or duplicated`.
+
+        **First, keep the evidence.** Don't run `vtopctl prune-ledger`, delete objects, or reset consumer offsets or file cursors until this is understood. Copy the state database (the SQLite file, or a `pg_dump` of the ledger) as it is now.
+
+        A vulnerability, including a way for an attacker to cause loss, goes to a [private security advisory](https://github.com/allamiro/vtop-engine/security/advisories/new) instead.
+
+        One kind of duplicate is known: replay writes a batch under a new object key, so the same records can be stored twice (README, *Known limitations*). Report duplicates outside that.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you file
+      options:
+        - label: I searched the existing issues, open and closed, and this one isn't there.
+          required: true
+        - label: This is not a security vulnerability. If an attacker could cause it, I'll report it privately instead.
+          required: true
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What you suspect
+      multiple: true
+      options:
+        - Data lost (a source range that is in no committed object)
+        - Duplicates beyond the known replay duplicate
+        - Source committed past a batch that never reached VERIFIED
+        - A committed object or manifest is missing, wrong or fails scrub
+        - audit-coverage reports a hole
+        - Other (say below)
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`vtopctl --version` for every binary that touched the data. Say if it was upgraded during the events."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: Install method
+      options:
+        - Release binary
+        - Built from source
+        - Container image
+        - Helm chart (helm/vtop)
+        - Other (say below)
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: OS release and architecture, and the filesystem the work directory and SQLite file live on.
+      placeholder: AlmaLinux 9.8 x86_64, ext4
+    validations:
+      required: true
+
+  - type: dropdown
+    id: source
+    attributes:
+      label: Source type
+      multiple: true
+      options:
+        - Kafka
+        - File, line-oriented
+        - File, whole_file
+        - Syslog spool
+        - None (cluster plane or Kafka gateway)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: state-store
+    attributes:
+      label: State store
+      options:
+        - SQLite
+        - PostgreSQL
+    validations:
+      required: true
+
+  - type: input
+    id: upload
+    attributes:
+      label: Upload backend and verification
+      description: The backend (native S3, `localfs`, `aws`/`s3cmd`/`mc` command), the checksum, and whether `upload.require_strong_verification` is `false`. Size-only verification accepts same-size corruption by design.
+      placeholder: native S3 against MinIO, sha256, strong verification
+    validations:
+      required: true
+
+  - type: textarea
+    id: batches
+    attributes:
+      label: Batch IDs
+      description: Every batch you think is affected, and the source range each should cover (topic/partition/offsets, or path and byte range).
+    validations:
+      required: true
+
+  - type: textarea
+    id: sequence
+    attributes:
+      label: Sequence of events
+      description: |
+        What ran, in order, with timestamps: starts and stops, signals, crashes or `kill -9`, restarts, `vtopctl replay`, upgrades or config changes, object store or network outages, a full disk, leader changes or promotions. Say whether `prune-ledger` has ever run against this ledger.
+      placeholder: |
+        10:02 vtopctl run started (v0.8.0)
+        10:14 object store unreachable for ~3 min
+        10:15 SIGTERM, "shutdown flush incomplete", exit 1
+        10:20 restarted
+    validations:
+      required: true
+
+  - type: textarea
+    id: ledger
+    attributes:
+      label: Ledger state
+      description: |
+        Output of these, trimmed to the affected batches where it is long:
+
+        - `vtopctl status --config <file>`
+        - `vtopctl list-batches --config <file> --json`
+        - `vtopctl audit-coverage --config <file> --check-storage`
+        - `vtopctl scrub --config <file>` (read-only; `--limit` or `--max-bytes-per-sec` bound it beside a live engine)
+
+        If one of them fails or you can't run it, say why.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: source-side
+    attributes:
+      label: Source-side state
+      description: What the source itself says. For Kafka, the group's committed offsets and the partition's log-start and end offsets. For files and spools, the inode, size and whether the file was rotated, truncated or replaced.
+      render: text
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Engine logs covering the events above, including any WARN or ERROR naming the batch IDs.
+      render: text
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration (redacted)
+      description: |
+        The config file, plus `vtopctl validate --config <file> --print-effective`.
+
+        **Redact secrets before pasting.** Replace any access key, password, token, credential or MAC key with `REDACTED`, keeping the key name. Never paste the environment or a Kubernetes Secret.
+      render: yaml
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Whether you can reproduce it, what you already ruled out, related issues (`Refs #N`).

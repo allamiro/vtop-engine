@@ -65,7 +65,8 @@
 
 ## 1. Where things stand
 
-As of **August 2026** (repo at v0.3.0):
+This section describes `main`. What each release shipped, and the limits
+it shipped with, are in [ROADMAP.md](ROADMAP.md).
 
 **Done**
 - `StateStore` trait extracted; engine holds `Box<dyn StateStore>`; scheme
@@ -82,8 +83,11 @@ As of **August 2026** (repo at v0.3.0):
   on SQLite; `vtopctl prune-ledger` under a maintenance identity on
   PostgreSQL (#128, part of Phase 8).
 - Prometheus metrics + readiness endpoint, opt-in via `VTOP_METRICS_ADDR`
-  (`vtop-observe`); structured per-stage events; Grafana/Loki/Mimir/Tempo/Alloy
-  compose stack and generated dashboards in `observability/` (part of Phase 6).
+  (`vtop-observe`); structured per-stage events; OpenTelemetry export (traces
+  of each batch's lifecycle, the metrics over OTLP, trace ids in the JSON
+  logs), built in and idle until `OTEL_EXPORTER_OTLP_ENDPOINT` is set (#683);
+  Grafana/Loki/Mimir/Tempo/Alloy compose stack and generated dashboards in
+  `observability/` (part of Phase 6).
 - Single-instance safety: exclusive work-dir lock at startup (#66) so the
   unsupported multi-writer configuration fails loudly instead of corrupting
   progress.
@@ -91,10 +95,6 @@ As of **August 2026** (repo at v0.3.0):
   (part of Phase 8's security baseline).
 
 **Not started — the critical path to a fleet**
-- Phase 4: deterministic / content-addressed object keys + idempotent retry.
-  Batch ids still embed `Utc::now()` + `Uuid::new_v4()`; replay still writes a
-  duplicate object. This is also the implementation's one known conformance
-  gap against protocol §15.1 (deterministic naming is a MUST).
 - Phase 5: Kafka consumer-group fleet mode. The consumer still uses per-read
   `assign()`; no `VTOP_KAFKA_GROUP_MODE` toggle; no multi-writer recovery
   (`FOR UPDATE SKIP LOCKED` / leases, #93).
@@ -102,10 +102,22 @@ As of **August 2026** (repo at v0.3.0):
   the engine.
 
 **Partially done**
-- Phase 6 (observability & ops): metrics, readiness, dashboards exist; OTel
-  trace export from the engine and Alertmanager rules do not.
-- Phase 8 (retention/backup/DR/security): retention shipped; backup/restore
-  runbook, DR drills, and the divergence checker have not been exercised.
+- Phase 4: deterministic / content-addressed object keys + idempotent retry.
+  **Objects done (#626, #688):** the object key is derived from the source,
+  the range and the content digest, and an existing object is reused only
+  after it verifies strongly, and a replay in a later hour is sealed at the
+  recorded instant of the window it rebuilds (v0.10.0). Remaining: batch
+  boundaries are not reproduced after a power loss, a row from before
+  v0.10.0 records no seal instant, and manifests stay per attempt
+  ([ARCHITECTURE.md](ARCHITECTURE.md) §13 item 3).
+- Phase 6 (observability & ops): metrics, readiness, dashboards, OTLP trace
+  export and a unit-tested Prometheus alert rule set with runbooks and
+  documented SLOs exist (#720); a store write-latency SLO and its alert do
+  not.
+- Phase 8 (retention/backup/DR/security): retention shipped, and an
+  attributable audit trail for every state-changing command (#694); a
+  backup/restore runbook (#734), DR drills (#735), and the divergence checker
+  have not been exercised.
 
 **Optional / gated**
 - Phase 9 (file/syslog HA via leases) — only if distributed file/syslog
@@ -130,11 +142,13 @@ transfer engine, **without weakening the core guarantee**:
   spool position) advances only after the object **and** manifest are uploaded
   and verified.
 - **Replay safety** — a crash at any stage is recoverable with **no data loss**.
-- **Delivery semantics (accurate):** today the system is **at-least-once with
-  possible duplicate objects** (§2.5, §7). *Idempotent at the archive layer*
-  requires **deterministic / content-addressed object keys [PROPOSED]** —
-  which protocol §15.1 already mandates (deterministic naming is a **MUST**);
-  this is the one known conformance gap in the reference implementation.
+- **Delivery semantics (accurate):** today the system is **at-least-once**. A
+  replay of the same bytes reuses the stored object (content-addressed keys,
+  #626), and a replay is rebuilt as first cut (v0.10.0); a replay that could
+  not be rebuilt as cut,
+  a later seal-time hour for a row from before v0.10.0, no checksum or a
+  command backend can still leave a duplicate object (§2.5, §7).
+  Protocol §15.1's deterministic naming MUST is narrowed by #626, not closed.
 
 ### 2.3 Non-goals
 - Not a stream-processing/analytics engine (only framing/format detection).
@@ -159,13 +173,13 @@ section calls out the consequence.
 ### 2.5 Current vs. target behavior (read this before trusting any HA claim)
 | Property | Current code | Target for production HA |
 |---|---|---|
-| Object key | `vtop-<UTCstamp>-<source>-<range>-<uuid8>` — **non-deterministic** (`Utc::now()` + `Uuid::new_v4()`) | **Deterministic or content-addressed** so retries are idempotent **[PROPOSED]** |
-| Replay outcome | Re-processing writes a **new object** (new key) → **duplicate object, no overwrite, no loss** | Retry resolves to the **same** object/version; duplicates impossible **[PROPOSED]** |
+| Object key | `vtop-<engine>-<source>-<range>[-i<inode>]-<digest>` for files and spools, `vtop-<source>-<range>-<digest>` for Kafka — **deterministic for the same bytes** (#626); falls back to the per-attempt `vtop-<UTCstamp>-<source>-<range>-<uuid8>` without a checksum, on a command backend, or when the derived key holds bytes that do not verify | **Deterministic or content-addressed** so retries are idempotent |
+| Replay outcome | Same bytes → **the stored object is reused** after strong verification; other boundaries, a later seal-time hour for a row from before v0.10.0, or other bytes → **second object, no overwrite, no loss** | Retry resolves to the **same** object/version; duplicates impossible **[PROPOSED]** |
 | File/syslog cursor | Lives **only in the state store** (rebuilt from `SOURCE_COMMITTED` rows) | Same, but **migrate/drain on backend switch** (§6.4) |
 | Kafka offset | Committed to the **broker** after VERIFIED (resumes broker-side) | Same; consumer-group mode for multi-instance **[PROPOSED]** |
 | Concurrency | Single process, **single-instance lock enforced at startup** (#66) | N replicas via Kafka consumer groups **[PROPOSED]** |
 | State backend | **SQLite and PostgreSQL** (feature-gated) behind the `StateStore` trait **[IMPLEMENTED]** | Same; Postgres-compatible store is the production path |
-| Metrics | Prometheus endpoint, opt-in via `VTOP_METRICS_ADDR` **[IMPLEMENTED]** | Same, plus traces and alerting (§14) |
+| Metrics | Prometheus endpoint, opt-in via `VTOP_METRICS_ADDR` **[IMPLEMENTED]**; OTLP traces, opt-in via `OTEL_EXPORTER_OTLP_ENDPOINT` **[IMPLEMENTED]** | Same, plus alerting (§14) |
 
 ---
 
@@ -202,7 +216,7 @@ VTOP has a clean **two-plane** design; understanding it keeps the HA design smal
 - The run loop is **single-process**, and the engine takes an exclusive
   instance lock at startup (§19).
 - The **bottleneck is S3 upload**, not the state store.
-- **Object keys are non-deterministic** (§2.5) — central to §7.
+- **Object keys are deterministic only for the same bytes** (§2.5, #626) — central to §7.
 
 ---
 
@@ -243,6 +257,101 @@ under the default, batches produced with checksums disabled **refuse to
 commit**, and running that way requires both opt-outs deliberately: the
 algorithm choice and the strength opt-out, each visible in configuration.
 
+**The opt-out is announced, not hidden (#629).** A size-only check
+**accepts same-size corruption**: a corrupted or replaced object of the
+recorded size is committed as verified. With
+`upload.require_strong_verification: false`, an engine started for `run`,
+`process-once` or `replay` logs one WARN at startup naming that consequence
+and the key. `vtopctl run` with `VTOP_METRICS_ADDR` set, the one process
+that serves metrics, also sets `vtop_verification_mode{mode="size_only"}` to
+1 (the `strong` series reads 0), so an alert can fire before any batch
+moves; the one-shot commands build no registry and export nothing.
+`vtopctl validate --config <file>` prints the same warning and still exits 0;
+there is no strict or production profile for it to refuse in. Every
+size-only verification logs a WARN with its batch id, and
+`vtop_verification_backend_limited_total` counts it where
+`vtop_verified_total` counts verifications: when the running engine marks the
+batch VERIFIED, and when recovery commits a VERIFIED row that was verified
+on size alone. The ledger records which class each row was verified with,
+`strong` or `size_only`, in the same write as its VERIFIED transition (#664),
+and recovery counts a commit by that class - including a row a later pass
+settles - not by what its own storage re-check finds after the restart: a
+strong row whose re-check confirms only size is not counted, and a size-only
+row whose re-check finds a digest is. A row verified by a release before
+#664 has no class and is counted as before, by its re-check. A row recovery
+re-checks but holds back under a lower incomplete range is logged, not
+counted, so a restart does not count it again. Under the strong default, the re-check logs the size-only result it
+refuses. The per-batch WARN
+is not rate-limited: it replaces that batch's INFO `verification_passed`
+line, so it is no more frequent than the batch log itself.
+
+**Per-stream checksum selection (#669).** An entry in `streams.yaml` may set
+`checksum: { algorithm: sha256 }`, `blake3`, or `none`. An omitted (or null)
+checksum inherits `config.yaml`'s algorithm; a block without `algorithm`, or
+with any other key, is refused at load rather than read as an override. Only
+the first entry per `source_name` applies, as everywhere in `streams.yaml`. The global
+`upload.require_strong_verification` floor applies to every stream: a stream
+that sets `none` is rejected at config load when the floor is on, and warns by
+stream name when it is off. The runtime floor still refuses any size-only
+backend result. `validate --print-effective` shows each stream's resolved
+`checksum.algorithm` and `verification_method`, with origin `stream` when the
+entry sets its own; at startup the engine logs one INFO
+`stream verification settings` line per stream with its algorithm, origin and
+method.
+
+On native S3, SHA-256 uses a service-computed checksum from HEAD, falling
+back to read-back if no usable whole-object checksum is supplied; BLAKE3
+always reads the stored body back and hashes it. Read-back consumes download traffic
+and hashing work. Local filesystem and command compatibility backends check
+stored content for either enabled algorithm. Choose explicitly for the
+backend and workload; there is no automatic cost-based selection and no
+per-stream `read_back` setting in this release.
+
+**Upgrade note:** engines predating this setting silently ignore a stream's
+`checksum` key and use the global algorithm. Upgrade every engine before
+relying on per-stream settings, retain a strong global algorithm during the
+upgrade, and run the new `validate` afterward. Existing batches retain their
+manifest-recorded algorithm: recovery and scrub use it even after config
+changes. Sharing a ledger does not change that rule. Downgrade remains
+unsupported.
+
+### Explain effective configuration before starting
+
+`vtopctl validate --config <file> --print-effective` prints a `default` block
+for unmatched discovered sources and one block per configured stream. The
+`default` block is also present without `streams.yaml`. Every setting identifies
+its origin: `stream`, `global`, or `built-in default`. This is a static explanation:
+no source, state store or object store is contacted, and secret references are
+not resolved. A stream whose tenant is omitted uses the built-in `default`
+tenant, matching the engine; unmatched sources use `engine.tenant`.
+
+Add `--json` for the versioned shape
+`{"status":"ok","warnings":[],"effective_version":1,"effective":{"default":{},"streams":[]}}`.
+Each setting in a block has `value` and `origin` fields. The explicit allowlist
+covers identity, evidence, placement and batching; it omits secret values and
+references, including the manifest MAC key's environment-variable name. The MAC
+setting reports only `enabled` or `disabled`.
+
+The verification method is the backend's preferred path: native S3 with SHA-256
+uses `store_checksum` when a service whole-object checksum is available, falling
+back to `read_back` otherwise (including multipart objects). Native S3 with
+BLAKE3, localfs, and the command backends use `read_back`; disabled checksums use
+`size_only`. An `upload.backend` that names no registered backend reports
+`unknown`: validate accepts the name, but the engine refuses it at startup.
+A batch whose compressed object exceeds `upload.multipart_threshold_bytes` is
+uploaded multipart and therefore read back even under `store_checksum`.
+
+The engine applies the first `streams.yaml` entry for each `source_name`. A
+later entry with the same name is listed under `shadowed_streams` (and as a
+`WARNING` line in text) instead of being printed as if it were in effect. A key
+written with no value or `~` counts as set: a string setting then takes that
+literal text.
+
+The resolved upload width is the configured ceiling after active transport
+tuning, before the adaptive controller reacts to live throttles.
+Without `--print-effective`, validate's existing output and exit codes are
+unchanged.
+
 **ETag caveat:** S3 multipart ETags are **not** reliable MD5 checksums. The
 authoritative integrity value is VTOP's own **SHA-256/BLAKE3 manifest checksum**,
 never the ETag.
@@ -259,7 +368,7 @@ The honest, minimal set — **one** durable store, not a zoo.
 | Work distribution + failover (Kafka) | **Kafka consumer groups** | **Required for HA** | Single-node Kafka **reading exists today**; **fleet consumer-group mode is [PROPOSED]**. Kafka is the coordinator — no extra coordination DB for the Kafka path. |
 | Durable data plane | **S3 / MinIO** | **Yes (have it)** | Distributed MinIO (erasure-coded) or S3; Object Lock for WORM. |
 | Orchestration / heal / scale | **Kubernetes (+ KEDA)** | **Yes for HA** | Restarts, rolling upgrades, lag-based autoscale. An engine chart is **[PROPOSED]** — the existing `helm/vtop` chart deploys the *cluster*, not the engine (§9). |
-| Observability | **Prometheus + Grafana (+ traces)** | **Yes** | Metrics endpoint **[IMPLEMENTED]**; dashboards in `observability/`; traces **[PROPOSED]** (§14). |
+| Observability | **Prometheus + Grafana (+ traces)** | **Yes** | Metrics endpoint **[IMPLEMENTED]**; dashboards in `observability/`; OTLP trace export **[IMPLEMENTED]** (§14). |
 | Secrets | **Vault / external-secrets / k8s Secrets** | Recommended | Creds already injected via env. |
 | File/syslog HA ownership | **etcd / Consul** (leases) | **Only if** file/syslog must be HA-distributed | The only thing Kafka groups don't solve. |
 
@@ -406,7 +515,7 @@ CREATE TABLE batches (
   CONSTRAINT state_enum CHECK (state IN (
     'DISCOVERED','BATCHING','SEALED','COMPRESSED','CHECKSUMMED',
     'OBJECT_UPLOADED','MANIFEST_UPLOADED','VERIFIED','SOURCE_COMMITTED',
-    'FAILED','REPLAY_REQUIRED')),
+    'FAILED','REPLAY_REQUIRED','SUPERSEDED')),
 
   -- THE INVARIANT (two equivalent guards, keep both):
   CONSTRAINT commit_needs_verify_state CHECK (
@@ -432,7 +541,7 @@ CREATE UNIQUE INDEX uq_file_range
 CREATE INDEX ix_state        ON batches (state);
 CREATE INDEX ix_source_time  ON batches (source_type, source_name, updated_at);
 CREATE INDEX ix_incomplete   ON batches (state)
-  WHERE state NOT IN ('SOURCE_COMMITTED','FAILED');   -- hot incomplete set
+  WHERE state NOT IN ('SOURCE_COMMITTED','SUPERSEDED');   -- hot incomplete set (= the recovery work-list)
 ```
 
 **Multi-writer recovery [PROPOSED]:** claim incomplete rows with
@@ -442,6 +551,8 @@ instances never recover the same batch. Required before fleet mode.
 ### 6.6 Ledger retention / pruning **[IMPLEMENTED — incremental delete, #128]**
 ```text
 - keep ACTIVE, FAILED, REPLAY_REQUIRED, and recent SOURCE_COMMITTED rows hot;
+- delete old SUPERSEDED rows (#567: handed-back ranges the source has since
+  committed past) on age alone - none is ever a restart cursor;
 - delete old SOURCE_COMMITTED rows incrementally, always retaining the
   per-path NEWEST committed row (by `(created_at, batch_id)`) so recovery cursor seeding
   is unchanged - the newest, not the highest end_byte, which after a
@@ -457,7 +568,8 @@ only: the PostgreSQL runtime identity is deliberately denied DELETE, so the
 engine refuses the setting there and pruning runs as a scheduled `vtopctl
 prune-ledger --older-than-days N` under a maintenance identity (see
 [`POSTGRES_DEPLOYMENT.md`](POSTGRES_DEPLOYMENT.md)).
-Rows in any non-committed state are never touched.
+Rows in any other state (in flight, VERIFIED, FAILED, REPLAY_REQUIRED) are
+never touched.
 
 **Pruning keeps an anchor (#560).** Every prune pass, the engine's and
 `vtopctl prune-ledger`'s alike, lists its CANDIDATE rows, writes them to a
@@ -481,8 +593,10 @@ PostgreSQL deployment a durable directory.
 ledger and the digests and checks, per source unit (a Kafka topic-partition
 under one consumer group, a file or spool file at one inode), that committed
 ranges tile:
-- a stretch a FAILED or REPLAY_REQUIRED row names, below a later commit, is a
-  range that failed and was never re-archived (the #552 shape);
+- a stretch a FAILED, REPLAY_REQUIRED or SUPERSEDED row names, below a later
+  commit, is a range that failed and was never re-archived (the #552 shape);
+  a SUPERSEDED row above the last commit is such a hole too, never pending
+  (#567: nothing reads it again);
 - a stretch nothing names is lost data for a file or spool (bytes are
   contiguous, e.g. the #558 rotation shape), and is reported but not failed
   for Kafka (compaction and transaction markers occupy offsets with no
@@ -496,7 +610,7 @@ ranges tile:
 present, and an object must be of the size the ledger recorded (a manifest has
 no recorded size). A committed row that names no object or manifest, and an
 object whose size the store does not report, are findings. Content is
-`verify-manifest`'s job. `--metrics-file`
+`vtopctl scrub`'s job (§7.5), or `verify-manifest`'s for one manifest. `--metrics-file`
 writes the result as a Prometheus text file, with counts by source type and
 never by path, for a node exporter's textfile collector. The command exits
 non-zero on lost data, so it can gate a cron job. Below a unit's first
@@ -548,6 +662,14 @@ below it. For those, take the start from the ledger row with the manifest's
 row; the end is right in both. See
 [`VTOP_PROTOCOL_DRAFT.md`](VTOP_PROTOCOL_DRAFT.md) §11.2.
 
+**Each pass is audited (#694).** `prune-ledger` writes an `attempt` record
+to the state store's `audit_events` table (and the log and `VTOP_AUDIT_LOG`)
+before it deletes anything, and is refused when it cannot; its outcome
+record names the rows deleted and the digest. Pruning never deletes an audit
+row. On PostgreSQL the maintenance identity needs `SELECT, INSERT` on
+`audit_events` and `USAGE` on its sequence. See
+[operate/auditing.md](operate/auditing.md).
+
 ---
 
 ## 7. Object storage, idempotency & Object Lock / WORM
@@ -555,17 +677,26 @@ row; the end is right in both. See
 This section supersedes any earlier "rewrites the same object" wording.
 
 ### 7.1 Current reality
-Object keys are **non-deterministic** (`Utc::now()` + `Uuid::new_v4()` inside
-the `batch_id`), so a replayed batch writes a **new** object. Result: **no data
-loss, but duplicate objects** can accumulate on crash/replay. The **state
-ledger + manifests** are the dedup authority today — not key collision.
+Since #626 the object key is **content-addressed within its range**:
+`vtop-[<engine>-]<source>-<range>[-i<inode>]-<digest>` (the engine and inode for
+file and spool ranges), under the partition prefix. A replay that
+produces the same bytes finds the object an earlier attempt stored, reuses it
+only after a strong verification against the batch's digest, and never writes
+over an object that does not verify (it falls back to the per-attempt key, the
+old scheme, and logs why). The `batch_id` stays per attempt and names the
+ledger row and the manifest. A replay still writes a second object when its
+batch boundaries, its seal-time partition hour, or its bytes differ, or when no
+digest or no reliable absent-key answer is available
+([ARCHITECTURE.md](ARCHITECTURE.md) §13 item 3). The **state ledger +
+manifests** remain the dedup authority for those.
 
 Protocol §15.1 requires the naming scheme to be **deterministic so that replay
 produces the same object key**, and protocol §14 says re-uploads of identical
 content SHOULD be idempotent. The reference implementation follows the §15.1
 partition layout (`tenant=…/source=…/format=…/year=…/…/{batch_id}…`) but the
 random `batch_id` component breaks the determinism MUST — this is the
-conformance gap that roadmap Phase 4 closes.
+conformance gap that roadmap Phase 4 closes. #626 closes it for objects and
+narrows it for manifests, which stay per attempt.
 
 ### 7.2 Object Lock / WORM safe-retry rules
 With S3 Object Lock, protected object versions **cannot be overwritten or deleted**.
@@ -584,6 +715,31 @@ Object Lock ENABLED:
      3. use CONTENT-ADDRESSED keys so duplicates are inherently harmless. [PROPOSED]
 ```
 
+**Status (#626, #684).** Rules 1 and 3 are implemented. Since #626 an
+object's key is derived from its source, range and content digest: a retry of
+the same bytes finds the object an earlier attempt stored, reuses it after a
+strong verification and writes nothing; anything else at the key is never
+written over, and the batch falls back to its per-attempt key. Manifests stay
+per attempt, so a retry never needs to overwrite one. Rule 2's version id is
+recorded for manifests (the hardened profile); objects' versions are read for
+the retention check but not persisted.
+
+With `upload.object_lock` (#684, `s3_native`), the engine itself writes
+every object and manifest under the configured retention and fails a batch
+whose stored versions do not carry it. A reused object is checked with the
+weaker bound (still under the configured mode). Since #709 a replay looks at
+that bound before it reuses the object: if the lock has ended, the object was
+stored unlocked, is in the other mode, or lacks the configured legal hold, the
+batch is written as a fresh object under its per-attempt key, under the
+configured lock, verified on the version written, and committed; the old
+object is never written over, deleted or re-locked (rule 1 falls back to rule
+3, at the cost of one extra object). A retention the store cannot report fails
+the batch and writes nothing, so an outage never multiplies objects. Before
+#709 such a range failed on every replay until an operator acted. Objects from failed
+attempts are locked as well and cannot be removed before their retention ends
+(under `compliance`, by anyone). See
+[OBJECT_LOCK_DEPLOYMENT.md](OBJECT_LOCK_DEPLOYMENT.md).
+
 ### 7.3 Recommendation
 Adopt **(1) deterministic keys + "existing verified object = success"** (optionally
 with **(2)** version_id recording). Only after this change is replay **idempotent at
@@ -592,6 +748,233 @@ the archive layer** and the delivery guarantee may be described that way.
 ### 7.4 ETag caveat (repeat)
 Never treat an S3 ETag as the integrity checksum (multipart ETags aren't MD5). The
 manifest SHA-256/BLAKE3 is the source of truth.
+
+### 7.5 Re-verifying committed objects: `vtopctl scrub` **[IMPLEMENTED, #628]**
+Verification gates the commit; after the commit nothing used to read the object
+again. An object overwritten with same-size bytes, deleted by a lifecycle rule
+or a bucket-policy mistake, or corrupted by the store, and a manifest rewritten
+in place, went unnoticed until someone fetched the data, by when the source has
+usually aged out and the batch cannot be archived again.
+`audit-coverage --check-storage` HEADs each object, which sees presence and
+size only; recovery's storage re-check reads content, but only for VERIFIED
+rows not yet committed, at startup.
+
+`vtopctl scrub --config ...` walks the committed rows of the ledger and of the
+prune digests (§6.6; `--digest-dir` as for `audit-coverage`). For each batch it
+runs recovery's own check (the same function): download the manifest at its
+pinned `manifest_version_id` (the current key only on a row that pinned none;
+a deleted pinned version fails closed, never falls back), verify its self-hash
+and, when `manifest_mac_key_env` is set, its MAC, bind it to the ledger row
+(batch id, URIs, the manifest digest and the object's size and digest the
+ledger recorded), then have the backend verify the object's stored content
+against the manifest's digest. Then, on a row that pinned a version, it reads
+the manifest's current key and requires it to hold the same bytes as the pinned
+version, because a reader fetching the archive by key reads that. This is a byte
+comparison, not a version-id check: an identical re-upload under a new version
+id passes, and any other content at the current key does not. Each batch gets
+one result:
+
+| Result | Meaning | Finding |
+|---|---|---|
+| `ok` | content matches the authenticated manifest, which matches the ledger | no |
+| `limited` | size-only: present at its size, but no digest compared (`checksum.algorithm: none`, or a backend that cannot hash); the same result recovery's re-check calls size-only and counts in `vtop_verification_backend_limited_total` (#629) | no |
+| `missing` | the object, the pinned manifest version or the manifest's current key is gone | yes |
+| `mismatched` | something is stored, and it is not what was committed (object content or size, the manifest's current key, the ledger's record of the object) | yes |
+| `unauthenticated` | the manifest does not parse, fails its self-hash or MAC, or does not bind to the ledger row | yes |
+| `unreadable` | the store answered with an error other than absence (timeout, throttle, permission); nothing was proven | yes |
+| `unsupported_version` | the row's pinned manifest version, carrying the self-hash the ledger recorded, is from a newer release than this binary reads (#671): not checked, so a finding; upgrade the scrub's binary and run it again. The same claim at a key no version pins is `unauthenticated`: a tamperer can write any version | yes |
+
+It exits non-zero on any finding; `--json` prints the report (each finding with
+its batch id, URIs, version and whether its row came from the ledger or a
+digest), and `--metrics-file` writes the counts as a Prometheus text file
+([observability README](../observability/README.md#archive-scrub) has the
+metrics and an example alert rule set). It repairs nothing: a finding can only
+alert, and the remedy is a restore from a replica or backup, or recording the
+loss. An S3 backend reports absence as `http 404`; a command backend's words
+for it may not be recognised, which turns `missing` into `unreadable` (still a
+finding).
+
+**Bounds.** Each batch costs a manifest GET, the object read the backend's
+`verify_object` does (native S3 over SHA-256 uses the service-computed checksum
+when the store kept one, and otherwise reads the body back), and, on a row that
+pinned a manifest version, a second manifest GET for the current key (a row
+without a pinned version reads the current key once, as its only manifest
+GET). To run it beside a live engine against a large archive without
+saturating the store:
+- `--concurrency N` (default 4) batches at once;
+- `--max-objects-per-sec R` (fractions allowed, down to one a day) and
+  `--max-bytes-per-sec B` (by each object's recorded size) space the starts,
+  whichever is slower;
+- `--cursor-file F` with `--limit N`: each run resumes after the batch the file
+  names and checks the next N in batch-id order (which is archive order: a
+  batch id starts with its UTC timestamp). Results are taken in that order, and
+  the cursor moves past each batch as its result is taken. With
+  `--concurrency` above 1, a batch that finishes ahead of an earlier one is
+  recorded only once the earlier one is, so a run killed part-way never skips a
+  batch but may check again up to concurrency - 1 batches it had already
+  finished. The run that reaches the end completes the pass; the next run
+  starts again from the first batch.
+
+  A finding holds the saved cursor until it is published. Saving stops
+  before the first finding, and the run's final position is saved only
+  after the report is printed and, with `--metrics-file`, the metrics file
+  is written. A run killed in between, or one whose metrics file cannot be
+  written (that run is undone to where it started), leaves the cursor
+  before the damage, so the next run finds it again rather than resuming
+  past damage nobody was told about. Once published, the cursor moves on;
+  the next pass checks the batch again. That is why the example alert reads
+  `vtop_scrub_last_finding_timestamp_seconds` and fires for a pass window
+  after it, rather than reading the latest run alone.
+
+  A run holds locks beside the cursor and the metrics file
+  (`<path>.lock`) from before it reads either until it has published, so an
+  overlapping run (a cron run that outlasts its hour) is refused, not
+  interleaved: two runs sharing a metrics file, cursor or not, would each
+  replace it from what they read before the other wrote. A missing metrics
+  directory is refused at that lock, before any reads;
+- or `--sample N [--seed S]`: N batches chosen at random; the seed is printed,
+  and the same seed picks the same batches.
+
+Scrub reads are ingress to the scrub's host. The operator ceilings of #481
+bound uploads: `upload.max_egress_bytes_per_second` shapes the bodies of
+`s3_native` object, manifest and part PUTs, and `upload.max_concurrency_ceiling`
+caps the upload concurrency knobs. The scrub uploads nothing, so neither
+applies to it, and its own `--max-bytes-per-sec` and `--concurrency` are what
+bound its reads. A config that sets the egress ceiling is still accepted with
+an `s3_native` backend, as for the engine.
+
+**Schedule.** There is no periodic mode inside the engine: its loop is single
+threaded, housekeeping such as the ledger prune runs on idle cycles, and one
+slice of full-object reads would stall archiving for as long as it takes.
+Listing the committed rows also reads the whole ledger, which a separate
+process can afford once per run. Run the command on a schedule instead, under
+an identity that can read the state store and the bucket (and nothing more):
+size `--limit` so that hourly runs cover the archive within the pass window,
+e.g. 1,000,000 committed batches once a week is about 6,000 per hourly run.
+
+crontab ends a command at the newline (a trailing `\` does not continue it), so
+keep the options in a script and schedule the script on one line:
+
+```bash
+#!/bin/sh
+# /usr/local/bin/vtop-scrub: a slice of the archive per run; a full pass about once a week.
+exec vtopctl scrub --config /etc/vtop/config.yaml \
+  --digest-dir /var/lib/vtop/ledger-digests \
+  --cursor-file /var/lib/vtop/scrub.cursor --limit 6000 \
+  --concurrency 4 --max-bytes-per-sec 20000000 \
+  --metrics-file /var/lib/node_exporter/textfile/vtop_scrub.prom --json \
+  > /var/log/vtop/scrub.json
+```
+
+```text
+0 * * * * /usr/local/bin/vtop-scrub
+```
+
+As a Kubernetes CronJob, give the cursor and the metrics file a persistent
+volume (the counters carry forward from the file each run replaces), set
+`concurrencyPolicy: Forbid`, and mount the config, the bucket credentials and
+the prune-digest directory, passing it as `--digest-dir`: without the digests a
+scrub checks only the rows still in the ledger and passes over the pruned ones.
+It warns (a WARN log line, and `warnings` in the JSON) when
+`engine.ledger_retention_days` is set and the directory holds no digests, but
+a deployment that prunes only with `vtopctl prune-ledger` sets no retention,
+so there it cannot tell. Run `vtopctl` directly (`command: [vtopctl]`), not through
+the image's entrypoint: `docker/entrypoint.sh` prepends `--config` from
+`VTOP_CONFIG` itself, so a second `--config` in the arguments is refused, and it
+exits unless `/data/work` and `/data/state` are writable, which a read-only
+scrub has no use for. With PostgreSQL the job connects like any other client;
+with SQLite the database file lives on the engine's volume, so run the scrub
+where that volume is mounted (a sidecar running the same schedule, or
+`kubectl exec`). The node exporter's textfile collector is node-local; from a
+CronJob, push the file to a Pushgateway instead
+(`curl --data-binary @vtop_scrub.prom http://pushgateway:9091/metrics/job/vtop_scrub`),
+or alert on the Job's own failure (`kube_job_status_failed`), which a finding
+causes.
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: vtop-scrub
+spec:
+  schedule: "0 * * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: scrub
+              image: <the engine image>
+              # vtopctl itself, not the entrypoint (which adds its own --config
+              # and requires writable /data/work and /data/state).
+              command: [vtopctl]
+              args: [scrub, --config, /etc/vtop/config.yaml,
+                     --digest-dir, /var/lib/vtop/ledger-digests,
+                     --cursor-file, /var/lib/vtop-scrub/scrub.cursor, --limit, "6000",
+                     --concurrency, "4", --max-bytes-per-sec, "20000000",
+                     --metrics-file, /var/lib/vtop-scrub/vtop_scrub.prom, --json]
+              envFrom:
+                - secretRef: {name: vtop-object-store}   # read access to the bucket
+              volumeMounts:
+                - {name: config, mountPath: /etc/vtop, readOnly: true}
+                - {name: ledger-digests, mountPath: /var/lib/vtop/ledger-digests, readOnly: true}
+                - {name: scrub-state, mountPath: /var/lib/vtop-scrub}
+          volumes:
+            - name: config
+              configMap: {name: vtop-engine}
+            - name: ledger-digests   # where prune-ledger writes them (§6.6)
+              persistentVolumeClaim: {claimName: vtop-ledger-digests, readOnly: true}
+            - name: scrub-state
+              persistentVolumeClaim: {claimName: vtop-scrub}
+```
+
+---
+
+### 7.6 Incomplete multipart uploads: a lifecycle rule **[RECOMMENDED, #668]**
+
+An incomplete multipart upload is invisible to `GET` and `LIST`, but its parts
+are **stored, and billed, until the upload is completed or aborted**. Since
+#668 the engine keeps a failed upload's session and parts so that the replay
+of the same bytes resumes it, rather than sending the object again. A session
+no replay resumes (the source grew, or the range was never read again) is
+aborted by the engine's sweep once it is older than
+`upload.multipart_abandon_after_secs` (24 h by default), at startup and every
+quarter of that window while the engine runs.
+
+The sweep only knows the uploads listed in its own work directory. An engine
+that never comes back, or whose work directory is lost, leaves its incomplete
+uploads behind. Add a bucket lifecycle rule as the backstop, with a window
+**longer** than the engine's abandon window, so it never aborts an upload a
+replay could still resume:
+
+```json
+{
+  "Rules": [
+    {
+      "ID": "vtop-abort-incomplete-multipart",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "" },
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 2 }
+    }
+  ]
+}
+```
+
+```bash
+aws s3api put-bucket-lifecycle-configuration --bucket <bucket> \
+  --lifecycle-configuration file://abort-incomplete.json
+```
+
+`DaysAfterInitiation` counts from when the upload was created, not from its
+last part, so a long upload on a slow link can be older than a part written a
+minute ago: keep the rule's window well above the abandon window plus the
+longest a batch's upload and replays can take. If the rule aborts an upload a
+replay later resumes, the store answers `NoSuchUpload` and the engine starts
+one new upload for that object (`vtop_multipart_sessions_total{outcome="restarted"}`):
+the cost is the parts sent again, never data.
 
 ---
 
@@ -619,9 +1002,9 @@ Define `end_offset` as the **last record's offset**; the committed offset is
 **Crash edge case (must be documented as safe):**
 ```text
 If the engine marks VERIFIED but crashes before the Kafka offset commit, the
-batch is replayed after rebalance. This is safe ONLY once object keys are
-deterministic (§7.3): the existing verified object+manifest is treated as
-success. Until then, replay produces a duplicate object (no loss).
+batch is replayed after rebalance. Since #626 a replay of the same range with
+the same bytes finds the existing verified object and reuses it (§7.3); a
+replay whose batch boundaries differ still writes a second object (no loss).
 ```
 
 ### 8.2 Single-node vs fleet consumer mode (design decision)
@@ -775,16 +1158,21 @@ path needed by the distributed options is already implemented (§6.3).
 | `engine.work_dir` / `log_level` | scratch dir; verbosity |
 | `engine.ledger_retention_days` / `ledger_prune_batch` | committed-row retention (§6.6; SQLite engine-side only) |
 | `engine.state_store_timeout_seconds` | wall-clock bound on every state-store request (default 30 s; whole-ledger scans get 10x) — a blackholed Postgres fails the request instead of hanging the engine (#556) |
-| `upload.request_timeout_seconds` | wall-clock bound on one attempt of one object-store request on the native S3 backend (default 300 s; the SDK's retries apply) (#556) |
+| `upload.request_timeout_seconds` | wall-clock bound on one attempt of one object-store request on the native S3 backend (default 300 s; the SDK's retries apply) (#556); a request that carries a body gets this plus its size at `request_min_bytes_per_second` |
+| `upload.request_min_bytes_per_second` | the slowest rate one request's body may cross the link at and still be waited for, native S3 backend (default 4096, must be > 0) (#663): each attempt of an object, part or manifest upload is allowed `request_timeout_seconds` plus its size at this rate, so a slow or policed uplink stretches the deadline instead of failing every body. Per request: the width times the parts in flight share the link |
 | `engine.ledger_digest_dir` | where prune digests are written and read (default: beside a SQLite database file; else under `work_dir`, which is scratch) |
 | `batching.max_records` / `max_bytes` / `max_batch_age_seconds` | seal thresholds |
 | `batching.max_concurrent_batches` | uploads kept in flight per cycle (default 8); the ceiling when the adaptive width is on |
 | `batching.adaptive_width.enabled` / `min_width` | AIMD upload width (#102): a cycle the store throttled halves the next cycle's width, a clean cycle grows it by one, never below `min_width` (default 1) nor above the ceiling. Off by default; `vtop_upload_width` shows the width in use |
 | `compression.type` / `level` | `gzip` \| `zstd` \| `none` |
-| `checksum.algorithm` | `sha256` \| `blake3` \| disabled |
-| `manifest_mac_key_env` | optional env-var name for the 32-byte hex manifest MAC key; the secret is not serialized |
+| `checksum.algorithm` | global `sha256` \| `blake3` \| `none`; inherited by streams without an override |
+| `streams.yaml`: `streams[].checksum.algorithm` | per-stream override with the same shape; `none` requires the global strong floor to be off, otherwise config load fails naming the stream |
+| `manifest_mac_key_env` | optional env-var name for the 32-byte hex manifest MAC key; the secret is not serialized. One key with no key id; refused together with `manifest.mac` |
+| `manifest.mac` | the manifest MAC keyring (#685): `active` (the signing key's id), `keys` (`{id, env\|file, legacy}`, every key that verifies) and `retired` (tombstoned ids). Needs `manifest.write_version: "0.4"`. A `0.4` manifest records the signing key in `manifest.mac_key_id` and is verified with the key it names. Every reader must run the keyring release before the active key changes; see [Rotate the manifest MAC key](operate/manifest-key-rotation.md) |
+| `manifest.write_version` | `"0.3"` (default) or `"0.4"`, quoted; anything else fails config load (#671). `0.4` adds `verification_plan` to new manifests. Set it only once every engine, `vtopctl scrub` and auditor of the archive runs v0.8.0 or later: v0.7.0 and earlier report `0.4` manifests as tampered. Engines before this release ignore the key and keep writing `0.3`; setting `"0.3"` again goes back, and `0.4` manifests already written stay readable |
+| `manifest.verification_receipts` | `false` (default) or `true` (#671): write `<batch_id>.receipt.json` beside each manifest once its batch is verified (class, method the store ran, signed like the manifest). Never part of the commit: a receipt that cannot be written is a WARN and `vtop_verification_receipts_total{result="failed"}`; recovery writes a missing one for a VERIFIED batch; `vtopctl scrub` reports missing ones. Older engines ignore the key |
 | `sources.kafka.*` | brokers, group, include/exclude, `enable_auto_commit:false` |
-| `sources.file.*` | paths, `delete_after_commit`, `whole_file`. Two directory entries naming one file — a symlink beside its target, two hard links — are **two sources** by ruling (#378): each is archived under its own name, so the file's records are archived twice, and discovery warns once per alias group naming every spelling. Narrow the patterns to one spelling if one source is meant. There is no merge and no knob, because a merge needs a cursor identity that survives an alias being removed and none is safe: keyed by the surviving spelling, `delete_after_commit` removes it and the target is re-read from zero; keyed by inode, a freed inode reused by a new file inherits the old cursor and that file's opening records are skipped. A duplicate costs storage; a merge risks data. |
+| `sources.file.*` | paths, `delete_after_commit`, `delete_quiet_seconds`, `delete_without_open_check`, `whole_file`. `delete_after_commit` is for files nothing writes to any more: whole-file drops, and rotated logs once the writer has reopened its new file. A fully archived file is deleted only after it has stayed unwritten for `delete_quiet_seconds` (default 3600) from the commit that covered it, so the engine catching up on a live log does not delete it out from under a writer that still holds it open (#619). A file whose mtime or ctime moves after the commit (a touch, a chmod, a producer stamping a finished drop) is **kept**, with a warning: a same-length rewrite between its first page and the page below the committed end looks the same, and only the ctime, which no process can set, shows it. A configured path that is a symbolic link is never deleted (point the pattern at the target). The delete renames the file within its directory first, so the directory must be writable by the engine and on the file's own filesystem; a bind-mounted single file fails with `EXDEV`, and the file is kept with that errno in the warning. A file a crash (or a failed put-back) leaves under a hidden `.vtop-delete.*` name is archived as a source of its own and then deleted. The wait is kept in memory: a restart starts it again, from the newest committed row, and only when that row names the file's inode and first page, its batch read the file to its end, and the file still has the mtime that batch recorded; otherwise the file stays until a new commit covers it. A quiet file is not a closed one, so the delete also needs proof that no process has the file open: a Linux write lease, held from before the file is moved aside until after the unlink. A writer that still holds the file - silent however long - or opens it while it is being deleted keeps it, and the wait starts again. `delete_quiet_seconds: 0` deletes at the covering commit, through the same lease, rename and check. The lease needs Linux, a local filesystem (ext2/3/4, xfs, btrfs, tmpfs, overlay, f2fs, zfs or bcachefs; never NFS, CIFS, FUSE, 9p, virtiofs or CephFS, where it could not see a writer on another machine), and the engine running as the files' owner or with `CAP_LEASE` in its effective set. In Kubernetes, `securityContext.capabilities.add: ["LEASE"]` reaches the effective set only of a container running as root. The chart runs the engine as uid 10001 with every capability dropped and `allowPrivilegeEscalation: false`, under which neither an added capability nor a file capability (`setcap`) takes effect, so there the engine must run as the uid that owns the files. **On upgrade**, an engine that deleted files written by another user, or on a network or FUSE mount, stops deleting them. Without the lease a fully archived file is **kept**, with a warning naming the reason; `delete_without_open_check: true` deletes it on the quiet period alone instead (on macOS, NFS or FUSE, or another user's file without `CAP_LEASE`, the only way a file is deleted), and then **a file a writer still holds open is deleted with it**: the writer's later lines go into a file no path names and nothing archives them, when it is silent for longer than the quiet period and then writes again, or when its write lands between the delete's final check and the unlink. That opt-out is warned about on every start and by `vtopctl validate`, and each such delete is logged as "deleted P without proof that no process had it open" and counted as `deleted_unchecked` (alert on any increase). Every delete, and every file kept, logs one line saying what happened, what the engine did and what to do, with `path`, `inode` and `archived_bytes` fields. Do not point the option at a live log. With `delete_after_commit`, deleting one hard-linked name changes the file's link count, so the other name is **kept** with "its link count changed since it was archived (from 2 to 1) - most likely another path this engine archived was deleted, or a hard link was made", counted as `links_changed`; its own copy is archived, so nothing is lost, and the remaining name is removed by hand. A hard link made after the commit keeps the file the same way. Two directory entries naming one file — a symlink beside its target, two hard links — are **two sources** by ruling (#378): each is archived under its own name, so the file's records are archived twice, and discovery warns once per alias group naming every spelling. Narrow the patterns to one spelling if one source is meant. There is no merge and no knob, because a merge needs a cursor identity that survives an alias being removed and none is safe: keyed by the surviving spelling, `delete_after_commit` removes it and the target is re-read from zero; keyed by inode, a freed inode reused by a new file inherits the old cursor and that file's opening records are skipped. A duplicate costs storage; a merge risks data. |
 | `sources.syslog_spool.*` | spool paths |
 | `upload.backend` | `s3_native` \| `s3cmd` \| `awscli` \| `minio` \| `localfs` \| `mock` |
 | `upload.bucket` | bucket (supports `telemetry-{format}`) |
@@ -792,8 +1180,10 @@ path needed by the distributed options is already implemented (§6.3).
 | `upload.command_binary` / `command_timeout_seconds` / `command_max_output_bytes` | hardened external-tool path and invocation bounds (compatibility backends only) |
 | `upload.command_env_allowlist` | exact runtime environment names copied into an otherwise empty command environment |
 | `upload.create_bucket` | auto-create per-format buckets |
-| `upload.require_strong_verification` | defaults true — false explicitly permits size-only commit |
+| `upload.require_strong_verification` | defaults true — false explicitly permits size-only commit, which accepts same-size corruption; warned at startup and by `vtopctl validate` (#629) |
 | `upload.max_egress_bytes_per_second` | operator ceiling on the process's total upload body bytes per second (#481), unset by default. One token bucket per process, shared by every backend in it, in front of each `s3_native` object, manifest and multipart-part body — application-layer rate policy over kernel TCP, not a network-aware mechanism; no one-second window admits more than the cap, retries included. Headers and the small XML bodies of `CreateMultipartUpload`, `CompleteMultipartUpload` and `CreateBucket` are neither shaped nor counted. Other backends refuse it at startup. Accounted in `vtop_upload_egress_bytes_total`, exported only when set |
+| `upload.multipart_part_attempts` | requests per multipart part before the part and the upload fail (default 3, at least 1) (#668). Only the failed part is sent again, after a wait that doubles from 1 s to at most 30 s with full jitter; the completed parts are kept. If the upload still fails, the session is kept for the replay when the object is under its content-derived key (#626), and aborted under a per-attempt key (checksums off, a command backend, or a derived key that could not be used, such as a HEAD refused for lack of `s3:ListBucket`). Each request also has the SDK's retries and the `request_timeout_seconds` / `request_min_bytes_per_second` deadline, so the longest one part can take is this many times that deadline times the SDK's attempts |
+| `upload.multipart_abandon_after_secs` | age after which an incomplete multipart session is abandoned (default 86400): its upload is aborted at the store and its file deleted, at startup and every quarter of the window (at most every 15 minutes) while the engine runs (#668). Keep a bucket lifecycle rule above it (§7.6) |
 | `upload.max_concurrency_ceiling` | operator maximum above the concurrency knobs (#481), unset by default: `batching.max_concurrent_batches`, `batching.adaptive_width.min_width` and `upload.transports.*.max_concurrency` above it are refused naming both numbers, and the adaptive width controller's ceiling and floor are clamped to it |
 | `partitioning.template` | object key layout |
 
@@ -806,6 +1196,9 @@ path needed by the distributed options is already implemented (§6.3).
 | `VTOP_METRICS_ADDR` | opt-in Prometheus metrics + readiness endpoint (e.g. `0.0.0.0:9090`); nothing listens unless set |
 | `VTOP_METRICS_TLS_CERT` / `VTOP_METRICS_TLS_KEY` | serve the metrics endpoint over TLS 1.3 (#294): both or neither — half a pair disables the endpoint rather than serving it plaintext |
 | `VTOP_METRICS_TLS_CLIENT_CA` | with the pair above, make the endpoint mutual: only scrapers presenting a certificate under this CA are served |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` (or `..._TRACES_ENDPOINT` / `..._METRICS_ENDPOINT`) | OpenTelemetry export over OTLP/HTTP (#683): traces, and the `/metrics` series. Nothing is exported, and no exporter exists, unless one is set. Every standard `OTEL_*` variable honoured, with its default, is listed in [observability/README.md](../observability/README.md#opentelemetry); one set to something unsupported stops the process at startup |
+| `OTEL_SERVICE_NAME` | `service.name` (default `vtop-engine`; `vtop-node` for the nodes) |
+| `OTEL_EXPORTER_OTLP_HEADERS` | collector request headers, e.g. an auth token; a secret |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | S3 credentials |
 | `AWS_REGION` | S3 region |
 | `VTOP_S3_ENDPOINT_URL` | S3/MinIO endpoint |
@@ -820,7 +1213,6 @@ path needed by the distributed options is already implemented (§6.3).
 | `VTOP_PG_STATEMENT_TIMEOUT_MS` | guard stuck statements |
 | `VTOP_OBJECT_KEY_MODE` | `legacy` \| `deterministic` \| `content-addressed` |
 | `VTOP_KAFKA_GROUP_MODE` | `assign` (single-node) \| `subscribe` (fleet) |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | OpenTelemetry collector |
 | `VTOP_INSTANCE_ID` | stable replica identity (group member / lease owner) |
 | `VTOP_ETCD_ENDPOINTS` | etcd/Consul endpoints for leases |
 | `VTOP_LEASE_TTL_SECONDS` | source-ownership lease TTL |
@@ -837,17 +1229,44 @@ path needed by the distributed options is already implemented (§6.3).
   (`crates/vtop-observe`, served by `vtopctl`), including a readiness probe.
 - **Structured per-stage events** — one logical span per batch with child
   events per pipeline stage.
+- **OpenTelemetry export** (#683) — built into `vtopctl` and `vtop-node`, idle
+  until `OTEL_EXPORTER_OTLP_ENDPOINT` is set: a `batch` span with a child per
+  step (seal, compress, checksum, upload_object, upload_manifest, verify,
+  commit), a span per recovery decision and per scrub check, the `/metrics`
+  series over OTLP, trace ids in the JSON log lines, and the exporter's own
+  counters on `/metrics`; HTTP/protobuf; a bounded queue, so the data path
+  never waits on the collector; flushed within 5 s at shutdown. See the
+  [observability README](../observability/README.md#opentelemetry).
 - **Dashboard tooling** — the `observability/` directory carries a
   Grafana/Loki/Mimir/Tempo/Alloy compose stack
   (`docker-compose.observability.yml`) and generated dashboards for the
   pipeline, Kafka, and flow views.
+- **Multipart metrics** (#668) — `vtop_multipart_parts_total{result}`
+  (`uploaded`, `reused`, `retried`, `failed`),
+  `vtop_multipart_sessions_total{outcome}` (`completed`, `resumed`,
+  `restarted`, `kept_after_failure`, `swept`) and
+  `vtop_multipart_bytes_reused_total`. `kept_after_failure` growing while
+  neither `resumed` nor `swept` does means incomplete uploads are piling up in
+  the bucket (§7.6).
+- **Archive scrub metrics** — `vtopctl scrub --metrics-file` (§7.5) writes
+  `vtop_scrub_objects_total{result}` and the last-success, last-pass and
+  last-finding times
+  as a textfile; the [observability README](../observability/README.md#archive-scrub)
+  has an example alert rule set.
+
+- **Alerting rules** (#720): `observability/prometheus/vtop-rules.yaml`, also
+  shipped as the chart's `PrometheusRule`: verification failures, no commits
+  while data waits, replay-rate spike, Kafka lag growth (from kafka-exporter),
+  size-only verification, failed Object Lock checks, retention loss, refused
+  replays, a state store refusing recovery's replay decisions, and piling
+  multipart sessions. Each has a promtool unit test and a
+  section in [Alert runbooks](operate/runbooks.md); the objectives are on
+  [Service level objectives](operate/slos.md).
 
 **Still needed for production [PROPOSED]:**
-- **Alerting rules** (Alertmanager): verification failures > 0; replay-rate
-  spike; lag growth; store write-latency SLO breach; no committed batches in N
-  minutes.
-- **OpenTelemetry trace export** from the engine (the Tempo backend is already
-  in the stack; the engine does not yet emit OTLP).
+- **Alerting rules:** a store write-latency SLO breach (the engine has no
+  write-latency objective yet; `vtop_stage_duration_seconds{stage="state_write"}`
+  is the metric it would read).
 - Metric coverage review: **verification-failure rate**, **replay /
   REPLAY_REQUIRED rate**, Kafka **consumer lag**, state-store write latency,
   **duplicate-object rate** (needed until deterministic keys land).
@@ -869,11 +1288,14 @@ Invariant preserved: source progress is NEVER advanced for unverified data.
 | Failure | Behavior | Why it's safe |
 |---|---|---|
 | Engine crash mid-batch | `recover()`: pre-VERIFIED → replay from last committed source position; VERIFIED-but-not-committed → retry commit | Progress never advanced for unverified data |
-| Replay after crash | **Today:** new object key → duplicate object (no loss). **After deterministic keys:** same key, existing verified = success | At-least-once now; idempotent later |
+| Replay after crash | **Today (#626):** same bytes → same key, existing verified object = success; replays rebuilt as first cut and sealed at the recorded instant (v0.10.0); a bound refused or too large, or a row from before v0.10.0 → second object (no loss) | At-least-once; idempotent for a replay of the same bytes |
 | State store unavailable | Cannot transition → stops committing (fails safe) | No commit-before-verify possible |
 | Kafka rebalance (fleet) | Revoked partitions: finish/abandon in-flight, no commit; reassigned replica resumes from committed offset | Offsets commit only post-verify |
 | File-owner replica dies (Tier 3) | Lease expires; another replica resumes from stored byte cursor | Cursor in shared durable store |
 | Object Lock blocks overwrite | Retry uses deterministic key / new version, never overwrite | §7.2 rule |
+| A multipart part fails (#668) | Only that part is sent again, up to `upload.multipart_part_attempts`, with backoff; the completed parts stay in the session. If it still fails, the batch fails and is replayed. Under the object's content-derived key (#626) the session is kept, and the replay of the same bytes resumes it and sends only the missing parts; under a per-attempt key it is aborted and the replay starts over | The whole object is read back and verified before VERIFIED, as for a fresh upload; ETags are never evidence |
+| The store cannot continue a multipart upload (`NoSuchUpload`, or `InvalidPart` on complete) (#668) | The upload is abandoned (aborted where it still exists) and restarts once with a new upload id, sending every part; a second failure in the same call fails the batch with nothing kept, and the replay starts afresh | A new upload, verified by read-back like any other |
+| A kept session is never resumed (#668) | The sweep aborts its upload once it is older than `upload.multipart_abandon_after_secs`; a failed abort keeps the session for the next sweep | Only incomplete uploads are aborted; a lifecycle rule (§7.6) covers a lost work directory |
 
 ---
 
@@ -940,6 +1362,13 @@ Short procedures now; expand into a full ops runbook before go-live.
 - **Audit archive coverage:** run `vtopctl audit-coverage --config ...
   [--check-storage] [--metrics-file ...]` on a schedule (§6.6); a non-zero
   exit names the source units with lost ranges.
+- **Scrub the archive:** run `vtopctl scrub --config ... --cursor-file ...
+  --limit N [--metrics-file ...]` on a schedule (§7.5) so every committed
+  object is read back once per pass; a non-zero exit lists the batches whose
+  object or manifest is missing, mismatched, unauthenticated or unreadable.
+  It cannot repair them: restore from a replica or backup, or record the loss.
+  A manifest from a newer release (`unsupported_version`) is a finding too;
+  its remedy is a scrub binary of that release or later.
 - **Upgrade the metadata tier (#554):** roll the voters one at a time, and
   confirm each has CAUGHT UP before the next. The chart's `RollingUpdate`
   replaces one pod at a time, but it waits only for `/readyz`, which on a
@@ -960,23 +1389,64 @@ Short procedures now; expand into a full ops runbook before go-live.
   remains is the one way to stall the tier - that voter cannot decode the
   raise itself. A node that refuses to start with "written by a newer
   release" is an old binary on a newer log: upgrade it.
-- **Upgrading data nodes past #611:** the fix lives in the FENCED replica,
-  which keeps records a promotion candidate merely lacks instead of
-  truncating them. A replica still on an older release truncates as before,
-  and nothing on the wire tells the candidate which kind answered. So until
-  every data node of a range runs this release, a failover can still lose an
-  acknowledged write. That needs a replica holding acknowledged records
-  above its own committed mark, which it has not learned yet because the
-  leader acknowledges the producer before the mark reaches followers. A
-  rolling upgrade causes failovers, so keep it from triggering that:
-  1. Upgrade a range's followers before the node that leads it.
-  2. Before restarting the leader (or any node whose restart moves a
-     lease), stop producers to the range and wait until every follower's
-     `vtop_broker_cluster_committed_offset{topic,range}` equals the
-     leader's. A fence then cannot
-     truncate an acknowledged record on any replica, old or new: the
-     truncation guard refuses below the mark.
-  3. Resume producers once the new leader is serving.
+  From level 8 on (#706) the leader checks this itself: before it proposes
+  the raise it asks every metadata voter and learner over the peer plane
+  what release it runs and the highest level it implements, and refuses -
+  proposing nothing - unless each answers that it supports the level. The
+  refusal names each member and what it answered: a release and level,
+  "closed without answering" (v0.9.0 or older has no answer to the question
+  and closes the connection; so does a member that refuses the request), or
+  why it could not be reached. Levels up to 7 are still raised on the
+  operator's word, because v0.8.0 and v0.9.0 implement 7 but cannot answer.
+  The check runs only on a leader on this release or later: raise once
+  `vtopctl meta status` shows one leads, because an older leader proposes
+  the raise unchecked. It runs when the raise is proposed, not when it is
+  applied: what a member answers is not replicated state, so add a voter on
+  an older release after a raise and that voter stalls as before (a
+  membership change while the members are being asked refuses the raise).
+- **Upgrade the data nodes (#634): roll, verify, finalize.** Once metadata
+  is at feature level 7, every data node with a `lease` block reports its
+  release, the replica protocol it speaks and the feature level it
+  implements; it starts at boot and asks again on its lease renewal cadence
+  until metadata records it. Metadata keeps the report only for a
+  registered node (`vtopctl meta register-node`).
+  1. **Roll the binaries**, one node at a time, a range's followers before
+     the node that leads it. Until you finalize, the cluster runs at the
+     level in force: a new node speaks the old replica protocol to a peer
+     that predates the version handshake, and nothing new switches on.
+  2. **Verify that every node reports the new release:** `vtopctl meta
+     node-versions --config meta-admin.yaml --level N` lists each
+     registered node with what it reported, and exits non-zero naming every
+     counted node that has not reported N or higher (including one that
+     never reported). A counted node is a live range member (a lease holder
+     or a member of a recorded replica set) or any node that has reported,
+     unless it is marked dead. "never reported" means the node
+     runs a release before #634, has no `lease` block, or is not registered.
+  3. **Finalize:** `vtopctl meta enable-features --level N`. It is refused,
+     naming the nodes, while any counted node has not reported N or higher. The
+     metadata state machine applies the same check, so a node that joins
+     between the check and the raise is caught too. After the raise, every
+     data node that has read the level refuses a replica peer below it on
+     both ends of a session, including a peer that predates the handshake,
+     and both logs name the cause. A node that will not return stops holding
+     a raise back once it is marked dead (`vtopctl meta set-node-state
+     --state dead`).
+
+  Level 7, where reporting starts, is the exception: no data node can
+  report before it is in force, so its raise is judged on the metadata tier
+  alone. It changes nothing on the replica plane, so raising it cannot cut
+  a peer off. Every level above 7 waits for the data nodes. A data node with
+  no metadata configured (a static range) reports nothing and holds no peer
+  to a level.
+
+  The #611 fix is not tied to a level. It lives in the fenced replica, so
+  while a range still has a replica on a release before it, a failover can
+  lose an acknowledged write through that replica's own truncation. A
+  rolling upgrade causes failovers. Until `node-versions` shows every node
+  of the range on a release with the fix, stop producers to the range
+  before restarting its leader, and wait until every follower's
+  `vtop_broker_cluster_committed_offset{topic,range}` equals the leader's:
+  the truncation guard then refuses below the mark on any replica.
 - **Rolling a data node back past #635:** a replica holding a suffix a fence
   kept in dispute marks its fencing-epoch journal version 2 until the new
   leader settles it, usually within one append. A crash between clearing the
@@ -1009,10 +1479,15 @@ Short procedures now; expand into a full ops runbook before go-live.
     a replica that disputes nothing). Every candidate holding records is Unknown to itself and
     stands aside, and a candidate holding none stands aside for them, so
     the range goes unled. (A fresh, empty range is not affected: a
-    candidate at 0 disputes nothing and promotes.) The transition record shows
-    `Refused{QuorumUnavailable}`, the same as an ordinary missing quorum;
-    the data node's warning names the lineage cause. There is no
-    in-product remedy yet.
+    candidate at 0 disputes nothing and promotes.) The refusal says so
+    (#636): the data node logs `reason="lineage_unproven"` and counts it in
+    `vtop_broker_promotion_refusals_total{reason="lineage_unproven"}`, and at
+    feature level 8 the transition record shows `Refused{LineageUnproven}`
+    (below 8 it shows `Refused{QuorumUnavailable}`, as before). Alert on that
+    series: unlike `quorum_unavailable`, waiting does not clear it. The
+    remedies, in order: restore the range from backup; failing that, the
+    last-resort override below ("Promote a range whose lineage cannot be
+    proven").
   - **A replica whose only dispute with the candidate is below its retained
     base is not counted.** The replica itself finds the retained records in
     agreement (#408), but the candidate cannot see its base, so the answer
@@ -1036,8 +1511,9 @@ Short procedures now; expand into a full ops runbook before go-live.
   before the raise. It also includes records written after it by a data
   node still on an older release: that node does not judge lineage, so its
   records count answers this release would mark Unknown. Nothing enforces
-  the upgrade order, so raise the level only after every data node runs this
-  release.
+  the upgrade order at levels 6 and 7 (the data-node gate starts above 7,
+  #634), and raising to 7 raises past 6, so raise either only after every
+  data node runs this release.
 - **Change a range's replica set (#553):** a range's quorum is counted over
   the set metadata records for it (`vtopctl meta replica-set --config
   meta-admin.yaml --topic-uuid T --range-uuid R`; every `vtopctl meta`
@@ -1076,6 +1552,75 @@ Short procedures now; expand into a full ops runbook before go-live.
   from the record leaves that node unable to lead.
 - **Restore from DB backup:** restore Postgres PITR → verify object store →
   start the engine (recovery scan re-reconciles) → run the divergence checker.
+- **Promote a range whose lineage cannot be proven (#636) - LAST RESORT,
+  only after restore from backup is ruled out.** A range that holds records
+  while none of its replicas has epoch history refuses every promotion with
+  `lineage_unproven` (see the #577 costs above), by design: an answer whose
+  history cannot be compared is a count of records whatever wrote them, and
+  counting it could expose another leadership's records or drop
+  acknowledged ones. The override is an explicit, audited, single-use
+  statement by an operator - the spirit of an unclean leader election, but
+  never automatic, never a configuration default, and never more than one
+  promotion:
+
+  ```bash
+  vtopctl node promote-unproven --meta-config meta-admin.yaml \
+    --topic <topic-uuid> --range <range-uuid> --replica <node-uuid> \
+    --operator "$USER" --i-accept-data-loss
+  ```
+
+  It records an attestation in metadata naming the replica whose log becomes
+  the range's history, the operator, and the time. Only that replica, at its
+  next promotion, counts the answers whose lineage is Unknown; metadata
+  accepts that promotion's report only while the attestation is live and
+  names its holder, records the attestation in the transition (`vtopctl
+  meta transitions` lists it as `ATTESTED` with operator and time, and
+  counts it under `attested`), and removes it in the same step, so a second
+  promotion needs a new attestation. A newer attestation replaces an unused
+  one; a promotion that proves its lineage without one retires it.
+  Everything else is still checked: the named replica must hold the
+  boundary the answers prove, a majority must be at or below it (otherwise
+  the refusal names the replica that holds more - attest that one instead),
+  and a published watermark still never regresses. Other replicas stand
+  aside for the named one.
+
+  **What it can lose.** Every record the named replica does not hold. That
+  includes records only other replicas hold above its tail, and records
+  other replicas hold at the SAME offsets with different content (an
+  offset is a count, not an identity, and without epoch history nothing
+  tells them apart). Records a producer was told were acknowledged can be
+  among them. Once metadata records the promotion, the promoted replica's
+  whole log becomes its epoch history, under the promotion's epoch, so it can
+  prove its lineage at the next failover. If metadata recorded it but the
+  answer was lost and that epoch ended first, the replica writes the history
+  at its next verification instead, once it finds the record as the newest
+  established promotion in the transition chain (the log says "answer was
+  lost"); it does not serve on it, since the others still cannot prove their
+  lineage. Repair every other replica from it
+  so none keeps records that history does not contain, one stopped replica
+  at a time:
+
+  ```bash
+  # stop the replica's data node first; repair refuses a live range
+  vtopctl node repair --config node-client.yaml \
+    --from <promoted replica> --into <the stopped replica's data dir> \
+    --fencing-epoch <the range's current epoch> --seal-tail
+  # then start the replica again
+  ```
+
+  (`--fencing-epoch` is the epoch metadata granted the promoted replica:
+  `vtopctl meta transitions` shows it as the last `ATTESTED` line.) Expect
+  `vtop_broker_promotions_attested_total` to have moved by one on the
+  promoted replica's data node (it is a per-process counter, so a restart
+  before the history was written counts it when it is), and alert on
+  any increase.
+
+  Needs metadata feature level 8: upgrade every metadata voter and every
+  data node, then `vtopctl meta enable-features --level 8`. Level 8 sits
+  above the data-node capability gate (level 7, #634), so the raise is
+  refused, naming the nodes, until every live range member reports it
+  supports 8 (`vtopctl meta node-versions`). Below level 8 the override is
+  refused before anything is recorded, and says so.
 - **Reconcile state store vs object storage:** list `SOURCE_COMMITTED` rows and
   confirm each object+manifest exists; flag orphan objects (no row) and missing
   objects (row but no object) for remediation.
@@ -1120,10 +1665,11 @@ Short procedures now; expand into a full ops runbook before go-live.
   an engine on a different host pointed at the same Postgres; that
   configuration is unsupported and warned about at startup. Do not scale
   replicas.
-- **Non-deterministic object keys** — replay can create **duplicate objects** (no
-  loss). This is also the implementation's one known gap against the protocol
-  draft's deterministic-naming MUST (protocol §15.1). Fixed by
-  deterministic/content-addressed keys (Phase 4).
+- **Object keys are deterministic only for the same bytes** (#626) — a replay
+  with the same batch boundaries reuses the stored object, in a later hour
+  too (v0.10.0); one whose boundaries or bytes differ still writes a second
+  object (no loss), and manifests stay per attempt. This narrows the gap against protocol
+  §15.1 without closing it (ARCHITECTURE.md §13 item 3).
 - **Engine loop is single-process** — no horizontal scale until Kafka
   consumer-group fleet mode lands (Phase 5).
 - **File/syslog HA is not solved without leases** — single-owner only.
@@ -1181,7 +1727,7 @@ bounded retry on SQLSTATE `40001`; battery green on Postgres. DDL is an explicit
 deployment identity; the live battery proves the runtime role cannot run DDL,
 `DELETE`, or `TRUNCATE`. See [`POSTGRES_DEPLOYMENT.md`](POSTGRES_DEPLOYMENT.md).
 
-### Phase 4 — Deterministic keys + idempotent retry ⬜ NOT STARTED — next up
+### Phase 4 — Deterministic keys + idempotent retry 🟡 PARTIAL (#626)
 - **Objective:** replaying a batch must resolve to the same object, so retry is
   idempotent at the archive layer and Object Lock is safe (§7). This also
   closes the implementation's one known conformance gap against the protocol
@@ -1198,7 +1744,23 @@ deployment identity; the live battery proves the runtime role cannot run DDL,
   overwrite attempt against a locked bucket (MinIO Object Lock in Compose).
 - **Exit criteria:** replay produces zero duplicate objects; retries never
   overwrite or delete a protected version.
-- **Rollback:** `VTOP_OBJECT_KEY_MODE=legacy` (duplicates return; no loss).
+- **Rollback:** as planned, `VTOP_OBJECT_KEY_MODE=legacy` (duplicates return; no loss). As shipped (#626) there is no toggle: roll back by running the previous release, which names every object per attempt again; archives with both kinds of key read the same.
+- **Status (#626):** objects are named by source, range and content digest
+  (`build_object_name`); an object already at the key is reused only after a
+  strong verification, and anything else there is never overwritten (the
+  batch falls back to its per-attempt key). There is no key-mode toggle: the
+  attempt key is the fallback, not a mode. Under the Object Lock profile
+  (#684) a reused object must still be locked, and a damaged object at the
+  derived key is never written over (`crates/vtop-cli/tests/object_lock.rs`,
+  against the mock store); the store's own behaviour, an overwrite that makes
+  a new version and a locked version that survives a delete, is tested
+  against the lab's MinIO in CI (`minio-integration`). A replay in a later
+  hour is sealed at the instant its row recorded (#755), and a replay over a
+  source that grew is rebuilt as first cut (#793, #796), so both reuse the
+  object (v0.10.0). Not done: reproducing batch boundaries after a power
+  loss, a stable partition hour for a row written before v0.10.0, and
+  per-range manifests.
+  See [ARCHITECTURE.md](ARCHITECTURE.md) §13 item 3.
 
 ### Phase 5 — Kafka consumer-group fleet mode ⬜ NOT STARTED
 - **Objective:** N replicas split partitions safely (§8).
@@ -1220,12 +1782,18 @@ deployment identity; the live battery proves the runtime role cannot run DDL,
 ### Phase 6 — Observability & alerting ◐ PARTIAL
 - **Done:** Prometheus metrics + readiness endpoint (`VTOP_METRICS_ADDR`,
   `vtop-observe`); structured per-stage events; `observability/` compose stack
-  (Grafana, Loki, Mimir, Tempo, Alloy) with generated dashboards.
-- **Remaining:** Alertmanager rules (verification failures > 0, replay-rate
-  spike, lag growth, store-latency SLO breach, no-commits-in-N-minutes); OTLP
-  trace export from the engine into the existing Tempo backend; metric
-  coverage review (duplicate-object rate until Phase 4 lands, consumer lag,
-  state-store write latency); documented SLOs.
+  (Grafana, Loki, Mimir, Tempo, Alloy) with generated dashboards; OTLP trace
+  export from the engine into that Tempo (#683); Grafana alert rules for the
+  lab (retention loss, replication health, consumer-group eviction: #454,
+  #561, #571).
+- **Done (#720):** Prometheus alert rules (verification failures, replay-rate
+  spike, lag growth, no commits in 30 minutes while data waits, and six more),
+  each unit-tested with promtool in CI and linked to a runbook section;
+  documented SLOs ([operate/slos.md](operate/slos.md)).
+- **Remaining:** a store-latency SLO and its alert; metric coverage review
+  (duplicate-object rate until Phase 4 lands, an engine-side consumer lag,
+  state-store write latency); wiring the rules to an Alertmanager is the
+  deployment's.
 - **Test plan:** force a verification failure and confirm the alert; load test
   and watch lag/replay panels.
 - **Exit criteria:** operators see throughput, lag, replay, failures; alerts
@@ -1295,7 +1863,7 @@ deployment identity; the live battery proves the runtime role cannot run DDL,
 | 1 | `StateStore` trait | ✅ done | P0 | 0 | no behavior change; `sqlite://` works | revert refactor |
 | 2 | Shared invariant tests | ✅ done | P0 | 1 | one invariant impl; battery green | keep SQLite path |
 | 3 | Postgres backend | ✅ done | P1 | 2 | `postgres://` works; DB enforces invariant | switch to `sqlite://` (drain first) |
-| 4 | Deterministic keys | ⬜ next | P1 | 3 | no duplicate objects; Object Lock safe | `VTOP_OBJECT_KEY_MODE=legacy` |
+| 4 | Deterministic keys | 🟡 partial (#626) | P1 | 3 | no duplicate objects; Object Lock safe | previous release (no toggle shipped) |
 | 5 | Kafka fleet mode | ⬜ | P1 | 4 | safe rebalance; no double-commit; no double-recovery | `assign` mode, 1 replica |
 | 6 | Observability & alerting | ◐ partial | P1 | 0 | alerts fire; traces exported; SLOs documented | disable metrics endpoint |
 | 7 | Engine k8s deployment | ⬜ | P1 | 4,5,6 | rolling upgrade w/o loss; bounded autoscale | Helm rollback |
@@ -1309,7 +1877,7 @@ deployment identity; the live battery proves the runtime role cannot run DDL,
 
 | Risk | Impact | Mitigation | Phase | Status |
 |---|---|---|---|---|
-| Object Lock prevents overwrite-based retry | Retries fail / stuck batches | Deterministic keys + "existing verified = success" / version_id (§7.2) | 4 | open |
+| Object Lock prevents overwrite-based retry | Retries fail / stuck batches | Deterministic keys + "existing verified = success" (#626); the engine writes and verifies the lock itself with `upload.object_lock` (#684) (§7.2) | 4 | mitigated (a reused object that is not locked as configured is replaced by a fresh locked object under the attempt key, #709) |
 | Kafka rebalance during in-flight batch | Duplicate work / spurious revocation | Revocation handler; tune poll/session timeouts; cooperative rebalancing (§8.3) | 5 | open |
 | Two engines over one store double-recover | Duplicate ingestion / double-commit | **Same host only:** the startup instance lock (#66) refuses it. **Cross-host over shared Postgres it cannot detect** — unsupported and warned at startup (§19). The ledger now fences a stalled engine (claim generation, #557) so a handover cannot be overwritten, but sources are still not divided between engines; open until Phase 5 | 5 | partially mitigated (same-host lock; ledger fence for handover) |
 | State database unavailable | Engine cannot commit | Fails safe (stops committing); HA store; alerts | 3,6 | mitigated |
@@ -1334,8 +1902,9 @@ Correctness & invariant
   [x] verify-before-commit enforced in core AND database (state-aware CHECKs)
   [x] crash before VERIFIED → replay; crash after VERIFIED/before COMMIT → safe
   [x] require_strong_verification defaults true
-  [ ] deterministic or content-addressed object keys enabled           (Phase 4)
-  [ ] Object Lock behavior tested (retry never overwrites)             (Phase 4)
+  [x] content-addressed object keys (#626, #688)
+  [ ] batch boundaries reproduced after power loss; per-range manifests (Phase 4)
+  [x] Object Lock behavior tested (retry never overwrites; #684)
 
 State store
   [x] StateStore trait + shared test battery green on SQLite AND Postgres
@@ -1357,8 +1926,9 @@ Object storage
 Operability
   [x] Prometheus metrics endpoint + readiness probe (VTOP_METRICS_ADDR)
   [x] dashboards defined (observability/ stack)
-  [ ] Alertmanager rules wired                                         (Phase 6)
-  [ ] OpenTelemetry traces exported                                    (Phase 6)
+  [x] Prometheus alert rules, unit-tested, with runbooks (#720)       (Phase 6)
+  [ ] Alertmanager routing wired (deployment-side)                    (Phase 6)
+  [x] OpenTelemetry traces exported (opt-in, OTEL_EXPORTER_OTLP_ENDPOINT)
   [ ] engine k8s chart: probes, limits, PDB, NetworkPolicy, runbook    (Phase 7)
 
 Security
@@ -1429,9 +1999,10 @@ proven by a scenario that drives real processes, not only by unit coverage.
   today from a `--features postgres` source build** (release artifacts don't
   yet enable the feature).
 - **Two current-behavior caveats the design must still fix for fleet HA:**
-  (a) object keys are **non-deterministic** → replay makes **duplicates**; fix with
-  **deterministic keys** (Phase 4) for idempotency + Object Lock safety —
-  also the one conformance gap against protocol §15.1.
+  (a) object keys are **deterministic only for the same bytes** (#626) → a replay
+  that could not be rebuilt as first cut still makes **duplicates**; replays
+  reproduce their boundaries since v0.10.0, and protocol §15.1 is met for
+  objects whenever the ledger row survives.
   (b) the engine is **single-instance by design** until Kafka consumer-group
   fleet mode and multi-writer recovery land (Phase 5).
 - **VERIFIED is defined precisely (§4); strong content-derived verification is

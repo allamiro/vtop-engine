@@ -29,7 +29,8 @@ pub mod tls;
 pub mod wire;
 
 pub use admin::{
-    refuses_lineage_verdicts, resolve_endpoint, stub_status, AdminCandidate, AdminClient,
+    predates_cluster_versions_read, refuses_lineage_verdicts, refuses_promote_unproven,
+    refuses_version_report, resolve_endpoint, stub_status, AdminCandidate, AdminClient,
     AdminHandler, AdminServer,
 };
 pub use authz::{AdminAuthorizer, AdminIdentity, CommandClass, Refusal};
@@ -37,7 +38,7 @@ pub use maybe_tls::{
     cross_mode_refusal, judge_dialect, sniff_dialect, tls_handshake_hint, warn_rate_limited,
     with_tls_handshake_hint, DialectVerdict, MaybeTls, WireDialect,
 };
-pub use peer::{PeerClient, PeerRpcHandler, PeerServer};
+pub use peer::{local_version, PeerClient, PeerRpcHandler, PeerServer, VersionAskError};
 pub use tls::{
     assert_peer_identity, build_client_connector, build_server_acceptor, common_name_from_cert,
     meta_node_id_from_cert, server_name, TlsMaterial,
@@ -46,21 +47,27 @@ pub use wire::{
     read_frame, write_frame, AdminAddLearnerRequest, AdminChangeMembershipRequest, AdminError,
     AdminGroupCursorView, AdminInitRequest, AdminLeaseView, AdminMembershipResponse,
     AdminProposeRequest, AdminProposeResponse, AdminRangeReplicaSetView,
-    AdminReadGroupCursorRequest, AdminReadGroupCursorResponse, AdminReadRangeLeaseRequest,
-    AdminReadRangeLeaseResponse, AdminReadRangeReplicaSetRequest, AdminReadRangeReplicaSetResponse,
+    AdminReadClusterVersionsRequest, AdminReadClusterVersionsResponse, AdminReadGroupCursorRequest,
+    AdminReadGroupCursorResponse, AdminReadPromotionAttestationRequest,
+    AdminReadPromotionAttestationResponse, AdminReadRangeLeaseRequest, AdminReadRangeLeaseResponse,
+    AdminReadRangeReplicaSetRequest, AdminReadRangeReplicaSetResponse,
     AdminReadRangeTransitionsRequest, AdminReadRangeTransitionsResponse,
     AdminReadSegmentPlacementRequest, AdminReadSegmentPlacementResponse, AdminRebalanceIntentView,
     AdminSegmentView, AdminStatusRequest, AdminStatusResponse, AdminTransitionView,
     PeerAppendRequest, PeerAppendResponse, PeerInstallRequest, PeerInstallResponse,
-    PeerVoteRequest, PeerVoteResponse, TransportError, TransportResult, VtpmFrame, WireLogId,
-    KIND_ADMIN_ADD_LEARNER_REQ, KIND_ADMIN_CHANGE_MEMBERSHIP_REQ, KIND_ADMIN_ERROR,
-    KIND_ADMIN_INIT_REQ, KIND_ADMIN_MEMBERSHIP_RESP, KIND_ADMIN_PROPOSE_REQ,
-    KIND_ADMIN_PROPOSE_RESP, KIND_ADMIN_READ_GROUP_CURSOR_REQ, KIND_ADMIN_READ_GROUP_CURSOR_RESP,
+    PeerVersionRequest, PeerVersionResponse, PeerVoteRequest, PeerVoteResponse, TransportError,
+    TransportResult, VtpmFrame, WireLogId, KIND_ADMIN_ADD_LEARNER_REQ,
+    KIND_ADMIN_CHANGE_MEMBERSHIP_REQ, KIND_ADMIN_ERROR, KIND_ADMIN_INIT_REQ,
+    KIND_ADMIN_MEMBERSHIP_RESP, KIND_ADMIN_PROPOSE_REQ, KIND_ADMIN_PROPOSE_RESP,
+    KIND_ADMIN_READ_CLUSTER_VERSIONS_REQ, KIND_ADMIN_READ_CLUSTER_VERSIONS_RESP,
+    KIND_ADMIN_READ_GROUP_CURSOR_REQ, KIND_ADMIN_READ_GROUP_CURSOR_RESP,
+    KIND_ADMIN_READ_PROMOTION_ATTESTATION_REQ, KIND_ADMIN_READ_PROMOTION_ATTESTATION_RESP,
     KIND_ADMIN_READ_RANGE_LEASE_REQ, KIND_ADMIN_READ_RANGE_LEASE_RESP,
     KIND_ADMIN_READ_RANGE_REPLICA_SET_REQ, KIND_ADMIN_READ_RANGE_REPLICA_SET_RESP,
     KIND_ADMIN_READ_RANGE_TRANSITIONS_REQ, KIND_ADMIN_READ_RANGE_TRANSITIONS_RESP,
     KIND_ADMIN_READ_SEGMENT_PLACEMENT_REQ, KIND_ADMIN_READ_SEGMENT_PLACEMENT_RESP,
     KIND_ADMIN_STATUS_REQ, KIND_ADMIN_STATUS_RESP, KIND_APPEND_REQ, KIND_APPEND_RESP,
-    KIND_INSTALL_REQ, KIND_INSTALL_RESP, KIND_VOTE_REQ, KIND_VOTE_RESP, MAX_ADMIN_MEMBERSHIP_NODES,
+    KIND_INSTALL_REQ, KIND_INSTALL_RESP, KIND_PEER_VERSION_REQ, KIND_PEER_VERSION_RESP,
+    KIND_VOTE_REQ, KIND_VOTE_RESP, MAX_ADMIN_MEMBERSHIP_NODES, MAX_CLUSTER_VERSION_NODES,
     MAX_FRAME_BYTES, VTPM_MAGIC, VTPM_VERSION,
 };

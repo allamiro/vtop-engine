@@ -160,6 +160,17 @@ pub enum MetaCommand {
     /// the commands it enables. Raising is permanent - there is no lowering -
     /// and asking for a level already in force is a no-op. The reply's
     /// generation is the level now in force.
+    ///
+    /// A level above 7 is also refused while any counted node - a live range
+    /// member, or any node that has reported, unless marked dead - has not
+    /// reported that level or higher (#634); the refusal names every such
+    /// node. See `node-versions`.
+    ///
+    /// From level 8 the metadata leader also asks every metadata voter and
+    /// learner what it runs before it proposes the raise (#706), and refuses
+    /// unless each answers that it supports the level. A voter on v0.9.0 or
+    /// older cannot answer, so it holds the raise back by name; so does one
+    /// that cannot be reached. The leader must run this release.
     EnableFeatures {
         #[command(flatten)]
         common: MetaCommonArgs,
@@ -167,6 +178,17 @@ pub enum MetaCommand {
         level: u32,
         #[arg(long)]
         request_id: Option<Uuid>,
+    },
+    /// What every registered node reported it runs (#634): its release, the
+    /// replica protocol it speaks and the feature level it implements, and
+    /// whether a feature raise counts it (a range member or a reporter, not
+    /// marked dead). With `--level`, also whether that level could be raised
+    /// now, naming every node it waits for; exits non-zero if not.
+    NodeVersions {
+        #[command(flatten)]
+        common: MetaCommonArgs,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        level: Option<u32>,
     },
     /// The replica set metadata recorded for a range (#553): the nodes its
     /// quorum is counted over, the record's generation (the CAS token
@@ -1022,20 +1044,28 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
         MetaCommand::Init { common, members } => {
             let config = load_admin_config(&common.config)?;
             let client = connect(&config)?;
-            let response = client
-                .init(members)
-                .await
-                .map_err(|error| error.to_string())?;
+            let listed = join_ids(&members);
+            let response = audited_membership(
+                vtop_observe::audit::Action::ClusterInit,
+                vec![("members", listed)],
+                || client.init(members),
+            )
+            .await?;
             note_redirects(&client);
             print_membership_change(&response.membership, "initialized", json)
         }
         MetaCommand::AddLearner { common, node_id } => {
             let config = load_admin_config(&common.config)?;
             let client = connect(&config)?;
-            let response = client
-                .add_learner(node_id)
-                .await
-                .map_err(|error| error.to_string())?;
+            let response = audited_membership(
+                vtop_observe::audit::Action::ClusterMembership,
+                vec![
+                    ("operation", "add_learner".to_owned()),
+                    ("node_id", node_id.to_string()),
+                ],
+                || client.add_learner(node_id),
+            )
+            .await?;
             note_redirects(&client);
             print_membership_change(&response.membership, "learner added", json)
         }
@@ -1046,10 +1076,20 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
         } => {
             let config = load_admin_config(&common.config)?;
             let client = connect(&config)?;
-            let response = client
-                .change_membership(voters, retain_removed_as_learners)
-                .await
-                .map_err(|error| error.to_string())?;
+            let listed = join_ids(&voters);
+            let response = audited_membership(
+                vtop_observe::audit::Action::ClusterMembership,
+                vec![
+                    ("operation", "change_membership".to_owned()),
+                    ("voters", listed),
+                    (
+                        "retain_removed_as_learners",
+                        retain_removed_as_learners.to_string(),
+                    ),
+                ],
+                || client.change_membership(voters, retain_removed_as_learners),
+            )
+            .await?;
             note_redirects(&client);
             print_membership_change(&response.membership, "membership changed", json)
         }
@@ -1378,6 +1418,7 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                             "broken_links": audit.broken_links,
                             "vote_disagreements": audit.vote_disagreements,
                             "boundary_regressions": audit.boundary_regressions,
+                            "attested_promotions": audit.attested,
                             "regression_floor_known": !audit.regression_floor_unknown,
                             "mac": { "verified": audit.verified, "unsigned": audit.unsigned, "unverified": audit.unverified, "mismatch": audit.mismatches },
                         },
@@ -1390,11 +1431,12 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                     println!("{}", transition_line(view, record));
                 }
                 println!(
-                    "{} transition(s) from epoch {from_epoch} (read at applied index {}); links: {} broken; votes: {} disagree; mac: {} verified, {} unsigned, {} unverified, {} MISMATCH",
+                    "{} transition(s) from epoch {from_epoch} (read at applied index {}); links: {} broken; votes: {} disagree; attested: {}; mac: {} verified, {} unsigned, {} unverified, {} MISMATCH",
                     audit.records.len(),
                     read_at_applied_index,
                     audit.broken_links,
                     audit.vote_disagreements,
+                    audit.attested,
                     audit.verified,
                     audit.unsigned,
                     audit.unverified,
@@ -1433,7 +1475,114 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                 },
                 feature_level: level,
             };
-            propose_and_print(&common.config, command, json).await
+            // Judged here as well as in the state machine (#634): the state
+            // machine's refusal is bounded to a few hundred bytes, and this
+            // one names every node the raise waits for. The level it raises
+            // from goes into the audit record when this read was made
+            // (#694); below the levels that need it, nothing is read, as
+            // before (review of #705).
+            let mut before = Vec::new();
+            if level > vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL {
+                let config = load_admin_config(&common.config)?;
+                let client = connect(&config)?;
+                let read = client.read_cluster_versions(true).await;
+                note_redirects(&client);
+                if let Ok(read) = &read {
+                    before.push((
+                        "level",
+                        serde_json::Value::from(read.versions.feature_level),
+                    ));
+                }
+                if let Err(refusal) = judge_feature_raise(level, read) {
+                    if let Some(event) =
+                        crate::audit::client_record(&command, vtop_observe::audit::Outcome::Refused)
+                    {
+                        let mut event = event.reason(format!("refused before sending: {refusal}"));
+                        for (name, value) in &before {
+                            event = event.before(name, value.clone());
+                        }
+                        crate::audit::record_best_effort(&event);
+                    }
+                    return Err(refusal);
+                }
+            }
+            propose_and_print_noting(&common.config, command, json, before).await
+        }
+        MetaCommand::NodeVersions { common, level } => {
+            let config = load_admin_config(&common.config)?;
+            let client = connect(&config)?;
+            let read = client
+                .read_cluster_versions(true)
+                .await
+                .map_err(|error| cluster_versions_unreadable(&error))?;
+            note_redirects(&client);
+            let versions = &read.versions;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "feature_level": versions.feature_level,
+                        "read_at_applied_index": read.read_at_applied_index,
+                        "truncated": read.truncated,
+                        "nodes": versions.nodes.iter().map(|node| serde_json::json!({
+                            "node_uuid": node.node_uuid,
+                            "state": node.state.as_str(),
+                            "range_member": node.range_member,
+                            "counted": node.counted(),
+                            "report": node.report.as_ref().map(|report| serde_json::json!({
+                                "release": report.release,
+                                "max_replica_protocol": report.max_replica_protocol,
+                                "supported_feature_level": report.supported_feature_level,
+                            })),
+                        })).collect::<Vec<_>>(),
+                        "blockers": level.map(|level| versions
+                            .blockers(level)
+                            .iter()
+                            .map(|blocker| blocker.node_uuid)
+                            .collect::<Vec<_>>()),
+                    }))
+                    .map_err(|error| error.to_string())?
+                );
+            } else {
+                println!(
+                    "feature level {} (read at applied index {})",
+                    versions.feature_level, read.read_at_applied_index
+                );
+                for node in &versions.nodes {
+                    let report = match &node.report {
+                        Some(report) => format!(
+                            "release {} replica protocol {} supports level {}",
+                            report.release,
+                            report.max_replica_protocol,
+                            report.supported_feature_level
+                        ),
+                        None => "never reported".to_owned(),
+                    };
+                    println!(
+                        "{} {} {}{}",
+                        node.node_uuid,
+                        node.state.as_str(),
+                        report,
+                        if node.counted() {
+                            ""
+                        } else if node.range_member || node.report.is_some() {
+                            " (dead: not counted)"
+                        } else {
+                            " (no range, no report: not counted)"
+                        }
+                    );
+                }
+                if read.truncated {
+                    println!(
+                        "(more than {} nodes are registered; the list stops there)",
+                        vtop_meta::transport::MAX_CLUSTER_VERSION_NODES
+                    );
+                }
+            }
+            match level {
+                Some(level) => judge_node_versions_listing(level, read),
+                None => Ok(()),
+            }
         }
         MetaCommand::ReplicaSet {
             common,
@@ -1984,18 +2133,146 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
     }
 }
 
+/// What `vtopctl node promote-unproven` says when metadata refuses the
+/// attestation at its feature-level gate (#636): the gate's own words, and
+/// what they mean here. Anything else is passed through as it came.
+pub(crate) fn explain_attestation_refusal(error: &str) -> String {
+    if vtop_meta::transport::refuses_promote_unproven(
+        &vtop_meta::transport::TransportError::Protocol(error.to_owned()),
+    ) || error.contains("unknown command kind tag 39")
+    {
+        format!(
+            "the cluster does not support the promotion override yet: it needs metadata feature \
+             level {} (#636), and nothing was recorded. Upgrade every metadata voter, then raise \
+             the level with `vtopctl meta enable-features --level {}`. Metadata said: {error}",
+            vtop_meta::PROMOTE_UNPROVEN_FEATURE_LEVEL,
+            vtop_meta::PROMOTE_UNPROVEN_FEATURE_LEVEL
+        )
+    } else {
+        error.to_owned()
+    }
+}
+
+/// `node-versions --level`'s verdict (#634): the same judgement as a raise,
+/// but with no state machine behind it to judge the nodes past a truncated
+/// list, so a truncated list that names no blocker is inconclusive.
+fn judge_node_versions_listing(
+    level: u32,
+    read: vtop_meta::transport::AdminReadClusterVersionsResponse,
+) -> Result<(), String> {
+    if read.truncated
+        && level > vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL
+        && read.versions.blockers(level).is_empty()
+    {
+        return Err(format!(
+            "feature level {level} cannot be judged: more than {} nodes are registered and the \
+             list stops there; `enable-features` would still be judged by the state machine",
+            vtop_meta::transport::MAX_CLUSTER_VERSION_NODES
+        ));
+    }
+    judge_feature_raise(level, Ok(read))
+}
+
+/// Whether a raise to `level` may be proposed, judged on a cluster-versions
+/// read (#634): `Err` names every counted node that has not reported `level`
+/// or higher, or says why the cluster could not be judged. A level at or
+/// below the report level is never judged on data nodes.
+fn judge_feature_raise(
+    level: u32,
+    read: Result<vtop_meta::transport::AdminReadClusterVersionsResponse, vtop_meta::TransportError>,
+) -> Result<(), String> {
+    let read = read.map_err(|error| {
+        format!(
+            "feature level {level} needs every counted node to report it, and {}",
+            cluster_versions_unreadable(&error)
+        )
+    })?;
+    // A level already in force is the no-op Ack the state machine gives
+    // it; refusing here would be stricter than the raise itself (review).
+    if read.versions.feature_level >= level {
+        return Ok(());
+    }
+    let blockers = read.versions.blockers(level);
+    if !blockers.is_empty() {
+        return Err(vtop_meta::describe_blockers(level, &blockers));
+    }
+    if read.truncated && level > vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL {
+        // The rest are judged where nothing can change underneath the
+        // decision: the state machine refuses the raise itself.
+        eprintln!(
+            "note: more than {} nodes are registered; those past the list are judged by the \
+             state machine when the raise is applied",
+            vtop_meta::transport::MAX_CLUSTER_VERSION_NODES
+        );
+    }
+    Ok(())
+}
+
+/// Why the cluster's versions could not be read, in words that say what to do.
+fn cluster_versions_unreadable(error: &vtop_meta::TransportError) -> String {
+    if vtop_meta::transport::predates_cluster_versions_read(error) {
+        format!(
+            "a metadata node predates version reports (#634): upgrade every metadata voter \
+             first ({error})"
+        )
+    } else {
+        format!("the cluster's versions could not be read: {error}")
+    }
+}
+
 pub(crate) async fn propose_and_print(
     config_path: &Path,
     command: MetadataCommand,
     json: bool,
 ) -> Result<(), String> {
-    let config = load_admin_config(config_path)?;
-    let client = connect(&config)?;
-    let response = client
-        .propose(command)
-        .await
-        .map_err(|error| error.to_string())?;
-    note_redirects(&client);
+    propose_and_print_noting(config_path, command, json, Vec::new()).await
+}
+
+/// [`propose_and_print`], with what the command changes from (`before`) in
+/// its audit record.
+///
+/// An audited command (#694) leaves the client's record: this operator, on
+/// this host, asked for it, and what came back - committed at an index,
+/// rejected by the state machine, refused by the endpoint, or not sent. The
+/// metadata nodes write the edge and applied records of the same request id.
+pub(crate) async fn propose_and_print_noting(
+    config_path: &Path,
+    command: MetadataCommand,
+    json: bool,
+    before: Vec<(&'static str, serde_json::Value)>,
+) -> Result<(), String> {
+    let record = crate::audit::client_record(&command, vtop_observe::audit::Outcome::Success);
+    let sent = async {
+        let config =
+            load_admin_config(config_path).map_err(|e| (false, format!("not sent: {e}")))?;
+        let client = connect(&config).map_err(|e| (false, format!("not sent: {e}")))?;
+        let response = client.propose(command).await;
+        note_redirects(&client);
+        response.map_err(|error| (is_refusal(&error), error.to_string()))
+    }
+    .await;
+    if let Some(mut event) = record {
+        for (name, value) in before {
+            event = event.before(name, value);
+        }
+        let event = match &sent {
+            Ok(response) => match &response.response {
+                MetadataResponse::Rejected(error) => event
+                    .with_outcome(vtop_observe::audit::Outcome::Failure)
+                    .log_index(response.log_id.index)
+                    .reason(format!("rejected by the state machine: {error}")),
+                _ => event.log_index(response.log_id.index),
+            },
+            Err((true, reason)) => event
+                .with_outcome(vtop_observe::audit::Outcome::Refused)
+                .reason(reason),
+            Err((false, reason)) => event
+                .with_outcome(vtop_observe::audit::Outcome::Failure)
+                .reason(reason),
+        };
+        crate::audit::record_best_effort(&event);
+    }
+    let response = sent.map_err(|(_, message)| message)?;
     if json {
         println!(
             "{}",
@@ -2013,6 +2290,48 @@ pub(crate) async fn propose_and_print(
         return Err("metadata command was rejected".to_owned());
     }
     Ok(())
+}
+
+/// Whether the endpoint refused the request by its authorization policy:
+/// the refusal crosses the wire as an admin error whose text the server's
+/// `TransportError::Unauthorized` wrote.
+fn is_refusal(error: &vtop_meta::TransportError) -> bool {
+    match error {
+        vtop_meta::TransportError::Unauthorized(_) => true,
+        vtop_meta::TransportError::Protocol(message) => message.starts_with("unauthorized: "),
+        _ => false,
+    }
+}
+
+/// Run a bootstrap or membership request and write the client's audit
+/// record of it (#694).
+async fn audited_membership<F, Fut>(
+    action: vtop_observe::audit::Action,
+    params: Vec<(&'static str, String)>,
+    run: F,
+) -> Result<vtop_meta::transport::AdminMembershipResponse, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<
+        Output = Result<vtop_meta::transport::AdminMembershipResponse, vtop_meta::TransportError>,
+    >,
+{
+    let result = run().await;
+    let outcome = match &result {
+        Ok(_) => vtop_observe::audit::Outcome::Success,
+        Err(error) if is_refusal(error) => vtop_observe::audit::Outcome::Refused,
+        Err(_) => vtop_observe::audit::Outcome::Failure,
+    };
+    let mut event = crate::audit::membership_record(action, &params, outcome);
+    if let Err(error) = &result {
+        event = event.reason(error);
+    }
+    crate::audit::record_best_effort(&event);
+    result.map_err(|error| error.to_string())
+}
+
+fn join_ids(ids: &[u64]) -> String {
+    ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",")
 }
 
 fn status_json(status: &AdminStatusResponse) -> serde_json::Value {
@@ -2373,6 +2692,10 @@ pub struct VoteAudit {
     /// `required`-th highest answer, as the promoter takes it; `None` for
     /// a standalone promotion, which proves none.
     pub boundary_ok: bool,
+    /// Under an attestation (#636), it names the holder: an attestation for
+    /// another replica is not one this promotion could have used. `true`
+    /// for a promotion with no attestation.
+    pub attestation_ok: bool,
     /// The recomputation agrees, the holder answered, no replica is
     /// counted twice, the majority required is at least a majority of the
     /// replicas that answered, the boundary is the quorum's, AND the
@@ -2418,6 +2741,11 @@ pub struct ChainAudit {
     /// Promotions whose boundary fell below one an earlier promotion
     /// published (#449).
     pub boundary_regressions: usize,
+    /// Promotions made under an operator's attestation (#636): answers of
+    /// unproven lineage were counted, and records the holder did not hold
+    /// may have been lost. Not a failure - the operator asked for it - but
+    /// every one is listed, with who attested and when.
+    pub attested: usize,
     /// The audit started past the chain's head and the boundaries published
     /// before it could not be read, so the regression check is unverified
     /// for this window (#449).
@@ -2652,20 +2980,31 @@ pub fn cross_check_epoch_vectors(
     from_epoch: u64,
     vectors: &[ReplicaEpochVector],
 ) -> EpochCrossCheck {
-    let granted: std::collections::BTreeMap<u64, (Uuid, Option<u64>)> = chain
+    // Per granted epoch: its holder, the boundary its promotion proved, and
+    // whether that promotion was made under an attestation naming the
+    // holder (#636) - whose history is then the holder's whole log, seeded
+    // at offset 0 on purpose.
+    let granted: std::collections::BTreeMap<u64, (Uuid, Option<u64>, bool)> = chain
         .iter()
         .map(|view| {
-            let boundary = match &view.outcome {
+            let (boundary, attested) = match &view.outcome {
                 TransitionOutcome::Reported {
                     outcome:
                         PromotionOutcome::Established {
-                            boundary_offset, ..
+                            boundary_offset,
+                            attestation,
+                            ..
                         },
                     ..
-                } => *boundary_offset,
-                _ => None,
+                } => (
+                    *boundary_offset,
+                    attestation
+                        .as_ref()
+                        .is_some_and(|attestation| attestation.replica_node_uuid == view.holder_to),
+                ),
+                _ => (None, false),
             };
-            (view.epoch_to, (view.holder_to, boundary))
+            (view.epoch_to, (view.holder_to, boundary, attested))
         })
         .collect();
     let replicas = vectors
@@ -2685,8 +3024,14 @@ pub fn cross_check_epoch_vectors(
                             epoch: start.epoch,
                             start_offset: start.start_offset,
                         }),
-                        Some((holder, Some(boundary)))
-                            if holder == node_uuid && start.start_offset < *boundary =>
+                        // The attested seed is the operator's statement,
+                        // not an overwrite: exactly offset 0, under an
+                        // attestation naming this holder. Any other start
+                        // below the boundary is still a finding.
+                        Some((holder, Some(boundary), attested))
+                            if holder == node_uuid
+                                && start.start_offset < *boundary
+                                && !(*attested && start.start_offset == 0) =>
                         {
                             Some(EpochFinding::BelowBoundary {
                                 epoch: start.epoch,
@@ -2835,10 +3180,21 @@ pub fn audit_transitions(
                         quorum,
                         votes,
                         required,
+                        attestation,
                         ..
                     },
                 ..
             } => {
+                // An attested promotion (#636) counted its Unknown answers,
+                // on the operator's word, and only for the replica the
+                // attestation names.
+                let attested = attestation.is_some();
+                let attestation_ok = attestation
+                    .as_ref()
+                    .is_none_or(|attestation| attestation.replica_node_uuid == view.holder_to);
+                if attested {
+                    audit.attested += 1;
+                }
                 // ONE answer per replica (review): the promoter built its
                 // evidence from a map keyed by node, and neither the report
                 // validation nor the wire enforce uniqueness, so a quorum
@@ -2859,7 +3215,7 @@ pub fn audit_transitions(
                 // did.
                 let answers: std::collections::BTreeMap<Uuid, u64> = answers
                     .into_iter()
-                    .filter(|(_, answer)| answer.counts())
+                    .filter(|(_, answer)| answer.counts() || attested)
                     .map(|(node, answer)| (node, answer.offset))
                     .collect();
                 // The holder's own offset, as the promoter used it: its
@@ -2896,6 +3252,7 @@ pub fn audit_transitions(
                 let ok = holder_answered
                     && majority_recorded
                     && boundary_ok
+                    && attestation_ok
                     && !duplicated
                     && recomputed == *votes
                     && *votes >= *required;
@@ -2908,6 +3265,7 @@ pub fn audit_transitions(
                     required: *required,
                     holder_answered,
                     boundary_ok,
+                    attestation_ok,
                     ok,
                 })
             }
@@ -2972,6 +3330,7 @@ fn outcome_text(view: &AdminTransitionView, record: &TransitionAudit) -> String 
                 boundary_offset,
                 sealed_prefix_end,
                 quorum,
+                attestation,
                 ..
             } => {
                 let vote = record
@@ -2989,6 +3348,8 @@ fn outcome_text(view: &AdminTransitionView, record: &TransitionAudit) -> String 
                                 "HOLDER ABSENT FROM QUORUM"
                             } else if !vote.boundary_ok {
                                 "BOUNDARY NOT THE QUORUM'S"
+                            } else if !vote.attestation_ok {
+                                "ATTESTATION NAMES ANOTHER REPLICA"
                             } else {
                                 "VOTE MISMATCH"
                             }
@@ -2999,6 +3360,10 @@ fn outcome_text(view: &AdminTransitionView, record: &TransitionAudit) -> String 
                     .iter()
                     .map(|answer| match answer.lineage {
                         None => format!("{}:{}", answer.node_uuid, answer.offset),
+                        // Counted, under an attestation (#636).
+                        Some(vtop_meta::AnswerLineage::Unknown) if attestation.is_some() => {
+                            format!("{}:{}:unknown-counted-attested", answer.node_uuid, answer.offset)
+                        }
                         Some(lineage) => format!(
                             "{}:{}:{}",
                             answer.node_uuid,
@@ -3012,8 +3377,22 @@ fn outcome_text(view: &AdminTransitionView, record: &TransitionAudit) -> String 
                     .regressed_below
                     .map(|published| format!(" BOUNDARY BELOW PUBLISHED {published}"))
                     .unwrap_or_default();
+                let attested = attestation
+                    .as_ref()
+                    .map(|attestation| {
+                        format!(
+                            " ATTESTED attestation={} replica={} operator={:?} attested_at_ms={} \
+                             (answers of unproven lineage counted; records the holder did not \
+                             hold may be lost)",
+                            attestation.attestation_id,
+                            attestation.replica_node_uuid,
+                            attestation.operator,
+                            attestation.attested_at_ms
+                        )
+                    })
+                    .unwrap_or_default();
                 format!(
-                    "established boundary={} sealed_prefix_end={} {vote}{regression} quorum=[{quorum}] reported_at_ms={reported_at_ms} reported_apply_index={reported_apply_index}",
+                    "established boundary={} sealed_prefix_end={} {vote}{regression}{attested} quorum=[{quorum}] reported_at_ms={reported_at_ms} reported_apply_index={reported_apply_index}",
                     boundary_offset.map(|n| n.to_string()).unwrap_or_else(|| "none".to_owned()),
                     sealed_prefix_end.map(|n| n.to_string()).unwrap_or_else(|| "none".to_owned()),
                 )
@@ -3116,8 +3495,16 @@ fn transition_json(view: &AdminTransitionView, record: &TransitionAudit) -> serd
                 quorum,
                 votes,
                 required,
+                attestation,
             } => serde_json::json!({
                 "kind": "established",
+                // The operator's override (#636), or null.
+                "attestation": attestation.as_ref().map(|attestation| serde_json::json!({
+                    "attestation_id": attestation.attestation_id,
+                    "replica_node_uuid": attestation.replica_node_uuid,
+                    "operator": attestation.operator,
+                    "attested_at_ms": attestation.attested_at_ms,
+                })),
                 "boundary_offset": boundary_offset,
                 "sealed_prefix_end": sealed_prefix_end,
                 "quorum": quorum.iter().map(|answer| {
@@ -3125,8 +3512,16 @@ fn transition_json(view: &AdminTransitionView, record: &TransitionAudit) -> serd
                     // Absent for a record without verdicts (#577), so a
                     // consumer cannot mistake "not recorded" for a verdict.
                     if let Some(lineage) = answer.lineage {
-                        json["lineage"] = serde_json::json!(lineage_word(lineage));
-                        json["counted"] = serde_json::json!(answer.counts());
+                        // Counted under an attestation (#636): the same
+                        // label the text listing uses, never "not counted".
+                        json["lineage"] = match lineage {
+                            vtop_meta::AnswerLineage::Unknown if attestation.is_some() => {
+                                serde_json::json!("unknown-counted-attested")
+                            }
+                            _ => serde_json::json!(lineage_word(lineage)),
+                        };
+                        json["counted"] =
+                            serde_json::json!(answer.counts() || attestation.is_some());
                         if let vtop_meta::AnswerLineage::Reconciled { truncated_records } = lineage {
                             json["truncated_records"] = serde_json::json!(truncated_records);
                         }
@@ -3157,7 +3552,7 @@ fn transition_json(view: &AdminTransitionView, record: &TransitionAudit) -> serd
         "granted_apply_index": view.granted_apply_index,
         "link_ok": record.link_ok,
         "vote": record.vote.as_ref().map(|vote| serde_json::json!({
-            "recorded": vote.recorded, "recomputed": vote.recomputed, "required": vote.required, "holder_answered": vote.holder_answered, "boundary_ok": vote.boundary_ok, "ok": vote.ok,
+            "recorded": vote.recorded, "recomputed": vote.recomputed, "required": vote.required, "holder_answered": vote.holder_answered, "boundary_ok": vote.boundary_ok, "attestation_ok": vote.attestation_ok, "ok": vote.ok,
         })),
         "mac": record.mac.word(),
         "outcome": outcome,
@@ -3193,6 +3588,293 @@ fn mac_key_from_env(name: &str) -> Result<[u8; 32], String> {
 mod tests {
     use super::*;
 
+    /// #636: below level 8 the attestation is refused at metadata's gate,
+    /// and the operator is told what that means and what to do - by the
+    /// gate's text and by an older release's codec alike. Any other error
+    /// passes through untouched.
+    #[test]
+    fn a_refused_attestation_says_the_cluster_is_below_level_8() {
+        let gate = vtop_meta::ConsensusError::FeatureNotEnabled {
+            needed: vtop_meta::PROMOTE_UNPROVEN_FEATURE_LEVEL,
+            enabled: 6,
+        }
+        .to_string();
+        for refusal in [gate, "unknown command kind tag 39".to_owned()] {
+            let explained = explain_attestation_refusal(&refusal);
+            assert!(explained.contains("feature level 8"), "{explained}");
+            assert!(explained.contains("nothing was recorded"), "{explained}");
+            assert!(
+                explained.contains("enable-features --level 8"),
+                "{explained}"
+            );
+        }
+        assert_eq!(
+            explain_attestation_refusal("metadata command was rejected"),
+            "metadata command was rejected"
+        );
+    }
+
+    /// #636: an attested promotion is audited as made - its Unknown answers
+    /// were counted, so the vote recomputes from them - and it is listed as
+    /// ATTESTED with who and when. An attestation naming a replica other
+    /// than the holder fails the audit: no promotion could have used it.
+    /// #656 review: the history an attested promotion writes - the holder's
+    /// whole log owned by the attested epoch, from offset 0 - is what the
+    /// operator asked for, not an overwrite, so the epoch-vector cross-check
+    /// accepts it. Only that seed: the same start without the attestation,
+    /// or any other start below the boundary under it, is still a finding.
+    #[test]
+    fn the_attested_history_seed_is_not_a_boundary_finding() {
+        let holder = Uuid::from_u128(1);
+        let transition = |attested: bool| AdminTransitionView {
+            epoch_from: 0,
+            epoch_to: 1,
+            holder_from: None,
+            holder_to: holder,
+            grant: GrantKind::Election,
+            granted_at_ms: 1_000,
+            granted_apply_index: 10,
+            outcome: TransitionOutcome::Reported {
+                outcome: PromotionOutcome::Established {
+                    boundary_offset: Some(100),
+                    sealed_prefix_end: None,
+                    quorum: vec![vtop_meta::QuorumAnswer {
+                        node_uuid: holder,
+                        offset: 100,
+                        lineage: Some(vtop_meta::AnswerLineage::Unknown),
+                    }],
+                    votes: 1,
+                    required: 1,
+                    attestation: attested.then(|| vtop_meta::PromotionAttestation {
+                        attestation_id: Uuid::from_u128(0x636),
+                        replica_node_uuid: holder,
+                        operator: "oncall".to_owned(),
+                        attested_at_ms: 900,
+                    }),
+                },
+                reported_at_ms: 1_500,
+                reported_apply_index: 12,
+            },
+            mac: None,
+        };
+        let vector = |start_offset: u64| -> Vec<ReplicaEpochVector> {
+            vec![(
+                holder,
+                "a:1".to_owned(),
+                Ok(vec![ReplicaEpochStart {
+                    epoch: 1,
+                    start_offset,
+                }]),
+            )]
+        };
+        let findings = |attested: bool, start: u64| {
+            cross_check_epoch_vectors(&[transition(attested)], 1, &vector(start)).replicas[0]
+                .findings
+                .len()
+        };
+        assert_eq!(
+            findings(true, 0),
+            0,
+            "the attested seed was reported as an overwrite"
+        );
+        assert_eq!(
+            findings(false, 0),
+            1,
+            "an ordinary promotion keeps the check"
+        );
+        assert_eq!(
+            findings(true, 40),
+            1,
+            "only the seed at 0 is the operator's"
+        );
+    }
+
+    #[test]
+    fn an_attested_promotion_is_listed_and_its_vote_recomputes() {
+        let (topic, range) = (Uuid::from_u128(0x20), Uuid::from_u128(0x21));
+        let holder = Uuid::from_u128(1);
+        let unknown = |node: u128| vtop_meta::QuorumAnswer {
+            node_uuid: Uuid::from_u128(node),
+            offset: 100,
+            lineage: Some(vtop_meta::AnswerLineage::Unknown),
+        };
+        let attested_by = |replica: Uuid| AdminTransitionView {
+            epoch_from: 0,
+            epoch_to: 1,
+            holder_from: None,
+            holder_to: holder,
+            grant: GrantKind::Election,
+            granted_at_ms: 1_000,
+            granted_apply_index: 10,
+            outcome: TransitionOutcome::Reported {
+                outcome: PromotionOutcome::Established {
+                    boundary_offset: Some(100),
+                    sealed_prefix_end: None,
+                    quorum: vec![unknown(1), unknown(2), unknown(3)],
+                    votes: 3,
+                    required: 2,
+                    attestation: Some(vtop_meta::PromotionAttestation {
+                        attestation_id: Uuid::from_u128(0x636),
+                        replica_node_uuid: replica,
+                        operator: "oncall".to_owned(),
+                        attested_at_ms: 900,
+                    }),
+                },
+                reported_at_ms: 1_500,
+                reported_apply_index: 12,
+            },
+            mac: None,
+        };
+        let views = vec![attested_by(holder)];
+        let audit = audit_transitions(&views, None, topic, range, 1, None, Some(None)).unwrap();
+        assert!(audit.verdict().is_ok(), "{audit:?}");
+        assert_eq!(audit.attested, 1);
+        let vote = audit.records[0].vote.as_ref().unwrap();
+        assert_eq!((vote.recorded, vote.recomputed, vote.ok), (3, 3, true));
+        let line = transition_line(&views[0], &audit.records[0]);
+        assert!(line.contains("ATTESTED"), "{line}");
+        assert!(line.contains("operator=\"oncall\""), "{line}");
+        assert!(line.contains("unknown-counted-attested"), "{line}");
+        let json = transition_json(&views[0], &audit.records[0]);
+        assert_eq!(json["outcome"]["attestation"]["operator"], "oncall");
+        assert_eq!(json["outcome"]["quorum"][0]["counted"], true);
+        assert_eq!(
+            json["outcome"]["quorum"][0]["lineage"], "unknown-counted-attested",
+            "a counted answer must not be labelled not counted"
+        );
+
+        // The same record without its attestation is the #577 shape: the
+        // Unknown answers are not counted, and three votes do not recompute.
+        let mut unattested = views.clone();
+        if let TransitionOutcome::Reported {
+            outcome: PromotionOutcome::Established { attestation, .. },
+            ..
+        } = &mut unattested[0].outcome
+        {
+            *attestation = None;
+        }
+        let audit =
+            audit_transitions(&unattested, None, topic, range, 1, None, Some(None)).unwrap();
+        assert_eq!(audit.vote_disagreements, 1);
+
+        let elsewhere = vec![attested_by(Uuid::from_u128(2))];
+        let audit = audit_transitions(&elsewhere, None, topic, range, 1, None, Some(None)).unwrap();
+        assert_eq!(audit.vote_disagreements, 1);
+        assert!(!audit.records[0].vote.as_ref().unwrap().attestation_ok);
+        assert!(audit.verdict().is_err());
+    }
+
+    /// #634: `enable-features` refuses a level while one live range member
+    /// reports an older one, naming it, and lets the same raise through once
+    /// that node has upgraded and reported again. A tier that cannot say
+    /// what its nodes run is not judged as one whose nodes are all current.
+    #[test]
+    fn a_raise_waits_for_the_data_node_on_the_older_release() {
+        use vtop_meta::transport::AdminReadClusterVersionsResponse;
+        use vtop_meta::{ClusterVersions, NodeState, NodeVersionEntry, NodeVersionRecord};
+        let next = vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL + 1;
+        let node = |id: u128, supported: u32| NodeVersionEntry {
+            node_uuid: Uuid::from_u128(id),
+            state: NodeState::Active,
+            range_member: true,
+            report: Some(NodeVersionRecord {
+                release: format!("0.{supported}.0"),
+                max_replica_protocol: 2,
+                supported_feature_level: supported,
+            }),
+        };
+        let read = |nodes| {
+            Ok(AdminReadClusterVersionsResponse {
+                versions: ClusterVersions {
+                    feature_level: vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL,
+                    nodes,
+                },
+                truncated: false,
+                read_at_applied_index: 9,
+            })
+        };
+
+        let old = vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL;
+        let refused =
+            judge_feature_raise(next, read(vec![node(1, next), node(2, old), node(3, next)]))
+                .unwrap_err();
+        assert!(
+            refused.contains(&format!("{} (release 0.{old}.0", Uuid::from_u128(2))),
+            "the refusal must name the node on the older release: {refused}"
+        );
+        assert!(
+            !refused.contains(&Uuid::from_u128(1).to_string()),
+            "{refused}"
+        );
+
+        assert_eq!(
+            judge_feature_raise(
+                next,
+                read(vec![node(1, next), node(2, next), node(3, next)])
+            ),
+            Ok(()),
+            "after node 2 upgrades and reports, the raise proceeds"
+        );
+
+        let predates = judge_feature_raise(
+            next,
+            Err(vtop_meta::TransportError::Protocol(
+                "unexpected response kind 29".to_owned(),
+            )),
+        )
+        .unwrap_err();
+        assert!(predates.contains("predates version reports"), "{predates}");
+    }
+
+    /// #634 review: a level already in force is a no-op the state machine
+    /// acknowledges, so `enable-features` must not refuse it for a node that
+    /// has since fallen behind (it is the replica plane's to refuse now).
+    #[test]
+    fn a_level_already_in_force_is_not_judged_again() {
+        use vtop_meta::transport::AdminReadClusterVersionsResponse;
+        use vtop_meta::{ClusterVersions, NodeState, NodeVersionEntry};
+        let next = vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL + 1;
+        let read = Ok(AdminReadClusterVersionsResponse {
+            versions: ClusterVersions {
+                feature_level: next,
+                nodes: vec![NodeVersionEntry {
+                    node_uuid: Uuid::from_u128(1),
+                    state: NodeState::Active,
+                    range_member: true,
+                    report: None,
+                }],
+            },
+            truncated: false,
+            read_at_applied_index: 9,
+        });
+        assert_eq!(judge_feature_raise(next, read), Ok(()));
+    }
+
+    /// #634 review: `node-versions --level` has no state machine behind it to
+    /// judge the nodes past a truncated list, so a truncated list with no
+    /// blocker in it is inconclusive, not a pass.
+    #[test]
+    fn a_truncated_listing_cannot_clear_a_raise() {
+        use vtop_meta::transport::AdminReadClusterVersionsResponse;
+        use vtop_meta::ClusterVersions;
+        let next = vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL + 1;
+        let truncated = AdminReadClusterVersionsResponse {
+            versions: ClusterVersions {
+                feature_level: vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL,
+                nodes: Vec::new(),
+            },
+            truncated: true,
+            read_at_applied_index: 9,
+        };
+        let verdict = judge_node_versions_listing(next, truncated.clone()).unwrap_err();
+        assert!(verdict.contains("cannot be judged"), "{verdict}");
+        assert_eq!(
+            judge_node_versions_listing(vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL, truncated),
+            Ok(()),
+            "a level that is never judged on data nodes needs no full list"
+        );
+    }
+
     /// #240: a replica's epoch vector is held to the chain — an epoch no
     /// grant explains, or the holder's epoch starting below the boundary its
     /// promotion proved, is a finding; a follower behind at promotion is not;
@@ -3222,6 +3904,7 @@ mod tests {
                     quorum: Vec::new(),
                     votes: 2,
                     required: 2,
+                    attestation: None,
                 },
                 reported_at_ms: 1_500 * epoch_to as i64,
                 reported_apply_index: 10 * epoch_to + 2,
@@ -3917,6 +4600,7 @@ transport: plaintext
                         ],
                         votes: 2,
                         required: 2,
+                        attestation: None,
                     },
                     reported_at_ms: 1_500,
                     reported_apply_index: 12,
@@ -4130,6 +4814,7 @@ transport: plaintext
                 quorum: Vec::new(),
                 votes: 0,
                 required: 0,
+                attestation: None,
             },
             reported_at_ms: 1_500,
             reported_apply_index: 12,
@@ -4285,6 +4970,7 @@ transport: plaintext
                         ],
                         votes: 2,
                         required: 2,
+                        attestation: None,
                     },
                     reported_at_ms: 1_500,
                     reported_apply_index: 12,

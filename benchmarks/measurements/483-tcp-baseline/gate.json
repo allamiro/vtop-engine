@@ -1,0 +1,41 @@
+{
+  "datagram_issues_open": false,
+  "p95_ratio": {
+    "clean_objects": 160,
+    "clean_p95_ms": 296640.8,
+    "config": "c16-p1",
+    "lossy_objects": 160,
+    "lossy_p95_ms": 289518.4,
+    "opens": false,
+    "ratio": 0.976,
+    "ratio_max_across_run_pairs": 1.023,
+    "ratio_min_across_run_pairs": 0.945,
+    "within_noise": false
+  },
+  "profiles": {
+    "wan100": {
+      "best_config": "c8-p1",
+      "confirmation_runs": 5,
+      "opens": false,
+      "selection_median_fraction": 0.9628,
+      "unused_max": 0.0492,
+      "unused_median": 0.0385,
+      "unused_min": 0.0077,
+      "within_noise": false
+    },
+    "wan100-loss1": {
+      "best_config": "c16-p1",
+      "confirmation_runs": 5,
+      "opens": false,
+      "selection_median_fraction": 1.0047,
+      "unused_max": 0.0344,
+      "unused_median": 0.0241,
+      "unused_min": 0.0191,
+      "within_noise": false
+    }
+  },
+  "thresholds": {
+    "p95_ratio": 2.0,
+    "unused_fraction": 0.2
+  }
+}

@@ -17,9 +17,10 @@ use crate::state::MetaValue;
 use crate::transport::admin::AdminHandler;
 use crate::transport::wire::{
     AdminGroupCursorView, AdminLeaseView, AdminRangeReplicaSetView, AdminReadGroupCursorResponse,
-    AdminReadRangeLeaseResponse, AdminReadRangeReplicaSetResponse,
-    AdminReadRangeTransitionsResponse, AdminReadSegmentPlacementResponse, AdminRebalanceIntentView,
-    AdminSegmentView, AdminTransitionView, MAX_TRANSITIONS_PER_READ,
+    AdminReadPromotionAttestationResponse, AdminReadRangeLeaseResponse,
+    AdminReadRangeReplicaSetResponse, AdminReadRangeTransitionsResponse,
+    AdminReadSegmentPlacementResponse, AdminRebalanceIntentView, AdminSegmentView,
+    AdminTransitionView, MAX_TRANSITIONS_PER_READ,
 };
 use crate::transport::wire::{
     AdminMembershipResponse, AdminProposeResponse, AdminStatusResponse, TransportError,
@@ -95,9 +96,37 @@ pub enum ConsensusError {
         if *.skew_ms >= 0 { "ahead of" } else { "behind" }
     )]
     ClockSkew { skew_ms: i64, bound_ms: u64 },
+    /// A raise to a level every metadata member must implement was refused because
+    /// a metadata member did not show it supports the level (#706). Nothing
+    /// was proposed. The message names each member and what it answered.
+    #[error("{}", crate::versions::describe_member_blockers(*.level, *.enabled, .blockers))]
+    MembersNotReady {
+        level: u32,
+        enabled: u32,
+        blockers: Vec<crate::versions::MemberBlocker>,
+    },
+    /// Refused before anything was proposed, for a reason the message
+    /// states with what to do.
+    #[error("{0}")]
+    Refused(String),
 }
 
 pub type ConsensusResult<T> = Result<T, ConsensusError>;
+
+/// Asks a metadata member what it runs (#706): its release and the highest
+/// feature level it implements.
+///
+/// A trait so the leader's judgement can be tested without sockets; the
+/// live node asks over the peer plane ([`crate::raft::network`]).
+#[async_trait]
+pub trait MemberVersionProbe: Send + Sync {
+    async fn ask(&self, member: MetaNodeId) -> crate::versions::MemberVersion;
+}
+
+/// How long the leader waits for one member's answer before a raise counts
+/// it as unreachable. Members are asked at once, so a raise waits at most
+/// this long however many there are.
+pub const MEMBER_VERSION_ASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The redirect a non-leader answers a WRITE with.
 ///
@@ -176,6 +205,10 @@ pub struct OpenraftConsensus {
     /// The leader's clock a lease request's `issued_at_ms` is checked against
     /// (#555). `None` reads the wall clock; tests install a fixed one.
     leader_clock: std::sync::RwLock<Option<LeaderClock>>,
+    /// How this node asks the other metadata members what they run before
+    /// it raises a level they must all implement (#706). `None` cannot ask,
+    /// so such a raise is refused rather than taken on trust.
+    member_probe: std::sync::RwLock<Option<std::sync::Arc<dyn MemberVersionProbe>>>,
 }
 
 /// Milliseconds since the Unix epoch, as the metadata leader sees them.
@@ -196,6 +229,154 @@ impl OpenraftConsensus {
             store: None,
             transition_mac_key: std::sync::RwLock::new(None),
             leader_clock: std::sync::RwLock::new(None),
+            member_probe: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// Ask the metadata members through `probe` before a raise to a level
+    /// they must all implement (#706).
+    pub fn with_member_probe(self, probe: std::sync::Arc<dyn MemberVersionProbe>) -> Self {
+        *self
+            .member_probe
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(probe);
+        self
+    }
+
+    /// Before a raise to `level`, ask every metadata member - voters and
+    /// learners - what it runs, and refuse unless each shows it implements
+    /// `level` (#706).
+    ///
+    /// Data nodes are judged by the state machine from their replicated
+    /// reports (#634). The members cannot be: a v0.9.0 voter has no way to
+    /// report, and its state machine rejects a level it does not know
+    /// deterministically, so its view of the level diverges for good and
+    /// the first command of that level stalls it. So the leader asks them
+    /// over the peer plane, here, before anything is proposed.
+    ///
+    /// Only a leader judges, as with lease commands: a follower that judged
+    /// and then won an election between the judgement and `client_write`
+    /// would append a raise nobody checked. A leader that loses office
+    /// after judging is refused by `client_write`.
+    ///
+    /// Not judged again at apply: what a member answers over the network is
+    /// not replicated state, so no replica could repeat the judgement. A
+    /// member added between this check and the raise is the gap, and the
+    /// operator adding it is the one person who knows it is on the way.
+    async fn judge_members_for(&self, level: u32) -> ConsensusResult<()> {
+        use crate::versions::{member_blockers, MemberVersion, FIRST_MEMBER_CHECKED_FEATURE_LEVEL};
+        if level < FIRST_MEMBER_CHECKED_FEATURE_LEVEL {
+            return Ok(());
+        }
+        let Some(store) = self.store.as_ref() else {
+            return Err(ConsensusError::Refused(format!(
+                "this node was built without applied state, so it cannot tell which feature \
+                 level is in force; the raise to {level} is refused and nothing was proposed"
+            )));
+        };
+        let enabled = store.with_storage(|storage| storage.state().feature_level());
+        // Already in force: the raise is an idempotent no-op the state
+        // machine answers, and nothing new reaches any member.
+        if level <= enabled {
+            return Ok(());
+        }
+        let metrics = self.raft.metrics().borrow().clone();
+        if metrics.state != ServerState::Leader {
+            return Err(ConsensusError::NotLeader {
+                leader: metrics.current_leader.map(MetaNodeId),
+            });
+        }
+        let local = MetaNodeId(metrics.id);
+        // Judged against one term and one membership: re-read once the
+        // members have answered (review of #758).
+        let judged_term = metrics.current_term;
+        let judged_membership = *metrics.membership_config.log_id();
+        let membership = metrics.membership_config.membership();
+        let members: std::collections::BTreeSet<NodeId> = membership
+            .voter_ids()
+            .chain(membership.learner_ids())
+            .collect();
+        let probe = self
+            .member_probe
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut asked = tokio::task::JoinSet::new();
+        let mut answers = Vec::with_capacity(members.len());
+        for member in members.into_iter().map(MetaNodeId) {
+            if member == local {
+                let mine = crate::transport::peer::local_version(local);
+                answers.push((
+                    member,
+                    MemberVersion::Reported {
+                        node_id: mine.node_id,
+                        release: mine.release,
+                        supported_feature_level: mine.supported_feature_level,
+                    },
+                ));
+                continue;
+            }
+            let Some(probe) = probe.clone() else {
+                answers.push((
+                    member,
+                    MemberVersion::Unreachable(
+                        "this node has no way to ask the metadata members".to_owned(),
+                    ),
+                ));
+                continue;
+            };
+            asked.spawn(async move {
+                let answer = tokio::time::timeout(MEMBER_VERSION_ASK_TIMEOUT, probe.ask(member))
+                    .await
+                    .unwrap_or_else(|_| {
+                        MemberVersion::Unreachable(format!(
+                            "no answer within {}s",
+                            MEMBER_VERSION_ASK_TIMEOUT.as_secs()
+                        ))
+                    });
+                (member, answer)
+            });
+        }
+        while let Some(joined) = asked.join_next().await {
+            match joined {
+                Ok(answer) => answers.push(answer),
+                // A probe that panicked answered nothing, and the member it
+                // was asking would drop out of the judgement: refuse the
+                // raise rather than judge without it.
+                Err(error) => {
+                    return Err(ConsensusError::Refused(format!(
+                        "asking the metadata members what they run failed ({error}); the \
+                         raise to {level} is refused and nothing was proposed"
+                    )))
+                }
+            }
+        }
+        // The answers hold only for the term and the membership they were
+        // asked under (review of #758). A leader that lost office and won it
+        // back, or a member added while they were asked, would otherwise
+        // carry a judgement about a different group into `client_write`.
+        let now = self.raft.metrics().borrow().clone();
+        if now.state != ServerState::Leader || now.current_term != judged_term {
+            return Err(ConsensusError::NotLeader {
+                leader: now.current_leader.map(MetaNodeId),
+            });
+        }
+        if *now.membership_config.log_id() != judged_membership {
+            return Err(ConsensusError::Refused(format!(
+                "feature level {level} not raised: the metadata membership changed while its \
+                 members were asked what they run. Nothing was proposed; the level stays \
+                 {enabled}. Raise again"
+            )));
+        }
+        let blockers = member_blockers(level, &answers);
+        if blockers.is_empty() {
+            Ok(())
+        } else {
+            Err(ConsensusError::MembersNotReady {
+                level,
+                enabled,
+                blockers,
+            })
         }
     }
 
@@ -528,6 +709,62 @@ impl AdminReadGroupCursor for OpenraftConsensus {
     }
 }
 
+/// Linearizable read of the cluster's feature level and what each node
+/// reported it runs (#634), its own trait as the other reads are.
+#[async_trait]
+pub trait AdminReadClusterVersions: Send + Sync {
+    async fn read_cluster_versions(
+        &self,
+        include_nodes: bool,
+    ) -> ConsensusResult<crate::transport::wire::AdminReadClusterVersionsResponse>;
+}
+
+#[async_trait]
+impl AdminReadClusterVersions for OpenraftConsensus {
+    async fn read_cluster_versions(
+        &self,
+        include_nodes: bool,
+    ) -> ConsensusResult<crate::transport::wire::AdminReadClusterVersionsResponse> {
+        let Some(store) = self.store.as_ref() else {
+            return Err(ConsensusError::Message(
+                "this node was built without applied state and cannot serve reads".to_owned(),
+            ));
+        };
+        // Fence FIRST, as every admin read does: a raise judged on a lagging
+        // copy could miss the member that joined, or the report that lags.
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map_err(classify_read_error)?;
+        Ok(store.with_storage(|storage| {
+            let read_at_applied_index = storage.last_applied();
+            let state = storage.state();
+            let (versions, truncated) = if include_nodes {
+                let mut versions = state.cluster_versions();
+                let truncated =
+                    versions.nodes.len() > crate::transport::wire::MAX_CLUSTER_VERSION_NODES;
+                versions
+                    .nodes
+                    .truncate(crate::transport::wire::MAX_CLUSTER_VERSION_NODES);
+                (versions, truncated)
+            } else {
+                (
+                    crate::versions::ClusterVersions {
+                        feature_level: state.feature_level(),
+                        nodes: Vec::new(),
+                    },
+                    false,
+                )
+            };
+            crate::transport::wire::AdminReadClusterVersionsResponse {
+                versions,
+                truncated,
+                read_at_applied_index,
+            }
+        }))
+    }
+}
+
 /// Linearizable read of a range's recorded replica set (#553), its own
 /// trait as the other reads are.
 #[async_trait]
@@ -573,6 +810,56 @@ impl AdminReadRangeReplicaSet for OpenraftConsensus {
                 replica_set: state
                     .range_replica_set(topic_uuid, range_uuid)
                     .map(AdminRangeReplicaSetView::from),
+                read_at_applied_index,
+            })
+        })
+    }
+}
+
+/// Linearizable read of a range's live promotion attestation (#636), its
+/// own trait as the other reads are.
+#[async_trait]
+pub trait AdminReadPromotionAttestation: Send + Sync {
+    async fn read_promotion_attestation(
+        &self,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+    ) -> ConsensusResult<AdminReadPromotionAttestationResponse>;
+}
+
+#[async_trait]
+impl AdminReadPromotionAttestation for OpenraftConsensus {
+    async fn read_promotion_attestation(
+        &self,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+    ) -> ConsensusResult<AdminReadPromotionAttestationResponse> {
+        let Some(store) = self.store.as_ref() else {
+            return Err(ConsensusError::Message(
+                "this node was built without applied state and cannot serve reads".to_owned(),
+            ));
+        };
+        // Fence FIRST, as every admin read does. A stale copy could still
+        // show an attestation a promotion has already used; metadata would
+        // refuse that promotion's report (the use is checked in apply), but
+        // the candidate should not get that far on a lagging view.
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map_err(classify_read_error)?;
+        store.with_storage(|storage| {
+            let read_at_applied_index = storage.last_applied();
+            let state = storage.state();
+            let range_found = matches!(
+                state.record(&MetaKey::Range {
+                    topic_uuid,
+                    range_uuid,
+                }),
+                Some(MetaValue::Range(_))
+            );
+            Ok(AdminReadPromotionAttestationResponse {
+                range_found,
+                attestation: state.promotion_attestation(topic_uuid, range_uuid).cloned(),
                 read_at_applied_index,
             })
         })
@@ -818,6 +1105,11 @@ pub trait AdminReadSegmentPlacement: Send + Sync {
 #[async_trait]
 impl Consensus for OpenraftConsensus {
     async fn propose(&self, command: MetadataCommand) -> ConsensusResult<CommitReceipt> {
+        // A raise the metadata members must all implement is judged on
+        // their own answers first (#706).
+        if let MetadataCommand::SetFeatureLevel { feature_level, .. } = &command {
+            self.judge_members_for(*feature_level).await?;
+        }
         // The feature gate (#554), judged before the command is replicated.
         // `SetFeatureLevel` is the one command not held back, because it is
         // how the gate opens.
@@ -979,6 +1271,11 @@ fn to_transport_error(error: ConsensusError) -> TransportError {
             message: ConsensusError::NotLeader { leader }.to_string(),
             leader,
         },
+        // Refused before anything was proposed: the edge record says
+        // "refused", not "outcome unknown".
+        refused @ (ConsensusError::MembersNotReady { .. } | ConsensusError::Refused(_)) => {
+            TransportError::Refused(refused.to_string())
+        }
         other => TransportError::Protocol(other.to_string()),
     }
 }
@@ -1034,6 +1331,28 @@ impl AdminHandler for OpenraftConsensus {
         )
         .await
         .map_err(to_transport_error)
+    }
+
+    async fn read_promotion_attestation(
+        &self,
+        request: crate::transport::wire::AdminReadPromotionAttestationRequest,
+    ) -> TransportResult<AdminReadPromotionAttestationResponse> {
+        AdminReadPromotionAttestation::read_promotion_attestation(
+            self,
+            request.topic_uuid,
+            request.range_uuid,
+        )
+        .await
+        .map_err(to_transport_error)
+    }
+
+    async fn read_cluster_versions(
+        &self,
+        request: crate::transport::wire::AdminReadClusterVersionsRequest,
+    ) -> TransportResult<crate::transport::wire::AdminReadClusterVersionsResponse> {
+        AdminReadClusterVersions::read_cluster_versions(self, request.include_nodes)
+            .await
+            .map_err(to_transport_error)
     }
 
     async fn read_segment_placement(

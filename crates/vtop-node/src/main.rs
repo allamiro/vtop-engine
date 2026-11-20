@@ -5,6 +5,7 @@
 //! pieces (`vtop-meta` Raft node, `vtop-broker` replication/serving); every
 //! correctness mechanism lives in those crates, none here.
 
+mod audit;
 mod client;
 mod colocated;
 mod config;
@@ -14,7 +15,10 @@ mod lease_watcher;
 mod meta_node;
 mod observe;
 mod promotion;
+#[cfg(test)]
+mod promotion_crash_sweep;
 mod tls;
+mod version_report;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -76,6 +80,32 @@ enum Command {
         /// Persist the acknowledged floor here after every batch.
         #[arg(long)]
         acked_file: Option<PathBuf>,
+        /// Offer at most this many records per second, averaged from the
+        /// start of this invocation; 0 sends each batch as soon as the last
+        /// is acknowledged. A failover benchmark (#597) needs a fixed offered
+        /// load below saturation, not a closed loop at it.
+        #[arg(long, default_value_t = 0)]
+        rate: u64,
+        /// Anchor `--rate`'s schedule at this wall-clock instant (unix
+        /// micros) instead of this invocation's start: the batch at sequence
+        /// `s` is due at `anchor + s / rate`. A producer restarted after a
+        /// failover with `--first-sequence` then resumes ONE schedule and
+        /// drains the backlog the outage built, as a fixed-rate source
+        /// buffering through the outage would, instead of starting a new,
+        /// later schedule.
+        #[arg(long)]
+        rate_anchor_unix_micros: Option<u64>,
+        /// Append `<unix_micros> <acked_total> <latency_micros>` here for
+        /// every acknowledged batch: the acknowledgement timeline a failover
+        /// is read from, which the floor in `--acked-file` cannot give.
+        #[arg(long)]
+        ack_log: Option<PathBuf>,
+        /// A batch with no answer after this many milliseconds ends the run
+        /// as interrupted (exit 3), as a refused connection does; 0 waits
+        /// forever. Without it a leader cut off by a network partition holds
+        /// the producer on a socket that never answers or closes.
+        #[arg(long, default_value_t = 0)]
+        request_timeout_ms: u64,
     },
     /// Fetch from offset 0 and byte-verify everything below the committed HWM.
     Verify {
@@ -148,9 +178,26 @@ async fn main() {
     // Structured logs use the same `VTOP_LOG_FORMAT` contract as `vtopctl`, so
     // node and engine lines land in Loki with one shape. Stderr only: stdout
     // carries the ready markers the chaos harness parses.
-    vtop_observe::logging::init("info", false);
+    //
+    // OpenTelemetry export (#683) comes up with the logs when an OTLP
+    // endpoint is set: the node's registry is sent as OTLP metrics beside
+    // `/metrics`. A setting it cannot honour stops the node at startup.
+    if let Err(e) = vtop_observe::otel::init(
+        "info",
+        false,
+        vtop_observe::otel::Process {
+            service: "vtop-node",
+            instance: None,
+            traces: false,
+        },
+    ) {
+        eprintln!("error: OpenTelemetry: {e}");
+        std::process::exit(1);
+    }
     let cli = Cli::parse();
     let outcome = run(cli).await;
+    // Bounded: see `vtop_observe::otel::SHUTDOWN_FLUSH_DEADLINE`.
+    vtop_observe::otel::shutdown().await;
     match outcome {
         Ok(code) => std::process::exit(code),
         Err(message) => {
@@ -202,6 +249,15 @@ fn shutdown_signal() -> tokio::sync::watch::Receiver<bool> {
 }
 
 async fn run(cli: Cli) -> Result<i32, String> {
+    // The audit file (#694), for the server roles: a set but unwritable
+    // `VTOP_AUDIT_LOG` stops the node here, naming the path, rather than
+    // after it has served a command it could not record there.
+    if matches!(
+        cli.command,
+        Command::Meta { .. } | Command::Data { .. } | Command::Node { .. }
+    ) {
+        vtop_observe::audit::init_file_sink_from_env().map_err(|e| e.to_string())?;
+    }
     match cli.command {
         // The handler is installed only for the SERVER roles. A client
         // command (`produce`, `verify`, `replica-status`) keeps the default
@@ -232,6 +288,10 @@ async fn run(cli: Cli) -> Result<i32, String> {
             first_sequence,
             durability,
             acked_file,
+            rate,
+            rate_anchor_unix_micros,
+            ack_log,
+            request_timeout_ms,
         } => {
             let config = client::ClientConfig::load(&client_config)?;
             client::produce(
@@ -244,6 +304,10 @@ async fn run(cli: Cli) -> Result<i32, String> {
                     first_sequence,
                     durability: parse_durability(&durability)?,
                     acked_file,
+                    rate,
+                    rate_anchor_unix_micros,
+                    ack_log,
+                    request_timeout_ms,
                 },
             )
             .await

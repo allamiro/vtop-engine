@@ -3,9 +3,12 @@
 **Verified Telemetry Object Protocol (VTOP)**
 
 Status: Draft / proposed protocol
-Version: 0.3 (reference implementation specification; 0.2 added the optional
+Version: 0.4 (reference implementation specification; 0.2 added the optional
 keyed BLAKE3 manifest authenticator, §11.2 and §18; 0.3 makes a manifest's
-`source_progress` span the whole batch, §11.2)
+`source_progress` span the whole batch, §11.2; 0.4 hashes and authenticates
+the stored document in a canonical form and adds `verification_plan` and the
+MAC key id, §11.2. The reference implementation reads `0.1` to `0.4` and
+writes `0.3` unless `manifest.write_version: "0.4"` is set)
 
 > This document describes a **proposed protocol** and accompanies a **reference implementation** ("VTOP Engine"). It is a draft for technical review and is part of an **invention-disclosure support package**. It does not describe a shipped standard.
 
@@ -267,7 +270,7 @@ A conformant manifest:
 | Field | Type | Requirement | Description |
 |-------|------|-------------|-------------|
 | `protocol` | string | MUST | Constant `"VTOP"`. |
-| `version` | string | MUST | Protocol version (e.g. `"0.3"`). See the `source_progress` note below for what `0.3` changed. |
+| `version` | string | MUST | Protocol version (e.g. `"0.3"`). See the `source_progress` note below for what `0.3` changed, and "Writing `0.4`" for what `0.4` adds. |
 | `batch_id` | string | MUST | Unique batch identifier. |
 | `tenant` | string | MUST | Tenant/source-owner identity. |
 | `source_type` | enum | MUST | `kafka` \| `file` \| `syslog_spool`. |
@@ -285,8 +288,12 @@ A conformant manifest:
 | `manifest.uri` | string | MUST | Manifest storage URI/key. |
 | `manifest.sha256` (self-hash) | string | MUST | Reproducible SHA-256 computed with both embedded hash/MAC values blanked. |
 | `manifest.mac` | string | MAY | 32-byte keyed BLAKE3 authenticator (lowercase hex), computed over the same canonical bytes. |
-| `state` | enum | SHOULD | Lifecycle state at manifest-write time. |
-| `verification_status` | enum | SHOULD | Status at manifest-write time. |
+| `manifest.mac_key_id` | string | `0.4` with a keyring: MUST; earlier: MUST NOT | The id of the key that computed `manifest.mac` (#685): 1 to 64 characters from `[A-Za-z0-9._-]`. Not blanked for the hash, so the self-hash and the MAC both cover it. Absent: the manifest is verified with the reader's key marked `legacy`. See "Key ids" below. |
+| `state` | enum | SHOULD | Lifecycle state at manifest-write time (`manifest_uploaded`). |
+| `verification_status` | enum | SHOULD | Status at manifest-write time, so always `not_verified`. **Deprecated** in favour of `verification_plan` plus the ledger or a verification receipt (§11.3); still written in `0.4` because v0.8.0 readers require it. |
+| `verification_plan` | object | `0.4` writer: MUST; earlier: MUST NOT | How the object will be verified, as configured when the manifest was written (`0.4`, #671). `method` and `require_strong` below. A `0.4` reader does not require it (a `0.4` document without it still verifies), and refuses a malformed one as a malformed document. |
+| `verification_plan.method` | string | MUST | `store_checksum`, `read_back` or `size_only`: the method for the configured backend and the object's `checksum_algorithm`, the same value `vtopctl validate --print-effective` and the startup log print. A reader accepts any string. |
+| `verification_plan.require_strong` | boolean | MUST | `upload.require_strong_verification` when the manifest was written. |
 | `partition` / retention metadata | object | SHOULD | Time/retention partitioning context. |
 | `signature` | string | MAY | Manifest signature when signing enabled. |
 
@@ -296,6 +303,159 @@ prove authenticity because anyone who can rewrite the document can recompute
 it. When `manifest.mac` is required by local policy, changing any bound field
 without the secret key fails authentication. A shared-key MAC does not provide
 public verifiability or non-repudiation.
+
+**Reading a manifest: version first (#671).** A reader checks `protocol`
+(`"VTOP"`) and `version` before it decodes any other field or computes any
+digest, and picks the hash scheme from the version:
+
+| `version` | Self-hash and MAC input |
+|---|---|
+| `0.1`, `0.2`, `0.3` | Legacy: the manifest decoded into the fields that release knows, both embedded values blanked, re-serialized as compact JSON in struct order. Unchanged, so every archived manifest verifies as before. A field that release does not know is dropped before hashing. |
+| `0.4` | Canonical: the **stored** document, with `manifest.sha256` set to `""` and `manifest.mac` set to `""` where that key is present (an absent MAC stays absent), object keys sorted at every depth, serialized as compact JSON. Fields the reader does not know stay in, so they are authenticated too. |
+| anything newer | Reported as a manifest that **claims a version this build cannot authenticate**, never as corrupt or tampered, and acted on only when its bytes are proven to be the writer's (below). |
+
+The `0.4` canonical form is sorted-key compact JSON as `serde_json` writes it:
+array order and every value are significant, strings are re-escaped minimally,
+and an integer is written in decimal. It is not full RFC 8785 (JCS). Some
+inputs are refused as malformed, because their canonical bytes would not pin
+down what the document says:
+
+- a **duplicate key** in any object, since parsers disagree on which one wins;
+- a **number that is not an integer** in the signed or unsigned 64-bit range:
+  a fraction, an exponent, or an integer beyond that range. It would be
+  re-encoded as a float, so different stored numbers could share one hash;
+- **`-0`**. It is not the integer `0`, and two stored forms would share one
+  canonical form.
+
+A `0.4` writer stays within these rules. In every version, a second
+`protocol` or `version` key at the top level is malformed.
+
+**Writing `0.4` (#671 release B).** An engine writes `0.3` unless
+`manifest.write_version: "0.4"` is set (any other value is refused when the
+config loads, naming `"0.3"` and `"0.4"`). A `0.4` manifest is the `0.3`
+document with `"version": "0.4"` and one more object:
+
+```json
+"verification_plan": { "method": "read_back", "require_strong": true }
+```
+
+- **It is a plan, not an outcome.** The manifest is uploaded before
+  verification and its digest is pinned (`manifest_version_id`), so it cannot
+  record a result. The result is in the state-store ledger.
+  `verification_status` stays `not_verified` and `state` stays
+  `manifest_uploaded`.
+- **`method`** is the method for the configured `upload.backend` and the
+  object's `checksum_algorithm`. Native S3 may fall back from
+  `store_checksum` to `read_back` for a multipart object, which is the same
+  (strong) class. A backend with no known method fails the batch, naming the
+  backend, rather than writing `unknown`. `checksum_algorithm` is not
+  repeated in the plan: `object.checksum_algorithm` already records it.
+- **The writer hashes and MACs the canonical form above** and stores the same
+  document pretty-printed. Both parse to one document, so they have one
+  canonical form, and the stored bytes verify on every reader of `0.4`.
+- **A `0.1`-`0.3` manifest never carries `verification_plan`.** The legacy
+  scheme drops fields its release does not know, so there the plan would be
+  unauthenticated. A reader ignores one found in such a document, whatever
+  its value, as an unknown key, exactly as a v0.8.0 reader does.
+- **`0.3` output is unchanged** byte for byte while the setting is off.
+
+**Key ids (#685).** A writer with several MAC keys signs with one, the
+active key, and records its id in `manifest.mac_key_id`; the field sits next
+to `manifest.mac` because they are read together.
+
+- **`0.4` only.** A `0.1`-`0.3` reader hashes the decoded struct, so it would
+  drop the id and report the manifest as tampered. A writer **MUST NOT**
+  record an id in a `0.1`-`0.3` manifest, and a reader ignores one found
+  there as an unknown key (as a v0.8.0 reader does) and verifies that
+  manifest with its legacy key: no legacy hash covers the id, so it cannot
+  choose the key.
+- **Verify with the named key.** A reader **MUST** verify the MAC with the
+  key whose id the manifest names, and **MUST NOT** try other keys. A
+  manifest with no id is verified with the one key the reader marks
+  `legacy`.
+- **Outcomes.** A named id the reader holds: verified with it, and a
+  mismatch is `MAC verification failed for key id "X"`. A named id the
+  reader has tombstoned: unauthenticated, `it names key id "X", which is
+  retired`. A named id the reader does not hold: unauthenticated, `it names
+  key id "X", which is not in this keyring`. No id and no legacy key:
+  unauthenticated, `it names no key id and no key ... is marked legacy`. No
+  MAC where a key is configured: refused, as before. None of these is
+  reported as a corrupt manifest: the bytes may be intact.
+- **A reader with one key and no ids** (the `manifest_mac_key_env` setting)
+  ignores the id and verifies with that key, as a v0.8.0 reader does. One
+  key is not a search, and this keeps such a reader verifying, mid-rotation,
+  what its key signed.
+- **An id is a label, and storage is untrusted.** A reader quotes an id from
+  a manifest escaped and bounded, and never uses it as a metric label.
+- **Readers that predate key ids** (v0.8.0 and earlier) authenticate the id
+  as an unknown `0.4` field and verify with their one key: they pass a
+  manifest their key signed and fail any other. Every reader therefore runs a
+  release that reads key ids before the active key changes.
+
+**Version grammar.** A version is dotted digits, `MAJOR.MINOR` or
+`MAJOR.MINOR.PATCH`, each part with no leading zero (`0` itself is fine). A
+missing PATCH compares as `0`. Versions above the newest the reader knows
+(`0.4` here), such as `0.5`, `0.4.1` or `1.0.0`, are **newer**. Anything else
+is a **malformed** document: a missing `protocol` or `version`, a version that
+is not a string, `00.5`, `0.4a`, an empty string, or a well-formed version
+that is not newer and not one this reader knows (`0.0`, `0.4.0`, `0.3.1`).
+The error type carries the difference.
+
+**A newer version is a claim, not a fact.** The version is read before
+anything is authenticated, so a storage tamperer can write `"version": "0.9"`
+over a manifest. A reader acts on the claim only when the bytes are proven to
+be what the batch's writer stored. Both of these must hold:
+
+- they are the row's **pinned** immutable manifest version, which an
+  overwrite of the key cannot change;
+- they carry the batch id and the self-hash the ledger recorded.
+
+Otherwise the manifest is unauthenticated, exactly as before (see
+SECURITY_MODEL.md §8.2). The readers:
+
+- **Recovery's re-check of a VERIFIED row** (`storage_still_verified`):
+  - **A proven newer manifest** leaves the row VERIFIED, neither committed nor
+    marked for replay. It is logged as an error and counted in
+    `vtop_recovery_unsupported_manifest_total`, and an upgraded engine
+    commits it later.
+  - **Holding back:** like any uncommitted range, it holds back a VERIFIED
+    range of the same source unit above it.
+  - **Retiring:** once the unit has committed past it (proven as for any
+    range retired under #567), it is retired as SUPERSEDED. That makes no
+    source commit, and stops the row being claimed and downloaded at every
+    restart.
+  - **An unproven newer manifest** is unauthenticated: FAILED, then
+    REPLAY_REQUIRED.
+  - **Rows that never reached VERIFIED** are not re-checked. Such a row is
+    re-read whatever its manifest says, as before.
+  - **Duplicates:** the engine's next read of that source still starts at the
+    committed point, below a held newer range, so its bytes are archived again
+    (a duplicate, never a gap), as for any range recovery leaves uncommitted.
+- **The in-run keyed read-back** of the manifest this engine just stored
+  verifies it from the stored bytes by the same rules.
+- **`vtopctl scrub`** reports a proven newer manifest as `unsupported_version`,
+  and an unproven one as `unauthenticated`. Both are findings, because neither
+  was checked. For `unsupported_version`, upgrade the scrub's binary and run
+  it again.
+- **`vtopctl verify-manifest`** has no ledger to bind the bytes to. It fails
+  with "manifest URI claims version X, which this build cannot authenticate".
+
+**Upgrade order.** The reader release (v0.8.0, release A in #671) reads
+`0.1`-`0.4` and writes `0.3`, so engines before and after it can share a
+ledger and an archive during a rolling upgrade. Release B writes `0.4` only
+when `manifest.write_version: "0.4"` is set, and **every engine, `vtopctl
+scrub`, auditor and other manifest consumer must run v0.8.0 or later first**:
+a v0.7.0 or earlier reader re-encodes a `0.4` manifest without the fields it
+does not know, gets a different hash and reports it as tampered
+(`verify-manifest` fails the self-hash and MAC, the scrub reports it, and
+recovery replays the batch: duplicates, not loss). The engine cannot see which
+releases read its archive, so setting the key is the operator's
+acknowledgement, and the startup log says so. An engine before release B
+ignores the `manifest:` section and keeps writing `0.3`, which is the safe
+direction. Setting `"0.3"` again stops new `0.4` manifests; those already
+written stay readable. The manifest is not part of the native protocol or the
+Raft log, so the cluster upgrade procedure is unchanged. Downgrade remains
+unsupported.
 
 **`source_progress` spans the whole batch (version `0.3`, #622).** A batch is
 often built from several reads of one source unit. Its `source_progress` names
@@ -323,7 +483,89 @@ row was pruned, from the prune digest that replaced it, not from the manifest;
 their end is correct. The field's shape did not change, so every released
 verifier verifies manifests of both versions.
 
-> The manifest is written at the `MANIFEST_UPLOADED` step, before storage-side verification, so its embedded `state`/`verification_status` reflect that point in time and its hash stays stable. The authoritative post-verification state (`VERIFIED` → `SOURCE_COMMITTED`) lives in the state store.
+> The manifest is written at the `MANIFEST_UPLOADED` step, before storage-side verification, so its embedded `state`/`verification_status` reflect that point in time and its hash stays stable. The authoritative post-verification state (`VERIFIED` → `SOURCE_COMMITTED`) lives in the state store. A `0.4` manifest also states the verification method it was written to expect (`verification_plan`), which is likewise true at write time. What verification found can be recorded in the archive too, in a separate verification receipt (§11.3).
+
+### 11.3 Verification receipt (extension)
+
+A manifest cannot record how its object was verified: it is stored, and its
+digest pinned, before verification runs. A **verification receipt** is an
+optional second object that records the outcome, written after the batch
+reaches `VERIFIED` (#671 release B). The reference implementation writes one
+when `manifest.verification_receipts: true` (off by default).
+
+**Location.** `<batch_id>.receipt.json`, in the same bucket and prefix as
+`<batch_id>.manifest.json`: the manifest's key with `.manifest.json` replaced
+by `.receipt.json`. A reader that does not know about receipts never fetches
+one, but a consumer that lists the prefix sees them.
+
+**Fields.** Version `"1"`:
+
+| Field | Type | Requirement | Description |
+|---|---|---|---|
+| `protocol` | string | MUST | Constant `"VTOP"`. |
+| `receipt_version` | string | MUST | `"1"`. A reader reports a larger integer as a receipt **newer** than it reads, and anything else as malformed. |
+| `batch_id` | string | MUST | The batch, as in its manifest and the ledger. |
+| `manifest.uri` | string | MUST | The manifest's URI. |
+| `manifest.sha256` | string | MUST | The manifest's own self-hash (`manifest.sha256`), as the ledger recorded it. The manifest's MAC covers that value, so a receipt cannot be moved to another manifest. |
+| `manifest.version_id` | string | MAY | The manifest version the ledger pinned, when the store gave one. |
+| `object.uri` | string | MUST | The object's URI. |
+| `object.size_bytes` | integer | MUST | As in the manifest. |
+| `object.checksum_algorithm` | string | MUST | As in the manifest. |
+| `object.checksum` | string | MUST | As in the manifest (empty when checksums are disabled). |
+| `object.version_id` | string | MAY | The object version the write returned. Absent for a reused object and for a receipt written by recovery. |
+| `verification.class` | string | MUST | `strong` or `size_only`: the class the state store recorded with `VERIFIED`. |
+| `verification.method` | string | MUST | The check the backend ran on the object: `store_checksum`, `read_back` or `size_only`, or `unspecified` when the backend did not say. Never guessed from the configuration: native S3 configured for `store_checksum` reads a multipart object back, and the receipt says `read_back`. A reader accepts any string. |
+| `verified_at` | string (RFC 3339) | MUST | When verification passed, by the writer's clock. |
+| `verified_by` | string | MUST | The writing engine's configured name. |
+| `origin` | string | MUST | `engine` (written after the engine's own verification) or `recovery` (written by recovery after its re-check of a `VERIFIED` batch that had none). |
+| `receipt.sha256` | string | MUST | The receipt's self-hash. |
+| `receipt.mac` | string | MAY | Keyed BLAKE3 over the same input, with the manifest MAC key. |
+| `receipt.mac_key_id` | string | MAY | The id of the key that computed `receipt.mac`, as for `manifest.mac_key_id` (§11.2, "Key ids"). |
+
+The receipt **MUST NOT** carry record content, credentials, key material, or
+a URI with a query string, fragment or user info.
+
+**Hash and MAC.** Exactly the `0.4` manifest scheme (§11.2, "Reading a
+manifest"), with the `receipt` object in place of the `manifest` object: the
+**stored** document with `receipt.sha256` set to `""` and `receipt.mac` set
+to `""` where present, object keys sorted at every depth, compact JSON; the
+same refusals (duplicate keys, numbers that are not 64-bit integers, `-0`);
+fields the reader does not know stay in and are authenticated. A reader
+verifies the MAC with the key `receipt.mac_key_id` names, or its legacy key
+when it names none, and never searches its keys; an unknown or retired key
+is **unauthenticated**, not corrupt.
+
+**What it is not.** The receipt is evidence about verification, not part of
+the commit rule (§13): an implementation **MUST NOT** wait for it before
+`SOURCE_COMMITTED`, and **MUST NOT** treat a missing receipt as a reason to
+replay. The state store stays the authority for commit state. A receipt that
+cannot be written is logged and counted; recovery writes the receipt of a
+`VERIFIED` batch that has none, after looking first, so an existing receipt
+is never replaced (under object lock a second write would be a second
+version). A batch committed without one keeps none: a later re-read would be
+a different statement, so an audit reports it missing rather than writing
+one.
+
+**Receipts recovery writes.** Recovery writes the receipt when its re-check
+of a `VERIFIED` batch passes, before it decides to commit, as the engine
+writes one before its own commit. Two consequences, both intended:
+
+- the receipt's `class` is the one the state store recorded and its `method`
+  is what the re-check ran, so a batch verified `strong` whose re-check could
+  only confirm size (accepted under the size-only opt-out) reads
+  `class: strong, method: size_only`;
+- a batch recovery holds back, and that is later replayed instead of
+  committed, keeps a receipt for a batch that never committed. Audits check
+  committed batches only, so such a receipt is never reported; the state
+  store says the batch was not committed.
+
+A writer bounds each receipt write by its own deadline, so a store that
+does not answer cannot hold a commit for long.
+
+**Checking a receipt.** Against the state store's row for its batch: the
+batch id, the manifest URI, digest and pinned version, the object URI, size
+and digest, and the class. Any difference means the receipt is not this
+batch's. The reference implementation's `vtopctl scrub` does this (§17.3).
 
 ---
 
@@ -338,7 +580,7 @@ DISCOVERED → BATCHING → SEALED → COMPRESSED → CHECKSUMMED →
 OBJECT_UPLOADED → MANIFEST_UPLOADED → VERIFIED → SOURCE_COMMITTED
 ```
 
-plus the failure/recovery states `FAILED` and `REPLAY_REQUIRED` (`REPLAY_REQUIRED` is not terminal — it re-enters at `BATCHING`).
+plus the failure/recovery states `FAILED` and `REPLAY_REQUIRED` (`REPLAY_REQUIRED` is not terminal — it re-enters at `BATCHING`), and the terminal state `SUPERSEDED`.
 
 Legal transitions (and **only** these) are permitted:
 
@@ -355,6 +597,8 @@ Legal transitions (and **only** these) are permitted:
 | ANY_STATE | FAILED |
 | FAILED | REPLAY_REQUIRED |
 | REPLAY_REQUIRED | BATCHING |
+| FAILED | SUPERSEDED |
+| REPLAY_REQUIRED | SUPERSEDED |
 
 ```
                  +--------------------------------------------------+
@@ -363,8 +607,18 @@ Legal transitions (and **only** these) are permitted:
  OBJECT_UPLOADED -> MANIFEST_UPLOADED -> VERIFIED -> SOURCE_COMMITTED|
         |  |  |  |  |  |  |  |                                      |
         +--+--+--+--+--+--+--+--> FAILED -> REPLAY_REQUIRED --------+
-                                   (from ANY_STATE)
+                                   (from ANY_STATE)  |        |
+                                                     +--------+--> SUPERSEDED
 ```
+
+`SOURCE_COMMITTED` and `SUPERSEDED` are the terminal states: no transition leaves either, not even to `FAILED`. "Any state" in `ANY_STATE → FAILED` means any non-terminal state.
+
+`SUPERSEDED` retires a batch whose range was handed back to its source (`FAILED` or `REPLAY_REQUIRED`) and which the source has since committed past. An implementation:
+
+- **MAY** move a batch to `SUPERSEDED` only when the committed progress of the batch's source unit (one partition under one consumer group; one file, by identity) is at or past the end of the batch's range, and the implementation's state shows that progress belongs to the same file (or partition) the batch was read from. A rewind to such a range re-reads nothing, because a rewind never goes below committed progress (§14).
+- **MUST NOT** advance any source progress marker in doing so. `SUPERSEDED` is not a commit, and it is not a path to `SOURCE_COMMITTED`: the only predecessor of `SOURCE_COMMITTED` is still `VERIFIED` (§13).
+- **MUST NOT** treat a `SUPERSEDED` batch as evidence that its range was archived. Committed progress having passed a range does not prove that a committed range covers its bytes. A coverage audit **MUST** judge a `SUPERSEDED` range as it judges a `FAILED` one.
+- **MAY** delete `SUPERSEDED` batches under the same retention rules as `SOURCE_COMMITTED` ones. A `SUPERSEDED` batch is never a restart position, so none has to be kept for that.
 
 A conformant implementation **MUST** persist state transitions durably so that recovery after a crash is possible (§14).
 
@@ -401,10 +655,12 @@ A conformant implementation **MUST NOT** commit source progress in any other ord
 A conformant implementation:
 
 - **MUST** persist batch state durably such that, after a crash, every batch can be classified as committed or not-yet-committed.
-- **MUST** treat any batch that did not reach `SOURCE_COMMITTED` as eligible for recovery.
+- **MUST** treat any batch that did not reach a terminal state (`SOURCE_COMMITTED` or `SUPERSEDED`) as eligible for recovery.
+- On recovery, a batch whose range its source has already committed past (§12) **MAY** be moved to `SUPERSEDED` instead of being replayed, via `FAILED` if it is in neither `FAILED` nor `REPLAY_REQUIRED`. A `VERIFIED` batch is not eligible: its commit is retried as below.
 - On recovery, a batch already in `VERIFIED` (object and manifest durably written and verified, but progress not yet committed) **MAY** complete by committing source progress (`VERIFIED → SOURCE_COMMITTED`); its object **MUST NOT** be discarded.
 - On recovery, a batch in any state *before* `VERIFIED` **MUST** be transitioned to `FAILED` and then `REPLAY_REQUIRED`, and re-entered at `BATCHING`; its uncommitted source range **MUST** remain replayable.
 - **MUST NOT** double-commit a source progress marker that was already committed.
+- **MUST NOT** rewind a source unit for replay below its committed progress. The source does not replay below that point; a replay of a range that starts below it resumes at the committed progress. This does not mean the bytes below were archived: a range below committed progress that no committed range covers is a coverage hole (§12), which a coverage audit reports and replay does not repair.
 - **MUST** be safe to re-run from the last committed source progress marker without data loss; re-uploaded objects with identical content **SHOULD** be idempotent (same `batch_id` and naming yields the same object key).
 
 A mismatch between persisted state and the contents of object storage (e.g., an object exists but is not verified) **MUST** be resolved by re-verifying or re-uploading before any commit.
@@ -430,6 +686,29 @@ s3://{bucket}/{prefix}/tenant={tenant}/source={source}/format={format}/year={yyy
 - Time partition components (`year/month/day/hour`) **SHOULD** be derived from a consistent event-time or batch-seal-time policy declared by the implementation.
 - `batch_id` **MUST** be unique within its partition prefix.
 - The naming scheme **MUST** be deterministic so that replay produces the same object key for the same batch.
+
+*Implementation note (reference engine, #626).* The object's file name is not
+the `batch_id` but `vtop-[{engine}-]{source}-{range}[-i{inode}]-{digest}` (the
+engine and inode only for file and spool ranges), where
+`digest` is the first 32 hex digits of the object checksum: the same bytes of the same range
+give the same key, and an object already at the key is reused only after it
+verifies against the batch's full digest. The manifest keeps
+`{batch_id}.manifest.json`, with a `batch_id` unique per attempt, so several
+manifests can name one object. Since v0.10.0 a replay rebuilds the batch
+it replays: its re-read stops at the range's recorded end, and it is sealed
+at the instant the ledger recorded for it, so it gets the same key, which
+closes this rule's gap for objects whenever the batch's ledger row survives.
+What still gets another key: a range the source no longer holds as it was
+cut (rewritten, truncated, removed by retention or compaction), a range over
+4x the current batching limits, a row written before v0.10.0 (no recorded
+instant), and a range whose row a power loss rolled back. Manifests stay per
+attempt. Without a checksum, or when the backend cannot report an absent key,
+the object is named by the `batch_id` as above. Under the reference engine's
+S3 Object Lock profile (#684), an object at the key is reused only if it is
+also still locked as configured (the configured mode, a date ahead, the legal
+hold when configured); otherwise the batch is written as a new, locked object
+named by the `batch_id`, and the object at the key is left untouched (#709). A
+retention the store cannot report fails the batch rather than choosing either.
 
 ### 15.2 Per-format bucket templating
 
@@ -482,6 +761,24 @@ The stored **manifest** **MUST** also be verified before commit. The self-hash
 stored bytes **MUST** contain a valid keyed MAC; a missing MAC **MUST NOT**
 silently downgrade verification.
 
+A reader **MUST** check `protocol` and `version` before verifying, select the
+hash scheme from the version, and report a version newer than it supports as
+such, never as a failed self-hash or MAC (§11.2, "Reading a manifest").
+A writer of `0.4` **MUST** compute the self-hash and MAC over the canonical
+form of the document it stores, and verifies those stored bytes the way a
+reader will before the batch may reach `VERIFIED` (§11.2, "Writing `0.4`").
+
+A reader with several MAC keys **MUST** verify a manifest with the key its
+`manifest.mac_key_id` names, or with its legacy key when it names none, and
+**MUST NOT** search its keys. A manifest naming a key the reader does not
+hold, or a retired one, is unauthenticated, and is reported as that, not as
+corrupt (§11.2, "Key ids").
+
+A verification receipt (§11.3), where one is written, is not part of this
+check and **MUST NOT** gate the commit. A reader that checks one verifies it
+by the `0.4` scheme with the key it names, then binds it to the state
+store's row: batch, manifest digest and version, object, and class.
+
 ---
 
 ## 18. Security considerations
@@ -492,7 +789,9 @@ silently downgrade verification.
 - Object storage permissions **SHOULD** follow least privilege; on-demand bucket creation (§15.2) has `CreateBucket` implications addressed in the security model.
 - Implementations **SHOULD** support object immutability (e.g., object lock / WORM) where the backend allows it.
 - Implementations **SHOULD** support manifest authentication. VTOP 0.2 supports
-  a shared-key BLAKE3 MAC; public-key signatures remain a possible extension.
+  a shared-key BLAKE3 MAC, and `0.4` names the key that computed it so keys
+  can be rotated (§11.2, "Key ids"); public-key signatures remain a possible
+  extension.
 - Verification (§10, §17) protects against silent corruption but is not a substitute for transport security.
 
 See the accompanying [SECURITY_MODEL.md](SECURITY_MODEL.md) for the full security model.
@@ -546,4 +845,4 @@ Adding any extension **MUST NOT** weaken the commit rule (§13) or the replay ru
 - [SECURITY_MODEL.md](SECURITY_MODEL.md) — security model and normative security rules.
 - [INVENTION_DISCLOSURE_DRAFT.md](INVENTION_DISCLOSURE_DRAFT.md) — candidate-invention disclosure draft.
 - [PRIOR_ART_SEARCH_PLAN.md](PRIOR_ART_SEARCH_PLAN.md) — prior-art search plan.
-- Project [README](../README.md) — setup, CLI, and Docker lab.
+- Project [README](../README.md), the [quick start](getting-started/quickstart.md) (Docker lab) and [the CLI](reference/cli.md).

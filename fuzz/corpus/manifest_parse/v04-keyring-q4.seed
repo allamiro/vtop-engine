@@ -1,0 +1,46 @@
+{
+  "protocol": "VTOP",
+  "version": "0.4",
+  "batch_id": "vtop-20261114T155240Z-_tmp_fx-q4_in_app_log-b0-32-567ed6f8",
+  "tenant": "default",
+  "source_type": "file",
+  "source_name": "/tmp/fx-q4/in/app.log",
+  "format": "raw",
+  "compression": "none",
+  "record_count": 1,
+  "first_timestamp": null,
+  "last_timestamp": null,
+  "source_progress": {
+    "source_type": "file",
+    "path": "/tmp/fx-q4/in/app.log",
+    "inode": 367384,
+    "start_byte": 0,
+    "end_byte": 32,
+    "file_size": 32,
+    "mtime": "2026-11-14T15:52:40.090289010+00:00"
+  },
+  "object": {
+    "uri": "s3://archive/tenant=default/source=_tmp_fx-q4_in_app.log/format=raw/year=2026/month=11/day=14/hour=15/vtop-vtop-fixture-_tmp_fx-q4_in_app_log-b0-32-i367384-b387c567e75305ceadac26fcde952954.raw",
+    "size_bytes": 32,
+    "checksum_algorithm": "sha256",
+    "checksum": "b387c567e75305ceadac26fcde9529541c4fa45d2299aee7ea96ec5743fc9202"
+  },
+  "manifest": {
+    "uri": "s3://archive/tenant=default/source=_tmp_fx-q4_in_app.log/format=raw/year=2026/month=11/day=14/hour=15/vtop-20261114T155240Z-_tmp_fx-q4_in_app_log-b0-32-567ed6f8.manifest.json",
+    "sha256": "20996ba01fe52acb5ed9b1385c97cce4be877ec1fd0059b1814d14fa0928c952",
+    "mac": "9c8db0e19b77f7f25a8bf00bc342a0cfe7f773e286a10144e6eb81e33eb4b968",
+    "mac_key_id": "q4"
+  },
+  "partitioning": {
+    "path_template": "tenant={tenant}/source={source}/format={format}/year={yyyy}/month={mm}/day={dd}/hour={hh}/",
+    "resolved_prefix": "tenant=default/source=_tmp_fx-q4_in_app.log/format=raw/year=2026/month=11/day=14/hour=15"
+  },
+  "upload_backend": "localfs",
+  "state": "manifest_uploaded",
+  "verification_status": "not_verified",
+  "verification_plan": {
+    "method": "read_back",
+    "require_strong": true
+  },
+  "created_at": "2026-11-14T15:52:40.104997302+00:00"
+}

@@ -158,6 +158,12 @@ pub fn classify(command: &MetadataCommand) -> (CommandClass, Option<Uuid>) {
         | MetadataCommand::SplitRange {
             holder_node_uuid, ..
         } => (CommandClass::NodeScoped, Some(*holder_node_uuid)),
+        // A version report is a node's account of itself (#634), and a raise
+        // of the feature level is judged on it: a node that could report for
+        // another could vouch for a node still on an older release.
+        MetadataCommand::ReportNodeVersion { node_uuid, .. } => {
+            (CommandClass::NodeScoped, Some(*node_uuid))
+        }
         _ => (CommandClass::ClusterScoped, None),
     }
 }
@@ -357,6 +363,37 @@ mod tests {
 
     fn authorizer(operators: &[&str]) -> AdminAuthorizer {
         AdminAuthorizer::with_operators(operators.iter().map(|s| (*s).to_owned()))
+    }
+
+    /// #634: a version report is a node's account of itself. Only that node
+    /// may send it: another node vouching for it could let a raise pass a
+    /// node still on an older release.
+    #[test]
+    fn a_node_may_report_its_own_version_and_nobody_elses() {
+        let report = MetadataCommand::ReportNodeVersion {
+            env: envelope(),
+            node_uuid: NODE_A,
+            release: "0.8.0".to_owned(),
+            max_replica_protocol: 2,
+            supported_feature_level: crate::command::SUPPORTED_FEATURE_LEVEL,
+        };
+        assert_eq!(classify(&report), (CommandClass::NodeScoped, Some(NODE_A)));
+        let authz = authorizer(&["ops-alice"]);
+        assert_eq!(
+            authz.authorize_command(&AdminIdentity::Node(NODE_A), &report),
+            Ok(())
+        );
+        assert_eq!(
+            authz.authorize_command(&AdminIdentity::Node(NODE_B), &report),
+            Err(Refusal::WrongHolder {
+                presented: NODE_B,
+                requested: NODE_A,
+            })
+        );
+        assert!(matches!(
+            authz.authorize_command(&AdminIdentity::MetaNode(1), &report),
+            Err(Refusal::NotAnOperator { .. })
+        ));
     }
 
     #[test]

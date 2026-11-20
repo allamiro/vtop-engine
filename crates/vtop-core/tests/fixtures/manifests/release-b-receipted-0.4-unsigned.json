@@ -1,0 +1,44 @@
+{
+  "protocol": "VTOP",
+  "version": "0.4",
+  "batch_id": "vtop-20261114T194849Z-_tmp_receipt-fixture-unsigned_input_log-b0-26-625bee1b",
+  "tenant": "default",
+  "source_type": "file",
+  "source_name": "/tmp/receipt-fixture-unsigned/input.log",
+  "format": "raw",
+  "compression": "none",
+  "record_count": 1,
+  "first_timestamp": null,
+  "last_timestamp": null,
+  "source_progress": {
+    "source_type": "file",
+    "path": "/tmp/receipt-fixture-unsigned/input.log",
+    "inode": 233206,
+    "start_byte": 0,
+    "end_byte": 26,
+    "file_size": 26,
+    "mtime": "2026-11-14T19:48:49.936218722+00:00"
+  },
+  "object": {
+    "uri": "s3://telemetry-data/tenant=default/source=_tmp_receipt-fixture-unsigned_input.log/format=raw/year=2026/month=11/day=14/hour=19/vtop-vtop-fixture-_tmp_receipt-fixture-unsigned_input_log-b0-26-i233206-3da094283589df0a1fee745cd8924ae8.raw",
+    "size_bytes": 26,
+    "checksum_algorithm": "sha256",
+    "checksum": "3da094283589df0a1fee745cd8924ae87b11ca1d1722932596b78fffee105c51"
+  },
+  "manifest": {
+    "uri": "s3://telemetry-data/tenant=default/source=_tmp_receipt-fixture-unsigned_input.log/format=raw/year=2026/month=11/day=14/hour=19/vtop-20261114T194849Z-_tmp_receipt-fixture-unsigned_input_log-b0-26-625bee1b.manifest.json",
+    "sha256": "fe4bac471080667166d6ca75ec1df567aab6afff7dc16c8ae4c73956b6a66a82"
+  },
+  "partitioning": {
+    "path_template": "tenant={tenant}/source={source}/format={format}/year={yyyy}/month={mm}/day={dd}/hour={hh}/",
+    "resolved_prefix": "tenant=default/source=_tmp_receipt-fixture-unsigned_input.log/format=raw/year=2026/month=11/day=14/hour=19"
+  },
+  "upload_backend": "localfs",
+  "state": "manifest_uploaded",
+  "verification_status": "not_verified",
+  "verification_plan": {
+    "method": "read_back",
+    "require_strong": true
+  },
+  "created_at": "2026-11-14T19:48:49.950389014+00:00"
+}

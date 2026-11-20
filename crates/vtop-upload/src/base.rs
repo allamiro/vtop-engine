@@ -6,15 +6,19 @@
 //! until verification passes.
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use vtop_core::checksum::digest_reader;
+use vtop_core::effective_config::VerificationMethod;
 use vtop_core::errors::VtopError;
 use vtop_core::types::ChecksumAlgorithm;
+
+pub use vtop_core::config::{ObjectLockConfig, ObjectLockMode};
 
 /// An engine-computed object checksum: the algorithm name (`sha256`, `blake3`)
 /// plus the lowercase-hex digest. Carrying the algorithm lets a backend choose
@@ -42,6 +46,10 @@ pub struct StoredManifest {
     /// Immutable object version assigned by the store (S3 `x-amz-version-id`).
     /// `None` when the backend or bucket does not expose versions.
     pub version_id: Option<String>,
+    /// The Object Lock retention the backend ASKED the store for (#684), or
+    /// `None` when it asked for none. What the store kept is a separate
+    /// question, answered by [`UploadBackend::verify_retention`].
+    pub retention: Option<RequestedRetention>,
 }
 
 /// Result of a telemetry/segment object upload.
@@ -50,6 +58,266 @@ pub struct StoredObject {
     /// Immutable object version assigned by the store (S3 `x-amz-version-id`).
     /// `None` when the backend or bucket does not expose versions.
     pub version_id: Option<String>,
+    /// The Object Lock retention the backend asked the store for (#684); for
+    /// a multipart object, the one fixed at CreateMultipartUpload.
+    pub retention: Option<RequestedRetention>,
+}
+
+/// A started multipart upload (#684): the store's upload id, and the Object
+/// Lock retention the request asked for. S3 fixes an object's lock when the
+/// multipart upload is CREATED, so this is the date the completed object
+/// carries, however long after it is completed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedUpload {
+    pub upload_id: String,
+    pub retention: Option<RequestedRetention>,
+}
+
+/// The S3 Object Lock retention a backend applies to every object and
+/// manifest it writes (#684), built from `upload.object_lock`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectLockPolicy {
+    pub mode: ObjectLockMode,
+    retain_for: Duration,
+    pub legal_hold: bool,
+}
+
+impl ObjectLockPolicy {
+    pub fn from_config(cfg: &ObjectLockConfig) -> Self {
+        Self {
+            mode: cfg.mode,
+            retain_for: Duration::from_secs(u64::from(cfg.retain_days) * 86_400),
+            legal_hold: cfg.legal_hold,
+        }
+    }
+
+    /// A retention of `retain_for`, which configuration cannot express (it
+    /// counts whole days). For a live test that has to clean up after itself:
+    /// a lock of a few seconds expires before the test ends. Never used by
+    /// the engine.
+    #[doc(hidden)]
+    pub fn with_retention_for_tests(
+        mode: ObjectLockMode,
+        retain_for: Duration,
+        legal_hold: bool,
+    ) -> Self {
+        Self {
+            mode,
+            retain_for,
+            legal_hold,
+        }
+    }
+
+    pub fn retain_for(&self) -> Duration {
+        self.retain_for
+    }
+
+    /// Whether this policy is the one `cfg` describes.
+    pub fn matches(&self, cfg: &ObjectLockConfig) -> bool {
+        *self == Self::from_config(cfg)
+    }
+
+    /// The retention to ask for on a write made at `now`, in whole seconds.
+    /// Both terms are rounded UP, so the date asked for is never earlier than
+    /// `now + retain_for`. A clock before 1970 counts as 1970: the date is
+    /// then in the past and the store refuses the write, which fails the
+    /// batch rather than archiving it unlocked.
+    pub fn request_at(&self, now: SystemTime) -> RequestedRetention {
+        let since = now.duration_since(UNIX_EPOCH).unwrap_or_default();
+        let round_up = |d: Duration| d.as_secs().saturating_add(u64::from(d.subsec_nanos() > 0));
+        let until = round_up(since).saturating_add(round_up(self.retain_for));
+        RequestedRetention {
+            mode: self.mode,
+            retain_until_unix_secs: i64::try_from(until).unwrap_or(i64::MAX),
+            legal_hold: self.legal_hold,
+        }
+    }
+}
+
+/// The Object Lock retention one write asked the store for (#684). The
+/// engine compares what the store kept against THIS, never against its own
+/// clock at check time, so skew between the engine and the store cannot fail
+/// a batch. Persisted in a multipart session (`serde`), so a resumed upload
+/// still knows the date fixed at its creation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestedRetention {
+    pub mode: ObjectLockMode,
+    pub retain_until_unix_secs: i64,
+    pub legal_hold: bool,
+}
+
+impl RequestedRetention {
+    /// The strict check for an object this attempt wrote: the same mode, a
+    /// date no earlier than the one asked for (a longer bucket default
+    /// passes), and the legal hold if one was asked for.
+    pub fn expectation(&self) -> RetentionExpectation {
+        RetentionExpectation {
+            mode: self.mode,
+            retain_until_at_least_unix_secs: self.retain_until_unix_secs,
+            legal_hold: self.legal_hold,
+        }
+    }
+}
+
+/// What a store reports about one object version's Object Lock (#684): each
+/// part `None` when the store returned no such header.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoredRetention {
+    /// The mode as the store spells it (`GOVERNANCE`, `COMPLIANCE`).
+    pub mode: Option<String>,
+    pub retain_until_unix_secs: Option<i64>,
+    pub legal_hold: Option<bool>,
+}
+
+/// What a store answered about one bucket feature, versioning or Object Lock
+/// (#722). [`NotSupported`](Self::NotSupported) is the store saying it does
+/// not implement the feature at all (HTTP 501 `NotImplemented`), which no
+/// bucket setting can change; a check that could not be made is an `Err`
+/// instead, and proves nothing either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketFeature {
+    Enabled,
+    NotEnabled,
+    NotSupported,
+}
+
+/// What a stored object's retention must satisfy (#684).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionExpectation {
+    pub mode: ObjectLockMode,
+    /// The earliest acceptable retain-until date, in Unix seconds.
+    pub retain_until_at_least_unix_secs: i64,
+    pub legal_hold: bool,
+}
+
+/// One part of an object's Object Lock state, for
+/// [`UploadBackend::confirm_lock_absent`] (#709).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockPart {
+    /// The retention mode and date (S3 `GetObjectRetention`).
+    Retention,
+    /// The legal hold (S3 `GetObjectLegalHold`).
+    LegalHold,
+}
+
+impl LockPart {
+    /// The part, for an operator message.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Retention => "retention",
+            Self::LegalHold => "legal hold",
+        }
+    }
+
+    /// The permission a store checks before it answers for this part.
+    pub fn permission(self) -> &'static str {
+        match self {
+            Self::Retention => "s3:GetObjectRetention",
+            Self::LegalHold => "s3:GetObjectLegalHold",
+        }
+    }
+}
+
+/// The outcome of [`UploadBackend::verify_retention`] (#684). Its
+/// [`label`](Self::label) is the `result` of `vtop_object_lock_checks_total`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetentionCheck {
+    /// The object is under the expected mode until at least the date.
+    Ok { retain_until_unix_secs: i64 },
+    /// The store reports no retention on the object.
+    Missing,
+    /// The store reports another mode.
+    ModeMismatch { found: String },
+    /// The retention ends before the expected date (for a reused object: it
+    /// has already ended).
+    TooShort { retain_until_unix_secs: i64 },
+    /// A legal hold was expected and the object has none.
+    LegalHoldMissing,
+    /// The backend cannot read an object's retention at all.
+    Unsupported,
+}
+
+impl RetentionCheck {
+    pub fn passed(&self) -> bool {
+        matches!(self, Self::Ok { .. })
+    }
+
+    /// The bounded `result` label; `Unsupported` counts as `error`.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Ok { .. } => "ok",
+            Self::Missing => "missing",
+            Self::ModeMismatch { .. } => "mode_mismatch",
+            Self::TooShort { .. } => "too_short",
+            Self::LegalHoldMissing => "legal_hold_missing",
+            Self::Unsupported => "error",
+        }
+    }
+
+    /// What was found against what was expected, for an operator message.
+    pub fn describe(&self, expected: &RetentionExpectation) -> String {
+        let want = format!(
+            "{} until at least {}",
+            expected.mode,
+            format_unix_secs(expected.retain_until_at_least_unix_secs)
+        );
+        match self {
+            Self::Ok {
+                retain_until_unix_secs,
+            } => format!(
+                "{} until {} (expected {want})",
+                expected.mode,
+                format_unix_secs(*retain_until_unix_secs)
+            ),
+            Self::Missing => format!("expected {want}, found no retention"),
+            Self::ModeMismatch { found } => format!("expected {want}, found mode {found}"),
+            Self::TooShort {
+                retain_until_unix_secs,
+            } => format!(
+                "expected {want}, found retain-until {}",
+                format_unix_secs(*retain_until_unix_secs)
+            ),
+            Self::LegalHoldMissing => {
+                format!("expected {want} with a legal hold, found no legal hold")
+            }
+            Self::Unsupported => "the backend cannot read an object's retention".to_string(),
+        }
+    }
+}
+
+/// A Unix time as an RFC 3339 UTC date, for messages.
+pub fn format_unix_secs(secs: i64) -> String {
+    aws_smithy_types::DateTime::from_secs(secs)
+        .fmt(aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|_| format!("{secs}s after 1970"))
+}
+
+/// The retention judgment, in exactly one place (#684): the S3 backend and
+/// the mock both consult it, so the mock cannot drift from the code it
+/// stands in for, as with [`judge_service_sha256`].
+pub fn judge_retention(
+    stored: &StoredRetention,
+    expected: &RetentionExpectation,
+) -> RetentionCheck {
+    let (Some(mode), Some(until)) = (stored.mode.as_deref(), stored.retain_until_unix_secs) else {
+        return RetentionCheck::Missing;
+    };
+    if !mode.eq_ignore_ascii_case(expected.mode.as_s3()) {
+        return RetentionCheck::ModeMismatch {
+            found: mode.to_string(),
+        };
+    }
+    if until < expected.retain_until_at_least_unix_secs {
+        return RetentionCheck::TooShort {
+            retain_until_unix_secs: until,
+        };
+    }
+    if expected.legal_hold && stored.legal_hold != Some(true) {
+        return RetentionCheck::LegalHoldMissing;
+    }
+    RetentionCheck::Ok {
+        retain_until_unix_secs: until,
+    }
 }
 
 /// One completed multipart part returned by the storage service.
@@ -86,21 +354,34 @@ pub struct VerificationResult {
     /// to a weaker check (e.g. size + existence only).
     pub backend_limited: bool,
     pub message: String,
+    /// The check that ran (#671 release B, D9): a checksum the store
+    /// computed over the body, a read-back of the body, or size and
+    /// existence only. Set by the backend that ran it, so a verification
+    /// receipt names what happened rather than what the configuration
+    /// implies: native S3 falls back from the store's SHA-256 to a read-back
+    /// for a multipart object. `None` for a failed check, and for a backend
+    /// that does not say; a receipt then records `unspecified`, never a
+    /// guess.
+    pub method: Option<VerificationMethod>,
 }
 
 impl VerificationResult {
+    /// A strong pass. Name the check with [`VerificationResult::by`].
     pub fn passed(message: impl Into<String>) -> Self {
         Self {
             passed: true,
             backend_limited: false,
             message: message.into(),
+            method: None,
         }
     }
+    /// A size-and-existence pass: by definition `size_only`.
     pub fn limited(message: impl Into<String>) -> Self {
         Self {
             passed: true,
             backend_limited: true,
             message: message.into(),
+            method: Some(VerificationMethod::SizeOnly),
         }
     }
     pub fn failed(message: impl Into<String>) -> Self {
@@ -108,7 +389,16 @@ impl VerificationResult {
             passed: false,
             backend_limited: false,
             message: message.into(),
+            method: None,
         }
+    }
+    /// The same result, naming the check that ran. A failed result names
+    /// none: nothing was confirmed by any method.
+    pub fn by(mut self, method: VerificationMethod) -> Self {
+        if self.passed {
+            self.method = Some(method);
+        }
+        self
     }
 }
 
@@ -127,6 +417,7 @@ pub(crate) fn judge_service_sha256(
     match service {
         Some(stored) if stored.eq_ignore_ascii_case(expected_hex) => {
             VerificationResult::passed("S3 service-computed SHA-256 verified")
+                .by(VerificationMethod::StoreChecksum)
         }
         Some(_) => VerificationResult::failed("S3 service-computed SHA-256 mismatch"),
         None => VerificationResult::limited(
@@ -206,7 +497,8 @@ where
             VerificationResult::passed(format!(
                 "{backend}: stored content {algorithm} verified",
                 algorithm = algo.as_str()
-            )),
+            ))
+            .by(VerificationMethod::ReadBack),
             false,
         ))
     } else {
@@ -722,23 +1014,99 @@ pub trait UploadBackend: Send + Sync {
 
     /// Whether this backend can return and re-address immutable object
     /// versions. `false` means `put_manifest` never yields a version and
-    /// `get_manifest_pinned`/`verify_bucket_versioning` fail closed.
+    /// `get_manifest_pinned`/`bucket_versioning` fail closed.
     fn supports_object_versions(&self) -> bool {
         false
     }
 
-    /// Preflight for the hardened profile: confirm the bucket keeps immutable
-    /// versions of overwritten objects. Default fails closed for backends
+    /// Preflight for the hardened profile: whether the bucket keeps immutable
+    /// versions of overwritten objects (S3 `GetBucketVersioning`).
+    /// `NotEnabled` and `NotSupported` are the store's answers; `Err` is a
+    /// check that could not be made. The default fails closed for backends
     /// without versioning.
-    async fn verify_bucket_versioning(&self, bucket: &str) -> Result<(), VtopError> {
+    async fn bucket_versioning(&self, bucket: &str) -> Result<BucketFeature, VtopError> {
         Err(VtopError::Upload(format!(
             "backend {} cannot confirm object versioning on bucket {bucket}",
             self.backend_name()
         )))
     }
 
+    /// The Object Lock retention this backend applies to every object and
+    /// manifest it writes (#684). `None` (the default) means it sends none.
+    fn object_lock(&self) -> Option<ObjectLockPolicy> {
+        None
+    }
+
+    /// Preflight for the Object Lock profile (#684): whether the bucket has
+    /// Object Lock enabled (S3 `GetObjectLockConfiguration`). `NotEnabled`
+    /// is the store's answer that it has not, `NotSupported` its answer that
+    /// it does not implement Object Lock at all (#722); `Err` is a check that
+    /// could not be made. The default fails closed, like
+    /// [`bucket_versioning`](Self::bucket_versioning).
+    async fn bucket_object_lock(&self, bucket: &str) -> Result<BucketFeature, VtopError> {
+        Err(VtopError::Upload(format!(
+            "backend {} cannot read the Object Lock configuration of bucket {bucket}",
+            self.backend_name()
+        )))
+    }
+
+    /// Read one object version's Object Lock retention and judge it against
+    /// `expected` (#684). `version_id` names the exact version a write
+    /// returned; `None` reads the current version of the key.
+    ///
+    /// Separate from [`verify_object`](Self::verify_object) on purpose:
+    /// recovery and the scrub verify content long after the write, when a
+    /// retention that has ended is normal, and must not fail for it. The
+    /// default is [`RetentionCheck::Unsupported`], which the engine treats as
+    /// a failure when the profile is set.
+    async fn verify_retention(
+        &self,
+        _object_uri: &str,
+        _version_id: Option<&str>,
+        _expected: &RetentionExpectation,
+    ) -> Result<RetentionCheck, VtopError> {
+        Ok(RetentionCheck::Unsupported)
+    }
+
+    /// Confirm that one object version really has no retention, or no legal
+    /// hold, with a request that answers a refused permission with an error
+    /// rather than with silence (#709). S3 omits the lock headers from a
+    /// HEAD to a caller without `s3:GetObjectRetention` (the legal hold
+    /// without `s3:GetObjectLegalHold`), so
+    /// [`verify_retention`](Self::verify_retention) reads a lost permission
+    /// as a missing lock;
+    /// the engine asks this before it acts on a missing one by writing a new
+    /// object. `Ok(true)`: the store says there is none. `Ok(false)`: there
+    /// is one after all. `Err`: it could not be read. The default fails
+    /// closed.
+    async fn confirm_lock_absent(
+        &self,
+        object_uri: &str,
+        _version_id: Option<&str>,
+        part: LockPart,
+    ) -> Result<bool, VtopError> {
+        Err(VtopError::Upload(format!(
+            "backend {} cannot confirm the {part:?} of {object_uri}",
+            self.backend_name()
+        )))
+    }
+
     /// HEAD/stat an object.
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError>;
+
+    /// Whether [`head_object`](Self::head_object) answers an absent object
+    /// with [`VtopError::NotFound`], and answers it with that ONLY when the
+    /// store said the key holds nothing (#626).
+    ///
+    /// The engine writes a batch under its derived object key only when the
+    /// key is free or already holds this batch's verified bytes; anything it
+    /// cannot tell apart from "free" could be an object it would overwrite. A
+    /// backend that relays a tool's words (the command backends) or cannot
+    /// separate a missing key from a refused request answers `false`, and the
+    /// engine names that backend's objects per attempt, as before.
+    fn reports_absent_objects(&self) -> bool {
+        false
+    }
 
     /// Download an object's full content.
     ///
@@ -817,13 +1185,15 @@ pub trait UploadBackend: Send + Sync {
         0
     }
 
-    /// Start a resumable multipart upload. Returns the backend upload id.
+    /// Start a resumable multipart upload. Returns the backend upload id and
+    /// the Object Lock retention it asked for (#684), fixed here for the
+    /// completed object.
     async fn create_multipart_upload(
         &self,
         object_uri: &str,
         _content_type: &str,
         _checksum: Option<ObjectChecksum<'_>>,
-    ) -> Result<String, VtopError> {
+    ) -> Result<CreatedUpload, VtopError> {
         Err(VtopError::Upload(format!(
             "backend {} does not support resumable multipart upload for {object_uri}",
             self.backend_name()
@@ -1074,6 +1444,106 @@ mod tests {
             assert!(message.contains("spawning s3cmd upload:"), "{message}");
             assert_eq!(hint.is_some_and(|h| message.contains(h)), hint.is_some());
             assert!(!message.contains("atomically"), "{message}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod object_lock_tests {
+    use super::*;
+
+    fn at(secs: u64, nanos: u32) -> SystemTime {
+        UNIX_EPOCH + Duration::new(secs, nanos)
+    }
+
+    /// #684: the date asked for is never earlier than now plus the
+    /// retention: both terms round UP to a whole second, and whole seconds
+    /// are what S3 echoes back, so the comparison is exact.
+    #[test]
+    fn the_date_asked_for_is_now_plus_the_retention_rounded_up() {
+        let policy = ObjectLockPolicy::from_config(&ObjectLockConfig {
+            mode: ObjectLockMode::Governance,
+            retain_days: 1,
+            legal_hold: false,
+        });
+        assert_eq!(
+            policy.request_at(at(1_000, 0)).retain_until_unix_secs,
+            1_000 + 86_400
+        );
+        assert_eq!(
+            policy.request_at(at(1_000, 1)).retain_until_unix_secs,
+            1_001 + 86_400,
+            "a sub-second clock rounds up, never down"
+        );
+        let short = ObjectLockPolicy::with_retention_for_tests(
+            ObjectLockMode::Compliance,
+            Duration::from_millis(1_500),
+            true,
+        );
+        let asked = short.request_at(at(10, 0));
+        assert_eq!(asked.retain_until_unix_secs, 12);
+        assert!(asked.legal_hold && asked.mode == ObjectLockMode::Compliance);
+        // A clock before 1970 asks for a date in the past, which the store
+        // refuses: the write fails rather than landing unlocked.
+        let before = UNIX_EPOCH - Duration::from_secs(5);
+        assert_eq!(policy.request_at(before).retain_until_unix_secs, 86_400);
+        assert!(policy.matches(&ObjectLockConfig {
+            mode: ObjectLockMode::Governance,
+            retain_days: 1,
+            legal_hold: false,
+        }));
+    }
+
+    /// The comparison is against what was ASKED for, so the stored date equal
+    /// to it passes, one second earlier fails, and later (a longer bucket
+    /// default) passes. No clock is read here: skew between engine and store
+    /// cannot fail a batch.
+    #[test]
+    fn the_judgment_compares_against_the_date_asked_for() {
+        let expected = RetentionExpectation {
+            mode: ObjectLockMode::Governance,
+            retain_until_at_least_unix_secs: 2_000,
+            legal_hold: true,
+        };
+        let kept = |mode: &str, until: i64, hold: Option<bool>| StoredRetention {
+            mode: Some(mode.into()),
+            retain_until_unix_secs: Some(until),
+            legal_hold: hold,
+        };
+        assert!(judge_retention(&kept("GOVERNANCE", 2_000, Some(true)), &expected).passed());
+        assert!(judge_retention(&kept("governance", 9_999, Some(true)), &expected).passed());
+        assert_eq!(
+            judge_retention(&kept("GOVERNANCE", 1_999, Some(true)), &expected),
+            RetentionCheck::TooShort {
+                retain_until_unix_secs: 1_999
+            }
+        );
+        assert!(matches!(
+            judge_retention(&kept("COMPLIANCE", 2_000, Some(true)), &expected),
+            RetentionCheck::ModeMismatch { .. }
+        ));
+        assert_eq!(
+            judge_retention(&kept("GOVERNANCE", 2_000, None), &expected),
+            RetentionCheck::LegalHoldMissing
+        );
+        assert_eq!(
+            judge_retention(&StoredRetention::default(), &expected),
+            RetentionCheck::Missing
+        );
+        let mode_only = StoredRetention {
+            mode: Some("GOVERNANCE".into()),
+            ..StoredRetention::default()
+        };
+        assert_eq!(
+            judge_retention(&mode_only, &expected),
+            RetentionCheck::Missing
+        );
+        for (check, label) in [
+            (RetentionCheck::Missing, "missing"),
+            (RetentionCheck::LegalHoldMissing, "legal_hold_missing"),
+            (RetentionCheck::Unsupported, "error"),
+        ] {
+            assert_eq!(check.label(), label);
         }
     }
 }

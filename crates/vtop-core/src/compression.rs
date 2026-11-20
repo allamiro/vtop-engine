@@ -156,6 +156,7 @@ mod tests {
             mtime: "now".into(),
             content_fingerprint: None,
             tail_fingerprint: None,
+            ctime: None,
         };
         TelemetryBatch {
             batch_id: "vtop-test".into(),
@@ -190,6 +191,44 @@ mod tests {
         decoder.read_to_string(&mut out).unwrap();
         assert_eq!(out, "line-1\nline-2\nline-3\n");
         assert_eq!(obj.uncompressed_bytes, out.len() as u64);
+    }
+
+    /// #626 names an object by the digest of its bytes, so a replay finds the
+    /// stored object only if compressing the same records again gives the
+    /// same bytes: no timestamp, no randomness, nothing from the attempt (the
+    /// batch id and creation time differ between the two batches here).
+    #[test]
+    fn the_same_records_compress_to_the_same_bytes() {
+        let kinds = [
+            CompressionType::Gzip,
+            CompressionType::Zstd,
+            CompressionType::None,
+        ];
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let first = sealed_batch(vec![b"line-1", b"line-2"]);
+        let mut second = sealed_batch(vec![b"line-1", b"line-2"]);
+        second.batch_id = "vtop-another-attempt".into();
+        second.created_at = "later".into();
+        let compress = |batch: &TelemetryBatch, dir: &Path| -> Vec<Vec<u8>> {
+            kinds
+                .iter()
+                .map(|&kind| {
+                    let obj = compress_batch(batch, kind, 6, dir).unwrap();
+                    std::fs::read(&obj.path).unwrap()
+                })
+                .collect()
+        };
+        let a = compress(&first, first_dir.path());
+        // Past a whole second, so a header timestamp would differ.
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        let b = compress(&second, second_dir.path());
+        for ((kind, a), b) in kinds.iter().zip(&a).zip(&b) {
+            assert_eq!(
+                a, b,
+                "{kind:?}: two compressions of the same records differ"
+            );
+        }
     }
 
     #[test]

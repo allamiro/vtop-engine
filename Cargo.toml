@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.10.1"
 edition = "2021"
 # MSRV: the floor is now set by aws-smithy-types 1.6.3, which declares
 # rust-version 1.94.1 (it raised the 1.94.0 floor sqlx 0.9 set, which had
@@ -40,7 +40,14 @@ http-body-util = "0.1"
 # The egress shaper (#481) implements http-body 1.x `Body` to wrap the SDK's
 # request body; already in the tree through the aws-sdk and hyper.
 http-body = "1"
-rdkafka = { version = "0.39", features = ["cmake-build", "ssl", "sasl"] }
+# Portable by default (#677). librdkafka is built from source with OpenSSL
+# compiled in (`ssl-vendored`), so a build no longer depends on the host's
+# OpenSSL version (1.1.1 on EL8, 3.x on EL9/10, 4.x on Fedora 45 and Homebrew),
+# and the binaries load no OpenSSL at run time. SASL PLAIN, SCRAM and
+# OAUTHBEARER are built into librdkafka. Only Kerberos (GSSAPI) needs Cyrus
+# SASL, which is the opt-in `kafka-gssapi` feature. Set OPENSSL_NO_VENDOR=1 to
+# link the system OpenSSL instead.
+rdkafka = { version = "0.39", features = ["cmake-build", "ssl-vendored"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-smithy-runtime-api = "1"
 aws-smithy-types = "1"
@@ -54,11 +61,31 @@ aws-sdk-s3 = { version = "1", default-features = false, features = [
     "rt-tokio",
 ] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = "1.0.129"
 serde_yaml = "0.9"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# OpenTelemetry export (#683), compiled into every binary through
+# vtop-observe and idle until an OTLP endpoint is set. HTTP/protobuf only: the
+# gRPC transport would add tonic and its stack, while this one rides the
+# hyper 1 + hyper-rustls client the aws-sdk already brings. Default features
+# are off throughout: they would add the reqwest client and the logs signal.
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "internal-logs"] }
+# No `internal-logs` on the exporter: its DEBUG events quote the request URL
+# whole and the collector's response body (review of #693). The SDK's own
+# internal logs stay; they report failures without either.
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "http-proto"] }
+opentelemetry-http = { version = "0.33", default-features = false, features = ["hyper"] }
+# The OTLP metrics messages, built from the Prometheus registry (vtop-observe
+# `otel::metrics`). Already in the tree through opentelemetry-otlp.
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "metrics", "trace"] }
+prost = { version = "0.14", default-features = false, features = ["std"] }
+tracing-opentelemetry = { version = "0.34", default-features = false }
+# Only features the aws-sdk already turns on, so this adds no package. The
+# crypto provider is rustls's `ring`, chosen explicitly as everywhere else.
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "tls12"] }
 thiserror = "2"
 anyhow = "1"
 async-trait = "0.1"
@@ -75,7 +102,7 @@ blake3 = "1"
 # `loosen-follower-log-revert` is required by the blank-follower snapshot
 # harness (openraft panics if a wiped follower reports a lower matching
 # index); see openraft FAQ "Can I wipe out the data of ONE node".
-openraft = { version = "=0.9.25", features = ["single-term-leader", "storage-v2", "loosen-follower-log-revert"] }
+openraft = { version = "=0.9.26", features = ["single-term-leader", "storage-v2", "loosen-follower-log-revert"] }
 hex = "0.4"
 base64 = "0.23"
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
@@ -107,16 +134,16 @@ quote = { version = "1", default-features = false }
 # path locally, and the version is what a published crate would resolve. Without
 # it these are wildcard dependencies, which crates.io rejects outright - so the
 # workspace could not actually be published as declared.
-vtop-core = { path = "crates/vtop-core", version = "0.7.0" }
-vtop-log = { path = "crates/vtop-log", version = "0.7.0" }
-vtop-protocol = { path = "crates/vtop-protocol", version = "0.7.0" }
-vtop-broker = { path = "crates/vtop-broker", version = "0.7.0" }
-vtop-meta = { path = "crates/vtop-meta", version = "0.7.0" }
-vtop-observe = { path = "crates/vtop-observe", version = "0.7.0" }
-vtop-kafka = { path = "crates/vtop-kafka", version = "0.7.0" }
-vtop-adapters = { path = "crates/vtop-adapters", version = "0.7.0", default-features = false }
-vtop-upload = { path = "crates/vtop-upload", version = "0.7.0" }
-vtop-state = { path = "crates/vtop-state", version = "0.7.0" }
+vtop-core = { path = "crates/vtop-core", version = "0.10.1" }
+vtop-log = { path = "crates/vtop-log", version = "0.10.1" }
+vtop-protocol = { path = "crates/vtop-protocol", version = "0.10.1" }
+vtop-broker = { path = "crates/vtop-broker", version = "0.10.1" }
+vtop-meta = { path = "crates/vtop-meta", version = "0.10.1" }
+vtop-observe = { path = "crates/vtop-observe", version = "0.10.1" }
+vtop-kafka = { path = "crates/vtop-kafka", version = "0.10.1" }
+vtop-adapters = { path = "crates/vtop-adapters", version = "0.10.1", default-features = false }
+vtop-upload = { path = "crates/vtop-upload", version = "0.10.1" }
+vtop-state = { path = "crates/vtop-state", version = "0.10.1" }
 
 [profile.release]
 opt-level = 3

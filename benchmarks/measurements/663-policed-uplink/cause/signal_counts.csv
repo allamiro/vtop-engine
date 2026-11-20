@@ -1,0 +1,6 @@
+signal,log_lines
+per-attempt or whole-operation timeout (batch failures),16
+store throttle (429/503) seen by the engine,0
+SDK stalled-upload protection fired,0
+width controller decision,0
+object or part upload completed,0

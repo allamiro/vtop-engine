@@ -5,8 +5,9 @@
 //! committed" path without any external service.
 
 use crate::base::{
-    ObjectChecksum, ObjectHead, StoredManifest, StoredObject, UploadBackend, UploadedPart,
-    VerificationResult,
+    judge_retention, BucketFeature, CreatedUpload, LockPart, ObjectChecksum, ObjectHead,
+    ObjectLockMode, ObjectLockPolicy, RequestedRetention, RetentionCheck, RetentionExpectation,
+    StoredManifest, StoredObject, StoredRetention, UploadBackend, UploadedPart, VerificationResult,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -14,6 +15,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use vtop_core::effective_config::VerificationMethod;
 use vtop_core::errors::VtopError;
 
 #[derive(Default)]
@@ -44,6 +46,25 @@ struct VersionHistory {
 #[derive(Default)]
 struct PendingMultipart {
     parts: HashMap<u32, Vec<u8>>,
+    /// The Object Lock asked for at create (#684), applied at complete.
+    retention: Option<RequestedRetention>,
+}
+
+/// How [`MockBackend::with_lock_fault`] makes the store mishandle the Object
+/// Lock it is asked for (#684). The backend still REPORTS what it asked for,
+/// as the real one does: only a read of the stored version shows the fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockFault {
+    /// The store accepts the lock headers and keeps no retention: a bucket,
+    /// or a store, that ignores them.
+    Ignored,
+    /// The store keeps another mode than the one asked for.
+    Mode(ObjectLockMode),
+    /// The store keeps the date moved by this many seconds: negative is a
+    /// shorter retention than asked for, positive a longer bucket default.
+    ShiftSeconds(i64),
+    /// The store keeps the retention and drops the legal hold.
+    NoLegalHold,
 }
 
 /// A test double for [`UploadBackend`].
@@ -94,6 +115,100 @@ pub struct MockBackend {
     /// When true, abort_multipart_upload fails — so the sweep's
     /// keep-session-on-failed-abort path is testable (#482).
     fail_abort: bool,
+    /// When true, abort_multipart_upload never answers: a store that has
+    /// stopped responding (#668, review), so a test can show a sweep does not
+    /// hold up a stop.
+    hang_abort: bool,
+    /// How many upcoming completes answer `InvalidPart` and leave the upload
+    /// pending, as S3 does when a part it holds is not the one named (#668).
+    complete_faults: AtomicUsize,
+    /// When set, every `head_object` fails this way instead of answering
+    /// (#626): a refusal that says nothing about the key, or a throttle.
+    head_fault: Option<HeadFault>,
+    /// Faults injected into `upload_part` by part number (#668), each with how
+    /// many more requests for that part it answers.
+    part_faults: Mutex<HashMap<u32, (PartFault, usize)>>,
+    /// Every `upload_part` request by part number, answered or not (#668):
+    /// what a test reads to prove only the failed part was sent again.
+    part_sends: Mutex<HashMap<u32, usize>>,
+    /// The Object Lock this backend asks for on every write (#684).
+    object_lock: Option<ObjectLockPolicy>,
+    /// How the store mishandles it, if at all. Settable on a shared mock,
+    /// so one test can fault one attempt and not the next.
+    lock_fault: Mutex<Option<LockFault>>,
+    /// After every object put, another writer puts the same bytes again at
+    /// the key WITHOUT a lock (#684): the current version is then not the
+    /// one this backend wrote.
+    shadow_writes: bool,
+    /// When set, every `verify_retention` fails with this message. Settable
+    /// on a shared mock (#710), so the engine can commit before the scrub's
+    /// reads fail.
+    retention_error: Mutex<Option<String>>,
+    /// The URI of every `verify_retention` call, in order (#710), so a test
+    /// can pin which keys a scrub read the retention of, and which it did not.
+    retention_reads: Mutex<Vec<String>>,
+    /// When set, `retention_error` applies only to keys ending with this
+    /// suffix (#710), so a test can fail the receipts' reads alone.
+    retention_error_suffix: Mutex<Option<String>>,
+    /// The engine's credentials lack `s3:GetObjectRetention` and
+    /// `s3:GetObjectLegalHold` (#709): a HEAD answers with no lock headers,
+    /// and `confirm_lock_absent` is refused, as S3 does.
+    lock_read_denied: bool,
+    /// What the bucket answers about Object Lock. Enabled unless a test says
+    /// otherwise.
+    bucket_object_lock: BucketFeature,
+    /// What the bucket answers about versioning (#722). Enabled unless a
+    /// test says otherwise.
+    bucket_versioning: BucketFeature,
+    /// `bucket_versioning` calls.
+    versioning_calls: AtomicUsize,
+    /// How many upcoming versioning checks fail as a store blip would.
+    versioning_errors: AtomicUsize,
+    /// `bucket_object_lock` calls, so a test can pin that a config without
+    /// the profile makes none.
+    lock_config_calls: AtomicUsize,
+    /// The buckets those calls named, in order.
+    lock_config_buckets: Mutex<Vec<String>>,
+    /// How many upcoming bucket checks fail as a store blip would.
+    lock_config_errors: AtomicUsize,
+    /// The retention the store keeps per `(key, version)` (#684).
+    retention: Mutex<HashMap<(String, String), StoredRetention>>,
+    /// Every put (object or manifest) to a key ending with this suffix fails
+    /// (#671 release B): a store refusing verification receipts. Settable on
+    /// a shared mock, so one attempt can fail and the next succeed.
+    failing_put_suffix: Mutex<Option<String>>,
+    /// Every put (object or manifest) to a key containing this text fails:
+    /// one batch range's puts, which its object key and batch id both name
+    /// (`-b0-7-`), while other ranges' go through (#626).
+    failing_put_containing: Mutex<Option<String>>,
+    /// Every put to a key ending with this suffix never answers: a store
+    /// that accepts the request and goes quiet (review of #711).
+    hanging_put_suffix: Mutex<Option<String>>,
+    /// When set, `lock_fault` applies only to keys ending with this suffix
+    /// (review of #711), so one kind of object can be left unlocked.
+    lock_fault_suffix: Mutex<Option<String>>,
+}
+
+/// How [`MockBackend::with_part_fault`] makes `upload_part` fail (#668).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartFault {
+    /// The connection was reset mid-request: an `Upload` error, nothing stored.
+    Reset,
+    /// The store asked for less: `UploadThrottled`, nothing stored.
+    Throttled,
+    /// The store no longer has the upload, as S3 answers `NoSuchUpload` once
+    /// an upload was aborted or expired: the pending upload and its parts are
+    /// dropped and the request answers `UploadSessionGone`.
+    SessionGone,
+}
+
+/// How [`MockBackend::with_head_fault`] makes `head_object` fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadFault {
+    /// `Upload` with a 403, as S3 answers a caller without list permission.
+    Refused,
+    /// `UploadThrottled`, as an overloaded store answers.
+    Throttled,
 }
 
 impl Default for MockBackend {
@@ -118,6 +233,242 @@ impl MockBackend {
         self
     }
 
+    /// Every abort_multipart_upload waits for ever (#668).
+    pub fn with_hanging_abort(mut self) -> Self {
+        self.hang_abort = true;
+        self
+    }
+
+    /// The next `times` completes answer `InvalidPart` and leave the upload
+    /// and its parts at the store (#668).
+    pub fn with_complete_faults(self, times: usize) -> Self {
+        self.complete_faults.store(times, Ordering::SeqCst);
+        self
+    }
+
+    /// Every `head_object` fails with `fault` (#626).
+    pub fn with_head_fault(mut self, fault: HeadFault) -> Self {
+        self.head_fault = Some(fault);
+        self
+    }
+
+    /// Ask for `policy` on every object, manifest and multipart create, as
+    /// the S3 backend does with `upload.object_lock` set (#684).
+    pub fn with_object_lock(mut self, policy: ObjectLockPolicy) -> Self {
+        self.object_lock = Some(policy);
+        self
+    }
+
+    /// The store mishandles the lock it is asked for (#684).
+    pub fn with_lock_fault(self, fault: LockFault) -> Self {
+        self.set_lock_fault(Some(fault));
+        self
+    }
+
+    /// [`MockBackend::with_lock_fault`] on a mock already shared; `None`
+    /// makes the store keep what it is asked for again.
+    pub fn set_lock_fault(&self, fault: Option<LockFault>) {
+        *self.lock_fault.lock().unwrap() = fault;
+    }
+
+    /// Another writer re-puts every object, unlocked, right after it lands.
+    pub fn with_shadow_writes(mut self) -> Self {
+        self.shadow_writes = true;
+        self
+    }
+
+    /// The credentials lack the permissions to read a lock (#709): every
+    /// object reads as unlocked through a HEAD, and the requests that can
+    /// tell a refusal from an absence are refused.
+    pub fn without_lock_read_permission(mut self) -> Self {
+        self.lock_read_denied = true;
+        self
+    }
+
+    /// Every retention read fails with `message`.
+    pub fn with_retention_error(self, message: impl Into<String>) -> Self {
+        self.set_retention_error(Some(message.into()));
+        self
+    }
+
+    /// Every retention read from now on fails with `message`, or none does.
+    pub fn set_retention_error(&self, message: Option<String>) {
+        *self.retention_error.lock().unwrap() = message;
+    }
+
+    /// Apply `retention_error` only to keys ending with `suffix`; `None`
+    /// applies it to every key, as before.
+    pub fn set_retention_error_only_for(&self, suffix: Option<&str>) {
+        *self.retention_error_suffix.lock().unwrap() = suffix.map(str::to_owned);
+    }
+
+    /// The URIs whose retention was read, in order (#710).
+    pub fn retention_reads(&self) -> Vec<String> {
+        self.retention_reads.lock().unwrap().clone()
+    }
+
+    /// Replace what the store keeps for one version, `None` for the current
+    /// one: a governance retention removed by a principal allowed to bypass
+    /// it, say (#684).
+    pub fn set_stored_retention(&self, uri: &str, version_id: Option<&str>, kept: StoredRetention) {
+        let Some(version) = version_id
+            .map(str::to_owned)
+            .or_else(|| self.current_version(uri))
+        else {
+            return;
+        };
+        self.retention
+            .lock()
+            .unwrap()
+            .insert((uri.to_owned(), version), kept);
+    }
+
+    /// The bucket answers that Object Lock is NOT enabled (#684).
+    pub fn without_bucket_object_lock(mut self) -> Self {
+        self.bucket_object_lock = BucketFeature::NotEnabled;
+        self
+    }
+
+    /// The store answers that it does not implement Object Lock at all
+    /// (#722): S3's 501 `NotImplemented`, as Garage documents.
+    pub fn with_object_lock_not_implemented(mut self) -> Self {
+        self.bucket_object_lock = BucketFeature::NotSupported;
+        self
+    }
+
+    /// What the bucket answers about versioning (#722).
+    pub fn with_bucket_versioning(mut self, answer: BucketFeature) -> Self {
+        self.bucket_versioning = answer;
+        self
+    }
+
+    /// The next `times` versioning checks fail with a 503, as a store blip.
+    pub fn with_versioning_errors(self, times: usize) -> Self {
+        self.versioning_errors.store(times, Ordering::SeqCst);
+        self
+    }
+
+    /// How many times the bucket's versioning was asked for.
+    pub fn versioning_calls(&self) -> usize {
+        self.versioning_calls.load(Ordering::SeqCst)
+    }
+
+    /// How many times the bucket's Object Lock configuration was asked for.
+    pub fn object_lock_config_calls(&self) -> usize {
+        self.lock_config_calls.load(Ordering::SeqCst)
+    }
+
+    /// The buckets those checks named, in order.
+    pub fn object_lock_config_buckets(&self) -> Vec<String> {
+        self.lock_config_buckets.lock().unwrap().clone()
+    }
+
+    /// The next `times` bucket checks fail with a 503, as a store blip.
+    pub fn with_lock_config_errors(self, times: usize) -> Self {
+        self.lock_config_errors.store(times, Ordering::SeqCst);
+        self
+    }
+
+    /// The retention the store keeps for one version of `uri`, `None` for
+    /// the current version.
+    pub fn stored_retention(&self, uri: &str, version_id: Option<&str>) -> StoredRetention {
+        let Some(version) = version_id
+            .map(str::to_owned)
+            .or_else(|| self.current_version(uri))
+        else {
+            return StoredRetention::default();
+        };
+        self.retention
+            .lock()
+            .unwrap()
+            .get(&(uri.to_owned(), version))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// A later write to `uri` that carries no lock, as a concurrent writer
+    /// without the profile would make (#684). Returns its version id.
+    pub fn add_unlocked_version(&self, uri: &str, data: Vec<u8>) -> String {
+        self.store_bytes(uri, data, None, None, None)
+            .expect("the mock stores bytes")
+    }
+
+    /// Delete one version as a caller WITHOUT the right to bypass retention
+    /// would (#684): refused while the version is under retention or a legal
+    /// hold, as S3 refuses it. [`delete_version`](Self::delete_version) is
+    /// the privileged form.
+    pub fn try_delete_version(&self, uri: &str, version_id: &str) -> Result<(), VtopError> {
+        let kept = self.stored_retention(uri, Some(version_id));
+        let now = unix_now();
+        let retained = kept.retain_until_unix_secs.is_some_and(|until| until > now);
+        if retained || kept.legal_hold == Some(true) {
+            return Err(VtopError::Upload(format!(
+                "mock delete_object {uri} (version {version_id}): AccessDenied (http 403): \
+                 the object is WORM protected and cannot be overwritten"
+            )));
+        }
+        self.delete_version(uri, version_id);
+        Ok(())
+    }
+
+    /// Seed a pending multipart upload created with `retention` (#684), the
+    /// state a session from an earlier process refers to.
+    pub fn seed_multipart_locked(
+        &self,
+        object_uri: &str,
+        upload_id: &str,
+        parts: Vec<(u32, Vec<u8>)>,
+        retention: RequestedRetention,
+    ) {
+        self.multiparts.lock().unwrap().insert(
+            (object_uri.to_owned(), upload_id.to_owned()),
+            PendingMultipart {
+                parts: parts.into_iter().collect(),
+                retention: Some(retention),
+            },
+        );
+    }
+
+    fn current_version(&self, uri: &str) -> Option<String> {
+        self.versions
+            .lock()
+            .unwrap()
+            .get(uri)
+            .and_then(|history| history.entries.last().map(|(id, _)| id.clone()))
+    }
+
+    /// What the store keeps of a lock it was asked for, after `lock_fault`.
+    fn kept(&self, uri: &str, asked: Option<RequestedRetention>) -> Option<StoredRetention> {
+        let asked = asked?;
+        let mut kept = StoredRetention {
+            mode: Some(asked.mode.as_s3().to_owned()),
+            retain_until_unix_secs: Some(asked.retain_until_unix_secs),
+            legal_hold: Some(asked.legal_hold),
+        };
+        let applies = self
+            .lock_fault_suffix
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_none_or(|suffix| uri.ends_with(suffix));
+        let fault = applies.then(|| *self.lock_fault.lock().unwrap()).flatten();
+        match fault {
+            None => {}
+            Some(LockFault::Ignored) => return None,
+            Some(LockFault::Mode(mode)) => kept.mode = Some(mode.as_s3().to_owned()),
+            Some(LockFault::ShiftSeconds(by)) => {
+                kept.retain_until_unix_secs = Some(asked.retain_until_unix_secs.saturating_add(by))
+            }
+            Some(LockFault::NoLegalHold) => kept.legal_hold = Some(false),
+        }
+        Some(kept)
+    }
+
+    fn asked(&self) -> Option<RequestedRetention> {
+        self.object_lock
+            .map(|policy| policy.request_at(std::time::SystemTime::now()))
+    }
+
     pub fn new() -> Self {
         Self {
             objects: Mutex::new(HashMap::new()),
@@ -130,6 +481,30 @@ impl MockBackend {
             s3_checksum_semantics: false,
             min_part_size: 0,
             fail_abort: false,
+            hang_abort: false,
+            complete_faults: AtomicUsize::new(0),
+            head_fault: None,
+            part_faults: Mutex::new(HashMap::new()),
+            part_sends: Mutex::new(HashMap::new()),
+            object_lock: None,
+            lock_fault: Mutex::new(None),
+            shadow_writes: false,
+            retention_error: Mutex::new(None),
+            retention_reads: Mutex::new(Vec::new()),
+            retention_error_suffix: Mutex::new(None),
+            lock_read_denied: false,
+            bucket_object_lock: BucketFeature::Enabled,
+            bucket_versioning: BucketFeature::Enabled,
+            versioning_calls: AtomicUsize::new(0),
+            versioning_errors: AtomicUsize::new(0),
+            lock_config_calls: AtomicUsize::new(0),
+            lock_config_buckets: Mutex::new(Vec::new()),
+            lock_config_errors: AtomicUsize::new(0),
+            retention: Mutex::new(HashMap::new()),
+            failing_put_suffix: Mutex::new(None),
+            failing_put_containing: Mutex::new(None),
+            hanging_put_suffix: Mutex::new(None),
+            lock_fault_suffix: Mutex::new(None),
             multipart_fail_after_parts: Arc::new(AtomicUsize::new(usize::MAX)),
             multipart_parts_uploaded: Arc::new(AtomicUsize::new(0)),
             bucket_ensures: AtomicUsize::new(0),
@@ -152,27 +527,106 @@ impl MockBackend {
         self
     }
 
-    fn take_throttle(&self, budget: &AtomicUsize, uri: &str) -> Result<(), VtopError> {
-        // Spend one unit of the budget if any is left. A compare-exchange loop
-        // because `fetch_update` is deprecated on current stable and its
-        // replacement is newer than the MSRV.
+    /// Spend one unit of `budget` if any is left. A compare-exchange loop
+    /// because `fetch_update` is deprecated on current stable and its
+    /// replacement is newer than the MSRV.
+    fn take_one(budget: &AtomicUsize) -> bool {
         let mut left = budget.load(Ordering::SeqCst);
-        let refused = loop {
+        loop {
             if left == 0 {
-                break false;
+                return false;
             }
             match budget.compare_exchange_weak(left, left - 1, Ordering::SeqCst, Ordering::SeqCst) {
-                Ok(_) => break true,
+                Ok(_) => return true,
                 Err(observed) => left = observed,
             }
-        };
-        if refused {
+        }
+    }
+
+    fn take_throttle(&self, budget: &AtomicUsize, uri: &str) -> Result<(), VtopError> {
+        if Self::take_one(budget) {
             Err(VtopError::UploadThrottled(format!(
                 "mock put {uri}: SlowDown (http 503): please reduce your request rate"
             )))
         } else {
             Ok(())
         }
+    }
+
+    /// Every put to a key ending with `suffix` fails, as a store that
+    /// refuses the request does (#671 release B). The error quotes a signed
+    /// URL, as an SDK error can, so a test can show it never reaches a log.
+    pub fn with_failing_put_suffix(self, suffix: &str) -> Self {
+        self.set_failing_put_suffix(Some(suffix));
+        self
+    }
+
+    /// [`MockBackend::with_failing_put_suffix`] on a shared mock; `None`
+    /// lets every put through again.
+    pub fn set_failing_put_suffix(&self, suffix: Option<&str>) {
+        *self.failing_put_suffix.lock().unwrap() = suffix.map(str::to_owned);
+    }
+
+    /// Every put to a key containing `text` fails; `None` lets them through
+    /// again.
+    pub fn set_failing_put_containing(&self, text: Option<&str>) {
+        *self.failing_put_containing.lock().unwrap() = text.map(str::to_owned);
+    }
+
+    /// Every put to a key ending with `suffix` never answers; `None` lets
+    /// them through again.
+    pub fn set_hanging_put_suffix(&self, suffix: Option<&str>) {
+        *self.hanging_put_suffix.lock().unwrap() = suffix.map(str::to_owned);
+    }
+
+    /// Apply `lock_fault` only to keys ending with `suffix`; `None` applies
+    /// it to every key, as before.
+    pub fn set_lock_fault_only_for(&self, suffix: Option<&str>) {
+        *self.lock_fault_suffix.lock().unwrap() = suffix.map(str::to_owned);
+    }
+
+    async fn hang_put(&self, uri: &str) {
+        let hangs = self
+            .hanging_put_suffix
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|suffix| uri.ends_with(suffix));
+        if hangs {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    fn refuse_put(&self, uri: &str) -> Result<(), VtopError> {
+        let contained = self
+            .failing_put_containing
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|text| uri.contains(text));
+        match self.failing_put_suffix.lock().unwrap().as_deref() {
+            _ if contained => Err(VtopError::Upload(format!(
+                "mock put {uri}: InternalError (http 500)"
+            ))),
+            Some(suffix) if uri.ends_with(suffix) => {
+                let key = uri.strip_prefix("s3://").unwrap_or(uri);
+                Err(VtopError::Upload(format!(
+                    "mock put {uri}: InternalError (http 500) at \
+                     https://store.example/{key}?X-Amz-Signature=deadbeef&X-Amz-Credential=AKIDEXAMPLE"
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// How many versions of `uri` the store holds: a write that replaced
+    /// the key adds one.
+    pub fn version_count(&self, uri: &str) -> usize {
+        self.versions
+            .lock()
+            .unwrap()
+            .get(uri)
+            .map_or(0, |history| history.entries.len())
     }
 
     /// A mock that always fails verification.
@@ -210,12 +664,103 @@ impl MockBackend {
         self.multipart_parts_uploaded.load(Ordering::SeqCst)
     }
 
+    /// The next `times` requests for part `part_number` fail as `fault`
+    /// (#668); later requests for it, and every other part, succeed. Adding a
+    /// fault for a part that already has one replaces it.
+    pub fn with_part_fault(self, part_number: u32, fault: PartFault, times: usize) -> Self {
+        self.set_part_fault(part_number, fault, times);
+        self
+    }
+
+    /// [`MockBackend::with_part_fault`] on a backend already shared with the
+    /// code under test.
+    pub fn set_part_fault(&self, part_number: u32, fault: PartFault, times: usize) {
+        self.part_faults
+            .lock()
+            .unwrap()
+            .insert(part_number, (fault, times));
+    }
+
+    /// How many `upload_part` requests named `part_number`, answered or not.
+    pub fn part_sends(&self, part_number: u32) -> usize {
+        self.part_sends
+            .lock()
+            .unwrap()
+            .get(&part_number)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Every `upload_part` request, answered or not.
+    pub fn part_sends_total(&self) -> usize {
+        self.part_sends.lock().unwrap().values().sum()
+    }
+
+    /// Whether the store still holds the multipart upload `upload_id` for
+    /// `object_uri`, as `ListMultipartUploads` would show it.
+    pub fn has_pending_multipart(&self, object_uri: &str, upload_id: &str) -> bool {
+        self.multiparts
+            .lock()
+            .unwrap()
+            .contains_key(&(object_uri.to_owned(), upload_id.to_owned()))
+    }
+
+    /// Drop every pending multipart upload, as a bucket lifecycle rule
+    /// (`AbortIncompleteMultipartUpload`) does once its window passes.
+    pub fn expire_pending_multiparts(&self) {
+        self.multiparts.lock().unwrap().clear();
+    }
+
+    /// Install a pending multipart upload with `parts` already stored, the
+    /// state a session file written by an earlier process refers to.
+    pub fn seed_multipart(&self, object_uri: &str, upload_id: &str, parts: Vec<(u32, Vec<u8>)>) {
+        self.multiparts.lock().unwrap().insert(
+            (object_uri.to_owned(), upload_id.to_owned()),
+            PendingMultipart {
+                parts: parts.into_iter().collect(),
+                retention: None,
+            },
+        );
+    }
+
+    /// Flip the first byte of part `part_number` in every pending upload: a
+    /// store that lost or damaged a part it acknowledged. Nothing the client
+    /// holds changes, so only a read-back of the completed object can see it.
+    pub fn corrupt_pending_part(&self, part_number: u32) {
+        for pending in self.multiparts.lock().unwrap().values_mut() {
+            if let Some(byte) = pending
+                .parts
+                .get_mut(&part_number)
+                .and_then(|p| p.first_mut())
+            {
+                *byte ^= 0xff;
+            }
+        }
+    }
+
+    fn take_part_fault(&self, part_number: u32) -> Option<PartFault> {
+        let mut faults = self.part_faults.lock().unwrap();
+        let (fault, left) = faults.get_mut(&part_number)?;
+        if *left == 0 {
+            return None;
+        }
+        *left -= 1;
+        Some(*fault)
+    }
+
     pub fn pending_multipart_count(&self) -> usize {
         self.multiparts.lock().unwrap().len()
     }
 
     pub fn ensure_bucket_calls(&self) -> usize {
         self.bucket_ensures.load(Ordering::SeqCst)
+    }
+
+    /// Every key the mock store holds an object or manifest at, sorted.
+    pub fn object_uris(&self) -> Vec<String> {
+        let mut uris: Vec<String> = self.objects.lock().unwrap().keys().cloned().collect();
+        uris.sort();
+        uris
     }
 
     /// True if the object exists in the mock store.
@@ -249,6 +794,7 @@ impl MockBackend {
         local_path: &Path,
         uri: &str,
         checksum: Option<&str>,
+        asked: Option<RequestedRetention>,
     ) -> Result<String, VtopError> {
         let data = tokio::fs::read(local_path).await?;
         // Under S3 semantics a single PUT gets a service-computed SHA-256,
@@ -257,7 +803,7 @@ impl MockBackend {
         let service = self
             .s3_checksum_semantics
             .then(|| vtop_core::checksum::sha256_bytes(&data));
-        self.store_bytes(uri, data, checksum, service)
+        self.store_bytes(uri, data, checksum, service, asked)
     }
 
     fn store_bytes(
@@ -266,6 +812,7 @@ impl MockBackend {
         data: Vec<u8>,
         checksum: Option<&str>,
         service_sha256: Option<String>,
+        asked: Option<RequestedRetention>,
     ) -> Result<String, VtopError> {
         let stored = Stored {
             size: data.len() as u64,
@@ -280,6 +827,12 @@ impl MockBackend {
         history.next += 1;
         let version_id = format!("v{}", history.next);
         history.entries.push((version_id.clone(), data));
+        if let Some(kept) = self.kept(uri, asked) {
+            self.retention
+                .lock()
+                .unwrap()
+                .insert((uri.to_string(), version_id.clone()), kept);
+        }
         Ok(version_id)
     }
 
@@ -300,12 +853,20 @@ impl UploadBackend for MockBackend {
         object_uri: &str,
         checksum: Option<ObjectChecksum<'_>>,
     ) -> Result<StoredObject, VtopError> {
+        self.refuse_put(object_uri)?;
+        self.hang_put(object_uri).await;
         self.take_throttle(&self.throttled_object_puts, object_uri)?;
+        let asked = self.asked();
         let version_id = self
-            .store(local_path, object_uri, checksum.map(|c| c.hex))
+            .store(local_path, object_uri, checksum.map(|c| c.hex), asked)
             .await?;
+        if self.shadow_writes {
+            let data = tokio::fs::read(local_path).await?;
+            self.add_unlocked_version(object_uri, data);
+        }
         Ok(StoredObject {
             version_id: Some(version_id),
+            retention: asked,
         })
     }
 
@@ -315,12 +876,16 @@ impl UploadBackend for MockBackend {
         manifest_uri: &str,
         checksum: Option<ObjectChecksum<'_>>,
     ) -> Result<StoredManifest, VtopError> {
+        self.refuse_put(manifest_uri)?;
+        self.hang_put(manifest_uri).await;
         self.take_throttle(&self.throttled_manifest_puts, manifest_uri)?;
+        let asked = self.asked();
         let version_id = self
-            .store(local_path, manifest_uri, checksum.map(|c| c.hex))
+            .store(local_path, manifest_uri, checksum.map(|c| c.hex), asked)
             .await?;
         Ok(StoredManifest {
             version_id: Some(version_id),
+            retention: asked,
         })
     }
 
@@ -385,6 +950,19 @@ impl UploadBackend for MockBackend {
     }
 
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {
+        match self.head_fault {
+            Some(HeadFault::Refused) => {
+                return Err(VtopError::Upload(format!(
+                    "mock head_object {object_uri}: AccessDenied (http 403)"
+                )))
+            }
+            Some(HeadFault::Throttled) => {
+                return Err(VtopError::UploadThrottled(format!(
+                    "mock head_object {object_uri}: SlowDown (http 503)"
+                )))
+            }
+            None => {}
+        }
         let map = self.objects.lock().unwrap();
         let s = map
             .get(object_uri)
@@ -461,6 +1039,7 @@ impl UploadBackend for MockBackend {
                                  service whole-object checksum; multipart or \
                                  unchecked upload)",
                             )
+                            .by(VerificationMethod::ReadBack)
                         } else {
                             VerificationResult::failed(
                                 "stored content SHA-256 mismatch on read-back",
@@ -472,6 +1051,7 @@ impl UploadBackend for MockBackend {
                     let actual = vtop_core::checksum::blake3_bytes(&stored.data);
                     if actual.eq_ignore_ascii_case(expected.hex) {
                         VerificationResult::passed("mock s3: read-back BLAKE3 verified")
+                            .by(VerificationMethod::ReadBack)
                     } else {
                         VerificationResult::failed("mock s3: read-back BLAKE3 mismatch")
                     }
@@ -504,9 +1084,10 @@ impl UploadBackend for MockBackend {
         let actual = vtop_core::checksum::digest_bytes(algo, &stored.data)
             .expect("enabled checksum algorithm has a digest");
         if actual.eq_ignore_ascii_case(expected.hex) {
-            Ok(VerificationResult::passed(
-                "mock: stored content checksum verified",
-            ))
+            Ok(
+                VerificationResult::passed("mock: stored content checksum verified")
+                    .by(VerificationMethod::ReadBack),
+            )
         } else {
             Ok(VerificationResult::failed("mock: checksum mismatch"))
         }
@@ -526,8 +1107,100 @@ impl UploadBackend for MockBackend {
         true
     }
 
-    async fn verify_bucket_versioning(&self, _bucket: &str) -> Result<(), VtopError> {
-        Ok(())
+    async fn bucket_versioning(&self, bucket: &str) -> Result<BucketFeature, VtopError> {
+        self.versioning_calls.fetch_add(1, Ordering::SeqCst);
+        if Self::take_one(&self.versioning_errors) {
+            return Err(VtopError::Upload(format!(
+                "mock get_bucket_versioning {bucket}: ServiceUnavailable (http 503)"
+            )));
+        }
+        Ok(self.bucket_versioning)
+    }
+
+    fn object_lock(&self) -> Option<ObjectLockPolicy> {
+        self.object_lock
+    }
+
+    async fn bucket_object_lock(&self, bucket: &str) -> Result<BucketFeature, VtopError> {
+        self.lock_config_calls.fetch_add(1, Ordering::SeqCst);
+        self.lock_config_buckets
+            .lock()
+            .unwrap()
+            .push(bucket.to_owned());
+        if Self::take_one(&self.lock_config_errors) {
+            return Err(VtopError::Upload(format!(
+                "mock get_object_lock_configuration {bucket}: ServiceUnavailable (http 503)"
+            )));
+        }
+        Ok(self.bucket_object_lock)
+    }
+
+    async fn verify_retention(
+        &self,
+        object_uri: &str,
+        version_id: Option<&str>,
+        expected: &RetentionExpectation,
+    ) -> Result<RetentionCheck, VtopError> {
+        self.retention_reads
+            .lock()
+            .unwrap()
+            .push(object_uri.to_owned());
+        let applies = self
+            .retention_error_suffix
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_none_or(|suffix| object_uri.ends_with(suffix));
+        if let Some(message) = self.retention_error.lock().unwrap().clone() {
+            if applies {
+                return Err(VtopError::Upload(message));
+            }
+        }
+        let version = match version_id {
+            Some(version) => version.to_owned(),
+            None => self
+                .current_version(object_uri)
+                .ok_or_else(|| VtopError::NotFound(object_uri.to_string()))?,
+        };
+        let exists = self
+            .versions
+            .lock()
+            .unwrap()
+            .get(object_uri)
+            .is_some_and(|h| h.entries.iter().any(|(id, _)| *id == version));
+        if !exists {
+            return Err(VtopError::NotFound(format!(
+                "{object_uri} (version {version})"
+            )));
+        }
+        let kept = if self.lock_read_denied {
+            StoredRetention::default()
+        } else {
+            self.stored_retention(object_uri, Some(&version))
+        };
+        Ok(judge_retention(&kept, expected))
+    }
+
+    async fn confirm_lock_absent(
+        &self,
+        object_uri: &str,
+        version_id: Option<&str>,
+        part: LockPart,
+    ) -> Result<bool, VtopError> {
+        if self.lock_read_denied {
+            return Err(VtopError::Upload(format!(
+                "mock get_object_{} {object_uri}: AccessDenied (http 403)",
+                match part {
+                    LockPart::Retention => "retention",
+                    LockPart::LegalHold => "legal_hold",
+                }
+            )));
+        }
+        let kept = self.stored_retention(object_uri, version_id);
+        Ok(match part {
+            LockPart::Retention => kept.mode.is_none() && kept.retain_until_unix_secs.is_none(),
+            LockPart::LegalHold => kept.legal_hold != Some(true),
+        })
     }
 
     /// Overrides the default no-op only to count: the trait's default would
@@ -539,6 +1212,12 @@ impl UploadBackend for MockBackend {
     fn supports_checksum_verification(&self) -> bool {
         !self.backend_limited
     }
+
+    fn reports_absent_objects(&self) -> bool {
+        // head_object answers a missing key, and only that, with NotFound.
+        true
+    }
+
     fn supports_multipart(&self) -> bool {
         true
     }
@@ -551,15 +1230,23 @@ impl UploadBackend for MockBackend {
         object_uri: &str,
         _content_type: &str,
         _checksum: Option<ObjectChecksum<'_>>,
-    ) -> Result<String, VtopError> {
+    ) -> Result<CreatedUpload, VtopError> {
         let mut next = self.next_upload_id.lock().unwrap();
         *next += 1;
         let upload_id = format!("mpu-{next}");
+        // Fixed HERE for the completed object, as S3 fixes it (#684).
+        let retention = self.asked();
         self.multiparts.lock().unwrap().insert(
             (object_uri.to_owned(), upload_id.clone()),
-            PendingMultipart::default(),
+            PendingMultipart {
+                parts: HashMap::new(),
+                retention,
+            },
         );
-        Ok(upload_id)
+        Ok(CreatedUpload {
+            upload_id,
+            retention,
+        })
     }
 
     async fn upload_part(
@@ -569,6 +1256,32 @@ impl UploadBackend for MockBackend {
         part_number: u32,
         data: Bytes,
     ) -> Result<UploadedPart, VtopError> {
+        *self
+            .part_sends
+            .lock()
+            .unwrap()
+            .entry(part_number)
+            .or_default() += 1;
+        match self.take_part_fault(part_number) {
+            None => {}
+            Some(PartFault::Reset) => {
+                return Err(VtopError::Upload(format!(
+                    "mock upload_part {object_uri}#{part_number}: connection reset by peer"
+                )))
+            }
+            Some(PartFault::Throttled) => {
+                return Err(VtopError::UploadThrottled(format!(
+                    "mock upload_part {object_uri}#{part_number}: SlowDown (http 503)"
+                )))
+            }
+            Some(PartFault::SessionGone) => {
+                self.multiparts
+                    .lock()
+                    .unwrap()
+                    .remove(&(object_uri.to_owned(), upload_id.to_owned()));
+                return Err(no_such_upload(object_uri, upload_id));
+            }
+        }
         let uploaded = self.multipart_parts_uploaded.fetch_add(1, Ordering::SeqCst);
         let limit = self.multipart_fail_after_parts.load(Ordering::SeqCst);
         if uploaded >= limit {
@@ -579,11 +1292,7 @@ impl UploadBackend for MockBackend {
         let mut map = self.multiparts.lock().unwrap();
         let pending = map
             .get_mut(&(object_uri.to_owned(), upload_id.to_owned()))
-            .ok_or_else(|| {
-                VtopError::Upload(format!(
-                    "mock: unknown multipart upload {upload_id} for {object_uri}"
-                ))
-            })?;
+            .ok_or_else(|| no_such_upload(object_uri, upload_id))?;
         pending.parts.insert(part_number, data.to_vec());
         Ok(UploadedPart {
             part_number,
@@ -598,32 +1307,52 @@ impl UploadBackend for MockBackend {
         parts: &[UploadedPart],
     ) -> Result<StoredObject, VtopError> {
         let mut map = self.multiparts.lock().unwrap();
+        let key = (object_uri.to_owned(), upload_id.to_owned());
         let pending = map
-            .remove(&(object_uri.to_owned(), upload_id.to_owned()))
-            .ok_or_else(|| {
-                VtopError::Upload(format!(
-                    "mock: unknown multipart upload {upload_id} for {object_uri}"
-                ))
-            })?;
+            .get(&key)
+            .ok_or_else(|| no_such_upload(object_uri, upload_id))?;
+        // A complete S3 refuses leaves the upload and its parts in place
+        // (#668, review): only a successful one removes it.
+        let invalid_part = |n: u32| {
+            VtopError::UploadSessionGone(format!(
+                "mock complete_multipart_upload {object_uri}: InvalidPart (http 400): part {n} \
+                 of upload {upload_id} is not the part named"
+            ))
+        };
+        let mut left = self.complete_faults.load(Ordering::SeqCst);
+        while left > 0 {
+            match self.complete_faults.compare_exchange_weak(
+                left,
+                left - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return Err(invalid_part(1)),
+                Err(observed) => left = observed,
+            }
+        }
         let mut body = Vec::new();
         let mut ordered = parts.to_vec();
         ordered.sort_by_key(|p| p.part_number);
         for part in &ordered {
-            let bytes = pending.parts.get(&part.part_number).ok_or_else(|| {
-                VtopError::Upload(format!(
-                    "mock: missing part {} for multipart {upload_id}",
-                    part.part_number
-                ))
-            })?;
+            let bytes = pending
+                .parts
+                .get(&part.part_number)
+                .ok_or_else(|| invalid_part(part.part_number))?;
             body.extend_from_slice(bytes);
         }
+        let retention = pending.retention;
+        map.remove(&key);
         // A multipart completion records NO service SHA-256 (#482): S3
         // returns a composite with a part-count suffix, which the real
         // head-decoding rejects — this None IS that composite, as the
         // verify path experiences it.
-        let version_id = self.store_bytes(object_uri, body, None, None)?;
+        let version_id = self.store_bytes(object_uri, body, None, None, retention)?;
         Ok(StoredObject {
             version_id: Some(version_id),
+            // The multipart module reports the retention it recorded at
+            // create, as with the real backend.
+            retention: None,
         })
     }
 
@@ -635,12 +1364,30 @@ impl UploadBackend for MockBackend {
         if self.fail_abort {
             return Err(VtopError::Upload("mock: forced abort failure".into()));
         }
+        if self.hang_abort {
+            std::future::pending::<()>().await;
+        }
         self.multiparts
             .lock()
             .unwrap()
-            .remove(&(object_uri.to_owned(), upload_id.to_owned()));
-        Ok(())
+            .remove(&(object_uri.to_owned(), upload_id.to_owned()))
+            .map(|_| ())
+            .ok_or_else(|| no_such_upload(object_uri, upload_id))
     }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// What S3 answers for an upload id it does not hold (#668): `NoSuchUpload`.
+fn no_such_upload(object_uri: &str, upload_id: &str) -> VtopError {
+    VtopError::UploadSessionGone(format!(
+        "mock: multipart upload {upload_id} for {object_uri}: NoSuchUpload (http 404)"
+    ))
 }
 
 #[cfg(test)]

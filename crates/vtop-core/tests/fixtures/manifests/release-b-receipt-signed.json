@@ -1,0 +1,26 @@
+{
+  "protocol": "VTOP",
+  "receipt_version": "1",
+  "batch_id": "vtop-20261114T194849Z-_tmp_receipt-fixture-signed_input_log-b0-33-1655ba04",
+  "manifest": {
+    "uri": "s3://telemetry-data/tenant=default/source=_tmp_receipt-fixture-signed_input.log/format=raw/year=2026/month=11/day=14/hour=19/vtop-20261114T194849Z-_tmp_receipt-fixture-signed_input_log-b0-33-1655ba04.manifest.json",
+    "sha256": "2fa5f6c92ba72ae376d9071e17f63a44ba981f061ee080dcbf4c9b0fc95985f8"
+  },
+  "object": {
+    "uri": "s3://telemetry-data/tenant=default/source=_tmp_receipt-fixture-signed_input.log/format=raw/year=2026/month=11/day=14/hour=19/vtop-vtop-fixture-_tmp_receipt-fixture-signed_input_log-b0-33-i737984-20d254308e4025c0baec307882ecc87a.raw",
+    "size_bytes": 33,
+    "checksum_algorithm": "sha256",
+    "checksum": "20d254308e4025c0baec307882ecc87a21757e6b5104a356a73e37c3156b9871"
+  },
+  "verification": {
+    "class": "strong",
+    "method": "read_back"
+  },
+  "verified_at": "2026-11-14T19:48:49.975421305+00:00",
+  "verified_by": "vtop-fixture",
+  "origin": "engine",
+  "receipt": {
+    "sha256": "939c39658428b07f0683df337f06a4b48e7d30def041ce01b58e08a6742cac3e",
+    "mac": "74f7a1efec44e0c4217b6c3b216febb5403b36e8ee8403e4e87a553a9a42c9aa"
+  }
+}

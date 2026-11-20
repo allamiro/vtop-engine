@@ -3,6 +3,7 @@
 use crate::engine::Engine;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::{Path, PathBuf};
+use tracing::Instrument as _;
 use vtop_core::config::{StreamsConfig, VtopConfig};
 use vtop_core::errors::VtopError;
 use vtop_core::state_machine::BatchState;
@@ -74,6 +75,19 @@ pub enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Check a config file (and a `streams.yaml` beside it) without starting
+    /// anything: no state store, object store or source is contacted. Exits
+    /// non-zero only for an invalid config; a valid but risky setting, such
+    /// as `upload.require_strong_verification: false`, is printed as a
+    /// warning and still passes.
+    Validate {
+        #[arg(long)]
+        config: PathBuf,
+        /// Explain effective per-stream settings and their origin, without
+        /// resolving secrets or contacting any service.
+        #[arg(long)]
+        print_effective: bool,
+    },
     /// Apply state-store schema migrations with a deployment identity.
     Migrate {
         #[arg(long)]
@@ -100,6 +114,75 @@ pub enum Command {
         /// exporter's textfile collector).
         #[arg(long)]
         metrics_file: Option<PathBuf>,
+    },
+    /// Read committed objects back and verify them again (#628). For each
+    /// committed batch, in the ledger or in a prune digest: download the
+    /// manifest at its pinned version, check its self-hash and MAC and that
+    /// it binds to the ledger row, verify the object's stored content against
+    /// the manifest's digest, and check the manifest's current key still
+    /// holds the pinned version. Reports missing, mismatched, unauthenticated
+    /// and unreadable batches, and manifests from a newer release
+    /// (unsupported_version), and exits non-zero on any. Read-only; it can
+    /// run beside a live engine, bounded by the limits below.
+    Scrub {
+        #[arg(long)]
+        config: PathBuf,
+        /// Where prune digests are read from [default: as audit-coverage].
+        #[arg(long)]
+        digest_dir: Option<PathBuf>,
+        /// Batches checked at once.
+        #[arg(long, default_value_t = crate::scrub::DEFAULT_CONCURRENCY as u32,
+              value_parser = clap::value_parser!(u32).range(1..=256))]
+        concurrency: u32,
+        /// Start at most this many batches per second (fractions allowed, down
+        /// to one a day).
+        #[arg(long, value_parser = positive_rate)]
+        max_objects_per_sec: Option<f64>,
+        /// Read at most this many object bytes per second, by each object's
+        /// recorded size.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        max_bytes_per_sec: Option<u64>,
+        /// Check at most this many batches this run.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        limit: Option<u64>,
+        /// Resume after the batch this file names, and record progress in it
+        /// as each batch completes. With --limit, successive runs walk the
+        /// archive a slice at a time; the run that reaches the end completes
+        /// the pass and the next one starts again from the beginning.
+        #[arg(long, conflicts_with = "sample")]
+        cursor_file: Option<PathBuf>,
+        /// Check this many batches chosen at random instead of walking in
+        /// order.
+        #[arg(long, conflicts_with = "limit",
+              value_parser = clap::value_parser!(u64).range(1..))]
+        sample: Option<u64>,
+        /// The sample's seed (random when not given; printed either way).
+        #[arg(long, requires = "sample")]
+        seed: Option<u64>,
+        /// Also write the results as a Prometheus text file (for a node
+        /// exporter's textfile collector). Totals carry forward from the file
+        /// it replaces.
+        #[arg(long)]
+        metrics_file: Option<PathBuf>,
+        /// Also read each batch's S3 Object Lock retention (object and
+        /// pinned manifest) and expect the mode `upload.object_lock` sets.
+        /// Reports locked, elapsed (an ended retention, not a finding),
+        /// missing and mode_mismatch (findings). Needs `upload.object_lock`
+        /// in the config, and `s3:GetObjectRetention` on the bucket. When
+        /// receipts are checked, also reads each existing verification
+        /// receipt's retention at its key (one more request per receipt),
+        /// reported apart from the batch's.
+        #[arg(long)]
+        check_retention: bool,
+        /// Check each batch's verification receipt (#671), and report a
+        /// missing one as a finding. Receipts are checked without this flag
+        /// when the config sets `manifest.verification_receipts`, and then a
+        /// missing one (such as a batch archived before receipts were
+        /// enabled) is counted, not a finding. With --check-retention, each
+        /// existing receipt's retention is read too. Read-only: the scrub
+        /// writes no receipt.
+        #[arg(long)]
+        require_receipts: bool,
     },
     /// Incrementally delete old SOURCE_COMMITTED ledger rows (#128). The
     /// newest committed row per source path always survives, so recovery
@@ -165,6 +248,12 @@ pub enum Command {
         #[command(subcommand)]
         command: crate::tier_tools::TierCommand,
     },
+    /// Read the audit trail (#694): who changed engine or cluster state,
+    /// when, from where, and what changed. See docs/operate/auditing.md.
+    Audit {
+        #[command(subcommand)]
+        command: crate::audit::AuditCommand,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -195,8 +284,14 @@ impl From<SourceKind> for SourceType {
 /// JSON is selected by `--json` OR `VTOP_LOG_FORMAT=json`. The encoding rules
 /// and the reasoning behind them live in [`vtop_observe::logging`], shared with
 /// the cluster nodes so engine and node lines land in Loki with one shape.
-pub fn init_tracing(level: &str, json: bool) {
-    vtop_observe::logging::init(level, json);
+///
+/// OpenTelemetry export (traces and metrics over OTLP) is installed beside
+/// the logs when `OTEL_EXPORTER_OTLP_ENDPOINT` (or a per-signal variable) is
+/// set, and not otherwise; see [`crate::otel`]. A setting that cannot be
+/// honoured is an error naming the variable. [`dispatch`] flushes export
+/// before the process exits.
+pub fn init_tracing(level: &str, json: bool, instance: Option<&str>) -> Result<(), VtopError> {
+    crate::otel::init_tracing(level, json, instance)
 }
 
 fn load(config: &Path) -> Result<(VtopConfig, StreamsConfig), VtopError> {
@@ -208,7 +303,101 @@ fn load(config: &Path) -> Result<(VtopConfig, StreamsConfig), VtopError> {
     } else {
         StreamsConfig { streams: vec![] }
     };
+    streams.validate(&cfg)?;
     Ok((cfg, streams))
+}
+
+/// The effective OpenTelemetry settings (#683), from the environment. Each
+/// endpoint is shown as host and path only; headers are shown as set or not,
+/// never their values.
+fn effective_otel_lines(settings: &vtop_observe::otel::Settings) -> Vec<(&'static str, String)> {
+    use vtop_observe::otel::{endpoint_display, Settings};
+    match settings {
+        Settings::Off(reason) => vec![("export", format!("off ({reason})"))],
+        Settings::On(export) => {
+            let signal = |s: &Option<vtop_observe::otel::Signal>| {
+                s.as_ref()
+                    .map_or_else(|| "off".to_owned(), |s| endpoint_display(&s.endpoint))
+            };
+            let headers = |s: &Option<vtop_observe::otel::Signal>| {
+                s.as_ref().map_or("none", |s| {
+                    if s.headers.is_empty() {
+                        "none"
+                    } else {
+                        "set (values not shown)"
+                    }
+                })
+            };
+            vec![
+                ("export", "on".to_owned()),
+                ("traces", signal(&export.traces)),
+                ("metrics", signal(&export.metrics)),
+                ("protocol", vtop_observe::otel::PROTOCOL.to_owned()),
+                ("sampler", export.sampler.describe()),
+                ("service_name", export.service_name.clone()),
+                ("traces_headers", headers(&export.traces).to_owned()),
+                ("metrics_headers", headers(&export.metrics).to_owned()),
+                ("queue_size", export.queue.max_queue.to_string()),
+                (
+                    "metric_interval_ms",
+                    export.metric_interval.as_millis().to_string(),
+                ),
+            ]
+        }
+    }
+}
+
+fn print_effective_otel(settings: &vtop_observe::otel::Settings) {
+    println!("opentelemetry:");
+    for (key, value) in effective_otel_lines(settings) {
+        println!("  {key}: {value}");
+    }
+}
+
+fn effective_otel_json(settings: &vtop_observe::otel::Settings) -> serde_json::Value {
+    serde_json::Value::Object(
+        effective_otel_lines(settings)
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), serde_json::Value::String(v)))
+            .collect(),
+    )
+}
+
+/// Render only the dedicated allowlist; never walk the configuration model.
+fn print_effective_block(
+    name: &str,
+    stream: &vtop_core::effective_config::EffectiveStream,
+) -> Result<(), VtopError> {
+    println!("{name}:");
+    let value = serde_json::to_value(stream)?;
+    if let Some(fields) = value.as_object() {
+        for (key, setting) in fields {
+            let value = &setting["value"];
+            // Strings bare, except an empty one, which would otherwise read
+            // as a missing value; anything else as its JSON literal.
+            let rendered = match value.as_str() {
+                Some("") => "\"\"".to_owned(),
+                Some(text) => text.to_owned(),
+                None => value.to_string(),
+            };
+            let origin = setting["origin"].as_str().unwrap_or("built-in default");
+            println!("  {key}: {rendered} ({origin})");
+        }
+    }
+    Ok(())
+}
+
+/// A rate that is a finite number above zero.
+/// An object rate: finite, and at least one a day (a slower rate's interval
+/// would exceed the pacer's one-day cap anyway, so it is refused here rather
+/// than silently raised).
+fn positive_rate(value: &str) -> Result<f64, String> {
+    const MIN: f64 = 1.0 / 86_400.0;
+    match value.parse::<f64>() {
+        Ok(rate) if rate.is_finite() && rate >= MIN => Ok(rate),
+        Ok(_) => Err(format!("must be a number of at least {MIN} (one a day)")),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 fn print_receipts(file: &Path, json: bool) -> i32 {
@@ -249,6 +438,9 @@ fn print_receipts(file: &Path, json: bool) -> i32 {
 
 /// Dispatch a parsed CLI invocation. Returns a process exit code.
 pub async fn dispatch(cli: Cli) -> i32 {
+    // A secret file accepted under the override leaves an audit record
+    // (#733), whichever command read it.
+    vtop_core::secret_file::set_override_hook(crate::audit::record_secret_override);
     // Segment tools are synchronous, config-free, and use their own exit-code
     // contract (see segment_tools), so they bypass the engine dispatch path.
     if let Command::Receipt { file } = &cli.command {
@@ -256,6 +448,28 @@ pub async fn dispatch(cli: Cli) -> i32 {
     }
     if let Command::Segment { command } = &cli.command {
         return crate::segment_tools::run(command, cli.json);
+    }
+    if let Command::Audit { command } = cli.command {
+        // A log stream (WARN and above unless --log-level says otherwise),
+        // so a secret file accepted under the override while the ledger is
+        // opened is announced here too (#733).
+        vtop_observe::logging::init(cli.log_level.as_deref().unwrap_or("warn"), cli.json);
+        return crate::audit::run(command, cli.json).await;
+    }
+    // The cluster and node clients write audit records of the commands they
+    // send (#694): their log stream (WARN and above unless --log-level says
+    // otherwise; audit records always) and the audit file.
+    if matches!(
+        cli.command,
+        Command::Meta { .. } | Command::Node { .. } | Command::Tier { .. }
+    ) {
+        vtop_observe::logging::init(cli.log_level.as_deref().unwrap_or("warn"), cli.json);
+        // No engine config, so no override: the default rule (#733).
+        if let Err(error) = crate::audit::init_sink(&vtop_core::secret_file::SecretPolicy::strict())
+        {
+            eprintln!("error: {error}");
+            return 1;
+        }
     }
     // Meta admin tools talk to the VTPM admin endpoint; they bypass the
     // archive engine entirely.
@@ -273,7 +487,10 @@ pub async fn dispatch(cli: Cli) -> i32 {
     if let Command::Tier { command } = cli.command {
         return crate::tier_tools::run(command, cli.json).await;
     }
-    match run_command(&cli).await {
+    // Boxed: `run_command` holds every command's future, the engine's whole
+    // cycle among them, and a debug build polled it on a test thread's
+    // stack until that overflowed (#626 grew the cycle a little more).
+    let code = match Box::pin(run_command(&cli)).await {
         Ok(()) => 0,
         Err(e) => {
             // Errors are reported on stderr without leaking secrets.
@@ -281,7 +498,11 @@ pub async fn dispatch(cli: Cli) -> i32 {
             eprintln!("error: {e}");
             1
         }
-    }
+    };
+    // The last spans of a stop (the shutdown flush's batches) are still
+    // queued; send them before exiting, within a bounded wait (#683).
+    crate::otel::shutdown().await;
+    code
 }
 
 async fn run_command(cli: &Cli) -> Result<(), VtopError> {
@@ -291,12 +512,18 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             init_tracing(
                 cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
                 cli.json,
-            );
+                Some(&cfg.engine.name),
+            )?;
             // Metrics are opt-in via VTOP_METRICS_ADDR and only for the
             // long-running `run` action: one-shot commands would expose a port
             // for a few milliseconds and never be scraped. Failure to start is
             // logged, never fatal - telemetry must not block archiving.
+            // A set but unwritable audit file stops the engine here, naming
+            // the path (#694).
+            // Metrics first (#733): opening the audit file can announce an
+            // override, and its count must land in the registry.
             crate::metrics_server::maybe_start().await;
+            crate::audit::init_sink(&cfg.secret_policy())?;
             let mut engine = Engine::new_exclusive(cfg, streams).await?;
             engine.run().await
         }
@@ -305,7 +532,11 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             init_tracing(
                 cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
                 cli.json,
-            );
+                Some(&cfg.engine.name),
+            )?;
+            // Before any key or ledger file is read, so a file accepted
+            // under the override is recorded in the audit file too (#733).
+            crate::audit::init_sink(&cfg.secret_policy())?;
             let engine = Engine::new(cfg, streams).await?;
             let sources = engine.discover().await?;
             if cli.json {
@@ -333,7 +564,11 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             init_tracing(
                 cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
                 cli.json,
-            );
+                Some(&cfg.engine.name),
+            )?;
+            // Before any key or ledger file is read, so a file accepted
+            // under the override is recorded in the audit file too (#733).
+            crate::audit::init_sink(&cfg.secret_policy())?;
             let mut engine = Engine::new_exclusive(cfg, streams).await?;
             engine.recover().await?;
             let outcomes = engine.process_once((*source).into()).await?;
@@ -372,32 +607,87 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             init_tracing(
                 cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
                 cli.json,
-            );
+                Some(&cfg.engine.name),
+            )?;
+            crate::audit::init_sink(&cfg.secret_policy())?;
+            let engine_name = cfg.engine.name.clone();
+            let audit = crate::audit::LedgerAudit {
+                command: "replay",
+                keyring: crate::audit::ledger_keyring(&cfg, "replay")?,
+            };
             let mut engine = Engine::new_exclusive(cfg, streams).await?;
-            if let Some(id) = batch_id {
-                match engine.store.get_batch(id).await? {
-                    Some(rec) => println!(
-                        "batch {} is in state {} — recovery will {}",
-                        id,
-                        rec.state,
-                        describe_recovery(rec.state)
-                    ),
-                    None => return Err(VtopError::NotFound(format!("batch {id}"))),
+            let span = tracing::info_span!("replay");
+            async {
+                if let Some(id) = batch_id {
+                    match engine.store.get_batch(id).await? {
+                        Some(rec) => println!(
+                            "batch {} is in state {} — recovery will {}",
+                            id,
+                            rec.state,
+                            describe_recovery(rec.state)
+                        ),
+                        None => return Err(VtopError::NotFound(format!("batch {id}"))),
+                    }
                 }
+                // Recorded before recovery moves a single row, and recovery is
+                // refused when the record cannot be written (#694).
+                // The ledger, whatever --batch-id names: recovery covers every
+                // incomplete batch, and --batch-id only prints that one's
+                // state (review of #705).
+                let target = vtop_observe::audit::Target::new("ledger", None);
+                let mut attempt = crate::audit::ledger_attempt(
+                    vtop_observe::audit::Action::LedgerReplay,
+                    target,
+                    &engine_name,
+                );
+                if let Some(id) = batch_id {
+                    attempt = attempt.param("batch_id", id);
+                }
+                audit.attempt(Some(engine.store.as_ref()), &attempt).await?;
+                let summary = match engine.recover().await {
+                    Ok(summary) => summary,
+                    Err(error) => {
+                        let failed = attempt
+                            .terminal(vtop_observe::audit::Outcome::Failure)
+                            .reason(&error);
+                        if let Err(unrecorded) =
+                            audit.finish(Some(engine.store.as_ref()), &failed).await
+                        {
+                            eprintln!("error: {unrecorded}");
+                        }
+                        return Err(error);
+                    }
+                };
+                let done = attempt
+                    .terminal(vtop_observe::audit::Outcome::Success)
+                    .after("committed", summary.committed)
+                    .after("replay_required", summary.replay_required)
+                    .after("superseded", summary.superseded)
+                    .after("still_pending", summary.still_pending);
+                println!(
+                    "recovery complete: committed={} replay_required={} superseded={} \
+                     still_pending={}; audit record {}",
+                    summary.committed,
+                    summary.replay_required,
+                    summary.superseded,
+                    summary.still_pending,
+                    done.audit_id
+                );
+                audit.finish(Some(engine.store.as_ref()), &done).await
             }
-            let summary = engine.recover().await?;
-            println!(
-                "recovery complete: committed={} replay_required={} still_pending={}",
-                summary.committed, summary.replay_required, summary.still_pending
-            );
-            Ok(())
+            .instrument(span)
+            .await
         }
         Command::Status { config } => {
             let (cfg, streams) = load(config)?;
             init_tracing(
                 cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
                 cli.json,
-            );
+                Some(&cfg.engine.name),
+            )?;
+            // Before any key or ledger file is read, so a file accepted
+            // under the override is recorded in the audit file too (#733).
+            crate::audit::init_sink(&cfg.secret_policy())?;
             let engine = Engine::new(cfg, streams).await?;
             let batches = engine.store.list_batches().await?;
             let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
@@ -419,7 +709,11 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             init_tracing(
                 cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
                 cli.json,
-            );
+                Some(&cfg.engine.name),
+            )?;
+            // Before any key or ledger file is read, so a file accepted
+            // under the override is recorded in the audit file too (#733).
+            crate::audit::init_sink(&cfg.secret_policy())?;
             let engine = Engine::new(cfg, streams).await?;
             let batches = engine.store.list_batches().await?;
             if cli.json {
@@ -456,13 +750,17 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             init_tracing(
                 cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
                 cli.json,
-            );
+                Some(&cfg.engine.name),
+            )?;
+            // Before any key or ledger file is read, so a file accepted
+            // under the override is recorded in the audit file too (#733).
+            crate::audit::init_sink(&cfg.secret_policy())?;
             let engine = Engine::new(cfg, streams).await?;
             let report = verify_manifest_deep(
                 engine.store.as_ref(),
                 engine.backend.as_ref(),
                 manifest,
-                engine.manifest_mac_key(),
+                engine.manifest_keyring(),
             )
             .await?;
             if cli.json {
@@ -480,29 +778,158 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 )))
             }
         }
+        Command::Validate {
+            config,
+            print_effective,
+        } => {
+            // `load` parses and validates both files; an error is the
+            // non-zero exit. Warnings never fail the check (#629): each is a
+            // documented opt-out, and refusing it here would only push
+            // operators to skip the check.
+            let (cfg, streams) = load(config)?;
+            // The OpenTelemetry variables are part of the deployment's
+            // configuration too (#683): one the engine would refuse at
+            // startup fails the check here, naming the variable.
+            let otel = vtop_observe::otel::settings_from_env(crate::otel::SERVICE_NAME)
+                .map_err(|e| VtopError::Config(format!("OpenTelemetry: {e}")))?;
+            // The files the engine would refuse for their permissions
+            // (#733), all of them at once: the same check, without reading
+            // any file, announcing anything or writing an audit record.
+            let mut secret_files = cfg.secret_files();
+            secret_files.extend(crate::audit::audit_file_from_env());
+            let permissions =
+                vtop_core::secret_file::inspect_all(&secret_files, &cfg.secret_policy());
+            if let Some(refused) = permissions.refusal_message() {
+                return Err(VtopError::Config(refused));
+            }
+            let mut warnings = streams.warnings(&cfg);
+            warnings.extend(
+                permissions
+                    .overrides
+                    .iter()
+                    .map(|accepted| accepted.validate_warning()),
+            );
+            if *print_effective {
+                let effective =
+                    vtop_core::effective_config::effective_streams(&cfg, Some(&streams));
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"status": "ok", "warnings": warnings, "effective_version": 1, "effective": effective, "opentelemetry": effective_otel_json(&otel)})
+                    );
+                } else {
+                    for warning in &warnings {
+                        println!("WARNING: {warning}");
+                    }
+                    for shadowed in &effective.shadowed {
+                        println!(
+                            "WARNING: streams[{}] repeats source_name {}; the engine applies only \
+                             the first entry with that name, so this one is never used",
+                            shadowed.index, shadowed.source_name
+                        );
+                    }
+                    println!("effective_version: 1");
+                    print_effective_block("default", &effective.default)?;
+                    for stream in &effective.streams {
+                        print_effective_block(
+                            &format!("stream {}", stream.source_name.value),
+                            stream,
+                        )?;
+                    }
+                    print_effective_otel(&otel);
+                }
+                return Ok(());
+            }
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"status": "ok", "warnings": warnings})
+                );
+            } else {
+                for warning in &warnings {
+                    println!("WARNING: {warning}");
+                }
+                println!(
+                    "{}: config is valid ({} warning(s))",
+                    config.display(),
+                    warnings.len()
+                );
+            }
+            Ok(())
+        }
         Command::Migrate { config } => {
             let cfg = VtopConfig::from_path(config)?;
             cfg.validate()?;
             init_tracing(
                 cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
                 cli.json,
-            );
-            let state_store = cfg.engine.state_store.resolve()?;
+                Some(&cfg.engine.name),
+            )?;
+            crate::audit::init_sink(&cfg.secret_policy())?;
+            let state_store = cfg.resolve_state_store()?;
+            // Before the migration writes to it (#733).
+            crate::engine::check_sqlite_files(&cfg, &state_store)?;
             let backend = if state_store.is_postgres() {
                 "postgresql"
             } else {
                 "sqlite"
             };
-            vtop_state::migrate_state_store(state_store.expose_secret()).await?;
-            if cli.json {
-                println!(
-                    "{}",
-                    serde_json::json!({"status": "ok", "backend": backend})
-                );
-            } else {
-                println!("state-store migration complete ({backend})");
+            let audit = crate::audit::LedgerAudit {
+                command: "migrate",
+                keyring: crate::audit::ledger_keyring(&cfg, "migrate")?,
+            };
+            let span = tracing::info_span!("migrate");
+            async {
+                // The attempt goes to the log stream and the audit file
+                // only: the table it would also go to is what this command
+                // creates. The rows follow once it exists (#694).
+                let attempt = crate::audit::ledger_attempt(
+                    vtop_observe::audit::Action::LedgerMigrate,
+                    vtop_observe::audit::Target::new("ledger", None),
+                    &cfg.engine.name,
+                )
+                .param("backend", backend);
+                audit.attempt(None, &attempt).await?;
+                if let Err(error) =
+                    vtop_state::migrate_state_store(state_store.expose_secret()).await
+                {
+                    let failed = attempt
+                        .terminal(vtop_observe::audit::Outcome::Failure)
+                        .reason(&error);
+                    if let Err(unrecorded) = audit.finish(None, &failed).await {
+                        eprintln!("error: {unrecorded}");
+                    }
+                    return Err(error);
+                }
+                let done = attempt.terminal(vtop_observe::audit::Outcome::Success);
+                // Both rows, now that the table exists: with the migration
+                // identity, which may write it.
+                let store = crate::engine::connect_configured_store(&cfg, &state_store)
+                    .await
+                    .map_err(|e| {
+                        VtopError::Other(format!(
+                            "the migration completed, but its audit rows could not be written \
+                             (the state store did not open: {e}); the log stream (target \
+                             vtop::audit) holds them"
+                        ))
+                    })?;
+                audit.append_to_ledger(store.as_ref(), &attempt).await?;
+                audit.finish(Some(store.as_ref()), &done).await?;
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"status": "ok", "backend": backend, "audit_id": done.audit_id})
+                    );
+                } else {
+                    println!(
+                        "state-store migration complete ({backend}); audit record {}",
+                        done.audit_id
+                    );
+                }
+                Ok(())
             }
-            Ok(())
+            .instrument(span)
+            .await
         }
         Command::AuditCoverage {
             config,
@@ -514,10 +941,14 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             init_tracing(
                 cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
                 cli.json,
-            );
+                Some(&cfg.engine.name),
+            )?;
+            // Before any key or ledger file is read, so a file accepted
+            // under the override is recorded in the audit file too (#733).
+            crate::audit::init_sink(&cfg.secret_policy())?;
             let digest_dir = digest_dir
                 .clone()
-                .unwrap_or_else(|| crate::coverage::default_digest_dir(&cfg.engine));
+                .unwrap_or_else(|| crate::coverage::default_digest_dir(&cfg));
             // Read-only construction: an audit may run beside a live engine.
             let engine = Engine::new(cfg, streams).await?;
             let ledger = engine.store.list_batches().await?;
@@ -557,6 +988,194 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 ))
             }
         }
+        Command::Scrub {
+            config,
+            digest_dir,
+            concurrency,
+            max_objects_per_sec,
+            max_bytes_per_sec,
+            limit,
+            cursor_file,
+            sample,
+            seed,
+            metrics_file,
+            check_retention,
+            require_receipts,
+        } => {
+            let (cfg, streams) = load(config)?;
+            init_tracing(
+                cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
+                cli.json,
+                Some(&cfg.engine.name),
+            )?;
+            crate::audit::init_sink(&cfg.secret_policy())?;
+            let engine_name = cfg.engine.name.clone();
+            // Whether this run moved the cursor: what its audit record says.
+            let mut cursor_moved = false;
+            let scrubbed: Result<(), VtopError> = async {
+                let digest_dir = digest_dir
+                    .clone()
+                    .unwrap_or_else(|| crate::coverage::default_digest_dir(&cfg));
+                let retention_days = cfg.engine.ledger_retention_days;
+                let retention_mode =
+                    crate::object_lock::scrub_retention_mode(&cfg, *check_retention)?;
+                let check_receipts = cfg.manifest.verification_receipts || *require_receipts;
+                // Read-only construction, as for audit-coverage: a scrub may run
+                // beside a live engine.
+                let engine = Engine::new(cfg, streams).await?;
+                let ledger = engine.store.list_batches().await?;
+                let (digested, digest_files) = crate::coverage::read_digests(&digest_dir)?;
+                let digest_warning = crate::scrub::missing_digests_warning(
+                    retention_days,
+                    &digest_dir,
+                    digest_files,
+                );
+                if let Some(warning) = &digest_warning {
+                    tracing::warn!("{warning}");
+                }
+                let sources = crate::scrub::RowSources {
+                    ledger_rows: ledger.len(),
+                    digest_rows: digested.len(),
+                    digest_files,
+                };
+                let to_usize = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
+                let opts = crate::scrub::ScrubOptions {
+                    concurrency: *concurrency as usize,
+                    max_objects_per_sec: *max_objects_per_sec,
+                    max_bytes_per_sec: *max_bytes_per_sec,
+                    limit: limit.map(to_usize),
+                    cursor_file: cursor_file.clone(),
+                    sample: sample.map(to_usize),
+                    seed: *seed,
+                    check_retention: retention_mode,
+                    check_receipts,
+                    require_receipts: *require_receipts,
+                };
+                // The run's locks, from before anything it will replace is read
+                // until it has published or rolled back (review of #652): an
+                // overlapping run that published in between would otherwise be
+                // overwritten from this run's older snapshot. Held to the end of
+                // this arm.
+                let lock = crate::scrub::lock_run(cursor_file.as_deref(), metrics_file.as_deref())?;
+                // Read BEFORE the scrub, and only an absent file is a first run:
+                // the totals and last-success time carry forward from it, so a
+                // file that exists and cannot be read would otherwise be replaced
+                // with counters reset and a success time of "never" (review).
+                let previous = match metrics_file {
+                    Some(path) => match std::fs::read_to_string(path) {
+                        Ok(text) => Some(text),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(e) => {
+                            return Err(VtopError::Other(format!(
+                                "metrics file {} cannot be read ({e}); the scrub's totals carry \
+                             forward from it",
+                                path.display()
+                            )))
+                        }
+                    },
+                    None => None,
+                };
+                // Taken before the run moves the cursor: with --metrics-file, a run
+                // counts only once its metrics are published (review of #652).
+                let snapshot = match (cursor_file, metrics_file) {
+                    (Some(cursor), Some(_)) => Some(crate::scrub::CursorSnapshot::take(cursor)?),
+                    _ => None,
+                };
+                let mut report = engine
+                    .scrub_held(crate::scrub::committed_rows(ledger, digested), &opts, &lock)
+                    .await?;
+                report.sources = sources;
+                report.warnings.extend(digest_warning);
+                // The report first, so the findings reach stdout whatever happens
+                // to the metrics file.
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    for line in report.lines() {
+                        println!("{line}");
+                    }
+                }
+                if let Some(path) = metrics_file {
+                    let written = crate::coverage::write_textfile(
+                        path,
+                        &report
+                            .prometheus_text(previous.as_deref(), chrono::Utc::now().timestamp()),
+                    );
+                    if let Err(error) = written {
+                        // Unpublished, the run's findings are in no metric the
+                        // alerts read. Put the cursor back, so the next run checks
+                        // this slice again and publishes what it finds.
+                        let undone = match &snapshot {
+                            Some(snapshot) => match snapshot.restore(&lock) {
+                                Ok(()) => "; the cursor was put back, so the next run checks \
+                                       this slice again"
+                                    .to_string(),
+                                Err(e) => format!("; the cursor could NOT be put back ({e})"),
+                            },
+                            None => String::new(),
+                        };
+                        return Err(VtopError::Other(format!(
+                            "scrub metrics file {} could not be written ({error}){undone}",
+                            path.display()
+                        )));
+                    }
+                }
+                // Published (the report, and the metrics file when asked for):
+                // only now may the cursor pass this run's findings.
+                if let Some(pending) = report.pending_cursor.take() {
+                    pending.commit(&lock)?;
+                    cursor_moved = true;
+                }
+                drop(lock);
+                if report.passed {
+                    Ok(())
+                } else {
+                    Err(VtopError::Other(format!(
+                        "scrub FAILED: {} finding(s) (see the report above)",
+                        report.findings.len()
+                    )))
+                }
+            }
+            .await;
+            // A run that writes a cursor changes what the next run checks:
+            // its record says whether the cursor moved (#694). Not refused
+            // when the audit file fails: the scrub reads, it does not delete.
+            if let Some(cursor) = cursor_file {
+                // Success: the run completed, whether or not it found
+                // anything (a run with nothing left to check keeps the
+                // cursor where it is). Failure: it stopped on an error
+                // before it could move the cursor.
+                let outcome = if cursor_moved || scrubbed.is_ok() {
+                    vtop_observe::audit::Outcome::Success
+                } else {
+                    vtop_observe::audit::Outcome::Failure
+                };
+                let mut event = vtop_observe::audit::AuditEvent::new(
+                    vtop_observe::audit::Action::ScrubCursor,
+                    vtop_observe::audit::Stage::Local,
+                    vtop_observe::audit::Actor::local(),
+                    vtop_observe::audit::Target::new("cursor", Some(cursor.display().to_string())),
+                    outcome,
+                )
+                .engine(&engine_name)
+                .param("cursor_file", cursor.display())
+                .param("check_retention", check_retention)
+                .param("require_receipts", require_receipts)
+                .after("cursor_moved", cursor_moved)
+                .after("passed", scrubbed.is_ok());
+                if let Some(limit) = limit {
+                    event = event.param("limit", limit);
+                }
+                if let Some(path) = metrics_file {
+                    event = event.param("metrics_file", path.display());
+                }
+                if let Err(error) = &scrubbed {
+                    event = event.reason(error);
+                }
+                crate::audit::record_best_effort(&event);
+            }
+            scrubbed
+        }
         Command::PruneLedger {
             config,
             digest_dir,
@@ -568,39 +1187,90 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             init_tracing(
                 cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
                 cli.json,
-            );
-            let state_store = cfg.engine.state_store.resolve()?;
+                Some(&cfg.engine.name),
+            )?;
+            crate::audit::init_sink(&cfg.secret_policy())?;
+            let state_store = cfg.resolve_state_store()?;
+            let audit = crate::audit::LedgerAudit {
+                command: "prune-ledger",
+                keyring: crate::audit::ledger_keyring(&cfg, "prune-ledger")?,
+            };
             // The configured bound, as the engine uses (review of #568).
-            let store = crate::engine::connect_configured_store(&cfg.engine, &state_store).await?;
+            let store = crate::engine::connect_configured_store(&cfg, &state_store).await?;
             let cutoff = (chrono::Utc::now() - chrono::Duration::days(i64::from(*older_than_days)))
                 .to_rfc3339();
             let digest_dir = digest_dir
                 .clone()
-                .unwrap_or_else(|| crate::coverage::default_digest_dir(&cfg.engine));
-            let (deleted, digest) =
-                crate::coverage::prune_with_digest(store.as_ref(), &cutoff, *limit, &digest_dir)
-                    .await?;
-            if cli.json {
-                println!(
-                    "{}",
-                    serde_json::json!({"status": "ok", "deleted": deleted, "digest": digest})
-                );
-            } else {
-                match digest {
-                    Some(path) => println!(
-                        "pruned {deleted} committed ledger row(s); digest {}",
-                        path.display()
-                    ),
-                    None => println!("pruned 0 committed ledger row(s)"),
+                .unwrap_or_else(|| crate::coverage::default_digest_dir(&cfg));
+            let span = tracing::info_span!("prune_ledger");
+            async {
+                // Recorded before a row is deleted; the prune is refused when
+                // the record cannot be written (#694).
+                let attempt = crate::audit::ledger_attempt(
+                    vtop_observe::audit::Action::LedgerPrune,
+                    vtop_observe::audit::Target::new("ledger", None),
+                    &cfg.engine.name,
+                )
+                .param("older_than_days", older_than_days)
+                .param("limit", limit)
+                .param("digest_dir", digest_dir.display());
+                audit.attempt(Some(store.as_ref()), &attempt).await?;
+                let (deleted, digest) = match crate::coverage::prune_with_digest(
+                    store.as_ref(),
+                    &cutoff,
+                    *limit,
+                    &digest_dir,
+                )
+                .await
+                {
+                    Ok(pruned) => pruned,
+                    Err(error) => {
+                        let failed = attempt
+                            .terminal(vtop_observe::audit::Outcome::Failure)
+                            .reason(&error);
+                        if let Err(unrecorded) = audit.finish(Some(store.as_ref()), &failed).await
+                        {
+                            eprintln!("error: {unrecorded}");
+                        }
+                        return Err(error);
+                    }
+                };
+                let mut done = attempt
+                    .terminal(vtop_observe::audit::Outcome::Success)
+                    .after("deleted", deleted);
+                if let Some(path) = &digest {
+                    done = done.after("digest", path.display().to_string());
                 }
+                audit.finish(Some(store.as_ref()), &done).await?;
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"status": "ok", "deleted": deleted, "digest": digest, "audit_id": done.audit_id})
+                    );
+                } else {
+                    match digest {
+                        Some(path) => println!(
+                            "pruned {deleted} committed ledger row(s); digest {}; audit record {}",
+                            path.display(),
+                            done.audit_id
+                        ),
+                        None => println!(
+                            "pruned 0 committed ledger row(s); audit record {}",
+                            done.audit_id
+                        ),
+                    }
+                }
+                Ok(())
             }
-            Ok(())
+            .instrument(span)
+            .await
         }
         Command::Receipt { .. } => unreachable!("dispatched before run_command"),
         Command::Segment { .. } => unreachable!("dispatched before run_command"),
         Command::Meta { .. } => unreachable!("dispatched before run_command"),
         Command::Node { .. } => unreachable!("dispatched before run_command"),
         Command::Tier { .. } => unreachable!("dispatched before run_command"),
+        Command::Audit { .. } => unreachable!("dispatched before run_command"),
     }
 }
 
@@ -628,7 +1298,7 @@ pub async fn verify_manifest_deep(
     store: &dyn vtop_state::StateStore,
     backend: &dyn vtop_upload::UploadBackend,
     manifest_uri: &str,
-    manifest_mac_key: Option<&vtop_core::manifest::ManifestMacKey>,
+    keyring: &vtop_core::manifest::ManifestKeyring,
 ) -> Result<VerifyReport, VtopError> {
     use vtop_core::checksum::digest_bytes;
     use vtop_core::types::ChecksumAlgorithm;
@@ -640,13 +1310,26 @@ pub async fn verify_manifest_deep(
     let manifest_bytes = backend
         .get_object_bounded(manifest_uri, vtop_core::manifest::MAX_MANIFEST_BYTES)
         .await?;
-    let parsed: vtop_core::manifest::VtopManifest = serde_json::from_slice(&manifest_bytes)
-        .map_err(|e| VtopError::Other(format!("manifest {manifest_uri} does not parse: {e}")))?;
+    // The version is checked before anything else: a manifest from a newer
+    // release is reported as that, never as a failed self-hash (#671).
+    let parsed = match vtop_core::manifest::ParsedManifest::from_slice(&manifest_bytes) {
+        Ok(parsed) => parsed,
+        // Standalone, with no ledger to bind the bytes to, the claim is all
+        // there is: reported as a claim this build cannot authenticate.
+        Err(e @ VtopError::UnsupportedManifestVersion { .. }) => {
+            return Err(e.at_manifest_uri(manifest_uri))
+        }
+        Err(e) => {
+            return Err(VtopError::Other(format!(
+                "manifest {manifest_uri} does not parse: {e}"
+            )))
+        }
+    };
     lines.push(format!(
         "manifest        : {} ({} bytes, batch {})",
         manifest_uri,
         manifest_bytes.len(),
-        parsed.batch_id
+        parsed.fields().batch_id
     ));
 
     // 2. Self-hash: is the manifest itself intact?
@@ -664,25 +1347,52 @@ pub async fn verify_manifest_deep(
     // A configured key upgrades the verdict from corruption detection to
     // authentication and deliberately rejects pre-key manifests. Without a
     // key, retain legacy behavior but do not claim an unverified MAC is valid.
-    let authentication_ok = parsed.verify_authentication(manifest_mac_key).is_ok();
+    //
+    // With a keyring (#685) the key is the one the manifest names, and the
+    // line says which, or why none could be used. The reason is the
+    // keyring's own text: it names key ids, never key material.
+    let authentication = parsed.authenticate(keyring);
+    authentication.count();
+    // The bounded label of the key that verified it: a configured id, or
+    // `none` for the manifest_mac_key_env key. Never the manifest's own id.
+    let verified_with = authentication
+        .key
+        .as_ref()
+        .filter(|k| k.result == vtop_core::manifest::KeyResult::Ok)
+        .map(|k| k.key_id.clone());
+    let authentication_ok = authentication.is_ok();
     failed |= !authentication_ok;
-    let authentication_status = match (manifest_mac_key, parsed.manifest.mac.as_deref()) {
-        (Some(_), _) if authentication_ok => "OK (keyed BLAKE3)".to_string(),
-        (Some(_), _) => "FAILED (MAC missing or invalid)".to_string(),
-        (None, Some(_)) => "PRESENT (not checked: no key configured)".to_string(),
-        (None, None) => "NOT CONFIGURED (self-hash only)".to_string(),
+    // The manifest_mac_key_env key keeps its wording from before key ids.
+    let single_key = keyring.is_configured() && keyring.active_id().is_none();
+    let names_an_id = parsed.fields().manifest.mac_key_id.is_some();
+    let authentication_status = match (
+        keyring.is_configured(),
+        parsed.fields().manifest.mac.as_deref(),
+        authentication.result,
+    ) {
+        (true, _, Ok(())) => match verified_with.as_deref() {
+            Some(label) if !single_key && names_an_id => {
+                format!("OK (keyed BLAKE3, key id {label})")
+            }
+            Some(label) if !single_key => format!("OK (keyed BLAKE3, legacy key {label})"),
+            _ => "OK (keyed BLAKE3)".to_string(),
+        },
+        (true, _, Err(VtopError::Manifest(why))) if !single_key => format!("FAILED ({why})"),
+        (true, _, Err(_)) => "FAILED (MAC missing or invalid)".to_string(),
+        (false, Some(_), _) => "PRESENT (not checked: no key configured)".to_string(),
+        (false, None, _) => "NOT CONFIGURED (self-hash only)".to_string(),
     };
     lines.push(format!("authentication  : {authentication_status}"));
 
     // 3. The stored object's actual content.
-    let object_bytes = backend.get_object(&parsed.object.uri).await?;
-    let size_ok = object_bytes.len() as u64 == parsed.object.size_bytes;
+    let object_bytes = backend.get_object(&parsed.fields().object.uri).await?;
+    let size_ok = object_bytes.len() as u64 == parsed.fields().object.size_bytes;
     failed |= !size_ok;
     lines.push(format!(
         "object size     : {} ({} bytes stored, {} expected)",
         if size_ok { "OK" } else { "FAILED" },
         object_bytes.len(),
-        parsed.object.size_bytes
+        parsed.fields().object.size_bytes
     ));
 
     // LIMITED is reserved for an EXPLICIT `none` algorithm (the operator chose
@@ -691,6 +1401,7 @@ pub async fn verify_manifest_deep(
     // algorithm with no recorded digest — is a hard failure: reporting it as
     // "limited" would hand a PASSED verdict to a same-sized replacement.
     let algo = parsed
+        .fields()
         .object
         .checksum_algorithm
         .parse::<ChecksumAlgorithm>();
@@ -703,21 +1414,25 @@ pub async fn verify_manifest_deep(
             failed = true;
             format!("FAILED (cannot verify content: {e})")
         }
-        (Ok(_), Some(actual)) if parsed.object.checksum.is_empty() => {
+        (Ok(_), Some(actual)) if parsed.fields().object.checksum.is_empty() => {
             failed = true;
             format!(
                 "FAILED (algorithm declared but no digest recorded; content hashes to {actual})"
             )
         }
         (Ok(_), Some(actual)) => {
-            let ok = actual.eq_ignore_ascii_case(&parsed.object.checksum);
+            let ok = actual.eq_ignore_ascii_case(&parsed.fields().object.checksum);
             failed |= !ok;
             if ok {
-                format!("OK ({} {})", parsed.object.checksum_algorithm, actual)
+                format!(
+                    "OK ({} {})",
+                    parsed.fields().object.checksum_algorithm,
+                    actual
+                )
             } else {
                 format!(
                     "FAILED (stored content hashes to {actual}, manifest says {})",
-                    parsed.object.checksum
+                    parsed.fields().object.checksum
                 )
             }
         }
@@ -726,7 +1441,7 @@ pub async fn verify_manifest_deep(
     lines.push(format!("object content  : {checksum_status}"));
 
     // 4. Ledger reconciliation.
-    let row = store.get_batch(&parsed.batch_id).await?;
+    let row = store.get_batch(&parsed.fields().batch_id).await?;
     let ledger_status = match &row {
         None => "ABSENT (not a failure: manifest may belong to another engine's store)".to_string(),
         Some(r) => {
@@ -758,11 +1473,12 @@ pub async fn verify_manifest_deep(
 
     let json = serde_json::json!({
         "manifest": manifest_uri,
-        "batch_id": parsed.batch_id,
-        "object_uri": parsed.object.uri,
+        "batch_id": parsed.fields().batch_id,
+        "object_uri": parsed.fields().object.uri,
         "self_hash_ok": self_hash_ok,
         "manifest_authentication": authentication_status,
-        "manifest_authentication_required": manifest_mac_key.is_some(),
+        "manifest_authentication_required": keyring.is_configured(),
+        "manifest_verified_with_key": verified_with,
         "object_size_ok": size_ok,
         "object_content": checksum_status,
         "ledger": ledger_status,
@@ -781,8 +1497,11 @@ fn describe_recovery(state: BatchState) -> &'static str {
     use vtop_core::replay::{next_recovery_action, RecoveryAction};
     match next_recovery_action(state) {
         RecoveryAction::RetrySourceCommit => "retry the source commit",
-        RecoveryAction::None => "do nothing (already committed)",
-        _ => "mark REPLAY_REQUIRED (source progress preserved)",
+        RecoveryAction::None => "do nothing (committed, or superseded by a later commit)",
+        _ => {
+            "mark REPLAY_REQUIRED (source progress preserved), or SUPERSEDED if its source \
+             has already committed past it"
+        }
     }
 }
 
@@ -823,6 +1542,50 @@ mod tests {
         match cli.command {
             Command::PruneLedger { limit, .. } => assert_eq!(limit, 500),
             other => panic!("parsed wrong command: {other:?}"),
+        }
+    }
+
+    /// The scrub's bounds are refused at parsing when they could not bound
+    /// anything (zero concurrency would never run a check; a zero or
+    /// negative rate never admits one), and a cursor walk and a random
+    /// sample are different runs, not one.
+    #[test]
+    fn scrub_rejects_bounds_that_bound_nothing_and_conflicting_modes() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["vtopctl", "scrub", "--config", "vtop.yaml"];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args)
+        };
+        match parse(&[]).unwrap().command {
+            Command::Scrub {
+                concurrency,
+                limit,
+                cursor_file,
+                sample,
+                ..
+            } => {
+                assert_eq!(concurrency as usize, crate::scrub::DEFAULT_CONCURRENCY);
+                assert!(limit.is_none() && cursor_file.is_none() && sample.is_none());
+            }
+            other => panic!("parsed wrong command: {other:?}"),
+        }
+        assert!(parse(&["--cursor-file", "c", "--limit", "500"]).is_ok());
+        assert!(parse(&["--sample", "10", "--seed", "7"]).is_ok());
+        assert!(parse(&["--max-objects-per-sec", "0.5"]).is_ok());
+        for bad in [
+            &["--concurrency", "0"][..],
+            &["--limit", "0"],
+            &["--sample", "0"],
+            &["--max-objects-per-sec", "0"],
+            &["--max-objects-per-sec", "-1"],
+            &["--max-objects-per-sec", "NaN"],
+            &["--max-objects-per-sec", "1e-300"],
+            &["--max-bytes-per-sec", "0"],
+            &["--sample", "5", "--cursor-file", "c"],
+            &["--sample", "5", "--limit", "5"],
+            &["--seed", "7"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?} must be refused");
         }
     }
 

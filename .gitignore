@@ -11,6 +11,8 @@
 
 # SQLite state files
 *.db
+# Ledger fixtures written by released binaries (#626) are test data.
+!crates/vtop-cli/tests/fixtures/**/*.db
 *.db-shm
 *.db-wal
 
@@ -24,3 +26,10 @@
 # cargo-mutants output
 mutants.out/
 mutants.out.old/
+
+# mkdocs build output (`mkdocs build` writes site/ by default)
+/site/
+
+# Python bytecode (mkdocs hooks import scripts/docs_hooks.py)
+__pycache__/
+*.pyc

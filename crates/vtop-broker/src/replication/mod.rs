@@ -26,6 +26,10 @@ pub mod fault;
 pub mod network;
 pub(crate) use network::REPLICA_LIMITS;
 pub mod transfer;
+pub mod version;
+
+#[cfg(test)]
+mod fence_race_tests;
 
 use crate::{
     storage_producer_id, BrokerError, BrokerResult, MetaFencingEpoch, MetaLeaseState,
@@ -44,10 +48,12 @@ pub use fault::{
     FaultInjectingReplicaSet, FollowerNetworkFault, NetworkFaultPlan, PendingDeliveryStats,
 };
 pub use network::{
-    address_now, FlowControlConfig, NetworkFollowerConfig, NetworkedReplicaSet, ReplicaPeerHandler,
-    ReplicaPeerServer, ReplicaStatusClient, ReplicaTlsMaterial,
+    address_now, FlowControlConfig, LeaderLineage, LeaderLineageSnapshot, NetworkFollowerConfig,
+    NetworkedReplicaSet, ReplicaPeerHandler, ReplicaPeerServer, ReplicaStatusClient,
+    ReplicaTlsMaterial,
 };
 pub use transfer::{LeaderSegmentTransferHandler, SegmentTransferClient, TransferredPrefix};
+pub use version::{ClusterFeatureLevel, PeerVersion, ReplicaVersionPolicy};
 
 /// Shared quorum-committed high-water mark for a range.
 ///
@@ -85,6 +91,18 @@ impl ClusterCommittedOffset {
     }
 }
 
+/// Followers whose durable acks, with the leader's own, make a write quorum
+/// of `replication_factor` replicas: a majority, less the leader.
+///
+/// One definition for the two places that must agree on it (#750): the
+/// fan-out stops waiting once this many followers have acked, and a newly
+/// built leader starts serving once this many replica streams are up.
+/// Waiting for more than this before serving is waiting for a stream a
+/// failover has, by definition, lost.
+pub fn write_quorum_followers(replication_factor: usize) -> usize {
+    (replication_factor / 2 + 1).saturating_sub(1)
+}
+
 /// Result of fanning a locally durable leader append out to followers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplicaQuorumResult {
@@ -102,6 +120,51 @@ impl ReplicaQuorumResult {
     /// Leader local durability counts as one ack.
     pub fn has_quorum(&self) -> bool {
         1 + self.follower_acks >= self.majority()
+    }
+}
+
+#[cfg(test)]
+mod write_quorum_tests {
+    use super::*;
+
+    /// The serving threshold and the ack threshold are the same number
+    /// (#750): exactly `write_quorum_followers(rf)` follower acks make a
+    /// quorum, and one fewer does not.
+    #[test]
+    fn the_write_quorum_is_the_number_of_acks_that_makes_a_quorum() {
+        for rf in 1..=7 {
+            let needed = write_quorum_followers(rf);
+            let at = ReplicaQuorumResult {
+                follower_acks: needed,
+                replication_factor: rf,
+            };
+            assert!(
+                at.has_quorum(),
+                "rf {rf}: {needed} follower acks must be a quorum"
+            );
+            if needed > 0 {
+                let below = ReplicaQuorumResult {
+                    follower_acks: needed - 1,
+                    replication_factor: rf,
+                };
+                assert!(
+                    !below.has_quorum(),
+                    "rf {rf}: {} acks must not be",
+                    needed - 1
+                );
+            }
+        }
+        assert_eq!(
+            write_quorum_followers(3),
+            1,
+            "three replicas: the leader and one peer"
+        );
+        assert_eq!(write_quorum_followers(5), 2);
+        assert_eq!(
+            write_quorum_followers(1),
+            0,
+            "a lone leader needs no stream"
+        );
     }
 }
 
@@ -203,7 +266,31 @@ pub struct InProcessFollower {
     /// Records a fence disputed but KEPT (#611): the epoch of that fence and
     /// the first offset in dispute. See [`KeptDispute`].
     kept_dispute: Mutex<Option<KeptDispute>>,
+    /// The newest mark a leader sent that passed the fencing check (#787).
+    /// [`Self::observe_hwm`] never shows a mark above local durability, so a
+    /// mark that arrives before the records under it (a fresh session sends
+    /// the current mark first, then the records the replica lacks) is shown
+    /// only up to what the replica held then. Each successful append shows
+    /// it again, through the same checks, so the records it covers become
+    /// visible without waiting for a new mark, which a quiet range never
+    /// sends.
+    last_mark: Mutex<Option<CommittedHwmUpdate>>,
+    /// Whether the journal holds a leader lineage the appends have not yet
+    /// caught up with (#640): the fast path that keeps a follower in steady
+    /// state from taking the journal lock on every append.
+    lineage_following: AtomicBool,
+    /// Runs between reading the high-water mark and installing a dispute
+    /// from it, so a unit test can land a concurrent mark exactly there.
+    #[cfg(test)]
+    before_dispute_install: Mutex<Option<TestHook>>,
+    /// Runs in `observe_hwm` after its settle and before its advance, so a
+    /// unit test can tell when a mark has passed its settle.
+    #[cfg(test)]
+    after_mark_settle: Mutex<Option<TestHook>>,
 }
+
+#[cfg(test)]
+type TestHook = Arc<dyn Fn() + Send + Sync>;
 
 /// A suffix a fence found in dispute and kept (#611), because the fencing
 /// caller could not prove that no quorum had acknowledged it.
@@ -326,7 +413,26 @@ impl InProcessFollower {
             online: AtomicBool::new(true),
             hold_fsync: AtomicBool::new(false),
             kept_dispute: Mutex::new(None),
+            last_mark: Mutex::new(None),
+            lineage_following: AtomicBool::new(false),
+            #[cfg(test)]
+            before_dispute_install: Mutex::new(None),
+            #[cfg(test)]
+            after_mark_settle: Mutex::new(None),
         })
+    }
+
+    /// Run a test hook. Cloned out of its slot first, so the slot's lock is
+    /// not held while the hook runs and a hook may touch its own slot.
+    #[cfg(test)]
+    fn run_test_hook(slot: &Mutex<Option<TestHook>>) {
+        let hook = slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     pub fn node_id(&self) -> Uuid {
@@ -376,20 +482,185 @@ impl InProcessFollower {
         // leader: `fetch_max` is what admits appends under the new epoch, so
         // recording after it can name a start above the first record that
         // epoch actually accepted.
+        //
+        // A replica holding the lineage of `epoch`'s leader (#640) files its
+        // tail by that lineage instead: the leader's own entries, which may
+        // begin above this tail. Only one without it records the epoch at
+        // its tail, which is right exactly when the tail is the leader's.
         if epoch > self.held_fencing_epoch.load(Ordering::SeqCst) {
             let next_offset = self.next_offset();
-            let mut guard = self
-                .fencing_epoch_journal
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(journal) = guard.as_mut() {
-                if journal.record_adoption(epoch, next_offset).is_err() {
-                    self.fencing_epoch_history_broken
-                        .store(true, Ordering::SeqCst);
+            if !self.follow_leader_lineage(epoch, next_offset) {
+                let mut guard = self
+                    .fencing_epoch_journal
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(journal) = guard.as_mut() {
+                    // Records already in the log under the lineage the
+                    // replica holds are filed by it first (#648 review): an
+                    // append group refused after its earlier members were
+                    // applied returned before following it, and the newer
+                    // epoch recorded at the tail below would seal them under
+                    // whatever the journal said.
+                    let adopted = journal
+                        .follow_held_leader_lineage(next_offset)
+                        .and_then(|_| journal.record_adoption(epoch, next_offset));
+                    if adopted.is_err() {
+                        self.fencing_epoch_history_broken
+                            .store(true, Ordering::SeqCst);
+                    }
                 }
             }
         }
         self.held_fencing_epoch.fetch_max(epoch, Ordering::SeqCst) < epoch
+    }
+
+    /// File this replica's records through `tail` under the lineage of
+    /// `epoch`'s leader, if it holds one (#640). Returns whether it did; a
+    /// journal that fails here is marked broken and also counts as done,
+    /// since nothing more may be recorded in it.
+    fn follow_leader_lineage(&self, epoch: u64, tail: u64) -> bool {
+        let mut guard = self
+            .fencing_epoch_journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(journal) = guard.as_mut() else {
+            return false;
+        };
+        match journal.follow_leader_lineage(epoch, tail) {
+            Ok(crate::fencing_epochs::LineageFollow::NotHeld) => {
+                self.lineage_following.store(false, Ordering::SeqCst);
+                false
+            }
+            Ok(crate::fencing_epochs::LineageFollow::Following { complete }) => {
+                self.lineage_following.store(!complete, Ordering::SeqCst);
+                true
+            }
+            Err(_) => {
+                self.fencing_epoch_history_broken
+                    .store(true, Ordering::SeqCst);
+                true
+            }
+        }
+    }
+
+    /// After a successful append under `epoch` that left the log at `tail`:
+    /// keep filing records under the leader's lineage while it has entries
+    /// the appends have not reached (#640). A single atomic load otherwise.
+    fn follow_leader_lineage_after_append(&self, epoch: u64, tail: u64) {
+        if self.lineage_following.load(Ordering::SeqCst) {
+            self.follow_leader_lineage(epoch, tail);
+        }
+    }
+
+    /// Take the fencing caller's history as the lineage of `epoch`'s leader
+    /// (#640), or hold it while a dispute is kept for `epoch`. Called with
+    /// the meta lock held, which every append holds too, so the tail read
+    /// here is the one the lineage is anchored at.
+    ///
+    /// A kept dispute means this replica holds records the caller does not
+    /// share. The lineage says who wrote the records the leader sends, not
+    /// those, so it waits for the dispute to settle (see
+    /// [`Self::settle_kept_dispute`]). It waits on disk, as the dispute does
+    /// since #635, so a restart between the fence and the settlement changes
+    /// nothing; and it is never followed while it waits, so the kept records
+    /// are never filed under the leader's entries.
+    fn take_leader_lineage_locked(&self, epoch: u64, leader: &[crate::fencing_epochs::EpochStart]) {
+        if self.held_fencing_epoch() != epoch {
+            // A newer grant overtook the fence; its own fence brings its own
+            // history.
+            return;
+        }
+        let (tail, base, disputed) = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let disputed = self
+                .kept_dispute
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some_and(|dispute| dispute.epoch == epoch);
+            (
+                state.segment.next_offset(),
+                state.segment.base_offset(),
+                disputed,
+            )
+        };
+        let mut guard = self
+            .fencing_epoch_journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(journal) = guard.as_mut() else {
+            return;
+        };
+        if self.fencing_epoch_history_broken.load(Ordering::SeqCst) {
+            return;
+        }
+        let outcome = if disputed {
+            journal
+                .hold_leader_lineage_until_settled(epoch, leader)
+                .map(|_| None)
+        } else {
+            journal
+                .take_leader_lineage(epoch, leader, tail, base)
+                .and_then(|taken| {
+                    if taken {
+                        journal.follow_leader_lineage(epoch, tail).map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                })
+        };
+        match outcome {
+            Ok(Some(crate::fencing_epochs::LineageFollow::Following { complete })) => {
+                self.lineage_following.store(!complete, Ordering::SeqCst);
+            }
+            Ok(_) => {}
+            Err(_) => {
+                self.fencing_epoch_history_broken
+                    .store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Take the history held for `epoch` while its fence's dispute was
+    /// pending, now that the dispute is settled (#640). Called with the meta
+    /// lock held, after the settlement's truncation retired the dispute, so
+    /// the tail it reads is the dispute's start and every record from there
+    /// on comes from `epoch`'s leader. A no-op when none is held.
+    fn take_waiting_leader_lineage_locked(&self, epoch: u64) {
+        let leader = self
+            .fencing_epoch_journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|journal| journal.waiting_leader_lineage(epoch));
+        if let Some(leader) = leader {
+            self.take_leader_lineage_locked(epoch, &leader);
+        }
+    }
+
+    /// Drop a history held for an older epoch's dispute, retired by a newer
+    /// fence or this node's own candidate fence rather than settled (#640,
+    /// the retirement rules of #635). Lock order: state, dispute, journal.
+    ///
+    /// A failed write is not fatal: a history left waiting for an older
+    /// epoch is never followed (appends under that epoch can no longer
+    /// arrive), and the open takes it only through the agreement check every
+    /// lineage passes. A torn sidecar reads as none.
+    fn drop_waiting_leader_lineage_before(&self, epoch: u64) {
+        let mut guard = self
+            .fencing_epoch_journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(journal) = guard.as_mut() {
+            if let Some(waiting) = journal
+                .waiting_leader_lineage_epoch()
+                .filter(|waiting| *waiting < epoch)
+            {
+                let _ = journal.drop_leader_lineage(waiting);
+            }
+        }
     }
 
     /// Bound this replica's disk in bytes; `None` disables retention (#290).
@@ -485,6 +756,52 @@ impl InProcessFollower {
                 .store(true, Ordering::SeqCst);
         }
         let reloaded = self.reload_kept_dispute(&mut journal, next_offset);
+        // A lineage reloaded from its sidecar (#640) is replayed over the log
+        // as it opened, before anything reads this history (#648 review): a
+        // crash between an append's fsync and the journal's re-derivation
+        // left those records filed under the old entries.
+        match journal.replay_leader_lineage_at_open(next_offset) {
+            Ok(following) => self.lineage_following.store(following, Ordering::SeqCst),
+            Err(_) => self
+                .fencing_epoch_history_broken
+                .store(true, Ordering::SeqCst),
+        }
+        // A history held while its fence's dispute was pending, whose dispute
+        // is no longer held (#640, with #635): a settlement a crash cut short
+        // before it took the lineage, or a record the reload judged stale.
+        // Taken afresh at the tail the log opened with, exactly as the
+        // settlement would have: the agreement check below the tail refuses
+        // it while any record this replica holds is still its own.
+        if let Some(epoch) = journal.waiting_leader_lineage_epoch() {
+            let still_disputed = reloaded.is_some_and(|dispute| dispute.epoch == epoch);
+            if !still_disputed {
+                let leader = journal.waiting_leader_lineage(epoch).unwrap_or_default();
+                let base = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .segment
+                    .base_offset();
+                let taken = journal
+                    .take_leader_lineage(epoch, &leader, next_offset, base)
+                    .and_then(|taken| {
+                        if taken {
+                            journal.follow_leader_lineage(epoch, next_offset).map(Some)
+                        } else {
+                            Ok(None)
+                        }
+                    });
+                match taken {
+                    Ok(Some(crate::fencing_epochs::LineageFollow::Following { complete })) => {
+                        self.lineage_following.store(!complete, Ordering::SeqCst);
+                    }
+                    Ok(_) => {}
+                    Err(_) => self
+                        .fencing_epoch_history_broken
+                        .store(true, Ordering::SeqCst),
+                }
+            }
+        }
         {
             // Installed under the state lock, like every change to the
             // dispute (#616 review), and before the journal is visible, so
@@ -863,8 +1180,19 @@ impl InProcessFollower {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(journal) = guard.as_mut() {
+            // With the held epoch's leader lineage (#640), the cut is filed
+            // by the leader's entries, not by the held epoch at the cut.
+            let held = self.held_fencing_epoch.load(Ordering::SeqCst);
             let repaired = journal.truncate_to(offset).and_then(|_| {
-                journal.record_held_epoch_at(self.held_fencing_epoch.load(Ordering::SeqCst), offset)
+                match journal.follow_leader_lineage(held, offset)? {
+                    crate::fencing_epochs::LineageFollow::NotHeld => {
+                        journal.record_held_epoch_at(held, offset)
+                    }
+                    crate::fencing_epochs::LineageFollow::Following { complete } => {
+                        self.lineage_following.store(!complete, Ordering::SeqCst);
+                        Ok(())
+                    }
+                }
             });
             if repaired.is_err() {
                 self.fencing_epoch_history_broken
@@ -917,9 +1245,14 @@ impl InProcessFollower {
                     .kept_dispute
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                return self
-                    .retire_kept_dispute_locked(&mut kept)
-                    .map_err(|problem| Self::unretired(dispute, &problem));
+                self.retire_kept_dispute_locked(&mut kept)
+                    .map_err(|problem| Self::unretired(dispute, &problem))?;
+                drop(kept);
+                drop(state);
+                // Nothing to discard, and the records from here on are this
+                // epoch's leader's all the same (#640).
+                self.take_waiting_leader_lineage_locked(epoch);
+                return Ok(());
             }
         }
         match self.truncate_to(dispute.from) {
@@ -951,6 +1284,10 @@ impl InProcessFollower {
                         &BrokerError::KeptDispute("the durable clear failed".to_owned()),
                     ));
                 }
+                // Every record from the dispute's start on now comes from
+                // this epoch's leader, so the history its fence carried is
+                // the lineage to file them by (#640).
+                self.take_waiting_leader_lineage_locked(epoch);
                 Ok(())
             }
             Err(BrokerError::TruncationBelowAcknowledged {
@@ -1024,6 +1361,22 @@ impl InProcessFollower {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         kept.map_or(offset, |dispute| offset.min(dispute.from))
+    }
+
+    /// Make this replica's log the range's history on an operator's
+    /// attestation (#636), as [`crate::LocalBroker::adopt_attested_history`]
+    /// does: a candidate promotes while it is still this follower, and the
+    /// leader built after it reopens the same journal.
+    ///
+    /// PRECONDITION: call it only once metadata has recorded a promotion of
+    /// this replica made under an attestation naming it. Nothing here can
+    /// check that; written earlier, the seed is lineage nobody authorized.
+    pub fn adopt_attested_history(&self, epoch: u64) -> crate::BrokerResult<bool> {
+        crate::fencing_epochs::FencingEpochJournal::seed_attested_history_in(
+            &self.fencing_epoch_journal,
+            &self.fencing_epoch_history_broken,
+            epoch,
+        )
     }
 
     /// This replica's epoch history; empty means "unknown", never "no changes".
@@ -1153,6 +1506,7 @@ impl InProcessFollower {
                         ),
                     )
                 })?;
+            self.drop_waiting_leader_lineage_before(epoch);
         }
         drop(kept);
         Ok(state.segment.committed_offset())
@@ -1163,6 +1517,16 @@ impl InProcessFollower {
         epoch: u64,
         leader_epoch_starts: &[crate::fencing_epochs::EpochStart],
     ) -> Result<FenceOutcome, (ErrorCode, String)> {
+        // The whole fence is one critical section with every append and every
+        // high-water mark (#649 review, cubic 4532895325): both hold the meta
+        // lock from their checks through their effect. Without it a mark
+        // could land between this replica reading its own mark and keeping a
+        // dispute from it, after the mark's settle had seen no dispute, and
+        // leave the dispute below the mark, where no settle may truncate and
+        // every later append is refused (the #616 wedge). Lock order is meta,
+        // then state, then the dispute and the journal, as on the append
+        // path; nothing below takes the meta lock again.
+        let meta = self.meta_fencing_epoch.lock();
         let held = self.held_fencing_epoch();
         if epoch < held {
             return Err((
@@ -1170,7 +1534,7 @@ impl InProcessFollower {
                 format!("fence request at epoch {epoch} is below this replica's held epoch {held}"),
             ));
         }
-        let granted = self.meta_fencing_epoch.lock().fencing_epoch;
+        let granted = meta.fencing_epoch;
         if epoch > granted {
             return Err((
                 ErrorCode::Fenced,
@@ -1188,7 +1552,7 @@ impl InProcessFollower {
         // sees an empty vector, compares as Unknown, and truncates nothing —
         // on this fence and every later one, and in the `epoch_starts` this
         // fence returns to the caller.
-        self.adopt_fencing_epoch(epoch);
+        self.adopt_fencing_epoch_locked(epoch);
 
         // Reconcile WHILE STOPPED. This is the only moment it is sound: the
         // replica has just been fenced, so nothing can append between the
@@ -1211,6 +1575,16 @@ impl InProcessFollower {
         // append over it discards it then (see `KeptDispute`).
         let truncated_records = self.reconcile_with(leader_epoch_starts, epoch)?;
 
+        // The caller's history is the lineage of this epoch's leader, should
+        // it be established (#640): a leader writes under its epoch only from
+        // the tail it sent. Taken now, while the log is stopped, so the
+        // records it later catches this replica up on are filed under the
+        // epochs that wrote them rather than under this fence's.
+        // Under the meta lock this fence holds throughout (#660), the lock
+        // `take_leader_lineage_locked` expects; taking it again here would
+        // deadlock.
+        self.take_leader_lineage_locked(epoch, leader_epoch_starts);
+
         // Offsets and history read together, under the state lock, so the pair
         // describes one instant of one log.
         let state = self
@@ -1220,13 +1594,15 @@ impl InProcessFollower {
         let local_committed_offset = state.segment.committed_offset();
         let next_offset = state.segment.next_offset();
         drop(state);
-        Ok(FenceOutcome {
+        let outcome = FenceOutcome {
             fencing_epoch: self.held_fencing_epoch(),
             local_committed_offset,
             next_offset,
             epoch_starts: self.epoch_starts(),
             truncated_records,
-        })
+        };
+        drop(meta);
+        Ok(outcome)
     }
 
     /// Discard anything written under a leadership `leader_epoch_starts` does
@@ -1289,6 +1665,7 @@ impl InProcessFollower {
                             ),
                         )
                     })?;
+                self.drop_waiting_leader_lineage_before(fencing_epoch);
             }
         }
         if leader_epoch_starts.is_empty() {
@@ -1310,14 +1687,19 @@ impl InProcessFollower {
             }
         };
         let divergence = match verdict {
-            // Agreed and Unknown are different facts with the same action
-            // HERE: touch nothing. One says there is nothing to discard, the
-            // other says we cannot prove there is. They are NOT the same fact
-            // to the candidate counting this replica's answer, and it tells
-            // them apart from the history this fence returns (#577,
-            // `promotion::fenced_lineage` in vtop-node): an Unknown answer's
-            // offset counts records whatever wrote them, so it is recorded
-            // but never counted toward the quorum.
+            // Agreed and Unknown discard nothing. One says there is nothing
+            // to discard, the other says we cannot prove there is. They are
+            // NOT the same fact to the candidate counting this replica's
+            // answer, and it tells them apart from the history this fence
+            // returns (#577, `promotion::fenced_lineage` in vtop-node): an
+            // Unknown answer's offset counts records whatever wrote them, so
+            // it is recorded but never counted toward the quorum.
+            //
+            // A replica that holds records but whose own history cannot be
+            // compared is left exactly as it is here. A leader's session
+            // refuses it instead (#649 review): it cannot tell which of its
+            // records match, so it sends it nothing and takes no ack from it
+            // until it is repaired. See `NetworkedReplicaSet`'s session fence.
             crate::fencing_epochs::Lineage::Agreed | crate::fencing_epochs::Lineage::Unknown => {
                 return Ok(0)
             }
@@ -1459,6 +1841,8 @@ impl InProcessFollower {
             // gap no leader fills. Without a tail in the caller's history,
             // nothing is kept, which is the answer before #616.
             let mark = self.cluster_committed.get();
+            #[cfg(test)]
+            Self::run_test_hook(&self.before_dispute_install);
             let (from, bounded_by) = if divergence >= mark {
                 (divergence, 0)
             } else {
@@ -1719,6 +2103,38 @@ impl InProcessFollower {
         &self,
         request: &ReplicaAppendRequest,
     ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
+        let applied = self.apply_append_unmarked(request);
+        if applied.is_ok() {
+            self.show_last_mark();
+        }
+        applied
+    }
+
+    /// Show the last mark a leader sent over records appended since it
+    /// arrived (#787). The leader could re-send that same mark at any moment
+    /// and this replica would apply it the same way: it goes through
+    /// [`Self::observe_hwm`] in full, so the fencing check refuses it once the
+    /// epoch has moved on, a kept dispute is settled first, and nothing is
+    /// shown above local durability.
+    fn show_last_mark(&self) {
+        let Some(update) = self
+            .last_mark
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        else {
+            return;
+        };
+        let shown = self.cluster_committed.get();
+        if update.committed_high_watermark > shown && self.local_committed_offset() > shown {
+            let _ = self.observe_hwm(&update);
+        }
+    }
+
+    fn apply_append_unmarked(
+        &self,
+        request: &ReplicaAppendRequest,
+    ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
         if !self.is_online() {
             return Err((
                 ErrorCode::Overloaded,
@@ -1866,7 +2282,9 @@ impl InProcessFollower {
                 let response = ReplicaAppendResponse {
                     local_committed_offset: self.ack_through(state.segment.committed_offset()),
                 };
+                let tail = state.segment.next_offset();
                 drop(state);
+                self.follow_leader_lineage_after_append(request.fencing_epoch, tail);
                 if barrier {
                     self.persist_committed_floor();
                 }
@@ -1894,13 +2312,24 @@ impl InProcessFollower {
         &self,
         requests: &[ReplicaAppendRequest],
     ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
+        let applied = self.apply_append_batch_unmarked(requests);
+        if applied.is_ok() {
+            self.show_last_mark();
+        }
+        applied
+    }
+
+    fn apply_append_batch_unmarked(
+        &self,
+        requests: &[ReplicaAppendRequest],
+    ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
         if requests.is_empty() {
             return Ok(ReplicaAppendResponse {
                 local_committed_offset: self.replication_status().0,
             });
         }
         if requests.len() == 1 {
-            return self.apply_append(&requests[0]);
+            return self.apply_append_unmarked(&requests[0]);
         }
         if !self.is_online() {
             return Err((
@@ -2048,14 +2477,23 @@ impl InProcessFollower {
                 ));
             }
         }
+        // Every member was checked against the held epoch above, so the
+        // group is one leader's, and so is the lineage it is filed under
+        // (#640).
+        let epoch = requests[0].fencing_epoch;
         if self.hold_fsync.load(Ordering::SeqCst) {
-            return Ok(ReplicaAppendResponse {
+            let response = ReplicaAppendResponse {
                 local_committed_offset: self.ack_through(state.segment.committed_offset()),
-            });
+            };
+            let tail = state.segment.next_offset();
+            drop(state);
+            self.follow_leader_lineage_after_append(epoch, tail);
+            return Ok(response);
         }
         match state.segment.commit() {
             Ok(local_committed_offset) => {
                 let local_committed_offset = self.ack_through(local_committed_offset);
+                let tail = state.segment.next_offset();
                 // One pass per batch, after the commit, and never under an
                 // fsync hold — the hold path returned above (#290). The floor
                 // persist rides the same barrier (#240) but AFTER the state
@@ -2064,6 +2502,7 @@ impl InProcessFollower {
                 // would serialize every other lock user behind it.
                 self.run_retention(&mut state.segment);
                 drop(state);
+                self.follow_leader_lineage_after_append(epoch, tail);
                 self.persist_committed_floor();
                 Ok(ReplicaAppendResponse {
                     local_committed_offset,
@@ -2091,6 +2530,23 @@ impl InProcessFollower {
         // kept records as committed and put them below a mark no truncation
         // may cross, wedging the replica.
         self.settle_kept_dispute(update.fencing_epoch, update.committed_high_watermark)?;
+        // Kept for the appends that follow (#787): the newest epoch's
+        // newest mark.
+        {
+            let mut last = self
+                .last_mark
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let newer = last.as_ref().is_none_or(|kept| {
+                (update.fencing_epoch, update.committed_high_watermark)
+                    > (kept.fencing_epoch, kept.committed_high_watermark)
+            });
+            if newer {
+                *last = Some(update.clone());
+            }
+        }
+        #[cfg(test)]
+        Self::run_test_hook(&self.after_mark_settle);
         // Never advertise above local durability.
         let local = self.local_committed_offset();
         let visible = update.committed_high_watermark.min(local);
@@ -2177,12 +2633,19 @@ impl ReplicaSet for InProcessReplicaSet {
 /// Where a fencing caller's log ends, when its history says so: the start of
 /// its entry for `fencing_epoch`, the adoption it records at its own tail
 /// before it fences anyone (#611). `None` when the history carries no such
-/// entry. Canonicalized, so an idle adoption at the same offset collapses
-/// into it.
+/// entry.
+///
+/// Found wherever it sits, not only in last place (#649 review): a leader's
+/// session fence (#641) reads its epoch before its history, so an epoch it
+/// adopted in between can follow the entry. Read from the raw vector, not
+/// the canonical one, which would fold the entry into a newer epoch adopted
+/// idle at the same offset. An epoch starts once on any one replica, so
+/// there is at most one such entry.
 fn caller_tail(caller: &[crate::fencing_epochs::EpochStart], fencing_epoch: u64) -> Option<u64> {
-    crate::fencing_epochs::canonicalize_lineage(caller)
-        .last()
-        .filter(|entry| entry.epoch == fencing_epoch)
+    caller
+        .iter()
+        .rev()
+        .find(|entry| entry.epoch == fencing_epoch)
         .map(|entry| entry.start_offset)
 }
 

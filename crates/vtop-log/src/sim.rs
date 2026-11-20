@@ -88,6 +88,71 @@ pub struct SimDiskState {
     pub dirs: BTreeSet<PathBuf>,
 }
 
+/// Most files a bundle restores; more is not a deeper input, only a slower one.
+const MAX_BUNDLE_FILES: usize = 64;
+
+impl SimDiskState {
+    /// The disk as one flat byte string, the form the fuzz targets that read
+    /// several files at once take their input in (#729): for each file, a
+    /// big-endian `u16` path length, the UTF-8 absolute path, a big-endian
+    /// `u32` content length, the content. Directories are not stored; they
+    /// are every file's ancestors.
+    pub fn to_bundle(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (path, bytes) in &self.files {
+            let path = path.to_string_lossy();
+            out.extend_from_slice(&(path.len() as u16).to_be_bytes());
+            out.extend_from_slice(path.as_bytes());
+            out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            out.extend_from_slice(bytes);
+        }
+        out
+    }
+
+    /// Read a bundle back. It is fuzzer input, so this never fails and never
+    /// panics: it stops at the first entry that runs past the end, skips a
+    /// path that is not absolute UTF-8 without a NUL, and keeps at most
+    /// [`MAX_BUNDLE_FILES`] files.
+    pub fn from_bundle(mut bytes: &[u8]) -> Self {
+        let mut disk = Self::default();
+        while disk.files.len() < MAX_BUNDLE_FILES {
+            let Some((path, rest)) = take_prefixed(bytes, 2) else {
+                break;
+            };
+            let Some((content, rest)) = take_prefixed(rest, 4) else {
+                break;
+            };
+            bytes = rest;
+            let Ok(path) = std::str::from_utf8(path) else {
+                continue;
+            };
+            if !path.starts_with('/') || path.contains('\0') {
+                continue;
+            }
+            let path = PathBuf::from(path);
+            let mut ancestor = path.parent();
+            while let Some(dir) = ancestor {
+                disk.dirs.insert(dir.to_path_buf());
+                ancestor = dir.parent();
+            }
+            disk.files.insert(path, content.to_vec());
+        }
+        disk
+    }
+}
+
+/// A big-endian length of `width` bytes, then that many bytes.
+fn take_prefixed(bytes: &[u8], width: usize) -> Option<(&[u8], &[u8])> {
+    if bytes.len() < width {
+        return None;
+    }
+    let (len, rest) = bytes.split_at(width);
+    let len = len
+        .iter()
+        .fold(0_usize, |acc, byte| (acc << 8) | usize::from(*byte));
+    (rest.len() >= len).then(|| rest.split_at(len))
+}
+
 #[derive(Clone, Debug)]
 enum DataOp {
     Write { position: u64, bytes: Vec<u8> },
@@ -935,5 +1000,57 @@ mod tests {
         assert!(!sim.has_crashed());
         assert_eq!(sim.snapshot(), disk);
         ActiveSegment::recover_in(&env, "/log/reset.active").unwrap();
+    }
+
+    /// #729: a disk round-trips through the fuzz-seed bundle byte for byte,
+    /// directories included, so a seed written from a real workload restores
+    /// as that workload's disk.
+    #[test]
+    fn a_disk_round_trips_through_a_bundle() {
+        let mut disk = SimDiskState::default();
+        disk.files
+            .insert(PathBuf::from("/log/a.segment"), vec![1, 2, 3]);
+        disk.files
+            .insert(PathBuf::from("/log/sub/b.index"), Vec::new());
+        disk.dirs.insert(PathBuf::from("/"));
+        disk.dirs.insert(PathBuf::from("/log"));
+        disk.dirs.insert(PathBuf::from("/log/sub"));
+        let bundle = disk.to_bundle();
+        assert_eq!(SimDiskState::from_bundle(&bundle), disk);
+    }
+
+    /// #729: the bundle is fuzzer input, so reading one never panics and
+    /// keeps every whole entry before the first malformed one.
+    #[test]
+    fn a_damaged_bundle_keeps_its_whole_entries_and_never_panics() {
+        let mut disk = SimDiskState::default();
+        disk.files.insert(PathBuf::from("/log/a"), vec![7; 10]);
+        let mut bundle = disk.to_bundle();
+        // A second entry whose length runs past the end.
+        bundle.extend_from_slice(&[0, 6]);
+        bundle.extend_from_slice(b"/log/b");
+        bundle.extend_from_slice(&u32::MAX.to_be_bytes());
+        bundle.push(1);
+        let read = SimDiskState::from_bundle(&bundle);
+        assert_eq!(read.files.len(), 1);
+        assert_eq!(read.files[Path::new("/log/a")], vec![7; 10]);
+
+        // A relative path, a non-UTF-8 path and a NUL are skipped, not
+        // trusted.
+        let mut odd = Vec::new();
+        for path in [&b"relative"[..], &[0xff, 0xfe][..], &b"/nul\0x"[..]] {
+            odd.extend_from_slice(&(path.len() as u16).to_be_bytes());
+            odd.extend_from_slice(path);
+            odd.extend_from_slice(&1_u32.to_be_bytes());
+            odd.push(0);
+        }
+        assert!(SimDiskState::from_bundle(&odd).files.is_empty());
+
+        for len in 0..bundle.len() {
+            let _ = SimDiskState::from_bundle(&bundle[..len]);
+        }
+        let sim = SimStorage::new();
+        sim.restore(&SimDiskState::from_bundle(&bundle));
+        assert_eq!(sim.snapshot().files.len(), 1);
     }
 }

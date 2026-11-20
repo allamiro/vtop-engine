@@ -1,0 +1,145 @@
+name: Bug report
+description: Something in vtopctl, vtop-node, the chart or the build doesn't work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Title it `area: what goes wrong`, for example `kafka source: a partition added at runtime is never read`.
+
+        Write the report in your own words and keep it short (see CONTRIBUTING.md). Paste commands and output as they are, not summaries of them.
+
+        - **A vulnerability** goes to a [private security advisory](https://github.com/allamiro/vtop-engine/security/advisories/new), never a public issue.
+        - **Lost, duplicated or unverified data** goes in the *Data safety* form, which asks for the ledger evidence.
+        - **Build or launch failures**: check the troubleshooting table under [Native prerequisites](https://github.com/allamiro/vtop-engine#native-prerequisites) first.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you file
+      options:
+        - label: I searched the existing issues, open and closed, and this one isn't there.
+          required: true
+        - label: This is not a security vulnerability. If an attacker could use it, I'll report it privately instead.
+          required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The output of `vtopctl --version` (and `vtop-node --version` for the cluster plane). For a source build, add the commit from `git rev-parse --short HEAD`.
+      placeholder: vtopctl 0.8.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: Install method
+      options:
+        - Release binary
+        - Built from source
+        - Container image
+        - Helm chart (helm/vtop)
+        - Other (say below)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Debian / Ubuntu
+        - RHEL, AlmaLinux or Rocky Linux 8
+        - RHEL, AlmaLinux or Rocky Linux 9
+        - RHEL, AlmaLinux or Rocky Linux 10
+        - Fedora
+        - macOS 11 or later, Apple silicon (arm64)
+        - macOS 11 or later, Intel (x86_64)
+        - Container (Docker, Kubernetes)
+        - Other (say below)
+    validations:
+      required: true
+
+  - type: input
+    id: platform-details
+    attributes:
+      label: Platform details
+      description: OS release and architecture. For a source build, the Rust version and any non-default features or variables (`--no-default-features`, `--features postgres`, `--features kafka-gssapi`, `OPENSSL_NO_VENDOR`).
+      placeholder: Ubuntu 24.04 x86_64, rustc 1.94.1, --features postgres
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Pick all that apply. "Not sure" is a fine answer.
+      multiple: true
+      options:
+        - "Archive engine (vtopctl run: batching, recovery, replay)"
+        - "Source: Kafka"
+        - "Source: file"
+        - "Source: syslog spool"
+        - Upload and verification (object store backends)
+        - "State store: SQLite"
+        - "State store: PostgreSQL"
+        - "Cluster plane (vtop-node: metadata Raft, replication, promotion)"
+        - Kafka gateway
+        - "CLI (vtopctl commands and their output)"
+        - Helm chart
+        - Build or install
+        - Documentation
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened
+      description: What you saw, with the exact error or exit code.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: And where that expectation comes from, if it's documented (README section, docs page, `--help`).
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands, from a clean start if you can. Say how often it happens (every time, 1 in 10 runs, once).
+      placeholder: |
+        1. vtopctl validate --config config.yaml
+        2. vtopctl run --config config.yaml
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: The relevant output, ideally with `--log-level debug`. Redact hostnames or paths you can't share, and say that you did.
+      render: text
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration (redacted)
+      description: |
+        The config file (and `streams.yaml`, if you use one), plus the output of `vtopctl validate --config <file> --print-effective`, which shows each effective setting and where it came from.
+
+        **Redact secrets before pasting.** The config should name environment variables and secret files, not hold their values, but check: replace any access key, password, token, SASL or TLS credential, MAC key or credential-bearing URL with `REDACTED`, keeping the key name. Never paste the environment (`env`), a Kubernetes Secret or Helm values with credentials in them.
+      render: yaml
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: What you already tried, a workaround, related issues (`Refs #N`).

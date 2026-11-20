@@ -25,6 +25,7 @@ pub fn file_config(
     backend: &str,
 ) -> VtopConfig {
     VtopConfig {
+        configured_fields: Default::default(),
         engine: EngineConfig {
             name: "vtop-test".into(),
             tenant: "default".into(),
@@ -55,12 +56,15 @@ pub fn file_config(
             algorithm: ChecksumAlgorithm::Sha256,
         },
         manifest_mac_key_env: None,
+        manifest: Default::default(),
         sources: SourcesConfig {
             kafka: None,
             file: Some(FileSourceConfig {
                 enabled: true,
                 paths,
                 delete_after_commit: false,
+                delete_quiet_seconds: vtop_core::config::DEFAULT_DELETE_QUIET_SECONDS,
+                delete_without_open_check: false,
                 whole_file: false,
             }),
             syslog_spool: None,
@@ -75,6 +79,7 @@ pub fn file_config(
             verify_tls: false,
             transport: "tcp_tls".into(),
             request_timeout_seconds: 300,
+            request_min_bytes_per_second: 4 * 1024,
             profile: None,
             command_binary: None,
             command_timeout_seconds: 300,
@@ -88,14 +93,17 @@ pub fn file_config(
             multipart_threshold_bytes: 8 * 1024 * 1024,
             multipart_max_parallelism: 4,
             multipart_abandon_after_secs: 24 * 60 * 60,
+            multipart_part_attempts: 3,
             transports: Default::default(),
             max_egress_bytes_per_second: None,
             max_concurrency_ceiling: None,
+            object_lock: None,
         },
         partitioning: PartitioningConfig {
             template: DEFAULT_TEMPLATE.into(),
             time_source: Default::default(),
         },
+        security: Default::default(),
     }
 }
 
@@ -161,8 +169,11 @@ pub fn pipeline<'a>(
         store,
         backend,
         config,
-        manifest_mac_key: config.resolve_manifest_mac_key().unwrap(),
+        manifest_keyring: Arc::new(config.resolve_manifest_keyring().unwrap()),
         versioned_buckets: std::sync::Arc::default(),
         provisioned_buckets: std::sync::Arc::default(),
+        key_notices: std::sync::Arc::default(),
+        locked_buckets: std::sync::Arc::default(),
+        lock_fallbacks: std::sync::Arc::default(),
     }
 }

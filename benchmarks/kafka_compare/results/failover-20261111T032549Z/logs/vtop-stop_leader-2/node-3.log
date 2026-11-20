@@ -1,0 +1,63 @@
+2026-11-11T03:58:09.584421919Z data_node_ready role=candidate node=aaaaaaaa-0000-0000-0000-0000000000a3 native=0.0.0.0:9400 replica=0.0.0.0:9300 metrics=0.0.0.0:9600
+2026-11-11T03:58:09.599255919Z meta_node_ready id=3 peer=0.0.0.0:9100 admin=0.0.0.0:9200 metrics=0.0.0.0:9600
+2026-11-11T03:59:06.095027834Z data_node_role_changed role=leader node=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2
+2026-11-11T03:58:09.543763710Z 2026-11-11T03:58:09.543486Z  INFO vtop_observe::server: observability endpoint listening (/metrics, /healthz, /readyz) bound=0.0.0.0:9600 transport="plaintext"
+2026-11-11T03:58:09.584173377Z 2026-11-11T03:58:09.583991Z  INFO vtop_node::lease_agent: lease agent running range=aaaaaaaa-0000-0000-0000-0000000000c1 node=aaaaaaaa-0000-0000-0000-0000000000a3
+2026-11-11T03:58:09.590552794Z 2026-11-11T03:58:09.590516Z  WARN vtop_node::lease_agent: lease agent round failed; retrying error=read range lease: io: Connection refused (os error 111) range=aaaaaaaa-0000-0000-0000-0000000000c1
+2026-11-11T03:58:09.597552210Z 2026-11-11T03:58:09.597365Z  INFO openraft::engine::engine_impl: startup begin: state: RaftState { vote: UTime { data: Vote { leader_id: LeaderId { term: 0, voted_for: None }, committed: false }, utime: Some(Instant { tv_sec: 122518, tv_nsec: 352573137 }) }, committed: None, purged_next: 0, log_ids: LogIdList { key_log_ids: [] }, membership_state: MembershipState { committed: EffectiveMembership { log_id: None, membership: Membership { configs: [], nodes: {} }, voter_ids: {} }, effective: EffectiveMembership { log_id: None, membership: Membership { configs: [], nodes: {} }, voter_ids: {} } }, snapshot_meta: SnapshotMeta { last_log_id: None, last_membership: StoredMembership { log_id: None, membership: Membership { configs: [], nodes: {} } }, snapshot_id: "" }, server_state: Learner, accepted: Accepted { leader_id: LeaderId { term: 0, voted_for: None }, log_id: None }, io_state: IOState { building_snapshot: false, vote: Vote { leader_id: LeaderId { term: 0, voted_for: None }, committed: false }, flushed: LogIOId { committed_leader_id: CommittedLeaderId { term: 0, p: PhantomData<u64> }, log_id: None }, applied: None, snapshot: None, purged: None }, purge_upto: None }, is_leader: false, is_voter: false
+2026-11-11T03:58:09.599481335Z warning: admin endpoint 0.0.0.0:9200 is authenticated but NOT authorized: any client holding a certificate signed by this CA — including every data node — may change cluster membership and grant range leases. Set `admin_authorization` to restrict cluster-scoped commands to named operator CNs.
+2026-11-11T03:58:09.965103461Z 2026-11-11T03:58:09.965052Z  INFO openraft::engine::engine_impl: now; 03:58:09.965047, vote is updated at: 03:58:09.597315, vote is updated before 367.731833ms, leader lease(600ms) will expire after 232.268167ms
+2026-11-11T03:58:09.971038336Z 2026-11-11T03:58:09.970856Z  WARN openraft::core::raft_core: A message will be ignored because vote changed: msg sent by vote: T1-N1:uncommitted; current my vote: None; when (VoteResponse)
+2026-11-11T03:58:09.985660919Z 2026-11-11T03:58:09.985554Z  WARN openraft::core::raft_core: A message will be ignored because vote changed: msg sent by vote: T1-N1:committed; current my vote: None; when (VoteResponse)
+2026-11-11T03:58:51.702320758Z 2026-11-11T03:58:51.702232Z  INFO openraft::engine::engine_impl: now; 03:58:51.702229, vote is updated at: 03:58:50.663564, vote is updated before 1.038664542s, leader lease(600ms) will expire after 0ns
+2026-11-11T03:58:51.703730008Z 2026-11-11T03:58:51.703611Z  WARN openraft::core::raft_core: A message will be ignored because vote changed: msg sent by vote: T2-N2:uncommitted; current my vote: None; when (VoteResponse)
+2026-11-11T03:58:51.710139800Z 2026-11-11T03:58:51.710049Z  WARN openraft::core::raft_core: A message will be ignored because vote changed: msg sent by vote: T2-N2:committed; current my vote: None; when (VoteResponse)
+2026-11-11T03:58:53.632798009Z 2026-11-11T03:58:53.632747Z  WARN vtop_node::lease_agent: refusing promotion: too few replicas could confirm the committed boundary range=aaaaaaaa-0000-0000-0000-0000000000c1 fencing_epoch=2 answered=1 required=2
+2026-11-11T03:58:53.635202967Z 2026-11-11T03:58:53.635115Z  INFO vtop_node::lease_agent: promotion outcome recorded against the epoch's transition range=aaaaaaaa-0000-0000-0000-0000000000c1 fencing_epoch=2 attempt=1
+2026-11-11T03:58:53.692830175Z 2026-11-11T03:58:53.692787Z  WARN vtop_node::lease_agent: refusing promotion: too few replicas could confirm the committed boundary range=aaaaaaaa-0000-0000-0000-0000000000c1 fencing_epoch=2 answered=1 required=2
+2026-11-11T03:58:53.695366967Z 2026-11-11T03:58:53.695315Z  INFO vtop_node::lease_agent: promotion outcome recorded against the epoch's transition range=aaaaaaaa-0000-0000-0000-0000000000c1 fencing_epoch=2 attempt=1
+2026-11-11T03:58:55.695032343Z 2026-11-11T03:58:55.694979Z  INFO vtop_node::lease_agent: verified promotion: committed boundary established by quorum range=aaaaaaaa-0000-0000-0000-0000000000c1 fencing_epoch=2 committed_offset=175100 replicas=2 uncounted_unknown_lineage=0
+2026-11-11T03:58:55.695305385Z 2026-11-11T03:58:55.695263Z  WARN vtop_node::lease_agent: metadata does not record lineage verdicts yet (feature level below 6); recording this promotion without them, and without the answers whose lineage was unknown range=aaaaaaaa-0000-0000-0000-0000000000c1 fencing_epoch=2 error=this command needs metadata feature level 6 and the cluster runs at 3; finish upgrading every metadata voter, then raise the level (vtopctl meta enable-features --level 6)
+2026-11-11T03:58:55.697663010Z 2026-11-11T03:58:55.697596Z  INFO vtop_node::lease_agent: promotion outcome recorded against the epoch's transition range=aaaaaaaa-0000-0000-0000-0000000000c1 fencing_epoch=2 attempt=2
+2026-11-11T03:58:55.697671843Z 2026-11-11T03:58:55.697617Z  INFO vtop_node::lease_agent: range lease held range=aaaaaaaa-0000-0000-0000-0000000000c1 fencing_epoch=2
+--- tail ---
+2026-11-11T04:00:20.311497591Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:20.574881216Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:20.835559216Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:21.095652008Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:21.361083341Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:21.622659924Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:21.884369466Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:22.144145716Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:22.408457800Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:22.670835008Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:22.933602383Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:23.195488550Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:23.458005384Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:23.722058842Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:23.985673509Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:24.249803926Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:24.516336884Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:24.781373426Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:25.042978468Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:25.308083176Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:25.567933135Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:25.831266593Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:26.094262927Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:26.356944968Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:26.620487677Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:26.885166219Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:27.147673427Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:27.412501386Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:27.676489427Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:27.944304552Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:28.209374553Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:28.474228719Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:28.739056095Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:29.000287761Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:29.259957178Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:29.521259887Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:29.782368303Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:30.044450387Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:30.304473429Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known
+2026-11-11T04:00:30.565882179Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Name or service not known

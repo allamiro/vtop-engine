@@ -173,11 +173,13 @@ not keep publishing the follower lag it saw at the instant of the failover.
 | `vtop_broker_retention_blocked{topic,range,reason}` | gauge | 1 while the latest pass ended above the bound. `committed_floor`: the oldest segment holds records a follower or the quorum mark has not passed, so disk grows until replication catches up. `active_segment`: the bound is smaller than one segment. A pass that reclaims nothing used to look the same as a range under its bound. |
 | `vtop_broker_retention_last_pass_failed{topic,range}` | gauge | 1 while the latest pass failed outright (retried after the next append). |
 | `vtop_broker_log_start_offset{topic,range}` | gauge | First offset the replica still holds; retention moves it. A consumer below it is told `OffsetOutOfRange` (#571). Removed while a candidate has no role installed. |
-| `vtop_broker_group_commits_total` | counter | Commit groups sealed and fsynced. |
-| `vtop_broker_group_commit_requests_total` | counter | Produce requests folded into groups. |
+| `vtop_broker_produce_phase_seconds_total{phase}` | counter | Time produce flushes spent in each phase (#752): `local_fsync` (the leader's append and fsync, under the broker's locks), `replicate` (the replica round, until a quorum acked or it gave up), `commit` (the lease re-check, the high-water mark advance and its propagation to followers). One flush is one admitted request, or one group with group commit on, so a mean per flush divides by the produce requests answered (`vtop_broker_requests_total{kind="produce"}`, less those refused before the append) or by `vtop_broker_group_commits_total`. A standalone `LocalFsync` produce spends nothing in the other two. |
+| `vtop_broker_group_commit_enabled` | gauge | 1 when concurrent produce requests on the range share one fsync and one replication round (group commit), 0 when each has its own. The `group_commit_*` series below exist only while it is 1. |
+| `vtop_broker_group_commits_total` | counter | Commit groups sealed and flushed. |
+| `vtop_broker_group_commit_requests_total` | counter | Produce requests folded into groups; divided by `commits_total`, the mean group size. |
 | `vtop_broker_group_commit_records_total` / `_bytes_total` | counter | Volume folded into groups. |
-| `vtop_broker_group_commit_sync_nanoseconds_total` | counter | Divide by commits for mean fsync cost. |
-| `vtop_broker_group_commit_queue_wait_nanoseconds_total` | counter | Time requests waited to join a group. |
+| `vtop_broker_group_commit_sync_nanoseconds_total` | counter | Time spent flushing groups: the local fsync, the replication round and the commit **together**, not the fsync alone. Divided by `commits_total` it is the mean barrier per group; `vtop_broker_produce_phase_seconds_total` splits it. |
+| `vtop_broker_group_commit_queue_wait_nanoseconds_total` | counter | For each group, how long its longest-waiting request waited to join, summed over groups: one wait per group, not a sum over requests. |
 | `vtop_broker_group_commit_last_batch_records` / `_bytes` | gauge | Size of the most recent group. |
 | `vtop_broker_requests_total{kind,outcome}` | counter | Requests answered, by kind (`produce`, `fetch`, `commit_cursor`, `fetch_cursor`, `replica_append`, `other`) and whether the broker served or refused. A refusal is often the system working — a fencing rejection is correct behaviour — so it is counted apart from a success rather than folded into one error rate. |
 | `vtop_broker_request_duration_seconds{kind}` | histogram | Time the broker held a request. **Measured around its own work, not the socket write**, so a slow consumer's TCP backpressure cannot be mistaken for a slow log. Buckets run 50µs–1s, dense where an fsync and a quorum round-trip live. |
@@ -301,9 +303,34 @@ codes into a container's captured stderr corrupts every downstream parser — a
 `level=~"WARN"` filter then matches nothing because the field names are wrapped
 in escape sequences.
 
+## Audit records
+
+A metadata node writes the audit records of the cluster plane (#694): the
+admin endpoint's record of every refused request and every operator command,
+with the caller's certificate identity, and each replica's record of the
+entries it applied, with the log index. A data node leading a range records
+the transfers it grants or refuses to `vtopctl node repair`. They go to the
+`vtop::audit` log target and, with `VTOP_AUDIT_LOG=/path` set, to an
+append-only JSONL file; a set but unwritable path stops `meta`, `data` and
+`node` at startup, naming the path. `vtop_audit_events_total{action,outcome}`
+and `vtop_audit_write_failures_total{sink}` are on every node's `/metrics`.
+Read a node's file with `vtopctl audit list --file`; see
+[operate/auditing.md](operate/auditing.md).
+
+## OpenTelemetry
+
+`vtop-node` carries the same OpenTelemetry export as the engine (#683), built
+in and idle until `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Then its registry,
+every metric in the catalogue above, is also sent over OTLP/HTTP every
+`OTEL_METRIC_EXPORT_INTERVAL`, with `service.name=vtop-node`. The node opens
+no spans of its own yet, so it sends no traces. The exporter's own counters
+(`vtop_otel_*`) are on every node's `/metrics` and read 0 with export off. The
+variables, the messages and the guarantees (a bounded queue, a 5 s flush at
+shutdown, startup refusing an unsupported setting) are in
+[observability/README.md](../observability/README.md#opentelemetry).
+
 ## What is not here yet
 
-* Proof-verification and evidence-gate counters cover segment recovery today;
-  the retention/tier evidence lag metrics are follow-up work.
-* `vtopctl node status`, the starter Grafana dashboard, and the compose scrape
-  wiring land with the same issue.
+* Proof-verification and evidence-gate counters cover segment recovery.
+  Retention is visible (`vtop_broker_retention_*`), but no metric says how far
+  tier or retention evidence lags behind sealing.

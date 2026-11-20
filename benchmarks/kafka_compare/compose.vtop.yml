@@ -19,6 +19,12 @@ x-node: &node
   memswap_limit: 2g
   ulimits:
     nofile: { soft: 65536, hard: 65536 }
+  # The same hardening as compose.kafka.yml's brokers (fairness rule 1): no
+  # capabilities (the node listens above 1024 as user vtop), no setuid gain.
+  # Not read_only or pids_limit: the first would move writable paths to
+  # tmpfs, the second caps threads; either could change what is measured.
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
   networks: [bench]
   healthcheck:
     test: ["CMD-SHELL", "curl -sf http://127.0.0.1:9600/readyz > /dev/null"]

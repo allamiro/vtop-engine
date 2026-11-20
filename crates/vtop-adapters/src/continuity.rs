@@ -277,6 +277,109 @@ pub fn probe_with_tail(
     Some((metadata, head, bytes))
 }
 
+/// What a file must be shown to be, for [`proves`]: the evidence a range's
+/// marker, or a cursor, recorded of the file it read.
+#[derive(Debug, Clone, Copy)]
+pub struct Identity<'a> {
+    pub inode: u64,
+    /// First-page fingerprints (#578) the file must start with - every one
+    /// of them. At least one: without a first page nothing is proven.
+    pub contents: &'a [&'a ContentFingerprint],
+    /// Pages the file must still hold, each ending at its offset (#620) -
+    /// every one recorded.
+    pub tails: &'a [&'a Tail],
+    /// The length the file must have at least. An append-only file never
+    /// gets shorter, so one shorter than a length it was seen at, a position
+    /// read up to, or a range's end has been truncated or rewritten since.
+    pub min_len: u64,
+}
+
+/// POSITIVE identity (#567, #621): whether `file` is proven to be the file
+/// `identity` describes - the same inode, no shorter than `min_len`, starting
+/// with every first page, and holding every tail where it ends. Not "not
+/// proven another file": a decision that cannot be undone, or that skips
+/// bytes when it is wrong, rests on this, so anything unknown answers no.
+///
+/// The one test of its kind, used by every caller that must know which file
+/// a recorded position belongs to: the committed point a range is retired
+/// against (`committed_through`, #567), the file a failed range is re-read
+/// from after a rotation (`rotated::proves`, #621), the file a commit counts
+/// towards, and the row a restart is seeded from (`seed_choice`, #621).
+/// Reads at offsets, so a descriptor's position is left alone.
+pub fn proves(file: &std::fs::File, identity: &Identity<'_>) -> bool {
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    if inode_of(&metadata) != Some(identity.inode) || metadata.len() < identity.min_len {
+        return false;
+    }
+    if identity.contents.is_empty() {
+        return false;
+    }
+    let Ok(head) = read_at_most(file, 0, ContentFingerprint::MAX_LEN as u64) else {
+        return false;
+    };
+    if !identity
+        .contents
+        .iter()
+        .all(|content| content.matches_head(&head))
+    {
+        return false;
+    }
+    identity.tails.iter().all(|tail| {
+        let from = tail.end.saturating_sub(tail.fingerprint.len);
+        read_at_most(file, from, tail.end - from)
+            .is_ok_and(|bytes| tail.fingerprint.matches_bytes(&bytes))
+    })
+}
+
+/// [`proves`] for the file now at `path`. A path that cannot be opened is
+/// not proven to be anything.
+pub fn proves_at_path(path: &std::path::Path, identity: &Identity<'_>) -> bool {
+    std::fs::File::open(path).is_ok_and(|file| proves(&file, identity))
+}
+
+/// Up to `len` bytes of `file` from `from`, read at an offset so the
+/// descriptor's position is left alone; fewer at the end of the file.
+#[cfg(unix)]
+pub(crate) fn read_at_most(file: &std::fs::File, from: u64, len: u64) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+    let mut bytes = vec![0u8; usize::try_from(len).unwrap_or(usize::MAX)];
+    let mut filled = 0;
+    while filled < bytes.len() {
+        match file.read_at(&mut bytes[filled..], from + filled as u64) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    bytes.truncate(filled);
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn read_at_most(
+    _file: &std::fs::File,
+    _from: u64,
+    _len: u64,
+) -> std::io::Result<Vec<u8>> {
+    // Without inodes nothing can be proven (`inode_of` is `None`), so no
+    // caller gets this far.
+    Ok(Vec::new())
+}
+
+#[cfg(unix)]
+fn inode_of(md: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(md.ino())
+}
+
+#[cfg(not(unix))]
+fn inode_of(_md: &std::fs::Metadata) -> Option<u64> {
+    None
+}
+
 /// Whether a commit for a range ending at `end_byte` still describes the file
 /// now at the path, so that moving the cursor to it is meaningful.
 ///
@@ -779,5 +882,114 @@ mod tests {
             ),
             Settled::Current
         );
+    }
+}
+
+/// The file a committed point was confirmed for (#624): the inode, first
+/// page and tail of the marker whose commit, checked against the file at the
+/// path, set it. A legacy marker without an inode confirms nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmedFile {
+    pub inode: u64,
+    pub content: Option<ContentFingerprint>,
+    /// The bytes ending at the committed point (#620), where the marker
+    /// recorded them.
+    pub tail: Option<Tail>,
+}
+
+impl ConfirmedFile {
+    pub fn of(
+        inode: Option<u64>,
+        content: Option<&ContentFingerprint>,
+        tail: Option<Tail>,
+    ) -> Option<Self> {
+        inode.map(|inode| Self {
+            inode,
+            content: content.cloned(),
+            tail,
+        })
+    }
+
+    /// Whether the file now at `path` is PROVEN to be this confirmed file AND
+    /// the file a later, lower commit's marker was read from - so that commit
+    /// can be skipped as superseded (#624) without losing a byte.
+    ///
+    /// Proof, by [`proves_at_path`] (#647), not the absence of disproof
+    /// (review of #659, Codex P1). An older generation's commit with no
+    /// fingerprint confirmed a point, a newer generation's lower commit was
+    /// then skipped because "unknown" could not be shown to differ, and the
+    /// read head stayed above bytes the new generation had not archived. So
+    /// both first pages must be KNOWN and match the file now, both tails
+    /// (where recorded) must hold, the inode must be the marker's, and the
+    /// file must be no shorter than the committed point or anything the
+    /// marker recorded. Anything unknown answers no, and the commit moves the
+    /// cursor as it did before #624.
+    pub fn proves(
+        &self,
+        path: &std::path::Path,
+        committed_byte: u64,
+        inode: Option<u64>,
+        content: Option<&ContentFingerprint>,
+        tail: Option<&Tail>,
+        min_len: u64,
+    ) -> bool {
+        let (Some(mine), Some(theirs)) = (self.content.as_ref(), content) else {
+            return false;
+        };
+        if inode != Some(self.inode) {
+            return false;
+        }
+        let tails: Vec<&Tail> = self.tail.iter().chain(tail).collect();
+        proves_at_path(
+            path,
+            &Identity {
+                inode: self.inode,
+                contents: &[mine, theirs],
+                tails: &tails,
+                min_len: min_len.max(committed_byte),
+            },
+        )
+    }
+}
+
+#[cfg(all(test, unix))]
+mod confirmed_file_tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
+
+    /// Review of #659 (Codex P1): a lower commit is skipped only on PROOF
+    /// that it and the confirmed committed point are of the file now at the
+    /// path. Unknown content, on either side, never proves.
+    #[test]
+    fn only_known_matching_content_proves_a_skip() {
+        let bytes: Vec<u8> = (0..84u8).map(|i| b'a' + i % 26).collect();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&bytes).unwrap();
+        f.flush().unwrap();
+        let path = f.path();
+        let inode = std::fs::metadata(path).unwrap().ino();
+        let fp = |b: &[u8]| ContentFingerprint::of(b);
+        let confirmed = |content: Option<ContentFingerprint>, tail: Option<Tail>| ConfirmedFile {
+            inode,
+            content,
+            tail,
+        };
+        let newer = fp(&bytes[..21]);
+        let good = confirmed(fp(&bytes[..60]), Tail::at(60, fp(&bytes[..60])));
+        assert!(good.proves(path, 60, Some(inode), newer.as_ref(), None, 21));
+        // Unknown content, on either side, proves nothing.
+        assert!(!confirmed(None, None).proves(path, 60, Some(inode), newer.as_ref(), None, 21));
+        assert!(!good.proves(path, 60, Some(inode), None, None, 21));
+        // Known content that is not the file's now.
+        assert!(!good.proves(path, 60, Some(inode), fp(&[b'z'; 21]).as_ref(), None, 21));
+        // Another inode for the marker.
+        assert!(!good.proves(path, 60, Some(inode + 1), newer.as_ref(), None, 21));
+        // A file shorter than the committed point or the marker's length.
+        assert!(!good.proves(path, 90, Some(inode), newer.as_ref(), None, 21));
+        assert!(!good.proves(path, 60, Some(inode), newer.as_ref(), None, 90));
+        // A confirmed tail the bytes below the committed point no longer hold.
+        let rewritten = confirmed(fp(&bytes[..60]), Tail::at(60, fp(&[b'z'; 60])));
+        assert!(!rewritten.proves(path, 60, Some(inode), newer.as_ref(), None, 21));
     }
 }

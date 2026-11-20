@@ -86,7 +86,7 @@ isolated by a separate measurement in this phase; they are the explanation the c
    requests) exists in `vtop-broker` but is not wired into the node. The client caps a request at
    `batch.size` (16 KiB by default) whatever the record size, so a ceiling set per request shows up as a
    roughly constant MiB/s across record sizes and a record rate that falls as records grow, which is the shape
-   of VTOP's two cells here.
+   of VTOP's cells here.
 3. **Translation in the gateway.** Every Kafka record batch is decoded, validated (CRC, attributes) and
    re-appended through the native broker, which frames it again for the replica plane; Kafka validates the
    batch and appends it with offsets assigned in place, without taking its records apart. The cost is CPU and
@@ -132,8 +132,6 @@ measurement (#597, #598, #599).
 - **Latency resolution.** The JVM perf tool reports percentiles in whole milliseconds, from a sample of the
   run's records; sub-millisecond differences are invisible.
 - **End-to-end latency, CPU and write amplification** (#596 metrics 3 and 4) are not measured yet.
-- **No CI drift check yet.** The images are deterministic for a given matplotlib version, but CI does not yet
-  regenerate and compare them (#600 acceptance).
 
 ## Environment
 

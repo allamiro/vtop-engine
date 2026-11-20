@@ -1,0 +1,26 @@
+{
+  "batch": 100,
+  "client_image": "vtop-bench:fa0b16633fdc",
+  "engines": {
+    "A": {
+      "image": "vtop-bench:71270e1872f6",
+      "image_id": "sha256:bca88926ac3e3912b59f2a2bcfbe6d650ffc14ffb0cdefe08e3a4dfbbf9c0506"
+    },
+    "B": {
+      "image": "vtop-bench:fa0b16633fdc",
+      "image_id": "sha256:9e21bb41234fffbb533252f99624aae6c4e5d5e8ef6f6a24bfda7db43c2083cb"
+    }
+  },
+  "finished_at": "2026-11-11T05:07:18+00:00",
+  "harness_commit": "a687970312bb649802e948bf0c8b0d6c39fb6377",
+  "host_logical_cpus": "18",
+  "order": "per round: A then B",
+  "profile": "defaults",
+  "rate": 5000,
+  "rounds": 4,
+  "seconds": 120,
+  "started_at": "2026-11-11T04:49:57+00:00",
+  "value_bytes": 8,
+  "warmup_s": 10.0,
+  "what": "steady-state A/B of two VTOP node images, no faults, interleaved; see steady_ab.py"
+}

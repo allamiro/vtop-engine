@@ -8,8 +8,9 @@ manifest-driven telemetry object transfer engine — plus the distributed VTOP
 > **Status:** prototype / candidate-invention disclosure support package. Not
 > patented or patent-pending.
 
-Start with the [project README](../README.md) for setup, the CLI, and the
-Docker lab.
+Start with the [project README](../README.md) for what the engine guarantees and the
+measurements behind it, then the [quick start](getting-started/quickstart.md),
+[building from source](install/from-source.md) and [the CLI](reference/cli.md).
 
 ## The one rule everything serves
 
@@ -23,7 +24,7 @@ durably written **and verified** in object storage. The normative statement is
 the commit rule, [VTOP_PROTOCOL_DRAFT.md §13](VTOP_PROTOCOL_DRAFT.md#13-commit-rule);
 its enforcement is described in
 [ARCHITECTURE.md](ARCHITECTURE.md#engine-runtime-flow) and the
-[README](../README.md#core-rule).
+[README](../README.md#the-one-rule).
 
 ## Two planes, one repository
 
@@ -61,8 +62,9 @@ different subjects** — each doc says which it means.
 | [POSTGRES_DEPLOYMENT.md](POSTGRES_DEPLOYMENT.md) | PostgreSQL state-store rollout: `vtopctl migrate`, identity/privilege split, TLS requirements, scheduled pruning. | Deploy the engine against a Postgres ledger. |
 | [SECURITY_MODEL.md](SECURITY_MODEL.md) | Threat model, transport security, credential handling, manifest confidentiality/authentication, integrity verification, immutability, hardening, supply chain, normative-rules summary. | Understand the threat model and operational security rules. |
 | [NODE_OBSERVABILITY.md](NODE_OBSERVABILITY.md) | The `/metrics`, `/healthz`, `/readyz` contract shared by the engine and the cluster nodes, the full metric catalogue, and what readiness means per role (#224). | Scrape, alert on, or health-gate a VTOP process. |
+| [SUPPORT.md](SUPPORT.md) | Versioning and support: which releases get fixes, what a 0.x minor may break, what 1.x will commit to, and the 1.x support window. Format rules and the deprecation table are in the [compatibility policy](reference/compatibility.md). | Decide which release to run, or plan an upgrade. |
 | [RELEASE_VERIFICATION.md](RELEASE_VERIFICATION.md) | Verifying release artifacts (checksums, cosign signatures, SBOM). | Validate a downloaded release. |
-| [ROADMAP.md](ROADMAP.md) | Release-by-release narrative for the VTOP *cluster* plane (v0.1.0+), including known limitations per release. | Decide whether to depend on a cluster version. |
+| [ROADMAP.md](ROADMAP.md) | Release-by-release narrative for the archive engine and the cluster plane (v0.1.0+), with known limitations and upgrade notes per release, and the versioning rules. | Decide whether to depend on a version, or plan an upgrade. |
 
 ### Research & validation
 
@@ -72,6 +74,7 @@ different subjects** — each doc says which it means.
 | [WRITE_AMP_PROOF_OVERHEAD.md](WRITE_AMP_PROOF_OVERHEAD.md) | Methodology and runner for native segment write amplification + proof-carrying overhead (#189). | Measure single-copy body path and v1 vs v2 proof cost. |
 | [FETCH_IO_RESEARCH.md](FETCH_IO_RESEARCH.md) | Methodology, runner, and recommendation gate for native fetch I/O (#190): buffered vs sendfile/splice vs experimental O_DIRECT. | Decide whether buffered fetch is enough before pursuing Direct I/O / io_uring. |
 | [THROUGHPUT_RESEARCH.md](THROUGHPUT_RESEARCH.md) | What reaching 1M records/sec would actually take (#92): per-stage timing, the single-box arithmetic, the measured compression matrix, and — stated plainly — that no end-to-end demonstration exists. | Plan capacity, or check what the throughput numbers do and do not claim. |
+| [EGRESS_TRANSPORT_RESEARCH.md](EGRESS_TRANSPORT_RESEARCH.md) | The egress-transport measurement record (#475): the tuned-TCP baseline on emulated 100 ms links, the gate fixed before it was read and its verdict (#483), the HTTP/3 counterparty survey (#484), and the standing rules on what may be claimed about transports (#490). | Check what the TCP upload path does on a long, lossy or policed link, or whether the datagram work is authorised. |
 | [METADATA_SATURATION_RESEARCH.md](METADATA_SATURATION_RESEARCH.md) | Methodology, runner, and sharding-trigger gate for the single three-node metadata Raft group (#192). | Measure when one metadata group saturates before implementing multi-group sharding. |
 
 ### Legal / disclosure support

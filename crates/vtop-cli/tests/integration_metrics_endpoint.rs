@@ -40,6 +40,18 @@ const DASHBOARD_METRICS: [&str; 12] = [
     "vtop_batch_duration_seconds",
 ];
 
+/// The `event` values of `vtop_kafka_partition_events_total` (#675), as the
+/// Kafka source counts them.
+const KAFKA_PARTITION_EVENTS: [&str; 7] = [
+    "no_partitions",
+    "lookup_failed",
+    "grew",
+    "new_partition_from_beginning",
+    "start_deferred",
+    "pinned_before_renewal",
+    "recreated_or_truncated",
+];
+
 fn populated() -> String {
     let m = telemetry::init().expect("registry must initialize");
     let l = ["default", "kafka", "cef"];
@@ -54,7 +66,18 @@ fn populated() -> String {
     m.verification_backend_limited_total
         .with_label_values(&l)
         .inc_by(0);
+    m.recovery_rechecks_total
+        .with_label_values(&[l[0], l[1], l[2], "strong", "size_only"])
+        .inc_by(0);
     m.replay_required_total.with_label_values(&l).inc_by(0);
+    for reason in telemetry::RECOVERY_HOLD_REASONS {
+        m.recovery_held_total
+            .with_label_values(&[l[0], l[1], reason])
+            .inc_by(0);
+    }
+    m.recovery_rewinds_lowered_total
+        .with_label_values(&[l[0], l[1]])
+        .inc_by(0);
     m.failed_total.with_label_values(&l).inc_by(0);
     m.records_total.with_label_values(&l).inc_by(10);
     m.bytes_in_total.with_label_values(&l).inc_by(100);
@@ -66,8 +89,98 @@ fn populated() -> String {
             .with_label_values(&["default", "kafka", "cef", s])
             .observe(0.01);
     }
+    for d in telemetry::OBJECT_KEY_DECISIONS {
+        m.object_key_decisions_total
+            .with_label_values(&["default", "kafka", "cef", d])
+            .inc_by(0);
+    }
+    for r in telemetry::REPLAY_REBUILD_RESULTS {
+        m.replay_rebuilds_total
+            .with_label_values(&["default", "file", "raw", r])
+            .inc_by(0);
+    }
+    for e in KAFKA_PARTITION_EVENTS {
+        m.kafka_partition_events_total
+            .with_label_values(&[e])
+            .inc_by(0);
+    }
+    for o in telemetry::FILE_DELETE_OUTCOMES {
+        m.file_delete_decisions_total
+            .with_label_values(&[o])
+            .inc_by(0);
+    }
+    for a in telemetry::AUDIT_ACTIONS {
+        for o in telemetry::AUDIT_OUTCOMES {
+            m.audit_events_total.with_label_values(&[a, o]).inc_by(0);
+        }
+    }
+    for sink in telemetry::AUDIT_SINKS {
+        m.audit_write_failures_total
+            .with_label_values(&[sink])
+            .inc_by(0);
+    }
+    for r in telemetry::MULTIPART_PART_RESULTS {
+        m.multipart_parts_total.with_label_values(&[r]).inc_by(0);
+    }
+    for o in telemetry::MULTIPART_SESSION_OUTCOMES {
+        m.multipart_sessions_total.with_label_values(&[o]).inc_by(0);
+    }
+    for r in vtop_core::manifest::KeyResult::ALL {
+        m.manifest_authentications_total
+            .with_label_values(&["q4-2026", r.as_str()])
+            .inc_by(0);
+    }
+    for r in telemetry::OBJECT_LOCK_CHECK_RESULTS {
+        m.object_lock_checks_total
+            .with_label_values(&["default", r])
+            .inc_by(0);
+    }
+    for mode in telemetry::OBJECT_LOCK_MODES {
+        m.object_lock_mode
+            .with_label_values(&["default", mode])
+            .set(0);
+    }
+    for r in telemetry::RECEIPT_WRITE_RESULTS {
+        m.verification_receipts_total
+            .with_label_values(&["default", r])
+            .inc_by(0);
+    }
     m.inflight_batches.set(2);
     m.encode().expect("encode must succeed")
+}
+
+/// #684: the Object Lock profile's two families, under their names, with
+/// `result` and `mode` from their closed sets. An alert on a failed lock
+/// check and a panel on the mode the engine writes under read these.
+#[test]
+fn the_object_lock_metrics_are_exported() {
+    let text = populated();
+    assert!(
+        text.contains("# TYPE vtop_object_lock_checks_total counter"),
+        "{text}"
+    );
+    assert!(
+        text.contains("# TYPE vtop_object_lock_mode gauge"),
+        "{text}"
+    );
+    for result in [
+        "ok",
+        "missing",
+        "mode_mismatch",
+        "too_short",
+        "legal_hold_missing",
+        "error",
+        "bucket_not_locked",
+        "store_unsupported",
+    ] {
+        let series =
+            format!(r#"vtop_object_lock_checks_total{{result="{result}",tenant="default"}}"#);
+        assert!(text.contains(&series), "missing {series}:\n{text}");
+    }
+    for mode in ["off", "governance", "compliance"] {
+        let series = format!(r#"vtop_object_lock_mode{{mode="{mode}",tenant="default"}}"#);
+        assert!(text.contains(&series), "missing {series}:\n{text}");
+    }
 }
 
 #[test]
@@ -96,6 +209,52 @@ fn histograms_expose_buckets_for_quantiles() {
             text.contains(h),
             "missing {h}; histogram_quantile() needs it"
         );
+    }
+}
+
+/// #671 release B: manifests are counted by the version they were written
+/// in, labelled by tenant and version only (two values, never a batch id or
+/// URI), so an alert can see the first 0.4 manifest before any reader trips
+/// on it.
+#[test]
+fn manifests_written_are_counted_by_version() {
+    let m = telemetry::init().expect("registry must initialize");
+    for version in ["0.3", "0.4"] {
+        m.manifests_written_total
+            .with_label_values(&["metrics-endpoint", version])
+            .inc_by(0);
+    }
+    let text = m.encode().expect("encode must succeed");
+    assert!(
+        text.contains("# TYPE vtop_manifests_written_total counter"),
+        "{text}"
+    );
+    for version in ["0.3", "0.4"] {
+        let series = format!(
+            r#"vtop_manifests_written_total{{tenant="metrics-endpoint",version="{version}"}}"#
+        );
+        assert!(text.contains(&series), "missing {series}");
+    }
+}
+
+/// #671 release B: verification receipts are counted by tenant and a closed
+/// `result` (written by the engine, failed, repaired by recovery), never by
+/// batch id or URI, so an alert can catch a store refusing receipts.
+#[test]
+fn verification_receipts_are_counted_by_bounded_result() {
+    assert_eq!(
+        telemetry::RECEIPT_WRITE_RESULTS,
+        ["written", "failed", "repaired"]
+    );
+    let text = populated();
+    assert!(
+        text.contains("# TYPE vtop_verification_receipts_total counter"),
+        "{text}"
+    );
+    for result in telemetry::RECEIPT_WRITE_RESULTS {
+        let series =
+            format!(r#"vtop_verification_receipts_total{{result="{result}",tenant="default"}}"#);
+        assert!(text.contains(&series), "missing {series}");
     }
 }
 
@@ -147,7 +306,45 @@ fn unbounded_identifiers_are_never_labels() {
 fn every_exported_label_is_from_a_bounded_set() {
     // "le" is Prometheus's own histogram bucket label. It is bounded by the
     // bucket list defined in telemetry.rs, not free-form, so it is legitimate.
-    const BOUNDED: [&str; 6] = ["tenant", "source_type", "format", "state", "stage", "le"];
+    // "decision" takes the values of telemetry::OBJECT_KEY_DECISIONS (#626),
+    // "outcome" those of FILE_DELETE_OUTCOMES (#619), never the path,
+    // "event" the seven of KAFKA_PARTITION_EVENTS (#675), and
+    // `verification_class` (strong, size_only, unknown) and `result` (strong,
+    // size_only, failed, unsupported_version) are closed sets (#664), as is
+    // `result` on vtop_replay_rebuilds_total (REPLAY_REBUILD_RESULTS, #626), and
+    // "version" is the manifest version, "0.3" or "0.4", the values
+    // `manifest.write_version` accepts (#671 release B).
+    // "reason" and "signal" label the OpenTelemetry exporter's own counters
+    // (#683): three drop reasons and two signals, fixed in vtop-observe.
+    // "action" is the closed set of audit actions and "sink" one of log,
+    // file, ledger (#694); `outcome` there is attempt, success, failure or
+    // refused.
+    // "key_id" is a key id the operator configured in `manifest.mac`, or
+    // `none` or `other`, never an id read from a manifest (#685): bounded by
+    // the config, and pinned by `a_hostile_manifest_key_id_never_becomes_a_label`.
+    // "mode" is the Object Lock mode of `vtop_object_lock_mode` (#684): off,
+    // governance or compliance (and strong or size_only on
+    // `vtop_verification_mode`).
+    const BOUNDED: [&str; 18] = [
+        "tenant",
+        "source_type",
+        "format",
+        "state",
+        "stage",
+        "le",
+        "decision",
+        "outcome",
+        "event",
+        "verification_class",
+        "result",
+        "reason",
+        "signal",
+        "version",
+        "action",
+        "sink",
+        "key_id",
+        "mode",
+    ];
     let text = populated();
     let mut seen = std::collections::BTreeSet::new();
     for line in text.lines().filter(|l| !l.starts_with('#')) {
@@ -168,6 +365,111 @@ fn every_exported_label_is_from_a_bounded_set() {
         "labels {unexpected:?} are not in the bounded set {BOUNDED:?}; if one is \
          genuinely low-cardinality add it there, otherwise it belongs in logs"
     );
+}
+
+/// #694: the audit trail's counters are exported under their names, labelled
+/// by the closed sets only (never the actor, target or a path), and their
+/// action set is the one the audit records use.
+#[test]
+fn the_audit_counters_are_exported_with_bounded_labels() {
+    let text = populated();
+    for (name, labels) in [
+        ("vtop_audit_events_total", &["action=", "outcome="][..]),
+        ("vtop_audit_write_failures_total", &["sink="][..]),
+    ] {
+        assert!(
+            text.contains(&format!("# TYPE {name} counter")),
+            "{name} is not exported:\n{text}"
+        );
+        let series: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with(&format!("{name}{{")))
+            .collect();
+        assert!(!series.is_empty(), "{name} has no series");
+        for line in series {
+            for label in labels {
+                assert!(line.contains(label), "{line} lacks {label}");
+            }
+        }
+    }
+    assert!(text.contains(r#"vtop_audit_events_total{action="ledger.prune",outcome="refused"}"#));
+    assert!(text.contains(r#"vtop_audit_write_failures_total{sink="ledger"}"#));
+    let actions: Vec<_> = vtop_observe::audit::Action::ALL
+        .iter()
+        .map(|a| a.as_str())
+        .collect();
+    assert_eq!(
+        actions,
+        telemetry::AUDIT_ACTIONS,
+        "the metric's action label set must be the audit record's action set"
+    );
+    let outcomes: Vec<_> = vtop_observe::audit::Outcome::ALL
+        .iter()
+        .map(|o| o.as_str())
+        .collect();
+    assert_eq!(outcomes, telemetry::AUDIT_OUTCOMES);
+    let sinks: Vec<_> = vtop_observe::audit::Sink::ALL
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    assert_eq!(sinks, telemetry::AUDIT_SINKS);
+}
+
+/// #733: the count of secret files accepted under
+/// `security.allow_loose_secret_permissions` is exported under its name with
+/// no labels at all: the path and mode are in the log line and the audit
+/// record, never a label.
+#[test]
+fn the_secret_file_override_counter_is_exported_without_labels() {
+    let text = populated();
+    let name = "vtop_secret_file_permission_overrides_total";
+    assert!(
+        text.contains(&format!("# TYPE {name} counter")),
+        "{name} is not exported:\n{text}"
+    );
+    let series: Vec<_> = text.lines().filter(|line| line.starts_with(name)).collect();
+    assert_eq!(series.len(), 1, "{series:?}");
+    assert!(
+        series[0].starts_with(&format!("{name} ")),
+        "{name} must carry no labels: {}",
+        series[0]
+    );
+    assert!(telemetry::AUDIT_ACTIONS.contains(&"security.override"));
+}
+
+/// #664: the counter an alert on "verified strong, re-checked size-only" reads
+/// is exported under its name, with the class and result as labels.
+#[test]
+fn the_recovery_recheck_counter_is_exported() {
+    let text = populated();
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("vtop_recovery_rechecks_total{")
+                && line.contains(r#"verification_class="strong""#)
+                && line.contains(r#"result="size_only""#)),
+        "vtop_recovery_rechecks_total{{verification_class, result}} is missing:\n{text}"
+    );
+}
+
+/// #782: the counters of a range recovery held and of a rewind it lowered
+/// above one are exported under their names, labelled by tenant, source type
+/// and, for the hold, its reason from a closed set: an alert on a state store
+/// refusing recovery's writes reads `reason="ledger_write_failed"`.
+#[test]
+fn the_recovery_hold_counters_are_exported() {
+    let text = populated();
+    assert_eq!(
+        telemetry::RECOVERY_HOLD_REASONS,
+        ["ledger_write_failed", "newer_manifest"]
+    );
+    for reason in telemetry::RECOVERY_HOLD_REASONS {
+        let series = format!(
+            r#"vtop_recovery_held_total{{reason="{reason}",source_type="kafka",tenant="default"}}"#
+        );
+        assert!(text.contains(&series), "missing {series}:\n{text}");
+    }
+    let series = r#"vtop_recovery_rewinds_lowered_total{source_type="kafka",tenant="default"}"#;
+    assert!(text.contains(series), "missing {series}:\n{text}");
 }
 
 /// The invariant, expressed in metrics: a commit is only ever recorded after a
@@ -276,6 +578,25 @@ async fn serves_metrics_health_and_readiness() {
         metrics.contains("vtop_records_total"),
         "/metrics must serve the registry: {metrics}"
     );
+    // #683: the OpenTelemetry exporter's own counters are served too, from
+    // the first scrape and with export off, so an alert on them reads 0
+    // rather than "no data".
+    for series in [
+        "vtop_otel_spans_exported_total ",
+        "vtop_otel_spans_dropped_total{reason=\"queue_full\"} ",
+        "vtop_otel_spans_dropped_total{reason=\"export_failed\"} ",
+        "vtop_otel_spans_dropped_total{reason=\"shutdown\"} ",
+        "vtop_otel_export_failures_total{signal=\"traces\"} ",
+        "vtop_otel_export_failures_total{signal=\"metrics\"} ",
+        "vtop_otel_metric_points_exported_total ",
+        "vtop_otel_metric_points_dropped_total ",
+        "vtop_otel_export_queue_length ",
+    ] {
+        assert!(
+            metrics.contains(series),
+            "{series} is not served: {metrics}"
+        );
+    }
 
     assert!(get("/healthz").await.trim_end().ends_with("200"));
     assert!(get("/readyz").await.trim_end().ends_with("200"));
@@ -342,5 +663,199 @@ async fn connection_cap_rejects_excess_and_recovers() {
     assert!(
         body.trim_end().ends_with("200"),
         "endpoint must recover once capacity frees: {body}"
+    );
+}
+
+/// #626: how each object key was decided is exported, with `decision` from
+/// its bounded set, so an alert can see replays writing second objects
+/// (`fallback_*`, `per_attempt`) without parsing logs.
+#[test]
+fn object_key_decisions_are_exported_by_bounded_decision() {
+    let text = populated();
+    assert!(text.contains("vtop_object_key_decisions_total"), "{text}");
+    for d in vtop_core::telemetry::OBJECT_KEY_DECISIONS {
+        let label = format!(r#"decision="{d}""#);
+        assert!(text.contains(&label), "missing {label}");
+    }
+}
+
+/// #626: what each replay of a recorded window came to is exported by
+/// `result`, from its bounded set, so an alert can see replays writing
+/// second objects (`bytes_differ`) without parsing logs. No range, key or
+/// path is a label.
+#[test]
+fn replay_rebuilds_are_exported_by_bounded_result() {
+    let text = populated();
+    assert!(text.contains("vtop_replay_rebuilds_total"), "{text}");
+    for r in vtop_core::telemetry::REPLAY_REBUILD_RESULTS {
+        let label = format!(r#"result="{r}""#);
+        assert!(
+            text.lines().any(
+                |line| line.starts_with("vtop_replay_rebuilds_total{") && line.contains(&label)
+            ),
+            "missing vtop_replay_rebuilds_total with {label}"
+        );
+    }
+}
+
+/// #619: every `delete_after_commit` decision is exported by `outcome`, a
+/// fixed set, so a rising `no_open_check` or `rename_refused` - files kept
+/// until the operator acts - can be alerted on without parsing logs.
+#[test]
+fn file_delete_decisions_are_exported_by_bounded_outcome() {
+    let text = populated();
+    assert!(text.contains("vtop_file_delete_decisions_total"), "{text}");
+    for o in vtop_core::telemetry::FILE_DELETE_OUTCOMES {
+        let label = format!(r#"outcome="{o}""#);
+        assert!(text.contains(&label), "missing {label}");
+    }
+}
+
+/// #619, v0.10.0: the outcome set is pinned by name. It is the union of the
+/// sixteen values v0.9.0 exported and the two v0.10.0 adds:
+/// `deleted_unchecked` (a delete under `delete_without_open_check` with no
+/// lease, the signal an operator is living with the opt-in's windows) and
+/// `links_changed` (a file kept because its link count changed). A value
+/// dropped or renamed breaks an alert, so a change here is deliberate.
+/// (`file_delete_decisions_are_exported_by_bounded_outcome` checks that
+/// /metrics exports each of them.)
+#[test]
+fn file_delete_outcomes_are_the_released_set_and_the_two_v0_10_0_adds() {
+    let released = [
+        "deleted",
+        "appended",
+        "shorter",
+        "other_file",
+        "rewritten",
+        "unprovable",
+        "metadata_changed",
+        "gone",
+        "symlink",
+        "open",
+        "no_open_check",
+        "rename_refused",
+        "failed",
+        "stale_commit",
+        "leftover_archived",
+        "opened_at_unlink",
+    ];
+    let added = ["deleted_unchecked", "links_changed"];
+    let mut expected: Vec<&str> = released.iter().chain(&added).copied().collect();
+    expected.sort_unstable();
+    let mut got: Vec<&str> = vtop_core::telemetry::FILE_DELETE_OUTCOMES.to_vec();
+    got.sort_unstable();
+    assert_eq!(got, expected, "telemetry::FILE_DELETE_OUTCOMES");
+}
+
+/// #675: Kafka partition-list changes are exported by `event`, a fixed set,
+/// so `recreated_or_truncated` can be alerted on.
+#[test]
+fn kafka_partition_events_are_exported_by_bounded_event() {
+    let text = populated();
+    assert!(text.contains("vtop_kafka_partition_events_total"), "{text}");
+    for e in KAFKA_PARTITION_EVENTS {
+        let label = format!(r#"event="{e}""#);
+        assert!(text.contains(&label), "missing {label}");
+    }
+}
+
+/// #668: multipart parts and sessions are exported by `result` and `outcome`,
+/// fixed sets, and never by object path, upload id or batch id, so an alert
+/// can see sessions kept after failures piling up without parsing logs.
+#[test]
+fn multipart_parts_and_sessions_are_exported_by_bounded_labels() {
+    let text = populated();
+    for name in [
+        "vtop_multipart_parts_total",
+        "vtop_multipart_sessions_total",
+        "vtop_multipart_bytes_reused_total",
+    ] {
+        assert!(text.contains(name), "{name} is not exported: {text}");
+    }
+    for r in vtop_core::telemetry::MULTIPART_PART_RESULTS {
+        let label = format!(r#"vtop_multipart_parts_total{{result="{r}"}}"#);
+        assert!(text.contains(&label), "missing {label}");
+    }
+    for o in vtop_core::telemetry::MULTIPART_SESSION_OUTCOMES {
+        let label = format!(r#"vtop_multipart_sessions_total{{outcome="{o}"}}"#);
+        assert!(text.contains(&label), "missing {label}");
+    }
+    for line in text.lines().filter(|l| l.starts_with("vtop_multipart_")) {
+        for forbidden in ["upload_id", "key=", "uri", "batch_id", "path"] {
+            assert!(
+                !line.contains(forbidden),
+                "{forbidden} is unbounded and belongs in the log line: {line}"
+            );
+        }
+    }
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("vtop_multipart_bytes_reused_total ")),
+        "the bytes counter is a plain, unlabelled counter, present from the start: {text}"
+    );
+}
+
+/// #685: manifest MAC checks are counted by key and result, and the key is
+/// the CONFIGURED id that was used, `none`, or `other`. A manifest naming a
+/// hostile id (from storage, so unbounded) is counted as `other`; its id
+/// never becomes a label.
+#[test]
+fn a_hostile_manifest_key_id_never_becomes_a_label() {
+    use serde_json::{json, Value};
+    use vtop_core::manifest::{
+        KeySourceKind, KeyringKey, ManifestKeyring, ManifestMacKey, ParsedManifest,
+    };
+    let m = telemetry::init().expect("registry must initialize");
+    let fixture: &[u8] =
+        include_bytes!("../../vtop-core/tests/fixtures/manifests/keyring-0.4-q4.json");
+    let hostile = "attacker-chosen-id-0123456789";
+    let mut doc: Value = serde_json::from_slice(fixture).unwrap();
+    doc["manifest"]["mac_key_id"] = json!(hostile);
+    let mut canonical = doc.clone();
+    canonical["manifest"]["sha256"] = json!("");
+    canonical["manifest"]["mac"] = json!("");
+    doc["manifest"]["sha256"] = json!(vtop_core::checksum::sha256_bytes(
+        &serde_json::to_vec(&canonical).unwrap()
+    ));
+    let keyring = ManifestKeyring::new(
+        "q4-endpoint",
+        vec![KeyringKey {
+            id: "q4-endpoint".into(),
+            key: ManifestMacKey::from_hex(&"22".repeat(32)).unwrap(),
+            source: KeySourceKind::File,
+            legacy: false,
+        }],
+        vec![],
+    )
+    .unwrap();
+    let before = m
+        .manifest_authentications_total
+        .with_label_values(&["other", "unknown_key"])
+        .get();
+    let auth = ParsedManifest::from_slice(&serde_json::to_vec(&doc).unwrap())
+        .unwrap()
+        .authenticate(&keyring);
+    assert!(auth.result.is_err());
+    auth.count();
+    assert_eq!(
+        m.manifest_authentications_total
+            .with_label_values(&["other", "unknown_key"])
+            .get(),
+        before + 1
+    );
+    let text = m.encode().expect("encode must succeed");
+    assert!(
+        text.contains("# TYPE vtop_manifest_authentications_total counter"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            r#"vtop_manifest_authentications_total{key_id="other",result="unknown_key"}"#
+        ),
+        "{text}"
+    );
+    assert!(
+        !text.contains(hostile),
+        "a manifest's id became a label: {text}"
     );
 }

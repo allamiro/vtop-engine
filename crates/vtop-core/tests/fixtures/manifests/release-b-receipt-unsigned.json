@@ -1,0 +1,25 @@
+{
+  "protocol": "VTOP",
+  "receipt_version": "1",
+  "batch_id": "vtop-20261114T194849Z-_tmp_receipt-fixture-unsigned_input_log-b0-26-625bee1b",
+  "manifest": {
+    "uri": "s3://telemetry-data/tenant=default/source=_tmp_receipt-fixture-unsigned_input.log/format=raw/year=2026/month=11/day=14/hour=19/vtop-20261114T194849Z-_tmp_receipt-fixture-unsigned_input_log-b0-26-625bee1b.manifest.json",
+    "sha256": "fe4bac471080667166d6ca75ec1df567aab6afff7dc16c8ae4c73956b6a66a82"
+  },
+  "object": {
+    "uri": "s3://telemetry-data/tenant=default/source=_tmp_receipt-fixture-unsigned_input.log/format=raw/year=2026/month=11/day=14/hour=19/vtop-vtop-fixture-_tmp_receipt-fixture-unsigned_input_log-b0-26-i233206-3da094283589df0a1fee745cd8924ae8.raw",
+    "size_bytes": 26,
+    "checksum_algorithm": "sha256",
+    "checksum": "3da094283589df0a1fee745cd8924ae87b11ca1d1722932596b78fffee105c51"
+  },
+  "verification": {
+    "class": "strong",
+    "method": "read_back"
+  },
+  "verified_at": "2026-11-14T19:48:49.955732805+00:00",
+  "verified_by": "vtop-fixture",
+  "origin": "engine",
+  "receipt": {
+    "sha256": "3de393eee65087f73a8da429a7577d69c92322e0c4240939c8e234345905a4e0"
+  }
+}

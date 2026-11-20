@@ -32,6 +32,7 @@ fn marker() -> ProgressMarker {
         mtime: "now".into(),
         content_fingerprint: None,
         tail_fingerprint: None,
+        ctime: None,
     }
 }
 

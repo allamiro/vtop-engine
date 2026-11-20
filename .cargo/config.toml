@@ -1,0 +1,9 @@
+# macOS: the lowest macOS release a binary built from this tree runs on (#677).
+# Rust already targets 11.0 on aarch64-apple-darwin, but C dependencies built
+# by cmake or cc (librdkafka, OpenSSL, aws-lc) otherwise default to the build
+# host's SDK. That raises the real minimum to the build machine's macOS and
+# floods the link with "built for newer 'macOS' version" warnings.
+# `force = false` keeps an explicit MACOSX_DEPLOYMENT_TARGET in the
+# environment in charge. Other platforms ignore it.
+[env]
+MACOSX_DEPLOYMENT_TARGET = { value = "11.0", force = false }

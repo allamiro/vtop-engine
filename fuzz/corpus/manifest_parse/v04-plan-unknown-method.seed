@@ -1,0 +1,50 @@
+{
+  "protocol": "VTOP",
+  "version": "0.4",
+  "batch_id": "vtop-20261114T112056Z-_tmp_manifest-fixture_input_log-b0-31-e6067ca2",
+  "tenant": "default",
+  "source_type": "file",
+  "source_name": "/tmp/manifest-fixture/input.log",
+  "format": "raw",
+  "compression": "none",
+  "record_count": 1,
+  "first_timestamp": null,
+  "last_timestamp": null,
+  "source_progress": {
+    "source_type": "file",
+    "path": "/tmp/manifest-fixture/input.log",
+    "inode": 99663,
+    "start_byte": 0,
+    "end_byte": 31,
+    "file_size": 31,
+    "mtime": "2026-11-14T11:20:56.642977296+00:00"
+  },
+  "object": {
+    "uri": "s3://archive/fixtures/tenant=default/source=_tmp_manifest-fixture_input.log/format=raw/year=2026/month=11/day=14/hour=11/vtop-20261114T112056Z-_tmp_manifest-fixture_input_log-b0-31-e6067ca2.raw",
+    "size_bytes": 31,
+    "checksum_algorithm": "sha256",
+    "checksum": "70760afe7d824194869e14ca677bda4e6d6f7542ba1ad42b63746ce9e3908c8a"
+  },
+  "manifest": {
+    "uri": "s3://archive/fixtures/tenant=default/source=_tmp_manifest-fixture_input.log/format=raw/year=2026/month=11/day=14/hour=11/vtop-20261114T112056Z-_tmp_manifest-fixture_input_log-b0-31-e6067ca2.manifest.json",
+    "sha256": "b2640492fe73821bcadcac7661aabca7453f2a8bad6fac8e376a87c86516683a"
+  },
+  "partitioning": {
+    "path_template": "tenant={tenant}/source={source}/format={format}/year={yyyy}/month={mm}/day={dd}/hour={hh}/",
+    "resolved_prefix": "tenant=default/source=_tmp_manifest-fixture_input.log/format=raw/year=2026/month=11/day=14/hour=11"
+  },
+  "upload_backend": "localfs",
+  "state": "manifest_uploaded",
+  "verification_status": "not_verified",
+  "verification_plan": {
+    "method": "future_method",
+    "require_strong": false,
+    "future_field": [
+      1,
+      {
+        "nested": true
+      }
+    ]
+  },
+  "created_at": "2026-11-14T11:20:56.657358046+00:00"
+}

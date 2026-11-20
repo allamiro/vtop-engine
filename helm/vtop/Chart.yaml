@@ -22,9 +22,15 @@ type: application
 # 0.2.1: no template or values change — the bump carries appVersion 0.4.0.
 # 0.2.0: `replicated` renders symmetric candidates and data.leaderOrdinal is
 # retired (#284) — a values-contract change, hence the minor bump.
-version: 0.5.0
+# 0.5.1: no template or values change — the bump carries appVersion 0.8.0.
+# 0.5.2: no template or values change — the bump carries appVersion 0.9.0.
+# 0.5.3: no template or values change — the bump carries appVersion 0.10.0.
+# 0.6.0: metrics.prometheusRule lands (#720, #772): an optional PrometheusRule
+# carrying the shipped alert rules, off by default — a values-contract
+# addition, hence the minor bump; carries appVersion 0.10.1.
+version: 0.6.0
 # Must track the workspace version in Cargo.toml; the GHCR image tags follow it.
-appVersion: "0.7.0"
+appVersion: "0.10.1"
 kubeVersion: ">=1.25.0-0"
 home: https://github.com/allamiro/vtop-engine
 sources:

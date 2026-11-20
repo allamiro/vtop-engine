@@ -1,0 +1,14 @@
+time_utc,decision,requests
+02:50:38,attempt #1 failed (transient: timeout); retried from the first byte,21
+02:50:39,attempt #1 failed (transient: timeout); retried from the first byte,3
+02:55:38,attempt #2 failed (transient: timeout); retried from the first byte,10
+02:55:39,attempt #2 failed (transient: timeout); retried from the first byte,12
+02:55:40,attempt #2 failed (transient: timeout); retried from the first byte,2
+02:59:34,not retried: out of attempts,1
+03:05:38,attempt #1 failed (transient: timeout); retried from the first byte,6
+03:05:38,attempt #1 not retried: retry quota exhausted,2
+03:05:39,attempt #1 failed (transient: timeout); retried from the first byte,2
+03:05:39,attempt #1 not retried: retry quota exhausted,6
+03:10:38,attempt #2 not retried: retry quota exhausted,1
+03:10:39,attempt #2 failed (transient: timeout); retried from the first byte,2
+03:10:39,attempt #2 not retried: retry quota exhausted,5

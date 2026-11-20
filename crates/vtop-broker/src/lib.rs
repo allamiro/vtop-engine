@@ -32,12 +32,14 @@ pub mod fencing_epochs;
 pub mod group_commit;
 pub mod kept_dispute;
 pub mod memory_budget;
+pub mod produce_phases;
 pub mod replication;
 pub mod retention_stats;
 pub mod server_metrics;
 
 use crate::group_commit::{GroupCommitConfig, GroupCommitCoordinator, QueuedProduce};
 use crate::memory_budget::{reject_message, BudgetReservation, ConnectionBudget};
+use crate::produce_phases::ProducePhase;
 use crate::replication::network::PlaintextExposure;
 use crate::replication::{ClusterCommittedOffset, ReplicaSet};
 
@@ -174,6 +176,13 @@ pub enum BrokerError {
     /// sides, see `vtop_meta::transport::cross_mode_refusal`.
     #[error("{0}")]
     CrossMode(String),
+    /// A replica peer this node will not run a session with, or one that
+    /// will not run one with this node (#634): the version handshake found
+    /// it below the cluster's finalized feature level, or found no protocol
+    /// in common. Its own variant because the remedy is an upgrade, not a
+    /// retry or a configuration change.
+    #[error("replica version: {0}")]
+    ReplicaVersion(String),
     #[error("segment storage error: {0}")]
     Segment(#[from] vtop_log::LogError),
 }
@@ -321,6 +330,18 @@ impl ProducerEpochJournal {
         }
         self.current.insert(producer_id, epoch);
         Ok(())
+    }
+
+    /// Whether an admission this journal gave `producer_id` at `epoch`
+    /// earlier in the same flush still stands: the journal is writable and
+    /// still at `left_at`, the epoch the flush's first pass left it at, which
+    /// `epoch` does not exceed. Then nothing outside that pass has moved the
+    /// producer on since, and the only newer epoch it can have recorded is a
+    /// later member of the same group, which comes after this one in queue
+    /// order exactly as it would sent alone (#752, D6). Anything else is
+    /// judged afresh by [`Self::accept`], so no fence is ever skipped.
+    fn still_admits(&self, producer_id: Uuid, epoch: u64, left_at: u64) -> bool {
+        !self.poisoned && epoch <= left_at && self.current(producer_id) == Some(left_at)
     }
 }
 
@@ -665,6 +686,8 @@ pub struct LocalBroker {
     group_checkpoints: Option<GroupCheckpointStore>,
     /// Optional adaptive cross-session group-commit coordinator.
     group_commit: Option<Arc<GroupCommitCoordinator>>,
+    /// Where produce time goes, by phase (#752).
+    produce_phases: crate::produce_phases::ProducePhaseMetrics,
     /// Shared memory budgets for produce / fetch / replication admission.
     memory: Arc<MemoryBudgetPool>,
     state: Mutex<BrokerState>,
@@ -791,6 +814,7 @@ impl LocalBroker {
             node_id,
             group_checkpoints: None,
             group_commit: None,
+            produce_phases: Default::default(),
             memory: MemoryBudgetPool::new(MemoryBudgetConfig::default())
                 .expect("default memory budget config is valid"),
             state: Mutex::new(BrokerState {
@@ -818,45 +842,7 @@ impl LocalBroker {
     /// a config that does not is refused here by name.
     pub fn with_group_commit(mut self, config: GroupCommitConfig) -> BrokerResult<Self> {
         if self.replicas.is_some() {
-            let limits = crate::replication::REPLICA_LIMITS;
-            let frame = u64::from(limits.max_frame_bytes);
-            let header = vtop_protocol::HEADER_LEN as u64;
-            let per_request = vtop_protocol::replica_append_frame_size(&self.range, &[])
-                .map_err(|problem| BrokerError::InvalidConfig(problem.to_string()))?
-                as u64
-                - header;
-            // How many requests one group can hold: the record threshold seals
-            // at max_records (one record per request at the least), the queue
-            // at max_pending_requests. ONE request never batches — the driver
-            // sends it as a single append, already judged per request — so
-            // only a config that can seal a multi-request group is judged
-            // here (review).
-            let requests = (config.max_records.min(config.max_pending_requests)) as u64;
-            if requests > 1 {
-                // The record bytes a group can reach: whichever bound is met
-                // first (review) — the byte and record thresholds together, or
-                // `requests` admissible requests each carrying the most one
-                // frame allows. A threshold set high to disable itself does
-                // not count against a config the other threshold keeps safe.
-                let single_payload_max = frame.saturating_sub(header + per_request);
-                let by_thresholds = config
-                    .max_bytes
-                    .saturating_add((config.max_records as u64).saturating_mul(16));
-                let by_requests = requests.saturating_mul(single_payload_max);
-                let worst = header
-                    .saturating_add(4)
-                    .saturating_add(requests.saturating_mul(per_request))
-                    .saturating_add(by_thresholds.min(by_requests));
-                if worst > frame {
-                    return Err(BrokerError::InvalidConfig(format!(
-                        "group commit could seal a group of up to {worst} bytes on the wire \
-                         (max_bytes {} + {} records + {requests} requests), more than the \
-                         replica plane frames per append ({frame}); lower max_bytes or \
-                         max_records so a sealed group always fits one replica frame",
-                        config.max_bytes, config.max_records
-                    )));
-                }
-            }
+            refuse_unframeable_group_commit(&self.range, &config)?;
         }
         self.group_commit = Some(Arc::new(
             GroupCommitCoordinator::new(config).map_err(BrokerError::InvalidConfig)?,
@@ -878,6 +864,12 @@ impl LocalBroker {
     /// Group-commit coordinator, when configured.
     pub fn group_commit(&self) -> Option<&Arc<GroupCommitCoordinator>> {
         self.group_commit.as_ref()
+    }
+
+    /// Time spent in each phase of the produce path since this broker was
+    /// built (#752): local fsync, replication, commit.
+    pub fn produce_phases(&self) -> &crate::produce_phases::ProducePhaseMetrics {
+        &self.produce_phases
     }
 
     /// Shared memory-budget pool.
@@ -1166,6 +1158,15 @@ impl LocalBroker {
             self.fencing_epoch_history_broken
                 .store(true, Ordering::SeqCst);
         }
+        // The directory may have been a follower's until a role flip, with
+        // a crash between an append it took from a leader and the journal's
+        // re-derivation from that leader's lineage (#640, #648 review). The
+        // replay files those records as the leader did before this broker
+        // reads or extends the history.
+        if journal.replay_leader_lineage_at_open(next_offset).is_err() {
+            self.fencing_epoch_history_broken
+                .store(true, Ordering::SeqCst);
+        }
         if journal.latest().is_none() {
             let epoch = self.held_fencing_epoch.load(Ordering::SeqCst);
             // Epoch 0 is the "no grant yet" sentinel a lease-driven replica
@@ -1210,6 +1211,21 @@ impl LocalBroker {
             return true;
         }
         journal.truncate_to(next_offset.saturating_add(1)).is_ok()
+    }
+
+    /// Make this replica's log the range's history on an operator's
+    /// attestation (#636): see
+    /// [`crate::fencing_epochs::FencingEpochJournal::seed_attested_history`].
+    ///
+    /// PRECONDITION: call it only once metadata has recorded a promotion of
+    /// this replica made under an attestation naming it. Nothing here can
+    /// check that; written earlier, the seed is lineage nobody authorized.
+    pub fn adopt_attested_history(&self, epoch: u64) -> BrokerResult<bool> {
+        crate::fencing_epochs::FencingEpochJournal::seed_attested_history_in(
+            &self.fencing_epoch_journal,
+            &self.fencing_epoch_history_broken,
+            epoch,
+        )
     }
 
     /// This replica's epoch history.
@@ -1993,15 +2009,38 @@ impl LocalBroker {
     /// Append every admitted member under one local durability barrier, then
     /// (for Quorum) one replica fan-out / HWM advance covering the group.
     fn flush_produce_group(&self, batch: &[QueuedProduce]) -> Vec<WireFrame> {
+        self.flush_admitted(batch, &[])
+    }
+
+    /// [`Self::flush_produce_group`], with `admitted[i]`, when present, the
+    /// epoch an earlier pass over the same group left the producer epoch
+    /// journal at after admitting `batch[i]` (see
+    /// [`ProducerEpochJournal::still_admits`]). Empty for a first pass.
+    fn flush_admitted(&self, batch: &[QueuedProduce], admitted: &[Option<u64>]) -> Vec<WireFrame> {
         if batch.is_empty() {
             return Vec::new();
         }
         let durability = batch[0].request.durability;
+        // One barrier, so one durability (#752, D8). The coordinator seals a
+        // group before a member that asks for another, so this cannot
+        // happen; were it to, each run of one durability is flushed on its
+        // own, in order, and no member is acknowledged at a weaker barrier
+        // than it asked for.
+        if let Some(split) = batch
+            .iter()
+            .position(|item| item.request.durability != durability)
+        {
+            let mut frames =
+                self.flush_admitted(&batch[..split], admitted.get(..split).unwrap_or(&[]));
+            frames
+                .extend(self.flush_admitted(&batch[split..], admitted.get(split..).unwrap_or(&[])));
+            return frames;
+        }
         // Lock order: metadata lease view, then broker state. Hold both only
         // through the local durable append so a concurrent grant/release cannot
         // revoke between the fencing check and fsync. Quorum fan-out runs after
         // these locks are released.
-        let prepared = {
+        let prepared = 'prepared: {
             let meta = self.meta_fencing_epoch.lock();
             let mut state = self
                 .state
@@ -2011,7 +2050,10 @@ impl LocalBroker {
             let mut records = Vec::new();
             let mut member_record_counts = Vec::with_capacity(batch.len());
             let mut early: Vec<Option<WireFrame>> = Vec::with_capacity(batch.len());
-            for item in batch {
+            // Which members this pass admitted, for a re-run of the group.
+            let mut admitted_here = Vec::with_capacity(batch.len());
+            for (index, item) in batch.iter().enumerate() {
+                admitted_here.push(false);
                 if let Err((code, message)) =
                     self.check_range(&meta, &item.request.range, item.request.fencing_epoch)
                 {
@@ -2019,10 +2061,27 @@ impl LocalBroker {
                     member_record_counts.push(0);
                     continue;
                 }
-                if let Err(problem) = state
-                    .producer_epochs
-                    .accept(item.request.producer_id, item.request.producer_epoch)
-                {
+                let (producer_id, producer_epoch) =
+                    (item.request.producer_id, item.request.producer_epoch);
+                // A member an earlier pass over this group admitted keeps
+                // that admission, while the journal still stands where that
+                // pass left it (#752, D6). Judged again, a member at epoch N
+                // would be fenced by the N+1 a later member of its own group
+                // had just recorded, where sent alone, ahead of it, it is
+                // accepted (review of #780).
+                let admission = match admitted.get(index).copied().flatten() {
+                    Some(left_at)
+                        if state.producer_epochs.still_admits(
+                            producer_id,
+                            producer_epoch,
+                            left_at,
+                        ) =>
+                    {
+                        Ok(())
+                    }
+                    _ => state.producer_epochs.accept(producer_id, producer_epoch),
+                };
+                if let Err(problem) = admission {
                     let frame = match problem {
                         BrokerError::ProducerFenced { .. } => error(
                             item.request_id,
@@ -2079,6 +2138,7 @@ impl LocalBroker {
                 member_record_counts.push(member_records.len());
                 records.append(&mut member_records);
                 early.push(None);
+                admitted_here[index] = true;
             }
 
             if records.is_empty() {
@@ -2097,10 +2157,13 @@ impl LocalBroker {
             // the bound sees an ack, not `SegmentByteLimit` — that error now
             // reaches a client only for a group larger than a whole segment,
             // which is a configuration problem no roll can fix.
-            match state
+            let fsync_started = std::time::Instant::now();
+            let appended = state
                 .segment
-                .append_group_minting(&records, Durability::Fsync)
-            {
+                .append_group_minting(&records, Durability::Fsync);
+            self.produce_phases
+                .record(ProducePhase::LocalFsync, fsync_started.elapsed());
+            match appended {
                 Ok(outcomes) => {
                     // Reclaim AFTER the append that may have rolled, under
                     // the same lock, so the sealed prefix never outlives the
@@ -2124,7 +2187,32 @@ impl LocalBroker {
                         cursor += count;
                         wire_by_member.push(Ok(member_outcomes));
                     }
-                    (tip_before, leader_committed, wire_by_member)
+                    Ok((tip_before, leader_committed, wire_by_member))
+                }
+                // A refusal one member can cause, in a group of more than
+                // one (#752, D6): the log validates the whole group before it
+                // writes a byte and refuses it whole, so nothing of it is on
+                // disk, and each member is re-run alone below, after these
+                // locks are released, so only the member that caused it
+                // fails. A storage error still fails the whole group.
+                Err(problem) if batch.len() > 1 && member_can_cause(&problem) => {
+                    // The log wrote nothing, but this pass's admissions
+                    // are durable in the producer epoch journal: carry where
+                    // each admitted member's producer now stands, so the
+                    // re-run keeps them rather than judging a member against
+                    // an epoch a later member of its own group recorded.
+                    let readmit = batch
+                        .iter()
+                        .zip(&admitted_here)
+                        .map(|(item, &admitted)| {
+                            if admitted {
+                                state.producer_epochs.current(item.request.producer_id)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    break 'prepared Err((problem, readmit));
                 }
                 Err(problem) => {
                     let code = match &problem {
@@ -2151,7 +2239,10 @@ impl LocalBroker {
             }
         };
 
-        let (tip_before, leader_committed, wire_by_member) = prepared;
+        let (tip_before, leader_committed, wire_by_member) = match prepared {
+            Ok(prepared) => prepared,
+            Err((problem, readmit)) => return self.flush_each_alone(batch, &problem, &readmit),
+        };
         if durability == WireDurability::LocalFsync {
             return batch
                 .iter()
@@ -2237,7 +2328,13 @@ impl LocalBroker {
             offset_cursor = member_end.max(offset_cursor);
         }
 
+        let replicate_started = std::time::Instant::now();
         let quorum = replicas.replicate_append_batch(&replica_requests, leader_committed);
+        let commit_started = std::time::Instant::now();
+        self.produce_phases.record(
+            ProducePhase::Replicate,
+            commit_started.duration_since(replicate_started),
+        );
         if !quorum.has_quorum() {
             let message = format!(
                 "quorum not reached: {} follower ack(s), need majority of {}",
@@ -2267,6 +2364,8 @@ impl LocalBroker {
                 if let Err((code, message)) =
                     self.check_range(&meta, &item.request.range, item.request.fencing_epoch)
                 {
+                    self.produce_phases
+                        .record(ProducePhase::Commit, commit_started.elapsed());
                     return batch
                         .iter()
                         .zip(wire_by_member)
@@ -2308,6 +2407,8 @@ impl LocalBroker {
             fencing_epoch: hwm_epoch,
             committed_high_watermark: committed,
         });
+        self.produce_phases
+            .record(ProducePhase::Commit, commit_started.elapsed());
         batch
             .iter()
             .zip(wire_by_member)
@@ -2321,6 +2422,38 @@ impl LocalBroker {
                         committed_next_offset: committed,
                     }),
                 },
+            })
+            .collect()
+    }
+
+    /// Re-run a group the log refused whole, one member at a time and in
+    /// order, so the refusal reaches only the members that cause it (#752,
+    /// D6). Each member then pays its own barrier, which is what it would
+    /// have paid without group commit; nothing of the refused group was
+    /// written, so nothing is appended twice.
+    fn flush_each_alone(
+        &self,
+        batch: &[QueuedProduce],
+        problem: &vtop_log::LogError,
+        readmit: &[Option<u64>],
+    ) -> Vec<WireFrame> {
+        if let Some(coordinator) = &self.group_commit {
+            coordinator.metrics().record_split();
+        }
+        vtop_meta::transport::warn_rate_limited(
+            "group-commit-split",
+            &format!(
+                "group commit: a group of {} requests was refused as a whole ({problem}); it \
+                 was re-run request by request, so only the requests that caused it fail. \
+                 Nothing is needed unless a client keeps sending the request that is refused",
+                batch.len()
+            ),
+        );
+        batch
+            .iter()
+            .zip(readmit)
+            .flat_map(|(item, readmit)| {
+                self.flush_admitted(std::slice::from_ref(item), std::slice::from_ref(readmit))
             })
             .collect()
     }
@@ -2353,6 +2486,78 @@ impl LocalBroker {
         }
         Ok(())
     }
+}
+
+/// Whether a replicated range could frame every group `config` can seal
+/// (#453, review): a group of individually admissible requests is
+/// replicated as one batch frame, and a config that could seal a group the
+/// plane cannot frame would lose quorum after the leader append. Public so a
+/// node can refuse such a config at startup, before it holds a lease it
+/// would then fail to build a leader for (#752).
+pub fn refuse_unframeable_group_commit(
+    range: &RangeIdentity,
+    config: &GroupCommitConfig,
+) -> BrokerResult<()> {
+    let limits = crate::replication::REPLICA_LIMITS;
+    let frame = u64::from(limits.max_frame_bytes);
+    let header = vtop_protocol::HEADER_LEN as u64;
+    let per_request = vtop_protocol::replica_append_frame_size(range, &[])
+        .map_err(|problem| BrokerError::InvalidConfig(problem.to_string()))?
+        as u64
+        - header;
+    // How many requests one group can hold: the record threshold seals
+    // at max_records (one record per request at the least), the queue
+    // at max_pending_requests. ONE request never batches — the driver
+    // sends it as a single append, already judged per request — so
+    // only a config that can seal a multi-request group is judged
+    // here (review).
+    let requests = (config.max_records.min(config.max_pending_requests)) as u64;
+    if requests > 1 {
+        // The record bytes a group can reach: whichever bound is met
+        // first (review) — the byte and record thresholds together, or
+        // `requests` admissible requests each carrying the most one
+        // frame allows. A threshold set high to disable itself does
+        // not count against a config the other threshold keeps safe.
+        let single_payload_max = frame.saturating_sub(header + per_request);
+        let by_thresholds = config
+            .max_bytes
+            .saturating_add((config.max_records as u64).saturating_mul(16));
+        let by_requests = requests.saturating_mul(single_payload_max);
+        let worst = header
+            .saturating_add(4)
+            .saturating_add(requests.saturating_mul(per_request))
+            .saturating_add(by_thresholds.min(by_requests));
+        if worst > frame {
+            return Err(BrokerError::InvalidConfig(format!(
+                "group commit could seal a group of up to {worst} bytes on the wire \
+                     (max_bytes {} + {} records + {requests} requests), more than the \
+                     replica plane frames per append ({frame}); lower max_bytes or \
+                     max_records so a sealed group always fits one replica frame",
+                config.max_bytes, config.max_records
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Whether the log refused a group for something one of its members can
+/// cause — a sequence or fencing refusal for one producer, or a size limit
+/// a smaller group would meet — rather than for the storage under it. These
+/// are all judged before a byte of the group is written.
+fn member_can_cause(problem: &vtop_log::LogError) -> bool {
+    matches!(
+        problem,
+        vtop_log::LogError::FirstSequence { .. }
+            | vtop_log::LogError::SequenceGap { .. }
+            | vtop_log::LogError::SequenceConflict { .. }
+            | vtop_log::LogError::SequenceBelowWindow { .. }
+            | vtop_log::LogError::ProducerFenced { .. }
+            | vtop_log::LogError::RecordTooLarge { .. }
+            | vtop_log::LogError::GroupTooLarge { .. }
+            | vtop_log::LogError::SegmentByteLimit { .. }
+            | vtop_log::LogError::SegmentRecordLimit { .. }
+            | vtop_log::LogError::UnsupportedRecordField(_)
+    )
 }
 
 fn map_metadata_error(error: &MetadataError) -> (ErrorCode, String) {
@@ -4145,6 +4350,42 @@ mod tests {
             reopened.accept(producer, 8),
             Err(BrokerError::ProducerFenced { .. })
         ));
+    }
+
+    /// A split group keeps an earlier pass's admission only while the
+    /// journal stands where that pass left it (review of #780): once
+    /// anything moves the producer further, or the writer is poisoned, the
+    /// member is judged afresh, so no fence is skipped.
+    #[test]
+    fn an_earlier_admission_stands_only_while_the_journal_has_not_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = ProducerEpochJournal::open(dir.path().join("epochs")).unwrap();
+        let producer = Uuid::from_u128(21);
+        journal.accept(producer, 1).unwrap();
+        journal.accept(producer, 2).unwrap();
+        assert!(
+            journal.still_admits(producer, 1, 2),
+            "left at 2 and still there"
+        );
+        assert!(journal.still_admits(producer, 2, 2));
+        assert!(
+            !journal.still_admits(producer, 3, 2),
+            "an epoch the pass never reached is not admitted by it"
+        );
+        assert!(
+            !journal.still_admits(Uuid::from_u128(22), 1, 1),
+            "a producer the journal never saw"
+        );
+        journal.accept(producer, 3).unwrap();
+        assert!(
+            !journal.still_admits(producer, 1, 2),
+            "the journal moved past where the pass left it"
+        );
+        journal.poisoned = true;
+        assert!(
+            !journal.still_admits(producer, 3, 3),
+            "a poisoned writer admits nothing"
+        );
     }
 
     #[test]

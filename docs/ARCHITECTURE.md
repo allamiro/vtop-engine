@@ -56,7 +56,7 @@ The governing rule is the protocol's **commit rule** ([VTOP_PROTOCOL_DRAFT.md §
 | Replay safety | Durable state journal + verification-before-commit; no marker advances for unverified data. |
 | Protocol/transport independence | `vtop-core` has no dependency on Kafka, S3, or the CLI; sources and backends sit behind traits. |
 | Cross-source uniformity | One `SourceAdapter` trait and one progress-marker abstraction over Kafka/file/spool. |
-| Determinism | Deterministic object naming so replay reproduces the same key (protocol §15.1 goal — **not yet met**: the `batch_id` embeds a timestamp and random suffix, so replay currently writes a new key; see §13). |
+| Determinism | Deterministic object naming so replay reproduces the same key (protocol §15.1). The object key is derived from the source, the range and the digest of the bytes, so a replay that produces the same bytes resolves to the object already stored (#626); the `batch_id`, and so the ledger row and the manifest key, stays unique per attempt. Limits in §13, item 3. |
 | Auditability | A bound, self-hashed manifest per object. |
 | Backend independence | One `UploadBackend` trait with a verification contract; many implementations. |
 
@@ -78,7 +78,7 @@ The project is a Cargo workspace. `vtop-core` is protocol-independent and depend
 | `vtop-adapters` | Source adapters behind the `SourceAdapter` trait: Kafka, file, syslog spool. | `rdkafka` |
 | `vtop-upload` | Upload backends behind the `UploadBackend` trait. | `aws-sdk-s3`, external CLIs |
 | `vtop-state` | Durable state journal behind the `StateStore` trait: SQLite by default, PostgreSQL behind `--features postgres`. | `sqlx` |
-| `vtop-observe` | Opt-in metrics/readiness HTTP endpoint (`VTOP_METRICS_ADDR`). | — |
+| `vtop-observe` | Opt-in metrics/readiness HTTP endpoint (`VTOP_METRICS_ADDR`); OpenTelemetry export over OTLP, idle until an endpoint is set (#683). | `opentelemetry-otlp`, `tracing-opentelemetry` |
 | `vtop-cli` | The `vtopctl` binary and the engine runtime that wires everything together. | all of the above |
 
 (The workspace also contains the cluster-plane crates `vtop-meta`, `vtop-node`, `vtop-broker`, `vtop-log`, and `vtop-protocol`, documented in [NATIVE_BROKER_ARCHITECTURE.md](NATIVE_BROKER_ARCHITECTURE.md); they are outside this document's scope.)
@@ -106,7 +106,7 @@ The project is a Cargo workspace. `vtop-core` is protocol-independent and depend
 
 | Type | Role |
 |------|------|
-| `BatchId` | Unique batch identifier embedding a UTC stamp, source/partition/offset range, and a random suffix (deterministic in shape, not in value — protocol §15.1 gap). |
+| `BatchId` | Unique identifier of one attempt at a batch, embedding a UTC stamp, source/partition/offset range, and a random suffix. Names the ledger row and the manifest; the object is named by `build_object_name` (source, range, content digest), not by the batch id (#626). |
 | `SourceProgressMarker` | Source-agnostic position: Kafka offset, file byte offset, or syslog spool offset. |
 | `Batch` | Sealed, immutable record set + covered marker range + record count + format + sizes. |
 | `Manifest` | Bound document: source identity, marker range, object location, integrity metadata, self-hash. |
@@ -133,7 +133,7 @@ The engine drives each batch stage-by-stage; each stage advances the batch to a 
 | 8 | **Verify** | Both stored object and manifest are verified against expected checksums/metadata. | `VERIFIED` |
 | 9 | **Commit** | Only after verification, the source marker is committed via the adapter. | `SOURCE_COMMITTED` |
 
-If any stage fails, the batch transitions to `FAILED`, then `REPLAY_REQUIRED`, and its range is handed back to the source at the end of the cycle, whether or not those writes land (§13, item 5). If verification fails, `commit_progress(...)` is never called. If the commit itself fails after verification, the batch stays `VERIFIED` (not lost) and recovery retries the commit.
+If any stage fails, the batch transitions to `FAILED`, then `REPLAY_REQUIRED`, and its range is handed back to the source at the end of the cycle, whether or not those writes land (§13, item 5). If verification fails, `commit_progress(...)` is never called. If the commit itself fails after verification, the batch stays `VERIFIED` (not lost). The running engine retries the commit after each later pass of the same source type, and recovery retries it after a restart (#624, §13 item 1).
 
 ### 5.1 State machine
 
@@ -142,7 +142,7 @@ DISCOVERED -> BATCHING -> SEALED -> COMPRESSED -> CHECKSUMMED ->
 OBJECT_UPLOADED -> MANIFEST_UPLOADED -> VERIFIED -> SOURCE_COMMITTED
 ```
 
-Recovery states: `FAILED`, `REPLAY_REQUIRED`.
+Recovery states: `FAILED`, `REPLAY_REQUIRED`. Terminal states: `SOURCE_COMMITTED`, and `SUPERSEDED` for a handed-back range that its source has since committed past (#567, §13).
 
 Legal transitions:
 
@@ -159,6 +159,8 @@ Legal transitions:
 | ANY_STATE | FAILED |
 | FAILED | REPLAY_REQUIRED |
 | REPLAY_REQUIRED | BATCHING |
+| FAILED | SUPERSEDED |
+| REPLAY_REQUIRED | SUPERSEDED |
 
 The `state_machine` module rejects any transition not in this table (`IllegalStateTransition` / `CommitBeforeVerified`).
 
@@ -258,6 +260,41 @@ is a real and silent condition.
   last case the ledger is not consulted for that run, and the protection
   against a stale engine's commit does not apply to it.
 
+While running, the partition list changes in ways a restart never sees, and
+`latest` must not skip what arrived meanwhile (#675):
+
+- **A partition added to a topic being read**, **a topic that listed no
+  partitions when first asked for** (created moments later, or not yet known to
+  the broker), or **a topic first read after the engine started** (discovery
+  lists every topic each cycle, so it was created since) starts from the
+  group's committed offset, else, under `latest`, from its **beginning**:
+  every record in it is newer than the start `latest` promised when the engine
+  began reading. Partition counts are re-checked every cycle from discovery's
+  own listing (with no listing, one metadata request every 30s), so a new
+  partition is assigned within a cycle. An answer with no partitions is never
+  cached. When the start cannot be established, the partition waits, never
+  assigned at `Offset::Stored`.
+- **A whole re-assign** (the topic set or a partition count changed, a record
+  was rejected, a poll failed) first pins every partition that stays assigned
+  and is still waiting at `Offset::Stored` under `latest` where it started. A
+  partition whose start cannot be established is left out and asked again
+  10s later; every other partition is assigned and read. A partition whose
+  records in a pass were all rejected or discarded is pinned at the first of
+  them.
+- **A failed partition lookup**, or a topic answer carrying an error other
+  than "unknown topic", serves the topic's last known list.
+- **A deleted and recreated topic** (fewer partitions than before, a topic that
+  lists partitions again after listing none, or an end offset below the
+  position held) is reported, not acted on: the ledger cannot tell the two
+  topics apart, and offsets alone cannot tell a recreate from a truncated log.
+  Where the new log is shorter than the old position, the broker answers out
+  of range and `auto.offset.reset` applies; where it already reaches past it,
+  the records below are skipped without an error, which the warning says.
+
+Each of these logs what happened, what the engine did and what the operator
+should check, with the topic, partition and offsets as fields, and counts in
+`vtop_kafka_partition_events_total{event}`.
+
 When retention has already removed records past that position, `auto.offset.reset`
 applies by two different routes, and both end the same way:
 
@@ -328,7 +365,9 @@ What follows from that, in the engine:
   range's start, or (file sources, whose markers record the length at read
   time) when it is shorter than it was when the range was read. A spool marker
   without an inode keeps the older size-only check, and a spool truncated and
-  regrown past the range's start cannot be told from the original. How the
+  regrown past the range's start cannot be told from the original. A file
+  source then looks for the file the range WAS read from, and re-reads the
+  range from it when it can prove it is that file (#621, below). How the
   engine reports a refused rewind is described in section 13.
 - **Commits are applied in the order the windows were read**, not the order
   their uploads finish. A rotation seals the old file's window and starts a new
@@ -381,14 +420,280 @@ What follows from that, in the engine:
   it. Before, a same-length replacement at the
   same inode satisfied every test of `delete_after_commit`
   (`end_byte >= size`) and was deleted unread.
+- **`delete_after_commit` deletes only a file that has stopped being
+  written** (#619). A commit that covers a file to its end starts a wait
+  instead of deleting it. It records what the file looked like (inode, first
+  page, page below the end, length, mtime, ctime), and the file is deleted only once it has stayed
+  exactly like that for `delete_quiet_seconds` (default 3600), timed on the
+  engine's monotonic clock from that commit. With `delete_quiet_seconds: 0`
+  there is no wait: the covering commit deletes the file at once, still
+  through the lease, rename and check below, so never while a process has it
+  open. The check runs again at the next commit or
+  read pass. Until then the file is kept and read as usual. Before, the
+  engine deleted the path the moment it caught up. Most appenders hold their
+  log open with `O_APPEND`, so every later line went into the unlinked
+  inode, which no path names, and was lost. That happened every time the
+  engine caught up on a live file. The delete itself renames the file to a
+  hidden name in the same directory (`.vtop-delete.<nanos>.<n>`, bounded
+  and independent of the file's own name, so a name near the 255-byte limit
+  still fits). The rename never replaces a file already at that name
+  (`renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(RENAME_EXCL)` on
+  Apple platforms; elsewhere, or on a filesystem without the flag, an
+  existence check first), and a taken name is skipped for the next. It then
+  checks the renamed file again, and unlinks it only if it is still
+  unchanged. A line appended between the decision and the rename is
+  caught there, and the file is hard-linked back under its name and kept.
+  Before, a check-then-unlink lost that line. A writer that opens the path
+  for each write creates a new file once the rename has happened, and that
+  file is read as a new source. A delete that fails for a reason that may
+  pass (the open, the unlink) keeps the wait's result and is retried on the
+  next pass. A rename aside that fails for a reason that will not pass by
+  itself (`EXDEV` - a bind-mounted single file - `EACCES`, `EPERM`,
+  `EROFS`, `EBUSY`) keeps the file, says so with the errno and what to fix,
+  and is retried a quiet period later.
+- **A configured path that is a symbolic link is never deleted.** A rename
+  moves the link, not its target: #631's delete removed the link, left the
+  target, and dropped the cursor, so a writer still writing to the target
+  was never read again. The file is kept, and the warning says to point the
+  pattern at the target.
+- **...and only on proof that no process has the file open** (#619, after
+  #631). A quiet file is not a closed one. With the quiet period alone, a
+  writer that held the file open lost its lines three ways: it was silent
+  for longer than the period and then wrote again; its write landed between
+  the final check of the renamed file and the unlink; or it opened the file
+  while the delete was under way and wrote after it. So the delete takes a
+  Linux write lease (`fcntl(F_SETLEASE, F_WRLCK)`, `vtop-adapters`
+  `write_lease.rs`) on the file before moving it aside, and holds it until
+  after the unlink. The kernel grants it only when the engine's descriptor
+  is the file's only open file description: no other process, and no other
+  descriptor of this one, has it open, for reading or writing, mapped
+  included. While it is held, any open of the file breaks it, and the
+  opener waits until it is released. So:
+  - a writer that still holds the file - silent however long - makes the
+    lease fail, and the file is kept; the wait starts again;
+  - a writer that opens the file after the lease is granted breaks it. The
+    final check sees that, the file is put back under its name, and only
+    then is the lease released, so the opener gets a file that still has
+    its name (unless a new file has taken the name since the rename; see
+    the limits);
+  - an open of the path that starts after the rename finds a new file. One
+    that started before it may have resolved the path to this file and not
+    yet reached the lease, so the lease is held for a grace of 50 ms after
+    the rename before the final check (review of #689). With writers that
+    open, append and close in a tight loop and no grace, a harness that
+    copies the delete's steps lost lines; with 20 or 50 ms it lost none.
+
+  Leases are per inode in the kernel, so the check also sees a writer in
+  another container sharing the volume, which a scan of `/proc/*/fd` cannot.
+  The engine's own descriptors count too: the descriptor kept to re-read a
+  file's outstanding ranges (#621) is the one the lease is taken through,
+  and the descriptor the covering commit checks the file with is closed
+  before the delete. The final checks run through the leased descriptor,
+  since opening the renamed file again would break the lease. A break sends
+  the holder a signal, SIGIO by default, whose default action ends the
+  process, so the lease is set to signal SIGURG, ignored by default, and
+  then to signal no one.
+
+  This is the only `unsafe` in the engine's `src/` trees: `fcntl` with
+  integer arguments on a descriptor a borrowed `File` keeps open for the
+  call, behind a safe wrapper (`write_lease::take`, `WriteLease::intact`,
+  and the release on drop), with a `SAFETY` note on the one block.
+- **Where there is no such proof, the delete is refused.** The lease needs
+  Linux, a local filesystem, the engine running as the file's owner or with
+  `CAP_LEASE` in its effective set (otherwise `EACCES`), and
+  `fs.leases-enable` on. "Local" is checked by `statfs` type against a list
+  (ext2/3/4, xfs, btrfs, tmpfs, overlay, f2fs, zfs, bcachefs) before a lease
+  is asked for: a lease counts only the openers its own kernel sees, so on
+  NFS, CIFS, CephFS, GlusterFS, virtiofs, 9p or sshfs it could not see a
+  writer on another machine or on the host of a shared folder, and kernels
+  from before leases became opt-in per filesystem grant one on FUSE anyway.
+  A lease error that may pass (anything but `EACCES`, `EPERM`, `EINVAL`,
+  `ENOSYS`, `EOPNOTSUPP`) is a failed delete, tried again. Without the proof
+  the fully archived file is kept, and a warning names the reason and the
+  remedies; the candidate is dropped, so the refusal is said once per
+  covering commit rather than retried every pass. On a platform other than
+  Linux the engine also says so at startup. `delete_without_open_check:
+  true` restores deletion on the quiet period alone there, and with it the
+  losses above, by the operator's choice. Where the lease can be had, it is
+  always taken, and a file some process holds is kept whatever that key
+  says.
+- **macOS.** The engine's open-file check is a Linux write lease, and it
+  has no check on macOS (`write_lease::take` answers that it cannot tell;
+  `libproc` and `lsof` see a snapshot, as a `/proc/*/fd` scan does). So a
+  fully archived file is kept there unless `delete_without_open_check` is
+  set. The file source's lib tests run on macOS in CI (the
+  `file source (macOS)` job) with the opt-in, because that is the only way
+  a delete happens there. Tests that need a lease run on Linux only, and a
+  test pins the default refusal on macOS and the other Unix platforms.
+- **"Unchanged" is one identity test**, `continuity::proves` (#647), the
+  test every identity decision shares: the same inode, the first page
+  (#578) and the page below the committed end (#620's tail fingerprint),
+  plus the exact length, and the mtime and ctime the batch READ (the
+  marker's, not the file's at commit time - review of #689: a same-length
+  rewrite between the pages during the upload, or during the downtime
+  before recovery commits, became the baseline and was deleted unread; and
+  #619: the same rewrite with the mtime set back agreed with the marker's
+  mtime, which is why the marker records the ctime too). The
+  covering commit, the delete decision
+  and the final check before the unlink all make it. Before #619 was
+  finished, the delete had a test of its own, which passed a marker that
+  named no first page on the inode and length alone, so a same-inode,
+  same-length rewrite that landed before the commit was deleted unread; and
+  on a platform without inode numbers it judged the size alone. Now
+  anything unknown answers no: a marker with no inode or no first page
+  never deletes a file. A file that is gone, or that fails the test in any
+  way, is no longer a candidate, and is kept until a new commit covers it.
+- **A moved mtime or ctime keeps the file** (#619). #631 restarted the wait
+  when only the mtime had moved and the tail proved both pages unchanged,
+  and deleted the file a quiet period later. But a same-length rewrite
+  confined between the first page and the page below the end looks exactly
+  like that - and with its mtime set back, like nothing at all - so it was
+  deleted unread. Every write moves the ctime, and so does setting the
+  mtime back; no process can set the ctime. So the candidate records it,
+  and any change of mtime or ctime ends the candidate and keeps the file,
+  with a warning to remove it by hand once it is known to hold nothing new.
+  A touched drop now stays: keeping a touched file costs disk, deleting a
+  rewritten one cost its lines. The ctime is checked up to and under the
+  lease; after the delete's own rename, which moves it, the check is the
+  lease, which nothing can write past without breaking. The deletes run on
+  the blocking pool, as many at once as the reads.
+- **The wait is in memory, so a restart starts it again.** The seed re-arms
+  it with a fresh clock, but only from a row that names the inode and the
+  first page, and whose batch saw the file end at the committed offset. A
+  batch that read part of a longer file never arms a delete from the seed:
+  a same-inode rewrite cut back to the committed offset would otherwise be
+  deleted before the first read's continuity check could see it. The file
+  must also still have the mtime the batch recorded
+  (`CommittedCursor::observed_mtime`, the marker's `mtime`), tail
+  fingerprint or not: a same-inode, same-length rewrite while the engine was
+  down agrees with everything else the seed records. A row with no mtime,
+  or a file whose mtime moved, leaves the delete unarmed, and the file is
+  kept with a warning. So must the file's ctime equal the one the batch's
+  read recorded (`CommittedCursor::observed_ctime`, the marker's `ctime`,
+  #619): a rewrite that also sets the mtime back is caught by the ctime the
+  read recorded, and the candidate keeps that ctime, not the one read at
+  the restart. The covering commit makes the same check, so the same
+  rewrite between a batch's read and its commit is caught too, with its
+  own warning (`metadata_changed`). A row written before v0.10.0 has no
+  ctime and arms as before, on the mtime alone, with the file's ctime at
+  the restart: for those rows the limit stands until their quiet period
+  ends. Refusing them instead would keep every file archived within the
+  last quiet period before the upgrade until someone removed it by hand.
+- **Hard links.** Deleting one name of a file moves the ctime of the
+  others (#378 makes each its own source) and lowers the link count. The
+  candidate records the link count (in memory), so another name's delete
+  then keeps its file as `links_changed`, with a warning that names the
+  change ("its link count changed since it was archived (from 2 to 1) -
+  most likely another path this engine archived was deleted, or a hard link
+  was made"). A hard link made after the commit keeps the file the same
+  way. Nothing is lost: each name's copy is archived. The remaining names
+  are removed by hand, or the patterns narrowed to one spelling. A name
+  read and committed after the other's delete sees the file as it is then,
+  and is deleted. Deletes are not serialised per inode in a pass, by
+  choice: that would save disk on a configuration discovery already warns
+  about. So names committed in one pass fall due together and their
+  deletes run side by side: each holds the file open while it checks it,
+  and moves its ctime when it moves it aside and back, so a name can be
+  kept as `open` or `metadata_changed` because of another, and tried again
+  a quiet period later. Those messages then add that the file had N names
+  when it was archived and that another name's delete also causes this.
+  In tests, one name was deleted and the rest kept as `links_changed`
+  within five quiet periods. Nothing is lost on any path.
+- With `delete_without_open_check` and no lease, a delete whose unlink fails
+  after the move aside puts the file back, which moves its ctime; the next
+  attempt then keeps the file and says so, rather than trusting a ctime it
+  cannot vouch for.
 
 Limits, stated plainly:
+
+- **Where the engine cannot check that no process holds a file open**, it
+  keeps the file (above). With `delete_without_open_check: true` it deletes
+  on the quiet period alone instead, and a writer that keeps the file open
+  loses lines in two windows:
+  - it is silent for longer than `delete_quiet_seconds` and then writes
+    again: it writes into a deleted file;
+  - after that same silence, its write lands between the delete's final
+    check of the renamed file and the unlink.
+
+  Each such delete is counted as `deleted_unchecked`, not `deleted`, and
+  logged as "deleted P without proof that no process had it open", with
+  the reason no lease could be taken and what a writer still holding it
+  loses: a warning the first time in a process, then at info, so a
+  directory of thousands of files does not log thousands of warnings. Any
+  increase of `vtop_file_delete_decisions_total{outcome="deleted_unchecked"}`
+  means an operator is living with these two windows. The opt-in is the
+  only way a file is deleted on macOS, on NFS or FUSE, and for another
+  user's file when the engine lacks `CAP_LEASE`.
+
+  Scanning `/proc/*/fd` was considered and rejected as the check: it is
+  Linux-only like the lease, it needs privileges to see other users'
+  descriptors, and it cannot see writers in other containers' PID
+  namespaces, which is exactly where a sidecar deployment puts them.
+- **With the lease, these windows are left**:
+  - an open of the path that resolved it to the file before the rename and
+    then stalled in the kernel for longer than the 50 ms grace before
+    reaching the lease;
+  - a process that opens the file by its hidden name
+    (`.vtop-delete.<nanos>.<n>`) between the final check and the unlink,
+    which nothing has reason to do.
+
+  Either open gets the unlinked file once the lease is released. If it
+  broke the lease by the time the unlink returns (the engine checks the
+  lease right after it), the engine logs an error ("deleted P after a
+  process opened it between the final check and the unlink ... what that
+  process writes to it is not archived") and counts `opened_at_unlink`;
+  one that breaks it after that check, before the lease is dropped, is not
+  seen. A process that reaches the file through another hard link writes
+  into a file that keeps that name, so its lines are not gone; they are
+  archived only if that name is a source this engine reads (#378). If such
+  an open breaks the lease at the unlink, the engine says which: a warning
+  naming the other source ("the file is still named Q, a source this
+  engine reads ... nothing to do"), or, when no source this engine reads
+  names the file, an error that the lines are NOT archived and that the
+  other name needs a pattern. Either is counted `opened_at_unlink`.
+
+  **The 50 ms grace is a bound, not a proof.** An open of the path that
+  began before the rename and spends more than 50 ms in the kernel before
+  it reaches the file can still land after the unlink; what it writes is
+  not archived. The engine counts `opened_at_unlink` and logs the error
+  only for an open that has broken the lease when the unlink returns (see
+  above). Two tests make the late open deterministic, with an `O_PATH`
+  descriptor taken before the rename and opened through `/proc/self/fd`
+  later, each waiting for `/proc/locks` to show the lease breaking: one
+  that lands in the grace keeps the file, and one that lands between the
+  final check and the unlink is logged and counted. With writers that open, append and close
+  in a loop, 20 and 50 ms lost nothing in the #689 harness; the ignored
+  test `delete_race_stress` repeats that run, and is run by hand on tmpfs,
+  ext4 and overlay before a release.
+- **A file left under a delete's hidden name is archived as a source of
+  its own.** A crash between the rename and the unlink leaves the file
+  under its hidden name, never deleted unchecked; a put-back that finds a
+  new file at the path (an `O_CREAT` writer recreated it during the grace)
+  leaves it there too. Either can hold a late write: the crash releases the
+  lease, and an opener that waited on it then writes into that file. So
+  discovery, with `delete_after_commit` on, also lists `.vtop-delete.*`
+  files in each pattern's directory, warns once per file, and archives them
+  - the bytes already archived again, as a duplicate, with any late write -
+  and then deletes them like any other file.
+- While the lease is held - the grace and the checks around it - an open of
+  the file waits (up to `fs.lease-break-time`, 45 s by default, if the
+  engine were frozen), and an `O_NONBLOCK` open fails with `EWOULDBLOCK`.
+- **Every decision is said** (#619): each delete, and each file kept, logs
+  one line naming the path, what happened, what the engine did and what to
+  do, with `path`, `inode` and `archived_bytes` as fields - for example
+  "not deleting P: 6 bytes were appended after the commit that archived its
+  first 8; they will be archived next pass", or "not deleting P: the rename
+  aside failed (EXDEV: ...)". A refusal that will not change is a warning,
+  said once per covering commit; one that repeats while its cause lasts (a
+  process holds the file, the rename fails) is said once, then at debug.
 
 - The **unread tail of a rotated-away file** is not read through the old path.
   If the rotated name (`app.log.1`) also matches a configured pattern it is
   discovered as its own source, with a fresh cursor, and is archived again from
   byte 0 — a duplicate, never a hole. Archiving the unread tail without the
-  duplicate would need cursors keyed by inode rather than path.
+  duplicate would need cursors keyed by inode rather than path. (A failed
+  range re-read from the rotated file, below, reads on to its end, as a rewind
+  of a file still at its path does: in that case the tail is archived.)
 - `copytruncate` is racy by nature: lines written between the copy and the
   truncate are lost by the rotation tool before the engine can see them. If the
   file also regrows beyond the old read position before the next read, the
@@ -428,6 +733,122 @@ Tracked as #361, which also carries the question of whether the adapter should
 refuse rather than resume when it detects the jump — a refusal is only useful
 if an operator can act on it, and a source that stops archiving because it fell
 behind may be worse than one that archives what remains.
+
+#### A failed range from a file rotated away since it was read (#621)
+
+A batch that fails hands its range back to the source, and the file adapter
+re-reads it from the path. When the file has been rotated in the meantime -
+`app.log` renamed to `app.log.1`, a new `app.log` created - the file at the
+path is not the range's, and the rewind used to be refused: an ERROR, the row
+left FAILED, refused again at every restart, and the range never archived
+unless the rotated name happened to match a source pattern. Worse, a rewind
+that was *accepted* while the file was still at its path, followed by a
+rotation before the re-read, restarted the cursor on the new file and never
+re-read the range at all, with no error.
+
+The adapter (`crates/vtop-adapters/src/rotated.rs`) now reaches the file the
+range was read from, in this order:
+
+1. **A held descriptor.** While a range read from a file is not committed, the
+   adapter keeps a descriptor open on that file. A rotation by rename moves the
+   descriptor to a list of rotated files instead of closing it, and a rename or
+   an unlink does not affect what an open descriptor reads, so this works even
+   when logrotate has already compressed and removed `app.log.1`. It does not
+   survive a restart. A rewind accepted before the rotation is honoured the
+   same way: the rewound range is re-read through the descriptor before the
+   new file is read.
+2. **The rotated-to path.** Across a restart there is no descriptor, so
+   recovery's rewind looks for the file among the entries of the path's own
+   directory and the files the source's patterns match, on the same
+   filesystem, by inode.
+
+Either way nothing is read from a file until it is **proven** to be the one
+the range was read from: the inode the marker recorded, the first page its
+fingerprint covers (#578), the page that ends where the marker's position is
+when it recorded one (its tail fingerprint, #620 - so a rotated file rewritten
+in place below an unchanged first page is not taken for the range's), and no
+shorter than when the range was read. The descriptor is proven again before
+every re-read, against the same first page, the page below where it was last
+read, and the longest the file has been seen to be: a rotated file truncated above
+its first page keeps its fingerprint, and reading on would archive a
+shortened prefix as the range (or nothing, and call the re-read done). Such a
+re-read is refused. For rotated-file recovery, a marker without an inode or a
+fingerprint cannot prove the old file and is refused as before (its rewind of
+the file at its own path keeps the inode-and-length check described above).
+
+The re-read starts at the range's start and reads on to the end of the rotated
+file, as a rewind of a file still at its path reads on to the path's end. A
+rewind of it never goes below what is committed from that file, as a rewind of
+a file at its path never goes below its committed point. Its markers carry the
+source path and the rotated file's inode. Wherever the identity checks tell the
+rotated file from the file now at the path - another inode, or other first
+bytes - its commit does not move the current file's cursor, and
+`delete_after_commit` (which judges the file at the path) deletes neither file.
+A replacement those checks cannot tell apart (the blind spots below) is the
+exception. A
+re-read in progress keeps its path a source even if nothing is at the path
+yet - and so does a rewind accepted before its file was renamed away with
+nothing created in its place, whose range only a read of the path moves onto
+the rotated list. A FAILED row stays in the ledger and is rewound again at every restart, so
+recovery asks the ledger for the newest committed batch of each file that has
+lived at that path (`StateStore::committed_cursors_by_file`) and starts the re-read
+above what is already archived of the rotated file - counting only a row whose
+first page, and page below its end, the rotated file still holds. A commit
+in a running engine raises that floor by the same test: a window of a file's
+old content, committed after the file was rewritten in place at the same
+inode, does not count as archiving the new content. Without that, a range
+re-read once was archived again at every restart while the rotated file
+existed.
+
+A rewind that still cannot be honoured stays loud: an ERROR naming the path,
+and `vtop_source_replay_refused_total{tenant,source_type}` counts it, so it
+can be alerted on. A re-read refused after the rewind was accepted (the
+rotated file truncated, or no longer starting with its first page) is counted
+there too, not only as a read error.
+
+Limits:
+
+- **`copytruncate` is not handled.** The copy has a new inode, and a matching
+  fingerprint and length are not proof of identity, so a range read before a
+  `copytruncate` is refused (and counted) unless the copy also matches a
+  configured pattern and is archived as its own source.
+- **A rotated file that is gone** - compressed (`app.log.1.gz` holds other
+  bytes, so it never matches) or removed - can be re-read only through a held
+  descriptor, so only within the process that read it. After a restart its
+  ranges are refused and counted.
+- **The descriptors are bounded.** At most 128 in all (`MAX_HELD_FILES`); past
+  that a file is not held, and a failed range falls back to the search. A
+  descriptor on a rotated file with no re-read in progress is closed one hour
+  after it was last used (`HOLD_FOR`) - it keeps a removed file's disk space
+  allocated until it is closed. A descriptor being re-read through is kept
+  while that re-read is in progress, and is never closed to make room. The
+  search looks at no more than 10,000 entries of the directory.
+- **Identity is the inode, the first page and the page below the marker's
+  position** (#620), with the same blind spots as every other check in this
+  section (above): a replacement matching both sampled pages, or a change
+  confined between them. A range starting at byte 0 has no page below its
+  start, so its proof is the inode and the first page alone.
+- **The restart seed is chosen per file, and needs proof.** A re-read batch
+  is created after the current file's batches - a window of it read in the
+  cycle whose rotation sealed the failed window, or batches committed before
+  a restart whose recovery then re-reads the range - so it becomes the path's
+  newest committed row. Seeded from that row, a restart took the current file
+  for a rotation and archived it again from byte 0 (review of #621). The seed
+  is therefore chosen from the newest committed row of EACH file that has
+  lived at the path (`StateStore::committed_cursors_by_file`): the newest, as
+  before, unless it names a file no longer at the path; then the row of the
+  file that is, when that file is positively identified - the same inode,
+  the first page and the page below the row's end (#620). A current file
+  whose row lacks either fingerprint (written before #578/#620), or whose
+  bytes no longer match them, is not proven, and the newest row stands: the
+  current file is read from byte 0 again, a duplicate bounded by the file,
+  never a skip. So does a current file whose rows pruning removed (pruning
+  keeps the newest row per path, which can be the re-read's). Likewise, if
+  pruning removes the re-read's rows while the rotated file still exists,
+  the next restart re-reads it.
+- Without inodes (non-Unix platforms) nothing can be proven, and the rewind is
+  refused as before. Syslog-spool sources are unchanged: a spool rotated away
+  is still refused.
 
 #### Ledger format note: content fingerprints (#578)
 
@@ -484,6 +905,149 @@ backend: the restart seed reads the new field out of the stored
   The coverage audit does not use it.
 - An older binary ignores it, as above.
 
+#### Ledger format note: ctime (#619)
+
+The same kind of change as the two notes above, to file markers only, and no
+DDL on either backend: the restart seed reads the new field out of the stored
+`progress_end_json` (`CommittedCursor::observed_ctime`), so `vtopctl
+migrate` has nothing to apply.
+
+- New, optional and omitted when unknown: `ctime` on file markers, the
+  file's ctime from the same fstat as `mtime` - the one after the read, so a
+  file that stops growing during a read still matches it - and written the
+  same way (RFC 3339 in UTC, up to nanosecond precision; compared as an
+  instant). Absent on a platform without ctimes.
+- Taken after the read, it also takes in a change the file went through
+  DURING the read: a rewrite of bytes the read has already passed, landing
+  before that fstat, is in the marker's mtime and ctime, and the covering
+  commit agrees with it. The window is the length of one read. The
+  fingerprints still catch such a rewrite in the first page or the page
+  below the end; between them it is the documented limit, now narrowed to
+  the read itself.
+- Rows written before it decode with the field absent. The covering commit
+  then judges the file by the mtime alone, and the restart seed arms the
+  delete as before, with the file's ctime at the restart (see "The wait is
+  in memory" above). A marker without it
+  serializes byte for byte as the code before it wrote the same marker.
+- A stored value that is not an RFC 3339 timestamp - another string, a
+  number, an object - decodes as absent, in markers decoded whole and in the
+  restart seed alike: absent only forgoes the check, so such a row arms the
+  delete on the mtime alone, like a row from before the field. This is
+  unlike a missing fingerprint, which keeps the file: the fingerprints are
+  the identity test, while the ctime only narrows the window a rewrite with
+  the mtime set back can use.
+- A restart after one of the engine's own delete attempts moved the file
+  aside and put it back (an opener broke the lease, or the unlink failed)
+  finds the file's ctime moved by that put-back. In memory the candidate
+  took the new ctime; the ledger keeps the read's. So the seed keeps the
+  file, and the warning lists that attempt among the causes. It costs disk,
+  not data.
+- The manifest's `source_progress` never carries it (`for_manifest` clears
+  it), for the reason above, so a manifest is byte for byte what released
+  readers verify. The coverage audit does not use it.
+- An older binary ignores it, as above. Downgrade is still not supported.
+
+#### Ledger format note: verification class (#664)
+
+A table change, unlike the two notes above: one new column on both backends,
+`verification_class TEXT`, nullable, no default.
+
+- Written with the transition to VERIFIED, in the same statement:
+  `strong` (the stored content matched a digest, by a store-computed
+  checksum or a read-back) or `size_only` (the store confirmed only size and
+  existence, `backend_limited`, accepted under
+  `upload.require_strong_verification: false`). The store refuses a class on
+  any other transition, and every other transition leaves it as it is, so a
+  committed row keeps the class it was verified with. The method within
+  `strong` (store checksum or read-back) is not recorded: the native S3
+  backend falls back from one to the other per object without reporting
+  which ran.
+- Recovery counts a commit of a VERIFIED row, in `commit_recovered` and in
+  the settle pass for a row it held back, by this class, not by its own
+  storage re-check. The re-check still decides whether the row may commit.
+- NULL is unknown: every row verified before #664, and a value this release
+  does not know (a later release's). Both are counted as before, by the
+  re-check. The column has no CHECK, so a later release can add a value
+  without a constraint migration, and an older reader treats it as unknown.
+- SQLite adds the column when it opens the file. PostgreSQL adds it in
+  `vtopctl migrate` (`ADD COLUMN IF NOT EXISTS`); engine startup names it, so
+  an engine of this release refuses a schema without it and asks for the
+  migration, naming the missing column. Either way, adding it to a table
+  that holds rows logs `state store: added the verification_class column; N
+  existing rows left NULL (verification class unknown) ...` once, with
+  `backend`, `existing_rows` and `column` as fields. The PostgreSQL schema
+  marker stays at 3: see the migration notes in
+  [`POSTGRES_DEPLOYMENT.md`](POSTGRES_DEPLOYMENT.md).
+- SQLite has a schema version of its own from #664: the file's `PRAGMA
+  user_version`, 1 for this schema, set on open (a file from before reads
+  0). A file whose version is higher was opened by a newer release, and this
+  release refuses it - `SQLite state-store schema version N (the ledger
+  file's PRAGMA user_version) is newer than this release supports (newest
+  1) ...` - and leaves it as it was. The check, the migration and the
+  version write are one `BEGIN IMMEDIATE` transaction, so a newer release
+  raising the version at the same moment is seen, never written back down.
+  The PostgreSQL schema has the same rule
+  for its marker. Releases before #664 do not read the version.
+- The serialized record (a prune digest row) carries `verification_class`
+  only when it is known, so a legacy row serializes as before; a value the
+  reader does not know reads as unknown rather than failing the digest.
+- An older binary ignores the column on both backends: it maps rows by
+  column name, inserts by an explicit column list, and never writes it. A row
+  it verifies has no class, and is counted by the re-check, as it always was.
+  One caveat: releases before #664 read `SELECT *` / `RETURNING *` through
+  statements cached per connection, and a connection open while the column
+  is added fails those reads until it is replaced (PostgreSQL: `cached plan
+  must not change result type`; SQLite: the driver panics on the extra
+  column). A running engine makes such reads only in startup recovery and
+  when it settles a VERIFIED row whose source commit failed; its batch
+  writes name their columns. Restart older PostgreSQL engines right after `vtopctl migrate`,
+  and stop any other process on a SQLite file before a newer release first
+  opens it. This release names every column it reads (`batch_columns!` in
+  vtop-state), so a column a later release adds does not affect it.
+
+#### Ledger format note: seal instant (#626)
+
+One new column on both backends, `sealed_at TEXT`, nullable, no default: the
+instant the batch's contents were fixed, RFC 3339 in UTC, the instant its
+time partition is taken from (section 11).
+
+- Written with the row's first write (the insert at BATCHING), so a row that
+  exists records it; no transition writes it again. A replay's own row
+  records the instant of the window it rebuilt, so a replay that fails in
+  turn keeps the first attempt's hour.
+- Read by recovery, from the rows it claims and hands back: a window that
+  covers exactly such a row's range is sealed at the recorded instant, so it
+  is filed under the same hour and names the same object key (section 13,
+  item 3). Nothing else reads it.
+- NULL is unknown: every row written before #626. A stored value that is not
+  an RFC 3339 instant reads as unknown too, on every read path and in a prune
+  digest; it never fails the row. A store read logs it as a WARN naming the
+  row (`batch_id`, `column`, `stored_len`; never the value), at most once a
+  minute with a `suppressed` count; a digest read drops it without a log. Such a row's replay
+  is sealed when it is read again, as before.
+- SQLite adds the column when it opens the file and leaves `PRAGMA
+  user_version` at 1: a nullable column older releases never name is nothing
+  they could misread, and raising the version would make a first open an
+  automatic one-way step. PostgreSQL adds it in `vtopctl migrate` (`ADD
+  COLUMN IF NOT EXISTS`); engine startup names it, so an engine of this
+  release refuses a schema without it and asks for the migration, naming
+  the column. Adding it to a table that holds rows logs `state store: added
+  the sealed_at column; N existing rows left NULL (seal instant unknown)
+  ...` once, with `backend`, `existing_rows` and `column` as fields. The
+  PostgreSQL schema marker stays at 3.
+- **What v0.9.0 does with a store this release has opened** (only N-1 may
+  share a ledger, #743). It ignores the column on both backends and keeps
+  working: it names its columns and never writes this one, so rows it
+  inserts carry NULL and its replays are filed as they always were. On
+  PostgreSQL the marker is unchanged, and v0.9.0's own `vtopctl migrate`
+  leaves the column in place. It reads prune digests whose rows carry
+  `sealed_at`: the record has no `deny_unknown_fields`. `scripts/ledger-compat.sh`
+  runs the released previous `vtopctl` over a ledger, and a digest, this
+  build opened and wrote (CI, SQLite); the PostgreSQL half needs a
+  `postgres` build of that release, which the release binaries are not.
+- The serialized record (a prune digest row) carries `sealed_at` only when it
+  is known, so a legacy row serializes as before.
+
 ---
 
 ## 8. Upload backends
@@ -500,21 +1064,62 @@ All backends implement `UploadBackend` (`upload`, `verify_object`, `ensure_bucke
 | `mock` | In-memory | Configurable | Yes (test double for resume/fencing) | Yes | Tests/benchmarks. |
 | `mock_fail` / `mock_limited` | In-memory fault injection | Forced failure / size-only | Yes | Yes | Fault-injection tests. |
 
+Only `s3_native` supports the S3 Object Lock profile (`upload.object_lock`,
+#684): every other backend refuses it at construction, naming the key and
+itself. With it, `put` and `create_multipart_upload` send the lock headers on
+every write (objects, manifests, multipart creates, so no write path can miss
+them), and the trait's `bucket_object_lock` and `verify_retention`
+(a HEAD of the version a write returned, or of the current version for a
+reused object) give the engine its preflight
+and its check. The reuse decision reads a reused object's retention before
+anything is written, and does not reuse one that is not locked as configured
+(#709, §13 item 3). The engine compares the stored retention with the date the
+backend reports it ASKED for, never with its own clock, and the check runs
+only in the pipeline before VERIFIED: recovery and the scrub verify content
+long after the write, when an ended retention is normal. See
+[OBJECT_LOCK_DEPLOYMENT.md](OBJECT_LOCK_DEPLOYMENT.md).
+
 ### Resumable multipart (#191)
 
 Large sealed segments (and other objects above `upload.multipart_threshold_bytes`)
 upload through a persisted multipart session when the backend advertises
 `supports_multipart()`:
 
-- Configurable `multipart_part_size_bytes`, `multipart_max_parallelism`, and
-  `multipart_abandon_after_secs`.
-- Session files under an operator-supplied state directory record upload id,
-  completed parts, and per-part BLAKE3 digests so a process restart resumes
-  without retransmitting finished parts.
+- Configurable `multipart_part_size_bytes`, `multipart_max_parallelism`,
+  `multipart_part_attempts` and `multipart_abandon_after_secs`.
+- Session files under an operator-supplied state directory (the engine's
+  `work_dir`) record upload id, completed parts, and per-part BLAKE3 digests
+  so a process restart resumes without retransmitting finished parts.
 - Sessions are fenced by destination URI + segment generation + fencing epoch
-  + content digest; a mismatched fence refuses resume (stale generation).
+  + content digest; a mismatched fence refuses resume (stale generation). A
+  session is identified by that content, not by the local file's name (#668):
+  every kept part is re-read from the current file and its digest compared
+  before it is skipped. A session with no content digest (checksums off) is
+  never resumed.
+- A failed part keeps what already completed (#668). Up to
+  `multipart_max_parallelism` parts are in flight and each success is written
+  to the session as it arrives. A failed part is retried alone, up to
+  `multipart_part_attempts` requests, with exponential backoff and full jitter
+  (1 s doubling to at most 30 s); after the first part fails for good no new
+  part starts, and the requests already on the wire are waited for and kept.
+  Every request and every throttle is reported to the caller, so the engine's
+  width controller still sees throttles the retries absorbed. An upload the
+  store cannot continue (`NoSuchUpload`, or `InvalidPart` / `InvalidPartOrder`
+  on complete) is aborted where it still exists and restarted once with a new
+  upload; a second failure in the same call keeps nothing.
+- **The telemetry path resumes across replays (#668).** When a batch's upload
+  fails, the engine keeps the session if the object is under its derived key
+  (#626): the replay of the same bytes names the same key and session and
+  sends only the missing parts. Under a per-attempt key nothing will name the
+  session again, so it is aborted as before. A replay whose bytes differ (the
+  source grew) names another key and leaves the old session to the sweep.
+- Abandoned sessions are swept at startup and, while the engine runs, every
+  quarter of `multipart_abandon_after_secs` (at most every 15 minutes). A
+  bucket lifecycle rule (`AbortIncompleteMultipartUpload`) is the backstop for
+  an engine that never comes back; see PRODUCTION_HA §7.6.
 - Multipart ETags are **not** integrity evidence. Evidence commit still requires
   strong whole-object `verify_object` and immutable version pins (#183/#184).
+  A resumed object is read back and verified exactly like a fresh one.
 - `vtopctl tier cleanup-abandoned` aborts aged in-progress uploads.
 
 Protocol §17 grades verification into three classes: **strong**
@@ -563,10 +1168,15 @@ The bound manifest is stored at the same prefix as `{batch_id}.manifest.json`.
   engine's buffer, before it waits for an upload slot, its ledger writes,
   compression, checksumming and upload, and recorded as its `sealed_at`. A
   saturated upload queue, a slow upload or a retry within the batch does not
-  move it. Late data, a backlog drain and a replay land in the hour they were
-  **sealed** in — a replay of yesterday's range is a new batch and is filed
-  under today. Partitions used to come from the wall clock at upload, so a
-  batch sealed at 12:59 and uploaded at 13:00 was filed under hour 13.
+  move it. Late data and a backlog drain land in the hour they were
+  **sealed** in. A replay of a window a failed attempt sealed lands in the
+  hour **that attempt** was sealed in (#626): the instant is recorded in the
+  window's ledger row (`sealed_at`) with its first write, and a window that
+  covers exactly that range is sealed at it again, so it names the same
+  object key (section 13, item 3). A replay of a row written before v0.10.0,
+  which records no instant, is filed under the hour it is replayed in.
+  Partitions used to come from the wall clock at upload, so a batch sealed
+  at 12:59 and uploaded at 13:00 was filed under hour 13.
 - `event`: the earliest record time the source reported. Only the Kafka source
   reports one (the message timestamp — producer `CreateTime` or broker
   `LogAppendTime`, whichever the topic uses); a batch from a source that reports
@@ -595,9 +1205,13 @@ record's times: producer timestamps arrive out of order.
 | Object | Object/manifest URIs, sizes, checksum algorithm + value. |
 | State | Current `BatchState`; transitions routed through the state machine. |
 | Verification | Verification status and strength. |
-| Timestamps | Discovery/seal/commit timestamps for audit and recovery. |
+| Timestamps | Discovery/seal/commit timestamps for audit and recovery; `sealed_at`, the instant the batch's contents were fixed, which a replay's time partition is taken from (#626). |
+
+Beside `batches`, both backends keep **`audit_events`** (#694): one row per audit record of a ledger command (`replay`, `prune-ledger`, `migrate`), with the record as written to the log and the audit file, a `seq` order, and a hash chain (`prev_hash`, `hash`, `chain`), keyed with a key derived from the manifest signing key when one is configured. It is append only (triggers on both backends; on PostgreSQL the runtime role has `SELECT, INSERT` only), and pruning never touches it. SQLite creates it on open; PostgreSQL gets it from `vtopctl migrate`, and startup refuses a schema without it. See [operate/auditing.md](operate/auditing.md).
 
 Crucially, every backend's `update_batch_state` routes **every** state change through the state machine's `transition()`, so the commit rule holds even at the persistence layer (not only in the pipeline); the PostgreSQL backend additionally enforces it with database constraints.
+
+**What a power loss keeps (SQLite).** The SQLite ledger runs in WAL mode at `synchronous=NORMAL`, which syncs the WAL only at checkpoints, because the default rollback journal at FULL cost about half of the batch time under backlog (#87). `VERIFIED` and `SOURCE_COMMITTED` are the exception: they are written through a second connection at `synchronous=FULL`, so each one returns only after the WAL is synced, and that sync also covers every earlier write (#626). A power loss can therefore roll back only the writes after the last of them. No committed range is read and archived again, and a `VERIFIED` row, which a Kafka offset commit follows, is never lost. What remains is the batches in flight that had not reached `VERIFIED`, which are replayed as after a process crash (§13). The cost is two WAL syncs per batch instead of none. PostgreSQL commits durably by default and needs no change.
 
 ---
 
@@ -608,10 +1222,59 @@ On startup, the `replay` module inspects `vtop-state` and maps each incomplete b
 1. A batch in **`VERIFIED`** but not yet committed (object and manifest durably stored and verified) has its **source commit retried** (`VERIFIED → SOURCE_COMMITTED`). The verified object is never discarded.
 2. A batch in any state **before `VERIFIED`** is transitioned `... → FAILED → REPLAY_REQUIRED` and its range is handed back to the source adapter (`replay_from_marker`) so it is read again. The replay decision is persisted first — if the `FAILED` or the `REPLAY_REQUIRED` write fails, no rewind is recorded for the row and it is counted as pending (a failure of the second write leaves the row `FAILED`, not untouched; the next recovery decides again). Recovery then collects the rewinds and applies the **lowest start per source unit** (one file or spool file at one inode, or one Kafka topic-partition) once, after the scan: each rewind overwrites the adapter's read position, so applying them row by row let the last row visited decide where the source resumed and skipped every earlier range. A rewind that fails, or that has no adapter to apply it to, is logged as an error and counted in the summary as still pending.
 
-   A `VERIFIED` row is committed only after that, and not at all while a range of the same source unit that **starts below it** is about to be re-read: a commit moves the unit's committed point to the end of the committed range, the file adapters clamp a rewind to the committed point, and a `VERIFIED` range archives only its own bytes — so pending bytes below its start would be skipped. Such a row stays `VERIFIED` (its object is in the archive) until a later pass commits it. A `VERIFIED` row that starts where the pending range starts — the object that replaced a stale row for the same bytes — commits normally. A marker with no inode (a legacy row) is compared against every inode at its path.
+   A `VERIFIED` row is committed only after that, and not at all while a range of the same source unit that **starts below it** is about to be re-read: a commit moves the unit's committed point to the end of the committed range, the file adapters clamp a rewind to the committed point, and a `VERIFIED` range archives only its own bytes — so pending bytes below its start would be skipped. Such a row stays `VERIFIED` (its object is in the archive) until a later pass commits it.
 
-   **A rewind never goes below what the source has already committed.** The file and spool adapters have always clamped to their committed byte; the Kafka adapter clamps to the ledger's committed frontier for the partition (its newest committed batch, or what the process committed since it started) or, for a partition the ledger does not know, to where an earlier rewind in this process landed. It asks the broker for the consumer group's committed offset only for a partition it has none of these for (#614) — a stale engine's commit can move the group's offset past a range recovery is about to re-read, and clamping to it skipped that range for good. Either way, a stale `FAILED` row left behind by a failure that has since been repaired no longer rewinds the group to its start and re-archives everything since on each restart. The stale rows themselves stay in the ledger and are re-visited at every restart (a no-op rewind and a ledger write each); retiring them needs a new durable state and is tracked in #567.
-3. Replay currently produces a **new** object key: the `batch_id` is derived from wall-clock time plus a random suffix, and the `year/…/hour` path components from the replayed batch's own partition time (§11, `partitioning.time_source`) - under `seal`, the hour the replay was sealed in, so a replay of yesterday's range is filed under today; under `event`, the earliest record time, so a Kafka replay usually lands in the original hour but under a new key. Either way a replayed batch writes a duplicate object (at-least-once, no data loss). Protocol §14/§15.1/§16 specify deterministic naming so that replay is idempotent — this is the open gap tracked as [PRODUCTION_HA.md](PRODUCTION_HA.md) Phase 4.
+   **A held range also lowers every rewind above it in its unit to its start (#782).** A range is *held* when recovery could not record its replay decision (#639), or when its manifest is from a newer release (#671). It is not handed back on its own, and it holds back a `VERIFIED` range above it just as a range being re-read does. A rewind of a higher range of the same unit is applied at the held start instead of its own, under the same inode and content rules (only content proven to be another file's does not count). The reason is that a rewind moves the read head *forward* when its start is above the committed point. Applied at its own start, the head passed the held range, the running pipeline's commit of the higher range then moved the committed point past it, and the held range was never archived; with `delete_after_commit`, its file could be deleted. Lowered, the head lands at or below the held range, and the pipeline reads it and everything above it again, in order. Reads are contiguous, so no batch commits past the held range without covering it. The cost is that the ranges above it are archived twice. The rewind is lowered rather than left out because not every head starts at the committed point: a file rotated away while the engine was down is read only through a rewind (#621, section 7.2), and a Kafka partition whose group never committed follows `auto.offset.reset`. Handing the held range back without its decision recorded costs at most a duplicate, for the reason item 5 gives. The higher range's row stays `REPLAY_REQUIRED` and the held row stays as it was until the next start, which retires both as `SUPERSEDED` or replays them; nothing of the hold is kept but the ledger rows, so a restart derives it again. Each held range is logged and counted in `vtop_recovery_held_total{reason}`, and each lowered rewind in `vtop_recovery_rewinds_lowered_total`.
+
+   **That later pass is the running engine's, not the next restart's (#624).** The engine keeps the `VERIFIED` rows it left uncommitted: the rows its recovery held back, and the rows whose source commit failed, at recovery or in a pass. After each later pass of the same source type, it reads each row again. A row that is no longer `VERIFIED` is dropped. A held-back row is committed once the adapter's committed point is at or past its **end**. By then the re-read below it has archived and committed its bytes again, so committing it moves no source. A row whose commit failed is retried as the pipeline left it.
+
+   Nothing is claimed. Every one of these rows is this process's own (created by its pipeline or claimed by its recovery), it still holds the fence token, and the pass that produced the row has finished with it. So no in-flight batch, of this engine or another, is ever touched. A row can outlive its lease, though, and an engine that claims it then may be about to re-read a range below it. So before the source is touched, the engine renews its claim in one fenced write (`StateStore::renew_claim`, conditional on the claim generation it holds). After a renewal no other engine can claim the row until the new lease runs out. A refused renewal means another engine owns the row: it is dropped without moving the source, and that engine's recovery commits it. Detecting the lost claim at the ledger write after the source commit would come too late, since a source commit cannot be undone and with `delete_after_commit` it can delete the file.
+
+   Committing a range its source has already passed must not move the source back. The Kafka adapter skips a commit at or below its frontier (#617). The file and spool adapters skip one at or below a committed point that this process confirmed, and only when `continuity::proves` (#647) shows that the file now at the path is both the confirmed file and the one the lower commit's marker was read from: the same inode, no shorter than any recorded length, both first-page fingerprints known and matching, and every recorded tail holding. Unknown content never proves (review of #659). Otherwise the commit moves the cursor as before. Before, they set the cursor to the stale end, and for a range read before a restart they moved the read head back too. The seed alone is not trusted for this: it can be a previous generation's (#564). Such a row is recorded `SOURCE_COMMITTED`: it is `VERIFIED`, and its source has committed through its end. A `VERIFIED` row that starts where the pending range starts — the object that replaced a stale row for the same bytes — commits normally. A marker with no inode (a legacy row) is compared against every inode at its path.
+
+   **A rewind never goes below what the source has already committed.** The file and spool adapters have always clamped to their committed byte; the Kafka adapter clamps to the ledger's committed frontier for the partition (its newest committed batch, or what the process committed since it started) or, for a partition the ledger does not know, to where an earlier rewind in this process landed. It asks the broker for the consumer group's committed offset only for a partition it has none of these for (#614) — a stale engine's commit can move the group's offset past a range recovery is about to re-read, and clamping to it skipped that range for good. Either way, a stale `FAILED` row left behind by a failure that has since been repaired no longer rewinds the group to its start and re-archives everything since on each restart.
+
+   **A range the source has committed past is retired, not handed back (#567).** Before the rewind is planned, recovery asks the row's adapter for the committed point of the row's unit (`SourceAdapter::committed_through`). At startup that is the ledger's newest committed row for the unit, newest by `(created_at, batch_id)` as in both stores and in pruning, the same row the restart cursor is seeded from, which retention never prunes. For Kafka it is the ledger frontier the adapter trusts (#614). For files and spools it is the cursor's committed byte, answered only when the row's marker is PROVEN to be the cursor's file: the same inode (a legacy marker without one is never retired), and the same content - both fingerprints matching the first bytes of the file now at the path, equal ones too, since equal fingerprints say only that the marker and the cursor read the same content, not that the file still holds it - and, for a marker with a tail fingerprint, the same bytes below its end, and for a cursor with one, the same bytes below its position; and the file no shorter than any length or position either recorded. This is one test (`continuity::proves`), shared with the choice of the restart seed and the re-read of a rotated file (#621, section 7.2). Anything less keeps the replay path, because `SUPERSEDED` is terminal. If that point is at or past the end of the row's range, the rewind would land there and read nothing again. So the row moves to `SUPERSEDED` (from `FAILED` or `REPLAY_REQUIRED`; an in-flight row is written `FAILED` first), it is counted in the summary as superseded, not as a replay, and no rewind is planned for it. `SUPERSEDED` is terminal. Neither the claim nor the incomplete listing returns it, so later restarts never touch it, and retention deletes it with committed history, digesting it first. If a write fails, nothing is rewound: a row that was `FAILED` or `REPLAY_REQUIRED` stays as it was, and an in-flight row whose `FAILED` write landed but whose `SUPERSEDED` write did not is left `FAILED`. Nothing below the committed point would be read anyway, and the next recovery decides again. A row whose range spans two files, or whose adapter cannot say, keeps the replay path. Before this, every such row was claimed at every restart, written `FAILED` and `REPLAY_REQUIRED` again, counted in `replay_required_total`, and given a no-op rewind, and retention never removed it.
+
+   `SUPERSEDED` claims only that the source committed past the range. It does not claim that a committed range covers the range's bytes. A ledger written before #552 can hold a committed range above a failed one, and that row is now retired like any other, because its rewind was already clamped to nothing. The coverage audit (#560) still judges a `SUPERSEDED` range exactly as a `FAILED` one and names it in any hole.
+3. **A replay that produces the same bytes resolves to the object already stored (#626).** The object key, under the partition prefix (`vtop_core::batch::build_object_name`), is `vtop-<engine>-<source>-<range>[-i<inode>]-<digest>.<format>[.<compression>]` for a file or spool range and `vtop-<source>-<range>-<digest>.<format>[.<compression>]` for a Kafka range: the source name, the batch's whole range (`ProgressMarker::spanning`) and the first 32 hex digits of the object's checksum, plus, for a file or spool file, the engine name and the inode. An object is shared only by attempts at one unit's range. A file or spool file is one host's unit, so two engines archiving byte-identical windows of their own files, or a new file at a path holding the old file's bytes, get separate objects. A Kafka topic-partition is one unit wherever it is read, so an engine that replays a range another engine sharing the ledger uploaded finds that object. The name does not carry the topic's ID: a topic deleted and recreated under the same name restarts its offsets at 0, and a new incarnation whose records are byte-identical at the same offsets would reuse the old incarnation's object, so a reader deduping by object URI would drop them. Only byte-identical records can do this, and the Kafka source reports a recreated topic as `recreated_or_truncated` in `vtop_kafka_partition_events_total` (#675); adding the topic ID to the name is left for later. Compression output is a function of the records and the level within one build (gzip writes no timestamp; a compression library upgrade may change the bytes and so the key, which costs one more object, nothing else), so the same range of the same source re-read with the same settings gives the same key. Before the put, the engine looks at that key:
+   - **absent** (the backend's HEAD answers `NotFound`): the batch is put there;
+   - **holds an object that verifies strongly** against the batch's size and full digest: the put is skipped and the object is reused (`object_key_reused` in the log). The pipeline then verifies it again like any other, so `VERIFIED` still rests on a read of the stored bytes;
+   - **under the S3 Object Lock profile, holds an object that verifies strongly but is not locked as configured** (#709): its retention is read first (a lock or hold the HEAD reports missing is confirmed with `UploadBackend::confirm_lock_absent`, S3 `GetObjectRetention` or `GetObjectLegalHold`, since a HEAD without the read permission omits the headers), and an ended lock, no lock, the other mode or a missing configured legal hold sends the batch to its attempt key like the case below, as a fresh object under the configured lock, counted as `fallback_lock_elapsed`, `fallback_unlocked`, `fallback_lock_mode` or `fallback_hold_missing` and logged as a rate-limited `object_key_fallback` WARN. The pipeline's retention check then holds the fresh object to the lock on the version written before `VERIFIED`. The attempt key is remembered per derived key for the process (`LockFallbacks`): a later replay reuses it when it holds the bytes and is locked, and when it is there and not usable either writes nothing for five minutes (`lock_withheld`), so a store that does not keep locks costs one extra object per range per window, not one per replay. A retention the store cannot report fails the batch before anything is written;
+   - **anything else** (the object there does not verify, verifies by size only, or the probe failed with anything but a throttle): the key is left alone and the batch is written under its **attempt key**, named by its `batch_id` as before, with the reason logged as `object_key_fallback`. Nothing that is already stored is ever overwritten, so a damaged object stays for the scrub to report, and a key that would need an overwrite under Object Lock is never written. A throttled probe fails the batch like any other stage.
+
+   Two writers of one derived key write the same bytes by construction, so the race between the probe and the put changes no content; in a versioned bucket it adds an identical version at worst. The put must still replace the key whole: S3 puts are atomic, and `localfs` copies beside the key and renames onto it, so a crash mid-copy cannot tear an object that a committed row already verified. The probe is the only guard against writing over an object that does not verify; a store-enforced conditional put (`If-None-Match: *`) would close the probe-to-put window as well, and is not used yet.
+
+   **What the operator is told.** Every outcome is one log event with `batch_id`, `source`, `range` and `key` (and `fallback_key`, `reason` where they apply) as fields, and a message that says what happened, what the engine did and what to do. Every outcome is also counted in `vtop_object_key_decisions_total{decision}`. The two notices a setting repeats on every batch (`object_key_per_attempt`, and `object_key_fallback` when the store refused or failed the check of a key) are logged at most once a minute per kind and source, with a `suppressed` count; the counter is never limited, and a fallback about one object (it differs, verifies by size only, or cannot be read) is always logged:
+
+   | `event` | Level | Condition and action |
+   |---|---|---|
+   | `object_key_derived` | info | nothing stored at the derived key; the batch is uploaded under it |
+   | `object_key_reused` | info | "object for range R of S already archived and verified; reusing key K, no upload" |
+   | `object_key_fallback` | warn | the key holds an object that does not verify (`fallback_differs`), verifies by size only (`fallback_size_only`) or cannot be read back (`fallback_unreadable`), or the store refused or failed the check of the key (`fallback_unchecked`), or, under the Object Lock profile, it verifies but is not locked as configured (`fallback_unlocked`, `fallback_lock_elapsed`, `fallback_lock_mode`, `fallback_hold_missing`; at most once a minute per kind and source); the batch goes under its attempt key instead of overwriting. `lock_withheld`: the attempt key written for the range moments ago is not usable either, nothing is written and the batch fails; and the message says what to check (`vtopctl scrub`, a content-verifying backend, list permission when the store answered 403, the store's health) |
+   | `object_key_probe_throttled` | warn | the store throttled the probe; nothing was written, the batch fails and its range is handed back |
+   | `object_key_per_attempt` | info | no checksum, or a backend that cannot report an absent key; the batch is written under its attempt key and a replay will write another object |
+
+   A window that rebuilds one an earlier attempt sealed is reported once more, after its key is decided, and counted in `vtop_replay_rebuilds_total{result}` (#626), with `earlier_batch_id` beside the fields above:
+
+   | `event` | Level | `result` | Condition and action |
+   |---|---|---|---|
+   | `replay_rebuilt` | info | `exact` | the window covers exactly the recorded range and was sealed at the recorded instant, so it names the same derived key, and the key decision used it (with `recorded_digest`, or `unknown` when the earlier attempt recorded no upload); its bytes match the object the earlier attempt uploaded, where the ledger recorded one |
+   | `replay_key_fallback` | info | `fallback` | the window covers exactly the recorded range with the same bytes, but the key decision fell back to the attempt key (an `object_key_fallback` or `object_key_per_attempt` event for the same batch says why), so a second object is written; the counter for the reason is `vtop_object_key_decisions_total` |
+   | `replay_bound_refused` | warn | `refused` | the re-read could not stop at the recorded end (the reason is a field); it reads to the current end as before, so a second object may be written; rate-limited per source with a `suppressed` count; find what rewrote or truncated the source, and run `vtopctl audit-coverage` |
+   | `replay_bound_too_large` | warn | `too_large` | the range is over 4x the current limits and is not bounded; raise the limits back or accept a second object |
+   | `replay_window_dropped` | warn | `dropped_at_stop` | the engine stopped inside a rebuild; the partial window was dropped, and the next start reads the range again; nothing to do |
+   | `replay_bytes_differ` | warn | `bytes_differ` | the window covers exactly the recorded range, but its digest differs from the object the earlier attempt uploaded (the row's `object_sha256`); the batch is written under its own key and the earlier object is left untouched; nothing to do if compression, format or checksum settings changed since, otherwise run `vtopctl scrub` |
+
+   Each is reported once the batch is VERIFIED, so an attempt that fails again (a store outage) is not counted. A window whose row recorded no seal instant (a row from before v0.10.0) is not reported unless its digest differs: it was sealed when it was read again. The earlier digest is the one the ledger recorded with `OBJECT_UPLOADED`. A failed attempt that put its object and then lost that write (a crash, or a ledger fault) records none, so a rebuild of it is judged on its range alone and counted `exact`, its event saying `recorded_digest: unknown`.
+
+   **What stays per attempt, and why.** The `batch_id` keeps its stamp and random suffix: it names the ledger row and the manifest (`{batch_id}.manifest.json`). A ledger row is one attempt: a FAILED or `REPLAY_REQUIRED` row and the row of the replay that succeeded are both kept, and a unique id per attempt keeps their transitions and claims apart (`batch_id` is the primary key of both stores). A manifest is per attempt for the same reason: it carries the `batch_id`, its own `created_at` and the self-hash and version id its row pinned (#135), so one attempt's manifest written over another's would break the pinned row's binding. Several manifests can therefore name one object, and they are always attempts at one unit's range with the same bytes, so a reader can dedupe them by the object URI. Batches of different units never share an object.
+
+   **Where a replay still writes a second object.**
+   - The batch boundaries differ, where the replay could not rebuild the window as first cut. Since #626 a file, spool or Kafka range handed back (by the running engine from memory, by recovery from its row) is re-read up to its recorded end and no further: the adapter stops the read there (`SourceAdapter::bound_replays`; for Kafka, the partition's offsets above the window's last are rejected without counting against the topic's budget, and the partition is paused for the rest of the pass), file and spool sources read on from it in the same pass as the next window (Kafka in the next pass), and the engine seals the rebuilt window exactly at its end, not by a threshold, its age or a forced flush (`process-once`, the shutdown flush). So a replay over a file that has grown since rebuilds the bytes the failed attempt uploaded and names its object. What still reads to the current end, as before: a range whose re-read cannot stop at its end (`refused`: a line crosses the recorded end, the file under the range was replaced, a rotated file re-read through its kept descriptor, whole-file mode, a Kafka partition whose log no longer holds the range because retention or compaction moved past it); a Kafka range read under another consumer group; a range over 4x the current `batching.max_records` or `max_bytes` (`too_large`, so the window it would hold stays bounded); and a range whose row a power loss rolled back, which leaves nothing to rebuild from. A power loss still archives again at most what was in flight (§12, `ledger_power_loss.rs`). A stop inside a rebuild drops the partial window (`dropped_at_stop`): flushing it would name another object, and its range, never committed, is read again at the next start. A rebuilt window and the bytes after it can be two windows of one unit in the same cycle; when the rebuilt one fails again and the later one verifies, the later one is held VERIFIED (`commit_held_back`, WARN) rather than committed, since its commit would move the committed point past the failed range and clamp that range's rewind. It settles once the failed range has been read again and committed. A window buffered above a range handed back (the bytes read on after a rebuilt window that then fails again) is dropped at the rewind, since the source reads it again, so it cannot be flushed and committed on its own while that range is rebuilt over several passes.
+   - The partition prefix differs, for a row that recorded no seal instant. Under `partitioning.time_source = seal` (the default) the time partition comes from the instant the window was sealed. Since #626 a window that covers exactly a range an earlier attempt sealed and handed back is sealed at that attempt's instant, read from memory while the engine runs and from the row's `sealed_at` after a restart, so a replay in a later hour names the same key. What is left: a row written before v0.10.0 (no `sealed_at`), a range whose row a power loss rolled back (no row at all), and a window that does not cover exactly the recorded range (the item above). `event` keeps the original hour for Kafka in every case.
+   - No digest names the object: with `checksum.algorithm = none`, or on a backend whose HEAD cannot tell an absent key from a refused request (the command backends: `awscli`, `minio`, `s3cmd`; native S3 answers `NotFound` only for a 404, and a 403 from a caller without list permission falls back), every attempt uses its attempt key, as before.
+   - An archive written before #626 used attempt keys only; a replay of one of its ranges does not find that object by name and writes a derived one beside it. Recovery, scrub and the coverage audit read object locations from the ledger and the manifests, never from the shape of a key, so archives with either kind of key, or both, are recovered, scrubbed and audited as before.
 4. A state/storage mismatch (e.g., an object present but unverified) is resolved by re-verifying or re-uploading **before** any commit.
 5. **While the engine is running, a failed range is handed back at once, and the hand-back does not wait on the ledger.** Adapters advance their read position when they *read*, not when a batch commits, so a batch that fails (or errors before `VERIFIED`) is handed back to its source at the end of the cycle that failed it, not at the next restart. Otherwise the next cycle reads on from the end of the failed range and the first later range to verify commits past it, leaving those bytes unarchived (#552).
 
@@ -624,7 +1287,7 @@ On startup, the `replay` module inspects `vtop-state` and maps each incomplete b
 
    A cycle in which a batch failed waits before reading again — the idle interval, doubling per consecutive failing cycle up to a minute, plus jitter — because the failed range is now read again and a tight loop would hammer a store that is down.
 
-   Limits, stated rather than implied: a ledger written by a build *before* #552 can already contain a committed range above a failed one. Replay does not repair that for file and spool sources — their rewind is clamped to the committed point so a superseded failed row cannot re-archive committed data on every restart — and the ledger cannot say whether the older range was later covered, because committed history may be pruned. Finding such holes is the job of an archive coverage audit (#560), not of recovery. A spool whose identity changed since the batch was read cannot be rewound; that is reported as an error and the range is not re-read — but only for a marker that recorded an inode: a legacy marker without one keeps the old size-only check and can rewind a replacement. The file adapter checks identity on replay the same way: a range whose file now has another inode (rotation, #558), is shorter than when the range was read, or keeps the inode but has different first bytes (a same-inode replacement, #578) is refused rather than re-read. The inode and content checks apply only to a marker that recorded them; a legacy marker keeps the size-only check.
+   Limits, stated rather than implied: a ledger written by a build *before* #552 can already contain a committed range above a failed one. Replay does not repair that for file and spool sources — their rewind is clamped to the committed point so a superseded failed row cannot re-archive committed data on every restart — and the ledger cannot say whether the older range was later covered, because committed history may be pruned. Finding such holes is the job of an archive coverage audit (#560), not of recovery. A spool whose identity changed since the batch was read cannot be rewound; that is reported as an error and the range is not re-read — but only for a marker that recorded an inode: a legacy marker without one keeps the old size-only check and can rewind a replacement. The file adapter checks identity on replay the same way: a range whose file now has another inode (rotation, #558), is shorter than when the range was read, or keeps the inode but has different first bytes (a same-inode replacement, #578) is refused rather than re-read - unless the file it was read from can still be reached and is proven to be that file, in which case the range is re-read from it (section 7.2, #621): through a descriptor the adapter kept on it in the same process, or, after a restart, under whatever name it has by then, found by inode among the entries of the path's directory and the files the source's patterns match. A range read before a `copytruncate` is still refused - the copy has a new inode, so it cannot be proven to be the file - as is one whose rotated file was compressed or removed before a restart. The inode and content checks apply only to a marker that recorded them; a legacy marker keeps the size-only check against the file at its path, and is never re-read from a rotated file. Every refused rewind, in a cycle or in recovery, is counted in `vtop_source_replay_refused_total{tenant,source_type}` as well as logged.
 
 This guarantees: no source progress marker is committed unless its object and manifest are durably stored and verified, and no committed marker is double-committed. Source progress is **never** advanced for unverified data.
 
@@ -640,7 +1303,7 @@ The `metrics` module records per-batch, end-to-end measurements, emitted as stru
 | Per-stage latency | compress, checksum, object upload, manifest upload, verify, commit (ms). |
 | Throughput | records/s, uncompressed MiB/s, effective upload MiB/s of the compressed object. |
 
-These per-batch records feed the aggregate Prometheus-style counters that are designed but not yet exported. All logs go to stderr; `--json` output is machine-readable.
+The engine also exports aggregate counters and histograms in Prometheus format at `/metrics` when `VTOP_METRICS_ADDR` is set (`crates/vtop-cli/src/metrics_server.rs`; the catalogue is in [NODE_OBSERVABILITY.md](NODE_OBSERVABILITY.md)), and the same series over OTLP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set (#683). All logs go to stderr; `--json` output is machine-readable.
 
 ---
 
@@ -650,7 +1313,7 @@ These per-batch records feed the aggregate Prometheus-style counters that are de
 - Adaptive sealing (records/bytes/age) bounds in-flight batch size and provides natural backpressure: a slow upload stage delays sealing of the next batch rather than growing memory unboundedly.
 - Source adapters **may** signal backpressure to the batching layer (protocol §6).
 - The Kafka adapter's manual offset commit (auto-commit disabled) ensures the broker's notion of progress tracks the engine's verified-and-committed progress, not its in-memory read position.
-- **Every call the engine makes to its object store and state store has a deadline** (#556). A store that accepts a connection and never answers would otherwise block the awaiting cycle forever, with the process alive and the health endpoint green. The native S3 backend sets the SDK's first-byte (read), per-attempt and whole-operation limits from `upload.request_timeout_seconds` (default 300 s per attempt; the whole operation is allowed the SDK's three attempts); its connect limit is a fixed 10 s, not configurable — the SDK's own defaults bound connecting but not waiting for a response, which the `request_deadline` test shows against a socket that accepts and stays silent. Those SDK limits end when the response headers arrive, so every response BODY the engine reads afterwards (verification, manifest recovery) is bounded separately, by the whole-operation allowance; a store that sends headers and then drips the body fails the read rather than holding it open. The compatibility backends use `upload.command_timeout_seconds`. The state store is wrapped so every request is bounded by `engine.state_store_timeout_seconds` (default 30 s; whole-ledger scans such as startup recovery get ten times it), and opening a Postgres store (connect plus schema check) is bounded by the same value. An expired request is an ordinary failure to the engine — a failed upload fails the batch, and recovery re-reads its range — but it is an **unknown outcome**, not a failed one: the store may have applied it. That is safe here because every ledger transition is checked against the state machine and recovery re-reads rows it finds incomplete; the worst case is a range archived twice, never one lost. Size `request_timeout_seconds` for the slowest link a part must cross (a 64 MiB part at 1 MiB/s needs about a minute). Not covered: `vtopctl migrate`, an operator-run one-shot command whose Postgres connection and schema statements carry no deadline (a schema change on a large ledger can legitimately be slow) — an operator who sees it hang interrupts it, and the migration's statements are idempotent, so running it again is safe.
+- **Every call the engine makes to its object store and state store has a deadline** (#556). A store that accepts a connection and never answers would otherwise block the awaiting cycle forever, with the process alive and the health endpoint green. The native S3 backend sets the SDK's first-byte (read), per-attempt and whole-operation limits from `upload.request_timeout_seconds` (default 300 s per attempt; the whole operation is allowed the SDK's three attempts); its connect limit is a fixed 10 s, not configurable — the SDK's own defaults bound connecting but not waiting for a response, which the `request_deadline` test shows against a socket that accepts and stays silent. Those SDK limits end when the response headers arrive, so every response BODY the engine reads afterwards (verification, manifest recovery) is bounded separately, by the whole-operation allowance; a store that sends headers and then drips the body fails the read rather than holding it open. The compatibility backends use `upload.command_timeout_seconds`. The state store is wrapped so every request is bounded by `engine.state_store_timeout_seconds` (default 30 s; whole-ledger scans such as startup recovery get ten times it), and opening a Postgres store (connect plus schema check) is bounded by the same value. An expired request is an ordinary failure to the engine — a failed upload fails the batch, and recovery re-reads its range — but it is an **unknown outcome**, not a failed one: the store may have applied it. That is safe here because every ledger transition is checked against the state machine and recovery re-reads rows it finds incomplete; the worst case is a range archived twice, never one lost. A request that carries a body — an object, a multipart part, a manifest — is allowed `request_timeout_seconds` plus its size at `upload.request_min_bytes_per_second` (default 4 KiB/s) for each attempt, and its connector read timeout is disabled so the attempt timeout alone bounds it (#663). A fixed deadline on a body is a deadline on the request's share of the link: on a policed 10 Mbit/s uplink at 100 ms the shipped width put 24 part uploads on the link at once, each moved about 11 KB/s, and an 8 MiB part could not cross in 300 s, so every attempt was cut and re-sent from its first byte and the default configuration committed nothing. The floor is per request because the width times the parts in flight share the uplink. A store that stops reading a body is still caught within seconds by the SDK's stalled-upload protection; what the scaled allowance lengthens is how long a store that has read a body may take to answer. Not covered: `vtopctl migrate`, an operator-run one-shot command whose Postgres connection and schema statements carry no deadline (a schema change on a large ledger can legitimately be slow) — an operator who sees it hang interrupts it, and the migration's statements are idempotent, so running it again is safe.
 ---
 
 ## 16. Benchmark harness
@@ -689,9 +1352,9 @@ reality.
 | Source adapters: Kafka (`assign`), file (line + `whole_file`), syslog spool (§7) | ✅ shipped | Kafka consumer-group (`subscribe`) fleet mode is future work. |
 | Upload backends incl. `localfs`, hardened command backends (§8) | ✅ shipped | Verification strength declared per backend (protocol §17). |
 | `StateStore`: SQLite + PostgreSQL, shared battery, DB constraints (§12) | ✅ shipped | Retry-on-`40001`; `vtopctl migrate` privilege split; retention (#128). |
-| Manifest self-hash + keyed BLAKE3 MAC, version pinning (§9) | ✅ shipped | Public-key signatures and key rotation are future work. |
-| Metrics endpoint + readiness, dashboards-as-code (§14) | ✅ shipped | OTLP trace export and alerting rules are future work. |
-| Deterministic object naming (§11, §13) | ⬜ planned | Protocol §15.1 MUST; the open conformance gap — [PRODUCTION_HA.md](PRODUCTION_HA.md) Phase 4. |
+| Manifest self-hash + keyed BLAKE3 MAC, version pinning (§9) | ✅ shipped | MAC key rotation through key ids and a keyring shipped (#685, `0.4` manifests). Public-key signatures are future work. |
+| Metrics endpoint + readiness, dashboards-as-code (§14) | ✅ shipped | OpenTelemetry export (traces and metrics over OTLP, idle until configured, #683) shipped too. A Prometheus alert rule set, unit-tested with `promtool`, with a runbook section per alert and documented SLOs, shipped too (#720, `observability/prometheus/vtop-rules.yaml`); wiring it to an Alertmanager is the deployment's. |
+| Deterministic object naming (§11, §13) | ✅ objects (#626) | Object keys derived from source, range and content digest; reused only after strong verification. Narrowed, not closed: manifests stay per attempt, and the limits in §13 item 3 still produce a second object. |
 | Multi-instance fleet (consumer groups + multi-writer recovery) | ⬜ planned | Phase 5; single-instance lock (#66) until then. |
 | Engine Kubernetes chart | ⬜ planned | Phase 7 — `helm/vtop` deploys the cluster plane, not the engine. |
 | File/syslog HA (leases) | ⬜ optional | Phase 9, gated on an explicit product decision. |

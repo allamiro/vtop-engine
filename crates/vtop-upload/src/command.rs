@@ -587,6 +587,7 @@ mod tests {
             verify_tls: true,
             transport: "tcp_tls".into(),
             request_timeout_seconds: 300,
+            request_min_bytes_per_second: 4 * 1024,
             profile: None,
             command_binary: Some(path.to_string_lossy().into_owned()),
             command_timeout_seconds: 2,
@@ -600,9 +601,11 @@ mod tests {
             multipart_threshold_bytes: 8 * 1024 * 1024,
             multipart_max_parallelism: 4,
             multipart_abandon_after_secs: 24 * 60 * 60,
+            multipart_part_attempts: 3,
             transports: Default::default(),
             max_egress_bytes_per_second: None,
             max_concurrency_ceiling: None,
+            object_lock: None,
         }
     }
 

@@ -18,9 +18,17 @@ path = "src/main.rs"
 default = ["kafka"]
 # Kafka is a compatibility/source adapter, not a native broker dependency.
 kafka = ["vtop-adapters/kafka", "dep:rdkafka"]
+# Opt-in Kerberos (SASL GSSAPI) for the Kafka source; see vtop-adapters.
+kafka-gssapi = ["kafka", "vtop-adapters/kafka-gssapi"]
 # Keep PostgreSQL optional in the CLI while providing a discoverable feature
 # for production builds and the separate `vtopctl migrate` deployment step.
 postgres = ["vtop-state/postgres"]
+# TEST BUILDS ONLY (#725): `VTOP_FAILPOINT=<point>` makes the engine kill
+# itself with SIGKILL at that line, for the engine crash sweep
+# (scripts/live-chaos/engine/run-sweep.sh). Off by default; no release
+# archive, container image or chart enables it, and
+# scripts/check-failpoints-absent.sh fails CI if one does.
+failpoints = ["dep:bytes", "rustix/process"]
 
 [dependencies]
 blake3 = { workspace = true }
@@ -47,9 +55,25 @@ async-trait = { workspace = true }
 uuid = { workspace = true }
 rustix = { workspace = true }
 rdkafka = { workspace = true, optional = true }
+# The multipart part type the failpoint decorator passes through.
+bytes = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The in-memory span exporter the trace tests assert against (#683).
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+# Decoding what the fake collector receives (tests/otel_messages.rs).
+opentelemetry-proto = { workspace = true }
+prost = { workspace = true }
+# s3_native_object_keys (#626) counts stored object versions on a live store.
+aws-sdk-s3 = { workspace = true }
+# `PgStateStore::execute_raw` resets the Postgres ledger between the recovery
+# tests that run on one when VTOP_TEST_POSTGRES is set (#664).
+vtop-state = { workspace = true, features = ["test-support"] }
+# ledger_v0_9_0 re-roots the paths in a ledger the released v0.9.0 wrote
+# (#626), with SQL, before this build opens it.
+sqlx = { workspace = true }
 
 # Integration tests live in the repo-root tests/ directory and are compiled as
 # integration tests of this package.
@@ -74,6 +98,19 @@ name = "integration_kafka_to_minio"
 path = "../../tests/integration_kafka_to_minio.rs"
 required-features = ["kafka"]
 
+# Every failpoint kills the real binary where it says it does (#725).
+[[test]]
+name = "failpoints"
+path = "tests/failpoints.rs"
+required-features = ["failpoints"]
+
 [[test]]
 name = "integration_metrics_endpoint"
 path = "tests/integration_metrics_endpoint.rs"
+
+# The schema on one PostgreSQL major (#723): `vtopctl migrate` twice, and a
+# ledger restore into a migrated schema. Needs a throwaway server
+# (VTOP_TEST_POSTGRES) and its client tools (VTOP_TEST_PG_EXEC); skips without.
+[[test]]
+name = "postgres_migrate_restore"
+required-features = ["postgres"]

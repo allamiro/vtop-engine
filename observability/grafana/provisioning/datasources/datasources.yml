@@ -17,11 +17,12 @@ datasources:
     access: proxy
     url: http://loki:3100
     jsonData:
-      # Jump from a log line straight to its trace once the engine emits them
-      # (issue #46). Harmless until then.
+      # Jump from a log line straight to its trace (#683). The engine's JSON
+      # lines inside a batch start with "trace_id":"<id>"; a logfmt line
+      # would carry trace_id=<id>.
       derivedFields:
         - datasourceUid: tempo
-          matcherRegex: 'trace_id=(\w+)'
+          matcherRegex: 'trace_id"?[=:]"?(\w+)'
           name: TraceID
           url: '$${__value.raw}'
 
@@ -31,9 +32,12 @@ datasources:
     access: proxy
     url: http://tempo:3200
     jsonData:
+      # From a span to the engine's log lines of the same trace (#683).
       tracesToLogsV2:
         datasourceUid: loki
         spanStartTimeShift: '-5m'
         spanEndTimeShift: '5m'
+        customQuery: true
+        query: '{service="vtop-engine"} |= "$${__trace.traceId}"'
       lokiSearch:
         datasourceUid: loki

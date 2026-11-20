@@ -47,12 +47,36 @@ pub enum VtopError {
     /// for an operator now and for a concurrency controller later.
     #[error("upload backend throttled: {0}")]
     UploadThrottled(String),
+    /// The store cannot continue a multipart upload the client is writing to
+    /// (#668): S3's `NoSuchUpload`, after the upload was aborted (a lifecycle
+    /// rule, another process's sweep) or completed by an earlier attempt; or
+    /// `InvalidPart` / `InvalidPartOrder` on complete, where a part the store
+    /// holds is not the one the client recorded. Kept apart from `Upload`
+    /// because the answer is not a retry of the same request, which would
+    /// fail the same way, but a new upload.
+    #[error("upload session no longer exists at the store: {0}")]
+    UploadSessionGone(String),
 
     #[error("state store error: {0}")]
     State(String),
 
     #[error("compression error: {0}")]
     Compression(String),
+
+    /// A manifest that claims a version newer than this build reads (#671).
+    /// Only a claim: the version is read before anything is authenticated,
+    /// so a reader acts on it only once it has proven the bytes are its
+    /// fleet's (a pinned version carrying the ledger's self-hash). Distinct
+    /// from [`VtopError::Manifest`] (malformed) and from the integrity errors.
+    #[error(
+        "manifest {}claims version {version}, which this build cannot authenticate (it reads versions up to {supported})",
+        uri.as_deref().map(|uri| format!("{uri} ")).unwrap_or_default()
+    )]
+    UnsupportedManifestVersion {
+        uri: Option<String>,
+        version: String,
+        supported: &'static str,
+    },
 
     #[error("manifest error: {0}")]
     Manifest(String),
@@ -80,6 +104,21 @@ impl VtopError {
     /// Whether this is the store saying "slow down" (#102).
     pub fn is_upload_throttle(&self) -> bool {
         matches!(self, VtopError::UploadThrottled(_))
+    }
+
+    /// Name the manifest a [`VtopError::UnsupportedManifestVersion`] is
+    /// about; any other error is returned unchanged.
+    pub fn at_manifest_uri(self, at: &str) -> Self {
+        match self {
+            VtopError::UnsupportedManifestVersion {
+                version, supported, ..
+            } => VtopError::UnsupportedManifestVersion {
+                uri: Some(at.to_owned()),
+                version,
+                supported,
+            },
+            other => other,
+        }
     }
 }
 

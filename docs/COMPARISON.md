@@ -7,7 +7,7 @@ about Northguard/Xinfra come from LinkedIn's public materials (their system is
 closed source, so that comparison is necessarily against what they have
 published, not against their code).
 
-VTOP is a **prototype / reference implementation** (0.x pre-releases). This
+VTOP is a **prototype / reference implementation** (0.x releases). This
 document compares architectures and guarantees, not production mileage —
 Kafka and Northguard both carry years of at-scale operation that no design
 argument substitutes for.
@@ -31,7 +31,7 @@ head-on.
 
 | Area | VTOP | Kafka |
 |---|---|---|
-| Leader election safety | Leadership is a metadata **lease**; acquisition mints `fencing_epoch + 1` through a linearizable Raft proposal, so the old leader is fenced **by construction**. There is no unclean-election knob to misconfigure. | ISR-based election; `unclean.leader.election.enable` exists and, when enabled (or mis-set), silently trades durability for availability. |
+| Leader election safety | Leadership is a metadata **lease**; acquisition mints `fencing_epoch + 1` through a linearizable Raft proposal, so the old leader is fenced **by construction**. There is no unclean-election knob to misconfigure: once every data node judges lineage and metadata is at feature level 8, the only way to promote without proof is an explicit, single-use operator command that is recorded in the transition chain (`vtopctl node promote-unproven`, #636), for a range whose lineage cannot be proven - for example records that predate the epoch journal, or journals lost, on every replica (see PRODUCTION_HA.md). Below the lineage-verdict level (6), and from a data node on an older release, promotion reports carry no verdicts and their answers are counted by offset, as before #577. | ISR-based election; `unclean.leader.election.enable` exists and, when enabled (or mis-set), silently trades durability for availability. |
 | End-to-end verifiability | Content roots per segment; sealed artifacts verified **offline and byte-exactly** (`vtopctl segment verify`); repair, retirement, and tiering commit only after **evidence** (`CommitReplacementProof`, `CommitTierEvidence`) with verifier identity and epoch recorded. These are metadata-log commits — distinct from the archive protocol's *source-progress* commit ([VTOP_PROTOCOL_DRAFT.md §3, §13](VTOP_PROTOCOL_DRAFT.md#13-commit-rule)). On the archive path, verification is graded strong / backend-limited / disabled (§17), with strong the default and non-strong commit requiring explicit opt-out. | Checksums protect against corruption in flight/at rest, but there is no end-to-end, third-party-re-verifiable proof chain for replicas, repairs, or tiered copies. |
 | Source-commit safety (archive path) | The commit rule ([§13](VTOP_PROTOCOL_DRAFT.md#13-commit-rule)): a Kafka offset / file cursor / spool position is never advanced until the object **and** its bound manifest are durably stored and verified; crash recovery is specified (§14) and replay never loses data. | `enable.auto.commit` and consumer-side offset management leave verify-before-commit discipline to each application. |
 | Determinism and test rigor | Pure deterministic metadata state machine (no serde, hand-coded bounded codecs, golden byte vectors); crash sweeps drive the exact production byte paths at every write boundary; mutation testing in CI; deterministic fault harness plus a 15-scenario live-chaos suite (kill -9, disk-full, fsync-EIO, partitions, clock skew, live failover, co-location, admin authorization, replica replacement, restart-free candidate failover). | Strong integration test culture, but replay determinism and byte-exact snapshot equivalence are not design invariants, and crash-point sweeps of the storage engine are not part of CI. |
@@ -45,9 +45,9 @@ head-on.
 |---|---|---|
 | Epoch-qualified truncation (KIP-101/KIP-279) | Largely closed in v0.2.0: per-replica epoch history, bounded divergence truncation, fence-and-read reconciliation. The §5.4.1-style election restriction shipped in v0.4.0 (`promotion.rs`, per-voter form). The §5.4.2 rule — a new leader publishes its high-water mark only through a quorum-acked marker of its own epoch, so a published mark never regresses — is implemented on `main` for v0.5.0 (`publish_boundary_marker`, driven from the lease publisher; scenarios 09 and 14 assert the non-regression). The remaining piece is the signed leadership-transition record. | #240 remainder |
 | Transactions / EOS | Kafka has cross-partition transactions and exactly-once streams. VTOP has producer idempotency (epoch + sequence dedup) — enough for exactly-once produce per range, no cross-range transactions. | Not scheduled; deliberate scope cut for now |
-| Consumer-group sophistication | Kafka has incremental cooperative rebalancing, static membership, regex subscriptions. VTOP has groups, cursors-in-metadata, heartbeats, and assignment — the minimum honest core. | Grows with #225's needs |
-| Ecosystem | Clients in every language, Connect, Streams, MirrorMaker, ksqlDB, decades of operational tooling. VTOP has `vtopctl` and dashboards-as-code. | #225 (Kafka wire-compatibility gateway) — inherit the client ecosystem instead of rebuilding it |
-| Scale features | Quotas, throttled reassignment, multi-tenancy, tiered storage at scale, thousands-of-partition operations. | Post-v0.2.0; benchmarks tracked in #92/#98/#130 |
+| Consumer-group sophistication | Kafka has incremental cooperative rebalancing, static membership, regex subscriptions. VTOP has groups, cursors-in-metadata, heartbeats, and assignment — the minimum honest core. | Not scheduled |
+| Ecosystem | Clients in every language, Connect, Streams, MirrorMaker, ksqlDB, decades of operational tooling. VTOP has `vtopctl`, dashboards-as-code, and a Kafka wire-compatibility gateway (#225) that stock librdkafka clients produce to and consume from; it is measured slower than Apache Kafka ([benchmarks/kafka-comparison.md](benchmarks/kafka-comparison.md)), and a Kafka client cannot yet follow a VTOP failover. | #225 shipped the gateway; a Kafka client following a failover is #751 (v0.11.0) |
+| Scale features | Quotas, throttled reassignment, multi-tenancy, tiered storage at scale, thousands-of-partition operations. | Not scheduled. The benchmark issues once named here (#92, #98, #130) are closed |
 
 ### Measured
 
@@ -61,6 +61,13 @@ ratios) is generated from a committed CSV, and its stated conditions
 `environment.json`; read it with those conditions, including that under
 `defaults` a Kafka acknowledgement does not wait for an fsync and a VTOP
 quorum acknowledgement does.
+
+Failover under load is in
+[`benchmarks/kafka-failover.md`](benchmarks/kafka-failover.md) (#597). Its
+first finding is a gap, not a number: a Kafka client cannot follow a VTOP
+failover, because the gateway is refused on the candidate nodes that fail over
+in place, so VTOP's failover there is measured through its native client and
+labelled as a different client path.
 
 ## VTOP vs LinkedIn Northguard/Xinfra
 
@@ -84,10 +91,14 @@ Kafka pain points: fixed partitioning, coupled metadata, opaque rebalancing.
 - **Evidence chain.** Nothing published about Northguard claims third-party
   re-verifiable proofs for repair, tiering, or leadership transitions;
   VTOP treats them as first-class records in the metadata log.
-- **No unclean path by construction.** Northguard's published material
+- **No unclean path by configuration.** Northguard's published material
   describes strong consistency; VTOP additionally makes the fencing argument
   mechanical: epochs are minted by a linearizable state machine whose golden
-  vectors and crash sweeps are in CI.
+  vectors and crash sweeps are in CI. The one unproven path is an explicit,
+  audited, single-use operator command for a range whose lineage cannot be
+  proven, such as records that predate the epoch journal, or journals lost,
+  on every replica (#636; needs metadata feature level 8, see
+  PRODUCTION_HA.md). It is never a setting.
 - **Auditable size.** A small, deterministic core that one person can read is
   a feature; it is also, honestly, a consequence of being early.
 
@@ -95,10 +106,10 @@ Kafka pain points: fixed partitioning, coupled metadata, opaque rebalancing.
 
 | Gap | Honest state | Closing item |
 |---|---|---|
-| Metadata scale-out | Northguard shards metadata so no central group is a bottleneck. VTOP runs **one** metadata Raft group; saturation characteristics are researched (`METADATA_SATURATION_RESEARCH.md`) but sharding is not built. | Post-v0.2.0 arc; research doc is the seed |
-| Live range splitting / self-balancing | VTOP models lineage and placement but does not yet split ranges under load or self-balance placements live. | Post-v0.2.0; placement plane (#180/#181) is the foundation |
-| Virtualization / migration layer | Xinfra gives LinkedIn topic virtualization and transparent migration between backends. VTOP has nothing equivalent; #225's gateway is the nearest analog (protocol-level rather than address-level). | #225, then revisit |
-| Production mileage | Northguard runs LinkedIn-scale traffic (trillions of records/day, per their materials). VTOP's scale story is a benchmark plan, not a track record. | #92 / #98 / #130 sweep grid and soaks |
+| Metadata scale-out | Northguard shards metadata so no central group is a bottleneck. VTOP runs **one** metadata Raft group; saturation characteristics are researched (`METADATA_SATURATION_RESEARCH.md`) but sharding is not built. | Not scheduled (no open issue); the research doc is the seed |
+| Live range splitting / self-balancing | VTOP models lineage and placement but does not yet split ranges under load or self-balance placements live. | Not scheduled (no open issue); the placement plane (#180/#181) is the foundation |
+| Virtualization / migration layer | Xinfra gives LinkedIn topic virtualization and transparent migration between backends. VTOP has nothing equivalent; #225's gateway is the nearest analog (protocol-level rather than address-level). | Not scheduled |
+| Production mileage | Northguard runs LinkedIn-scale traffic (trillions of records/day, per their materials). VTOP's scale story is a benchmark plan, not a track record. | Soaks (#726, #727) and a 30-day pilot deployment (#738), milestones v0.11.0 and v0.12.0 |
 | Multi-tenancy | Published Northguard material emphasizes tenant isolation. VTOP is single-tenant today (one principal per range in the authorizer). | Identity layer landed with #238 (v0.2.0); per-tenant principals on top of it are the remaining work |
 
 ## What "better" means here, concretely

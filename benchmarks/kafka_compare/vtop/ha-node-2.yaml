@@ -1,0 +1,64 @@
+# VTOP node 2 for the failover comparison (#597): a CO-LOCATED node, one
+# process hosting a metadata Raft voter and a CANDIDATE replica of the one
+# range, the shape the Helm chart renders for a replicated topology (#284,
+# #287). The three members are identical apart from identity; whichever
+# acquires the range lease leads, and when it dies a survivor takes the range
+# in place, with no restart and no config rewritten.
+#
+# The counterpart of Kafka's combined broker+controller nodes in
+# compose.kafka.yml: three containers, each a voter of the metadata quorum and
+# a replica of the partition.
+#
+# Promotion fences the other replicas over the replica plane, and the node
+# refuses that on a plaintext plane, so every plane here is TLS (the phase-1
+# static leader ran plaintext and could not fail over at all). failover.py
+# mints the certificates per run with scripts/live-chaos/gen-certs.sh (SAN
+# localhost, hence server_name "localhost"); none is committed.
+#
+# No `kafka` block: the node refuses one on a candidate (see the failover
+# report). Every timing knob not written here is the binary's default (profile
+# `defaults`, #595 rule 5): lease 15 s, renew 5 s, poll 2 s; Raft election
+# 300-600 ms, heartbeat 60 ms; segment format v1.
+meta:
+  node_id: 2
+  cluster_id: 11111111-2222-3333-4444-555555555555
+  data_dir: /home/vtop/meta
+  peer_listen: "0.0.0.0:9100"
+  admin_listen: "0.0.0.0:9200"
+  # The full voter set, identical on every node; the binary ignores its own.
+  peers:
+    - { id: 1, addr: "vtop-1:9100", server_name: "localhost" }
+    - { id: 2, addr: "vtop-2:9100", server_name: "localhost" }
+    - { id: 3, addr: "vtop-3:9100", server_name: "localhost" }
+  tls: { ca: /etc/vtop/tls/ca.pem, cert: /etc/vtop/tls/meta-2.pem, key: /etc/vtop/tls/meta-2-key.pem }
+data:
+  role: candidate
+  # The same list on every member, this node included; the binary skips its own.
+  peers:
+    - { node_uuid: aaaaaaaa-0000-0000-0000-0000000000a1, addr: "vtop-1:9300", server_name: "localhost" }
+    - { node_uuid: aaaaaaaa-0000-0000-0000-0000000000a2, addr: "vtop-2:9300", server_name: "localhost" }
+    - { node_uuid: aaaaaaaa-0000-0000-0000-0000000000a3, addr: "vtop-3:9300", server_name: "localhost" }
+  node_uuid: aaaaaaaa-0000-0000-0000-0000000000a2
+  cluster_id: 11111111-2222-3333-4444-555555555555
+  data_dir: /home/vtop/data
+  # The floor of the epoch view, not an epoch to serve at: grants are minted from 1.
+  fencing_epoch: 0
+  range: { topic: "bench", topic_epoch: 1, range_id: aaaaaaaa-0000-0000-0000-0000000000c1, range_generation: 0 }
+  segment_id: aaaaaaaa-0000-0000-0000-0000000000d1
+  native_listen: "0.0.0.0:9400"
+  replica_listen: "0.0.0.0:9300"
+  replica_tls: { ca: /etc/vtop/tls/ca.pem, cert: /etc/vtop/tls/data-2.pem, key: /etc/vtop/tls/data-2-key.pem }
+  native_tls: { ca: /etc/vtop/tls/ca.pem, cert: /etc/vtop/tls/data-2.pem, key: /etc/vtop/tls/data-2-key.pem }
+  principal_id: aaaaaaaa-0000-0000-0000-0000000000ce
+  lease:
+    # Ask this process's own metadata voter first; admin_peers is where a
+    # redirect to the Raft leader leads (#292).
+    admin_endpoint: "127.0.0.1:9200"
+    server_name: "localhost"
+    topic_uuid: aaaaaaaa-0000-0000-0000-0000000000b1
+    tls: { ca: /etc/vtop/tls/ca.pem, cert: /etc/vtop/tls/data-2.pem, key: /etc/vtop/tls/data-2-key.pem }
+    admin_peers:
+      - { node_id: 1, endpoint: "vtop-1:9200", server_name: "localhost" }
+      - { node_id: 2, endpoint: "vtop-2:9200", server_name: "localhost" }
+      - { node_id: 3, endpoint: "vtop-3:9200", server_name: "localhost" }
+observability: { listen: "0.0.0.0:9600" }

@@ -1,6 +1,6 @@
 """Metrics collection + summary generation.
 
-Writes the seven required CSV files plus summary.json / summary.md into
+Writes one CSV per entry in CSV_HEADERS plus summary.json / summary.md into
 `results/<run_id>/`. Never overwrites a prior run (unique run_id; refuses an
 existing directory).
 """
@@ -93,6 +93,16 @@ CSV_HEADERS: dict[str, list[str]] = {
     "backlog_metrics.csv": [
         "run_id", "cycle", "elapsed_seconds", "files_seeded", "bytes_seeded",
         "bytes_archived", "backlog_bytes", "cycle_batches",
+    ],
+    # One row per `process-once` cycle (#483): when it started on the run's
+    # clock, how long the call took, and what it committed. The run-level
+    # throughput divides by the whole wall clock — seeding, the ledger read
+    # and the recovery pass included — so a goodput comparison against a
+    # link's rate needs the engine's own busy time, and only the cycles know
+    # it. Header-only for `engine_mode: run`, which has no cycles.
+    "cycle_metrics.csv": [
+        "run_id", "cycle", "started_seconds", "cycle_seconds", "exit_code",
+        "batches", "committed_batches", "committed_bytes",
     ],
     "replay_metrics.csv": [
         "run_id", "batch_id", "failed_state", "replay_start_time",
