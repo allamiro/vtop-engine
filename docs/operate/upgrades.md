@@ -7,9 +7,12 @@ every upgrade.
   newest patch of each released minor series (v0.2 onwards) opens under the
   current build, serves its records byte for byte, and still serves them after
   a restart ([`scripts/upgrade-compat.sh`](../../scripts/upgrade-compat.sh)).
-- **Downgrades are not supported.** A newer release may write data an older
-  one cannot read, and nothing tests that path. Going back means a fresh
-  directory, or a verified backup taken before the upgrade.
+- **Downgrades are not supported**, except for what the
+  [compatibility matrix](../reference/compatibility.md#downgrade) records for
+  the previous release: the state ledger, its prune digests and the audit
+  trail. A newer release may write data an older one cannot read, and nothing
+  else tests that path. Going back means a fresh directory, or a verified
+  backup taken before the upgrade.
 
 The source for this page is the release notes in the [roadmap](../ROADMAP.md);
 read the section for the release you are moving to. What each format
