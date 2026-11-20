@@ -262,14 +262,32 @@ pub trait StateStore: Send + Sync {
     ) -> Result<Vec<CommittedCursor>, VtopError>;
 
     /// Where each Kafka (topic, partition, consumer group) resumes according
-    /// to the ledger: the end offset of its NEWEST committed batch, by
-    /// `(created_at, batch_id)`, computed IN THE STORE (#77, #614).
+    /// to the ledger, one answer per incarnation of the topic the ledger holds
+    /// rows of, computed IN THE STORE (#77, #614).
+    ///
+    /// An incarnation is a topic id (the UUID the broker gives a topic, which
+    /// a deleted and recreated topic does not keep) as the markers record it.
+    /// For a known id the answer is the HIGHEST end offset of its committed
+    /// batches, not the end of the newest-created row: recovery can commit a
+    /// window created earlier above one created later - a damaged range is
+    /// re-read as a new row while the window above it is held, and both are
+    /// then committed - and resuming from the newer, lower row re-archives
+    /// the range between (a duplicate, never a loss). A maximum is safe only
+    /// within one incarnation: a recreated topic numbers its offsets from
+    /// zero, and the old log's highest end would skip the new log's first
+    /// records.
+    ///
+    /// Rows with no id (written before it was recorded) are one more answer,
+    /// the newest committed row's end, as the ledger always resumed. They are
+    /// never compared with rows of a known id. [`CommittedKafkaOffset::newest`]
+    /// marks the answer that holds the newest-created row of the unit.
     ///
     /// The Kafka adapter resumes from this rather than from the group's
     /// committed offset on the broker, which any engine can move, fenced or
-    /// not. History pruning keeps exactly this row for every (topic,
-    /// partition, consumer group), so the answer is the same before and after
-    /// any prune.
+    /// not. History pruning keeps exactly the rows this reads - per
+    /// incarnation the highest end (ties broken by `(created_at, batch_id)`),
+    /// and for the rows of no id the newest - so every answer is the same
+    /// before and after any prune.
     async fn committed_kafka_offsets(&self) -> Result<Vec<CommittedKafkaOffset>, VtopError>;
 
     /// The newest committed batch of EACH FILE (inode) that has lived at each
@@ -336,11 +354,13 @@ pub trait StateStore: Send + Sync {
     /// cursor, so it needs no newer row to be deleted. Three protections are
     /// non-negotiable: rows in any other state are never touched; rows at or
     /// after the
-    /// cutoff are never touched; and for every source path (falling back to
-    /// `source_name` when the progress marker carries no path), and for a
-    /// Kafka row every (topic, partition, consumer group), the NEWEST
-    /// committed row - by `created_at`, then `batch_id` - is always retained,
-    /// so [`StateStore::committed_cursors`] and
+    /// cutoff are never touched; for every source path (falling back to
+    /// `source_name` when the progress marker carries no path) the NEWEST
+    /// committed row - by `created_at`, then `batch_id` - is always retained;
+    /// and for a Kafka row, for every (topic, partition, consumer group,
+    /// topic id), the row with the HIGHEST end offset (ties by `created_at`,
+    /// then `batch_id`) is always retained - for rows with no topic id, the
+    /// NEWEST - so [`StateStore::committed_cursors`] and
     /// [`StateStore::committed_kafka_offsets`] return identical answers
     /// before and after any prune. [`StateStore::max_committed_end_bytes`]
     /// is not prune-invariant: the highest end byte can belong to an older

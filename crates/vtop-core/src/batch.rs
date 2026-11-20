@@ -353,6 +353,7 @@ mod tests {
             start_offset: start,
             end_offset: end,
             consumer_group: "vtop-engine".into(),
+            topic_id: None,
         }
     }
 

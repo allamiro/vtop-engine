@@ -5332,12 +5332,14 @@ impl Engine {
         {
             let committed = self.store.committed_kafka_offsets().await?;
             k.seed_committed_from_ledger(committed.iter().map(|c| {
-                (
-                    c.topic.as_str(),
-                    c.partition,
-                    c.consumer_group.as_str(),
-                    c.end_offset,
-                )
+                vtop_adapters::kafka_source::LedgerResume {
+                    topic: c.topic.as_str(),
+                    partition: c.partition,
+                    consumer_group: c.consumer_group.as_str(),
+                    topic_id: c.topic_id.as_deref(),
+                    end_offset: c.end_offset,
+                    newest: c.newest,
+                }
             }));
         }
         Ok(())
@@ -6546,6 +6548,7 @@ mod tests {
             start_offset: offset,
             end_offset: offset,
             consumer_group: "g".into(),
+            topic_id: None,
         };
         let read = |offset: i64, lo: Option<&str>, hi: Option<&str>| ReadResult {
             records: vec![b"r".to_vec()],
@@ -6671,6 +6674,7 @@ mod tests {
             start_offset: 0,
             end_offset: 0,
             consumer_group: "g".into(),
+            topic_id: None,
         };
         // Same topic, different partitions -> distinct buffer keys (no mixing).
         assert_ne!(buffer_key(&topic, &mk(0)), buffer_key(&topic, &mk(1)));
@@ -6714,6 +6718,7 @@ mod tests {
             start_offset: 0,
             end_offset: 0,
             consumer_group: "g".into(),
+            topic_id: None,
         };
         // Key names the marker's topic and partition, not the requested source.
         assert_eq!(buffer_key(&requested, &marker_for_b).1, "topic_b#p3");
@@ -6730,6 +6735,7 @@ mod tests {
             start_offset: 0,
             end_offset: 0,
             consumer_group: "g".into(),
+            topic_id: None,
         };
         assert_eq!(
             source_for_marker(&requested, &marker_for_a).source_name,
@@ -9126,6 +9132,7 @@ mod tests {
             start_offset: start,
             end_offset: start + 9,
             consumer_group: "g".into(),
+            topic_id: None,
         };
         for order in [[0usize, 1, 2], [2, 1, 0], [1, 2, 0]] {
             let candidates = [
@@ -9250,6 +9257,7 @@ mod tests {
             start_offset: start,
             end_offset: end,
             consumer_group: "g".into(),
+            topic_id: None,
         };
         let mut plan = RewindPlan::default();
         plan.add(&kafka(10, 19));
@@ -10019,6 +10027,7 @@ mod tests {
             start_offset: start,
             end_offset: end,
             consumer_group: "g".into(),
+            topic_id: None,
         };
         for (start, end) in [(100, 149), (150, 199), (200, 249)] {
             buf.append(ReadResult {
@@ -10835,6 +10844,7 @@ mod tests {
             start_offset: start,
             end_offset: start + 9,
             consumer_group: group.into(),
+            topic_id: None,
         };
         let mut plan = RewindPlan::default();
         plan.hold(&kafka("g", 0, 10));
@@ -11449,6 +11459,7 @@ mod tests {
                 start_offset: start,
                 end_offset: end,
                 consumer_group: Self::GROUP.into(),
+                topic_id: None,
             };
             let read = ReadResult {
                 records: (self.next..end)
@@ -11712,6 +11723,7 @@ mod tests {
             start_offset: start,
             end_offset: 2,
             consumer_group: group.into(),
+            topic_id: None,
         };
         assert_eq!(
             rewinds(&kafka("g", 0, 0), &kafka("g", 0, 2)),

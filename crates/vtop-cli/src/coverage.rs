@@ -220,6 +220,7 @@ pub fn unit_ranges(record: &BatchRecord) -> Vec<(Unit, u64, u64)> {
                 end_offset,
                 consumer_group,
                 start_offset: last_read_start,
+                topic_id: None,
             },
         ) => {
             // A Kafka window never spans partitions (one buffer each); a pair
@@ -1455,6 +1456,7 @@ mod tests {
             start_offset: start,
             end_offset: end,
             consumer_group: "g".into(),
+            topic_id: None,
         }
     }
 
