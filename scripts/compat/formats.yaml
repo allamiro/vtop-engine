@@ -223,6 +223,7 @@ formats:
       - {file: crates/vtop-meta/src/command.rs, name: PROMOTE_UNPROVEN_FEATURE_LEVEL, value: '8'}
       - {file: crates/vtop-meta/src/command.rs, name: COMMAND_KIND_SET_FEATURE_LEVEL, value: '36'}
       - {file: crates/vtop-meta/src/command.rs, name: COMMAND_KIND_REPORT_NODE_VERSION, value: '38'}
+      - {file: crates/vtop-meta/src/versions.rs, name: FIRST_MEMBER_CHECKED_FEATURE_LEVEL, value: '8'}
     tag_sets:
       - file: crates/vtop-meta/src/command.rs
         prefix: COMMAND_KIND_
@@ -387,6 +388,8 @@ formats:
     constants:
       - {file: crates/vtop-meta/src/transport/wire.rs, name: VTPM_MAGIC, value: 'b"VTPM"'}
       - {file: crates/vtop-meta/src/transport/wire.rs, name: VTPM_VERSION, value: '1'}
+      - {file: crates/vtop-meta/src/transport/wire.rs, name: KIND_PEER_VERSION_REQ, value: '7'}
+      - {file: crates/vtop-meta/src/transport/wire.rs, name: KIND_PEER_VERSION_RESP, value: '8'}
       - {file: crates/vtop-meta/src/transport/wire.rs, name: KIND_ADMIN_READ_CLUSTER_VERSIONS_REQ, value: '29'}
       - {file: crates/vtop-meta/src/transport/wire.rs, name: KIND_ADMIN_READ_CLUSTER_VERSIONS_RESP, value: '30'}
 
@@ -438,6 +441,7 @@ not_formats:
   - {file: crates/vtop-state/src/sqlite_store.rs, name: SCHEMA, why: "the SQLite DDL; the ledger's version marker is SQLITE_SCHEMA_VERSION (format 5)"}
   - {file: crates/vtop-meta/src/command.rs, name: MAX_TIER_VERSION_ID_BYTES, why: "a length bound on an object version id"}
   - {file: crates/vtop-meta/src/transport/wire.rs, name: MAX_CLUSTER_VERSION_NODES, why: "a count bound on a node-versions reply"}
+  - {file: crates/vtop-meta/src/raft/consensus.rs, name: MEMBER_VERSION_ASK_TIMEOUT, why: "how long a leader waits for one member's version answer before a raise counts it unreachable"}
   - {file: crates/vtop-meta/src/transport/maybe_tls.rs, name: FRAME_MAGIC_FIRST, why: "the first byte the VTPW and VTPM magics share, used to tell plaintext from TLS"}
   - {file: crates/vtop-kafka/src/records.rs, name: MAGIC_V2, why: "the Kafka record batch's magic byte: Kafka's format, not VTOP's"}
   - {file: crates/vtop-observe/src/otel/settings.rs, name: PROTOCOL, why: "the OTLP export protocol name"}
