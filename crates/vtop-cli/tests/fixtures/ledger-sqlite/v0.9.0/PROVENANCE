@@ -11,5 +11,5 @@ input: >-
   app.log in this directory: eleven lines, appended between the runs
 files:
   app.log: 8a4462a4d0a7ef8bd48cc19e663acbfbe9115114dea3e0c1c61c28214d41a53f
-  ledger-digests/ledger-digest-2d09dd13aa263d64efe8e716ddee5d6d.jsonl: e9e4e5aaa6b09baf1b7f3a1513f058f7ba1cf3752041135be17fb2eae76b7ee4
-  state.db: 9bde55d6134f84e470c0bb46ed9e86e9fa67909306357c33b63894db2e92cb62
+  ledger-digests/ledger-digest-cde6bd6cd108392cab7c9abd49cf70bc.jsonl: 48cd43edc680b33df290bc5989e1055d47eb7af986e7778ffd6bb7549f82175c
+  state.db: 7ac98cbe6d343c87da0ab8343250039b366c0e6072d486adbc83a71b7f0b41c9
