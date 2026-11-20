@@ -748,6 +748,182 @@ mod tests {
         }
     }
 
+    /// How long a test waits for an answer before it calls the request
+    /// unanswered. A member left waiting fails the test; it does not hang it.
+    const ANSWER_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// The scenario for a leader that fails its group: request 1 leads a
+    /// group of its own and holds it until requests 2 and 3 are queued, so
+    /// those two are flushed together, by whichever of them is in front,
+    /// with `second`. Returns 2's and 3's outcomes (`Err` with the panic
+    /// message if its thread panicked), then checks that a fourth request is
+    /// still served, so the lead was passed on after the failed group.
+    fn second_group_outcomes(
+        second: fn(&[QueuedProduce]) -> Vec<WireFrame>,
+    ) -> Vec<(u64, Result<WireFrame, String>)> {
+        let coord = Arc::new(GroupCommitCoordinator::new(zero_delay()).unwrap());
+        let queued = |coord: &GroupCommitCoordinator| {
+            coord
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pending
+                .len()
+        };
+        let (first_flushing, first_flush_started) = std::sync::mpsc::channel();
+        let first = {
+            let coord = Arc::clone(&coord);
+            thread::spawn(move || {
+                coord.enqueue_and_wait(QueuedProduce::new(1, 1, sample_request(1)), |batch| {
+                    first_flushing.send(()).unwrap();
+                    let deadline = Instant::now() + ANSWER_DEADLINE;
+                    while queued(&coord) < 2 {
+                        assert!(
+                            Instant::now() < deadline,
+                            "requests 2 and 3 were not queued behind request 1's group"
+                        );
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    answer(batch)
+                })
+            })
+        };
+        first_flush_started.recv_timeout(ANSWER_DEADLINE).unwrap();
+
+        let (outcomes, outcome) = std::sync::mpsc::channel();
+        for request_id in [2u64, 3] {
+            let coord = Arc::clone(&coord);
+            let outcomes = outcomes.clone();
+            thread::spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    coord.enqueue_and_wait(
+                        QueuedProduce::new(request_id, 1, sample_request(request_id)),
+                        second,
+                    )
+                }))
+                .map_err(|payload| {
+                    payload
+                        .downcast_ref::<&str>()
+                        .map(|message| (*message).to_owned())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_default()
+                });
+                outcomes.send((request_id, result)).unwrap();
+            });
+        }
+        let mut answered: Vec<_> = (0..2)
+            .map(|_| {
+                outcome.recv_timeout(ANSWER_DEADLINE).unwrap_or_else(|_| {
+                    panic!(
+                        "a member of the failed group was still unanswered after \
+                         {ANSWER_DEADLINE:?}: it was left waiting for an answer nobody owed it"
+                    )
+                })
+            })
+            .collect();
+        answered.sort_by_key(|(request_id, _)| *request_id);
+        assert_eq!(
+            first.join().unwrap().request_id,
+            1,
+            "request 1 was answered with its own frame"
+        );
+
+        let (fourth_done, fourth) = std::sync::mpsc::channel();
+        {
+            let coord = Arc::clone(&coord);
+            thread::spawn(move || {
+                let frame =
+                    coord.enqueue_and_wait(QueuedProduce::new(4, 1, sample_request(4)), answer);
+                fourth_done.send(frame).unwrap();
+            });
+        }
+        let frame = fourth.recv_timeout(ANSWER_DEADLINE).unwrap_or_else(|_| {
+            panic!(
+                "request 4, sent after the failed group, was unanswered after \
+                 {ANSWER_DEADLINE:?}: the lead was never passed on"
+            )
+        });
+        assert!(
+            matches!(frame.message, Message::ProduceResponse(_)),
+            "request 4 was served: {frame:?}"
+        );
+        answered
+    }
+
+    fn is_retryable_storage_error(frame: &WireFrame, request_id: u64) -> bool {
+        frame.request_id == request_id
+            && matches!(
+                &frame.message,
+                Message::Error(error) if error.code == ErrorCode::Storage && error.retryable
+            )
+    }
+
+    /// Found while merging #780: a leader whose flush panicked never
+    /// answered the rest of its group and never passed the lead, so every
+    /// other member, and every later request on the range, waited forever.
+    /// Now the panic still reaches the leader's own thread, and every other
+    /// member is answered with a retryable error.
+    #[test]
+    fn a_panic_in_the_flush_answers_every_other_member_and_passes_the_lead() {
+        let answered = second_group_outcomes(|_| panic!("the flush under test panicked"));
+        let panicked: Vec<_> = answered
+            .iter()
+            .filter(|(_, outcome)| outcome.is_err())
+            .collect();
+        assert_eq!(
+            panicked.len(),
+            1,
+            "only the group's leader runs the flush, so only it panics: {answered:?}"
+        );
+        assert!(panicked[0]
+            .1
+            .as_ref()
+            .unwrap_err()
+            .contains("the flush under test panicked"));
+        for (request_id, outcome) in &answered {
+            if let Ok(frame) = outcome {
+                assert!(
+                    is_retryable_storage_error(frame, *request_id),
+                    "request {request_id} was answered with a retryable storage error, \
+                     not {frame:?}"
+                );
+            }
+        }
+    }
+
+    /// Found while merging #780: a flush that returned fewer frames than its
+    /// group had members left the members past the last frame waiting
+    /// forever in a release build (and panicked the leader on a debug
+    /// assertion in a debug one). Now each is answered with a retryable
+    /// error, and the others get their own frames.
+    #[test]
+    fn a_flush_short_of_frames_answers_the_members_it_left_out() {
+        let answered = second_group_outcomes(|batch| answer(&batch[..1]));
+        let mut served = 0;
+        let mut refused = 0;
+        for (request_id, outcome) in &answered {
+            let frame = outcome
+                .as_ref()
+                .unwrap_or_else(|message| panic!("request {request_id} panicked: {message}"));
+            if matches!(frame.message, Message::ProduceResponse(_)) {
+                assert_eq!(frame.request_id, *request_id);
+                served += 1;
+            } else {
+                assert!(
+                    is_retryable_storage_error(frame, *request_id),
+                    "request {request_id} was answered with a retryable storage error, \
+                     not {frame:?}"
+                );
+                refused += 1;
+            }
+        }
+        assert_eq!(
+            (served, refused),
+            (1, 1),
+            "the flush answered the first member of the group of two only: {answered:?}"
+        );
+    }
+
     /// D1 (#752), a guard: a request alone in the queue is flushed at once
     /// when the window is zero (natural batching), where the 5 ms default
     /// holds every solo request for the whole window. The best of five, so
@@ -1029,6 +1205,60 @@ mod loom_model {
                 "the lead was given up once the queue emptied"
             );
             assert_eq!(coord.metrics().requests_total(), 3);
+        });
+    }
+
+    /// A flush that leaves its group's last member without a frame (found
+    /// while merging #780): in every interleaving each request is answered
+    /// once, with its own frame or a retryable storage error under its own
+    /// request id, and the lead is never lost.
+    #[test]
+    fn a_flush_short_of_frames_still_answers_everyone_and_passes_the_lead() {
+        fn short(batch: &[QueuedProduce]) -> Vec<WireFrame> {
+            echo(&batch[..batch.len() - 1])
+        }
+        fn answered(frame: WireFrame, request_id: u64) {
+            assert_eq!(frame.request_id, request_id);
+            match frame.message {
+                Message::ProduceResponse(response) => {
+                    assert_eq!(response.committed_next_offset, request_id)
+                }
+                Message::Error(error) => {
+                    assert_eq!(error.code, ErrorCode::Storage);
+                    assert!(error.retryable);
+                }
+                other => panic!("request {request_id} was answered with {other:?}"),
+            }
+        }
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.check(|| {
+            let coord = Arc::new(
+                GroupCommitCoordinator::new(GroupCommitConfig {
+                    max_delay: Duration::ZERO,
+                    ..GroupCommitConfig::default()
+                })
+                .unwrap(),
+            );
+            let others: Vec<_> = [2u64, 3]
+                .into_iter()
+                .map(|request_id| {
+                    let coord = Arc::clone(&coord);
+                    loom::thread::spawn(move || {
+                        answered(coord.enqueue_and_wait(item(request_id), short), request_id)
+                    })
+                })
+                .collect();
+            answered(coord.enqueue_and_wait(item(1), short), 1);
+            for other in others {
+                other.join().unwrap();
+            }
+            let state = coord.state.lock().unwrap();
+            assert!(state.pending.is_empty(), "every request was taken");
+            assert!(
+                !state.flushing,
+                "the lead was given up once the queue emptied"
+            );
         });
     }
 }
