@@ -11,7 +11,13 @@ of each minor, so a new release joins the day its tag exists. Each cell's
 expected result is ``pass`` unless ``scripts/compat/expected.yaml`` lists an
 exception, so adding a refusal means editing a reviewed file.
 
-A cell with ``only_newest: true`` runs the newest release alone in both modes.
+A cell with ``only_newest: true`` runs the newest release alone in both modes;
+``only_newest: [forward]`` does so for the listed directions only (a ledger is
+read by every release since ``since`` when it is upgraded, but only the
+previous release may share one with this build). A cell may also say
+``source: build`` (its old binary needs a feature the published archives lack,
+so the tag is built from source with it) and ``nightly_only: true`` (too heavy
+for a pull request: only ``full`` runs it).
 
 Modes:
 
@@ -40,6 +46,7 @@ import sys
 
 DEFAULT_EXPECTED = pathlib.Path(__file__).resolve().parent / "expected.yaml"
 DIRECTIONS = ("upgrade", "forward")
+SOURCES = ("release", "build")
 RESULTS = ("pass", "refuse", "hash-failure")
 FINAL = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
 
@@ -108,7 +115,7 @@ def matrix(expected: dict, tags: list[str], mode: str) -> list[dict]:
     available = [tag for tag in released if tag not in from_source]
     newest_minor = available[-1] if available else None
 
-    per_cell: dict[str, list[str]] = {}
+    per_cell: dict[tuple[str, str], list[str]] = {}
     for name, cell in cells.items():
         since = version(cell["since"])
         directions = cell.get("directions") or []
@@ -119,12 +126,26 @@ def matrix(expected: dict, tags: list[str], mode: str) -> list[dict]:
         for direction in directions:
             if direction not in DIRECTIONS:
                 raise ExpectedError(f"cell {name}: unknown direction {direction!r}")
-        if not isinstance(cell.get("only_newest", False), bool):
-            raise ExpectedError(f"cell {name}: only_newest must be true or false")
+        only_newest = cell.get("only_newest", False)
+        if isinstance(only_newest, bool):
+            newest_only = set(directions) if only_newest else set()
+        elif isinstance(only_newest, list) and all(d in directions for d in only_newest):
+            newest_only = set(only_newest)
+        else:
+            raise ExpectedError(
+                f"cell {name}: only_newest must be true, false or a list of the cell's directions"
+            )
+        source = cell.get("source", "release")
+        if source not in SOURCES:
+            raise ExpectedError(f"cell {name}: unknown source {source!r}; one of {SOURCES}")
+        if not isinstance(cell.get("nightly_only", False), bool):
+            raise ExpectedError(f"cell {name}: nightly_only must be true or false")
         applies = [tag for tag in available if version(tag) >= since]
-        # A cell for a format only the previous release may share with this
-        # build (the ledger, #743) runs the newest release alone.
-        per_cell[name] = applies[-1:] if cell.get("only_newest") else applies
+        for direction in directions:
+            # A format only the previous release may share with this build
+            # (the ledger, #743) runs the newest release alone, in the
+            # directions that say so.
+            per_cell[(name, direction)] = applies[-1:] if direction in newest_only else applies
 
     outcome: dict[tuple[str, str, str], dict] = {}
     boundary: set[tuple[str, str, str]] = set()
@@ -141,7 +162,7 @@ def matrix(expected: dict, tags: list[str], mode: str) -> list[dict]:
             raise ExpectedError(f"an exception for {name} {direction} needs a why")
         if row["expect"] == "refuse" and not row.get("message"):
             raise ExpectedError(f"a refusal for {name} {direction} must give the message the older binary prints")
-        matched = _exception_tags(row, per_cell[name])
+        matched = _exception_tags(row, per_cell[(name, direction)])
         if not matched:
             raise ExpectedError(f"an exception for {name} {direction} matches no released tag the cell runs: {row}")
         for tag in matched:
@@ -153,15 +174,17 @@ def matrix(expected: dict, tags: list[str], mode: str) -> list[dict]:
         # release after it (the first that must not need the row).
         last = matched[-1]
         boundary.add((name, last, direction))
-        after = per_cell[name].index(last) + 1
-        if after < len(per_cell[name]):
-            boundary.add((name, per_cell[name][after], direction))
+        after = per_cell[(name, direction)].index(last) + 1
+        if after < len(per_cell[(name, direction)]):
+            boundary.add((name, per_cell[(name, direction)][after], direction))
 
     out = []
     for name, cell in cells.items():
         for direction in cell["directions"]:
-            for tag in per_cell[name]:
+            for tag in per_cell[(name, direction)]:
                 key = (name, tag, direction)
+                if mode == "pr" and cell.get("nightly_only"):
+                    continue
                 if mode == "pr" and tag != newest_minor and key not in boundary:
                     continue
                 result = outcome.get(key, {"expect": "pass", "message": ""})
@@ -171,7 +194,7 @@ def matrix(expected: dict, tags: list[str], mode: str) -> list[dict]:
                     "direction": direction,
                     "expect": result["expect"],
                     "message": result["message"],
-                    "source": "release",
+                    "source": cell.get("source", "release"),
                 })
     if not out:
         raise ExpectedError("no cell to run: every cell's since is newer than every release")
