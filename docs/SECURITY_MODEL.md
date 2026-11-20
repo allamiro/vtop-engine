@@ -470,6 +470,7 @@ Per-format buckets (e.g. `telemetry-{format}`) with optional on-demand creation 
 - Naming an absent or malformed key **MUST** fail startup rather than silently emit unsigned manifests. The error names the key id and the variable or file, never the value.
 - Enabling a key deliberately rejects unsigned pre-cutover manifests. Operators **MUST** verify or explicitly migrate their backlog before enabling it.
 - Several keys can be configured, each with an id, so the key can be rotated (§8.3). Public-key signatures are not implemented.
+- What a forged, swapped, retired-key or unsigned manifest does to the scrub and to recovery, with the MAC on and off, is measured against a real S3 server in [Tamper evidence](reference/tamper-evidence.md).
 
 ### 8.1 Freshness: version pinning and the hardened profile (#135)
 
@@ -761,6 +762,13 @@ Removing an ignore removes it from both files and this table together.
 | Multipart upload integrity for very large objects | Yes, on `s3_native` | Above `upload.multipart_threshold_bytes` the engine uploads in parts (#482); a failed part is retried alone and the replay of the same bytes resumes the session (#668). Part ETags are never evidence: the whole stored object is verified before `VERIFIED`, as for a single-part upload. The command backends (`awscli`, `s3cmd`, `minio`) hand the whole object to their tool, which may split it internally but cannot resume a failed upload; `localfs` writes one file. |
 | Authorization / multi-tenant isolation | Not by VTOP | Relies on storage-side IAM and least-privilege credentials. |
 | Refusing secret files other local users can reach | Yes, on Unix (#733) | Manifest key files, the state-store secret file, the SQLite ledger and the audit file; not yet TLS keys or `vtop-node`'s files (§3). |
+
+Each tamper-evidence claim in this table and in §6 to §8 and §10 is exercised
+by a test that changes a stored object, manifest, receipt, audit row or ledger
+row and checks what the defence reports, and, where the defence is off or
+cannot see the change, that it does not: [Tamper evidence](reference/tamper-evidence.md)
+lists every case with its test, and what is not protected (a compromised
+engine host, a leaked MAC key, encryption at rest).
 
 ## 15. Summary of normative rules
 
