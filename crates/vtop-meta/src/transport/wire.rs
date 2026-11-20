@@ -1977,10 +1977,10 @@ impl AdminReadRangeLeaseResponse {
                     _ => None,
                 },
             }),
-            _ => {
-                return Err(CodecError::InvalidValue {
+            other => {
+                return Err(CodecError::UnknownTag {
                     what: "lease presence",
-                    reason: "lease presence byte must be 0, 1, or 2",
+                    tag: u32::from(other),
                 })
             }
         };
