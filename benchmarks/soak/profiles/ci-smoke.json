@@ -1,6 +1,6 @@
 {
   "name": "ci-smoke",
-  "description": "A short run that exercises the whole harness (lab, load, each fault kind, prune, scrub, evaluator, evidence tarball) in about fifteen minutes. Its trend limits are loose: it proves the machinery works, not that the engine is leak-free.",
+  "description": "A short run that exercises the whole harness (lab, load, each fault kind, prune, scrub, evaluator, evidence tarball) in about ten minutes once the images are built. Its trend limits are loose: it proves the machinery works, not that the engine is leak-free.",
   "duration_s": 540,
   "rate_records_per_s": 300,
   "record_bytes": 700,

@@ -529,6 +529,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="keep the lab's data (Kafka, MinIO, the engine's ledger and work directory) here, on a disk with the "
         "profile's free space, instead of in Docker volumes",
     )
+    parser.add_argument(
+        "--subnet",
+        metavar="CIDR",
+        help="give the lab's network this subnet, for a host whose Docker address pools are used up",
+    )
     parser.add_argument("--keep-lab", action="store_true", help="leave the containers and volumes up at the end")
     return parser.parse_args(argv)
 
@@ -649,6 +654,7 @@ def main(argv: list[str] | None = None) -> int:
         args.engine_image,
         toxiproxy_port=free_port(),
         data_dir=args.data_dir.resolve() if args.data_dir else None,
+        subnet=args.subnet,
         load={
             "SOAK_RATE": profile["rate_records_per_s"],
             "SOAK_RECORD_BYTES": profile["record_bytes"],

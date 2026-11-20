@@ -215,6 +215,7 @@ class Lab:
         toxiproxy_port: int,
         data_dir: Path | None = None,
         load: dict | None = None,
+        subnet: str | None = None,
         runner: Runner = subprocess_runner,
         sleep: Callable[[float], None] = time.sleep,
         http: Callable[[str, str, bytes | None], tuple[int, str]] | None = None,
@@ -225,6 +226,7 @@ class Lab:
         self.toxiproxy_port = toxiproxy_port
         self.data_dir = data_dir
         self.load = load or {}
+        self.subnet = subnet
         self.run = runner
         self.sleep = sleep
         self.http = http or self._http
@@ -263,7 +265,14 @@ class Lab:
         # not through the driver's own environment, so a runner that records
         # argv records the whole call.
         env = [f"{k}={v}" for k, v in sorted(self.compose_env.items())]
-        argv = ["env", *env, "docker", "compose", "-p", self.project, "-f", str(COMPOSE_FILE), *args]
+        files = ["-f", str(COMPOSE_FILE)]
+        if self.subnet:
+            # A host with many Docker networks can run out of the daemon's
+            # predefined address pools; an explicit subnet needs none.
+            override = self.run_dir / "network.override.yml"
+            override.write_text(f"networks:\n  soak:\n    ipam:\n      config:\n        - subnet: {self.subnet}\n")
+            files += ["-f", str(override)]
+        argv = ["env", *env, "docker", "compose", "-p", self.project, *files, *args]
         return self.run(argv, timeout)
 
     def require(self, result: Result, what: str) -> Result:

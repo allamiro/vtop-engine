@@ -8,7 +8,7 @@ candidate would be deployed before anyone looks at it".
 
 It is run by a maintainer before each release candidate. A 72 hour run needs a
 dedicated host for three days, so no pull request and no scheduled job starts
-one. A short profile, `ci-smoke`, runs the same machinery in about fifteen
+one. A short profile, `ci-smoke`, runs the same machinery in about ten
 minutes and proves the harness works.
 
 The harness lives in `benchmarks/soak/` and the workflow is
@@ -211,11 +211,13 @@ not start. `--keep-lab` leaves the containers up afterwards for inspection;
 `--project` changes the container-name prefix when more than one lab shares a
 host. `SOAK_CPUS_KAFKA`, `SOAK_CPUS_MINIO`, `SOAK_CPUS_PRODUCER` and
 `SOAK_CPUS_ENGINE` in the environment cap a container's CPUs, for a shared
-machine; leave them unset on the host that produces the evidence.
+machine; leave them unset on the host that produces the evidence. `--subnet`
+gives the lab's network an explicit subnet, for a host whose Docker address
+pools are used up.
 
 ### The `ci-smoke` profile
 
-`ci-smoke` runs the same driver in about fifteen minutes: 300 records a
+`ci-smoke` runs the same driver in about ten minutes: 300 records a
 second over 2 partitions for 9 minutes, a fault every 75 seconds (each kind
 once, and a second `kill9`), `prune-ledger` every minute and a sampled `scrub`
 every 150 seconds. Its trend limits are loose (200%), because a nine minute run
@@ -228,6 +230,43 @@ It runs on a GitHub-hosted runner when dispatched with the profile
 `ci-smoke`, and on a pull request that changes only the soak's own files (the
 soak directory, the workflow, this page, the docs navigation and the benchmark
 test paths).
+
+### What the smoke run showed
+
+The harness was run end to end on a developer machine (Docker Desktop on
+Apple silicon, so an arm64 Linux VM; Kafka and MinIO capped at one CPU each,
+the producer at half a CPU and the engine at two; a release build of the
+engine from commit `bc4c2856` in a stand-in Debian 13 image, not the image
+`docker/Dockerfile` builds). The run took 9 minutes 27 seconds from start to
+teardown, with the images already built, and passed all 20 criteria:
+
+- all six faults landed and the engine recovered from each, the slowest in 18 s
+  and the median in 10 s;
+- seven `audit-coverage` runs were clean (one after each fault and the final
+  `--check-storage`), and the final full `scrub` read 93 batches clean;
+- both partitions' committed offsets reached the topic's end, and the engine
+  exited 0 on `SIGTERM`;
+- `prune-ledger --older-than-days 0` ran eight times without failing and
+  deleted 109 ledger rows between them.
+
+Two things the run showed about the engine:
+
+- While the clock was an hour ahead, MinIO answered the engine's requests with
+  `RequestTimeTooSkewed` (HTTP 403). The engine logged `batch failed`, then
+  `batch did not reach VERIFIED; its range was handed back to the source and
+  will be re-read`, and committed nothing from those batches; once the clock
+  was back it archived them, and the coverage audit found no hole. That is the
+  commit rule holding under a clock fault, in a nine minute run on one machine,
+  which is all it is evidence for.
+- The ledger's size (the state database and its write-ahead log) climbs from
+  the engine's start to about 4 MiB in the first few minutes, then stays
+  there, and starts again after a restart. This is why a trend is fitted
+  within one engine process and why the ledger limit has an absolute floor.
+  Whether the plateau holds for 72 hours is what the real run is for.
+
+The `ci-smoke` job in `soak.yml` has not run on a GitHub-hosted runner yet:
+it first runs when this workflow is on the default branch and someone
+dispatches it, or on the next pull request that changes only the soak's files.
 
 ## Evidence
 

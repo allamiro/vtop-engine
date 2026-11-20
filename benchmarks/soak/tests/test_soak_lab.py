@@ -147,6 +147,19 @@ def test_the_engines_data_directories_are_handed_to_the_user_the_image_runs_as(t
     assert argv[-2:] == ["/data/state", "/data/work"]
 
 
+def test_a_subnet_is_given_to_the_lab_network_by_an_override_file(tmp_path):
+    runner = Recorder()
+    lab = soak_lab.Lab("vtop-t", tmp_path, "img:1", toxiproxy_port=1, subnet="10.99.1.0/24", runner=runner)
+    lab.up("kafka")
+    argv = runner.calls[0]
+    override = str(tmp_path / "network.override.yml")
+    assert argv.count("-f") == 2 and override in argv
+    assert "subnet: 10.99.1.0/24" in (tmp_path / "network.override.yml").read_text()
+    runner2 = Recorder()
+    soak_lab.Lab("vtop-t", tmp_path, "img:1", toxiproxy_port=1, runner=runner2).up("kafka")
+    assert runner2.calls[0].count("-f") == 1
+
+
 def test_a_data_dir_turns_the_volumes_into_bind_mounts(tmp_path):
     env = make_lab(tmp_path, data_dir=tmp_path / "d").compose_env
     assert env["SOAK_MINIO_DATA"] == str(tmp_path / "d" / "minio")
