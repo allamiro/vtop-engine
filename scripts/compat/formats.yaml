@@ -74,6 +74,7 @@ formats:
       - {file: crates/vtop-cli/src/coverage.rs, name: DIGEST_VERSION, value: '1'}
     fixtures: [crates/vtop-cli/tests/fixtures/ledger-sqlite]
     cells: [digests-audit]
+    fuzz: [ledger_rows]
 
   - id: 5
     name: State ledger, SQLite
@@ -107,6 +108,7 @@ formats:
     marker: "none: optional fields"
     status: evolving; key names frozen
     at_1_0: stable
+    fuzz: [ledger_rows]
 
   - id: 8
     name: "`audit_events` table and hash chain"
@@ -126,6 +128,7 @@ formats:
     constants:
       - {file: crates/vtop-observe/src/audit.rs, name: AUDIT_VERSION, value: '1'}
     fixtures: [crates/vtop-cli/tests/fixtures/audit/audit-v1.jsonl]
+    fuzz: [audit_record]
 
   - id: 10
     name: Segment log v1 and v2, index, chunk sidecar, commit marker
@@ -149,6 +152,9 @@ formats:
       - {file: crates/vtop-log/src/segment.rs, name: CHUNK_SIDECAR_VERSION, value: '1'}
       - {file: crates/vtop-log/src/segment.rs, name: COMMIT_MAGIC, value: 'b"VTOPCMT1"'}
       - {file: crates/vtop-log/src/segment.rs, name: COMMIT_VERSION, value: '1'}
+    fixtures: [crates/vtop-log/tests/fixtures/segments]
+    fuzz: [segment_codec]
+    cells: [segments]
 
   - id: 11
     name: Retention and truncate intents, producer snapshot
@@ -164,6 +170,9 @@ formats:
       - {file: crates/vtop-log/src/truncate_intent.rs, name: VERSION_V2, value: '2'}
       - {file: crates/vtop-log/src/producer_snapshot.rs, name: MAGIC, value: 'b"VTOPPRD1"'}
       - {file: crates/vtop-log/src/producer_snapshot.rs, name: VERSION, value: '1'}
+    fixtures: [crates/vtop-log/tests/fixtures/segments]
+    fuzz: [segment_codec]
+    cells: [segments]
 
   - id: 12
     name: "Broker journals: fencing epochs, lineage, epoch, kept dispute, committed floor"
@@ -186,6 +195,8 @@ formats:
     one_way:
       - "a kept dispute (v0.8.0, #635): an older binary refuses to start while one is pending"
       - "staged journal and sidecar rewrites through <file>.rewrite (v0.8.0, #640)"
+    fixtures: [crates/vtop-log/tests/fixtures/segments]
+    cells: [segments]
 
   - id: 13
     name: Multipart session (`*.multipart.json`)
@@ -196,6 +207,7 @@ formats:
     constants:
       - {file: crates/vtop-upload/src/multipart.rs, name: SESSION_SCHEMA, value: '1'}
     fixtures: [crates/vtop-upload/tests/fixtures/multipart-session-v0.8.0.json]
+    fuzz: [session_files]
 
   - id: 14
     name: Scrub cursor
@@ -205,6 +217,7 @@ formats:
     at_1_0: classified at the freeze
     constants:
       - {file: crates/vtop-cli/src/scrub.rs, name: CURSOR_VERSION, value: '1'}
+    fuzz: [session_files]
 
   - id: 15
     name: Metadata log chunk and entry frames
@@ -216,6 +229,7 @@ formats:
       - {file: crates/vtop-meta/src/storage/log.rs, name: CHUNK_MAGIC, value: 'b"VTOPMLG1"'}
       - {file: crates/vtop-meta/src/storage/log.rs, name: CHUNK_VERSION, value: '1'}
       - {file: crates/vtop-meta/src/storage/log.rs, name: ENTRY_MAGIC, value: 'b"VTOPMLE1"'}
+    fuzz: [meta_storage_files]
 
   - id: 16
     name: Metadata command set
@@ -345,6 +359,7 @@ formats:
           CATEGORY_RANGE_REPLICA_SET: 20
           CATEGORY_NODE_VERSION: 21
           CATEGORY_PROMOTION_ATTESTATION: 22
+    fuzz: [meta_storage_files]
 
   - id: 18
     name: Metadata hard state, applied, purged, membership log id
@@ -361,6 +376,7 @@ formats:
       - {file: crates/vtop-meta/src/storage/purged.rs, name: PURGED_VERSION, value: '1'}
       - {file: crates/vtop-meta/src/storage/membership_log_id.rs, name: MEMBERSHIP_LOG_ID_MAGIC, value: 'b"VTOPMML1"'}
       - {file: crates/vtop-meta/src/storage/membership_log_id.rs, name: MEMBERSHIP_LOG_ID_VERSION, value: '1'}
+    fuzz: [meta_storage_files]
 
   - id: 19
     name: Native protocol
@@ -372,6 +388,7 @@ formats:
       - {file: crates/vtop-protocol/src/lib.rs, name: MAGIC, value: 'b"VTPW"'}
       - {file: crates/vtop-protocol/src/lib.rs, name: PROTOCOL_MAJOR, value: '1'}
       - {file: crates/vtop-protocol/src/lib.rs, name: PROTOCOL_MINOR, value: '0'}
+    fuzz: [protocol_frame]
 
   - id: 20
     name: Replica protocol negotiation
@@ -400,6 +417,7 @@ formats:
       - {file: crates/vtop-meta/src/transport/wire.rs, name: KIND_PEER_VERSION_RESP, value: '8'}
       - {file: crates/vtop-meta/src/transport/wire.rs, name: KIND_ADMIN_READ_CLUSTER_VERSIONS_REQ, value: '29'}
       - {file: crates/vtop-meta/src/transport/wire.rs, name: KIND_ADMIN_READ_CLUSTER_VERSIONS_RESP, value: '30'}
+    fuzz: [vtpm_frame]
 
   - id: 22
     name: "Kafka gateway: advertised APIs and version ranges"
@@ -407,6 +425,7 @@ formats:
     marker: none
     status: experimental
     at_1_0: experimental
+    fuzz: [kafka_request]
 
   - id: 23
     name: "`config.yaml`"
@@ -445,6 +464,11 @@ formats:
     at_1_0: classified at the freeze
 
 # Constants whose names look like format markers but are not.
+# Fuzz targets that are not a persisted or wire format's decoder, and why.
+fuzz_other:
+  detect_record: source-side format detection of a log line (what a source hands the engine), not a persisted format
+  detect_batch: source-side format detection of a batch, not a persisted format
+
 not_formats:
   - {file: crates/vtop-state/src/sqlite_store.rs, name: SCHEMA, why: "the SQLite DDL; the ledger's version marker is SQLITE_SCHEMA_VERSION (format 5)"}
   - {file: crates/vtop-meta/src/command.rs, name: MAX_TIER_VERSION_ID_BYTES, why: "a length bound on an object version id"}

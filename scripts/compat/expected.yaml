@@ -48,6 +48,16 @@ cells:
     since: v0.7.0
     directions: [upgrade, forward]
 
+  # A data node's directory (scripts/compat/cells/segments.sh, which runs
+  # scripts/upgrade-compat.sh): the release's vtop-node writes it (the single
+  # `range.active` before v0.3.0, sealed segments from v0.3.0, segment format
+  # v2 from v0.5.0) and this build must open it, quarantine nothing, serve
+  # every record byte for byte and again after a restart. Upgrade only:
+  # downgrade of a data directory is neither tested nor supported.
+  segments:
+    since: v0.2.0
+    directions: [upgrade]
+
   # The PostgreSQL ledger (cells/ledger-postgres.sh). The published archives
   # have no `postgres` feature, so the release is built from its tag with it,
   # and a throwaway server runs beside it: nightly and on demand only.

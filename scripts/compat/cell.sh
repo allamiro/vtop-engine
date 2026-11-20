@@ -40,7 +40,7 @@ case "$CELL:$DIRECTION" in
     MANIFEST_COMPAT_KEEP=1 MANIFEST_COMPAT_WORKDIR="$WORKDIR" \
       exec "$here/../manifest-compat.sh" "$HEAD/vtopctl" "$TAG" "$RELEASED/vtopctl" "$EXPECT"
     ;;
-  ledger-sqlite:* | digests-audit:* | ledger-postgres:*)
+  ledger-sqlite:* | digests-audit:* | ledger-postgres:* | segments:*)
     # Each cell script takes the directories, and keeps its own logs.
     exec "$here/cells/$CELL.sh" "$TAG" "$DIRECTION" "$EXPECT" "$RELEASED" "$HEAD" \
       "$WORKDIR/$CELL-$DIRECTION" "$MESSAGE"

@@ -22,8 +22,9 @@
 # follower on the previous release - which predates the replica version
 # handshake - as well as to one on this build.
 #
-# Required: CHAOS_OLD_VTOP_NODE, a vtop-node binary built from the previous
-# release tag. This scenario does not build it; CI's upgrade job does.
+# Required: CHAOS_OLD_VTOP_NODE, the previous release's vtop-node. This
+# scenario does not fetch it; CI's upgrade job runs the published binary
+# (scripts/compat/fetch-release.sh, #743).
 #
 # Without it the scenario SKIPS (exit 77, which run-all.sh reports as SKIP),
 # before the harness is loaded: a suite run on a workstation has no previous
