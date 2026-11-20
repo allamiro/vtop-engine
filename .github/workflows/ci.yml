@@ -2434,8 +2434,16 @@ jobs:
     # fixed `vtop_test_*` databases and roles, and the workflow's concurrency
     # group is per ref. One at a time across the repository; a run waits
     # rather than cancel another's half-done restore.
+    #
+    # GitHub keeps one PENDING job per concurrency group and cancels the older
+    # pending one when a third arrives, whatever cancel-in-progress says, so a
+    # shared group cancels (and reddens) other PRs' runs while two or more
+    # wait. When no managed database is configured the job does nothing, so
+    # it then gets a group of its own per run and never queues. The client
+    # image variable is required whenever the smoke is enabled (the gate step
+    # refuses without it), and unlike a secret, `vars` may name a group.
     concurrency:
-      group: postgres-managed-smoke
+      group: ${{ vars.VTOP_MANAGED_POSTGRES_CLIENT_IMAGE != '' && 'postgres-managed-smoke' || format('postgres-managed-smoke-off-{0}-{1}', github.run_id, github.run_attempt) }}
       cancel-in-progress: false
     env:
       VTOP_TEST_POSTGRES: ${{ secrets.VTOP_MANAGED_POSTGRES_URL }}
