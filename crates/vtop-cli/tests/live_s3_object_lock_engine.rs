@@ -37,7 +37,7 @@ use vtop_cli::testkit::file_config;
 use vtop_cli::Engine;
 use vtop_core::config::{ObjectLockConfig, ObjectLockMode, StreamsConfig, VtopConfig};
 use vtop_core::types::SourceType;
-use vtop_s3_testkit::{Capability, LiveS3, S3Settings};
+use vtop_s3_testkit::{Capability, LiveS3, RefusalAt, S3Settings};
 
 /// How to reach the store, from `VTOP_TEST_S3_*` (#722), read once.
 fn settings() -> S3Settings {
@@ -124,11 +124,48 @@ async fn s3_client() -> aws_sdk_s3::Client {
     aws_sdk_s3::Client::from_conf(conf)
 }
 
+/// The refusal on a store without Object Lock or versioning (#722; Garage):
+/// the engine, started as `vtopctl run` starts it, refuses at startup in three
+/// parts (#770). Against the plain bucket: such a store has no locked one.
+async fn refused_at_startup(capability: Capability, at: RefusalAt) {
+    assert_eq!(
+        at,
+        RefusalAt::Startup,
+        "VTOP refuses {capability} at startup"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(dir.path(), &plain_bucket(), "vtop-it-722-refusal");
+    let parts: &[&str] = match capability {
+        Capability::ObjectLock | Capability::ObjectLockEnforced => &[
+            "the store does not implement S3 Object Lock",
+            "the engine did not start",
+            "remove upload.object_lock",
+        ],
+        Capability::Versioning => {
+            // The hardened profile alone, so its own check is the one asked.
+            cfg.upload.object_lock = None;
+            &[
+                "versioning",
+                "the engine did not start",
+                "upload.require_object_versioning: false",
+            ]
+        }
+        other => panic!("no refusal is asserted for {other}"),
+    };
+    let err = match Engine::new_exclusive(cfg, StreamsConfig { streams: vec![] }).await {
+        Ok(_) => panic!("an engine must not start on a store without {capability}"),
+        Err(e) => e.to_string(),
+    };
+    for part in parts {
+        assert!(err.contains(part), "{err:?} should say {part:?}");
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires an S3-compatible endpoint with Object Lock"]
 async fn live_the_engine_refuses_a_bucket_without_object_lock_at_startup() {
     let live = LiveS3::from_env();
-    live.case(
+    live.case_with_refusal(
         "engine.object_lock.refuses_a_plain_bucket_at_startup",
         &[Capability::ObjectLock],
         || async {
@@ -149,6 +186,7 @@ async fn live_the_engine_refuses_a_bucket_without_object_lock_at_startup() {
                 assert!(err.contains(&part), "{err:?} should say {part:?}");
             }
         },
+        refused_at_startup,
     )
     .await;
 }
@@ -157,9 +195,9 @@ async fn live_the_engine_refuses_a_bucket_without_object_lock_at_startup() {
 #[ignore = "requires an S3-compatible endpoint with Object Lock"]
 async fn live_the_engine_archives_a_batch_under_the_configured_lock() {
     let live = LiveS3::from_env();
-    live.case(
+    live.case_with_refusal(
         "engine.object_lock.archives_a_batch_locked",
-        &[Capability::Versioning, Capability::ObjectLock],
+        &[Capability::ObjectLock, Capability::Versioning],
         || async {
             let dir = tempfile::tempdir().unwrap();
             let bucket = locked_bucket();
@@ -297,6 +335,7 @@ async fn live_the_engine_archives_a_batch_under_the_configured_lock() {
                     .unwrap_or_else(|e| panic!("cleaning up {uri}: {e:?}"));
             }
         },
+        refused_at_startup,
     )
     .await;
 }

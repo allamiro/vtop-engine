@@ -26,7 +26,7 @@
 
 use std::io::Write;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use vtop_s3_testkit::{Capability, LiveS3, S3Settings};
+use vtop_s3_testkit::{Capability, LiveS3, RefusalAt, S3Settings};
 use vtop_upload::s3_native::{S3NativeBackend, S3NativeConfig};
 use vtop_upload::{
     upload_resumable, BucketFeature, LockPart, MultipartFence, MultipartUploadConfig,
@@ -156,11 +156,38 @@ async fn clean_up(client: &aws_sdk_s3::Client, bucket: &str, prefix: &str) {
     }
 }
 
+/// The refusal on a store without Object Lock or versioning (#722; Garage
+/// documents both missing): the backend's own answer, which the engine
+/// refuses at startup on (#770), checked against the plain bucket, since
+/// such a store has no locked one.
+async fn store_lacks_it(capability: Capability, at: RefusalAt) {
+    assert_eq!(
+        at,
+        RefusalAt::Startup,
+        "VTOP refuses {capability} at startup"
+    );
+    let b = backend(None).await;
+    match capability {
+        Capability::ObjectLock | Capability::ObjectLockEnforced => assert_eq!(
+            b.bucket_object_lock(&plain_bucket()).await.unwrap(),
+            BucketFeature::NotSupported,
+            "the store answers that it does not implement Object Lock, which the engine \
+             refuses at startup"
+        ),
+        Capability::Versioning => assert_ne!(
+            b.bucket_versioning(&plain_bucket()).await.unwrap(),
+            BucketFeature::Enabled,
+            "the store does not keep versions, which the hardened profile refuses at startup"
+        ),
+        other => panic!("no refusal is asserted for {other}"),
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires an S3-compatible endpoint with Object Lock"]
 async fn live_the_preflight_tells_a_locked_bucket_from_a_plain_one() {
     let live = LiveS3::from_env();
-    live.case(
+    live.case_with_refusal(
         "object_lock.the_preflight_tells_locked_from_plain",
         &[Capability::ObjectLock],
         || async {
@@ -178,6 +205,7 @@ async fn live_the_preflight_tells_a_locked_bucket_from_a_plain_one() {
                 plain_bucket()
             );
         },
+        store_lacks_it,
     )
     .await;
 }
@@ -186,11 +214,11 @@ async fn live_the_preflight_tells_a_locked_bucket_from_a_plain_one() {
 #[ignore = "requires an S3-compatible endpoint with Object Lock"]
 async fn live_every_write_path_lands_under_the_lock_it_asked_for() {
     let live = LiveS3::from_env();
-    live.case(
+    live.case_with_refusal(
         "object_lock.every_write_path_lands_locked",
         &[
-            Capability::Versioning,
             Capability::ObjectLock,
+            Capability::Versioning,
             Capability::ChecksumCrc32Default,
         ],
         || async {
@@ -270,6 +298,7 @@ async fn live_every_write_path_lands_under_the_lock_it_asked_for() {
             tokio::time::sleep(retain + Duration::from_secs(2)).await;
             clean_up(&client, &bucket, &prefix).await;
         },
+        store_lacks_it,
     )
     .await;
 }
@@ -278,11 +307,11 @@ async fn live_every_write_path_lands_under_the_lock_it_asked_for() {
 #[ignore = "requires an S3-compatible endpoint with Object Lock"]
 async fn live_a_locked_version_survives_delete_and_overwrite_and_reports_elapsed_after() {
     let live = LiveS3::from_env();
-    live.case(
+    live.case_with_refusal(
         "object_lock.a_locked_version_survives_delete_and_overwrite",
         &[
-            Capability::Versioning,
             Capability::ObjectLock,
+            Capability::Versioning,
             Capability::ObjectLockEnforced,
         ],
         || async {
@@ -362,6 +391,7 @@ async fn live_a_locked_version_survives_delete_and_overwrite_and_reports_elapsed
             );
             clean_up(&client, &bucket, &prefix).await;
         },
+        store_lacks_it,
     )
     .await;
 }
@@ -370,12 +400,12 @@ async fn live_a_locked_version_survives_delete_and_overwrite_and_reports_elapsed
 #[ignore = "requires an S3-compatible endpoint with Object Lock"]
 async fn live_a_multipart_object_carries_the_lock_its_create_asked_for() {
     let live = LiveS3::from_env();
-    live.case(
+    live.case_with_refusal(
         "object_lock.a_multipart_object_carries_its_lock",
         &[
             Capability::Multipart,
-            Capability::Versioning,
             Capability::ObjectLock,
+            Capability::Versioning,
         ],
         || async {
             let bucket = locked_bucket();
@@ -426,6 +456,7 @@ async fn live_a_multipart_object_carries_the_lock_its_create_asked_for() {
             tokio::time::sleep(retain + Duration::from_secs(2)).await;
             clean_up(&client, &bucket, &prefix).await;
         },
+        store_lacks_it,
     )
     .await;
 }
