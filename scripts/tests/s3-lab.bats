@@ -79,3 +79,22 @@ teardown() {
     [ "$status" -eq 0 ]
     [[ "$output" == *"did not reach a case"* ]]
 }
+
+@test "a test run can be limited to the binaries named" {
+    mkdir "$ROOT/bins"
+    printf '#!/bin/sh\necho "a ran"\n' > "$ROOT/bins/a"
+    printf '#!/bin/sh\necho "b ran"\n' > "$ROOT/bins/b"
+    chmod +x "$ROOT/bins/a" "$ROOT/bins/b"
+    run bash "$LAB" test demo "$ROOT/bins" "$ROOT/results.jsonl" b
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"b ran"* ]]
+    [[ "$output" != *"a ran"* ]]
+}
+
+@test "naming only binaries that do not exist fails rather than running nothing" {
+    mkdir "$ROOT/bins"
+    printf '#!/bin/sh\nexit 0\n' > "$ROOT/bins/a"
+    chmod +x "$ROOT/bins/a"
+    run bash "$LAB" test demo "$ROOT/bins" "$ROOT/results.jsonl" nosuch
+    [ "$status" -eq 2 ]
+}
