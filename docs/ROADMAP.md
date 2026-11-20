@@ -9,34 +9,6 @@ what each release does **not** yet do.
 
 ---
 
-## Next release — key, state-store, ledger and audit files other local users can reach are refused
-
-- **[#733](https://github.com/allamiro/vtop-engine/issues/733)** — key,
-  state-store, ledger and audit files other local users can reach are
-  refused before they are read: a manifest MAC key file, the
-  `engine.state_store` secret file, the SQLite ledger and its `-wal` and
-  `-shm` files, and the `VTOP_AUDIT_LOG` file. Group- or world-writable is
-  always refused; world-readable and group-readable are refused unless the
-  file's directory is closed to other users, or (group read only) the file
-  is a read-only Kubernetes Secret mount, which is how `defaultMode: 0400`
-  appears once the pod sets `fsGroup`. The audit file may be group-readable.
-  `vtopctl validate` reports every such file at once. New SQLite ledgers are
-  created `0600`. `security.allow_loose_secret_permissions: true` accepts
-  the readable cases, each announced by a WARN, an audit record
-  (`security.override`) and `vtop_secret_file_permission_overrides_total`.
-  Mounting recipes for Kubernetes Secrets, External Secrets Operator, the
-  Secrets Store CSI driver, Vault Agent and Docker secrets are in
-  [Secret files and their permissions](operate/secrets.md).
-- **Upgrade note (#733): this refuses at startup what used to start.** A
-  world-readable key file, a state-store secret file others can read, or a
-  `0644` ledger in a directory others can enter stops the engine, naming the
-  file, its mode and the `chmod` that fixes it. Run this release's
-  `vtopctl validate` against each config before upgrading, where the engine runs.
-  An engine of an earlier release ignores the `security` section, so the
-  override can be set ahead of the upgrade; unknown keys inside `security`
-  are refused by this release. TLS private keys and the files `vtop-node`
-  reads are not checked yet.
-
 ## v0.1.0 — a range that fails over
 
 Metadata leases, a lease agent on the data node, verified promotion, and the
@@ -1204,7 +1176,7 @@ Known limitations:
   working. A later release's new key there will be refused by this one.
 - **Manifests are never re-signed.** A retired (tombstoned) key's manifests
   fail on purpose; re-archiving that data is a separate decision.
-- **Key files are permission-checked** since #733, as are
+- **Key files are permission-checked** since v0.10.2 (#733), as are
   `engine.state_store` files: see
   [Secret files and their permissions](operate/secrets.md).
 
@@ -1227,8 +1199,8 @@ mode_mismatch. The deployment profile is
   `scrub --check-retention` afterwards to find any unlocked object.
 - **Unknown keys inside `upload.object_lock` are refused,** like
   `manifest.mac`, so a later release's new key there is refused by this one.
-- **Upgrade note (#709): a replay no longer reuses an object that is not
-  locked as configured.** Under the profile, a replay that resolves to an
+- **Upgrade note (#709, v0.10.2): a replay no longer reuses an object that is
+  not locked as configured.** Under the profile, a replay that resolves to an
   object already archived under its derived key (#626) whose lock has ended,
   that was stored unlocked (for example before the profile was enabled), that
   is in the other mode, or that lacks the configured legal hold, writes the
@@ -1314,6 +1286,48 @@ v0.10.0's Linux archives did not start on Debian 12, Ubuntu 22.04 or RHEL 8 and 
   - #729: the nightly fuzzing and the commit-path mutation gate are in; the gate on the verify, recovery and file-continuity code is not.
   - #724: build, test and smoke the release archives on every supported platform. This release checks the floor and runs three distributions; the full matrix is not done.
   - Everything under v0.10.0's "Known open" still stands, except #799, which is fixed: #709, #773, #774, #706, #752, #751, #743, #733, and #714, the bar for calling VTOP production-ready. VTOP remains a prototype.
+
+## v0.10.2 — batches stay within max_bytes, and a Linux archive for every Linux
+
+A patch release: no schema, on-disk or wire format, feature level or one-way step changes. It fixes how large a batch `vtopctl run` seals, makes the engine refuse key, ledger and audit files that other local users can reach (a behaviour change at startup, described below), lets a replay recover from an Object Lock that ended, and widens the Linux archives to every glibc since 2.17 plus a static musl build. VTOP is still a prototype: the bar for calling it more is #714.
+
+- **Bugs.**
+  - **Batches in `run` hold at most `max_bytes`.** `vtopctl run` sealed batches at about twice `batching.max_bytes`: with 16 MiB, a 73 MB log was cut into 33,554,257-byte batches, at v0.7.0 and v0.10.1 alike. A read that would take the buffered window past `max_records` or `max_bytes` now seals the window first. `process-once` never did this. A window rebuilt for a replay (#626) is never split. Expect more, smaller batches at the same throughput: roughly twice as many objects for a source that filled every window (#824).
+  - **A replay over an unlocked or ended Object Lock recovers.** Under `upload.object_lock`, a replay that resolved to an object already archived for its range, but not locked as configured (the lock had ended, it was stored unlocked, it is in the other mode, or it lacks the legal hold), failed that range on every replay. It now writes a fresh locked object under its per-attempt key and commits it, leaves the old object untouched, logs a WARN and counts a `fallback_*` decision in `vtop_object_key_decisions_total`. A new alert, `VtopObjectLockFallback`, ships in the rules (a ticket, not a page). A retention the store cannot report still fails the batch (#709, #757).
+  - **Files other local users can reach are refused.** The manifest MAC key files, the `engine.state_store` secret file, the SQLite ledger (with its `-wal` and `-shm` files) and the `VTOP_AUDIT_LOG` file were read without looking at their mode. The engine now refuses them when they are writable by group or other, or readable by other users (or by group, outside a read-only Kubernetes secret mount, which is how `defaultMode: 0400` appears once the pod sets `fsGroup`), unless the directory holding them is closed (owned by the engine's user, mode 0700). The audit file may be group-readable. New SQLite and audit files are created 0600. TLS private keys and the files `vtop-node` reads are not checked yet. `vtopctl validate` reports every refused file at once. See "Upgrading from v0.10.1" for what to do (#733, #775).
+  - **`libz-sys` 1.1.33** replaces 1.1.32 for RUSTSEC-2026-0544 (a heap buffer overflow). chrono's unmaintained notice (RUSTSEC-2026-0543, no fixed release) is ignored with its justification and tracked (#822). Dependency bumps: openraft 0.9.26, and five minor and patch updates (#815, #814).
+- **Cluster plane.**
+  - **A raise to feature level 8 or above waits for every metadata member.** Before proposing it, the leader asks every voter and learner which release it runs and the highest level it implements (new peer-plane message kinds 7 and 8). A member that does not answer, cannot be reached or answers as another node holds the raise back, and the refusal names it. Kinds 7 and 8 are new in this release, so a v0.10.2 leader treats a voter on v0.10.1 or earlier as unable to answer: a raise to level 8 on a cluster still at level 7 is refused until every voter runs v0.10.2. A level already in force asks nobody, so a cluster that has taken v0.10.0's raise to 8 is not affected; the check matters for the first raise to a level above 8 in a later release (#706, #758).
+  - **Seven enums an older voter would call corrupt are reported as a newer format.** No byte written or read changes; an unknown tag is reported as "newer format" instead of "corrupt" (#743, #763).
+  - **The group-commit coordinator answers its leader first, and one member's refusal fails only that member.** No node calls it yet, so no behaviour changes in a deployment (#752, #780).
+- **Release pipeline.**
+  - **Linux archives for every Linux.** The `-linux-gnu` archives are built inside manylinux2014 (CentOS 7), so the floor is glibc 2.17: RHEL and CentOS 7 and later, Amazon Linux 2 and 2023, Debian 8 and later, Ubuntu 14.04 and later. v0.10.1's glibc 2.28 floor did not cover Amazon Linux 2 or RHEL 7. New `-linux-musl` archives (x86_64 and aarch64) are fully static and run on any Linux, Alpine included. Each release now has six archives. The release workflow checks the symbol floor and the static link, and runs every Linux archive on Amazon Linux 2 and 2023, Debian 12 and 13, Ubuntu 22.04 and 24.04 and AlmaLinux 8, 9 and 10 (musl ones on Alpine too), and the macOS archives on both macOS runners. The musl archives use musl's own allocator, whose performance under load has not been measured (#724, #842).
+  - **Build provenance.** The archives and the image carry a GitHub build provenance attestation, verified with `gh attestation verify` before the release publishes; [release verification](RELEASE_VERIFICATION.md) has the commands. Earlier releases have none. This release is the first to run those steps, so a failure there stops the publish before anything is released (#731, #825).
+  - **Advisory reviews.** Every ignored advisory carries a review date, and a check fails after 90 days (#819).
+- **Tests and CI.**
+  - The live-broker Kafka suite runs on every Apache Kafka release from 3.7 to 4.4, through TLS and SASL listeners, and on Redpanda; the refusal tests check that wrong passwords, unknown users, a missing CA and a plaintext client against a TLS port are each refused within a bounded time (#721, #820, #834).
+  - The archive engine is killed with `kill -9` at every state transition and at the commit boundary, against real Kafka, MinIO and SQLite, through a `failpoints` feature that is off in release builds (#725, #818).
+  - A format registry and a check that the sources match it; a check that the versions copied into the docs match the workspace; a versioning, deprecation and support policy (#743, #783, #776, #777).
+  - The managed PostgreSQL smoke no longer queues on unrelated pull requests, and the manifest compat job no longer fails on a release bump commit (#821, #817).
+
+**Upgrading from v0.10.1.** Downgrade is not supported.
+
+- **Run `vtopctl validate` with the v0.10.2 binary first.** The engine now refuses to start when a key, state-store, ledger or audit file can be reached by other local users (#775). A ledger written 0644 by an earlier release is refused unless the directory holding it is closed to others (owned by the engine's user, mode 0700); a file that is group- or world-writable is always refused. `validate` lists every refused file at once and changes nothing. Fix each by `chmod 0600` (`chmod 0700` on the directory), or accept a readable file by setting `security.allow_loose_secret_permissions: true`: each file accepted that way is announced with a WARN, counted on `vtop_secret_file_permission_overrides_total` and recorded as a `security.override` audit action. The override never accepts a writable file. No file's mode is changed by the engine. In a pod, mount a Secret as a whole volume with `defaultMode: 0400` and the chart's `fsGroup`; see [Secret files and their permissions](operate/secrets.md). This is not a one-way step: a v0.10.1 engine starts on the same files. The Helm chart runs the cluster plane, which does not apply this check. An earlier engine ignores the `security` section, so the override can be set ahead of the upgrade.
+- **Otherwise a drop-in replacement.** Replace the binaries; start order does not matter, and v0.10.1 and v0.10.2 engines, voters and data nodes can run side by side. No schema (PostgreSQL stays at marker 3, SQLite at `user_version` 1), on-disk or wire format, and no cluster feature level (it stays 8) changes. No one-way step is added; v0.10.0's (feature level 8, `manifest.write_version: "0.4"`, `manifest.mac`, `upload.object_lock`) are unchanged. The two new peer-plane message kinds are used only to judge a raise to level 8 or above.
+- **One new key.** `security.allow_loose_secret_permissions` (a new `security` section, default `false`, unknown keys inside it refused). The top level does not refuse unknown sections, so a v0.10.1 engine ignores it without a word. That is harmless: it never refuses the files this release refuses, so the override changes nothing there.
+- **Batch size.** A `run` engine now seals at `max_bytes` where it sealed at about twice that. The number of objects per byte archived rises to what the setting says, up to about twice the count for a source that filled every window.
+- **Object Lock.** Under `upload.object_lock`, a replay over an object that is not locked as configured now writes one extra locked object per range instead of failing it. An engine on v0.10.1 in a mixed fleet still stalls on such a range until it is upgraded. Watch for the `VtopObjectLockFallback` alert; Helm chart 0.6.1 renders it when `metrics.prometheusRule.enabled` is on.
+- **Linux hosts.** Take the `-linux-gnu` archive on any glibc 2.17 or later host, or the `-linux-musl` archive on Alpine, an older glibc, or where no shared library may load; [binaries](install/binaries.md#which-linux-archive-to-pick) says how to tell. Verify the download as before, and with `gh attestation verify` ([release verification](RELEASE_VERIFICATION.md)).
+- **Helm chart 0.6.1** (from 0.6.0; `appVersion` 0.10.2). No template or values key changes. The shipped alert rules gain `VtopObjectLockFallback`, `values.yaml` gains comments on `extraVolumes` and `extraVolumeMounts` for secret files from an external manager, and `ci/external-secret-values.yaml` is a rendered example.
+- **Known open.**
+  - #798: an OpenTelemetry message test (`otel_messages`) fails intermittently in CI; the cause is not found. Moved to v0.11.0.
+  - #725: the kill-and-restart suite covers the transitions; the second pull request for the issue is not in.
+  - #724: the archives are built and smoked on the platforms above; the full matrix of supported platforms is not done. #731: the attestations first run on a real tag, so the issue stays open until a tag verifies them. #729: nightly fuzzing and the commit-path mutation gate are in; the gate on the verify, recovery and file-continuity code is not.
+  - #752, #751: group commit is measured and its coordinator fixed, but not wired into the data node, and a Kafka client cannot yet follow a failover through a candidate node.
+  - #706: the actor of a cluster command is in the admin endpoint's record only, not in the replicated log; only the voter check from #758 is in.
+  - #743: the format registry and the compatibility policy are in; the tested downgrade matrix is not complete.
+  - #773, #774: #626 follow-ups (adopting an earlier attempt's object on backends that cannot report absence; reporting failed attempts' objects no committed row names).
+  - #726: the 72 hour soak has not run. #714: the bar for calling VTOP production-ready. VTOP remains a prototype.
 
 ## v0.11.0 and beyond
 
