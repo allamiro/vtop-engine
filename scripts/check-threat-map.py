@@ -9,7 +9,7 @@ nothing, so this check reads the tables and fails when:
   - a row's control or test cell has no reference and is not marked GAP;
   - a reference names a file that does not exist;
   - a reference names a symbol the file no longer contains (a test reference
-    must be a function: `fn name` in Rust, `def name` in Python);
+    must be a function: `fn name` in Rust, a `def` in the syntax tree in Python);
   - a Rust test reference is `#[ignore]`d, so CI would not run it;
   - an ID is used twice, or does not start with a known group letter;
   - a group has no row at all, so a whole plane cannot drop out of the map;
@@ -35,6 +35,7 @@ way the check expects.
 from __future__ import annotations
 
 import argparse
+import ast
 import pathlib
 import re
 import sys
@@ -167,7 +168,7 @@ def _test_pattern(path: str, symbol: str) -> re.Pattern | None:
     if path.endswith(".rs"):
         return re.compile(r"\bfn\s+" + re.escape(symbol) + r"(?![A-Za-z0-9_])")
     if path.endswith(".py"):
-        return re.compile(r"\bdef\s+" + re.escape(symbol) + r"(?![A-Za-z0-9_])")
+        return re.compile(r"\bdef\s+" + re.escape(symbol) + r"(?![A-Za-z0-9_])")  # for the message only
     return None
 
 
@@ -273,6 +274,16 @@ def resolve(root: pathlib.Path, path: str, symbol: str | None, is_test: bool):
         text = file.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as e:
         return f"`{path}` cannot be read: {e}", None
+    if is_test and path.endswith(".py"):
+        # The syntax tree, so a def inside a docstring or a comment is no test.
+        try:
+            tree = ast.parse(text)
+        except SyntaxError as e:
+            return f"`{path}` does not parse: {e}", None
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == symbol:
+                return None, node.lineno
+        return f"`{path}` has no test function `{symbol}`", None
     # A test that is commented out, or quoted in a string, is not a test; a control may be cited by
     # the comment or message that states it, so only tests lose their comments.
     if is_test and path.endswith(".rs"):
@@ -280,8 +291,6 @@ def resolve(root: pathlib.Path, path: str, symbol: str | None, is_test: bool):
     lines = text.splitlines()
     pattern = (_test_pattern(path, symbol) if is_test else None) or _word(symbol)
     for n, line in enumerate(lines):
-        if is_test and path.endswith(".py") and line.lstrip().startswith("#"):
-            continue
         if pattern.search(line):
             if is_test and path.endswith(".rs") and _ignored(lines, n):
                 return f"test `{path}::{symbol}` is #[ignore]d, so CI does not run it", None

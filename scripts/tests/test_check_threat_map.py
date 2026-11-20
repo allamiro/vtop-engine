@@ -64,7 +64,13 @@ SOURCES = {
         "    const C: char = '\"';\n    #[test]\n    fn after_a_quote_char() {}\n"
         "}\n"
     ),
-    "scripts/tests/test_x.py": "class T:\n    def test_it_holds(self):\n        pass\n",
+    "scripts/tests/test_x.py": (
+        "class T:\n    def test_it_holds(self):\n        pass\n"
+        "    async def test_async_holds(self):\n        pass\n"
+        '    """\n    def test_in_a_docstring(self): pass\n    """\n'
+        "    # def test_in_a_comment(self): pass\n"
+        "    X = 'def test_in_a_string(self): pass'\n"
+    ),
     ".github/workflows/ci.yml": "jobs:\n  audit:\n    name: supply-chain (cargo audit)\n",
     "deny.toml": "[sources]\nunknown-git = \"deny\"\n",
     "scripts/scenario.sh": "#!/usr/bin/env bash\necho ok\n",
@@ -221,6 +227,20 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(self.repo(document(rows)).problems(), [])
         rows["T1"] = row("T1", test="`scripts/tests/test_x.py::test_gone`")
         self.assert_fails(self.repo(document(rows)), "T1", "test_gone")
+        rows["T1"] = row("T1", test="`scripts/tests/test_x.py::test_async_holds`")
+        self.assertEqual(self.repo(document(rows)).problems(), [])
+
+    def test_a_python_def_in_a_docstring_comment_or_string_is_not_a_test(self):
+        for name in ("test_in_a_docstring", "test_in_a_comment", "test_in_a_string"):
+            rows = good_rows()
+            rows["T1"] = row("T1", test=f"`scripts/tests/test_x.py::{name}`")
+            self.assert_fails(self.repo(document(rows)), "T1", "no test function")
+
+    def test_a_python_file_that_does_not_parse_fails_naming_it(self):
+        rows = good_rows()
+        rows["T1"] = row("T1", test="`scripts/tests/test_x.py::test_it_holds`")
+        r = self.repo(document(rows), {**SOURCES, "scripts/tests/test_x.py": "def broken(:\n"})
+        self.assert_fails(r, "T1", "does not parse")
 
     def test_a_workflow_job_or_a_script_can_be_the_check(self):
         rows = good_rows()
