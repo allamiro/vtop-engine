@@ -1018,10 +1018,10 @@ impl MetaValue {
                             _ => None,
                         },
                     }),
-                    _ => {
-                        return Err(CodecError::InvalidValue {
+                    other => {
+                        return Err(CodecError::UnknownTag {
                             what: "lease presence",
-                            reason: "lease presence byte must be 0, 1, or 2",
+                            tag: u32::from(other),
                         })
                     }
                 };
@@ -11487,5 +11487,216 @@ mod tests {
                 placement_weight: DEFAULT_PLACEMENT_WEIGHT,
             })
         );
+    }
+}
+
+/// #743 (closed-enum review): every enum inside a checksummed snapshot or
+/// dedup record that can gain a variant must, on a reader that predates the
+/// variant, read as a NEWER format, not as corruption. Each test encodes a
+/// real record, puts a tag no release has written yet where the enum's byte
+/// is, decodes it with the production decoder, and asks the store's own
+/// classifier how it would report that error.
+#[cfg(test)]
+mod closed_enum_newer_tests {
+    use super::*;
+    use crate::command::{MetadataError, MetadataResponse, NodeState, VerificationMethod};
+    use crate::storage::{codec_corrupt, MetaStoreError};
+    use std::path::Path;
+
+    const NEWER_TAG: u8 = 0x7f;
+
+    /// What the store reports when it meets `error` in a snapshot file.
+    fn reported(error: &CodecError) -> MetaStoreError {
+        codec_corrupt(Path::new("snapshot"), error)
+    }
+
+    /// `bytes` with the byte at `at` (which must hold `expected`, so a layout
+    /// change fails here and not as a confusing pass) set to a newer tag.
+    fn with_newer_tag(mut bytes: Vec<u8>, at: usize, expected: u8) -> Vec<u8> {
+        assert_eq!(bytes[at], expected, "the enum's tag byte moved");
+        bytes[at] = NEWER_TAG;
+        bytes
+    }
+
+    fn assert_newer(error: CodecError, what: &'static str) {
+        assert_eq!(
+            error,
+            CodecError::UnknownTag {
+                what,
+                tag: u32::from(NEWER_TAG)
+            }
+        );
+        match reported(&error) {
+            MetaStoreError::NewerFormat { reason, .. } => {
+                assert!(reason.contains(what), "{reason}")
+            }
+            other => panic!("an unknown {what} must read as a newer format, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_node_state_in_a_node_record_is_newer() {
+        let addr = "10.0.0.1:7000";
+        let bytes = MetaValue::Node(NodeRecord {
+            addr: addr.into(),
+            state: NodeState::Active,
+            generation: 1,
+            failure_domain: "a".into(),
+            placement_weight: 1,
+        })
+        .encode()
+        .unwrap();
+        // value tag, u16 address length, the address, then the state.
+        let bytes = with_newer_tag(bytes, 1 + 2 + addr.len(), 1);
+        assert_newer(MetaValue::decode(&bytes).unwrap_err(), "node state");
+    }
+
+    #[test]
+    fn an_unknown_verification_method_in_a_replacement_proof_is_newer() {
+        let bytes = MetaValue::ReplacementProof(ReplacementProofRecord {
+            generation: 1,
+            segment_generation: 2,
+            content_root: [3; 32],
+            expected_length_bytes: 4,
+            source_node_uuid: Uuid::from_u128(5),
+            destination_node_uuid: Uuid::from_u128(6),
+            fencing_epoch: 7,
+            verification_method: VerificationMethod::AuthenticatedContentRoot,
+            verifier_node_uuid: Uuid::from_u128(8),
+            verified_at_apply_index: 9,
+            verified_term: 10,
+        })
+        .encode()
+        .unwrap();
+        // value tag, three u64s and the root (with the length between them),
+        // two node uuids, the fencing epoch, then the method.
+        let at = 1 + 8 + 8 + 32 + 8 + 16 + 16 + 8;
+        let bytes = with_newer_tag(bytes, at, 1);
+        assert_newer(
+            MetaValue::decode(&bytes).unwrap_err(),
+            "verification method",
+        );
+    }
+
+    #[test]
+    fn an_unknown_segment_state_in_a_segment_record_is_newer() {
+        let bytes = MetaValue::Segment(SegmentRecord {
+            segment_generation: 1,
+            base_offset: 2,
+            next_offset: 3,
+            content_root: [4; 32],
+            state: SegmentState::SealedUnverified,
+            sealed_by_epoch: 5,
+        })
+        .encode()
+        .unwrap();
+        let bytes = with_newer_tag(bytes, 1 + 8 + 8 + 8 + 32, 1);
+        assert_newer(MetaValue::decode(&bytes).unwrap_err(), "segment state");
+    }
+
+    #[test]
+    fn an_unknown_key_state_in_a_key_record_is_newer() {
+        let bytes = MetaValue::Key(KeyRecord {
+            scheme: 1,
+            public_material_digest: [2; 32],
+            state: KeyState::Active,
+        })
+        .encode()
+        .unwrap();
+        let bytes = with_newer_tag(bytes, 1 + 2 + 32, 1);
+        assert_newer(MetaValue::decode(&bytes).unwrap_err(), "key state");
+    }
+
+    #[test]
+    fn an_unknown_transition_grant_kind_in_a_range_transition_is_newer() {
+        let bytes = MetaValue::RangeTransition(RangeTransitionRecord {
+            epoch_from: 1,
+            epoch_to: 2,
+            holder_from: None,
+            holder_to: Uuid::from_u128(3),
+            grant: GrantKind::Election,
+            granted_at_ms: 4,
+            granted_apply_index: 5,
+            outcome: TransitionOutcome::Pending,
+        })
+        .encode()
+        .unwrap();
+        // value tag, two epochs, the absent holder-from flag, the holder.
+        let bytes = with_newer_tag(bytes, 1 + 8 + 8 + 1 + 16, 1);
+        assert_newer(
+            MetaValue::decode(&bytes).unwrap_err(),
+            "transition grant kind",
+        );
+    }
+
+    /// The request dedup table carries each request's response, and it
+    /// travels in snapshots.
+    #[test]
+    fn an_unknown_response_kind_in_a_dedup_response_is_newer() {
+        let mut bytes = MetadataResponse::Ack { generation: 1 }.encode().unwrap();
+        assert_eq!(&bytes[..2], &[0, 1], "the response kind moved");
+        bytes[..2].copy_from_slice(&u16::from(NEWER_TAG).to_be_bytes());
+        assert_newer(
+            MetadataResponse::decode(&bytes).unwrap_err(),
+            "response kind",
+        );
+    }
+
+    #[test]
+    fn an_unknown_error_kind_in_a_rejected_dedup_response_is_newer() {
+        let mut bytes = MetadataResponse::Rejected(MetadataError::NotFound)
+            .encode()
+            .unwrap();
+        assert_eq!(bytes.len(), 4, "response kind then error kind");
+        bytes[2..4].copy_from_slice(&u16::from(NEWER_TAG).to_be_bytes());
+        assert_newer(MetadataResponse::decode(&bytes).unwrap_err(), "error kind");
+    }
+
+    /// Lease presence has grown once already (#223 added 2, a lease with a
+    /// deadline); a third shape from a later release is newer, not damage.
+    #[test]
+    fn an_unknown_lease_presence_in_a_range_record_is_newer() {
+        let range = |expires_at_ms| {
+            MetaValue::Range(RangeRecord {
+                generation: 1,
+                key_prefix: 0,
+                key_prefix_bits: 0,
+                fencing_epoch: 2,
+                lineage_generation: 0,
+                parents: Vec::new(),
+                sealed_at: None,
+                lease: Some(LeaseRecord {
+                    holder_node_uuid: Uuid::from_u128(3),
+                    fencing_epoch: 2,
+                    granted_apply_index: 4,
+                    expires_at_ms,
+                }),
+            })
+            .encode()
+            .unwrap()
+        };
+        // The two encodings differ first at the presence byte (1, then 2).
+        let (plain, deadline) = (range(None), range(Some(5)));
+        let at = plain
+            .iter()
+            .zip(&deadline)
+            .position(|(a, b)| a != b)
+            .unwrap();
+        let bytes = with_newer_tag(deadline, at, 2);
+        assert_newer(MetaValue::decode(&bytes).unwrap_err(), "lease presence");
+    }
+
+    /// The control: damage, not an unknown tag, still reads as corruption.
+    #[test]
+    fn a_truncated_record_is_still_corrupt() {
+        let bytes = MetaValue::Key(KeyRecord {
+            scheme: 1,
+            public_material_digest: [2; 32],
+            state: KeyState::Active,
+        })
+        .encode()
+        .unwrap();
+        let error = MetaValue::decode(&bytes[..bytes.len() - 1]).unwrap_err();
+        assert!(matches!(reported(&error), MetaStoreError::Corrupt { .. }));
     }
 }

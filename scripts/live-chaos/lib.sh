@@ -15,13 +15,19 @@
 #   CHAOS_MIN_FREE_MIB minimum free scratch space (default: 256)
 #   CHAOS_SHIM_DIR  writable directory for compiled fault shims (default:
 #                   target/live-chaos)
+#   CHAOS_VTOPCTL   the vtopctl to run (default: target/$CHAOS_PROFILE/vtopctl).
+#                   The engine crash sweep (#725) needs a build with the
+#                   `failpoints` feature, which can live beside the
+#                   --no-default-features build the cluster scenarios use.
+#   CHAOS_NO_CERTS=1 skip the TLS material init_workdir generates; the
+#                   engine sweep starts no cluster node
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT_DIR="$REPO_ROOT/scripts/live-chaos"
 CHAOS_PROFILE="${CHAOS_PROFILE:-release}"
 VTOP_NODE="$REPO_ROOT/target/$CHAOS_PROFILE/vtop-node"
-VTOPCTL="$REPO_ROOT/target/$CHAOS_PROFILE/vtopctl"
+VTOPCTL="${CHAOS_VTOPCTL:-$REPO_ROOT/target/$CHAOS_PROFILE/vtopctl}"
 
 CLUSTER_ID="${CHAOS_CLUSTER_ID:-11111111-2222-3333-4444-555555555555}"
 RANGE_ID="${CHAOS_RANGE_ID:-aaaaaaaa-0000-0000-0000-0000000000c1}"
@@ -337,8 +343,10 @@ init_workdir() {
   mkdir -p "$WORKDIR/logs" \
     || fail "cannot create log directory under $WORKDIR; set CHAOS_WORKDIR to a writable filesystem"
   CERTS="$WORKDIR/certs"
-  "$SCRIPT_DIR/gen-certs.sh" "$CERTS" 1 2 3 4 5 6 -- \
-    "$LEADER_UUID" "$FOLLOWER1_UUID" "$FOLLOWER2_UUID" "$SPARE_UUID" > /dev/null
+  if [[ "${CHAOS_NO_CERTS:-0}" != "1" ]]; then
+    "$SCRIPT_DIR/gen-certs.sh" "$CERTS" 1 2 3 4 5 6 -- \
+      "$LEADER_UUID" "$FOLLOWER1_UUID" "$FOLLOWER2_UUID" "$SPARE_UUID" > /dev/null
+  fi
   log "workdir=$WORKDIR"
 }
 
@@ -1827,10 +1835,157 @@ wait_meta_leader() { # <node-ids...>
   fail "no meta leader elected within ${ELECTION_TIMEOUT_SECONDS}s"
 }
 
+# wait_meta_leader_except <excluded-id> <node-ids...> — the leader once it is
+# a node other than <excluded-id>; echoes its id. After the leader is
+# killed, its followers keep naming it until their election timeout runs
+# out, so wait_meta_leader returns the dead node at once (review of #758).
+# Only the given nodes are asked, the leader must be one of them, and it
+# must name itself, so a follower's stale or early answer is not taken.
+wait_meta_leader_except() { # <excluded-id> <node-ids...>
+  local excluded="$1"
+  shift
+  local deadline=$((SECONDS + ELECTION_TIMEOUT_SECONDS)) last="none"
+  while [[ $SECONDS -lt $deadline ]]; do
+    local id
+    for id in "$@"; do
+      local leader
+      leader="$(meta_status_field "$id" "['current_leader']" 2>/dev/null || echo null)"
+      [[ "$leader" != "null" && -n "$leader" ]] || continue
+      last="$leader (from node $id)"
+      [[ "$leader" != "$excluded" && " $* " == *" $leader "* ]] || continue
+      local own
+      own="$(meta_status_field "$leader" "['current_leader']" 2>/dev/null || echo null)"
+      if [[ "$own" == "$leader" ]]; then
+        echo "$leader"
+        return 0
+      fi
+    done
+    sleep 0.3
+  done
+  fail "no meta leader other than node $excluded among nodes $* within ${ELECTION_TIMEOUT_SECONDS}s (last reported: $last)"
+}
+
 # Propose a RegisterNode command through node <id>; used as commit load.
 propose_register() { # <via-node-id> <target-uuid-suffix (2 hex)>
   local via="$1" suffix="$2"
   meta_admin "$via" register-node \
     --node-uuid "cccccccc-0000-0000-0000-0000000000$suffix" \
     --addr "$REGISTER_HOST_PREFIX.$((16#$suffix)):$REGISTER_PORT"
+}
+
+# ---------------------------------------------------------------------------
+# The archive engine (#725)
+# ---------------------------------------------------------------------------
+# These drive `vtopctl run`, the archive engine, rather than the cluster
+# plane: scripts/live-chaos/engine/run-sweep.sh kills it at each failpoint
+# against real Kafka and MinIO and checks what a restart makes of it.
+
+# engine_start <config> <log> [failpoint] — start `vtopctl run` in the
+# background, armed with the failpoint when one is given, and set ENGINE_PID.
+# A variable rather than stdout: the caller must `wait` on the process to
+# read how it died, which a $(...) subshell's child would not allow.
+engine_start() {
+  local config="$1" logfile="$2" point="${3:-}"
+  if [[ -n "$point" ]]; then
+    VTOP_FAILPOINT="$point" "$VTOPCTL" run --config "$config" > "$logfile" 2>&1 &
+  else
+    env -u VTOP_FAILPOINT "$VTOPCTL" run --config "$config" > "$logfile" 2>&1 &
+  fi
+  ENGINE_PID=$!
+  echo "$ENGINE_PID" >> "$WORKDIR/pids"
+}
+
+# engine_wait_killed <pid> <failpoint> <log> <timeout-seconds> — the engine
+# died by SIGKILL at that failpoint. A point that never fires would let the
+# engine run on and drain, and the leg would prove nothing: that is a failure
+# named as such, not a pass.
+engine_wait_killed() {
+  local pid="$1" point="$2" logfile="$3" timeout_s="$4"
+  local deadline=$((SECONDS + timeout_s))
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( SECONDS >= deadline )); then
+      kill -9 "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      fail "failpoint $point never fired in ${timeout_s}s: the engine was still running. Last log lines:
+$(tail -n 15 "$logfile")"
+    fi
+    sleep 0.2
+  done
+  local code=0
+  wait "$pid" || code=$?
+  [[ $code -eq 137 ]] \
+    || fail "$point: the engine exited with status $code, not by SIGKILL (137). Last log lines:
+$(tail -n 15 "$logfile")"
+  grep -q "failpoint $point fired" "$logfile" \
+    || fail "$point: the engine died by SIGKILL, but not at its failpoint (no 'failpoint $point fired' line). Last log lines:
+$(tail -n 15 "$logfile")"
+}
+
+# engine_drain <pid> <log> <timeout-seconds> <condition-command...> — wait
+# until the condition command succeeds while the engine runs, then stop the
+# engine with SIGTERM and require a clean exit. On expiry the condition's own
+# last output (what it observed) is in the failure.
+engine_drain() {
+  local pid="$1" logfile="$2" timeout_s="$3"
+  shift 3
+  local deadline=$((SECONDS + timeout_s)) observed=""
+  until observed="$("$@" 2>&1)"; do
+    kill -0 "$pid" 2>/dev/null \
+      || fail "the restarted engine exited before it drained. Last observed: $observed. Last log lines:
+$(tail -n 15 "$logfile")"
+    if (( SECONDS >= deadline )); then
+      kill -9 "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      fail "the restarted engine did not drain in ${timeout_s}s. Last observed: $observed. Last log lines:
+$(tail -n 15 "$logfile")"
+    fi
+    sleep 1
+  done
+  kill -TERM "$pid" 2>/dev/null || true
+  local code=0 stop_deadline=$((SECONDS + STOP_TIMEOUT_SECONDS * 3))
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( SECONDS >= stop_deadline )); then
+      kill -9 "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      fail "the drained engine did not stop within $((STOP_TIMEOUT_SECONDS * 3))s of SIGTERM"
+    fi
+    sleep 0.2
+  done
+  wait "$pid" || code=$?
+  [[ $code -eq 0 ]] \
+    || fail "the drained engine exited with status $code after SIGTERM, not 0. Last log lines:
+$(tail -n 15 "$logfile")"
+}
+
+# assert_archive_coverage <config> <log> — ddia-fault-testing rule 3a: the
+# committed ranges tile every source with no hole, every committed object and
+# manifest is in the store at its recorded size, and `scrub` reads each one
+# back and verifies it against its manifest.
+assert_archive_coverage() {
+  local config="$1" logfile="$2"
+  "$VTOPCTL" audit-coverage --check-storage --config "$config" > "$logfile" 2>&1 \
+    || fail "audit-coverage --check-storage found lost data:
+$(tail -n 25 "$logfile")"
+  "$VTOPCTL" scrub --config "$config" >> "$logfile" 2>&1 \
+    || fail "scrub is not clean:
+$(tail -n 25 "$logfile")"
+}
+
+# readback_records <bucket> <prefix> <dest-dir> — copy every object under
+# the prefix out of MinIO with `mc`, in the lab's own minio-init container
+# (docker-compose.yml), so the records are counted from what the store holds
+# rather than from what the engine reports it wrote. The copy travels as a
+# tar on stdout: nothing is mounted, so it works from a runner and from a
+# container driving the host's Docker alike.
+readback_records() {
+  local bucket="$1" prefix="$2" dest="$3"
+  mkdir -p "$dest"
+  # shellcheck disable=SC2016  # expanded by the container's shell
+  (cd "$REPO_ROOT" && docker compose run --rm -T minio-init \
+    'mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" > /dev/null \
+     && mkdir -p /tmp/out \
+     && mc mirror --quiet "local/'"$bucket"'/'"$prefix"'" /tmp/out > /dev/null \
+     && tar -C /tmp/out -cf - .' 2> "$dest.mc.log") | tar -C "$dest" -xf - \
+    || fail "could not copy s3://$bucket/$prefix out of MinIO with mc:
+$(tail -n 10 "$dest.mc.log")"
 }

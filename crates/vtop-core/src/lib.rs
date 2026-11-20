@@ -26,6 +26,7 @@ pub mod manifest;
 pub mod metrics;
 pub mod partitioning;
 pub mod replay;
+pub mod secret_file;
 pub mod state_machine;
 pub mod telemetry;
 pub mod types;

@@ -1065,6 +1065,31 @@ fn served_values(follower: &InProcessFollower, from: u64) -> Vec<String> {
 /// then catches it up.
 #[test]
 fn a_deposed_leader_absent_from_the_election_discards_its_unacknowledged_suffix_and_catches_up() {
+    deposed_leader_returns(false);
+}
+
+/// #787. The same return, with the leader's last record committed BEFORE
+/// the deposed replica comes back, so the range is quiet when its session
+/// opens. The session sends the current mark first, before the records the
+/// replica lacks; the replica, holding only the agreed prefix once the mark
+/// has discarded its suffix, can show none of it (a mark is never shown
+/// above local durability). The records then arrive, and no later mark
+/// does: the range is quiet. Before the fix the replica held the leader's
+/// records durably and served none of them, its mark stuck at the prefix
+/// until the next write, which on a quiet range may never come. This is the
+/// interleaving behind the CI failure of the test above (#787): there the
+/// return and the last produce race, and the mark sometimes won.
+///
+/// Invariant: a replica that applies records below the last mark its leader
+/// sent shows that mark over them, without waiting for another one.
+#[test]
+fn a_deposed_leader_returning_to_a_quiet_range_shows_the_mark_over_the_records_it_catches_up() {
+    deposed_leader_returns(true);
+}
+
+/// The scenario of the two tests above. `quiet`: the leader's last record is
+/// committed while the deposed replica is still down.
+fn deposed_leader_returns(quiet: bool) {
     let flow = FlowControlConfig {
         reconnect_backoff: Duration::from_millis(20),
         ack_timeout: Duration::from_millis(500),
@@ -1149,6 +1174,14 @@ fn a_deposed_leader_absent_from_the_election_discards_its_unacknowledged_suffix_
         "precondition: follower 2 serves the leader's records"
     );
 
+    if quiet {
+        produce_at(&h.leader, h.range.clone(), epoch, 7);
+        assert!(
+            await_within(Duration::from_secs(5), || h.cluster_committed.get() == 8),
+            "precondition: the leader committed 7 without follower 1"
+        );
+    }
+
     // It returns: its watcher adopts the granted epoch, and that is all.
     deposed.adopt_fencing_epoch(epoch);
     assert_eq!(
@@ -1157,7 +1190,9 @@ fn a_deposed_leader_absent_from_the_election_discards_its_unacknowledged_suffix_
         "precondition: the suffix is still held"
     );
     down.store(false, Ordering::SeqCst);
-    produce_at(&h.leader, h.range.clone(), epoch, 7);
+    if !quiet {
+        produce_at(&h.leader, h.range.clone(), epoch, 7);
+    }
 
     let expected = ["v5", "v6", "v7"];
     let caught_up = await_within(Duration::from_secs(10), || {

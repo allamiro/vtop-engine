@@ -120,6 +120,13 @@ failover.
   `networkPolicy.enabled` where your CNI enforces NetworkPolicy, or give it
   TLS with `observability.tls.secretName`.
 - `metrics.serviceMonitor.enabled` for the Prometheus Operator.
+- `metrics.prometheusRule.enabled` installs the engine's alert rules as a
+  `PrometheusRule` (it needs the Operator's CRDs, like the ServiceMonitor).
+  This chart runs the cluster plane, not the engine: the rules fire only for
+  engines your Prometheus also scrapes. `metrics.prometheusRule.labels` adds
+  the labels your Prometheus's rule selector matches, and
+  `metrics.prometheusRule.runbookBaseUrl` points the `runbook_url` links at
+  your own copy of the [alert runbooks](../operate/runbooks.md).
 - The cluster alert rules on [Metrics and alerts](../operate/monitoring.md#alerts),
   and the node metrics in [Node endpoints and metrics](../NODE_OBSERVABILITY.md).
 - A pod that goes not ready because metadata fenced it is behaving correctly.
@@ -128,6 +135,31 @@ Operating notes: the PodDisruptionBudget allows one pod down at a time; the
 default anti-affinity is only preferred, so set required anti-affinity or zone
 spreading; on SIGTERM a leader releases its range lease so failover starts at
 once (`terminationGracePeriodSeconds`, default 60).
+
+## Secrets from an external manager
+
+The chart mounts its own TLS Secrets with `defaultMode: 0440` and the pod's
+`fsGroup: 10001`. To add a secret file from a manager (External Secrets
+Operator, the Secrets Store CSI driver, Vault Agent) to the chart's pods, use
+`extraVolumes` and `extraVolumeMounts`; mount the whole volume at a directory,
+never with `subPath`, and use `defaultMode: 0400`, which the kubelet turns
+into `0440` because of `fsGroup`.
+[`ci/external-secret-values.yaml`](../../helm/vtop/ci/external-secret-values.yaml)
+is a rendered example; the [chart README](../../helm/vtop/README.md#secrets-from-an-external-manager)
+has the details.
+
+The archive engine, which this chart does not run, checks the files that hold
+its secrets and its ledger before reading them, and refuses ones other users
+can reach. When you run it in Kubernetes yourself, mount its manifest keys
+and its `engine.state_store` secret the same way: a Secret volume with
+`defaultMode: 0400`, a pod `fsGroup` the engine's user belongs to, no
+`subPath`, and the file paths in `config.yaml`. The resulting `0440` files
+are accepted as a Kubernetes Secret mount. Keep its ledger and audit file on
+a volume with `fsGroupChangePolicy: OnRootMismatch`: under the default
+policy the kubelet makes every file on a writable volume group-writable at
+each mount, which the engine refuses. The rule, the override and the
+recipes for each manager are on
+[Secret files and their permissions](../operate/secrets.md).
 
 ## Upgrade notes
 

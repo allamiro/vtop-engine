@@ -121,6 +121,15 @@ fn range_identity() -> RangeIdentity {
 }
 
 fn open_segment(dir: &TempDir, segment_id: u128, range: &RangeIdentity) -> ActiveSegment {
+    open_segment_with(dir, segment_id, range, SegmentConfig::default())
+}
+
+fn open_segment_with(
+    dir: &TempDir,
+    segment_id: u128,
+    range: &RangeIdentity,
+    config: SegmentConfig,
+) -> ActiveSegment {
     let descriptor = SegmentDescriptor {
         segment_id: Uuid::from_u128(segment_id),
         topic: range.topic.clone(),
@@ -133,12 +142,7 @@ fn open_segment(dir: &TempDir, segment_id: u128, range: &RangeIdentity) -> Activ
         },
         base_offset: 0,
     };
-    ActiveSegment::create(
-        dir.path().join("range.active"),
-        descriptor,
-        SegmentConfig::default(),
-    )
-    .unwrap()
+    ActiveSegment::create(dir.path().join("range.active"), descriptor, config).unwrap()
 }
 
 fn group_config() -> GroupCommitConfig {
@@ -471,4 +475,502 @@ fn local_fsync_group_commit_shares_one_commit_metric() {
     assert_eq!(metrics.commits_total(), 1);
     assert_eq!(metrics.requests_total(), 6);
     assert!(metrics.sync_nanos_total() > 0);
+}
+
+fn replicated_leader(
+    config: GroupCommitConfig,
+    wrap: impl FnOnce(Arc<InProcessReplicaSet>, MetaFencingEpoch) -> Arc<dyn ReplicaSet>,
+) -> (Arc<LocalBroker>, ClusterCommittedOffset, Vec<TempDir>) {
+    replicated_leader_on(config, SegmentConfig::default(), wrap)
+}
+
+/// [`replicated_leader`] whose own segment has `segment` limits.
+fn replicated_leader_on(
+    config: GroupCommitConfig,
+    segment: SegmentConfig,
+    wrap: impl FnOnce(Arc<InProcessReplicaSet>, MetaFencingEpoch) -> Arc<dyn ReplicaSet>,
+) -> (Arc<LocalBroker>, ClusterCommittedOffset, Vec<TempDir>) {
+    let range = range_identity();
+    let meta = MetaFencingEpoch::new(FENCING_EPOCH);
+    let cluster_committed = ClusterCommittedOffset::new(0);
+    let leader_dir = tempfile::tempdir().unwrap();
+    let leader_segment = open_segment_with(&leader_dir, 0xD1, &range, segment);
+    let leader_epochs = ProducerEpochJournal::open(leader_dir.path().join("epochs")).unwrap();
+    let (mut dirs, followers) = build_followers(&range, &meta);
+    let replicas = wrap(Arc::new(InProcessReplicaSet::new(followers)), meta.clone());
+    let leader = Arc::new(
+        LocalBroker::with_replication(
+            leader_segment,
+            leader_epochs,
+            range,
+            FENCING_EPOCH,
+            meta,
+            LEADER,
+            Some(cluster_committed.clone()),
+            Some(replicas),
+        )
+        .unwrap()
+        .with_group_commit(config)
+        .unwrap(),
+    );
+    dirs.push(leader_dir);
+    (leader, cluster_committed, dirs)
+}
+
+/// Seals on the `n`th request queued; the 10 s window is only a backstop, so
+/// which requests share a group does not depend on thread timing.
+fn sealing_at(n: usize) -> GroupCommitConfig {
+    GroupCommitConfig {
+        max_delay: Duration::from_secs(10),
+        max_records: n,
+        max_bytes: 1024 * 1024,
+        max_pending_requests: 32,
+    }
+}
+
+/// Run `frames` concurrently, released together, and return each answer in
+/// the order given.
+fn concurrently(broker: &Arc<LocalBroker>, frames: Vec<WireFrame>) -> Vec<WireFrame> {
+    let barrier = Arc::new(Barrier::new(frames.len()));
+    let handles: Vec<_> = frames
+        .into_iter()
+        .map(|frame| {
+            let broker = Arc::clone(broker);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                broker.handle(Role::Producer, frame)
+            })
+        })
+        .collect();
+    handles.into_iter().map(|h| h.join().unwrap()).collect()
+}
+
+/// Defect 2 (#752, D6): one member's bad sequence must fail that member
+/// only. The log validates a whole group before writing a byte and refuses
+/// it whole, and the broker used to give every member that refusal; a
+/// `SequenceConflict` is not retryable for an idempotent Kafka producer, so
+/// one client's bad sequence would have failed another client's request
+/// for good.
+#[test]
+fn one_members_sequence_conflict_does_not_fail_the_others() {
+    let (leader, cluster_committed, _dirs) =
+        replicated_leader(sealing_at(2), |inner, _| inner as Arc<dyn ReplicaSet>);
+    let range = range_identity();
+    let good = Uuid::from_u128(0xB1);
+    let bad = Uuid::from_u128(0xB2);
+    // A new producer's first sequence must be 0; this one starts at 5.
+    let answers = concurrently(
+        &leader,
+        vec![
+            produce_frame(range.clone(), good, 0, 1),
+            produce_frame(range, bad, 5, 2),
+        ],
+    );
+    let metrics = leader.group_commit().unwrap().metrics();
+    assert_eq!(
+        metrics.last_sample().requests,
+        2,
+        "the two requests must have shared a group for this test to mean anything"
+    );
+    let response = expect_ok(answers[0].clone());
+    assert_eq!(
+        response.outcomes.len(),
+        1,
+        "the good member is acknowledged"
+    );
+    match &answers[1].message {
+        Message::Error(ErrorResponse { code, .. }) => {
+            assert_eq!(*code, ErrorCode::SequenceConflict, "{:?}", answers[1])
+        }
+        other => panic!("the bad member must be refused: {other:?}"),
+    }
+    assert_eq!(
+        cluster_committed.get(),
+        1,
+        "exactly the good member's record is committed"
+    );
+}
+
+/// `members`, each a `(producer, epoch)` request with one 700-byte record,
+/// queued in this order into one group that the log refuses as too large
+/// (one such record fits a group, two do not), so the group is split and
+/// each member re-run alone. Returns the answers, in order, and the
+/// cluster's committed offset.
+fn split_group(members: &[(u128, u64)]) -> (Vec<WireFrame>, u64) {
+    let segment = SegmentConfig {
+        max_record_bytes: 1024,
+        max_group_bytes: 1024 + 128,
+        ..SegmentConfig::default()
+    };
+    let (leader, cluster_committed, _dirs) =
+        replicated_leader_on(sealing_at(members.len()), segment, |inner, _| {
+            inner as Arc<dyn ReplicaSet>
+        });
+    let coordinator = leader.group_commit().unwrap();
+    let mut handles = Vec::new();
+    for (index, &(producer, producer_epoch)) in members.iter().enumerate() {
+        let frame = WireFrame {
+            request_id: index as u64 + 1,
+            stream_id: 1,
+            message: Message::ProduceRequest(ProduceRequest {
+                range: range_identity(),
+                fencing_epoch: FENCING_EPOCH,
+                producer_id: Uuid::from_u128(producer),
+                producer_epoch,
+                first_sequence: 0,
+                durability: WireDurability::Quorum,
+                records: vec![ProduceRecord {
+                    timestamp_millis: 1_000,
+                    key: b"k".to_vec(),
+                    value: vec![b'v'; 700],
+                }],
+            }),
+        };
+        let sender = Arc::clone(&leader);
+        handles.push(thread::spawn(move || sender.handle(Role::Producer, frame)));
+        // Each request is queued before the next is sent, so the group's
+        // order does not depend on thread timing. The last one seals the
+        // group and is taken at once, so it is never seen queued.
+        if index + 1 == members.len() {
+            break;
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while coordinator.queued_requests() <= index {
+            assert!(
+                Instant::now() < deadline,
+                "request {} was not queued within 10 s",
+                index + 1
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    let answers = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let metrics = coordinator.metrics();
+    assert_eq!(
+        (metrics.last_sample().requests, metrics.split_groups_total()),
+        (members.len() as u64, 1),
+        "the requests must have shared a group and been split for this test to mean anything"
+    );
+    (answers, cluster_committed.get())
+}
+
+fn expect_acked(answer: &WireFrame, epoch: u64) {
+    match &answer.message {
+        Message::ProduceResponse(response) => assert_eq!(
+            response.outcomes.len(),
+            1,
+            "the epoch-{epoch} request is acknowledged with its record"
+        ),
+        other => {
+            panic!("the epoch-{epoch} request was refused after its group was split: {other:?}")
+        }
+    }
+}
+
+/// Review of #780: a group split request by request must keep the
+/// admission its first pass gave each member. One producer's epoch-1
+/// request and then its epoch-2 request share a group; the first pass
+/// admits both in queue order, durably advancing the producer's epoch
+/// journal to 2. The log refuses the group whole as too large and each
+/// member is re-run alone. The re-run judged the epoch-1 request against
+/// the journal its own group had just advanced and fenced it: a permanent
+/// refusal for a request that, sent alone ahead of the epoch-2 one, is
+/// accepted.
+#[test]
+fn a_split_group_keeps_its_first_passes_producer_admissions() {
+    let (answers, committed) = split_group(&[(0xB5, 1), (0xB5, 2)]);
+    expect_acked(&answers[0], 1);
+    expect_acked(&answers[1], 2);
+    assert_eq!(committed, 2, "both records are committed, epoch 1 first");
+}
+
+/// A guard for the fix above: keeping a split group's admissions must not
+/// weaken a fence. Producer B5's epoch-2 request, another producer's
+/// request, then B5's epoch-1 request: the first pass fences the epoch-1
+/// request behind epoch 2, the other two are too large together, and after
+/// the split the epoch-1 request is still fenced, exactly as it is sent
+/// alone after the epoch-2 one.
+#[test]
+fn a_split_group_still_fences_an_older_epoch_queued_behind_a_newer() {
+    let (answers, committed) = split_group(&[(0xB5, 2), (0xB6, 1), (0xB5, 1)]);
+    expect_acked(&answers[0], 2);
+    expect_acked(&answers[1], 1);
+    match &answers[2].message {
+        Message::Error(ErrorResponse { code, .. }) => assert_eq!(
+            *code,
+            ErrorCode::Fenced,
+            "the epoch-1 request is fenced: {:?}",
+            answers[2]
+        ),
+        other => panic!("the epoch-1 request must be fenced behind epoch 2: {other:?}"),
+    }
+    assert_eq!(committed, 2, "only the two admitted records are committed");
+}
+
+/// A replica set that loses the lease in the middle of the round: the
+/// followers ack (a quorum), but metadata has moved on before the leader
+/// can publish the commit.
+struct StealingReplicaSet {
+    inner: Arc<InProcessReplicaSet>,
+    meta: MetaFencingEpoch,
+}
+
+impl ReplicaSet for StealingReplicaSet {
+    fn replication_factor(&self) -> usize {
+        self.inner.replication_factor()
+    }
+
+    fn replicate_append_batch(
+        &self,
+        requests: &[ReplicaAppendRequest],
+        leader_committed_offset: u64,
+    ) -> ReplicaQuorumResult {
+        let result = self
+            .inner
+            .replicate_append_batch(requests, leader_committed_offset);
+        self.meta.set(FENCING_EPOCH + 1);
+        result
+    }
+
+    fn propagate_committed_hwm(&self, update: &CommittedHwmUpdate) {
+        self.inner.propagate_committed_hwm(update);
+    }
+}
+
+/// D5 (#752), a guard: a lease lost between a group's fsync and its commit
+/// fences EVERY member, and the group's records are never published as
+/// committed, although a quorum held them.
+#[test]
+fn a_lease_lost_between_fsync_and_commit_fences_every_member() {
+    let (leader, cluster_committed, _dirs) = replicated_leader(sealing_at(3), |inner, meta| {
+        Arc::new(StealingReplicaSet { inner, meta }) as Arc<dyn ReplicaSet>
+    });
+    let range = range_identity();
+    let answers = concurrently(
+        &leader,
+        (0..3u128)
+            .map(|index| produce_frame(range.clone(), Uuid::from_u128(0xB0 + index), 0, 1))
+            .collect(),
+    );
+    assert_eq!(
+        leader
+            .group_commit()
+            .unwrap()
+            .metrics()
+            .last_sample()
+            .requests,
+        3
+    );
+    for answer in &answers {
+        match &answer.message {
+            Message::Error(ErrorResponse { code, .. }) => assert_eq!(*code, ErrorCode::Fenced),
+            other => panic!("a member was acknowledged past a lost lease: {other:?}"),
+        }
+    }
+    assert_eq!(
+        cluster_committed.get(),
+        0,
+        "nothing is published as committed"
+    );
+}
+
+/// Storage whose data barrier can be held: `sync_data` blocks while the
+/// gate is armed, and says when it has started.
+struct HoldingStorage {
+    inner: vtop_log::env::RealStorage,
+    gate: Arc<SyncGate>,
+}
+
+#[derive(Default)]
+struct SyncGate {
+    armed: std::sync::atomic::AtomicBool,
+    entered: Mutex<bool>,
+    entered_cv: std::sync::Condvar,
+    released: Mutex<bool>,
+    released_cv: std::sync::Condvar,
+}
+
+impl SyncGate {
+    fn pass(&self) {
+        if !self.armed.load(Ordering::SeqCst) {
+            return;
+        }
+        *self.entered.lock().unwrap() = true;
+        self.entered_cv.notify_all();
+        let mut released = self.released.lock().unwrap();
+        while !*released {
+            released = self.released_cv.wait(released).unwrap();
+        }
+    }
+
+    fn await_entered(&self) {
+        let mut entered = self.entered.lock().unwrap();
+        while !*entered {
+            let (guard, timeout) = self
+                .entered_cv
+                .wait_timeout(entered, Duration::from_secs(10))
+                .unwrap();
+            entered = guard;
+            assert!(
+                !timeout.timed_out() || *entered,
+                "the group never reached its fsync"
+            );
+        }
+    }
+
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.released_cv.notify_all();
+    }
+}
+
+struct HoldingFile {
+    inner: Box<dyn vtop_log::env::StorageFile>,
+    gate: Arc<SyncGate>,
+}
+
+impl std::io::Read for HoldingFile {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buffer)
+    }
+}
+
+impl std::io::Write for HoldingFile {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buffer)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl std::io::Seek for HoldingFile {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(position)
+    }
+}
+
+impl vtop_log::env::StorageFile for HoldingFile {
+    fn sync_data(&mut self) -> std::io::Result<()> {
+        self.gate.pass();
+        self.inner.sync_data()
+    }
+    fn set_len(&mut self, len: u64) -> std::io::Result<()> {
+        self.inner.set_len(len)
+    }
+    fn len(&self) -> std::io::Result<u64> {
+        self.inner.len()
+    }
+}
+
+impl vtop_log::env::Storage for HoldingStorage {
+    fn open(
+        &self,
+        path: &std::path::Path,
+        mode: vtop_log::env::OpenMode,
+    ) -> std::io::Result<Box<dyn vtop_log::env::StorageFile>> {
+        Ok(Box::new(HoldingFile {
+            inner: self.inner.open(path, mode)?,
+            gate: Arc::clone(&self.gate),
+        }))
+    }
+    fn read(&self, path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+        self.inner.read(path)
+    }
+    fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+        self.inner.rename(from, to)
+    }
+    fn remove_file(&self, path: &std::path::Path) -> std::io::Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn exists(&self, path: &std::path::Path) -> std::io::Result<bool> {
+        self.inner.exists(path)
+    }
+    fn read_dir(
+        &self,
+        path: &std::path::Path,
+    ) -> std::io::Result<Vec<vtop_log::env::DirEntryInfo>> {
+        self.inner.read_dir(path)
+    }
+    fn sync_dir(&self, path: &std::path::Path) -> std::io::Result<()> {
+        self.gate.pass();
+        self.inner.sync_dir(path)
+    }
+}
+
+/// D5 (#752), a guard: no member of a group is answered before the group's
+/// fsync returns. The data barrier is held mid-group; while it is, nothing
+/// may come back, and once it returns every member is acknowledged.
+#[test]
+fn no_member_is_acknowledged_before_the_groups_fsync_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = Arc::new(SyncGate::default());
+    let env = vtop_log::env::Env {
+        storage: Arc::new(HoldingStorage {
+            inner: vtop_log::env::RealStorage,
+            gate: Arc::clone(&gate),
+        }),
+        ..vtop_log::env::Env::real()
+    };
+    let range = range_identity();
+    let segment = ActiveSegment::create_in(
+        &env,
+        dir.path().join("range.active"),
+        SegmentDescriptor {
+            segment_id: Uuid::from_u128(0xD1),
+            topic: range.topic.clone(),
+            topic_epoch: range.topic_epoch,
+            lineage: RangeLineage {
+                range_id: range.range_id,
+                generation: range.range_generation,
+                key_range: KeyRange::full(),
+                parents: Vec::new(),
+            },
+            base_offset: 0,
+        },
+        SegmentConfig::default(),
+    )
+    .unwrap();
+    let epochs = ProducerEpochJournal::open(dir.path().join("epochs")).unwrap();
+    let broker = Arc::new(
+        LocalBroker::new(segment, epochs, range.clone(), FENCING_EPOCH)
+            .unwrap()
+            .with_group_commit(sealing_at(3))
+            .unwrap(),
+    );
+    gate.armed.store(true, Ordering::SeqCst);
+    let (answered_tx, answered) = std::sync::mpsc::channel();
+    let handles: Vec<_> = (0..3u128)
+        .map(|index| {
+            let broker = Arc::clone(&broker);
+            let range = range.clone();
+            let answered_tx = answered_tx.clone();
+            thread::spawn(move || {
+                let mut frame = produce_frame(range, Uuid::from_u128(0xB0 + index), 0, 1);
+                if let Message::ProduceRequest(request) = &mut frame.message {
+                    request.durability = WireDurability::LocalFsync;
+                }
+                answered_tx
+                    .send(broker.handle(Role::Producer, frame))
+                    .unwrap();
+            })
+        })
+        .collect();
+    gate.await_entered();
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        answered.try_recv().is_err(),
+        "a member was answered while its group's fsync was still held"
+    );
+    gate.release();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    let answers: Vec<_> = answered.try_iter().collect();
+    assert_eq!(answers.len(), 3);
+    for answer in answers {
+        expect_ok(answer);
+    }
+    assert_eq!(broker.group_commit().unwrap().metrics().commits_total(), 1);
 }
