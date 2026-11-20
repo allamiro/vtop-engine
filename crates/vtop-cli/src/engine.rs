@@ -43,6 +43,7 @@ use vtop_state::{connect_state_store_with_deadline, BatchPatch, BatchRecord, Sta
 use vtop_upload::multipart::{self, MultipartFence, MultipartUploadConfig};
 use vtop_upload::{ObjectChecksum, UploadBackend};
 
+use crate::failpoints;
 use crate::rebuild::{RecordedWindow, RecordedWindows};
 use crate::spans::{self, BatchTrace, Stage};
 use crate::verification_mode::{self, Recheck};
@@ -1187,6 +1188,7 @@ impl<'a> Pipeline<'a> {
         if multipart_used {
             tracing::info!(batch_id, uri = %object_uri, "object_uploaded via multipart");
         }
+        failpoints::hit(failpoints::AFTER_OBJECT_PUT_BEFORE_LEDGER);
         let obj_patch = BatchPatch {
             object_uri: Some(object_uri.clone()),
             object_sha256: Some(object_checksum.clone().unwrap_or_default()),
@@ -1293,6 +1295,7 @@ impl<'a> Pipeline<'a> {
                 .to_string());
         }
         metrics.manifest_upload_ms = t.elapsed().as_millis() as u64;
+        failpoints::hit(failpoints::AFTER_MANIFEST_PUT_BEFORE_LEDGER);
         let man_patch = BatchPatch {
             manifest_uri: Some(manifest_uri.clone()),
             manifest_sha256: Some(manifest.fields().manifest.sha256.clone()),
@@ -1714,6 +1717,7 @@ impl<'a> Pipeline<'a> {
         // Only now is it legal to advance source progress.
         trace.begin(Stage::Commit);
         let t = Instant::now();
+        failpoints::hit(failpoints::BEFORE_SOURCE_COMMIT);
         if let Err(e) = adapter.commit_progress(&progress_end).await {
             // Verified but commit failed: leave as VERIFIED so recovery retries
             // the commit. NEVER lose the verified object.
@@ -1730,6 +1734,7 @@ impl<'a> Pipeline<'a> {
             });
         }
         metrics.commit_ms = t.elapsed().as_millis() as u64;
+        failpoints::hit(failpoints::AFTER_SOURCE_COMMIT_BEFORE_LEDGER);
         let t_write = Instant::now();
         self.store.mark_source_committed(&batch_id).await?;
         metrics.state_write_ms += t_write.elapsed().as_millis() as u64;
@@ -2391,11 +2396,16 @@ pub(crate) async fn connect_configured_store(
     engine: &vtop_core::config::EngineConfig,
     state_store: &vtop_core::config::ResolvedStateStore,
 ) -> Result<Box<dyn StateStore>, VtopError> {
-    connect_state_store_with_deadline(
+    let store = connect_state_store_with_deadline(
         state_store.expose_secret(),
         Duration::from_secs(engine.state_store_timeout_seconds),
     )
-    .await
+    .await?;
+    // A test build puts the ledger failpoints around every transition
+    // (#725); a release build has no such code.
+    #[cfg(feature = "failpoints")]
+    let store: Box<dyn StateStore> = Box::new(crate::failpoints::wrap::Ledger(store));
+    Ok(store)
 }
 
 impl Engine {
@@ -2408,6 +2418,9 @@ impl Engine {
         config: VtopConfig,
         streams: StreamsConfig,
     ) -> Result<Self, VtopError> {
+        // Before anything is opened: an unknown point refuses to start. A
+        // no-op that reads nothing in a build without the feature (#725).
+        crate::failpoints::arm_from_env()?;
         config.validate()?;
         streams.validate(&config)?;
         let state_store = config.engine.state_store.resolve()?;
@@ -2487,6 +2500,9 @@ impl Engine {
         let manifest_keyring = Arc::new(config.resolve_manifest_keyring()?);
         let store = connect_configured_store(&config.engine, &state_store).await?;
         let backend = vtop_upload::build_backend(&config.upload).await?;
+        // `mid_object_put` sits inside the multipart upload (#725).
+        #[cfg(feature = "failpoints")]
+        let backend: Arc<dyn UploadBackend> = Arc::new(crate::failpoints::wrap::Backend(backend));
 
         let mut adapters: HashMap<SourceType, Box<dyn SourceAdapter>> = HashMap::new();
         if let Some(k) = &config.sources.kafka {
@@ -2918,10 +2934,12 @@ impl Engine {
                 return false;
             }
         }
+        failpoints::hit(failpoints::BEFORE_SOURCE_COMMIT);
         if let Err(e) = adapter.commit_progress(&rec.progress_end).await {
             tracing::warn!(batch_id = %rec.batch_id, error = %e, "source commit still failing; retried after the next pass");
             return false;
         }
+        failpoints::hit(failpoints::AFTER_SOURCE_COMMIT_BEFORE_LEDGER);
         match self.store.mark_source_committed(&rec.batch_id).await {
             Ok(()) => {
                 if let Some(mx) = telemetry::metrics() {
@@ -4656,8 +4674,10 @@ impl Engine {
         summary: &mut RecoverySummary,
     ) -> Result<(), VtopError> {
         if let Some(adapter) = self.adapters.get_mut(&rec.source_type) {
+            failpoints::hit(failpoints::BEFORE_SOURCE_COMMIT);
             match adapter.commit_progress(&rec.progress_end).await {
                 Ok(()) => {
+                    failpoints::hit(failpoints::AFTER_SOURCE_COMMIT_BEFORE_LEDGER);
                     self.store.mark_source_committed(&rec.batch_id).await?;
                     // A restart-recovery commit is still a commit:
                     // without it, commits_total under-counts on
