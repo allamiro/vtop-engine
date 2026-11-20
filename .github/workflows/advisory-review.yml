@@ -1,0 +1,44 @@
+# Every advisory that .cargo/audit.toml and deny.toml ignore carries the date it
+# was last reviewed, and docs/SECURITY_MODEL.md section 13 repeats it. An ignore
+# nobody re-checks becomes permanent, so this fails once a date is more than 90
+# days old and warns from day 75 (scripts/check-advisory-review.py).
+#
+#   pull_request       every pull request, unfiltered: an overdue review fails
+#                      every PR until someone does it. The job takes seconds.
+#   push               main, so its last run says the state of main.
+#   schedule           weekly, so an expiry turns a run red even in a week
+#                      with no pull request, and a review coming due shows as
+#                      a warning on that run first.
+#   workflow_dispatch  by hand.
+name: Advisory review
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: advisory-review-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: advisory review dates
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The runner's own python3 is enough: the check and its tests use only
+      # the standard library.
+      - name: Unit tests for the check
+        run: python3 -I -m unittest discover -s scripts/tests -p 'test_check_advisory_review.py' -v
+
+      - name: Every ignored advisory was reviewed in the last 90 days
+        run: python3 -I scripts/check-advisory-review.py

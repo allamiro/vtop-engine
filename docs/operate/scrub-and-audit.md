@@ -95,6 +95,10 @@ and printed as a `retention:` line:
 | `missing` | No retention: written without it, or removed by a principal allowed to bypass governance. It can be deleted or overwritten. | Yes |
 | `mode_mismatch` | Under another mode than the configured one. | Yes |
 
+`elapsed` and `missing` objects are not reused by the engine: a replay that
+resolves to one writes a fresh locked object under its attempt key instead,
+and leaves the old one as it is (#709).
+
 A retention that cannot be read makes the batch `unreadable`. The scrub needs
 `s3:GetObjectRetention`; see [S3 Object Lock](../OBJECT_LOCK_DEPLOYMENT.md).
 

@@ -10,7 +10,7 @@ docker pull ghcr.io/allamiro/vtop-engine:latest   # the newest release, currentl
 | Property | Value |
 |---|---|
 | Image | `ghcr.io/allamiro/vtop-engine` |
-| Tags | The release version without the `v`, for example `0.10.0`. `latest` follows the newest release whose version has no pre-release suffix such as `-rc.1`. |
+| Tags | The release version without the `v`: tag `vX.Y.Z` is image `X.Y.Z`. `latest` follows the newest release whose version has no pre-release suffix such as `-rc.1`. |
 | Platforms | `linux/amd64`, `linux/arm64` |
 | Binaries | `/usr/local/bin/vtopctl`, `/usr/local/bin/vtop-node` |
 | Base | `debian:bookworm-slim`, pinned by digest |

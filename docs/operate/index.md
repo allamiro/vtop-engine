@@ -28,7 +28,7 @@ archive is complete, then the procedures you will need less often.
 
     ---
 
-    Log format and levels, where audit evidence lives, and what is planned.
+    Log format and levels, the audit trail, and where the other evidence lives.
 
     [:octicons-arrow-right-24: Logs and auditing](logs-and-auditing.md)
 

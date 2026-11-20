@@ -6,8 +6,11 @@
 # CI (ci.yml) only runs on pushes/PRs to `main`, NOT on tags, so this workflow
 # re-runs fmt/clippy/test itself as a gate before publishing anything.
 #
-# Scope note: 0.x tags publish as GitHub **pre-releases**. VTOP is a prototype;
-# see docs/PRODUCTION_HA.md §19 (Known limitations) before depending on it.
+# Scope note: a plain vX.Y.Z tag, 0.x included, publishes as a full GitHub
+# release; only a version with a pre-release suffix (-rc.1) publishes as a
+# pre-release (the "Derive version + release channel" step says why). VTOP is
+# a prototype; see docs/PRODUCTION_HA.md §19 (Known limitations) before
+# depending on it.
 name: Release
 
 # Least privilege by default; the docker and release jobs elevate exactly what
@@ -835,7 +838,7 @@ jobs:
           body: |
             ## VTOP Engine v${{ needs.verify.outputs.version }}
 
-            > **Maturity:** VTOP is a **prototype / reference implementation**. The 0.x series signals that the API may still change, not that a tag is a preview — each release is signed, attested, and intended for use. Read [Known limitations](https://github.com/${{ github.repository }}/blob/main/docs/PRODUCTION_HA.md#19-known-limitations-current-code) (§19) before depending on this in production.
+            > **Maturity:** VTOP is a **prototype / reference implementation**. Each release is signed, attested and published as a full release, not a GitHub pre-release; the 0.x series means a minor version may still break compatibility, and the release notes say where. Read [Known limitations](https://github.com/${{ github.repository }}/blob/main/docs/PRODUCTION_HA.md#19-known-limitations-current-code) (§19) before depending on this in production.
 
             ${{ steps.changelog.outputs.notes }}
 
