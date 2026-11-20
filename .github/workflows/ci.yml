@@ -323,6 +323,10 @@ jobs:
               # will paste and rely on, so it is linted like the rest — listed here
               # AND in the shellcheck step, for the reason the comment above gives.
               - 'scripts/test-progress.sh'
+              # The Kafka broker helper the kafka matrix (#721) starts every
+              # broker with. Its own workflow runs on a change to it; this
+              # entry is the lint.
+              - 'scripts/kafka-broker.sh'
               # The release-notes generator only ever runs during a tag build,
               # where a failure means a published release with a broken body and
               # no second chance to get it right before people see it. Lint it
@@ -523,7 +527,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Prebuilt cargo-audit binary (fast; no compile).
       - name: Install cargo-audit
-        uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
           tool: cargo-audit
       # Reads .cargo/audit.toml: fails on any advisory NOT documented there,
@@ -546,7 +550,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.3
 
@@ -625,7 +629,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.3
 
@@ -1237,7 +1241,8 @@ jobs:
             scripts/upgrade-compat.sh \
             scripts/manifest-compat.sh scripts/ledger-compat.sh \
             scripts/traffic-snapshot.sh scripts/test-progress.sh \
-            scripts/check-naming.sh scripts/check-egress-claims.sh
+            scripts/check-naming.sh scripts/check-egress-claims.sh \
+            scripts/kafka-broker.sh
 
       # `-P scripts/live-chaos/scenarios` resolves the scenarios' dynamic
       # `source "$(dirname …)/../lib.sh"`. Without it every scenario reports
@@ -1369,6 +1374,18 @@ jobs:
           VTOP_TEST_KAFKA: localhost:9092
         run: cargo test -p vtop-cli --test integration_kafka_to_minio -- --ignored
 
+  # The same live-broker tests on the oldest Kafka release the docs declare
+  # supported (#721, docs/install/kafka.md). The job above stays the newest
+  # line's check; kafka-matrix.yml runs every pinned release nightly. Its
+  # check is named `kafka matrix / kafka integration (3.7.2)`.
+  kafka-matrix:
+    name: kafka matrix
+    needs: changes
+    if: needs.changes.outputs.kafka == 'true'
+    uses: ./.github/workflows/kafka-matrix.yml
+    with:
+      brokers: '["3.7.2"]'
+
   # The live S3 tests against a real store (#668). They are `#[ignore]` and
   # need `VTOP_TEST_S3_ENDPOINT`, so until this job they ran only by hand:
   # the multipart resume test (#668) proved the store keeps the parts that
@@ -1474,7 +1491,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
           tool: cargo-deny
       - run: cargo deny check
@@ -1726,12 +1743,25 @@ jobs:
           key: ${{ runner.os }}-manifest-compat-${{ hashFiles('**/Cargo.lock') }}
       # v0.7.0, the last release before the 0.4 reader, and the newest patch
       # of every minor series from v0.8.0, DERIVED from the tags so a new
-      # release joins the day its tag exists. Finals only, as upgrade-compat.
+      # release joins the day its assets are published. Finals only, as
+      # upgrade-compat. Only tags with a published GitHub release count: a
+      # release tag is pushed right after its bump merges, and main's CI on
+      # that merge starts while release.yml is still building the assets
+      # (about 35 minutes), so the newest patch falls back to the previous
+      # one of its series until it is published (v0.10.1 failed main with
+      # "release not found" this way).
       - name: Select the released readers
         id: tags
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          published="$(gh release list --limit 200 --exclude-drafts --json tagName --jq '.[].tagName')"
+          for t in $(git tag --list 'v[0-9]*'); do
+            grep -qx "$t" <<< "$published" || echo "::notice::$t has no published release yet; its series uses the previous patch"
+          done
           tags="$(git tag --list 'v[0-9]*' --sort=version:refname \
+            | grep -Fx -f <(printf '%s\n' "$published") \
             | awk -F. '/^v[0-9]+\.[0-9]+\.[0-9]+$/ { latest[$1 "." $2] = $0 } END { for (m in latest) print latest[m] }' \
             | sort -V \
             | awk -F. '{ maj = substr($1, 2) + 0; min = $2 + 0; if (maj > 0 || min >= 7) print }' \
@@ -1883,7 +1913,7 @@ jobs:
         with:
           toolchain: stable
           components: llvm-tools-preview
-      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
           tool: cargo-llvm-cov
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -2032,7 +2062,7 @@ jobs:
           # triple explicitly - otherwise a musl default fails with
           # "sanitizer is incompatible with statically linked libc".
           targets: x86_64-unknown-linux-gnu
-      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
           tool: cargo-fuzz
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -2127,7 +2157,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
-      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
           tool: cargo-mutants
       - name: Install librdkafka build dependencies
@@ -2179,7 +2209,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
-      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
           tool: cargo-mutants
       - name: Install librdkafka build dependencies
@@ -2417,8 +2447,16 @@ jobs:
     # fixed `vtop_test_*` databases and roles, and the workflow's concurrency
     # group is per ref. One at a time across the repository; a run waits
     # rather than cancel another's half-done restore.
+    #
+    # GitHub keeps one PENDING job per concurrency group and cancels the older
+    # pending one when a third arrives, whatever cancel-in-progress says, so a
+    # shared group cancels (and reddens) other PRs' runs while two or more
+    # wait. When no managed database is configured the job does nothing, so
+    # it then gets a group of its own per run and never queues. The client
+    # image variable is required whenever the smoke is enabled (the gate step
+    # refuses without it), and unlike a secret, `vars` may name a group.
     concurrency:
-      group: postgres-managed-smoke
+      group: ${{ vars.VTOP_MANAGED_POSTGRES_CLIENT_IMAGE != '' && 'postgres-managed-smoke' || format('postgres-managed-smoke-off-{0}-{1}', github.run_id, github.run_attempt) }}
       cancel-in-progress: false
     env:
       VTOP_TEST_POSTGRES: ${{ secrets.VTOP_MANAGED_POSTGRES_URL }}

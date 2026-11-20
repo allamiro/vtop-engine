@@ -164,6 +164,7 @@ nav:
       - Container image: install/container.md
       - Helm chart: install/helm.md
       - Build from source: install/from-source.md
+      - Kafka brokers: install/kafka.md
       - Verify a release: RELEASE_VERIFICATION.md
   - Deploy:
       - deploy/index.md
