@@ -33,7 +33,7 @@ use crate::api_groups::{
 };
 use crate::bridge::{Bridge, Fetched, Sequenced};
 use crate::groups::{Coordinator, GroupConfig, JoinRequest, Joined, SyncStanding};
-use crate::lease::{LeaseState, LeaseView};
+use crate::lease::{HolderView, LeaseState, LeaseView, RangeHolder};
 use crate::messages::{
     frame, unserved_api_name, write_response_header, ApiKey, ErrorCode, HeaderVerdict,
     RequestHeader, SERVED_APIS, UNSERVED_API_NAMES,
@@ -73,6 +73,13 @@ pub struct GatewayConfig {
     /// today: one partition, this gateway's, and Metadata says so — the
     /// behaviour is unchanged for anyone who never sets this.
     pub partitions: Vec<PartitionLeader>,
+    /// Every member of the cluster that may serve this range, this node
+    /// included (#751): what Metadata lists so a client told about a dead
+    /// broker has somewhere to go. EMPTY means the brokers the topology
+    /// names, which is every deployment before candidates served Kafka. The
+    /// list is the same on every member; the node validates that before this
+    /// gateway is built.
+    pub brokers: Vec<KafkaBroker>,
     /// A request frame above this is a closed connection, not an allocation.
     pub max_frame_bytes: usize,
     /// The longest a fetch waits for data, whatever the client asked: the
@@ -126,6 +133,7 @@ impl Default for GatewayConfig {
             node_id: 1,
             partition: 0,
             partitions: Vec::new(),
+            brokers: Vec::new(),
             cluster_id: Some("vtop".to_owned()),
             max_frame_bytes: 32 * 1024 * 1024,
             max_fetch_wait: Duration::from_secs(5),
@@ -220,6 +228,73 @@ impl Jobs {
     }
 }
 
+/// What a quiesce found (#751).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Quiesced {
+    /// Calls handed to another task and still running when the wait began.
+    pub in_flight: usize,
+    /// How long the wait took.
+    pub waited: Duration,
+    /// Whether the wait passed the ceiling before the last call ended. The
+    /// wait does not stop there: a call that has not ended still holds the
+    /// bridge, and the directory behind it must have one owner.
+    pub passed_ceiling: bool,
+}
+
+/// The gateway's in-flight work, for the node that owns the gateway's
+/// leadership (#751). `serve` consumes the gateway, so this is how a node
+/// that demotes while the gateway keeps listening waits for the bridge calls
+/// the gateway handed out.
+#[derive(Clone)]
+pub struct GatewayHandle {
+    jobs: Arc<Jobs>,
+    ceiling: Duration,
+}
+
+impl GatewayHandle {
+    /// Calls handed to another task that have not ended: a bridge call on
+    /// the blocking pool, a store write driven past its request.
+    pub fn in_flight(&self) -> usize {
+        self.jobs.active()
+    }
+
+    /// The longest the gateway's own ceilings let one such call run: the
+    /// produce, fetch and offset waits and the drain, the sum `serve` waits
+    /// for at shutdown.
+    pub fn ceiling(&self) -> Duration {
+        self.ceiling
+    }
+
+    /// Wait until no call is in flight.
+    ///
+    /// The caller empties the [`crate::slot::BridgeSlot`] FIRST: every call
+    /// that starts after that is refused without touching a bridge, and a
+    /// call counted here began before it, so when this returns no call holds
+    /// the retired bridge and the caller may drop it. This does NOT give up at
+    /// the ceiling. A call that outlives its ceiling is a bug the node reports
+    /// (`on_ceiling` runs once, with the count still in flight, when the wait
+    /// passes it), and the wait goes on, because dropping the broker under a
+    /// running call is the one outcome this exists to prevent.
+    pub async fn quiesce(&self, on_ceiling: impl FnOnce(usize)) -> Quiesced {
+        let started = std::time::Instant::now();
+        let in_flight = self.jobs.active();
+        let mut passed_ceiling = false;
+        if tokio::time::timeout(self.ceiling, self.jobs.idle())
+            .await
+            .is_err()
+        {
+            passed_ceiling = true;
+            on_ceiling(self.jobs.active());
+            self.jobs.idle().await;
+        }
+        Quiesced {
+            in_flight,
+            waited: started.elapsed(),
+            passed_ceiling,
+        }
+    }
+}
+
 struct JobDone(Arc<Jobs>);
 
 impl Drop for JobDone {
@@ -245,6 +320,27 @@ async fn until<T>(
         Ok(Err(_)) | Err(_) => Err(ErrorCode::RequestTimedOut),
     }
 }
+
+/// A broker Metadata lists (#751): a member of the cluster a client may be
+/// sent to, with the address clients reach it at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KafkaBroker {
+    pub node_id: i32,
+    pub host: String,
+    pub port: i32,
+}
+
+/// A fencing epoch as Kafka carries a leader epoch: an `i32`. An epoch past
+/// `i32::MAX` is not one this engine reaches (one per promotion), and is
+/// saturated rather than wrapped to a smaller number a client would read as
+/// older than the one it holds.
+fn leader_epoch(epoch: u64) -> i32 {
+    i32::try_from(epoch).unwrap_or(i32::MAX)
+}
+
+/// A leader epoch carried by a request for which the node has no answer: the
+/// client sent none.
+const NO_LEADER_EPOCH: i32 = -1;
 
 /// A partition of the served topic and the broker that leads it (#457 slice
 /// 3): what Metadata tells a client so it sends each partition's traffic to
@@ -313,6 +409,11 @@ pub struct Gateway {
     /// can take the range away — an embedder with no lease at all — and the
     /// gateway speaks for it unconditionally, as it did before this existed.
     lease: Option<Arc<dyn LeaseView>>,
+    /// Who holds the range while this node does not (#751). `None` keeps the
+    /// answer every gateway gave before: a node that does not hold the range
+    /// names no leader. With it, Metadata names the holder, so a client that
+    /// asked this node is redirected by the answer itself.
+    holders: Option<Arc<dyn HolderView>>,
     /// Each group's commits in turn (review): a commit is judged under its
     /// generation and then written, and a slow write must not let a later
     /// commit — a newer generation's, after the member lapsed — be judged,
@@ -361,6 +462,30 @@ impl Gateway {
     pub fn with_lease(mut self, lease: Arc<dyn LeaseView>) -> Self {
         self.lease = Some(lease);
         self
+    }
+
+    /// Who holds the range while this node does not (#751). Metadata then
+    /// names the holder as the partition's leader, at the epoch it holds the
+    /// range at, so a client that asked a candidate that follows is told where
+    /// to go instead of being refused with nowhere to go. A holder this node
+    /// has no Kafka endpoint for is not named: the client is told the leader
+    /// is not available, and asks again.
+    pub fn with_holder(mut self, holders: Arc<dyn HolderView>) -> Self {
+        self.holders = Some(holders);
+        self
+    }
+
+    /// A handle that outlives `serve` taking the gateway: what a node uses to
+    /// wait for the work still in flight before it hands the range back
+    /// (#751).
+    pub fn handle(&self) -> GatewayHandle {
+        GatewayHandle {
+            jobs: Arc::clone(&self.jobs),
+            ceiling: self.config.max_produce_wait
+                + self.config.max_fetch_wait
+                + self.config.max_offset_wait
+                + self.config.drain_timeout,
+        }
     }
 
     /// The refusal totals (#596), for the node's metrics collector: shared,
@@ -506,6 +631,69 @@ impl Gateway {
         )
     }
 
+    /// Why this node cannot serve its own partition under the leader epoch a
+    /// client names (#751), or `None` when it can.
+    ///
+    /// The lease is read here and not left to the bridge. A node whose lease
+    /// is gone is deposed: its bridge may still answer a read, and a read from
+    /// a deposed leader can miss records the new leader has acknowledged. A
+    /// client that names an epoch is held to it as Kafka holds it: older than
+    /// this node's is `FENCED_LEADER_EPOCH` (the client is behind a failover),
+    /// newer is `UNKNOWN_LEADER_EPOCH` (this node is the one behind). Both are
+    /// answered by a metadata refresh, and neither touches the bridge. A busy
+    /// view is no evidence of either, and a node with no lease view has no
+    /// epoch to hold a client to.
+    fn not_serving(&self, requested_epoch: i32) -> Option<ErrorCode> {
+        match self.lease.as_ref()?.lease() {
+            LeaseState::Gone => Some(ErrorCode::NotLeaderOrFollower),
+            LeaseState::Held(epoch) => {
+                let held = leader_epoch(epoch);
+                if requested_epoch < 0 || requested_epoch == held {
+                    None
+                } else if requested_epoch < held {
+                    Some(ErrorCode::FencedLeaderEpoch)
+                } else {
+                    Some(ErrorCode::UnknownLeaderEpoch)
+                }
+            }
+            LeaseState::Unknown => None,
+        }
+    }
+
+    /// A request for this node's own partition answered
+    /// `NOT_LEADER_OR_FOLLOWER`: counted, and said under a rate limit (#751).
+    /// A client retries this on its own, so the line is for an operator who
+    /// sees it persist: it names the holder this node last read and the one
+    /// command that checks the lease.
+    fn not_leader(&self, refusal: Refusal, topic: &str) {
+        let total = self.refusals.count(refusal);
+        if !total.is_power_of_two() {
+            return;
+        }
+        let holder = self
+            .holders
+            .as_ref()
+            .and_then(|holders| holders.holder())
+            .map_or_else(
+                || "unknown".to_owned(),
+                |h| format!("broker {}", h.broker_id),
+            );
+        let api = refusal.api();
+        tracing::warn!(
+            api,
+            topic,
+            refused = total,
+            // Between the previous line and this one, `total / 2 - 1` were
+            // counted and not said.
+            suppressed = (total / 2).saturating_sub(1),
+            %holder,
+            "kafka {api} refused topic={topic}: this node does not hold the range (lease holder: \
+             {holder}). Answered NOT_LEADER_OR_FOLLOWER; the client refreshes metadata and goes to \
+             the holder. Nothing is needed unless it persists; if it does, check the lease with \
+             `vtopctl meta`."
+        );
+    }
+
     /// The refusal a fenced gateway gives the group protocol: retriable, and
     /// the client's next FindCoordinator (here or at another broker) is what
     /// finds the holder.
@@ -551,6 +739,7 @@ impl Gateway {
             groups: Arc::new(Coordinator::new(group_config)),
             offsets: None,
             lease: None,
+            holders: None,
             commit_order: Arc::new(std::sync::Mutex::new(HashMap::new())),
             jobs: Arc::new(Jobs::default()),
             refusals: Arc::new(Refusals::default()),
@@ -1074,10 +1263,35 @@ impl Gateway {
         // refreshing its metadata elsewhere. A multi-partition topology still
         // names the healthy peers, so a client bootstrapped only here can
         // find them.
-        let leads = self.speaks_for_the_range();
+        // One reading of the lease and of the holder for the whole answer
+        // (#751): a Metadata that read them per topic could name this node as
+        // the leader of one topic and a peer as the leader of the next.
+        let state = self.lease.as_ref().map(|lease| lease.lease());
+        let leads = !matches!(state, Some(LeaseState::Gone));
+        let own_epoch = match state {
+            Some(LeaseState::Held(epoch)) => leader_epoch(epoch),
+            _ => NO_LEADER_EPOCH,
+        };
+        let brokers = self.listed_brokers();
+        let holder = self.reachable_holder(&brokers);
         let mut topics = Vec::with_capacity(names.len());
         for name in names {
-            topics.push(match self.bounds(&name, ceiling).await {
+            let bounds = self.bounds(&name, ceiling).await;
+            // A node that can name the holder answers for a topic it cannot
+            // read itself (#751): its bridge is empty, or its lease is gone,
+            // and the client is told where the range is rather than that
+            // this node is not it. `NOT_LEADER_OR_FOLLOWER` from the bridge is
+            // the topic existing and not being led here, which is exactly
+            // what this branch is for; any other refusal is the topic's own.
+            let held_here = leads && bounds.is_ok();
+            if self.holders.is_some()
+                && !held_here
+                && matches!(bounds, Ok(_) | Err(ErrorCode::NotLeaderOrFollower))
+            {
+                topics.push(self.topic_behind_the_holder(name, state, holder));
+                continue;
+            }
+            topics.push(match bounds {
                 Ok(_) if !leads => {
                     let map = self.partition_map();
                     if map.len() <= 1 {
@@ -1099,6 +1313,7 @@ impl Gateway {
                                     } else {
                                         partition.node_id
                                     },
+                                    leader_epoch: NO_LEADER_EPOCH,
                                     error: if partition.index == self.config.partition {
                                         ErrorCode::NotLeaderOrFollower
                                     } else {
@@ -1118,6 +1333,14 @@ impl Gateway {
                         .map(|partition| crate::api::MetadataPartition {
                             index: partition.index,
                             leader: partition.node_id,
+                            // This node's own partition carries the epoch it
+                            // holds the range at; another broker's partition
+                            // carries none, because this node cannot know it.
+                            leader_epoch: if partition.index == self.config.partition {
+                                own_epoch
+                            } else {
+                                NO_LEADER_EPOCH
+                            },
                             error: ErrorCode::None,
                         })
                         .collect(),
@@ -1142,32 +1365,100 @@ impl Gateway {
             });
         }
         Ok(MetadataResponse {
-            // Every broker the topology names (#457 slice 3), so a client can
-            // reach the partition it wants. Itself alone where no topology
-            // was given.
-            // Deduplicated in linear time (review): a topology may name
-            // 4 096 partitions and this is an unauthenticated path, so
-            // scanning the growing list once per partition would be eight
-            // million comparisons a request. The node refuses a topology
-            // that reuses a broker id, so in a validated deployment nothing
-            // is ever dropped here; a library caller that builds its own
-            // config still gets the first entry for an id, as before.
-            brokers: {
-                let mut seen = std::collections::HashSet::new();
-                self.partition_map()
-                    .into_iter()
-                    .filter(|partition| seen.insert(partition.node_id))
-                    .map(|partition| MetadataBroker {
-                        node_id: partition.node_id,
-                        host: partition.host,
-                        port: partition.port,
-                    })
-                    .collect()
-            },
+            // Every broker this node lists (#751, #457 slice 3), so a client
+            // can reach the partition it wants and the node that holds it
+            // after a failover.
+            brokers,
             cluster_id: self.config.cluster_id.clone(),
             controller_id: self.config.node_id,
             topics,
         })
+    }
+
+    /// Every broker Metadata lists (#751): the members the node configured,
+    /// then any broker the topology names that they did not. Deduplicated in
+    /// linear time (review): a topology may name 4 096 partitions and this is
+    /// an unauthenticated path, so scanning the growing list once per
+    /// partition would be eight million comparisons a request. The node
+    /// refuses a list that reuses a broker id, so in a validated deployment
+    /// nothing is ever dropped here; a library caller that builds its own
+    /// config still gets the first entry for an id.
+    fn listed_brokers(&self) -> Vec<MetadataBroker> {
+        let mut seen = std::collections::HashSet::new();
+        self.config
+            .brokers
+            .iter()
+            .map(|broker| (broker.node_id, broker.host.clone(), broker.port))
+            .chain(
+                self.partition_map()
+                    .into_iter()
+                    .map(|partition| (partition.node_id, partition.host, partition.port)),
+            )
+            .filter(|(node_id, _, _)| seen.insert(*node_id))
+            .map(|(node_id, host, port)| MetadataBroker {
+                node_id,
+                host,
+                port,
+            })
+            .collect()
+    }
+
+    /// The holder, when naming it would help: another node than this one, and
+    /// one a client can be told the address of.
+    fn reachable_holder(&self, brokers: &[MetadataBroker]) -> Option<RangeHolder> {
+        self.holders
+            .as_ref()?
+            .holder()
+            .filter(|holder| holder.broker_id != self.config.node_id)
+            .filter(|holder| brokers.iter().any(|b| b.node_id == holder.broker_id))
+    }
+
+    /// A topic this node cannot lead right now, answered from the holder
+    /// (#751). Its own partition is led by the holder at the holder's epoch,
+    /// or has no leader this node can name (`LEADER_NOT_AVAILABLE`, which a
+    /// client answers by asking again). A node that holds the lease while its
+    /// bridge is not installed yet (a promotion's last step) names itself to
+    /// nobody: the client asks again a moment later and finds it installed.
+    fn topic_behind_the_holder(
+        &self,
+        name: String,
+        state: Option<LeaseState>,
+        holder: Option<RangeHolder>,
+    ) -> MetadataTopic {
+        let own = self.config.partition;
+        let none = crate::api::MetadataPartition {
+            index: own,
+            leader: -1,
+            leader_epoch: NO_LEADER_EPOCH,
+            error: ErrorCode::LeaderNotAvailable,
+        };
+        let own_entry = match (state, holder) {
+            (Some(LeaseState::Held(_)), _) | (_, None) => none,
+            (_, Some(holder)) => crate::api::MetadataPartition {
+                index: own,
+                leader: holder.broker_id,
+                leader_epoch: leader_epoch(holder.epoch),
+                error: ErrorCode::None,
+            },
+        };
+        let mut partitions: Vec<crate::api::MetadataPartition> = self
+            .partition_map()
+            .into_iter()
+            .filter(|partition| partition.index != own)
+            .map(|partition| crate::api::MetadataPartition {
+                index: partition.index,
+                leader: partition.node_id,
+                leader_epoch: NO_LEADER_EPOCH,
+                error: ErrorCode::None,
+            })
+            .collect();
+        partitions.push(own_entry);
+        partitions.sort_by_key(|partition| partition.index);
+        MetadataTopic {
+            error: ErrorCode::None,
+            name,
+            partitions,
+        }
     }
 
     /// `Err` closes the connection: the one produce shape with no answer.
@@ -2074,13 +2365,20 @@ impl Gateway {
                         error_message: None,
                     },
                     Err((error, reason)) => {
-                        tracing::warn!(
-                            topic = %topic.name,
-                            partition = partition.index,
-                            code = error.as_i16(),
-                            %reason,
-                            "kafka produce refused"
-                        );
+                        if error == ErrorCode::NotLeaderOrFollower && self.leads(partition.index) {
+                            // Its own counted, rate-limited line (#751): a
+                            // client hammering a follower must not write one
+                            // line per request.
+                            self.not_leader(Refusal::ProduceNotLeader, &topic.name);
+                        } else {
+                            tracing::warn!(
+                                topic = %topic.name,
+                                partition = partition.index,
+                                code = error.as_i16(),
+                                %reason,
+                                "kafka produce refused"
+                            );
+                        }
                         ProducePartitionResponse {
                             index: partition.index,
                             error,
@@ -2115,6 +2413,15 @@ impl Gateway {
                     "partition {partition}: this gateway leads partition {}",
                     self.config.partition
                 ),
+            ));
+        }
+        // A deposed leader is refused before the bridge is asked (#751): the
+        // broker behind it would refuse the append on its own epoch, and this
+        // refusal is the same answer without the work.
+        if let Some(error) = self.not_serving(NO_LEADER_EPOCH) {
+            return Err((
+                error,
+                "this node does not hold the range's lease".to_owned(),
             ));
         }
         let Some(records) = records else {
@@ -2278,6 +2585,8 @@ impl Gateway {
                         Err(self
                             .not_ours_for(&topic.name, partition.index, &mut served, ceiling)
                             .await)
+                    } else if let Some(error) = self.not_serving(partition.current_leader_epoch) {
+                        Err(error)
                     } else if remaining == 0 {
                         // No budget left: the watermarks without records —
                         // but an offset outside the log is still refused
@@ -2343,6 +2652,11 @@ impl Gateway {
                             }
                         }
                         Err(error) => {
+                            if error == ErrorCode::NotLeaderOrFollower
+                                && self.leads(partition.index)
+                            {
+                                self.not_leader(Refusal::FetchNotLeader, &topic.name);
+                            }
                             any_error = true; // an error is an answer; do not wait on it
                             FetchPartitionResponse {
                                 index: partition.index,
@@ -2391,6 +2705,8 @@ impl Gateway {
                             .await,
                         -1,
                     )
+                } else if let Some(error) = self.not_serving(partition.current_leader_epoch) {
+                    (error, -1)
                 } else if partition.timestamp == TIMESTAMP_LATEST
                     || partition.timestamp == TIMESTAMP_EARLIEST
                 {
@@ -2418,6 +2734,9 @@ impl Gateway {
                     );
                     (ErrorCode::UnsupportedVersion, -1)
                 };
+                if error == ErrorCode::NotLeaderOrFollower && self.leads(partition.index) {
+                    self.not_leader(Refusal::ListOffsetsNotLeader, &topic.name);
+                }
                 partitions.push(ListOffsetsPartitionResponse {
                     index: partition.index,
                     error,
