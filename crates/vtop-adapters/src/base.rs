@@ -84,6 +84,15 @@ pub struct AdapterReadReport {
     pub retention_lost: Vec<SourceRetentionLoss>,
 }
 
+/// A range handed back to its source that the engine wants rebuilt exactly
+/// as it was first cut (#626): from `start` to `end`, the markers of the
+/// window's ledger row.
+#[derive(Debug, Clone)]
+pub struct ReplayRange {
+    pub start: ProgressMarker,
+    pub end: ProgressMarker,
+}
+
 /// A telemetry source adapter.
 #[async_trait]
 pub trait SourceAdapter: Send + Sync {
@@ -226,6 +235,20 @@ pub trait SourceAdapter: Send + Sync {
             results.push(self.replay_from_marker(marker).await);
         }
         results
+    }
+
+    /// Bound the re-read of ranges already handed back
+    /// ([`Self::replay_from_markers`]) to their recorded ends (#626), one
+    /// answer per range in the same order: `true` when this adapter will stop
+    /// a read at the range's end, so the window it rebuilds ends where the
+    /// failed attempt's did and the bytes after it come as the next read.
+    ///
+    /// The default bounds nothing: the re-read runs to the read budget or the
+    /// end of the source, as before, and the engine treats the range so. An
+    /// adapter that cannot stop exactly at a recorded end must answer `false`
+    /// rather than stop near it.
+    fn bound_replays(&mut self, ranges: &[ReplayRange]) -> Vec<bool> {
+        vec![false; ranges.len()]
     }
 
     fn source_type(&self) -> SourceType;

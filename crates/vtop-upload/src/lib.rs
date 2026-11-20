@@ -19,9 +19,10 @@ pub mod s3cmd_backend;
 pub use vtop_core::effective_config::{verification_method, VerificationMethod};
 
 pub use base::{
-    format_unix_secs, judge_retention, CreatedUpload, LockPart, ObjectChecksum, ObjectHead,
-    ObjectLockMode, ObjectLockPolicy, RequestedRetention, RetentionCheck, RetentionExpectation,
-    StoredManifest, StoredObject, StoredRetention, UploadBackend, UploadedPart, VerificationResult,
+    format_unix_secs, judge_retention, BucketFeature, CreatedUpload, LockPart, ObjectChecksum,
+    ObjectHead, ObjectLockMode, ObjectLockPolicy, RequestedRetention, RetentionCheck,
+    RetentionExpectation, StoredManifest, StoredObject, StoredRetention, UploadBackend,
+    UploadedPart, VerificationResult,
 };
 pub use base::{is_throttle_code, is_throttle_status, looks_throttled, THROTTLE_ERROR_CODES};
 pub use mock::{HeadFault, LockFault, MockBackend, PartFault};

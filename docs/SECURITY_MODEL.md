@@ -4,6 +4,9 @@
 >
 > Protocol-level behavior referenced here (state machine, commit rule §13, replay rule §14, verification semantics §17, manifest spec §11) is normatively defined in [VTOP_PROTOCOL_DRAFT.md](VTOP_PROTOCOL_DRAFT.md); this document adds the security rules around it.
 
+To report a vulnerability, and for response times and supported versions, see
+the [security policy](../SECURITY.md).
+
 The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normative requirements for conformant behavior.
 
 ## Table of contents

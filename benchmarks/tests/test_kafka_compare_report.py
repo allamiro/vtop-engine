@@ -433,7 +433,7 @@ def test_no_ratio_when_either_saturation_is_zero():
 def test_footer_renders_unknown_host_memory_instead_of_crashing(value):
     env = environment()
     env["comparable"]["host_memory_bytes"] = value
-    assert "logical CPUs, unknown)" in report.footer_text(env, "test-run")
+    assert report.footer.parse(report.footer.footer_text(env))["RAM"] == "unknown"
 
 
 def test_report_writes_a_doc_given_as_a_bare_file_name(run_dir, tmp_path, monkeypatch):

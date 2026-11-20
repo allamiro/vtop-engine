@@ -35,10 +35,12 @@ use crate::bridge::{Bridge, Fetched, Sequenced};
 use crate::groups::{Coordinator, GroupConfig, JoinRequest, Joined, SyncStanding};
 use crate::lease::{LeaseState, LeaseView};
 use crate::messages::{
-    frame, write_response_header, ApiKey, ErrorCode, HeaderVerdict, RequestHeader,
+    frame, unserved_api_name, write_response_header, ApiKey, ErrorCode, HeaderVerdict,
+    RequestHeader, SERVED_APIS, UNSERVED_API_NAMES,
 };
 use crate::offsets::{Committed, OffsetStore};
 use crate::records::{BatchError, RecordBatch};
+use crate::refusals::{Refusal, Refusals};
 use crate::topics::{Resolved, TopicMap};
 use crate::turnstile::Turnstile;
 use crate::wire::{Decoder, Encoder};
@@ -285,6 +287,9 @@ pub fn coordinator_partition_index(group: &str, partitions: usize) -> usize {
 enum Answer {
     Reply(Vec<u8>),
     Close(String),
+    /// Close without a further log line: the refusal was already logged
+    /// and counted where it was decided (#596), under its own rate limit.
+    Refused,
 }
 
 /// One idempotent producer on one topic, as the gateway orders its sets.
@@ -317,9 +322,15 @@ pub struct Gateway {
     commit_order: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Every call handed to another task, for the drain (review).
     jobs: Arc<Jobs>,
-    /// Commits refused for want of a store, for a warning that does not
-    /// repeat itself per request.
-    offsetless_refusals: std::sync::atomic::AtomicU64,
+    /// Every refusal counted by API and reason (#596), exported by the node
+    /// as `vtop_kafka_requests_refused_total`. The OffsetCommit warning is
+    /// paced on the same total it reports; the unserved-api warning on a
+    /// per-key count (below), whose sum is the exported total.
+    refusals: Arc<Refusals>,
+    /// Requests for an unserved api key, per named key and one slot for any
+    /// other (#596): each named key gets its own rate limit, so a client's
+    /// CreateTopics retries do not hide its first DescribeConfigs.
+    unserved_by_key: [std::sync::atomic::AtomicU64; UNSERVED_API_NAMES.len() + 1],
     /// Which backend answers each Kafka topic (#458): one bridge for every
     /// name unless a topic map was given.
     topics: TopicMap,
@@ -350,6 +361,12 @@ impl Gateway {
     pub fn with_lease(mut self, lease: Arc<dyn LeaseView>) -> Self {
         self.lease = Some(lease);
         self
+    }
+
+    /// The refusal totals (#596), for the node's metrics collector: shared,
+    /// so they stay readable after `serve` takes the gateway.
+    pub fn refusals(&self) -> Arc<Refusals> {
+        Arc::clone(&self.refusals)
     }
 
     /// The partitions this gateway advertises: the topology it was given, or
@@ -536,7 +553,8 @@ impl Gateway {
             lease: None,
             commit_order: Arc::new(std::sync::Mutex::new(HashMap::new())),
             jobs: Arc::new(Jobs::default()),
-            offsetless_refusals: std::sync::atomic::AtomicU64::new(0),
+            refusals: Arc::new(Refusals::default()),
+            unserved_by_key: Default::default(),
             closed: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -785,6 +803,7 @@ impl Gateway {
                     tracing::warn!(%reason, "kafka request refused; connection closed");
                     return Ok(());
                 }
+                Answer::Refused => return Ok(()),
             }
         }
     }
@@ -808,6 +827,10 @@ impl Gateway {
                     write_response_header(&mut out, header.correlation_id, false);
                     encode_api_versions(&mut out, 0, code);
                     return Answer::Reply(out.into_vec());
+                }
+                if ApiKey::from_i16(header.api_key).is_none() {
+                    self.unserved_api(header.api_key, header.correlation_id);
+                    return Answer::Refused;
                 }
                 return Answer::Close(format!("{reason} (correlation {})", header.correlation_id));
             }
@@ -1444,19 +1467,68 @@ impl Gateway {
         Ok(())
     }
 
-    fn no_offset_store(&self, api: &str) {
-        let refused = self
-            .offsetless_refusals
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1;
+    /// An OffsetCommit this gateway cannot keep (#596): counted, and logged
+    /// at each power of two with the running total. INVALID_REQUEST is the
+    /// answer because OffsetCommit has no error-message field, so the client
+    /// can show only the code's own text, and 42's ends "See the broker logs
+    /// for more details", which points here. The code it replaced, 43,
+    /// reads as a message-format mismatch and sent an operator looking at
+    /// record versions.
+    fn no_offset_store(&self, group: &str) {
+        let refused = self.refusals.count(Refusal::OffsetCommitWithoutStore);
         if refused.is_power_of_two() {
             tracing::warn!(
-                api,
+                api = "OffsetCommit",
+                group,
                 refused,
-                "kafka {api} refused: this gateway has no durable offset store (the metadata \
-                 plane's cursor is #457's next slice); a committed offset it would forget is not \
-                 taken"
+                code = ErrorCode::InvalidRequest.as_i16(),
+                "kafka OffsetCommit refused: this node runs without a metadata plane (a static \
+                 leader or a standalone node), so there is no durable offset store. Nothing was \
+                 stored and the client was answered INVALID_REQUEST; produce and fetch are \
+                 unaffected. OffsetCommit requests refused so far, across all groups: {refused} \
+                 (`group` is this request's). To keep committed offsets, run the node as a leased \
+                 leader on a metadata plane (a `lease:` block, docs/PRODUCTION_HA.md). For a read \
+                 that does not need them, set `enable.auto.commit=false` on the consumer."
             );
+        }
+    }
+
+    /// A request for an api key this gateway does not serve (#596): counted,
+    /// logged at each power of two per named key with the running total, and
+    /// the connection is closed as before. The key is the client's, so it is
+    /// a log field and never a metric label.
+    fn unserved_api(&self, api_key: i16, correlation_id: i32) {
+        self.refusals.count(Refusal::UnservedApi);
+        let slot = UNSERVED_API_NAMES
+            .iter()
+            .position(|(key, _)| *key == api_key)
+            .unwrap_or(UNSERVED_API_NAMES.len());
+        let refused =
+            self.unserved_by_key[slot].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if !refused.is_power_of_two() {
+            return;
+        }
+        match unserved_api_name(api_key) {
+            Some(api) => tracing::warn!(
+                api,
+                api_key,
+                correlation_id,
+                refused,
+                "kafka request refused: {api} (api key {api_key}) is not served by this gateway, \
+                 and the connection was closed ({refused} so far). This gateway serves the topics \
+                 named in its node config (`kafka.topic` or `kafka.topics`); a VTOP topic is \
+                 created on the metadata plane (`vtopctl meta create-topic`), not through the \
+                 Kafka API. Create or change topics there and point the client at the existing \
+                 topic."
+            ),
+            None => tracing::warn!(
+                api_key,
+                correlation_id,
+                refused,
+                "kafka request refused: api key {api_key} is not served by this gateway, and the \
+                 connection was closed ({refused} so far across keys it does not name). It \
+                 serves {SERVED_APIS}. Use a client feature that needs only those."
+            ),
         }
     }
 
@@ -1549,9 +1621,9 @@ impl Gateway {
         // deterministic refusal into a timeout, nor a client's routine
         // auto-commits into backend work that cannot succeed.
         let Some(store) = self.offsets.as_ref() else {
-            self.no_offset_store("OffsetCommit");
+            self.no_offset_store(&request.group_id);
             return (
-                every_partition(request, ErrorCode::UnsupportedForMessageFormat),
+                every_partition(request, ErrorCode::InvalidRequest),
                 outstanding,
             );
         };
@@ -4430,7 +4502,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             read_offset_commit(&reply, 7),
-            vec![(0, ErrorCode::UnsupportedForMessageFormat.as_i16())]
+            vec![(0, ErrorCode::InvalidRequest.as_i16())]
         );
         let reply = call(
             bare,
@@ -5931,6 +6003,213 @@ mod tests {
         );
     }
 
+    /// Every event logged while `f` runs, as `LEVEL message field=value ...`
+    /// (#596: the operator-facing refusals are part of the contract). A
+    /// minimal subscriber, so the crate needs no logging dependency.
+    fn logged<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+        use std::fmt::Write as _;
+        use std::sync::Mutex;
+        use tracing::field::{Field, Visit};
+
+        struct Line(String);
+        impl Visit for Line {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    let _ = write!(self.0, " {value:?}");
+                } else {
+                    let _ = write!(self.0, " {}={value:?}", field.name());
+                }
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "message" {
+                    let _ = write!(self.0, " {value}");
+                } else {
+                    let _ = write!(self.0, " {}={value}", field.name());
+                }
+            }
+        }
+        struct Capture(Arc<Mutex<Vec<String>>>);
+        impl tracing::Subscriber for Capture {
+            fn register_callsite(
+                &self,
+                _: &'static tracing::Metadata<'static>,
+            ) -> tracing::subscriber::Interest {
+                tracing::subscriber::Interest::always()
+            }
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut line = Line(event.metadata().level().to_string());
+                event.record(&mut line);
+                self.0.lock().unwrap().push(line.0);
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let out = tracing::subscriber::with_default(Capture(lines.clone()), f);
+        let lines = lines.lock().unwrap().clone();
+        (out, lines)
+    }
+
+    /// A gateway with no offset store, served, with its refusal totals in
+    /// hand (they outlive the move into `serve`).
+    async fn start_offsetless() -> (SocketAddr, Arc<Refusals>, tokio::sync::watch::Sender<bool>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let gateway = Gateway::new(
+            Arc::new(MemoryBridge::with_topics(["events"])),
+            GatewayConfig {
+                advertised_port: addr.port() as i32,
+                ..GatewayConfig::default()
+            },
+        );
+        let refusals = gateway.refusals();
+        tokio::spawn(gateway.serve(listener, rx));
+        (addr, refusals, tx)
+    }
+
+    /// #596: without a store, OffsetCommit answers INVALID_REQUEST (42),
+    /// whose client text points at the broker logs, not
+    /// UNSUPPORTED_FOR_MESSAGE_FORMAT (43), which sent phase 1 of the Kafka
+    /// comparison looking at record versions. Every refusal is counted.
+    #[tokio::test]
+    async fn offset_commit_without_a_store_answers_invalid_request() {
+        let (addr, refusals, _stop) = start_offsetless().await;
+        for correlation in 1..=3 {
+            let reply = call(
+                addr,
+                8,
+                7,
+                correlation,
+                &offset_commit_body(7, "g", -1, "", "events", 0, 0, None),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                read_offset_commit(&reply, 7),
+                vec![(0, ErrorCode::InvalidRequest.as_i16())]
+            );
+        }
+        assert_eq!(refusals.get(Refusal::OffsetCommitWithoutStore), 3);
+        assert_eq!(refusals.get(Refusal::UnservedApi), 0);
+    }
+
+    /// The refusal's log line says what happened, what the gateway did and
+    /// what to do, with the group and the code as fields, and repeats only
+    /// at powers of two with the running total.
+    #[test]
+    fn the_refusal_log_names_the_cause_the_action_and_the_remedy() {
+        let gateway = Gateway::new(
+            Arc::new(MemoryBridge::with_topics(["events"])),
+            GatewayConfig::default(),
+        );
+        let ((), lines) = logged(|| {
+            for _ in 0..4 {
+                gateway.no_offset_store("billing");
+            }
+        });
+        let refusals: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("kafka OffsetCommit refused"))
+            .collect();
+        assert_eq!(refusals.len(), 3, "logged at 1, 2 and 4: {lines:#?}");
+        let first = refusals[0];
+        for part in [
+            "WARN",
+            "without a metadata plane",
+            "no durable offset store",
+            "Nothing was stored",
+            "INVALID_REQUEST",
+            "produce and fetch are unaffected",
+            "leased leader on a metadata plane",
+            "across all groups: 1",
+            "enable.auto.commit=false",
+            "api=OffsetCommit",
+            "group=billing",
+            "code=42",
+            "refused=1",
+        ] {
+            assert!(first.contains(part), "{part:?} missing from {first}");
+        }
+        assert!(
+            !first.contains("live-chaos"),
+            "operators are pointed at docs: {first}"
+        );
+        assert!(refusals[2].contains("refused=4"), "{}", refusals[2]);
+        assert!(!first.contains("#457"), "stale text: {first}");
+        assert_eq!(gateway.refusals().get(Refusal::OffsetCommitWithoutStore), 4);
+    }
+
+    /// #596: an admin request the gateway does not serve is logged by name,
+    /// with the operator path, rate-limited per key so one tool's retries
+    /// do not hide another's first request; every one is counted under the
+    /// single bounded `unserved` label.
+    #[test]
+    fn an_unserved_api_log_names_createtopics_and_describeconfigs() {
+        let gateway = Gateway::new(
+            Arc::new(MemoryBridge::with_topics(["events"])),
+            GatewayConfig::default(),
+        );
+        let ((), lines) = logged(|| {
+            gateway.unserved_api(19, 1);
+            gateway.unserved_api(19, 2);
+            gateway.unserved_api(19, 3);
+            gateway.unserved_api(32, 4);
+            gateway.unserved_api(57, 5);
+        });
+        let named = |needle: &str| -> Vec<&String> {
+            lines.iter().filter(|l| l.contains(needle)).collect()
+        };
+        let create = named("CreateTopics (api key 19)");
+        assert_eq!(create.len(), 2, "logged at 1 and 2, not 3: {lines:#?}");
+        for part in [
+            "WARN",
+            "is not served by this gateway",
+            "the connection was closed",
+            "vtopctl meta create-topic",
+            "kafka.topics",
+            "api=CreateTopics",
+            "api_key=19",
+        ] {
+            assert!(
+                create[0].contains(part),
+                "{part:?} missing from {}",
+                create[0]
+            );
+        }
+        assert_eq!(
+            named("DescribeConfigs (api key 32)").len(),
+            1,
+            "its own rate limit: {lines:#?}"
+        );
+        let other = named("api key 57 is not served");
+        assert_eq!(other.len(), 1, "{lines:#?}");
+        assert!(
+            other[0].contains("OffsetFetch"),
+            "names what is served: {}",
+            other[0]
+        );
+        assert_eq!(gateway.refusals().get(Refusal::UnservedApi), 5);
+    }
+
+    /// On the wire: CreateTopics closes the connection, as before, and is
+    /// counted.
+    #[tokio::test]
+    async fn an_unserved_api_closes_the_connection_and_is_counted() {
+        let (addr, refusals, _stop) = start_offsetless().await;
+        let mut socket = TcpStream::connect(addr).await.unwrap();
+        assert_eq!(exchange(&mut socket, &request(19, 4, 9, &[])).await, None);
+        assert_eq!(refusals.get(Refusal::UnservedApi), 1);
+    }
+
     /// Without a store, a commit is refused by name before the bridge is
     /// asked anything (review): the answer can be nothing else, and a busy
     /// bridge must not turn it into a timeout.
@@ -5952,7 +6231,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             read_offset_commit(&reply, 7),
-            vec![(0, ErrorCode::UnsupportedForMessageFormat.as_i16())]
+            vec![(0, ErrorCode::InvalidRequest.as_i16())]
         );
         assert_eq!(
             bridge.1.load(std::sync::atomic::Ordering::SeqCst),
@@ -6822,5 +7101,196 @@ mod tests {
         drop(stop);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(call(addr, 18, 0, 1, &[]).await.is_some(), "still serving");
+    }
+    /// `fuzz/corpus/kafka_request`, where the fuzz target's committed seeds
+    /// live (#729).
+    fn fuzz_seed_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus/kafka_request")
+    }
+
+    /// A request as `answer` receives it: the header, then the body, without
+    /// the length prefix the socket read strips.
+    fn unframed(key: i16, version: i16, body: &[u8]) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.i16(key);
+        e.i16(version);
+        e.i32(7);
+        e.nullable_string(Some("seed-client"));
+        e.raw(body);
+        e.into_vec()
+    }
+
+    /// The seeds: every served api at its lowest and highest served version,
+    /// with bodies the gateway's own tests send.
+    fn fuzz_seeds() -> Vec<(String, Vec<u8>)> {
+        let metadata = |version: i16| {
+            let mut e = Encoder::new();
+            e.array_len(1);
+            e.string("events");
+            if version >= 4 {
+                e.bool(false);
+            }
+            if version >= 8 {
+                e.bool(false);
+                e.bool(false);
+            }
+            e.into_vec()
+        };
+        let list_offsets = |version: i16| {
+            let mut e = Encoder::new();
+            e.i32(-1);
+            if version >= 2 {
+                e.i8(0);
+            }
+            e.array_len(1);
+            e.string("events");
+            e.array_len(1);
+            e.i32(0);
+            if version >= 4 {
+                e.i32(-1);
+            }
+            e.i64(-2);
+            e.into_vec()
+        };
+        let records = batch_bytes(&["one", "two"], true);
+        let sequenced = sequenced_batch_bytes(&["three"], 5, 1, 0);
+        let mut both = records.clone();
+        both.extend_from_slice(&sequenced);
+        let assignment = consumer_assignment("events", &[0, 1]);
+        let mut seeds = Vec::new();
+        for key in [
+            ApiKey::Produce,
+            ApiKey::Fetch,
+            ApiKey::ListOffsets,
+            ApiKey::Metadata,
+            ApiKey::ApiVersions,
+            ApiKey::InitProducerId,
+            ApiKey::FindCoordinator,
+            ApiKey::JoinGroup,
+            ApiKey::SyncGroup,
+            ApiKey::Heartbeat,
+            ApiKey::LeaveGroup,
+            ApiKey::OffsetCommit,
+            ApiKey::OffsetFetch,
+        ] {
+            let (low, high) = key.version_range();
+            for version in [low, high] {
+                let body = match key {
+                    ApiKey::Produce => produce_body("events", 0, -1, None, &both),
+                    ApiKey::Fetch => fetch_body(version, "events", 0, 0, 100),
+                    ApiKey::ListOffsets => list_offsets(version),
+                    ApiKey::Metadata => metadata(version),
+                    ApiKey::ApiVersions => Vec::new(),
+                    ApiKey::InitProducerId => init_producer_id_body(None),
+                    ApiKey::FindCoordinator => find_coordinator_body(version, "group-a", 0),
+                    ApiKey::JoinGroup => {
+                        join_body(version, "group-a", "", &[("range", &b"\x00\x01"[..])])
+                    }
+                    ApiKey::SyncGroup => sync_body(
+                        version,
+                        "group-a",
+                        1,
+                        "member-1",
+                        &[("member-1", assignment.as_slice())],
+                    ),
+                    ApiKey::Heartbeat => heartbeat_body(version, "group-a", 1, "member-1"),
+                    ApiKey::LeaveGroup => leave_body("group-a", "member-1"),
+                    ApiKey::OffsetCommit => offset_commit_body(
+                        version,
+                        "group-a",
+                        1,
+                        "member-1",
+                        "events",
+                        0,
+                        42,
+                        Some("seed"),
+                    ),
+                    ApiKey::OffsetFetch => {
+                        offset_fetch_body(version, "group-a", Some(&[("events", &[0, 1][..])]))
+                    }
+                };
+                seeds.push((
+                    format!("api-{:02}-v{version}", key.as_i16()),
+                    unframed(key.as_i16(), version, &body),
+                ));
+            }
+        }
+        // The RECORDS field on its own, which the target also decodes raw.
+        seeds.push(("records-two-batches".to_owned(), both));
+        seeds
+    }
+
+    /// Rewrites the committed seeds. Run on purpose after a format change:
+    /// `cargo test -p vtop-kafka -- --ignored write_fuzz_seeds`.
+    #[test]
+    #[ignore = "writes fuzz/corpus/kafka_request; run on purpose"]
+    fn write_fuzz_seeds() {
+        let dir = fuzz_seed_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, bytes) in fuzz_seeds() {
+            std::fs::write(dir.join(format!("{name}.seed")), bytes).unwrap();
+        }
+    }
+
+    /// #729: every committed request seed decodes, header and whole body, as
+    /// the gateway dispatches it, so the fuzzer starts inside every decoder;
+    /// and every served api has one.
+    #[test]
+    fn the_committed_fuzz_seeds_decode() {
+        let mut served = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(fuzz_seed_dir()).unwrap() {
+            let path = entry.unwrap().path();
+            // Only the committed seeds: a local fuzzing run leaves the inputs it
+            // found here too (git-ignored), and those may rightly not decode.
+            if path.extension().and_then(|e| e.to_str()) != Some("seed") {
+                continue;
+            }
+            let bytes = std::fs::read(&path).unwrap();
+            let name = path.display().to_string();
+            if name.contains("records-") {
+                assert!(!decode_all(&bytes).is_empty(), "{name}");
+                continue;
+            }
+            let mut d = Decoder::new(&bytes);
+            let Ok(HeaderVerdict::Serve(header)) = RequestHeader::decode(&mut d) else {
+                panic!("{name}: the header is not served");
+            };
+            let key = ApiKey::from_i16(header.api_key).unwrap();
+            let version = header.api_version;
+            let decoded = match key {
+                ApiKey::ApiVersions => Ok(()),
+                ApiKey::Metadata => consumed(decode_metadata(&mut d, version), &d, "m").map(drop),
+                ApiKey::Produce => consumed(decode_produce(&mut d, version), &d, "p").map(drop),
+                ApiKey::Fetch => consumed(decode_fetch(&mut d, version), &d, "f").map(drop),
+                ApiKey::ListOffsets => {
+                    consumed(decode_list_offsets(&mut d, version), &d, "l").map(drop)
+                }
+                ApiKey::InitProducerId => {
+                    consumed(decode_init_producer_id(&mut d, version), &d, "i").map(drop)
+                }
+                ApiKey::FindCoordinator => {
+                    consumed(decode_find_coordinator(&mut d, version), &d, "c").map(drop)
+                }
+                ApiKey::JoinGroup => {
+                    consumed(decode_join_group(&mut d, version), &d, "j").map(drop)
+                }
+                ApiKey::SyncGroup => {
+                    consumed(decode_sync_group(&mut d, version), &d, "s").map(drop)
+                }
+                ApiKey::Heartbeat => consumed(decode_heartbeat(&mut d, version), &d, "h").map(drop),
+                ApiKey::LeaveGroup => {
+                    consumed(decode_leave_group(&mut d, version), &d, "v").map(drop)
+                }
+                ApiKey::OffsetCommit => {
+                    consumed(decode_offset_commit(&mut d, version), &d, "o").map(drop)
+                }
+                ApiKey::OffsetFetch => {
+                    consumed(decode_offset_fetch(&mut d, version), &d, "e").map(drop)
+                }
+            };
+            decoded.unwrap_or_else(|error| panic!("{name}: {error}"));
+            served.insert(header.api_key);
+        }
+        assert_eq!(served.len(), 13, "a served api has no seed: {served:?}");
     }
 }

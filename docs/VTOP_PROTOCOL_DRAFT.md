@@ -691,14 +691,20 @@ engine and inode only for file and spool ranges), where
 give the same key, and an object already at the key is reused only after it
 verifies against the batch's full digest. The manifest keeps
 `{batch_id}.manifest.json`, with a `batch_id` unique per attempt, so several
-manifests can name one object. A batch whose replay has other boundaries or
-another partition hour is a different batch under this rule and gets another
-key. Without a checksum, or when the backend cannot report an absent key, the
-object is named by the `batch_id` as above. Under the reference engine's S3
-Object Lock profile (#684), an object at the key is reused only if it is also
-still locked as configured (the configured mode, a date ahead, the legal hold
-when configured); otherwise the batch is written as a new, locked object named
-by the `batch_id`, and the object at the key is left untouched (#709). A
+manifests can name one object. Since v0.10.0 a replay rebuilds the batch
+it replays: its re-read stops at the range's recorded end, and it is sealed
+at the instant the ledger recorded for it, so it gets the same key, which
+closes this rule's gap for objects whenever the batch's ledger row survives.
+What still gets another key: a range the source no longer holds as it was
+cut (rewritten, truncated, removed by retention or compaction), a range over
+4x the current batching limits, a row written before v0.10.0 (no recorded
+instant), and a range whose row a power loss rolled back. Manifests stay per
+attempt. Without a checksum, or when the backend cannot report an absent key,
+the object is named by the `batch_id` as above. Under the reference engine's
+S3 Object Lock profile (#684), an object at the key is reused only if it is
+also still locked as configured (the configured mode, a date ahead, the legal
+hold when configured); otherwise the batch is written as a new, locked object
+named by the `batch_id`, and the object at the key is left untouched (#709). A
 retention the store cannot report fails the batch rather than choosing either.
 
 ### 15.2 Per-format bucket templating

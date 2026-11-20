@@ -28,8 +28,9 @@ use std::io::Write;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use vtop_upload::s3_native::{S3NativeBackend, S3NativeConfig};
 use vtop_upload::{
-    upload_resumable, LockPart, MultipartFence, MultipartUploadConfig, ObjectChecksum,
-    ObjectLockMode, ObjectLockPolicy, RetentionCheck, RetentionExpectation, UploadBackend,
+    upload_resumable, BucketFeature, LockPart, MultipartFence, MultipartUploadConfig,
+    ObjectChecksum, ObjectLockMode, ObjectLockPolicy, RetentionCheck, RetentionExpectation,
+    UploadBackend,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -152,19 +153,15 @@ async fn clean_up(client: &aws_sdk_s3::Client, bucket: &str, prefix: &str) {
 #[ignore = "requires an S3-compatible endpoint with Object Lock"]
 async fn live_the_preflight_tells_a_locked_bucket_from_a_plain_one() {
     let backend = backend(None).await;
-    assert!(
-        backend
-            .bucket_object_lock_enabled(&locked_bucket())
-            .await
-            .unwrap(),
+    assert_eq!(
+        backend.bucket_object_lock(&locked_bucket()).await.unwrap(),
+        BucketFeature::Enabled,
         "{} was created with Object Lock",
         locked_bucket()
     );
-    assert!(
-        !backend
-            .bucket_object_lock_enabled(&plain_bucket())
-            .await
-            .unwrap(),
+    assert_eq!(
+        backend.bucket_object_lock(&plain_bucket()).await.unwrap(),
+        BucketFeature::NotEnabled,
         "{} was created without Object Lock: the store's answer is a definite no",
         plain_bucket()
     );
