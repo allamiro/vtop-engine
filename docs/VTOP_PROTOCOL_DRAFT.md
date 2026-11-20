@@ -703,7 +703,12 @@ cut (rewritten, truncated, removed by retention or compaction), a range over
 4x the current batching limits, a row written before v0.10.0 (no recorded
 instant), and a range whose row a power loss rolled back. Manifests stay per
 attempt. Without a checksum, or when the backend cannot report an absent key,
-the object is named by the `batch_id` as above.
+the object is named by the `batch_id` as above. Under the reference engine's
+S3 Object Lock profile (#684), an object at the key is reused only if it is
+also still locked as configured (the configured mode, a date ahead, the legal
+hold when configured); otherwise the batch is written as a new, locked object
+named by the `batch_id`, and the object at the key is left untouched (#709). A
+retention the store cannot report fails the batch rather than choosing either.
 
 ### 15.2 Per-format bucket templating
 
