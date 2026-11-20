@@ -13,8 +13,9 @@
 # depending on it.
 name: Release
 
-# Least privilege by default; the docker and release jobs elevate exactly what
-# they need (packages/id-token and contents respectively) per-job.
+# Least privilege by default; the docker, image-manifest and release jobs
+# elevate exactly what they need (packages/id-token, attestations and contents)
+# per-job.
 permissions:
   contents: read
 
@@ -732,7 +733,8 @@ jobs:
     permissions:
       contents: read
       packages: write
-      id-token: write # keyless cosign signing
+      id-token: write # keyless cosign signing and the provenance attestation
+      attestations: write # the provenance attestation
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -838,6 +840,50 @@ jobs:
           digest="$(docker buildx imagetools inspect "$IMAGE_NAME:${{ needs.verify.outputs.version }}" --format '{{ .Manifest.Digest }}')"
           cosign sign --yes "${IMAGE_NAME}@${digest}"
 
+      # Build provenance for the image (#731): a SLSA attestation naming this
+      # workflow, this tag and this commit, stored with GitHub's attestations
+      # and in the registry beside the image. It describes the multi-arch
+      # index the tags point at. This job is skipped for workflow_dispatch, so
+      # a dry-run attests nothing.
+      - name: Resolve the manifest digest
+        id: manifest
+        run: |
+          set -euo pipefail
+          digest="$(docker buildx imagetools inspect "$IMAGE_NAME:${{ needs.verify.outputs.version }}" --format '{{ .Manifest.Digest }}')"
+          case "$digest" in sha256:*) ;; *) echo "::error::unexpected manifest digest '$digest'"; exit 1 ;; esac
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Attest the image's build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      # What users run (docs/RELEASE_VERIFICATION.md), run here before the
+      # release job can publish: a release whose image attestation does not
+      # verify is not published. The signer workflow and the tag are pinned,
+      # as the docs tell users to.
+      - name: Verify the image's attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # Retried: the attestation was written seconds ago, and the lookup
+          # can briefly lag the write.
+          for i in 1 2 3; do
+            gh attestation verify "oci://${IMAGE_NAME}@${DIGEST}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-ref "$GITHUB_REF" \
+              --deny-self-hosted-runners && exit 0
+            [ "$i" = 3 ] || sleep 15
+          done
+          echo "::error::the image's attestation did not verify"
+          exit 1
+
       - name: latest names the newest release
         env:
           VERSION: ${{ needs.verify.outputs.version }}
@@ -899,7 +945,8 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: write
-      id-token: write # keyless cosign signing for binary archives
+      id-token: write # keyless cosign signing and provenance for binary archives
+      attestations: write # build provenance for binary archives
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -950,6 +997,52 @@ jobs:
             bundle="${archive}.sigstore.json"
             cosign sign-blob --yes --bundle "$bundle" "$archive"
             test -s "$bundle"
+          done
+
+      # Build provenance for the archives (#731), in addition to the Sigstore
+      # bundles above: a SLSA attestation stored with GitHub's attestations,
+      # which `gh attestation verify` checks. Like the rest of this job it is
+      # skipped for workflow_dispatch, so a dry-run attests nothing. SHA256SUMS
+      # is written after this and is not itself attested.
+      - name: Attest the archives' build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: artifacts/vtop-engine-*.tar.gz
+
+      # What users run (docs/RELEASE_VERIFICATION.md), run here before anything
+      # is published: every archive must verify against this workflow at this
+      # tag, from a GitHub-hosted runner, or the release is not published.
+      - name: Verify the archives' attestations
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(artifacts/vtop-engine-*.tar.gz)
+          if (( ${#archives[@]} == 0 )); then
+            echo "::error::no binary archives found to verify"
+            exit 1
+          fi
+          for archive in "${archives[@]}"; do
+            ok=false
+            # Retried: the attestation was written seconds ago, and the lookup
+            # can briefly lag the write.
+            for i in 1 2 3; do
+              if gh attestation verify "$archive" \
+                --repo "$GITHUB_REPOSITORY" \
+                --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+                --source-ref "$GITHUB_REF" \
+                --deny-self-hosted-runners; then
+                ok=true
+                break
+              fi
+              [ "$i" = 3 ] || sleep 15
+            done
+            if [ "$ok" != true ]; then
+              echo "::error::$archive's attestation did not verify"
+              exit 1
+            fi
           done
 
       - name: Checksums
@@ -1016,4 +1109,4 @@ jobs:
 
             Binaries for `linux` (x86_64, aarch64) and `macOS` (arm64, x86_64) are attached below, each containing `vtop-node` and `vtopctl`. Each Linux architecture has two archives: `-unknown-linux-gnu` needs glibc 2.17 or newer (Amazon Linux 2, RHEL 7 and later, Debian, Ubuntu), and `-unknown-linux-musl` is fully static and runs on any Linux, Alpine included. The macOS archives need macOS 11 or newer. **[Which archive to pick](https://github.com/${{ github.repository }}/blob/main/docs/install/binaries.md#supported-platforms)**. Windows is not built.
 
-            Every artifact is signed (keyless Sigstore) and an SPDX SBOM is attached. **[How to verify a release](https://github.com/${{ github.repository }}/blob/main/docs/RELEASE_VERIFICATION.md)** — cosign commands for the image and the archives, and what `SHA256SUMS` does and does not tell you.
+            Every artifact is signed (keyless Sigstore), the archives and the image carry a build provenance attestation, and an SPDX SBOM is attached. **[How to verify a release](https://github.com/${{ github.repository }}/blob/main/docs/RELEASE_VERIFICATION.md)** — cosign and `gh attestation verify` commands for the image and the archives, and what `SHA256SUMS` does and does not tell you.
