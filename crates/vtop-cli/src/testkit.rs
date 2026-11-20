@@ -103,6 +103,7 @@ pub fn file_config(
             template: DEFAULT_TEMPLATE.into(),
             time_source: Default::default(),
         },
+        security: Default::default(),
     }
 }
 

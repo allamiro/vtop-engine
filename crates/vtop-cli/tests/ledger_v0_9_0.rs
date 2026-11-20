@@ -53,6 +53,13 @@ async fn a_v0_9_0_ledger_opens_and_its_failed_ranges_are_replayed_once() {
     let db = dir.path().join("state.db");
     let input = dir.path().join("app.log");
     std::fs::copy(format!("{FIXTURE}/state.db"), &db).unwrap();
+    // The copy keeps the checkout's 0644, in a directory other users can
+    // enter, which the engine refuses as a ledger (#733): make it owner-only,
+    // as the engine creates one. This test is about the schema, not the mode.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     std::fs::copy(format!("{FIXTURE}/app.log"), &input).unwrap();
     let inode = std::fs::metadata(&input).unwrap().ino();
     {

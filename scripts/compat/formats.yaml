@@ -441,3 +441,4 @@ not_formats:
   - {file: crates/vtop-meta/src/transport/maybe_tls.rs, name: FRAME_MAGIC_FIRST, why: "the first byte the VTPW and VTPM magics share, used to tell plaintext from TLS"}
   - {file: crates/vtop-kafka/src/records.rs, name: MAGIC_V2, why: "the Kafka record batch's magic byte: Kafka's format, not VTOP's"}
   - {file: crates/vtop-observe/src/otel/settings.rs, name: PROTOCOL, why: "the OTLP export protocol name"}
+  - {file: crates/vtop-core/src/secret_file.rs, name: TMPFS_MAGIC, why: "Linux's statfs number for tmpfs (linux/magic.h), used to recognise a Kubernetes secret mount: the kernel's, not VTOP's"}

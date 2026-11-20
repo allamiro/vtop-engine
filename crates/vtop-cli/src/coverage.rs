@@ -43,6 +43,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use vtop_core::config::sqlite_database_file;
 use vtop_core::errors::VtopError;
 use vtop_core::state_machine::BatchState;
 use vtop_core::types::{ContentFingerprint, ProgressMarker, SourceType};
@@ -897,7 +898,8 @@ struct DigestTrailer {
 /// never read each other's digests as their own history; only otherwise
 /// (PostgreSQL, an in-memory SQLite) under `work_dir`, which is scratch and
 /// which a PostgreSQL deployment should override.
-pub fn default_digest_dir(engine: &vtop_core::config::EngineConfig) -> PathBuf {
+pub fn default_digest_dir(config: &vtop_core::config::VtopConfig) -> PathBuf {
+    let engine = &config.engine;
     if let Some(dir) = engine
         .ledger_digest_dir
         .as_deref()
@@ -905,9 +907,8 @@ pub fn default_digest_dir(engine: &vtop_core::config::EngineConfig) -> PathBuf {
     {
         return PathBuf::from(dir);
     }
-    if let Some(database) = engine
-        .state_store
-        .resolve()
+    if let Some(database) = config
+        .resolve_state_store()
         .ok()
         .and_then(|store| sqlite_database_file(store.expose_secret()))
     {
@@ -921,30 +922,6 @@ pub fn default_digest_dir(engine: &vtop_core::config::EngineConfig) -> PathBuf {
         return beside.join(format!("{name}.ledger-digests"));
     }
     Path::new(&engine.work_dir).join("ledger-digests")
-}
-
-/// The file a SQLite connection string names, or `None` for PostgreSQL and
-/// an in-memory database.
-fn sqlite_database_file(conn: &str) -> Option<PathBuf> {
-    let conn = conn.trim();
-    let lower = conn.to_ascii_lowercase();
-    if lower.starts_with("postgres://") || lower.starts_with("postgresql://") {
-        return None;
-    }
-    let rest = conn
-        .strip_prefix("sqlite://")
-        .or_else(|| conn.strip_prefix("sqlite:"))
-        .unwrap_or(conn);
-    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
-    // The `mode=memory` QUERY PARAMETER, exactly - not those characters
-    // anywhere in the string, which a real path can contain (review).
-    let in_memory = query
-        .split('&')
-        .any(|parameter| parameter.eq_ignore_ascii_case("mode=memory"));
-    if path.is_empty() || path == ":memory:" || in_memory {
-        return None;
-    }
-    Some(PathBuf::from(path))
 }
 
 /// Write `rows` as one digest file in `dir`, durably (written, fsynced,
@@ -1788,20 +1765,20 @@ mod tests {
             "mock",
         );
         assert_eq!(
-            default_digest_dir(&config.engine),
+            default_digest_dir(&config),
             PathBuf::from("/var/lib/vtop/state.db.ledger-digests"),
             "named for the database, so a neighbour's digests are not read as its own"
         );
         let mut configured = config.clone();
         configured.engine.ledger_digest_dir = Some("/backed-up/digests".into());
         assert_eq!(
-            default_digest_dir(&configured.engine),
+            default_digest_dir(&configured),
             PathBuf::from("/backed-up/digests")
         );
         let memory =
             crate::testkit::file_config("/tmp/scratch", "sqlite::memory:", Vec::new(), "mock");
         assert_eq!(
-            default_digest_dir(&memory.engine),
+            default_digest_dir(&memory),
             PathBuf::from("/tmp/scratch/ledger-digests")
         );
         assert_eq!(

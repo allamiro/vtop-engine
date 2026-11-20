@@ -1359,7 +1359,14 @@ fn keyring_config(
     let key_dir = dir.join("keys");
     std::fs::create_dir_all(&key_dir).unwrap();
     for (id, hex) in [("q3", Q3_HEX), ("q4", Q4_HEX)] {
-        std::fs::write(key_dir.join(id), format!("{hex}\n")).unwrap();
+        let path = key_dir.join(id);
+        std::fs::write(&path, format!("{hex}\n")).unwrap();
+        // Owner-only, as the engine requires of a key file (#733).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
     }
     ManifestMacConfig {
         active: active.into(),
