@@ -75,7 +75,7 @@ cleanup() {
 trap cleanup EXIT
 
 CERTS="$WORKDIR/certs"
-"$SCRIPT_DIR/live-chaos/gen-certs.sh" "$CERTS" 1 -- "$NODE_UUID" "$FOLLOWER_UUID" > /dev/null
+NATIVE_CLIENT_CN="$PRINCIPAL_ID" "$SCRIPT_DIR/live-chaos/gen-certs.sh" "$CERTS" 1 -- "$NODE_UUID" "$FOLLOWER_UUID" > /dev/null
 
 DATA_DIR="$WORKDIR/data"
 FOLLOWER_DIR="$WORKDIR/data-follower"

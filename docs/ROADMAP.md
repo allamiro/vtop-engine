@@ -36,6 +36,23 @@ what each release does **not** yet do.
   override can be set ahead of the upgrade; unknown keys inside `security`
   are refused by this release. TLS private keys and the files `vtop-node`
   reads are not checked yet.
+- **A native client certificate is bound to the principal it acts as.** The
+  produce/fetch authorizer used to check only that the client certificate
+  chained to `native_tls.ca` and that the hello named the node's
+  `principal_id`; any client certificate the CA had signed could act as the
+  principal by declaring its UUID. A session is now admitted only when the
+  leaf certificate's Common Name is that principal's UUID, the field the
+  metadata, replica and admin planes already read as an identity. A refused
+  session is recorded as a `native.session` audit record
+  ([Auditing](operate/auditing.md)). A plaintext native plane has no
+  certificate and is unchanged.
+- **Upgrade note (native plane): a client certificate whose CN is not the
+  principal's UUID is refused.** The Helm chart's
+  `data.principalId` is documented as equal to the client certificate's CN;
+  this release enforces it. Before upgrading, check each native client's certificate
+  (`openssl x509 -noout -subject`) against the node's `principal_id`, and
+  reissue the ones that differ with `CN=<principal_id>`. The refusal is
+  logged by the node and names the CN it saw.
 
 ## v0.1.0 — a range that fails over
 

@@ -14,6 +14,7 @@ use crate::config::{
     refuse_kafka_gateway_misuse, refuse_plaintext_promotion, PlaneTransport,
 };
 use crate::config::{DataNodeConfig, DataRole};
+use crate::native_auth::PrincipalAuthorizer;
 use crate::observe::{
     BrokerCollector, FollowerCollector, NodeObservability, SegmentRecoveryCollector,
     ServerCollector,
@@ -30,14 +31,13 @@ use vtop_broker::replication::{
 };
 use vtop_broker::{
     LocalBroker, MetaFencingEpoch, NativeServer, ProducerEpochJournal, ServerConfig,
-    SessionAuthorizer,
 };
 use vtop_log::env::Env;
 use vtop_log::{
     ActiveSegment, KeyRange, RangeLineage, RecoveryReport, SegmentConfig, SegmentDescriptor,
     SegmentSet,
 };
-use vtop_protocol::{RangeIdentity, Role};
+use vtop_protocol::RangeIdentity;
 
 pub const MAX_FRAME_BYTES: u32 = 32 * 1024 * 1024;
 pub const MAX_RECORDS: u32 = 65_536;
@@ -636,26 +636,6 @@ impl LeaderStatusReplica {
     }
 }
 
-/// mTLS already authenticated the chain against the harness CA; the
-/// authorizer additionally pins the one configured principal.
-struct PrincipalAuthorizer {
-    principal: Uuid,
-}
-
-impl SessionAuthorizer for PrincipalAuthorizer {
-    fn authorize(&self, _peer_chain_der: &[Vec<u8>], principal_id: Uuid, role: Role) -> bool {
-        principal_id == self.principal && matches!(role, Role::Producer | Role::Consumer)
-    }
-
-    /// On a plaintext native plane (#294) the rule is the same — the
-    /// configured principal, as a producer or consumer — and the evidence
-    /// is only the declaration. That is the mode's stated cost: the plane
-    /// is served only where `native_transport` allowed it to bind.
-    fn authorize_unverified(&self, principal_id: Uuid, role: Role) -> bool {
-        principal_id == self.principal && matches!(role, Role::Producer | Role::Consumer)
-    }
-}
-
 /// The replica plane's server for this node's transport (#294): TLS with
 /// this node's identity, or plaintext with the exposure the config named.
 fn replica_server(
@@ -745,7 +725,7 @@ fn native_server(
     principal: Uuid,
     server_config: ServerConfig,
 ) -> Result<NativeServer, String> {
-    let authorizer = Arc::new(PrincipalAuthorizer { principal });
+    let authorizer = Arc::new(PrincipalAuthorizer::new(config.node_uuid, principal));
     match config.native_transport {
         PlaneTransport::Tls => NativeServer::new(
             broker,
@@ -772,7 +752,7 @@ fn native_server_over_slot(
     principal: Uuid,
     server_config: ServerConfig,
 ) -> Result<NativeServer, String> {
-    let authorizer = Arc::new(PrincipalAuthorizer { principal });
+    let authorizer = Arc::new(PrincipalAuthorizer::new(config.node_uuid, principal));
     match config.native_transport {
         PlaneTransport::Tls => NativeServer::over_slot(
             slot,
@@ -4820,7 +4800,7 @@ mod stream_wait_tests {
             .block_on(async move {
                 tokio::task::spawn_blocking(move || {
                     broker.handle(
-                        Role::Producer,
+                        vtop_protocol::Role::Producer,
                         vtop_protocol::WireFrame {
                             request_id: 1,
                             stream_id: 1,
