@@ -96,11 +96,16 @@ pub enum Action {
     /// `params` name the log index range and why.
     #[serde(rename = "audit.gap")]
     AuditGap,
+    /// A key, state-store, ledger or audit file other local users can read,
+    /// accepted only because `security.allow_loose_secret_permissions` is
+    /// true (#733). One record per file per process; the target is the file.
+    #[serde(rename = "security.override")]
+    SecurityOverride,
 }
 
 impl Action {
     /// Every action, for label sets and tests.
-    pub const ALL: [Action; 13] = [
+    pub const ALL: [Action; 14] = [
         Action::LedgerReplay,
         Action::LedgerPrune,
         Action::LedgerMigrate,
@@ -114,6 +119,7 @@ impl Action {
         Action::NodeReconfigureRange,
         Action::PromotionAttest,
         Action::AuditGap,
+        Action::SecurityOverride,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -131,6 +137,7 @@ impl Action {
             Action::NodeReconfigureRange => "node.reconfigure_range",
             Action::PromotionAttest => "promotion.attest",
             Action::AuditGap => "audit.gap",
+            Action::SecurityOverride => "security.override",
         }
     }
 
@@ -207,6 +214,9 @@ impl Action {
                 "command",
             ],
             Action::AuditGap => &["from_index", "through_index", "reason"],
+            // What the file holds, its mode and who besides the owner can
+            // read it: never its contents.
+            Action::SecurityOverride => &["file_kind", "mode", "exposed_to", "setting"],
         }
     }
 
@@ -439,7 +449,7 @@ impl Actor {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Target {
     /// `ledger`, `batch`, `cluster`, `topic`, `range`, `node`, `cursor`,
-    /// `data_dir`.
+    /// `data_dir`, `file` (a secret file accepted under an override, #733).
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,

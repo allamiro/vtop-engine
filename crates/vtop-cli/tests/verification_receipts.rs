@@ -321,6 +321,13 @@ async fn a_receipt_is_signed_by_the_active_key_and_names_it() {
     std::fs::create_dir_all(&keys).unwrap();
     for (id, byte) in [("q3", "3c"), ("q4", "4d")] {
         std::fs::write(keys.join(id), byte.repeat(32)).unwrap();
+        // Owner-only, as the engine requires of a key file (#733).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(keys.join(id), std::fs::Permissions::from_mode(0o400))
+                .unwrap();
+        }
     }
     let mut cfg = config(dir.path(), "receipts-keyring", &input);
     cfg.manifest.write_version = ManifestWriteVersion::V0_4;

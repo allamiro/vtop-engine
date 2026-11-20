@@ -671,6 +671,7 @@ jobs:
           helm lint helm/vtop -f helm/vtop/ci/default-values.yaml
           helm lint helm/vtop -f helm/vtop/ci/separated-values.yaml
           helm lint helm/vtop -f helm/vtop/ci/plaintext-values.yaml
+          helm lint helm/vtop -f helm/vtop/ci/external-secret-values.yaml
 
       # The plaintext shape (#294): every plane without TLS renders WITHOUT a
       # Secret, as the node's spelled-out any-interface form, and never a tls
@@ -730,6 +731,26 @@ jobs:
           manifests=$(grep -c '^kind:' /tmp/rendered.yaml)
           echo "rendered $manifests manifests"
           test "$manifests" -ge 5
+
+      # A secret file from an external manager (#733) goes in through
+      # extraVolumes as a whole Secret volume at defaultMode 0400 (256), which
+      # the kubelet makes 0440 under the chart's fsGroup: the form the archive
+      # engine accepts. Asserted on the rendered pod, so the documented
+      # example cannot drift from what the chart does with it.
+      - name: An external secret renders as a whole volume at 0400
+        run: |
+          set -euo pipefail
+          helm template vtop helm/vtop -f helm/vtop/ci/external-secret-values.yaml > /tmp/external.yaml
+          # toYaml sorts the keys: defaultMode comes before secretName.
+          grep -A3 'name: external-secret$' /tmp/external.yaml | grep -q 'secretName: vtop-external-secret'
+          grep -B2 -A2 'secretName: vtop-external-secret' /tmp/external.yaml | grep -q 'defaultMode: 256'
+          grep -B1 -A2 'mountPath: /etc/vtop/external' /tmp/external.yaml | grep -q 'readOnly: true'
+          grep -q 'fsGroup: 10001' /tmp/external.yaml
+          if grep -q 'subPath' /tmp/external.yaml; then
+            echo "the external secret must be mounted whole, never with subPath" >&2
+            exit 1
+          fi
+          echo "external secret mounted whole at 0400 with fsGroup 10001"
 
       # The engine's alert rules as a PrometheusRule (#720): off by default,
       # refused like the ServiceMonitor where the Operator's CRDs are absent,

@@ -63,6 +63,14 @@ pub const KIND_APPEND_REQ: u16 = 3;
 pub const KIND_APPEND_RESP: u16 = 4;
 pub const KIND_INSTALL_REQ: u16 = 5;
 pub const KIND_INSTALL_RESP: u16 = 6;
+/// A metadata member's release and the highest feature level it implements
+/// (#706): what a leader asks every member before it raises the level to one
+/// the members must all implement (8 and up). A release before this one has no arm for
+/// the kind and closes the connection without an answer, which is itself
+/// the answer: it predates the question, so it supports no level that asks
+/// it.
+pub const KIND_PEER_VERSION_REQ: u16 = 7;
+pub const KIND_PEER_VERSION_RESP: u16 = 8;
 pub const KIND_ADMIN_STATUS_REQ: u16 = 10;
 pub const KIND_ADMIN_STATUS_RESP: u16 = 11;
 pub const KIND_ADMIN_PROPOSE_REQ: u16 = 12;
@@ -151,6 +159,11 @@ pub enum TransportError {
     Unauthorized(String),
     #[error("{0}")]
     Protocol(String),
+    /// The node refused the request before proposing anything (#706): a
+    /// precondition the operator must fix first. Its own variant so the
+    /// edge audit record says "refused" rather than "outcome unknown".
+    #[error("{0}")]
+    Refused(String),
     /// The peer refused because it does not lead; ask `leader` instead.
     ///
     /// Its own variant rather than a [`TransportError::Protocol`] carrying the
@@ -402,6 +415,85 @@ fn take_log_entry(reader: &mut Reader<'_>) -> Result<MetaLogEntry, CodecError> {
 // ---------------------------------------------------------------------------
 // Peer RPC payloads
 // ---------------------------------------------------------------------------
+
+/// "What do you run?", asked by a metadata leader of a member (#706).
+///
+/// Carries the asking node so an mTLS plane can cross-check it against the
+/// certificate, as every other peer request's claimed sender is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerVersionRequest {
+    pub from: MetaNodeId,
+}
+
+impl PeerVersionRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8);
+        put_u64(&mut out, self.from.0);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let from = MetaNodeId(reader.u64("version request sender")?);
+        reader.finish()?;
+        Ok(Self { from })
+    }
+}
+
+/// A member's answer: who answered, its release, and the highest metadata
+/// feature level it implements.
+///
+/// `node_id` is the ANSWERING node, so a leader that dialled a stale address
+/// (a member replaced under the same name, a plaintext plane with no
+/// certificate to check) does not take another node's word for the one it
+/// asked about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerVersionResponse {
+    pub node_id: MetaNodeId,
+    /// 1..=[`crate::command::MAX_RELEASE_BYTES`] bytes, such as `0.10.0`.
+    pub release: String,
+    pub supported_feature_level: u32,
+}
+
+impl PeerVersionResponse {
+    pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        if self.release.is_empty() {
+            return Err(CodecError::InvalidValue {
+                what: "member release",
+                reason: "a release must not be empty",
+            });
+        }
+        let mut out = Vec::with_capacity(8 + 2 + self.release.len() + 4);
+        put_u64(&mut out, self.node_id.0);
+        put_bounded_str(
+            &mut out,
+            &self.release,
+            crate::command::MAX_RELEASE_BYTES,
+            "member release",
+        )?;
+        put_u32(&mut out, self.supported_feature_level);
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let node_id = MetaNodeId(reader.u64("member node id")?);
+        let release = reader.bounded_str(crate::command::MAX_RELEASE_BYTES, "member release")?;
+        if release.is_empty() {
+            return Err(CodecError::InvalidValue {
+                what: "member release",
+                reason: "a release must not be empty",
+            });
+        }
+        let supported_feature_level = reader.u32("member feature level")?;
+        reader.finish()?;
+        Ok(Self {
+            node_id,
+            release,
+            supported_feature_level,
+        })
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerVoteRequest {
@@ -2192,6 +2284,97 @@ impl AdminError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #706: the member version exchange, derived by hand from the layout -
+    /// request `u64 from`; response `u64 node_id | u16 len + release | u32
+    /// level` - so a change to either shape fails here before an older
+    /// leader meets it.
+    #[test]
+    fn the_member_version_exchange_matches_its_golden_bytes() {
+        let request = PeerVersionRequest {
+            from: MetaNodeId(1),
+        };
+        assert_eq!(request.encode(), [0, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(
+            PeerVersionRequest::decode(&request.encode()).unwrap(),
+            request
+        );
+
+        let response = PeerVersionResponse {
+            node_id: MetaNodeId(3),
+            release: "0.10.0".to_owned(),
+            supported_feature_level: 9,
+        };
+        let golden: Vec<u8> = [
+            &[0, 0, 0, 0, 0, 0, 0, 3][..],
+            &[0, 6],
+            b"0.10.0",
+            &[0, 0, 0, 9],
+        ]
+        .concat();
+        assert_eq!(response.encode().unwrap(), golden);
+        assert_eq!(PeerVersionResponse::decode(&golden).unwrap(), response);
+        assert_eq!((KIND_PEER_VERSION_REQ, KIND_PEER_VERSION_RESP), (7, 8));
+    }
+
+    /// Every length is bounded before it is trusted, trailing bytes are
+    /// refused, and an empty release is neither sent nor accepted.
+    #[test]
+    fn the_member_version_exchange_refuses_malformed_frames() {
+        let mut trailing = PeerVersionRequest {
+            from: MetaNodeId(1),
+        }
+        .encode();
+        trailing.push(0);
+        assert!(matches!(
+            PeerVersionRequest::decode(&trailing),
+            Err(CodecError::Trailing(1))
+        ));
+        assert!(matches!(
+            PeerVersionRequest::decode(&[0; 7]),
+            Err(CodecError::Truncated(_))
+        ));
+
+        let over = "9".repeat(crate::command::MAX_RELEASE_BYTES + 1);
+        let refused = PeerVersionResponse {
+            node_id: MetaNodeId(1),
+            release: over.clone(),
+            supported_feature_level: 9,
+        }
+        .encode();
+        assert!(matches!(refused, Err(CodecError::BoundExceeded { .. })));
+        let mut forged = vec![0, 0, 0, 0, 0, 0, 0, 1];
+        put_u16(&mut forged, over.len() as u16);
+        forged.extend_from_slice(over.as_bytes());
+        put_u32(&mut forged, 9);
+        assert!(matches!(
+            PeerVersionResponse::decode(&forged),
+            Err(CodecError::BoundExceeded { .. })
+        ));
+
+        let empty = PeerVersionResponse {
+            node_id: MetaNodeId(1),
+            release: String::new(),
+            supported_feature_level: 9,
+        };
+        assert!(empty.encode().is_err());
+        let mut forged = vec![0, 0, 0, 0, 0, 0, 0, 1, 0, 0];
+        put_u32(&mut forged, 9);
+        assert!(PeerVersionResponse::decode(&forged).is_err());
+
+        let mut trailing = PeerVersionResponse {
+            node_id: MetaNodeId(1),
+            release: "0.10.0".to_owned(),
+            supported_feature_level: 9,
+        }
+        .encode()
+        .unwrap();
+        trailing.push(0);
+        assert!(matches!(
+            PeerVersionResponse::decode(&trailing),
+            Err(CodecError::Trailing(1))
+        ));
+    }
 
     /// The redirect round-trips in all three of its states, and an OLD frame
     /// still decodes.

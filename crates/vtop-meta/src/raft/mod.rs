@@ -52,7 +52,8 @@ pub mod type_config;
 
 pub use audit_delivery::{AuditProgress, AuditProgressSnapshot, ReplayReason};
 pub use consensus::{
-    CommitReceipt, Consensus, ConsensusError, ConsensusResult, OpenraftConsensus, ReadFence,
+    CommitReceipt, Consensus, ConsensusError, ConsensusResult, MemberVersionProbe,
+    OpenraftConsensus, ReadFence, MEMBER_VERSION_ASK_TIMEOUT,
 };
 pub use log_store::MetaRaftLogStore;
 pub use network::{PeerDirectory, PeerEndpoint, RaftPeerHandler, TlsRaftNetworkFactory};

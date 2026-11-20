@@ -126,6 +126,14 @@ raise above 7 (in a later release) is refused while any counted node has not
 reported that level, and the refusal names each one. `node-versions --level N`
 answers whether level `N` could be raised now, and exits non-zero if not.
 
+From level 8 the metadata voters are checked too (#706): the leader asks every
+voter and learner what it runs before it proposes the raise, and refuses,
+proposing nothing, unless each answers that it supports the level. A voter
+still on v0.9.0 or older cannot answer, so the refusal names it ("closed
+without answering"); upgrade it and raise again. The leader must run this
+release for the check to happen: raise once `vtopctl meta status` shows an
+upgraded node leads.
+
 ### 3. Then use the new settings
 
 Engines older than v0.8.0 silently ignore these keys, so set them only once
@@ -162,6 +170,20 @@ need no reader upgrade: a reader that does not know them never fetches them. Old
 none, so turn on `vtopctl scrub --require-receipts` only once every engine
 writes them; see [Verification receipts](verification-receipts.md).
 
+## Secret-file permissions (next release, #733)
+
+Engines of the next release refuse to start when a manifest key file, the
+`engine.state_store` secret file, the SQLite ledger (or its `-wal` or `-shm`
+file) or the `VTOP_AUDIT_LOG` file can be read or written by other local
+users, where earlier releases started. A `0644` ledger inside a `0700` data
+directory still starts, and so does a Kubernetes Secret mounted with
+`defaultMode: 0400` and `fsGroup`. Before upgrading, run the new release's
+`vtopctl validate` against each engine's config on its host or in its pod:
+it names every file that would be refused, with the `chmod` that fixes it.
+The rule, the mounting recipes and the
+`security.allow_loose_secret_permissions` override are in
+[Secret files and their permissions](secrets.md#upgrading-to-the-release-with-this-check).
+
 ## Before any upgrade
 
 - Read the release's section in the [roadmap](../ROADMAP.md), including its
@@ -173,4 +195,8 @@ writes them; see [Verification receipts](verification-receipts.md).
   `vtopctl migrate` from the new release with the migration identity before
   the new engines start, as in the
   [deployment sequence](../POSTGRES_DEPLOYMENT.md#deployment-sequence).
+- Run the new release's `vtopctl validate` against each engine's config,
+  where the engine runs: it reports what the new engine would refuse at
+  startup (from the next release, the
+  [secret-file permissions](secrets.md) too).
 - Stop each engine with SIGTERM and let its shutdown flush finish.

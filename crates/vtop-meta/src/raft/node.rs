@@ -95,6 +95,8 @@ pub async fn start_meta_node(
         }
     });
     let network = TlsRaftNetworkFactory::new(node_id, directory, material);
+    // Asked before a raise to a level every member must implement (#706).
+    let member_probe = network.member_probe();
     let config = Arc::new(
         Config {
             cluster_name: "vtop-meta-raft".into(),
@@ -112,7 +114,11 @@ pub async fn start_meta_node(
     Ok(MetaNode {
         // The store is attached so this node can serve linearizable lease
         // reads (#223); the Raft handle alone cannot see applied state.
-        consensus: Arc::new(OpenraftConsensus::new(raft.clone()).with_store(read_store)),
+        consensus: Arc::new(
+            OpenraftConsensus::new(raft.clone())
+                .with_store(read_store)
+                .with_member_probe(member_probe),
+        ),
         peer_handler: Arc::new(RaftPeerHandler::new(raft)),
     })
 }
