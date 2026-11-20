@@ -12,8 +12,8 @@ for each rule, is issue
 > today, the rule says so. **Downgrade is not supported in 0.x**: nothing
 > tests it yet. The downgrade rules below are targets; they take effect for
 > a pair of releases only once the compatibility matrix records a downgrade
-> result for that pair. The format registry and the compatibility matrix
-> this page refers to are being added under #743.
+> result for that pair. The compatibility matrix this page refers to is
+> being added under #743.
 
 ## Status words
 
@@ -37,7 +37,8 @@ Every format in the [inventory](#inventory) carries one of three statuses.
 ## What frozen means
 
 A format is frozen at 1.0 when all six of these hold. The format registry
-(being added under #743) records which do for each format.
+(see [inventory](#inventory)) will record which do for each format, as
+#743's later steps add the fixtures, cells and fuzz targets.
 
 1. **The marker is read first.** Every reader checks the version before it
    decodes anything else, and its error says one of three different things:
@@ -121,7 +122,9 @@ What is tested today:
 - The released `vtopctl` of v0.7.0 and later is run over a manifest archive
   the current build wrote: v0.8.0 and later must verify it, and v0.7.0 must
   report the documented self-hash failure
-  ([`scripts/manifest-compat.sh`](../../scripts/manifest-compat.sh)).
+  ([`scripts/manifest-compat.sh`](../../scripts/manifest-compat.sh), run by the
+  [Compat workflow](../../.github/workflows/compat.yml) on the published,
+  signature-checked release binaries).
 
 ## Downgrade
 
@@ -153,7 +156,7 @@ What an older binary does with newer data, by case:
 |---|---|---|---|
 | A nullable ledger column | Names its own columns, ignores the new one and writes `NULL` in the rows it inserts. A later release reads `NULL` as unknown. | Supported. No marker bump, and the column is never dropped. Only N-1 shares a PostgreSQL ledger with N. | No |
 | A ledger row in a state, or of a source type, N-1 does not know | Fails closed. | One-way: needs a marker or version bump, so the refusal comes at startup and not mid-run. | No |
-| A `0.4` manifest | v0.8.0 and later verify it; v0.7.0 and earlier report it as tampered. | The documented cutoff. Archives are never rewritten; set `write_version: "0.3"` to stop writing more. | Yes: v0.7.0, and v0.8.0 and later (`manifest-compat`) |
+| A `0.4` manifest | v0.8.0 and later verify it; v0.7.0 and earlier report it as tampered. | The documented cutoff. Archives are never rewritten; set `write_version: "0.3"` to stop writing more. | Yes: v0.7.0, and v0.8.0 and later (the `manifest` cell of the Compat workflow) |
 | A metadata log entry or snapshot record from a raised feature level | The voter refuses to start, saying *newer format*, and changes nothing. Today that holds for a new command kind, log entry kind, value tag or key category; other enum values inside records are reported as corrupt until [#763](https://github.com/allamiro/vtop-engine/pull/763). | One-way at the raise, which is operator-gated and permanent. The notes say which level first puts a new kind in the log. | No |
 | A segment v2 directory | Every release since v0.5.0 reads v2. | Supported. A later segment version follows [reader first](#reader-first). | No |
 
@@ -174,6 +177,8 @@ What an older binary does with newer data, by case:
 | Surface | Deprecated in | Earliest removal | Replacement |
 |---|---|---|---|
 | `manifest.write_version: "0.3"` (planned) | v0.12.0, when `0.4` becomes the default | 2.0 | `"0.4"` |
+| The manifest field `verification_status` (on `main`, in no release yet) | v0.10.0 (#671 release B) | Not set. It is still written, also in `0.4` manifests, because v0.8.0 readers require it; its value is always `not_verified`. | `verification_plan` in a `0.4` manifest, and the ledger or a verification receipt for what verification found ([protocol §11.2](../VTOP_PROTOCOL_DRAFT.md#112-field-reference)) |
+| The `CancelRetention` metadata command, and `vtopctl meta cancel-retention` that proposes it | v0.1.0 (#184). The subcommand's help says "Deprecated", and the state machine rejects every proposal ("retention cannot be cancelled after deletion is authorized"). | Not scheduled. The command stays on the wire so a peer of any release decodes it. | None. A `RetentionPlanned` segment is terminal: recovery completes the retention, or a repair establishes fresh verified placement. |
 
 ## Config, JSON output and the wire, before 1.0
 
@@ -205,7 +210,19 @@ Every persisted and wire format, its version marker, its class and its
 status now and at 1.0. The progress-marker JSON key names `path` and
 `end_byte` are frozen as they are: PostgreSQL indexes read them.
 
+The table is generated from the format registry,
+[`scripts/compat/formats.yaml`](../../scripts/compat/formats.yaml), which also
+names the source constants behind each format.
+[`scripts/check-format-registry.py`](../../scripts/check-format-registry.py)
+runs on every pull request and fails when the sources hold a magic, or a
+version, schema, protocol or feature-level constant, that no entry names;
+when a listed value changes (a version bump, a new feature level, a new
+metadata command kind) without the registry changing with it; or when this
+table differs from what the registry generates. Edit the registry and run
+`scripts/check-format-registry.py --write`; never edit the table by hand.
+
 <!-- inventory:begin -->
+<!-- Generated by scripts/check-format-registry.py --write from scripts/compat/formats.yaml. Edit the registry, not this table. -->
 | # | Format | Version marker | Class | Status now | At 1.0 |
 |---|---|---|---|---|---|
 | 1 | Manifest | `version` `0.1` to `0.4`; writes `0.3`, `0.4` opt-in | A | stable reader, evolving writer | reads `0.1` to `0.4` forever, writes `0.4` |

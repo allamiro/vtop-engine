@@ -8,7 +8,9 @@
 # repository's tags and scripts/compat/expected.yaml, which lists every
 # expected result that is not `pass`. A refusal with no row there fails.
 #
-# The released binaries are the published archives, never rebuilds:
+# Only tags with a published (non-draft) GitHub release are downloaded: a tag
+# is pushed before release.yml has built its assets, and a tag with no release
+# is not run. The released binaries are the published archives, never rebuilds:
 # scripts/compat/fetch-release.sh checks each against the release's
 # SHA256SUMS and its Sigstore bundle (signed by release.yml at that tag),
 # and checks what the archive holds, before anything runs.
@@ -34,6 +36,7 @@ on:
       - 'rust-toolchain*'
       - 'scripts/compat/**'
       - 'scripts/manifest-compat.sh'
+      - 'scripts/ledger-compat.sh'
       - '.github/workflows/compat.yml'
   push:
     branches: [main]
@@ -45,6 +48,7 @@ on:
       - 'rust-toolchain*'
       - 'scripts/compat/**'
       - 'scripts/manifest-compat.sh'
+      - 'scripts/ledger-compat.sh'
       - '.github/workflows/compat.yml'
   schedule:
     - cron: '23 4 * * *'
@@ -71,9 +75,6 @@ jobs:
       matrix: ${{ steps.select.outputs.matrix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          # The releases are derived from the repository's tags.
-          fetch-depth: 0
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
@@ -157,7 +158,12 @@ jobs:
           name: compat-head-bin
           path: head
       - run: chmod +x head/vtopctl
+      # cosign v3: releases are signed in the new Sigstore bundle format,
+      # which cosign v2 cannot read (fetch-release.sh refuses a v2). Pinned
+      # here rather than left to the installer's default.
       - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: 'v3.0.2'
       # A published release's assets never change, so the download is cached
       # by tag; fetch-release.sh checks a cached copy again on every run.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

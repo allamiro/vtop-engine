@@ -11,6 +11,8 @@ of each minor, so a new release joins the day its tag exists. Each cell's
 expected result is ``pass`` unless ``scripts/compat/expected.yaml`` lists an
 exception, so adding a refusal means editing a reviewed file.
 
+A cell with ``only_newest: true`` runs the newest release alone in both modes.
+
 Modes:
 
 * ``full`` (nightly, and on demand): every release since each cell applies;
@@ -117,7 +119,12 @@ def matrix(expected: dict, tags: list[str], mode: str) -> list[dict]:
         for direction in directions:
             if direction not in DIRECTIONS:
                 raise ExpectedError(f"cell {name}: unknown direction {direction!r}")
-        per_cell[name] = [tag for tag in available if version(tag) >= since]
+        if not isinstance(cell.get("only_newest", False), bool):
+            raise ExpectedError(f"cell {name}: only_newest must be true or false")
+        applies = [tag for tag in available if version(tag) >= since]
+        # A cell for a format only the previous release may share with this
+        # build (the ledger, #743) runs the newest release alone.
+        per_cell[name] = applies[-1:] if cell.get("only_newest") else applies
 
     outcome: dict[tuple[str, str, str], dict] = {}
     boundary: set[tuple[str, str, str]] = set()

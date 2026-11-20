@@ -1,0 +1,448 @@
+# The format registry (#743): every persisted and wire format VTOP owns, its
+# class and status under docs/reference/compatibility.md, and the source
+# constants that define it.
+#
+# scripts/check-format-registry.py keeps it true. It fails when the sources
+# hold a magic or a VERSION, SCHEMA, MAGIC, PROTOCOL or FEATURE_LEVEL constant
+# that no entry (and no not_formats row) names, when a listed constant's value
+# or a tag set's highest tag differs from what is written here, or when the
+# inventory table on the page differs from what this file generates
+# (`scripts/check-format-registry.py --write`). So a version bump, a new
+# magic, a new feature level or a new command kind is always an edit to this
+# reviewed file.
+#
+# Per entry:
+#   id, name, class (A archive, B node-local, C wire, D operator interface),
+#   marker, status, at_1_0      the inventory row on the page;
+#   constants                   {file, name, value}: value as written in Rust;
+#   magics                      {file, magic}: a magic not held in a constant;
+#   tag_sets                    {file, prefix, tags}: every tag of the set
+#                               and its number; a tag is never renumbered;
+#   marker                      may quote one of the entry's constants as
+#                               {NAME}, so the table follows its value;
+#   fixtures, fuzz              paths and fuzz targets that exist today;
+#   one_way                     one-way steps taken so far, with the operator
+#                               action that takes each.
+
+formats:
+  - id: 1
+    name: Manifest
+    class: A
+    marker: "`version` `0.1` to `0.4`; writes `0.3`, `0.4` opt-in"
+    status: stable reader, evolving writer
+    at_1_0: reads `0.1` to `0.4` forever, writes `0.4`
+    constants:
+      - {file: crates/vtop-core/src/manifest.rs, name: VTOP_VERSION, value: '"0.3"'}
+      - {file: crates/vtop-core/src/manifest.rs, name: VTOP_VERSION_04, value: '"0.4"'}
+      - {file: crates/vtop-core/src/manifest.rs, name: MAX_READABLE_VERSION, value: '"0.4"'}
+      - {file: crates/vtop-core/src/manifest.rs, name: VTOP_PROTOCOL, value: '"VTOP"'}
+      - {file: crates/vtop-core/src/manifest.rs, name: LEGACY_VERSIONS, value: '["0.1", "0.2", "0.3"]'}
+      - {file: crates/vtop-core/src/manifest.rs, name: CANONICAL_VERSIONS, value: '["0.4"]'}
+    fixtures: [crates/vtop-core/tests/fixtures/manifests]
+    fuzz: [manifest_parse]
+    one_way:
+      - "manifest.write_version: \"0.4\" (operator setting, v0.10.0): readers before v0.8.0 report a 0.4 manifest as tampered"
+
+  - id: 2
+    name: Verification receipt
+    class: A
+    marker: "`receipt_version` `1`"
+    status: evolving
+    at_1_0: stable
+    constants:
+      - {file: crates/vtop-core/src/manifest/receipt.rs, name: RECEIPT_VERSION, value: '"1"'}
+    fixtures:
+      - crates/vtop-core/tests/fixtures/manifests/release-b-receipt-signed.json
+      - crates/vtop-core/tests/fixtures/manifests/release-b-receipt-unsigned.json
+    fuzz: [manifest_parse]
+
+  - id: 3
+    name: Object key layout
+    class: A
+    marker: "none: the key's shape"
+    status: partition path stable, file-name scheme evolving
+    at_1_0: stable
+
+  - id: 4
+    name: Ledger digest (`ledger-digest-*.jsonl`)
+    class: A
+    marker: "`vtop_ledger_digest` `1`"
+    status: evolving
+    at_1_0: stable, read forever
+    constants:
+      - {file: crates/vtop-cli/src/coverage.rs, name: DIGEST_VERSION, value: '1'}
+
+  - id: 5
+    name: State ledger, SQLite
+    class: B
+    marker: "`PRAGMA user_version` `1`"
+    status: evolving
+    at_1_0: stable
+    constants:
+      - {file: crates/vtop-state/src/sqlite_store.rs, name: SQLITE_SCHEMA_VERSION, value: '1'}
+
+  - id: 6
+    name: State ledger, PostgreSQL
+    class: B
+    marker: schema marker `3`
+    status: evolving
+    at_1_0: stable
+    constants:
+      - {file: crates/vtop-state/src/pg_store.rs, name: SCHEMA_VERSION, value: '3'}
+      - {file: crates/vtop-state/src/pg_store.rs, name: MIN_SCHEMA_VERSION, value: '3'}
+      - {file: crates/vtop-state/src/pg_store.rs, name: SCHEMA_MARKER_PREFIX, value: '"-- vtop-state-schema "'}
+      - {file: crates/vtop-state/src/pg_store.rs, name: STATE_ADDED_SINCE_FIRST_SCHEMA, value: '"superseded"'}
+    one_way:
+      - "schema marker 3 (vtopctl migrate, v0.8.0, #567): v0.7.0 refuses the database once a SUPERSEDED row exists"
+
+  - id: 7
+    name: Progress markers (ledger, digests, manifests)
+    class: B
+    marker: "none: optional fields"
+    status: evolving; key names frozen
+    at_1_0: stable
+
+  - id: 8
+    name: "`audit_events` table and hash chain"
+    class: B
+    marker: "`audit_version` column"
+    status: evolving
+    at_1_0: stable
+
+  - id: 9
+    name: Audit record (JSONL)
+    class: B
+    marker: "`audit_version` `1`"
+    status: evolving
+    at_1_0: stable
+    constants:
+      - {file: crates/vtop-observe/src/audit.rs, name: AUDIT_VERSION, value: '1'}
+    fixtures: [crates/vtop-cli/tests/fixtures/audit/audit-v1.jsonl]
+
+  - id: 10
+    name: Segment log v1 and v2, index, chunk sidecar, commit marker
+    class: B
+    marker: "`VTOPSEG1`, `VTOPREC1`, `VTOPIDX1`; `VTOPSEG2`, `VTOPREC2`; `VTOPCHK1`; `VTOPCMT1`"
+    status: v1 stable, v2 evolving
+    at_1_0: v1 stable; v2's status and the release that makes it the default writer are decided in their own issue
+    constants:
+      - {file: crates/vtop-log/src/codec.rs, name: HEADER_MAGIC, value: 'b"VTOPSEG1"'}
+      - {file: crates/vtop-log/src/codec.rs, name: RECORD_MAGIC, value: 'b"VTOPREC1"'}
+      - {file: crates/vtop-log/src/codec.rs, name: INDEX_MAGIC, value: 'b"VTOPIDX1"'}
+      - {file: crates/vtop-log/src/codec_v2.rs, name: HEADER_MAGIC_V2, value: 'b"VTOPSEG2"'}
+      - {file: crates/vtop-log/src/codec_v2.rs, name: RECORD_MAGIC_V2, value: 'b"VTOPREC2"'}
+      - {file: crates/vtop-log/src/types.rs, name: FORMAT_VERSION, value: '1'}
+      - {file: crates/vtop-log/src/types.rs, name: FORMAT_VERSION_V2, value: '2'}
+      - {file: crates/vtop-log/src/types.rs, name: RECORD_SCHEMA_VERSION_V2, value: '2'}
+      - {file: crates/vtop-log/src/types.rs, name: CHUNK_SIDECAR_MAGIC, value: 'b"VTOPCHK1"'}
+      - {file: crates/vtop-log/src/types.rs, name: CHUNK_TREE_SCHEME_V1, value: '"vtop-b3tree-v1"'}
+      - {file: crates/vtop-log/src/types.rs, name: COMMIT_SCHEME_KEYED, value: '"blake3-keyed"'}
+      - {file: crates/vtop-log/src/types.rs, name: COMMIT_SCHEME_UNKEYED, value: '"unkeyed-digest"'}
+      - {file: crates/vtop-log/src/segment.rs, name: CHUNK_SIDECAR_VERSION, value: '1'}
+      - {file: crates/vtop-log/src/segment.rs, name: COMMIT_MAGIC, value: 'b"VTOPCMT1"'}
+      - {file: crates/vtop-log/src/segment.rs, name: COMMIT_VERSION, value: '1'}
+
+  - id: 11
+    name: Retention and truncate intents, producer snapshot
+    class: B
+    marker: "`VTOPRIN1`, `VTOPTIN1`, `VTOPPRD1`"
+    status: evolving
+    at_1_0: classified at the freeze
+    constants:
+      - {file: crates/vtop-log/src/retention_intent.rs, name: MAGIC, value: 'b"VTOPRIN1"'}
+      - {file: crates/vtop-log/src/retention_intent.rs, name: VERSION, value: '1'}
+      - {file: crates/vtop-log/src/truncate_intent.rs, name: MAGIC, value: 'b"VTOPTIN1"'}
+      - {file: crates/vtop-log/src/truncate_intent.rs, name: VERSION, value: '1'}
+      - {file: crates/vtop-log/src/truncate_intent.rs, name: VERSION_V2, value: '2'}
+      - {file: crates/vtop-log/src/producer_snapshot.rs, name: MAGIC, value: 'b"VTOPPRD1"'}
+      - {file: crates/vtop-log/src/producer_snapshot.rs, name: VERSION, value: '1'}
+
+  - id: 12
+    name: "Broker journals: fencing epochs, lineage, epoch, kept dispute, committed floor"
+    class: B
+    marker: "`VTOPFNC1`, `VTOPFLN1`, `VTOPEPC1`, `VTOPKDS1`, `VTOPFLR1`"
+    status: evolving
+    at_1_0: classified at the freeze
+    constants:
+      - {file: crates/vtop-broker/src/fencing_epochs.rs, name: MAGIC, value: 'b"VTOPFNC1"'}
+      - {file: crates/vtop-broker/src/fencing_epochs.rs, name: VERSION, value: '1'}
+      - {file: crates/vtop-broker/src/fencing_epochs.rs, name: VERSION_DISPUTE_PENDING, value: '2'}
+      - {file: crates/vtop-broker/src/fencing_epochs.rs, name: LINEAGE_MAGIC, value: 'b"VTOPFLN1"'}
+      - {file: crates/vtop-broker/src/fencing_epochs.rs, name: LINEAGE_VERSION, value: '1'}
+      - {file: crates/vtop-broker/src/lib.rs, name: EPOCH_MAGIC, value: 'b"VTOPEPC1"'}
+      - {file: crates/vtop-broker/src/lib.rs, name: EPOCH_VERSION, value: '1'}
+      - {file: crates/vtop-broker/src/kept_dispute.rs, name: MAGIC, value: 'b"VTOPKDS1"'}
+      - {file: crates/vtop-broker/src/kept_dispute.rs, name: VERSION, value: '1'}
+      - {file: crates/vtop-broker/src/committed_floor.rs, name: MAGIC, value: 'b"VTOPFLR1"'}
+      - {file: crates/vtop-broker/src/committed_floor.rs, name: VERSION, value: '1'}
+    one_way:
+      - "a kept dispute (v0.8.0, #635): an older binary refuses to start while one is pending"
+      - "staged journal and sidecar rewrites through <file>.rewrite (v0.8.0, #640)"
+
+  - id: 13
+    name: Multipart session (`*.multipart.json`)
+    class: B
+    marker: "`schema_version` `1`"
+    status: evolving
+    at_1_0: stable
+    constants:
+      - {file: crates/vtop-upload/src/multipart.rs, name: SESSION_SCHEMA, value: '1'}
+    fixtures: [crates/vtop-upload/tests/fixtures/multipart-session-v0.8.0.json]
+
+  - id: 14
+    name: Scrub cursor
+    class: B
+    marker: "`vtop_scrub_cursor` `1`"
+    status: evolving
+    at_1_0: classified at the freeze
+    constants:
+      - {file: crates/vtop-cli/src/scrub.rs, name: CURSOR_VERSION, value: '1'}
+
+  - id: 15
+    name: Metadata log chunk and entry frames
+    class: B
+    marker: "`VTOPMLG1`, `VTOPMLE1`"
+    status: evolving
+    at_1_0: "follows #740"
+    constants:
+      - {file: crates/vtop-meta/src/storage/log.rs, name: CHUNK_MAGIC, value: 'b"VTOPMLG1"'}
+      - {file: crates/vtop-meta/src/storage/log.rs, name: CHUNK_VERSION, value: '1'}
+      - {file: crates/vtop-meta/src/storage/log.rs, name: ENTRY_MAGIC, value: 'b"VTOPMLE1"'}
+
+  - id: 16
+    name: Metadata command set
+    class: B
+    marker: command kinds, feature levels {BASELINE_FEATURE_LEVEL} to {SUPPORTED_FEATURE_LEVEL}
+    status: evolving, level-gated
+    at_1_0: "follows #740"
+    constants:
+      - {file: crates/vtop-meta/src/command.rs, name: BASELINE_FEATURE_LEVEL, value: '3'}
+      - {file: crates/vtop-meta/src/command.rs, name: SUPPORTED_FEATURE_LEVEL, value: '8'}
+      - {file: crates/vtop-meta/src/command.rs, name: LINEAGE_VERDICTS_FEATURE_LEVEL, value: '6'}
+      - {file: crates/vtop-meta/src/command.rs, name: NODE_VERSION_REPORTS_FEATURE_LEVEL, value: '7'}
+      - {file: crates/vtop-meta/src/command.rs, name: PROMOTE_UNPROVEN_FEATURE_LEVEL, value: '8'}
+      - {file: crates/vtop-meta/src/command.rs, name: COMMAND_KIND_SET_FEATURE_LEVEL, value: '36'}
+      - {file: crates/vtop-meta/src/command.rs, name: COMMAND_KIND_REPORT_NODE_VERSION, value: '38'}
+      - {file: crates/vtop-meta/src/versions.rs, name: FIRST_MEMBER_CHECKED_FEATURE_LEVEL, value: '8'}
+    tag_sets:
+      - file: crates/vtop-meta/src/command.rs
+        prefix: COMMAND_KIND_
+        tags:
+          COMMAND_KIND_REGISTER_NODE: 1
+          COMMAND_KIND_SET_NODE_STATE: 2
+          COMMAND_KIND_CREATE_TOPIC: 3
+          COMMAND_KIND_GRANT_RANGE_LEASE: 4
+          COMMAND_KIND_RELEASE_RANGE_LEASE: 5
+          COMMAND_KIND_REGISTER_SEALED_SEGMENT: 6
+          COMMAND_KIND_MARK_SEGMENT_VERIFIED: 7
+          COMMAND_KIND_PUT_KEY_RECORD: 8
+          COMMAND_KIND_CREATE_CONSUMER_GROUP: 9
+          COMMAND_KIND_JOIN_CONSUMER_GROUP: 10
+          COMMAND_KIND_LEAVE_CONSUMER_GROUP: 11
+          COMMAND_KIND_ASSIGN_MEMBER_RANGES: 12
+          COMMAND_KIND_COMMIT_GROUP_CURSOR: 13
+          COMMAND_KIND_HEARTBEAT_MEMBER: 14
+          COMMAND_KIND_EXPIRE_STALE_MEMBER: 15
+          COMMAND_KIND_SET_NODE_PLACEMENT_ATTRS: 16
+          COMMAND_KIND_COMMIT_SEGMENT_PLACEMENT: 17
+          COMMAND_KIND_COMMIT_REPLACEMENT_PROOF: 18
+          COMMAND_KIND_PLAN_REPLICA_RETIREMENT: 19
+          COMMAND_KIND_CONFIRM_REPLICA_RETIRED: 20
+          COMMAND_KIND_PROPOSE_REBALANCE: 21
+          COMMAND_KIND_CANCEL_REBALANCE: 22
+          COMMAND_KIND_COMMIT_TIER_EVIDENCE: 23
+          COMMAND_KIND_SET_TOPIC_RETENTION_POLICY: 24
+          COMMAND_KIND_PLAN_RETENTION: 25
+          COMMAND_KIND_CONFIRM_RETENTION_EXPIRED: 26
+          COMMAND_KIND_CANCEL_RETENTION: 27
+          COMMAND_KIND_ACQUIRE_RANGE_LEASE: 28
+          COMMAND_KIND_RENEW_RANGE_LEASE: 29
+          COMMAND_KIND_REPORT_PROMOTION_OUTCOME: 30
+          COMMAND_KIND_COMMIT_GROUP_CURSOR_FENCED: 31
+          COMMAND_KIND_ENSURE_GROUP_MEMBER_FOR_RANGE: 32
+          COMMAND_KIND_COMMIT_GROUP_CURSOR_COORDINATED: 33
+          COMMAND_KIND_ENSURE_GROUP_MEMBER_COORDINATED: 34
+          COMMAND_KIND_SPLIT_RANGE: 35
+          COMMAND_KIND_SET_FEATURE_LEVEL: 36
+          COMMAND_KIND_SET_RANGE_REPLICA_SET: 37
+          COMMAND_KIND_REPORT_NODE_VERSION: 38
+          COMMAND_KIND_ATTEST_UNPROVEN_PROMOTION: 39
+    one_way:
+      - "raising the feature level (vtopctl meta enable-features): permanent; a voter older than the level refuses a log that holds its kinds"
+
+  - id: 17
+    name: Metadata snapshot and state encoding
+    class: B
+    marker: "`VTOPMSN1` v1 and v2, payload version `1`"
+    status: evolving, level-gated
+    at_1_0: "follows #740"
+    constants:
+      - {file: crates/vtop-meta/src/storage/snapshot.rs, name: SNAPSHOT_MAGIC, value: 'b"VTOPMSN1"'}
+      - {file: crates/vtop-meta/src/storage/snapshot.rs, name: SNAPSHOT_VERSION_V1, value: '1'}
+      - {file: crates/vtop-meta/src/storage/snapshot.rs, name: SNAPSHOT_VERSION_V2, value: '2'}
+      - {file: crates/vtop-meta/src/state.rs, name: SNAPSHOT_PAYLOAD_VERSION, value: '1'}
+      - {file: crates/vtop-meta/src/state.rs, name: VALUE_TAG_NODE_VERSION, value: '24'}
+      - {file: crates/vtop-meta/src/keys.rs, name: CATEGORY_NODE_VERSION, value: '21'}
+    tag_sets:
+      - file: crates/vtop-meta/src/state.rs
+        prefix: VALUE_TAG_
+        tags:
+          VALUE_TAG_NODE: 1
+          VALUE_TAG_TOPIC: 2
+          VALUE_TAG_TOPIC_NAME: 3
+          VALUE_TAG_RANGE: 4
+          VALUE_TAG_SEGMENT: 5
+          VALUE_TAG_KEY: 6
+          VALUE_TAG_GROUP: 7
+          VALUE_TAG_GROUP_NAME: 8
+          VALUE_TAG_GROUP_MEMBER: 9
+          VALUE_TAG_GROUP_CURSOR: 10
+          VALUE_TAG_GROUP_MEMBER_V2: 11
+          VALUE_TAG_NODE_V2: 12
+          VALUE_TAG_SEGMENT_PLACEMENT: 13
+          VALUE_TAG_REPLACEMENT_PROOF: 14
+          VALUE_TAG_REBALANCE_INTENT: 15
+          VALUE_TAG_RANGE_V2: 16
+          VALUE_TAG_SEGMENT_TIER_COPY: 17
+          VALUE_TAG_TOPIC_RETENTION_POLICY: 18
+          VALUE_TAG_RANGE_TRANSITION: 19
+          VALUE_TAG_RANGE_V3: 20
+          VALUE_TAG_LINEAGE_TRANSITION: 21
+          VALUE_TAG_CLUSTER_CONFIG: 22
+          VALUE_TAG_RANGE_REPLICA_SET: 23
+          VALUE_TAG_NODE_VERSION: 24
+          VALUE_TAG_PROMOTION_ATTESTATION: 25
+      - file: crates/vtop-meta/src/keys.rs
+        prefix: CATEGORY_
+        tags:
+          CATEGORY_CLUSTER_CONFIG: 1
+          CATEGORY_NODE: 2
+          CATEGORY_TOPIC_BY_NAME: 3
+          CATEGORY_TOPIC: 4
+          CATEGORY_RANGE: 5
+          CATEGORY_SEGMENT: 6
+          CATEGORY_KEY: 7
+          CATEGORY_REQUEST: 8
+          CATEGORY_GROUP: 9
+          CATEGORY_GROUP_BY_NAME: 10
+          CATEGORY_GROUP_MEMBER: 11
+          CATEGORY_GROUP_CURSOR: 12
+          CATEGORY_SEGMENT_PLACEMENT: 13
+          CATEGORY_SEGMENT_REPLACEMENT_PROOF: 14
+          CATEGORY_SEGMENT_REBALANCE_INTENT: 15
+          CATEGORY_SEGMENT_TIER_COPY: 16
+          CATEGORY_TOPIC_RETENTION_POLICY: 17
+          CATEGORY_RANGE_TRANSITION: 18
+          CATEGORY_LINEAGE_TRANSITION: 19
+          CATEGORY_RANGE_REPLICA_SET: 20
+          CATEGORY_NODE_VERSION: 21
+          CATEGORY_PROMOTION_ATTESTATION: 22
+
+  - id: 18
+    name: Metadata hard state, applied, purged, membership log id
+    class: B
+    marker: "`VTOPMHS1`, `VTOPMAP1`, `VTOPMPG1`, `VTOPMML1`"
+    status: evolving
+    at_1_0: "follows #740"
+    constants:
+      - {file: crates/vtop-meta/src/storage/hardstate.rs, name: HARD_STATE_MAGIC, value: 'b"VTOPMHS1"'}
+      - {file: crates/vtop-meta/src/storage/hardstate.rs, name: HARD_STATE_VERSION, value: '1'}
+      - {file: crates/vtop-meta/src/storage/applied.rs, name: APPLIED_MAGIC, value: 'b"VTOPMAP1"'}
+      - {file: crates/vtop-meta/src/storage/applied.rs, name: APPLIED_VERSION, value: '1'}
+      - {file: crates/vtop-meta/src/storage/purged.rs, name: PURGED_MAGIC, value: 'b"VTOPMPG1"'}
+      - {file: crates/vtop-meta/src/storage/purged.rs, name: PURGED_VERSION, value: '1'}
+      - {file: crates/vtop-meta/src/storage/membership_log_id.rs, name: MEMBERSHIP_LOG_ID_MAGIC, value: 'b"VTOPMML1"'}
+      - {file: crates/vtop-meta/src/storage/membership_log_id.rs, name: MEMBERSHIP_LOG_ID_VERSION, value: '1'}
+
+  - id: 19
+    name: Native protocol
+    class: C
+    marker: "`VTPW`, major `1`, minor `0`"
+    status: evolving
+    at_1_0: "follows #740"
+    constants:
+      - {file: crates/vtop-protocol/src/lib.rs, name: MAGIC, value: 'b"VTPW"'}
+      - {file: crates/vtop-protocol/src/lib.rs, name: PROTOCOL_MAJOR, value: '1'}
+      - {file: crates/vtop-protocol/src/lib.rs, name: PROTOCOL_MINOR, value: '0'}
+
+  - id: 20
+    name: Replica protocol negotiation
+    class: C
+    marker: replica protocol `1` and `2`
+    status: evolving
+    at_1_0: "follows #740"
+    constants:
+      - {file: crates/vtop-protocol/src/lib.rs, name: REPLICA_PROTOCOL_LEGACY, value: '1'}
+      - {file: crates/vtop-protocol/src/lib.rs, name: REPLICA_PROTOCOL_HANDSHAKE, value: '2'}
+      - {file: crates/vtop-protocol/src/lib.rs, name: REPLICA_PROTOCOL_MAX, value: REPLICA_PROTOCOL_HANDSHAKE}
+    magics:
+      # The hello's nonce marker (REPLICA_HELLO_MARKER).
+      - {file: crates/vtop-protocol/src/lib.rs, magic: VTRP}
+
+  - id: 21
+    name: Metadata peer and admin transport
+    class: C
+    marker: "`VTPM`, version `1`"
+    status: evolving
+    at_1_0: "follows #740"
+    constants:
+      - {file: crates/vtop-meta/src/transport/wire.rs, name: VTPM_MAGIC, value: 'b"VTPM"'}
+      - {file: crates/vtop-meta/src/transport/wire.rs, name: VTPM_VERSION, value: '1'}
+      - {file: crates/vtop-meta/src/transport/wire.rs, name: KIND_PEER_VERSION_REQ, value: '7'}
+      - {file: crates/vtop-meta/src/transport/wire.rs, name: KIND_PEER_VERSION_RESP, value: '8'}
+      - {file: crates/vtop-meta/src/transport/wire.rs, name: KIND_ADMIN_READ_CLUSTER_VERSIONS_REQ, value: '29'}
+      - {file: crates/vtop-meta/src/transport/wire.rs, name: KIND_ADMIN_READ_CLUSTER_VERSIONS_RESP, value: '30'}
+
+  - id: 22
+    name: "Kafka gateway: advertised APIs and version ranges"
+    class: C
+    marker: none
+    status: experimental
+    at_1_0: experimental
+
+  - id: 23
+    name: "`config.yaml`"
+    class: D
+    marker: none (`config_version` planned)
+    status: evolving
+    at_1_0: classified at the freeze
+
+  - id: 24
+    name: "`vtopctl validate --print-effective`"
+    class: D
+    marker: "`effective_version` `1`"
+    status: JSON stable, text for people
+    at_1_0: JSON stable
+    fixtures: [crates/vtop-cli/tests/fixtures/effective.json, crates/vtop-cli/tests/fixtures/effective.txt]
+
+  - id: 25
+    name: "`vtopctl` JSON output and exit codes"
+    class: D
+    marker: none yet (`report_version` planned)
+    status: evolving
+    at_1_0: classified at the freeze
+
+  - id: 26
+    name: Metric names and labels
+    class: D
+    marker: none
+    status: evolving
+    at_1_0: a stable subset
+
+  - id: 27
+    name: Helm values
+    class: D
+    marker: the chart `version`
+    status: evolving
+    at_1_0: classified at the freeze
+
+# Constants whose names look like format markers but are not.
+not_formats:
+  - {file: crates/vtop-state/src/sqlite_store.rs, name: SCHEMA, why: "the SQLite DDL; the ledger's version marker is SQLITE_SCHEMA_VERSION (format 5)"}
+  - {file: crates/vtop-meta/src/command.rs, name: MAX_TIER_VERSION_ID_BYTES, why: "a length bound on an object version id"}
+  - {file: crates/vtop-meta/src/transport/wire.rs, name: MAX_CLUSTER_VERSION_NODES, why: "a count bound on a node-versions reply"}
+  - {file: crates/vtop-meta/src/raft/consensus.rs, name: MEMBER_VERSION_ASK_TIMEOUT, why: "how long a leader waits for one member's version answer before a raise counts it unreachable"}
+  - {file: crates/vtop-meta/src/transport/maybe_tls.rs, name: FRAME_MAGIC_FIRST, why: "the first byte the VTPW and VTPM magics share, used to tell plaintext from TLS"}
+  - {file: crates/vtop-kafka/src/records.rs, name: MAGIC_V2, why: "the Kafka record batch's magic byte: Kafka's format, not VTOP's"}
+  - {file: crates/vtop-observe/src/otel/settings.rs, name: PROTOCOL, why: "the OTLP export protocol name"}
+  - {file: crates/vtop-core/src/secret_file.rs, name: TMPFS_MAGIC, why: "Linux's statfs number for tmpfs (linux/magic.h), used to recognise a Kubernetes secret mount: the kernel's, not VTOP's"}

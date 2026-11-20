@@ -27,7 +27,7 @@ Ground truth: `.github/workflows/release.yml` (a push of a `v*` tag publishes), 
 
 ## 1. The bump PR
 
-Branch from `origin/main` (`release/vX.Y.Z-bump` was used for 0.8.0, `release/0.7.0` for 0.7.0). Title `release: bump the workspace to X.Y.Z`. Four files, plus the citation file:
+Branch from `origin/main` (`release/vX.Y.Z-bump` was used for 0.8.0, `release/0.7.0` for 0.7.0). Title `release: bump the workspace to X.Y.Z`. Four files, plus the citation file, the pages that print the version, and on a minor release `SECURITY.md`:
 
 | File | Change |
 |---|---|
@@ -35,7 +35,10 @@ Branch from `origin/main` (`release/vX.Y.Z-bump` was used for 0.8.0, `release/0.
 | `Cargo.lock` | `cargo update --workspace`. The diff must be exactly the **twelve** `vtop-*` entries and no third-party package; if anything else moved, revert it. Then `cargo check --workspace --locked`. |
 | `helm/vtop/Chart.yaml` | `appVersion: "X.Y.Z"` (it must track the workspace version; GHCR tags follow it). The chart's own `version` follows its contract, not the app: **patch** bump when no template or values changed since the last tag, **minor** when they did (a values-contract change). Check with `git diff vPREV..origin/main --stat -- helm/vtop/templates helm/vtop/values.yaml helm/vtop/ci`. Add the matching comment line above `version:` (0.5.1 for 0.8.0: "no template or values change — the bump carries appVersion 0.8.0"). Nothing in CI ties `appVersion` to `Cargo.toml`, so review it by eye. |
 | `docs/ROADMAP.md` | A section for the release (below), and the forward section renamed to the next release. |
+| `SECURITY.md` | **Minor releases only:** the "Supported versions" row becomes `X.Y.x` (only the latest minor receives security fixes). `scripts/check-security-policy.py` fails the docs build until it matches `Cargo.toml`. |
 | `CITATION.cff` | `version` and `date-released` (the day the tag is pushed, as `YYYY-MM-DD`; v0.8.0 is `2026-11-12`). If the tag goes out on another day, fix the date in a follow-up PR; the tag does not move. |
+| `README.md` | The BibTeX entry's `version = {X.Y.Z}` under "Citing VTOP Engine". Nothing else in the README. |
+| `docs/install/helm.md`, `docs/install/container.md` | The chart version and `appVersion` rows and the `--branch vX.Y.Z` checkout (helm.md), and every `ghcr.io/allamiro/vtop-engine:X.Y.Z` image. `docs/operate/upgrades.md` gets a short "Upgrading from vPREV to vX.Y.Z" section, the operator steps of the ROADMAP section, not a copy of it. |
 
 ### The ROADMAP section
 
@@ -50,6 +53,10 @@ Branch from `origin/main` (`release/vX.Y.Z-bump` was used for 0.8.0, `release/0.
 - **Downgrade is not supported.**
 
 Also retire a stale "Next release" block at the top of the file if what it describes has shipped.
+
+### Status sentences
+
+`scripts/check-release-versions.py` (run by the `docs` workflow) fails when the BibTeX entry, `CITATION.cff`, the chart's `appVersion` or the install pages disagree with `Cargo.toml` (the helm page's chart version row with `Chart.yaml`), and on a dated "As of <month> <year> (repo at vX)" lead-in. It cannot read prose. Before the bump, re-read each present-tense status sentence ("not yet", "planned", "future work", "today", a "Done" or "Not started" list, a checklist box) in `docs/reference/limitations.md`, `docs/PRODUCTION_HA.md` §1, §19 and §23, `docs/ARCHITECTURE.md` §18, `docs/SECURITY_MODEL.md` §14, `docs/COMPARISON.md`, `docs/LIVE_CHAOS_VALIDATION.md` "Scope boundaries" and `docs/introduction/when-to-use.md` against the milestone and the code, and fix what the release made stale in the same PR. A sentence that says something shipped and has not is fixed toward the code.
 
 ### The PR body
 
@@ -126,9 +133,11 @@ Also: the image's `latest` tag moved (only for a non-pre-release), `helm/vtop/Ch
 
 - [ ] Milestone empty or deliberately moved; the bug-only rule respected.
 - [ ] `scripts/check-data-safety-register.py --quiet-days` passes; the quiet-period days are in the bump PR body.
-- [ ] Bump PR touches only Cargo.toml (11 edits), Cargo.lock (12 `vtop-*` entries), Chart.yaml, ROADMAP.md, CITATION.cff.
+- [ ] Bump PR touches only Cargo.toml (11 edits), Cargo.lock (12 `vtop-*` entries), Chart.yaml, ROADMAP.md, CITATION.cff, the README BibTeX version, the install pages and the upgrades page, and status sentences the release made stale.
+- [ ] `python3 scripts/check-release-versions.py` passes; the status sentences were re-read against the milestone and the code.
 - [ ] Chart version bump matches whether templates or values changed.
 - [ ] ROADMAP: upgrade order, one-way changes with reasons, silently ignored keys, known open, no downgrade.
+- [ ] Before the bump PR, on Linux, the ignored delete stress test run by hand on tmpfs, ext4 and overlay, once each (`TMPDIR=<dir on that filesystem> cargo test -p vtop-adapters --lib --locked -- --ignored delete_race_stress --nocapture`; in Docker, `/dev/shm` is tmpfs, the container's `/tmp` is overlay, a named volume is ext4). It must report 0 lines lost; record its summary line (lines written, archived, kept on disk unarchived, deletes, `opened_at_unlink`) in the bump PR. Not a CI gate: a lease behaves by filesystem, and the run is a few minutes of writers racing deletes (#619).
 - [ ] CI green on the exact head; head contains current `main`; merged by REST with `sha` pinned.
 - [ ] Tag is annotated, on the merge commit, and matches `Cargo.toml`.
 - [ ] `release.yml` green; ten assets; `SHA256SUMS`, every Sigstore bundle and the image signature verified; macOS `otool` clean and `minos 11.0`.

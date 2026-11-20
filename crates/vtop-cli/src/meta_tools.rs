@@ -165,6 +165,12 @@ pub enum MetaCommand {
     /// member, or any node that has reported, unless marked dead - has not
     /// reported that level or higher (#634); the refusal names every such
     /// node. See `node-versions`.
+    ///
+    /// From level 8 the metadata leader also asks every metadata voter and
+    /// learner what it runs before it proposes the raise (#706), and refuses
+    /// unless each answers that it supports the level. A voter on v0.9.0 or
+    /// older cannot answer, so it holds the raise back by name; so does one
+    /// that cannot be reached. The leader must run this release.
     EnableFeatures {
         #[command(flatten)]
         common: MetaCommonArgs,

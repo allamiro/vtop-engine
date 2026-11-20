@@ -1,0 +1,1 @@
+{"audit_version":2,"audit_id":"6f1c0a52-2a43-4d87-9b8e-1b2f5d0c7a05","time":"2026-11-14T13:00:00.000Z","actor":{"kind":"os","uid":1001,"name":"future","source":"os"},"action":"ledger.compact","stage":"local","target":{"kind":"table"},"outcome":"success","signature":"a field only version 2 has"}

@@ -21,7 +21,12 @@ setup() {
 # gh release download TAG --repo R --dir D --pattern P ... -> copies
 set -euo pipefail
 case "$1 $2" in
-  "release view") ls "$FAKE_RELEASE" ;;
+  "release view")
+    case "$*" in
+      *isDraft*) echo "draft=${FAKE_DRAFT:-false} prerelease=${FAKE_PRERELEASE:-false}" ;;
+      *) ls "$FAKE_RELEASE" ;;
+    esac
+    ;;
   "release download")
     shift 2
     dir=""
@@ -40,13 +45,18 @@ esac
 GH
     cat > "$BIN/cosign" <<'COSIGN'
 #!/usr/bin/env bash
-# Records its arguments; fails when FAKE_COSIGN_FAIL is set.
+# Reports FAKE_COSIGN_VERSION (default v3.0.2) for `version`; otherwise records
+# its arguments and fails when FAKE_COSIGN_FAIL is set.
+if [[ "${1:-}" == version ]]; then
+  printf 'GitVersion:    %s\n' "${FAKE_COSIGN_VERSION:-v3.0.2}"
+  exit 0
+fi
 echo "$*" > "$FAKE_COSIGN_ARGS"
 [[ -z "${FAKE_COSIGN_FAIL:-}" ]]
 COSIGN
     chmod +x "$BIN/gh" "$BIN/cosign"
     export PATH="$BIN:$PATH" FAKE_RELEASE="$RELEASE" FAKE_COSIGN_ARGS="$WORK/cosign-args"
-    unset FAKE_COSIGN_FAIL
+    unset FAKE_COSIGN_FAIL FAKE_COSIGN_VERSION FAKE_DRAFT FAKE_PRERELEASE
 }
 
 teardown() {
@@ -83,6 +93,40 @@ reseal() {
     # The bundle is checked against the release workflow at THIS tag.
     grep -q -- "--certificate-identity https://github.com/allamiro/vtop-engine/.github/workflows/release.yml@refs/tags/$TAG" "$WORK/cosign-args"
     grep -q -- "--certificate-oidc-issuer https://token.actions.githubusercontent.com" "$WORK/cosign-args"
+}
+
+@test "cosign v2 cannot read the releases' bundles, so it is refused" {
+    make_release vtop-node vtopctl
+    export FAKE_COSIGN_VERSION=v2.4.1
+    run bash "$FETCH" "$TAG" "$CACHE" "$TARGET"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"not cosign v3 or later"* ]]
+    [ ! -e "$WORK/cosign-args" ]
+}
+
+@test "a cosign that does not say its version is refused" {
+    make_release vtop-node vtopctl
+    export FAKE_COSIGN_VERSION=unknown
+    run bash "$FETCH" "$TAG" "$CACHE" "$TARGET"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"not cosign v3 or later"* ]]
+}
+
+@test "a draft release is not downloaded" {
+    make_release vtop-node vtopctl
+    export FAKE_DRAFT=true
+    run bash "$FETCH" "$TAG" "$CACHE" "$TARGET"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"not a published final release"* ]]
+    [ ! -e "$CACHE/$TAG/$ASSET" ]
+}
+
+@test "a pre-release is not downloaded" {
+    make_release vtop-node vtopctl
+    export FAKE_PRERELEASE=true
+    run bash "$FETCH" "$TAG" "$CACHE" "$TARGET"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"not a published final release"* ]]
 }
 
 @test "an archive whose digest is not the one in SHA256SUMS fails" {
@@ -301,6 +345,20 @@ make_bins() {
     run bash "${BATS_TEST_DIRNAME}/../compat/cell.sh" manifest v0.9.0 forward refuse "$WORK/released" "$WORK/head" "newer"
     [ "$status" -eq 1 ]
     [[ "$output" == *"expects pass or hash-failure"* ]]
+}
+
+@test "the ledger cell refuses an expectation it cannot check" {
+    make_bins
+    run bash "${BATS_TEST_DIRNAME}/../compat/cell.sh" ledger-sqlite v0.9.0 forward hash-failure "$WORK/released" "$WORK/head"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"the ledger cell expects pass"* ]]
+}
+
+@test "a ledger cell runs the ledger check, which fails on binaries that do not archive" {
+    make_bins
+    run bash "${BATS_TEST_DIRNAME}/../compat/cell.sh" ledger-sqlite v0.9.0 forward pass "$WORK/released" "$WORK/head"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"ledger-compat/v0.9.0"* ]]
 }
 
 @test "a released binary that is missing fails before anything runs" {

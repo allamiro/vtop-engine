@@ -91,7 +91,8 @@ it missing. Nothing to do unless it repeats; then check the store's health and
 the engine's permission to write beside the manifests
 ```
 
-Alert on it as a warning, not a page:
+Alert on it as a warning, not a page. This rule is an example; it is not in
+the [shipped rule set](monitoring.md#alerts):
 
 ```yaml
 - alert: VtopVerificationReceiptsFailing

@@ -72,11 +72,13 @@ GET /readyz    readiness
 | `vtop_verification_backend_limited_total` | counter | Size-only verification acceptances under `upload.require_strong_verification: false`, counted where `vtop_verified_total` counts verifications: when the running engine marks a batch VERIFIED on a size-only result, and when recovery (or a later pass settling a row it held back) commits a row the ledger records as verified `size_only` - even if the opt-out has been turned off since, as long as its re-check still lets it commit (#664; a row from before #664, with no class, is counted by recovery's storage re-check, as before; a row recovery holds back under a lower incomplete range is logged, not counted). Each is also a WARN with its batch id, and each **accepts same-size corruption** (#629) |
 | `vtop_verification_mode{tenant,mode}` | gauge | Set once at startup: `mode="size_only"` is 1 when `upload.require_strong_verification` is false, `mode="strong"` is 1 otherwise. Alert on `vtop_verification_mode{mode="size_only"} == 1` to catch a lab setting left in production before any batch moves. Exported by `vtopctl run` only, like every series here; the one-shot `process-once` and `replay` serve no endpoint and log the startup WARN instead (#629) |
 | `vtop_object_lock_mode{tenant,mode}` | gauge | The S3 Object Lock profile the engine started with (#684): `mode="governance"` or `mode="compliance"` is 1 with `upload.object_lock` set, `mode="off"` is 1 without it; the others read 0. Set once at startup by `run`, like `vtop_verification_mode` |
-| `vtop_object_lock_checks_total{tenant,result}` | counter | Object Lock checks (#684), primed at zero at startup: one per object and per manifest a batch wrote or reused under the profile, by `result`: `ok`; `missing`, `mode_mismatch`, `too_short`, `legal_hold_missing` (the store did not keep the retention asked for: the batch failed, is replayed, and `vtop_verification_failures_total` counts it too); `error` (the retention could not be read, or the backend asked for none); `bucket_not_locked` (a batch refused at the first upload to a templated bucket without Object Lock). **Alert on any increase of a result other than `ok`.** Each failure is an ERROR `object_lock_check_failed` (or `object_lock_bucket_refused`) event with the batch id, URI and result |
+| `vtop_object_lock_checks_total{tenant,result}` | counter | Object Lock checks (#684), primed at zero at startup: one per object and per manifest a batch wrote or reused under the profile, by `result` (a replay's look at an object before reusing it, #709, is a key decision in `vtop_object_key_decisions_total` and is counted here only when the read fails, as `error`): `ok`; `missing`, `mode_mismatch`, `too_short`, `legal_hold_missing` (the store did not keep the retention asked for: the batch failed, is replayed, and `vtop_verification_failures_total` counts it too); `error` (the retention could not be read, or the backend asked for none); `bucket_not_locked` (a batch refused at the first upload to a templated bucket without Object Lock); `store_unsupported` (the same, on a store that answered "not implemented" to the Object Lock check, #722). **Alert on any increase of a result other than `ok`.** Each failure is an ERROR `object_lock_check_failed` (or `object_lock_bucket_refused`) event with the batch id, URI and result |
 | `vtop_replay_required_total` | counter | Work being repeated |
-| `vtop_file_delete_decisions_total{outcome}` | counter | Every `sources.file.delete_after_commit` decision about a fully archived file (#619): `deleted`, or why it was kept - `appended`, `shorter`, `other_file`, `rewritten`, `unprovable`, `metadata_changed`, `gone`, `symlink`, `open`, `no_open_check`, `rename_refused`, `failed`, `stale_commit` - plus `leftover_archived` (a file found under a delete's hidden name, archived as its own source) and `opened_at_unlink` (a late open slipped past the delete; an error is logged). Each count has a log line naming the path, what happened and what to do. A rising `no_open_check` or `rename_refused` means files that stay until the operator acts |
+| `vtop_file_delete_decisions_total{outcome}` | counter | Every `sources.file.delete_after_commit` decision about a fully archived file (#619): `deleted`, `deleted_unchecked` (deleted under `sources.file.delete_without_open_check` with no lease, so nothing proved that no process had it open), or why it was kept - `appended`, `shorter`, `other_file`, `rewritten`, `unprovable`, `metadata_changed`, `links_changed` (its link count changed: another name of it was deleted, or a hard link made), `gone`, `symlink`, `open`, `no_open_check`, `rename_refused`, `failed`, `stale_commit` - plus `leftover_archived` (a file found under a delete's hidden name, archived as its own source) and `opened_at_unlink` (an open reached the file between the final check and the unlink; an error is logged, and what that process writes is not archived - or a warning, when the file keeps another hard link that is a source this engine reads). An `opened_at_unlink` delete is also counted as `deleted`, so do not add the two to count deletes. Each count has a log line naming the path, what happened and what to do. A rising `no_open_check` or `rename_refused` means files that stay until the operator acts. Alert on `increase(vtop_file_delete_decisions_total{outcome="deleted_unchecked"}[1h]) > 0`: an operator is living with the opt-in's two windows (see `delete_without_open_check`) |
 | `vtop_recovery_rechecks_total` | counter | VERIFIED batches recovery re-checked against storage at startup (#664), labelled by `verification_class` - the class the ledger recorded the batch was verified with: `strong`, `size_only`, or `unknown` for a row from before #664 or one carrying a class a newer release wrote - and `result`, what the re-check found: `strong`, `size_only`, `failed`, `unsupported_version`. A row held back is re-checked, and counted, at every restart. Alert on `verification_class="strong", result="size_only"`: content verified strongly that the store can no longer confirm (the commit is still counted as strong, and logged as a WARN with the batch id); restore checksum support on the backend (checksums enabled, a backend that can hash the stored bytes), then run `vtopctl scrub`, which uses the same check |
 | `vtop_recovery_unsupported_manifest_total` | counter | VERIFIED batches whose manifest recovery found to be from a newer release than the engine reads (#671), proven to be the writer's pinned version. They are left VERIFIED (or retired SUPERSEDED once their source has committed past them), never replayed. Non-zero means an engine is older than a writer sharing its ledger, which the upgrade order rules out: upgrade that engine |
+| `vtop_recovery_held_total{tenant,source_type,reason}` | counter | Ranges recovery held instead of rewinding (#639, #782), by `reason`: `ledger_write_failed` (the state store refused the `FAILED` or `REPLAY_REQUIRED` write of the replay decision) or `newer_manifest` (a VERIFIED batch written by a newer release, #671). A held range holds back every VERIFIED range above it in its source unit, and a rewind above it starts at it instead, so nothing is skipped. `ledger_write_failed` above zero means the state store is refusing writes: check its disk, permissions and connectivity. The batch id and the error are in the ERROR line beside it. |
+| `vtop_recovery_rewinds_lowered_total{tenant,source_type}` | counter | Rewinds recovery applied at the start of a held range of the same source unit below them, instead of their own (#782). Applied at their own start, they moved the read head past the held range. Each one means the held range is read again with the ranges above it, which are archived twice; it follows a `vtop_recovery_held_total` increase and needs no action of its own. |
 | `vtop_failed_total` | counter | Batches that hit FAILED |
 | `vtop_manifest_authentications_total{key_id,result}` | counter | Manifest MAC checks (#685): the engine's read-back of each stored manifest, and recovery's re-check. Each configured key's `ok`/`failed` series, each tombstone's `retired_key` and `other`/`unknown_key` are created at zero at startup, so `increase()` catches the first one. `key_id` is a configured key id, `none` (a key with no id, or a manifest with no id where no key is `legacy`) or `other` (an id this process does not hold); never an id read from a manifest. `result` is `ok`, `failed`, `unknown_key` or `retired_key`. `unknown_key` means a process lacks a key that signed part of the archive: add it as verify-only. Unauthenticated, not corrupt: the scrub and recovery treat it as `unauthenticated`, and their messages name the key id |
 | `vtop_manifests_written_total{tenant,version}` | counter | Manifests stored, by the version written (`manifest.write_version`, #671): `0.3` or `0.4`. A `0.4` sample means every reader of the archive must run v0.8.0 or later; v0.7.0 and earlier report those manifests as tampered. The startup INFO line names the version and why |
@@ -95,33 +97,18 @@ GET /readyz    readiness
 | `vtop_multipart_parts_total{result}` | counter | Multipart parts (#668), by `result`: `uploaded` (sent in this upload call; a call that restarts on a new upload counts what it sent to each, since both crossed the link), `reused` (kept from an earlier call, matched against the local bytes and not sent again), `retried` (one per extra attempt at a part), `failed` (the part's last attempt in the call failed). Throttled part requests are also in `vtop_upload_throttled_total{stage="object_upload"}`. |
 | `vtop_multipart_sessions_total{outcome}` | counter | Multipart sessions (#668), by `outcome`: `completed`, `resumed` (a replay adopted the session a failed attempt kept), `restarted` (the store could not continue the upload, `NoSuchUpload` or `InvalidPart` on complete; it was abandoned and a new one started; `resumed` stays counted if it had been resumed), `kept_after_failure` (an upload failed and its session and parts were kept for the replay), `swept` (an abandoned session's upload was aborted). **Alert when `kept_after_failure` grows while `resumed` and `swept` do not**: incomplete uploads are piling up in the bucket, where their parts are billed (see `docs/PRODUCTION_HA.md` §7.6). `resumed`, `restarted`, `kept_after_failure` and `swept` are also `multipart_*` log events (`multipart_session_resumed`, `multipart_session_restarted`, `multipart_session_kept`, `multipart_sweep`) with the object `key`; a part retry is a `multipart_part_retry` event, at most one a minute per object with a `suppressed` count. |
 | `vtop_multipart_bytes_reused_total` | counter | Bytes of kept parts a resumed upload did not send again (#668): what keeping sessions saved. |
-| `vtop_object_key_decisions_total{decision}` | counter | How each batch's object key was decided (#626). `derived` and `reused` are the normal path: `reused` is a replay that found its verified object and uploaded nothing. A rising `fallback_differs` (an object at the key does not verify; run `vtopctl scrub`), `fallback_size_only`, `fallback_unreadable` (an object at the key could not be read back), `fallback_unchecked` (the store refused or failed the check of the key; a 403 means a missing list permission) or `per_attempt` (no checksum, or a command backend) means replays write second objects. `probe_throttled` batches failed and were handed back. Each decision is also an `object_key_*` log event with `batch_id`, `source`, `range` and `key`; the repeating `per_attempt` and `fallback_unchecked` notices are logged at most once a minute per source with a `suppressed` count. |
+| `vtop_object_key_decisions_total{decision}` | counter | How each batch's object key was decided (#626). `derived` and `reused` are the normal path: `reused` is a replay that found its verified object and uploaded nothing. A rising `fallback_differs` (an object at the key does not verify; run `vtopctl scrub`), `fallback_size_only`, `fallback_unreadable` (an object at the key could not be read back), `fallback_unchecked` (the store refused or failed the check of the key; a 403 means a missing list permission) or `per_attempt` (no checksum, or a command backend) means replays write second objects. `probe_throttled` batches failed and were handed back. Under the S3 Object Lock profile (#709), a replay whose verified object at the key is not locked as configured writes a fresh locked object under its attempt key instead: `fallback_lock_elapsed` (its lock ended; if this keeps rising, ranges wait longer than `retain_days` for their replay), `fallback_unlocked` (it has no lock: stored before the profile, or by a store that dropped the headers), `fallback_lock_mode` (the other mode) or `fallback_hold_missing`. The engine remembers the fresh key per range for the process: a replay reuses it when it is usable, and when it is there and not usable either (a store that does not keep the lock) writes nothing for five minutes, counted as `lock_withheld`. These are WARN `object_key_fallback` events naming the batch, the old `key` and the new `fallback_key`, at most once a minute per source and kind. Alert on `increase(...{decision=~"fallback_unlocked|fallback_lock_mode|fallback_hold_missing|lock_withheld"}[1h]) > 0` as a warning; the series is not primed, so the first one in a new series is missed by `increase()`. A retention that cannot be read is not a fallback: the batch fails and `vtop_object_lock_checks_total{result="error"}` counts it. Each decision is also an `object_key_*` log event with `batch_id`, `source`, `range` and `key`; the repeating `per_attempt` and `fallback_unchecked` notices are logged at most once a minute per source with a `suppressed` count. |
+| `vtop_replay_rebuilds_total{tenant,source_type,format,result}` | counter | What each replay of a window an earlier attempt sealed came to (#626). `exact`: the window covers exactly the recorded range and was sealed at the recorded instant, so it is filed under the same hour and names the same key as the failed attempt (the `reused` decision above is what then skipped the upload). `bytes_differ`: the window covers exactly the recorded range, but its digest differs from the object the earlier attempt uploaded, so a second object is written and the first is left untouched (compression, format or checksum settings changed, or the source's content did). `fallback`: the same range and bytes, but the key decision fell back to the per-attempt key (the `fallback_*` or `per_attempt` decision says why), so a second object is written. `refused`: the re-read could not stop at the recorded end (a line crosses it, the file under it was replaced, a rotated file's re-read), so it read to the current end as before. `too_large`: the range is over 4x the current batching limits and was not bounded. `dropped_at_stop`: the engine stopped inside a rebuild and dropped the partial window; the next start reads it again. **Alert on any increase of `bytes_differ`, `fallback`, `refused` or `too_large`**: `increase(vtop_replay_rebuilds_total{result=~"bytes_differ|fallback|refused|too_large"}[1h]) > 0` means replays are likely writing second objects; under the Object Lock profile each is retained until its date. Each result is also a log event with `batch_id`, `earlier_batch_id`, `source`, `range` and `key`: `replay_rebuilt` (INFO), `replay_key_fallback` (INFO), `replay_bytes_differ`, `replay_bound_refused` (rate-limited, with `suppressed`), `replay_bound_too_large` and `replay_window_dropped` (WARN). No range, key or path is a label. `vtop_object_key_decisions_total` keeps its decisions unchanged. |
 
 ### Multipart sessions
 
 A failed multipart upload keeps its session and completed parts so the replay
 resumes it (#668). They are billed storage until the upload completes or is
 aborted, so watch that kept sessions are resumed or swept rather than piling
-up. An example rule:
-
-```yaml
-groups:
-  - name: vtop-multipart
-    rules:
-      # Sessions kept after failures, with none resumed and none swept, for
-      # longer than the abandon window (24 h by default): replays are not
-      # resuming them and the sweep is not reaching them. Check the engine's
-      # multipart_sweep_failed events and the bucket's lifecycle rule.
-      - alert: VtopMultipartSessionsPilingUp
-        expr: |
-          sum(increase(vtop_multipart_sessions_total{outcome="kept_after_failure"}[26h])) > 0
-          and on()
-          sum(increase(vtop_multipart_sessions_total{outcome=~"resumed|swept"}[26h])) == 0
-        for: 1h
-        labels: { severity: warning }
-        annotations:
-          summary: Incomplete multipart uploads are kept and never resumed or swept
-```
+up: the shipped rule `VtopMultipartSessionsPiling` (see
+[Alert rules](#alert-rules)) fires when a session was kept 30 to 36 hours ago, past the 24 h abandon window
+and the 6 h sweep interval, and none was resumed and none swept for 36 hours.
+A session the sweep is not yet due to abort does not raise it.
 
 ### Retention loss
 
@@ -226,6 +213,19 @@ A range whose log start is not moving has no estimate (no division by zero),
 and a group that retention has already passed pages on the first rule, not the
 second. Groups that commit through the Kafka gateway (#457) are metadata
 cursors and appear here.
+
+### Kafka gateway refusals
+
+A data node's Kafka gateway counts what it refuses in
+`vtop_kafka_requests_refused_total{api,reason}` (#596); its log lines for
+the same refusals repeat only at powers of two, with the running total.
+Both labels are a fixed set, and on a node that runs a gateway every series
+is exported from the first scrape at zero:
+
+| `api` | `reason` | What it means, and what to do |
+|---|---|---|
+| `offset_commit` | `no_offset_store` | A consumer committed offsets to a node with no metadata plane (a static leader or a standalone node). Nothing was stored; the client was answered `INVALID_REQUEST`. A consumer with auto-commit on logs it and keeps reading; an explicit commit fails. Run the node as a leased leader on a metadata plane, or set `enable.auto.commit=false` on consumers that do not need committed offsets. |
+| `unserved` | `unserved_api` | A client sent a request the gateway does not serve (CreateTopics, DescribeConfigs, ...), and the connection was closed. The log line names the api key. Topics are created on the metadata plane (`vtopctl meta create-topic`), not through the Kafka API. |
 
 ### Archive scrub
 
@@ -339,6 +339,32 @@ produces.
   identical to a broken scrape. An incident counter must read `0`, not blank.
 - **Telemetry can never break the data path.** A bad `VTOP_METRICS_ADDR`, a port
   clash, or a registry failure logs an error and the engine keeps archiving.
+
+## Alert rules
+
+[`prometheus/vtop-rules.yaml`](prometheus/vtop-rules.yaml) is the engine's
+Prometheus rule set (#720): verification failures, no commits while data is
+waiting, a replay-rate spike, Kafka lag growth (from kafka-exporter), size-only
+verification, failed Object Lock checks, retention loss, refused replays, a
+state store refusing recovery's replay decisions, and piling multipart
+sessions. Each alert has a firing and a quiet promtool unit
+test in [`prometheus/tests/`](prometheus/tests/vtop-rules.test.yaml) and a
+`runbook_url` to its section of
+[`docs/operate/runbooks.md`](../docs/operate/runbooks.md); the objectives they
+protect are in [`docs/operate/slos.md`](../docs/operate/slos.md). The Helm
+chart ships a copy as a `PrometheusRule` (`metrics.prometheusRule.enabled`),
+kept identical by CI.
+
+```bash
+docker run --rm --network none -v "$PWD/observability/prometheus:/rules:ro" -w /rules \
+  --entrypoint promtool prom/prometheus:v3.15.1 test rules tests/vtop-rules.test.yaml
+python3 scripts/check-alert-runbooks.py   # every alert: a runbook section and both tests
+```
+
+The lab does not run Prometheus or Alertmanager; Mimir stores the metrics and
+Grafana evaluates its own provisioned rules (see the scope list below). The
+two sets are described side by side on
+[Metrics and alerts](../docs/operate/monitoring.md#alerts).
 
 ## The audit trail
 

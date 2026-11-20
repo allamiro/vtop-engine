@@ -5,7 +5,8 @@
 # toolchain makes of that source, not what operators installed.
 #
 # Checks, in order, each failing closed:
-#   1. the tag is a final release (vX.Y.Z), and it has an archive for TARGET;
+#   1. the tag is a final release (vX.Y.Z) with a published release (not a
+#      draft or a pre-release), and that release has an archive for TARGET;
 #   2. the archive is listed in the release's SHA256SUMS, and its digest
 #      matches (a corrupted or swapped download);
 #   3. its Sigstore bundle verifies against the release workflow AT THAT TAG
@@ -25,7 +26,9 @@
 # archive for TARGET.
 #
 # Environment: GH_TOKEN for `gh`; COSIGN (default `cosign`) names the
-# binary; FETCH_RELEASE_REPO (default allamiro/vtop-engine).
+# binary, which must be cosign v3 or later: releases are signed in the new
+# bundle format, which cosign v2 cannot read; FETCH_RELEASE_REPO (default
+# allamiro/vtop-engine).
 set -euo pipefail
 
 usage() { echo "usage: fetch-release.sh <tag> <cache-dir> [target]" >&2; exit 2; }
@@ -49,8 +52,15 @@ ISSUER="https://token.actions.githubusercontent.com"
 
 dir="$(mkdir -p "$CACHE/$TAG" && cd "$CACHE/$TAG" && pwd)"
 
+# Only a published release has assets worth running: a tag whose release is a
+# draft (or still being built) is not downloaded.
 download() {
-  local names
+  local names state
+  state="$(gh release view "$TAG" --repo "$REPO" --json isDraft,isPrerelease \
+    --jq '"draft=\(.isDraft) prerelease=\(.isPrerelease)"')" \
+    || fail "cannot read the release of $TAG"
+  [[ "$state" == "draft=false prerelease=false" ]] \
+    || fail "$TAG is not a published final release ($state)"
   names="$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name')" \
     || fail "cannot read the assets of $TAG"
   if ! grep -qxF "$ASSET" <<< "$names"; then
@@ -64,6 +74,16 @@ download() {
     --pattern "$ASSET" --pattern "$BUNDLE" --pattern SHA256SUMS >&2 \
     || fail "download failed"
 }
+
+# Releases are signed in the Sigstore bundle format cosign v3 writes; cosign
+# v2 cannot read it and would report every release as unverifiable.
+require_cosign_3() {
+  local major
+  major="$("$COSIGN" version 2>&1 | sed -n 's/^GitVersion:[[:space:]]*v\{0,1\}\([0-9][0-9]*\)\..*/\1/p' | head -n 1)"
+  [[ "$major" =~ ^[0-9]+$ && "$major" -ge 3 ]] \
+    || fail "$COSIGN is not cosign v3 or later (the releases' bundles need it): '${major:-unknown}'"
+}
+require_cosign_3
 
 # 2 and 3: the digest and who built it. Prints why on failure and returns
 # non-zero, so a bad CACHED copy can be fetched once more before failing.

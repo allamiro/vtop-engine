@@ -104,6 +104,17 @@ class Matrix(unittest.TestCase):
             ],
         )
 
+    def test_an_only_newest_cell_runs_the_newest_release_alone_in_every_mode(self):
+        cells = dict(EXPECTED["cells"], ledger={"since": "v0.7.0", "directions": ["forward"],
+                                                "only_newest": True})
+        expected = dict(EXPECTED, cells=cells)
+        for mode in ("full", "pr"):
+            got = [r for r in rows(select.matrix(expected, TAGS, mode)) if r[0] == "ledger"]
+            self.assertEqual(got, [("ledger", "v0.9.0", "forward", "pass")], mode)
+        # A newer release replaces it the day it is published.
+        got = [r for r in rows(select.matrix(expected, TAGS + ["v0.10.0"], "full")) if r[0] == "ledger"]
+        self.assertEqual(got, [("ledger", "v0.10.0", "forward", "pass")])
+
     def test_an_exact_tag_exception(self):
         expected = dict(EXPECTED, exceptions=[
             {"cell": "ledger-sqlite", "direction": "forward", "tags": ["v0.8.0"],
@@ -191,6 +202,13 @@ class Validation(unittest.TestCase):
             dict(EXPECTED, cells={"manifest": {"since": "v9.0.0", "directions": ["forward"]}},
                  exceptions=[]),
             "no cell",
+        )
+
+    def test_only_newest_must_be_a_boolean(self):
+        self.check_refused(
+            dict(EXPECTED, cells={"manifest": {"since": "v0.7.0", "directions": ["forward"],
+                                               "only_newest": "yes"}}, exceptions=[]),
+            "only_newest",
         )
 
     def test_an_unknown_direction_is_refused(self):
