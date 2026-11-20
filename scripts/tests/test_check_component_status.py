@@ -178,3 +178,27 @@ class CheckTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StripCommentsTests(unittest.TestCase):
+    """HTML comments are removed by a scan that carries its state across lines."""
+
+    def test_comments_are_removed_on_one_line_and_across_lines(self):
+        strip = MOD.strip_comments
+        cases = [
+            ("a <!-- b --> c", False, ("a  c", False)),
+            ("a <!-- b", False, ("a ", True)),
+            ("still in", True, ("", True)),
+            ("end --> after", True, (" after", False)),
+            ("x <!-- 1 --> y <!-- 2 --> z", False, ("x  y  z", False)),
+            ("--> a <!-- b", True, (" a ", True)),
+            ("no comment", False, ("no comment", False)),
+        ]
+        for line, state, want in cases:
+            with self.subTest(line=line, in_comment=state):
+                self.assertEqual(strip(line, state), want)
+
+    def test_a_claim_inside_a_multi_line_comment_is_not_read(self):
+        text = "Fine prose.\n<!--\nVTOP is production-ready.\n-->\nMore prose.\n"
+        lines = [s for _, s in MOD.sentences(text)]
+        self.assertFalse(any("production-ready" in s for s in lines), lines)

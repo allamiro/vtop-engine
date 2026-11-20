@@ -214,6 +214,33 @@ def scan_targets(root: pathlib.Path) -> list[pathlib.Path]:
     return [p for p in pages if p.is_file() and p.relative_to(root).as_posix() not in SKIP]
 
 
+def strip_comments(line: str, in_comment: bool) -> tuple[str, bool]:
+    """The visible part of one line, and whether a comment is still open after it.
+
+    A plain scan rather than a regular expression: an HTML comment can open on
+    one line and close on a later one, and several can open and close on the
+    same line, so the state carries from line to line.
+    """
+    visible: list[str] = []
+    rest = line
+    while rest:
+        if in_comment:
+            end = rest.find("-->")
+            if end < 0:
+                return "".join(visible), True
+            rest = rest[end + 3 :]
+            in_comment = False
+        else:
+            start = rest.find("<!--")
+            if start < 0:
+                visible.append(rest)
+                break
+            visible.append(rest[:start])
+            rest = rest[start + 4 :]
+            in_comment = True
+    return "".join(visible), in_comment
+
+
 def sentences(text: str):
     """(line number, sentence) for prose outside code fences and comments."""
     in_fence = False
@@ -224,15 +251,7 @@ def sentences(text: str):
             continue
         if in_fence:
             continue
-        line = re.sub(r"<!--.*?-->", "", raw)
-        if in_comment:
-            if "-->" not in line:
-                continue
-            line = line.split("-->", 1)[1]
-            in_comment = False
-        if "<!--" in line and "-->" not in line.split("<!--", 1)[1]:
-            line = line.split("<!--", 1)[0]
-            in_comment = True
+        line, in_comment = strip_comments(raw, in_comment)
         for piece in SENTENCE_END.split(line):
             if piece.strip():
                 yield number, piece
