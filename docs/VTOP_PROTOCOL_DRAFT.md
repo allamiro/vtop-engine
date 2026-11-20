@@ -3,9 +3,12 @@
 **Verified Telemetry Object Protocol (VTOP)**
 
 Status: Draft / proposed protocol
-Version: 0.3 (reference implementation specification; 0.2 added the optional
+Version: 0.4 (reference implementation specification; 0.2 added the optional
 keyed BLAKE3 manifest authenticator, §11.2 and §18; 0.3 makes a manifest's
-`source_progress` span the whole batch, §11.2)
+`source_progress` span the whole batch, §11.2; 0.4 hashes and authenticates
+the stored document in a canonical form and adds `verification_plan` and the
+MAC key id, §11.2. The reference implementation reads `0.1` to `0.4` and
+writes `0.3` unless `manifest.write_version: "0.4"` is set)
 
 > This document describes a **proposed protocol** and accompanies a **reference implementation** ("VTOP Engine"). It is a draft for technical review and is part of an **invention-disclosure support package**. It does not describe a shipped standard.
 
@@ -700,7 +703,12 @@ cut (rewritten, truncated, removed by retention or compaction), a range over
 4x the current batching limits, a row written before v0.10.0 (no recorded
 instant), and a range whose row a power loss rolled back. Manifests stay per
 attempt. Without a checksum, or when the backend cannot report an absent key,
-the object is named by the `batch_id` as above.
+the object is named by the `batch_id` as above. Under the reference engine's
+S3 Object Lock profile (#684), an object at the key is reused only if it is
+also still locked as configured (the configured mode, a date ahead, the legal
+hold when configured); otherwise the batch is written as a new, locked object
+named by the `batch_id`, and the object at the key is left untouched (#709). A
+retention the store cannot report fails the batch rather than choosing either.
 
 ### 15.2 Per-format bucket templating
 
