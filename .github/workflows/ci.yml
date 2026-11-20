@@ -66,6 +66,7 @@ jobs:
       chaos: ${{ steps.filter.outputs.chaos }}
       upgrade: ${{ steps.filter.outputs.upgrade }}
       manifest_compat: ${{ steps.filter.outputs.manifest_compat }}
+      restore_drill: ${{ steps.filter.outputs.restore_drill }}
       helm: ${{ steps.filter.outputs.helm }}
       file_source: ${{ steps.filter.outputs.file_source }}
       prometheus_rules: ${{ steps.filter.outputs.prometheus_rules }}
@@ -287,6 +288,7 @@ jobs:
               - 'scripts/upgrade-compat.sh'
               - 'scripts/manifest-compat.sh'
               - 'scripts/ledger-compat.sh'
+              - 'scripts/restore-drill.sh'
               # The live-chaos harness is executable shell that gates every
               # distributed-systems claim this project makes, and it was
               # unlinted: a change to lib.sh — sourced by every scenario —
@@ -408,6 +410,24 @@ jobs:
               - 'rust-toolchain*'
               - 'scripts/manifest-compat.sh'
               - 'scripts/ledger-compat.sh'
+              - '.github/workflows/ci.yml'
+            # The SQLite ledger's backup and restore drill (#734): an engine,
+            # the ledger it writes, and the audit and scrub that read the
+            # result. The crates are the ones that change what the drill
+            # observes (the ledger, the state machine and recovery, the file
+            # source, the CLI that runs them), not every crate.
+            restore_drill:
+              - 'crates/vtop-state/**'
+              - 'crates/vtop-core/**'
+              - 'crates/vtop-adapters/**'
+              - 'crates/vtop-upload/**'
+              - 'crates/vtop-cli/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.cargo/**'
+              - 'rust-toolchain*'
+              - 'scripts/restore-drill.sh'
+              - 'docs/operate/backup-and-recovery.md'
               - '.github/workflows/ci.yml'
   build-and-test:
     name: fmt + clippy + test + build
@@ -1270,6 +1290,7 @@ jobs:
             scripts/k8s-smoke.sh scripts/k8s-forward.sh scripts/e2e-smoke.sh \
             scripts/upgrade-compat.sh \
             scripts/manifest-compat.sh scripts/ledger-compat.sh \
+            scripts/restore-drill.sh \
             scripts/traffic-snapshot.sh scripts/test-progress.sh \
             scripts/check-naming.sh scripts/check-egress-claims.sh \
             scripts/check-failpoints-absent.sh scripts/kafka-broker.sh
@@ -2492,6 +2513,50 @@ jobs:
 
   # The Postgres backend (Phase 3) must pass the SAME behavioural battery as
   # SQLite, and its DB-level invariant trigger must reject a bypass, with
+  # The SQLite ledger's backup and restore, drilled (#734): an engine archives a
+  # growing file, the ledger is backed up with the online backup API while it
+  # runs, the engine is killed and the ledger destroyed, and the restore
+  # (docs/operate/backup-and-recovery.md) is followed by an engine that must
+  # resume with no hole (`audit-coverage --check-storage`, `scrub --sample`)
+  # and by RPO and RTO inside the documented bounds. The PostgreSQL modes run
+  # from postgres-matrix.yml, nightly, on the pinned images.
+  restore-drill-sqlite:
+    name: restore drill (sqlite)
+    needs: changes
+    if: needs.changes.outputs.restore_drill == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      # The upgrade-compat job's key: the same `vtopctl` build, so a hit costs a
+      # relink and this job adds no cache entry of its own.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-upgrade-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build vtopctl
+        run: cargo build -p vtop-cli --no-default-features --bin vtopctl
+      - name: Back up, destroy, restore and resume
+        env:
+          RESTORE_DRILL_WORKDIR: ${{ runner.temp }}/restore-drill-sqlite
+        run: scripts/restore-drill.sh sqlite target/debug/vtopctl
+      - name: Keep the measurements and logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: restore-drill-sqlite
+          path: |
+            ${{ runner.temp }}/restore-drill-sqlite/result.json
+            ${{ runner.temp }}/restore-drill-sqlite/logs
+          if-no-files-found: ignore
+          retention-days: 30
+
   # `vtopctl migrate`, a ledger restore and the engine's recovery (#723).
   # The jobs and the pinned images live in postgres-matrix.yml, which also
   # runs all five supported majors nightly. Here, on a change the `postgres`

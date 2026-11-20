@@ -143,10 +143,12 @@ it.
   one-way step is justified in its pull request and has a refusal test. (The
   SQLite ledger has no such gate yet; see the change rules.)
 - **After a feature level is raised,** the metadata tier can go back only by
-  restoring a backup taken before the raise. That restore will be documented
-  and drilled with the backup work
-  ([#734](https://github.com/allamiro/vtop-engine/issues/734)); until then
-  there is no tested way back after a raise, and there is no export tool.
+  restoring a backup taken before the raise. The ledger's restore is
+  documented and drilled
+  ([#734](https://github.com/allamiro/vtop-engine/issues/734),
+  [Backup and recovery](../operate/backup-and-recovery.md)); the metadata
+  tier's is not, so there is no tested way back after a raise, and there is no
+  export tool.
 
 What an older binary does with newer data, by case:
 
