@@ -116,7 +116,8 @@ jobs:
         run: |
           cargo test --locked --no-run -p vtop-upload \
             --test live_s3_verification --test transport_conformance \
-            --test live_s3_multipart_resume --test live_s3_object_lock
+            --test live_s3_multipart_resume --test live_s3_object_lock \
+            --test live_s3_probes
           cargo test --locked --no-run -p vtop-cli \
             --test live_s3_object_lock_engine --test live_s3_verification_receipts
       - name: Assume the test role (OIDC, no stored keys)
@@ -147,7 +148,7 @@ jobs:
               cargo test --locked -p vtop-upload \
               --test live_s3_verification --test transport_conformance \
               --test live_s3_multipart_resume --test live_s3_object_lock \
-              -- --ignored --test-threads=1 || status=1
+              --test live_s3_probes -- --ignored --test-threads=1 || status=1
             AWS_REQUEST_CHECKSUM_CALCULATION=$mode VTOP_TEST_S3_RESULTS="$results" \
               cargo test --locked -p vtop-cli \
               --test live_s3_object_lock_engine --test live_s3_verification_receipts \
