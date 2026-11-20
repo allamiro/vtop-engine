@@ -137,10 +137,14 @@ fn store_blocking(
         use std::io::Write;
         let mut src = std::fs::File::open(local_path)?;
         let mode = src.metadata()?.permissions();
-        let mut out = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&staging)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // Owner-only from the first byte: the source's own mode is applied
+        // after the copy, and until then a umask-default 0644 file would let
+        // another user read a 0600 object as it is written.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut out = options.open(&staging)?;
         std::io::copy(&mut src, &mut out)?;
         out.flush()?;
         // The source's mode, as a copy keeps it, set through the handle so a
@@ -667,5 +671,28 @@ mod tests {
             b"payload"
         );
         assert!(rec.events().iter().any(|e| e.starts_with("file ")));
+    }
+
+    /// The stored object has the source's mode, as a copy keeps it (the
+    /// staging file starts owner-only and takes the source's mode through its
+    /// handle, so a 0600 source is never exposed as a 0644 file mid-copy).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_stored_object_keeps_the_source_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        for mode in [0o600, 0o640, 0o444] {
+            let root = tempfile::tempdir().unwrap();
+            let b = LocalFsBackend::new(root.path());
+            let f = tmp(b"payload");
+            std::fs::set_permissions(f.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+            let uri = "s3://bkt/mode.gz";
+            b.put_object(f.path(), uri, None).await.unwrap();
+            let got = std::fs::metadata(b.object_path(uri).unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(got, mode);
+        }
     }
 }
