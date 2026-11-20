@@ -343,9 +343,9 @@ pub fn current_ids() -> Option<(String, String)> {
 
 /// Register the exporter's counters into `registry`, and make it the registry
 /// the OTLP metrics export reads. Call once the process has its registry.
-pub fn register_registry(registry: &prometheus::Registry) -> Result<(), prometheus::Error> {
+pub fn register_registry(registry: &vtop_surface::Registry) -> Result<(), prometheus::Error> {
     stats::register(registry)?;
-    metrics::set_registry(registry);
+    metrics::set_registry(registry.prometheus());
     Ok(())
 }
 

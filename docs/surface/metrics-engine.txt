@@ -1,0 +1,47 @@
+# Generated from the code by scripts/update-surface-snapshots.sh (#719); do not edit by hand. One item per line, sorted.
+vtop_audit_events_total counter action,outcome
+vtop_audit_write_failures_total counter sink
+vtop_batch_duration_seconds histogram format,source_type,tenant
+vtop_batches_total counter format,source_type,state,tenant
+vtop_bytes_in_total counter format,source_type,tenant
+vtop_bytes_out_total counter format,source_type,tenant
+vtop_commits_total counter format,source_type,tenant
+vtop_compression_ratio histogram format,source_type,tenant
+vtop_failed_total counter format,source_type,tenant
+vtop_file_delete_decisions_total counter outcome
+vtop_inflight_batches gauge
+vtop_kafka_partition_events_total counter event
+vtop_manifest_authentications_total counter key_id,result
+vtop_manifests_written_total counter tenant,version
+vtop_multipart_bytes_reused_total counter
+vtop_multipart_parts_total counter result
+vtop_multipart_sessions_total counter outcome
+vtop_object_key_decisions_total counter decision,format,source_type,tenant
+vtop_object_lock_checks_total counter result,tenant
+vtop_object_lock_mode gauge mode,tenant
+vtop_otel_export_failures_total counter signal
+vtop_otel_export_queue_length gauge
+vtop_otel_metric_points_dropped_total counter
+vtop_otel_metric_points_exported_total counter
+vtop_otel_spans_dropped_total counter reason
+vtop_otel_spans_exported_total counter
+vtop_records_total counter format,source_type,tenant
+vtop_recovery_held_total counter reason,source_type,tenant
+vtop_recovery_rechecks_total counter format,result,source_type,tenant,verification_class
+vtop_recovery_rewinds_lowered_total counter source_type,tenant
+vtop_recovery_unsupported_manifest_total counter format,source_type,tenant
+vtop_replay_rebuilds_total counter format,result,source_type,tenant
+vtop_replay_required_total counter format,source_type,tenant
+vtop_retention_lost_records_total counter source_type,tenant
+vtop_secret_file_permission_overrides_total counter
+vtop_source_read_errors_total counter source_type,tenant
+vtop_source_replay_refused_total counter source_type,tenant
+vtop_stage_duration_seconds histogram format,source_type,stage,tenant
+vtop_upload_egress_bytes_total counter
+vtop_upload_throttled_total counter format,source_type,stage,tenant
+vtop_upload_width gauge
+vtop_verification_backend_limited_total counter format,source_type,tenant
+vtop_verification_failures_total counter format,source_type,tenant
+vtop_verification_mode gauge mode,tenant
+vtop_verification_receipts_total counter result,tenant
+vtop_verified_total counter format,source_type,tenant

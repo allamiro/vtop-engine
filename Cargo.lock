@@ -4060,6 +4060,7 @@ dependencies = [
  "vtop-observe",
  "vtop-protocol",
  "vtop-state",
+ "vtop-surface",
  "vtop-upload",
 ]
 
@@ -4084,6 +4085,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "vtop-surface",
  "zstd",
 ]
 
@@ -4162,6 +4164,7 @@ dependencies = [
  "vtop-meta",
  "vtop-observe",
  "vtop-protocol",
+ "vtop-surface",
 ]
 
 [[package]]
@@ -4194,6 +4197,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
+ "vtop-surface",
 ]
 
 [[package]]
@@ -4221,6 +4225,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vtop-core",
+]
+
+[[package]]
+name = "vtop-surface"
+version = "0.10.1"
+dependencies = [
+ "clap",
+ "prometheus",
 ]
 
 [[package]]
