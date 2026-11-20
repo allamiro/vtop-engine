@@ -53,6 +53,9 @@ jobs:
             for run in $(gh run list --workflow "$workflow" --branch main --limit 30 \
                 --json databaseId,conclusion --jq '.[] | select(.conclusion == "success" or .conclusion == "failure") | .databaseId'); do
               if gh run download "$run" --pattern 's3-compat-results-*' --dir "$dest" 2>/dev/null; then
+                # The run's own date, so an old artifact keeps it (the report
+                # reads the nearest RUN_DATE) instead of looking newly run.
+                gh run view "$run" --json createdAt --jq '.createdAt[0:10]' > "$dest/RUN_DATE"
                 echo "$run"
                 return 0
               fi

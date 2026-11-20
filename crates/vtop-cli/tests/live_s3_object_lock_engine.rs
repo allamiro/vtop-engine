@@ -116,7 +116,9 @@ async fn s3_client() -> aws_sdk_s3::Client {
         .credentials_provider(Credentials::new(
             env("AWS_ACCESS_KEY_ID"),
             env("AWS_SECRET_ACCESS_KEY"),
-            None,
+            // The AWS leg assumes a role through OIDC, which gives temporary
+            // credentials with a session token; the lab's keys have none.
+            std::env::var("AWS_SESSION_TOKEN").ok(),
             None,
             "test",
         ))

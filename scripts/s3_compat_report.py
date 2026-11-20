@@ -279,6 +279,30 @@ def check_digests(runs: list[dict], repo: str) -> list[str]:
     return problems
 
 
+def source_run_date(path: str, source: str) -> str:
+    """The date of the workflow run that produced `path`.
+
+    The refresh workflow writes the run's date to a `RUN_DATE` file beside what
+    it downloaded, so an old artifact keeps its own date however often it is
+    ingested (the nearest `RUN_DATE`, from the file's directory up to `source`).
+    A local ingest without one takes S3_COMPAT_RUN_DATE, then today.
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    stop = os.path.abspath(source)
+    while True:
+        marker = os.path.join(directory, "RUN_DATE")
+        if os.path.isfile(marker):
+            with open(marker, encoding="utf-8") as handle:
+                date = handle.read().strip()
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+                raise Refused(f"{marker}: {date!r} is not a YYYY-MM-DD date")
+            return date
+        if directory == stop or os.path.dirname(directory) == directory:
+            break
+        directory = os.path.dirname(directory)
+    return os.environ.get("S3_COMPAT_RUN_DATE") or _today()
+
+
 def ingest(source: str, repo: str) -> list[str]:
     """Write tests/s3-compat/results/<id>.json from each results-<id>.jsonl under `source`."""
     written = []
@@ -296,7 +320,7 @@ def ingest(source: str, repo: str) -> list[str]:
             "server_version": first.get("server_version"),
             "image_digest": first.get("image_digest"),
             "vtop_commit": first.get("vtop_commit"),
-            "run_date": os.environ.get("S3_COMPAT_RUN_DATE") or _today(),
+            "run_date": source_run_date(path, source),
             "cases": sorted(cases, key=lambda c: c["case"]),
         }
         os.makedirs(os.path.join(repo, RESULTS), exist_ok=True)

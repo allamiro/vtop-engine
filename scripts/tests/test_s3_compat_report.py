@@ -182,3 +182,31 @@ def test_malformed_results_are_refused(tmp_path, capsys, mutate, message):
 
 def test_the_committed_page_matches_the_committed_results():
     assert report.main(["--check"]) == 0
+
+
+def test_an_ingested_run_keeps_the_date_of_the_run_that_produced_it(tmp_path):
+    """A stale artifact must not look newly executed: its date is its run's, however often it is ingested."""
+    repo = tmp_path / "repo"
+    (repo / "tests/s3-compat/servers").mkdir(parents=True)
+    src = tmp_path / "dl"
+    for sub, date in (("ci", "2026-11-14"), ("aws", "2026-11-02")):
+        (src / sub / f"s3-compat-results-{sub}").mkdir(parents=True)
+        (src / sub / "RUN_DATE").write_text(date + "\n")
+        line = dict(case("a", ["put_get_head"], "pass"), server=sub)
+        (src / sub / f"s3-compat-results-{sub}" / f"results-{sub}.jsonl").write_text(json.dumps(line) + "\n")
+    report.ingest(str(src), str(repo))
+    again = report.ingest(str(src), str(repo))
+    assert sorted(again) == ["tests/s3-compat/results/aws.json", "tests/s3-compat/results/ci.json"]
+    dates = {p.stem: json.loads(p.read_text())["run_date"] for p in (repo / "tests/s3-compat/results").glob("*.json")}
+    assert dates == {"ci": "2026-11-14", "aws": "2026-11-02"}
+
+
+def test_a_malformed_run_date_is_refused(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    src = tmp_path / "dl"
+    src.mkdir()
+    (src / "RUN_DATE").write_text("last tuesday\n")
+    (src / "results-x.jsonl").write_text(json.dumps(dict(case("a", ["put_get_head"], "pass"), server="x")) + "\n")
+    with pytest.raises(report.Refused, match="not a YYYY-MM-DD date"):
+        report.ingest(str(src), str(repo))
