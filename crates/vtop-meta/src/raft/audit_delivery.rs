@@ -445,7 +445,24 @@ impl MetaRaftStore {
                 return CatchUp::Done;
             }
             let from = delivery.delivered + 1;
-            let (readable, cut_by) = readable_from(storage, from, applied);
+            let (readable, cut_by) = match readable_from(storage, from, applied) {
+                Ok(found) => found,
+                Err(error) => {
+                    // Not a divergent log: the entry that settles it could not
+                    // be read. Name no gap; try again on the retry interval.
+                    crate::transport::warn_rate_limited(
+                        "audit-replay-read",
+                        &format!(
+                            "could not read the log at the newest snapshot to deliver the \
+                             applied audit records above log index {} ({error}); the node \
+                             keeps serving and tries again within {}s",
+                            delivery.delivered,
+                            crate::audit::AUDIT_RETRY_INTERVAL.as_secs()
+                        ),
+                    );
+                    return CatchUp::Stopped;
+                }
+            };
             let gap = (readable > from).then(|| (from, (readable - 1).min(applied), cut_by));
             let chunk_end = applied.min(readable.saturating_add(AUDIT_CATCH_UP_CHUNK - 1));
             let mut records = Vec::new();
@@ -621,16 +638,27 @@ impl MetaRaftStore {
 /// By Raft's log matching, the same index and term mean the same prefix:
 /// the log below agrees with the snapshot. Otherwise the log below it may be
 /// a stale branch that an installed snapshot replaced.
+///
+/// An entry the log does not hold (purged, or never appended) is `false`.
+/// An entry the log holds but cannot read is an error, not `false`: a
+/// transient read failure must not be taken for a divergent log, or the
+/// retained records below the snapshot would be named a gap and, at open,
+/// the mistaken boundary persisted (review of #767).
 fn log_agrees_with(
     storage: &crate::storage::MetaStorage,
     snapshot: &crate::storage::snapshot::SnapshotMeta,
-) -> bool {
-    storage
-        .log()
-        .read_range(snapshot.last_index, snapshot.last_index + 1)
-        .ok()
-        .and_then(|entries| entries.into_iter().next())
-        .is_some_and(|entry| entry.term == snapshot.last_term)
+) -> crate::storage::MetaStoreResult<bool> {
+    let index = snapshot.last_index;
+    let log = storage.log();
+    match (log.first_index(), log.last_index()) {
+        (Some(first), Some(last)) if (first..=last).contains(&index) => {}
+        _ => return Ok(false),
+    }
+    Ok(log
+        .read_range(index, index + 1)?
+        .into_iter()
+        .next()
+        .is_some_and(|entry| entry.term == snapshot.last_term))
 }
 
 /// At open: when the newest snapshot lies above both the audit frontier and
@@ -649,7 +677,7 @@ pub(crate) fn recover_install_floor(
         .audited_frontier()
         .unwrap_or(0)
         .max(storage.audited_floor());
-    if snapshot.last_index <= covered || log_agrees_with(storage, &snapshot) {
+    if snapshot.last_index <= covered || log_agrees_with(storage, &snapshot)? {
         return Ok(());
     }
     storage.save_audited_floor(snapshot.last_index)
@@ -661,12 +689,13 @@ pub(crate) fn recover_install_floor(
 /// only when the log agrees with it at the snapshot's index (Raft's log
 /// matching: the same index and term mean the same prefix); otherwise the
 /// log below it was replaced by an installed snapshot and may be a stale
-/// branch this replica never applied (`SnapshotInstall`).
+/// branch this replica never applied (`SnapshotInstall`). An entry that is
+/// there but cannot be read is an error, never a disagreement.
 fn readable_from(
     storage: &crate::storage::MetaStorage,
     from: u64,
     applied: u64,
-) -> (u64, GapReason) {
+) -> crate::storage::MetaStoreResult<(u64, GapReason)> {
     let newest = storage.snapshots().newest();
     let installed_over = |cut_at: u64| {
         newest
@@ -679,7 +708,7 @@ fn readable_from(
         } else {
             GapReason::LogPurged
         };
-        return (applied + 1, reason);
+        return Ok((applied + 1, reason));
     };
     let mut readable = from.max(first_in_log);
     let mut reason = GapReason::LogPurged;
@@ -690,12 +719,12 @@ fn readable_from(
         reason = GapReason::SnapshotInstall;
     }
     if let Some(snapshot) = &newest {
-        if readable <= snapshot.last_index && !log_agrees_with(storage, snapshot) {
+        if readable <= snapshot.last_index && !log_agrees_with(storage, snapshot)? {
             readable = snapshot.last_index + 1;
             reason = GapReason::SnapshotInstall;
         }
     }
-    (readable, reason)
+    Ok((readable, reason))
 }
 
 fn describe_node(node_id: Option<u64>) -> String {

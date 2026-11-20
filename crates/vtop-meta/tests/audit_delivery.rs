@@ -1173,3 +1173,86 @@ async fn a_failed_install_floor_write_never_lets_a_local_snapshot_hide_the_stale
     }
     assert!(failed_installs > 0);
 }
+
+/// Review of #767: a failed read of the log entry at the newest snapshot's
+/// index was taken for a log that disagrees with the snapshot. Delivery,
+/// which trailed a snapshot this replica built itself, then named the
+/// retained records a `snapshot_install` gap instead of delivering them, and
+/// at open the mistaken boundary was saved as the install floor, so the
+/// records were never delivered even after the disk recovered. For every
+/// storage operation of a restart, failing it once must cost nothing but a
+/// retry: no gap record, and every applied record delivered.
+#[tokio::test]
+async fn a_failed_read_at_the_snapshot_is_retried_not_named_a_gap() {
+    use openraft::storage::RaftSnapshotBuilder;
+    let (sim, env) = sim();
+    let entries = workload(13);
+    append(&env, &entries);
+    {
+        // Applied while the sink refuses, then a snapshot built here: the
+        // audit frontier stays behind it.
+        let refusing = Sink::refusing();
+        let (_store, mut machine) = open(&env, &refusing);
+        machine
+            .apply(entries.iter().map(raft_entry).collect::<Vec<_>>())
+            .await
+            .unwrap();
+        machine
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+    }
+    sim.crash();
+    sim.reboot();
+    let disk = sim.snapshot();
+    let expected = audited_indexes(&entries);
+
+    // The operations of a clean restart.
+    let ops = {
+        let sink = Arc::new(Sink::default());
+        let base = sim.op_count();
+        let (store, _machine) = open(&env, &sink);
+        assert!(store.deliver_pending(ReplayReason::Restart));
+        assert!(sink.gaps().is_empty(), "{:?}", sink.gaps());
+        assert_eq!(
+            sink.indexes().into_iter().collect::<BTreeSet<_>>(),
+            expected
+        );
+        sim.op_count() - base
+    };
+    assert!(ops > 0);
+
+    for fail_at in 0..ops {
+        sim.restore(&disk);
+        let sink = Arc::new(Sink::default());
+        let base = sim.op_count();
+        sim.set_fault(FaultPlan::FailOp {
+            op: base + fail_at,
+            kind: std::io::ErrorKind::Other,
+        });
+        // The restart that meets the failure: it may fail to open, or open
+        // and deliver nothing yet.
+        if let Ok(store) = MetaRaftStore::open_in(&env, "/n", cluster()) {
+            store.set_audit_sink(sink.clone());
+            let _machine = MetaRaftStateMachine::new(store.clone()).with_node_id(NODE_ID);
+            store.deliver_pending(ReplayReason::Restart);
+        }
+        sim.set_fault(FaultPlan::None);
+
+        // The disk is fine again: the next restart delivers what is left.
+        let (store, _machine) = open(&env, &sink);
+        assert!(store.deliver_pending(ReplayReason::Restart));
+        assert!(
+            sink.gaps().is_empty(),
+            "failed op {fail_at}: a read failure was named a gap: {:?}",
+            sink.gaps()
+        );
+        assert_eq!(
+            sink.indexes().into_iter().collect::<BTreeSet<_>>(),
+            expected,
+            "failed op {fail_at}"
+        );
+    }
+}
