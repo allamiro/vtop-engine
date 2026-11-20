@@ -19,7 +19,7 @@ capabilities:
   checksum_crc32_default:
     state: xfail
     issue: 778
-    note: "The SDK's default CRC32 trailer (aws-chunked) is refused with 'Invalid payload signature', so a BLAKE3 write fails; with AWS_REQUEST_CHECKSUM_CALCULATION=when_required it succeeds."
+    note: "The SDK's default CRC32 trailer (aws-chunked) is refused with 'Invalid payload signature'; with AWS_REQUEST_CHECKSUM_CALCULATION=when_required a plain PUT succeeds. VTOP no longer sends the trailer (#778 was fixed by #788: BLAKE3 and no-checksum writes carry a SHA-256 header), so no VTOP write depends on it; only the informational probe asks."
   multipart: pass
   multipart_abort: pass
   multipart_list_uploads: pass

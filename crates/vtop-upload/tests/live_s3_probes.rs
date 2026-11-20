@@ -12,6 +12,15 @@
 //!   informational: VTOP does not use it, decision D14): a second PUT with
 //!   `If-None-Match: *` to an existing key must be refused with 412.
 //!
+//! - `probe.the_sdks_default_crc32_trailer_is_accepted`
+//!   (`checksum_crc32_default`, informational): a PUT with no checksum of its
+//!   own, under the SDK's default `AWS_REQUEST_CHECKSUM_CALCULATION`, goes out
+//!   as an `aws-chunked` body with a CRC32 trailer. Garage and Zenko
+//!   CloudServer refuse it. VTOP no longer sends it (#778: BLAKE3 and
+//!   no-checksum writes carry a SHA-256 header), so no VTOP write depends on
+//!   it; it stays asked so a store's answer is on the page, and because
+//!   another tool pointed at the same store would meet it.
+//!
 //! Run like the other live tests (`tests/s3-compat/README.md`):
 //! `VTOP_TEST_S3_ENDPOINT=http://localhost:9000 AWS_ACCESS_KEY_ID=minioadmin
 //!  AWS_SECRET_ACCESS_KEY=minioadmin cargo test -p vtop-upload
@@ -156,6 +165,40 @@ async fn live_conditional_put_if_none_match() {
                     assert_eq!(&got[..], b"first", "the refused PUT changed nothing");
                 }
             }
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires an S3-compatible endpoint and credentials"]
+async fn live_the_sdks_default_crc32_trailer_is_accepted() {
+    let live = LiveS3::from_env();
+    let s = &live.settings;
+    live.case(
+        "probe.the_sdks_default_crc32_trailer_is_accepted",
+        &[Capability::PutGetHead, Capability::ChecksumCrc32Default],
+        || async {
+            let c = client(s).await;
+            let key = key("sdk-default-crc32");
+            let body = b"a body with no checksum of its own";
+            // No checksum value on the request: under the SDK's default the
+            // SDK computes a CRC32 and sends it as a trailer.
+            let put = c
+                .put_object()
+                .bucket(&s.bucket)
+                .key(&key)
+                .body(ByteStream::from_static(body))
+                .send()
+                .await;
+            if let Err(e) = put {
+                let code = e
+                    .as_service_error()
+                    .and_then(|se| se.code())
+                    .map(str::to_owned);
+                panic!("the store refused the SDK's default PUT (code {code:?}): {e:?}");
+            }
+            let _ = c.delete_object().bucket(&s.bucket).key(&key).send().await;
         },
     )
     .await;

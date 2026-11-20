@@ -216,11 +216,7 @@ async fn live_every_write_path_lands_under_the_lock_it_asked_for() {
     let live = LiveS3::from_env();
     live.case_with_refusal(
         "object_lock.every_write_path_lands_locked",
-        &[
-            Capability::ObjectLock,
-            Capability::Versioning,
-            Capability::ChecksumCrc32Default,
-        ],
+        &[Capability::ObjectLock, Capability::Versioning],
         || async {
             let bucket = locked_bucket();
             let prefix = unique("writes");
@@ -313,9 +309,6 @@ async fn live_a_locked_version_survives_delete_and_overwrite_and_reports_elapsed
             Capability::ObjectLock,
             Capability::Versioning,
             Capability::ObjectLockEnforced,
-            // The overwrite is written with no checksum, so the SDK's
-            // default CRC32 goes on it (pinned when_supported under the lock).
-            Capability::ChecksumCrc32Default,
         ],
         || async {
             let bucket = locked_bucket();
@@ -471,7 +464,7 @@ async fn live_a_multipart_object_carries_the_lock_its_create_asked_for() {
 #[ignore = "requires an S3-compatible endpoint with Object Lock"]
 async fn live_an_absent_lock_is_confirmed_and_a_present_one_is_not() {
     let live = LiveS3::from_env();
-    live.case(
+    live.case_with_refusal(
         "object_lock.an_absent_lock_is_confirmed_and_a_present_one_is_not",
         &[Capability::ObjectLock],
         || async {
@@ -527,6 +520,7 @@ async fn live_an_absent_lock_is_confirmed_and_a_present_one_is_not() {
             tokio::time::sleep(retain + Duration::from_secs(2)).await;
             clean_up(&client, &bucket, &prefix).await;
         },
+        store_lacks_it,
     )
     .await;
 }
