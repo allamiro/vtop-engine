@@ -19,7 +19,7 @@ use openraft::raft::{
 };
 use openraft::storage::{RaftLogStorage, RaftStateMachine};
 use openraft::{Config, EmptyNode, Raft, ServerState, SnapshotPolicy};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -53,6 +53,12 @@ struct RouterInner {
     /// Seeded counter for deterministic delivery sequencing.
     delivery_seq: u64,
     seed: u64,
+    /// Voters that still run the previous release, each with the highest
+    /// command kind its decoder knows (#706). An AppendEntries carrying a
+    /// higher kind fails to decode on such a voter, so it is answered as an
+    /// unreachable peer and recorded in `undecodable`.
+    old_voters: HashMap<NodeId, u16>,
+    undecodable: Vec<(NodeId, u16)>,
 }
 
 impl Router {
@@ -63,6 +69,8 @@ impl Router {
                 blocked: HashSet::new(),
                 delivery_seq: 0,
                 seed,
+                old_voters: HashMap::new(),
+                undecodable: Vec::new(),
             })),
         }
     }
@@ -101,6 +109,48 @@ impl Router {
         let seq = guard.delivery_seq;
         guard.delivery_seq = guard.delivery_seq.wrapping_add(1).wrapping_add(guard.seed);
         seq
+    }
+
+    /// Make `id` a voter that runs the release whose decoder knows command
+    /// kinds up to `highest_kind`.
+    fn make_old_voter(&self, id: NodeId, highest_kind: u16) {
+        self.inner
+            .lock()
+            .unwrap()
+            .old_voters
+            .insert(id, highest_kind);
+    }
+
+    /// The voter is upgraded: it decodes every kind this build writes.
+    fn upgrade_voter(&self, id: NodeId) {
+        self.inner.lock().unwrap().old_voters.remove(&id);
+    }
+
+    /// Every (voter, kind) an old voter could not decode so far.
+    fn undecodable(&self) -> Vec<(NodeId, u16)> {
+        self.inner.lock().unwrap().undecodable.clone()
+    }
+
+    /// The first command kind in `entries` that `target` cannot decode, if it
+    /// is an old voter; the failure is recorded.
+    fn undecodable_for(
+        &self,
+        target: NodeId,
+        entries: &[openraft::Entry<MetaRaftTypeConfig>],
+    ) -> Option<u16> {
+        let mut guard = self.inner.lock().unwrap();
+        let highest = *guard.old_voters.get(&target)?;
+        for entry in entries {
+            if let openraft::EntryPayload::Normal(command) = &entry.payload {
+                let bytes = command.encode().expect("a logged command encodes");
+                let kind = u16::from_be_bytes([bytes[0], bytes[1]]);
+                if kind > highest {
+                    guard.undecodable.push((target, kind));
+                    return Some(kind);
+                }
+            }
+        }
+        None
     }
 
     fn is_blocked(&self, from: NodeId, to: NodeId) -> bool {
@@ -171,6 +221,12 @@ impl RaftNetwork<MetaRaftTypeConfig> for NetworkClient {
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, EmptyNode, RaftError<NodeId>>> {
         let raft = self.target_raft()?;
         let target = self.target;
+        // An old voter fails to decode a kind it does not know, and with it
+        // the whole batch carrying it (#554): the leader sees a peer that
+        // cannot be reached.
+        if self.router.undecodable_for(target, &rpc.entries).is_some() {
+            return Err(self.unreachable());
+        }
         // Spawn so the caller (leader raft core) can yield on current_thread;
         // otherwise in-process RPC deadlocks waiting for the follower core.
         tokio::spawn(async move { raft.append_entries(rpc).await })
@@ -1855,6 +1911,407 @@ async fn the_promotion_override_never_reaches_a_log_below_level_8() {
             judged.response
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// #706: the actor of a cluster command, in the replicated log
+// ---------------------------------------------------------------------------
+
+/// Every command kind in `node`'s log, in order (`Normal` entries only).
+fn logged_kinds(node: &NodeHandle) -> Vec<(u64, u16)> {
+    use vtop_meta::MetaLogPayload;
+    node.store.with_storage(|storage| {
+        let log = storage.log();
+        let (Some(first), Some(last)) = (log.first_index(), log.last_index()) else {
+            return Vec::new();
+        };
+        log.read_range(first, last + 1)
+            .expect("read the log")
+            .into_iter()
+            .filter_map(|entry| match entry.payload {
+                MetaLogPayload::Normal(command) => {
+                    let bytes = command.encode().expect("a logged command encodes");
+                    Some((entry.index, u16::from_be_bytes([bytes[0], bytes[1]])))
+                }
+                _ => None,
+            })
+            .collect()
+    })
+}
+
+/// The tail of attributed commands in `node`'s applied state.
+fn audit_tail_of(node: &NodeHandle) -> Vec<(u64, vtop_meta::AuditEntryRecord)> {
+    node.store.with_storage(|storage| {
+        storage
+            .state()
+            .audit_tail()
+            .map(|(index, entry)| (index, entry.clone()))
+            .collect()
+    })
+}
+
+/// #706: below feature level 9 an operator's command goes into the log bare,
+/// exactly as the previous release wrote it - on every node, with a voter that
+/// cannot decode kind 40 in the group, and that voter is never sent one. After
+/// `SetFeatureLevel(9)` (itself bare) the same proposal commits as ONE
+/// kind-40 entry, on every replica, carrying the verified actor, the address
+/// the leader saw and the leader's own id; every replica's state holds the
+/// same tail, and a replica that restarts rebuilds it from its log.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn the_actor_is_in_the_log_only_from_level_9_and_survives_a_restart() {
+    use vtop_meta::transport::admin::ProposalCaller;
+    use vtop_meta::transport::authz::AdminIdentity;
+    use vtop_meta::{
+        AdminHandler, AttributedOutcome, CommandActor, OpenraftConsensus,
+        ATTRIBUTED_COMMANDS_FEATURE_LEVEL,
+    };
+
+    const PREVIOUS_RELEASE_HIGHEST_KIND: u16 = 39;
+    const KIND_SET_FEATURE_LEVEL: u16 = 36;
+    const KIND_ATTRIBUTED: u16 = 40;
+    let seed = SEED ^ 0x7060;
+    let mut cluster = Cluster::boot(seed).await;
+    let leader_id = cluster.leader_id();
+    let old_voter = [1u64, 2, 3]
+        .into_iter()
+        .find(|id| *id != leader_id)
+        .unwrap();
+    cluster
+        .router
+        .make_old_voter(old_voter, PREVIOUS_RELEASE_HIGHEST_KIND);
+    let consensus = OpenraftConsensus::new(cluster.leader().raft.clone())
+        .with_store(cluster.leader().store.clone())
+        .with_member_probe(this_build());
+    consensus.set_leader_clock(|| 1_750_000_000_777);
+    let alice = ProposalCaller {
+        identity: AdminIdentity::Named("ops-alice".to_owned()),
+        peer: Some("192.0.2.44".parse().unwrap()),
+    };
+    let operator_command = |cluster: &mut Cluster, node: u128| {
+        let env = cluster.envelope();
+        register_cmd(env, Uuid::from_u128(node))
+    };
+
+    // Level 8: everything the previous release knows is enabled.
+    let env = cluster.envelope();
+    consensus
+        .propose(MetadataCommand::SetFeatureLevel {
+            env,
+            feature_level: ATTRIBUTED_COMMANDS_FEATURE_LEVEL - 1,
+        })
+        .await
+        .unwrap();
+
+    // Below level 9 the proposal is the bare command: no kind 40 anywhere,
+    // and the old voter was never sent anything it cannot decode.
+    let command = operator_command(&mut cluster, 0x7001);
+    let bare = AdminHandler::propose_as(&consensus, command, &alice)
+        .await
+        .unwrap_or_else(|e| panic!("propose_as seed={seed:#x}: {e}"));
+    assert!(matches!(bare.response, MetadataResponse::Ack { .. }));
+    let _ = cluster.leader().raft.trigger().heartbeat().await;
+    cluster.wait_applied_at_least(bare.log_id.index - 1).await;
+    for (id, node) in &cluster.nodes {
+        let kinds = logged_kinds(node);
+        assert!(
+            kinds
+                .iter()
+                .all(|(_, kind)| *kind <= PREVIOUS_RELEASE_HIGHEST_KIND),
+            "node {id} holds a kind the previous release cannot decode: {kinds:?} (seed={seed:#x})"
+        );
+        assert!(
+            audit_tail_of(node).is_empty(),
+            "node {id} recorded an actor below level 9 (seed={seed:#x})"
+        );
+    }
+    assert_eq!(
+        cluster.router.undecodable(),
+        Vec::new(),
+        "the old voter was sent a kind it cannot decode (seed={seed:#x})"
+    );
+
+    // The raise is bare, and then the voter is upgraded - the contract the
+    // raise rests on (#758): every voter runs the release before the level
+    // is raised.
+    let env = cluster.envelope();
+    let raised = consensus
+        .propose(MetadataCommand::SetFeatureLevel {
+            env,
+            feature_level: ATTRIBUTED_COMMANDS_FEATURE_LEVEL,
+        })
+        .await
+        .unwrap();
+    cluster.router.upgrade_voter(old_voter);
+    let _ = cluster.leader().raft.trigger().heartbeat().await;
+    cluster.wait_applied_at_least(raised.log_id.index - 1).await;
+    let leader_kinds = logged_kinds(cluster.leader());
+    assert_eq!(
+        leader_kinds.last().map(|(_, kind)| *kind),
+        Some(KIND_SET_FEATURE_LEVEL),
+        "the raise to level 9 is the last entry and is bare: {leader_kinds:?}"
+    );
+    assert!(
+        leader_kinds
+            .iter()
+            .all(|(_, kind)| *kind != KIND_ATTRIBUTED),
+        "no kind 40 may precede the raise to level 9, and the raise is bare: {leader_kinds:?}"
+    );
+
+    // At level 9 the same proposal commits as one kind-40 entry. Its request
+    // id is its own, since the recording auditor is process-wide.
+    let audit = vtop_meta::audit::Recording::installed();
+    let command = register_cmd(
+        CommandEnvelope {
+            request_id: Uuid::new_v4(),
+            issued_at_ms: 1_750_000_000_000,
+        },
+        Uuid::from_u128(0x7002),
+    );
+    let request_id = command.envelope().request_id;
+    let wrapped = AdminHandler::propose_as(&consensus, command, &alice)
+        .await
+        .unwrap_or_else(|e| panic!("propose_as seed={seed:#x}: {e}"));
+    assert!(
+        matches!(wrapped.response, MetadataResponse::Ack { .. }),
+        "the response is the command's own: {:?}",
+        wrapped.response
+    );
+    let _ = cluster.leader().raft.trigger().heartbeat().await;
+    cluster
+        .wait_applied_at_least(wrapped.log_id.index - 1)
+        .await;
+    for (id, node) in &cluster.nodes {
+        let attributed: Vec<_> = logged_kinds(node)
+            .into_iter()
+            .filter(|(_, kind)| *kind == KIND_ATTRIBUTED)
+            .collect();
+        assert_eq!(
+            attributed.len(),
+            1,
+            "node {id} holds one attributed entry (seed={seed:#x})"
+        );
+        let tail = audit_tail_of(node);
+        assert_eq!(tail.len(), 1, "node {id} (seed={seed:#x})");
+        let (_, entry) = &tail[0];
+        assert_eq!(entry.request_id, request_id);
+        assert_eq!(
+            entry.attribution.actor,
+            CommandActor::Named("ops-alice".to_owned())
+        );
+        assert_eq!(entry.attribution.peer, Some("192.0.2.44".parse().unwrap()));
+        assert_eq!(
+            entry.attribution.vouched_by, leader_id,
+            "the leader checked the certificate"
+        );
+        assert_eq!(entry.attribution.recorded_at_ms, 1_750_000_000_777);
+        assert_eq!(entry.outcome, AttributedOutcome::Applied);
+    }
+    // Every replica still writes its applied record for the command, as it
+    // did when the command was bare: the wrapper is audited as its subject.
+    let records = audit.for_request(request_id);
+    assert_eq!(
+        records.len(),
+        3,
+        "one applied record per replica (seed={seed:#x}): {records:?}"
+    );
+    assert!(records
+        .iter()
+        .all(|record| record.stage == vtop_meta::audit::AuditStage::Applied));
+    // The node the command registered exists on every replica, as bare.
+    cluster.assert_converged_snapshots();
+
+    // A node's own report is machine traffic and a follower never wraps:
+    // neither adds an entry.
+    let env = cluster.envelope();
+    let release = MetadataCommand::ReleaseRangeLease {
+        env,
+        topic_uuid: Uuid::from_u128(0x20),
+        range_uuid: Uuid::from_u128(0x21),
+        expected_fencing_epoch: 1,
+    };
+    let node_caller = ProposalCaller {
+        identity: AdminIdentity::Node(Uuid::from_u128(0x10)),
+        peer: None,
+    };
+    let released = AdminHandler::propose_as(&consensus, release, &node_caller)
+        .await
+        .unwrap();
+    let _ = cluster.leader().raft.trigger().heartbeat().await;
+    cluster
+        .wait_applied_at_least(released.log_id.index - 1)
+        .await;
+    assert_eq!(
+        audit_tail_of(cluster.leader()).len(),
+        1,
+        "a node handing a range back is not attributed"
+    );
+
+    // The record survives a restart: a replica that stops and reopens its
+    // disk rebuilds the tail from its log.
+    let before = audit_tail_of(&cluster.nodes[&old_voter]);
+    let (sim, root) = cluster.take_and_shutdown(old_voter).await;
+    cluster.restart_node(old_voter, sim, root).await;
+    let applied = cluster
+        .leader()
+        .raft
+        .metrics()
+        .borrow()
+        .last_applied
+        .map(|id| id.index)
+        .unwrap_or(0);
+    cluster.wait_applied_at_least(applied).await;
+    assert_eq!(
+        audit_tail_of(&cluster.nodes[&old_voter]),
+        before,
+        "the restarted replica lost the actor (seed={seed:#x})"
+    );
+    assert_eq!(before.len(), 1);
+    cluster.assert_converged_snapshots();
+}
+
+/// #706: a voter still on the previous release is never sent kind 40 below
+/// the level, and when the level is raised over it anyway (the contract
+/// violation the raise is checked against, #758), it is the one that stalls:
+/// it cannot decode the entry, the two upgraded voters keep committing, and
+/// the entry never reaches its log.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn an_old_voter_cannot_decode_kind_40_and_only_it_stalls() {
+    use vtop_meta::transport::admin::ProposalCaller;
+    use vtop_meta::transport::authz::AdminIdentity;
+    use vtop_meta::{AdminHandler, OpenraftConsensus, ATTRIBUTED_COMMANDS_FEATURE_LEVEL};
+
+    let seed = SEED ^ 0x7061;
+    let mut cluster = Cluster::boot(seed).await;
+    let leader_id = cluster.leader_id();
+    let old_voter = [1u64, 2, 3]
+        .into_iter()
+        .find(|id| *id != leader_id)
+        .unwrap();
+    cluster.router.make_old_voter(old_voter, 39);
+    let consensus = OpenraftConsensus::new(cluster.leader().raft.clone())
+        .with_store(cluster.leader().store.clone())
+        .with_member_probe(this_build());
+    let env = cluster.envelope();
+    consensus
+        .propose(MetadataCommand::SetFeatureLevel {
+            env,
+            feature_level: ATTRIBUTED_COMMANDS_FEATURE_LEVEL,
+        })
+        .await
+        .unwrap();
+    let caller = ProposalCaller {
+        identity: AdminIdentity::Named("ops".to_owned()),
+        peer: None,
+    };
+    let env = cluster.envelope();
+    let committed = AdminHandler::propose_as(
+        &consensus,
+        register_cmd(env, Uuid::from_u128(0x7101)),
+        &caller,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(committed.response, MetadataResponse::Ack { .. }));
+    assert!(
+        cluster
+            .router
+            .undecodable()
+            .iter()
+            .all(|(id, kind)| *id == old_voter && *kind == 40),
+        "only the old voter, and only kind 40 (seed={seed:#x})"
+    );
+    assert!(!cluster.router.undecodable().is_empty());
+    assert!(
+        logged_kinds(&cluster.nodes[&old_voter])
+            .iter()
+            .all(|(_, kind)| *kind != 40),
+        "kind 40 reached the old voter's log (seed={seed:#x})"
+    );
+    let upgraded = [1u64, 2, 3]
+        .into_iter()
+        .find(|id| *id != leader_id && *id != old_voter)
+        .unwrap();
+    assert_eq!(
+        audit_tail_of(&cluster.nodes[&upgraded]).len(),
+        1,
+        "the upgraded voters committed it (seed={seed:#x})"
+    );
+}
+
+/// #706: a follower never wraps, and a leader whose applied level is below 9
+/// never does (it proposes bare): the wrap needs the leader's own word and the
+/// level in force.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_follower_and_a_leader_below_the_level_never_wrap() {
+    use vtop_meta::transport::admin::ProposalCaller;
+    use vtop_meta::transport::authz::AdminIdentity;
+    use vtop_meta::{
+        AdminHandler, OpenraftConsensus, TransportError, ATTRIBUTED_COMMANDS_FEATURE_LEVEL,
+    };
+
+    let seed = SEED ^ 0x7062;
+    let mut cluster = Cluster::boot(seed).await;
+    let leader_id = cluster.leader_id();
+    let leader_side = OpenraftConsensus::new(cluster.leader().raft.clone())
+        .with_store(cluster.leader().store.clone())
+        .with_member_probe(this_build());
+    let env = cluster.envelope();
+    leader_side
+        .propose(MetadataCommand::SetFeatureLevel {
+            env,
+            feature_level: ATTRIBUTED_COMMANDS_FEATURE_LEVEL,
+        })
+        .await
+        .unwrap();
+    let _ = cluster.leader().raft.trigger().heartbeat().await;
+    cluster.wait_applied_at_least(2).await;
+    let follower_id = [1u64, 2, 3]
+        .into_iter()
+        .find(|id| *id != leader_id)
+        .unwrap();
+    let through_follower = OpenraftConsensus::new(cluster.nodes[&follower_id].raft.clone())
+        .with_store(cluster.nodes[&follower_id].store.clone());
+    let caller = ProposalCaller {
+        identity: AdminIdentity::Named("ops".to_owned()),
+        peer: None,
+    };
+    let before = logged_kinds(cluster.leader()).len();
+    let env = cluster.envelope();
+    let redirected = AdminHandler::propose_as(
+        &through_follower,
+        register_cmd(env, Uuid::from_u128(0x7201)),
+        &caller,
+    )
+    .await;
+    assert!(
+        matches!(redirected, Err(TransportError::NotLeader { .. })),
+        "a follower redirects, it does not write (seed={seed:#x}): {redirected:?}"
+    );
+    assert_eq!(logged_kinds(cluster.leader()).len(), before);
+
+    // A certificate name over the record's bound is refused before anything
+    // is proposed, and the log is unchanged.
+    let long = ProposalCaller {
+        identity: AdminIdentity::Named("c".repeat(129)),
+        peer: None,
+    };
+    let env = cluster.envelope();
+    let refused = AdminHandler::propose_as(
+        &leader_side,
+        register_cmd(env, Uuid::from_u128(0x7202)),
+        &long,
+    )
+    .await;
+    match refused {
+        Err(TransportError::Refused(reason)) => {
+            assert!(
+                reason.contains("129 bytes") && reason.contains("Nothing was proposed"),
+                "{reason}"
+            )
+        }
+        other => panic!("an oversized name was not refused (seed={seed:#x}): {other:?}"),
+    }
+    assert_eq!(logged_kinds(cluster.leader()).len(), before);
 }
 
 /// Every metadata member answers as this build (#706): what a raise judged

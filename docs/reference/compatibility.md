@@ -238,7 +238,7 @@ table differs from what the registry generates. Edit the registry and run
 | 13 | Multipart session (`*.multipart.json`) | `schema_version` `1` | B | evolving | stable |
 | 14 | Scrub cursor | `vtop_scrub_cursor` `1` | B | evolving | classified at the freeze |
 | 15 | Metadata log chunk and entry frames | `VTOPMLG1`, `VTOPMLE1` | B | evolving | follows #740 |
-| 16 | Metadata command set | command kinds, feature levels 3 to 8 | B | evolving, level-gated | follows #740 |
+| 16 | Metadata command set | command kinds, feature levels 3 to 9 | B | evolving, level-gated | follows #740 |
 | 17 | Metadata snapshot and state encoding | `VTOPMSN1` v1 and v2, payload version `1` | B | evolving, level-gated | follows #740 |
 | 18 | Metadata hard state, applied, purged, membership log id | `VTOPMHS1`, `VTOPMAP1`, `VTOPMPG1`, `VTOPMML1` | B | evolving | follows #740 |
 | 19 | Native protocol | `VTPW`, major `1`, minor `0` | C | evolving | follows #740 |
