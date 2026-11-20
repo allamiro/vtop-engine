@@ -1827,6 +1827,36 @@ wait_meta_leader() { # <node-ids...>
   fail "no meta leader elected within ${ELECTION_TIMEOUT_SECONDS}s"
 }
 
+# wait_meta_leader_except <excluded-id> <node-ids...> — the leader once it is
+# a node other than <excluded-id>; echoes its id. After the leader is
+# killed, its followers keep naming it until their election timeout runs
+# out, so wait_meta_leader returns the dead node at once (review of #758).
+# Only the given nodes are asked, the leader must be one of them, and it
+# must name itself, so a follower's stale or early answer is not taken.
+wait_meta_leader_except() { # <excluded-id> <node-ids...>
+  local excluded="$1"
+  shift
+  local deadline=$((SECONDS + ELECTION_TIMEOUT_SECONDS)) last="none"
+  while [[ $SECONDS -lt $deadline ]]; do
+    local id
+    for id in "$@"; do
+      local leader
+      leader="$(meta_status_field "$id" "['current_leader']" 2>/dev/null || echo null)"
+      [[ "$leader" != "null" && -n "$leader" ]] || continue
+      last="$leader (from node $id)"
+      [[ "$leader" != "$excluded" && " $* " == *" $leader "* ]] || continue
+      local own
+      own="$(meta_status_field "$leader" "['current_leader']" 2>/dev/null || echo null)"
+      if [[ "$own" == "$leader" ]]; then
+        echo "$leader"
+        return 0
+      fi
+    done
+    sleep 0.3
+  done
+  fail "no meta leader other than node $excluded among nodes $* within ${ELECTION_TIMEOUT_SECONDS}s (last reported: $last)"
+}
+
 # Propose a RegisterNode command through node <id>; used as commit load.
 propose_register() { # <via-node-id> <target-uuid-suffix (2 hex)>
   local via="$1" suffix="$2"

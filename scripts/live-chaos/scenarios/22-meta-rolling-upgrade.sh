@@ -103,13 +103,21 @@ await_converged "previous release"
 # node on this build does. The previous release has no answer to the
 # question and closes the connection, which is what the refusal must name.
 raise_refused_past_old_voter() { # <old voter id>
-  local old="$1" leader="" attempt out
+  local old="$1" leader="" attempt out id live=()
+  for id in 1 2 3; do
+    [[ "$id" != "$old" ]] && live+=("$id")
+  done
   for attempt in 1 2 3 4 5; do
     leader="$(wait_meta_leader 1 2 3)"
     [[ "$leader" != "$old" ]] && break
     log "the old voter $old leads (attempt $attempt); restarting it on the previous release"
     stop_node_now "${PID[$old]}"
-    leader="$(wait_meta_leader 1 2 3)"
+    # The old voter stays down until a node on this build has won the
+    # election: its followers name it as leader until their election
+    # timeout runs out, and a restart before then could hand it the
+    # leadership straight back (review of #758).
+    leader="$(wait_meta_leader_except "$old" "${live[@]}")"
+    log "node $leader leads with the old voter $old stopped"
     VTOP_NODE="$OLD_VTOP_NODE"
     case "$old" in
       1) PID[1]=$(start_meta_node 1 2 3) ;;
