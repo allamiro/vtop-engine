@@ -424,6 +424,9 @@ read_restored() {
   [[ -n "$RESTORED_NEWEST" && "$RESTORED_COMMITTED" -ge 1 ]] \
     || fail "the restored ledger holds no committed batch: the backup captured none of what the engine had written"
 }
+# How many files the primary has archived (segments, and the backup's label).
+wal_archived() { docker exec "$PG_CONT" sh -c 'ls /walarch | wc -l' | tr -d ' '; }
+wal_archived_ge() { (($(wal_archived) >= $1)); }
 first_commit_after_restore() {
   wait_until 120 "the first commit after the restore" committed_gt "$RESTORED_COMMITTED"
 }
@@ -612,7 +615,14 @@ case "$MODE" in
     T_TARGET="$(ledger_q "SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00'" | head -n 1)"
     T_TARGET_ISO="${T_TARGET/ /T}"
     T_TARGET_ISO="${T_TARGET_ISO%+00}Z"
-    sleep $((VTOP_DRILL_ARCHIVE_TIMEOUT_S * 2 + 2))
+
+    # Land the disaster late in an archive interval, so that the drill measures
+    # a loss and not the best case: wait for two segments to be archived after
+    # the target (the second one carries WAL from well past it), then let the
+    # engine write for most of the next interval, which is what is lost.
+    archived0="$(wal_archived)"
+    wait_until 120 "two WAL segments to be archived after the target" wal_archived_ge $((archived0 + 2))
+    sleep $((VTOP_DRILL_ARCHIVE_TIMEOUT_S - 2))
 
     log "disaster: the engine is killed and the server and its data are lost"
     kill_engine

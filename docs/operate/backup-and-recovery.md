@@ -67,7 +67,7 @@ different ones.
 |---|---|---|
 | `VTOP_DRILL_BACKUP_INTERVAL_S` | 8 | SQLite and `pg_dump`: how long the engine runs after the backup before the ledger is destroyed (the interval between backups, in the drill). |
 | `VTOP_DRILL_ARCHIVE_TIMEOUT_S` | 5 | PostgreSQL with WAL archiving: `archive_timeout` on the primary. |
-| `VTOP_DRILL_SQLITE_RPO_S` | 13 | SQLite RPO: the backup interval, plus 5 for the write that lands between the backup and the interval's end. |
+| `VTOP_DRILL_SQLITE_RPO_S` | 13 | SQLite RPO: the backup interval, plus 5 for the age of the newest row the backup holds and the time the engine takes to stop. |
 | `VTOP_DRILL_DUMP_RPO_S` | 13 | `pg_dump` RPO: the same. |
 | `VTOP_DRILL_PITR_RPO_S` | 10 | WAL archiving RPO: `archive_timeout`, plus 5 for the archive command's own time. |
 | `VTOP_DRILL_SQLITE_RTO_S` | 60 | SQLite RTO. |
@@ -85,33 +85,46 @@ Each row is one run of the drill, with the conditions below it. They show
 that the procedures work and what their parts cost on a small ledger; they are
 not a promise about yours.
 
-| Mode | RPO | RTO | Backup took | Ledger rows lost, archived again |
-|---|---|---|---|---|
-| SQLite, `.backup` | 6.2 s | 0.23 s | 6 ms | 3 |
-| PostgreSQL 18, `pg_dump` | 8.3 s | 0.55 s | 0.11 s | 3 |
-| PostgreSQL 14, `pg_dump` | 8.3 s | 0.71 s | 0.10 s | 4 |
-| PostgreSQL 18, base backup and WAL archive | 0 s | 1.5 s | 0.21 s | 0 |
-| PostgreSQL 14, base backup and WAL archive | 0 s | 1.3 s | 0.17 s | 0 |
+| Mode | RPO | RTO | Backup took | Ledger rows lost, archived again | Where |
+|---|---|---|---|---|---|
+| SQLite, `.backup` | 6.2 s | 0.44 s | 9 ms | 3 | CI |
+| PostgreSQL 14, `pg_dump` | 8.2 s | 0.95 s | 0.14 s | 4 | CI |
+| PostgreSQL 15, `pg_dump` | 8.2 s | 1.06 s | 0.14 s | 4 | CI |
+| PostgreSQL 16, `pg_dump` | 8.2 s | 1.03 s | 0.14 s | 4 | CI |
+| PostgreSQL 17, `pg_dump` | 8.2 s | 1.07 s | 0.14 s | 4 | CI |
+| PostgreSQL 18, `pg_dump` | 8.2 s | 0.74 s | 0.09 s | 4 | CI |
+| PostgreSQL 14, base backup and WAL archive | 2.3 s | 1.2 s | 0.17 s | 1 | laptop |
+| PostgreSQL 18, base backup and WAL archive | 4.1 s | 1.1 s | 0.20 s | 2 | laptop |
 
-Conditions: a `vtopctl` debug build; a file source grown by about 20 records a
-second of 85 bytes, in batches of up to 40 records or 2 seconds; the bucket a
-local directory; a ledger of a few dozen rows; Docker Desktop on an arm64
-laptop, two CPUs, PostgreSQL from `postgres:18-alpine` and the pinned
-`postgres:14` image. The backup interval is 8 seconds and `archive_timeout` 5
-seconds. Every run archived every source record (between 440 and 620 in these
-runs) and passed the checks under [The drill](#the-drill).
+Conditions, for every row: a `vtopctl` debug build; a file source grown by
+about 20 records a second of 85 bytes, in batches of up to 40 records or 2
+seconds; the bucket a local directory; a ledger of a few dozen rows; a backup
+interval of 8 seconds and `archive_timeout` of 5 seconds. Every run archived
+every source record (430 to 980 of them) and passed the checks under
+[The drill](#the-drill).
+
+- **CI** is a GitHub-hosted `ubuntu-latest` runner, the images pinned in
+  `postgres-matrix.yml`, in the run of this page's pull request for the
+  SQLite and dump modes.
+- **laptop** is Docker Desktop on an arm64 laptop with two CPUs, PostgreSQL
+  from `postgres:18-alpine` and the pinned `postgres:14` image. The WAL
+  archiving rows are from here because they were measured with the disaster
+  placed late in an archive interval (below); CI measures them the same way
+  from the nightly on, and keeps the figures as an artifact.
 
 Reading them:
 
-- The RPO of a backup taken at intervals is about the interval, less the time
-  since the engine's last write when the ledger was lost. The 6 to 8 seconds
+- The RPO of a backup taken at intervals is up to the interval, and less when
+  the engine was between writes at the moment of the loss. The 6 to 8 seconds
   above are an 8-second interval.
 - The RPO of WAL archiving falls anywhere from 0 to `archive_timeout`,
   depending on where in that interval the server is lost: a lost host loses the
-  WAL it had not yet archived. These runs happened to land at 0.
+  WAL it had not yet archived. The drill ends the server 3 seconds after a
+  segment was archived, so that it measures a loss and not the best case; the
+  2 to 4 seconds above are that stretch.
 - The RTO is small because the ledger is small and the engine reads the
   backlog (the records written since the backup) in one pass. The restore step
-  of the PostgreSQL modes was under a second.
+  of the PostgreSQL modes was about a second.
 
 CI measures the same numbers on every run and keeps them in the workflow run's
 summary and as an artifact: `restore drill (sqlite)` in the CI workflow, and
@@ -200,6 +213,17 @@ archive_timeout = 60        # force a segment switch this often while the ledger
 pg_basebackup --pgdata=/basebackup/base --wal-method=stream --checkpoint=fast
 ```
 
+Copy the prune digests (`engine.ledger_digest_dir`) to the same storage **after
+every `vtopctl prune-ledger`**, not only when you take a base backup: a recovery
+to the end of the archive replays the pruning's deletions, and a digest written
+since your last copy is lost with the host while the rows it recorded are gone
+from the recovered ledger.
+
+```bash
+mkdir -p /backup/digests
+cp -a /var/lib/vtop/ledger-digests/. /backup/digests/
+```
+
 `archive_timeout` bounds the RPO: a server lost between two switches loses
 the WAL of that interval. The drill sets it to 5 seconds so that it can
 measure; a production value is a trade between that loss and the many small
@@ -219,8 +243,9 @@ segment files it writes.
      -c recovery_target_action=promote
    ```
 
-4. Wait until `SELECT pg_is_in_recovery()` is false, then run `vtopctl migrate`
-   and start the engine.
+4. Wait until `SELECT pg_is_in_recovery()` is false.
+5. Put the digest directory back (`mkdir -p` it and `cp -a /backup/digests/. <dir>/`),
+   run `vtopctl migrate`, and start the engine.
 
 **Restore to a time**, for a ledger that was damaged at a known moment, adds
 `-c recovery_target_time='2026-11-20 18:52:18.465513+00'` to the same start.
@@ -274,7 +299,8 @@ Each mode:
 3. takes the backup while the engine runs, lets the engine run on for the
    backup interval, then kills it with SIGKILL and destroys the ledger (for
    WAL archiving, the server and its data volume, keeping the archive and the
-   base backup);
+   base backup, 3 seconds after a WAL segment was archived so that some of the
+   ledger's history is lost);
 4. restores as this page says, and starts the engine again, while the writer
    keeps writing;
 5. stops the writer and waits for the engine to archive the source to its
