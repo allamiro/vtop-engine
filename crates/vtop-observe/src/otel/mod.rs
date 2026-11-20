@@ -406,7 +406,9 @@ where
 
     fn on_close(&self, id: tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
         let Some(span) = ctx.span(&id) else { return };
-        self.open.closed();
+        // The line first, then the count: once the count says nothing is open
+        // the final flush may begin, and a test that compares the two lines'
+        // order must not find the flush's first (review of #830).
         if span.parent().is_none() {
             tracing::debug!(
                 target: LIFECYCLE_TARGET,
@@ -415,6 +417,7 @@ where
                 "root span closed"
             );
         }
+        self.open.closed();
     }
 }
 
@@ -780,5 +783,54 @@ mod tests {
         .await;
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(*recorder.0.lock().unwrap(), ["batch"]);
+    }
+    /// Review of #830: the "root span closed" line is written while the span
+    /// still counts as open, so a flush that begins the moment the count
+    /// reaches zero logs its start after it, never before.
+    #[test]
+    fn a_close_is_logged_before_the_count_that_lets_the_flush_begin() {
+        struct Probe {
+            open: OpenSpans,
+            counts: Arc<Mutex<Vec<usize>>>,
+        }
+        struct Message(bool);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}") == "root span closed";
+                }
+            }
+        }
+        impl<S: Subscriber> Layer<S> for Probe {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut message = Message(false);
+                event.record(&mut message);
+                if message.0 {
+                    self.counts.lock().unwrap().push(self.open.count());
+                }
+            }
+        }
+
+        let open = OpenSpans::default();
+        let counts = Arc::new(Mutex::new(Vec::new()));
+        let (provider, _recorder) = recording_provider();
+        let subscriber = tracing_subscriber::registry()
+            .with(counted_layer(&provider, &open))
+            .with(Probe {
+                open: open.clone(),
+                counts: counts.clone(),
+            });
+        let _guard = tracing::subscriber::set_default(subscriber);
+        drop(tracing::debug_span!(target: "vtop_test", "batch"));
+        assert_eq!(
+            *counts.lock().unwrap(),
+            [1],
+            "the close line saw the span already uncounted"
+        );
+        assert_eq!(open.count(), 0);
     }
 }
