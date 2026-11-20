@@ -98,6 +98,13 @@ name = "integration_kafka_to_minio"
 path = "../../tests/integration_kafka_to_minio.rs"
 required-features = ["kafka"]
 
+# The same Kafka source refused by a broker that wants TLS or SASL: the wrong
+# password, the wrong user, the wrong certificate authority (#721).
+[[test]]
+name = "integration_kafka_auth"
+path = "../../tests/integration_kafka_auth.rs"
+required-features = ["kafka"]
+
 # Every failpoint kills the real binary where it says it does (#725).
 [[test]]
 name = "failpoints"
