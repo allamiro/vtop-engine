@@ -234,7 +234,7 @@ is in [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | mock, for tests | the stored in-memory bytes are hashed |
 
 <!-- s3-compat:start -->
-No S3 compatibility results are committed yet; see [S3 compatibility](docs/reference/s3-compatibility.md) for how they are produced.
+The live S3 tests last ran, with every outcome as expected, against: Zenko CloudServer, Garage, MinIO (lab, source-built), RustFS, SeaweedFS, Versity S3 Gateway. Which server supports which capability and verification method: [S3 compatibility](docs/reference/s3-compatibility.md).
 <!-- s3-compat:end -->
 
 The Kafka source is a Cargo feature: `cargo build -p vtop-cli --no-default-features`

@@ -133,14 +133,28 @@ def pinned_digest(repo: str, server: str) -> str | None:
     return match.group(1) if match else None
 
 
-def cell(cases: list[dict], cap: str) -> str:
-    """One capability's cell, from the cases that named it."""
+def state_of(entry) -> str | None:
+    """The state a capability file gives a capability: a bare word or {state: ...}."""
+    if isinstance(entry, dict):
+        entry = entry.get("state")
+    return entry if isinstance(entry, str) else None
+
+
+def cell(cases: list[dict], cap: str, state: str | None = None) -> str:
+    """One capability's cell, from the cases that named it.
+
+    `state` is what the server's file says for the capability. A case decided by
+    another capability it also needed (Object Lock before its enforcement) records
+    only that one; a refusal it recorded still shows the other as refused when the
+    file says the server lacks it."""
     # A case the harness could not run (`not_run`, with why) tested nothing.
     mine = [c for c in cases if cap in c.get("capabilities", []) and c["outcome"] != "not_run"]
     if not mine:
         return NOT_TESTED
     if any(not c.get("expected", True) for c in mine):
         return UNEXPECTED
+    if state == "unsupported" and any(c["outcome"] == "refused" for c in mine):
+        return REFUSED
     decided = [c for c in mine if c.get("deciding_capability") == cap]
     for outcome, text in (("refused", REFUSED), ("not_applicable", NOT_APPLICABLE)):
         if any(c["outcome"] == outcome for c in decided):
@@ -197,7 +211,11 @@ def render_page(runs: list[dict], servers: dict[str, dict]) -> str:
     header = "| Capability | " + " | ".join(run["server"] for run in runs) + " |"
     out += [header, "|---|" + "---|" * len(runs)]
     for cap in CAPABILITIES:
-        out.append(f"| `{cap}` | " + " | ".join(cell(run["cases"], cap) for run in runs) + " |")
+        cells = []
+        for run in runs:
+            declared = (servers.get(run["server"], {}) or {}).get("capabilities", {}) or {}
+            cells.append(cell(run["cases"], cap, state_of(declared.get(cap))))
+        out.append(f"| `{cap}` | " + " | ".join(cells) + " |")
     out.append("| verification method seen | " + " | ".join(methods(run["cases"]) for run in runs) + " |")
     notes = []
     for run in runs:

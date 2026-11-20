@@ -61,6 +61,18 @@ def test_a_refusal_is_shown_as_refused_as_designed_for_the_capability_that_decid
     assert report.cell(cases, "versioning") == report.NOT_TESTED
 
 
+def test_a_capability_the_file_says_the_server_lacks_is_refused_when_a_refusal_case_named_it():
+    # Garage lacks both; the case records the one that decided it (object_lock),
+    # and the file says versioning is unsupported too: that refusal is shown for it.
+    cases = [case("lock", ["object_lock", "versioning"], "refused", "unsupported (refused at startup)", "object_lock")]
+    assert report.cell(cases, "versioning", "unsupported") == report.REFUSED
+    # A file that says the server has it does not turn a refusal into a refused cell.
+    assert report.cell(cases, "versioning", "pass") == report.NOT_TESTED
+    assert report.state_of({"state": "unsupported", "refusal": "startup"}) == "unsupported"
+    assert report.state_of("pass") == "pass"
+    assert report.state_of(None) is None
+
+
 def test_an_unexpected_outcome_marks_every_capability_of_the_case():
     cases = [case("m", ["multipart", "path_style"], "unexpected_fail", expected=False)]
     assert report.cell(cases, "multipart") == report.UNEXPECTED
