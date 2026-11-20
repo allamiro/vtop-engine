@@ -118,7 +118,7 @@ fn seeds() -> Vec<(&'static str, Vec<u8>)> {
         index,
         payload: MetaLogPayload::Normal(MetadataCommand::Attributed {
             attribution: Attribution {
-                actor: if index % 2 == 0 {
+                actor: if index.is_multiple_of(2) {
                     CommandActor::Named("ops-alice".to_owned())
                 } else {
                     CommandActor::Node(Uuid::from_u128(0x10))

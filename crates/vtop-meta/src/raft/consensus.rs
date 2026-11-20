@@ -249,8 +249,9 @@ impl OpenraftConsensus {
     /// The applied level is a lower bound on the true level, so a leader that
     /// lags can only leave a command bare, never wrap one early; and only a
     /// leader wraps, because only a leader's word that it verified the
-    /// certificate counts (a follower redirects the client, which asks the
-    /// leader and presents its certificate there).
+    /// certificate counts. A follower that sees the level in force sends the
+    /// client to the leader ([`ConsensusError::NotLeader`]), which presents
+    /// its certificate there.
     fn attribute(
         &self,
         command: MetadataCommand,
@@ -267,10 +268,21 @@ impl OpenraftConsensus {
             return Ok(command);
         };
         let metrics = self.raft.metrics().borrow().clone();
+        let enabled = store.with_storage(|storage| storage.state().feature_level());
+        // A follower that sees the level in force redirects instead of
+        // passing the command on bare. A role read before the write is a
+        // race: if this node won an election between the read and
+        // `client_write`, the bare command would commit with no actor (review
+        // of #850). The client asks the leader, which wraps it. Below the
+        // level there is nothing to wrap, so the redirect is `client_write`'s.
         if metrics.state != ServerState::Leader {
+            if enabled >= ATTRIBUTED_COMMANDS_FEATURE_LEVEL {
+                return Err(ConsensusError::NotLeader {
+                    leader: metrics.current_leader.map(MetaNodeId),
+                });
+            }
             return Ok(command);
         }
-        let enabled = store.with_storage(|storage| storage.state().feature_level());
         if enabled < ATTRIBUTED_COMMANDS_FEATURE_LEVEL {
             let term = metrics.current_term;
             if self
