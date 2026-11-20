@@ -2020,6 +2020,40 @@ impl Collector for KafkaRefusalCollector {
     }
 }
 
+/// Whether this node's Kafka gateway serves its range now (#751), as
+/// `vtop_kafka_gateway_serving`: 1 while it appends and reads for the range,
+/// 0 while it only redirects (a candidate that follows, a leader whose lease
+/// is gone). Read at scrape time, so it is never a stale copy of the role.
+/// One series, no labels: a node runs at most one gateway.
+pub struct KafkaGatewayServingCollector {
+    serving: Arc<dyn Fn() -> bool + Send + Sync>,
+    gauge: IntGauge,
+}
+
+impl KafkaGatewayServingCollector {
+    pub fn new(serving: Arc<dyn Fn() -> bool + Send + Sync>) -> Result<Self, String> {
+        Ok(Self {
+            serving,
+            gauge: gauge(
+                "kafka_gateway_serving",
+                "1 while this node's Kafka gateway serves its range (produce, fetch, offsets), \
+                 0 while it only redirects clients to the node that holds the range",
+            )?,
+        })
+    }
+}
+
+impl Collector for KafkaGatewayServingCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        self.gauge.desc()
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        self.gauge.set(i64::from((self.serving)()));
+        self.gauge.collect()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Integrity
 // ---------------------------------------------------------------------------
@@ -2937,6 +2971,27 @@ mod tests {
     /// #596: the gateway's refusals are exported under the bounded
     /// `{api,reason}` pair, every series at zero from the first scrape, and
     /// the value is the gateway's own total.
+    /// `vtop_kafka_gateway_serving` follows the role at scrape time (#751).
+    #[test]
+    fn the_kafka_gateway_serving_gauge_reads_the_role_at_scrape_time() {
+        let serving = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let read = Arc::clone(&serving);
+        let registry = Registry::new_custom(Some("vtop".into()), None).unwrap();
+        registry
+            .register(Box::new(
+                KafkaGatewayServingCollector::new(Arc::new(move || {
+                    read.load(std::sync::atomic::Ordering::SeqCst)
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        assert!(scrape(&registry).contains("vtop_kafka_gateway_serving 0"));
+        serving.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(scrape(&registry).contains("vtop_kafka_gateway_serving 1"));
+        serving.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(scrape(&registry).contains("vtop_kafka_gateway_serving 0"));
+    }
+
     #[test]
     fn kafka_refusals_are_exported_by_api_and_reason() {
         let refusals = Arc::new(vtop_kafka::Refusals::default());

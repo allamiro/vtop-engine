@@ -165,6 +165,27 @@ pub struct KafkaGatewayConfig {
     /// Metadata advertises, and a name in no row is unknown by name.
     #[serde(default)]
     pub topics: Vec<KafkaTopicRoute>,
+    /// Candidate only (#751): every member of the replica set as a Kafka
+    /// broker, this node included, identical on every member. Metadata lists
+    /// them all and names whichever holds the lease as the partition's
+    /// leader, so a client that bootstrapped from any member finds the
+    /// holder after a failover with no restart and no config change.
+    #[serde(default)]
+    pub brokers: Vec<KafkaBrokerEntry>,
+}
+
+/// One member of a candidate replica set as a Kafka broker (#751).
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct KafkaBrokerEntry {
+    /// The member's `node_uuid`, one of `peers`: how the lease's holder is
+    /// mapped to a broker.
+    pub node_uuid: Uuid,
+    /// The broker id it reports as, matching that member's `kafka.node_id`.
+    pub node_id: i32,
+    /// What clients dial for it: its advertised host and port.
+    pub host: String,
+    pub port: u16,
 }
 
 /// One partition of the Kafka topic and the broker that leads it (#457
@@ -233,6 +254,11 @@ impl KafkaGatewayConfig {
     /// twice under a key that will be ignored. With no topology, the override
     /// is the only answer there is.
     pub fn advertises_a_host(&self, partition: i32) -> bool {
+        // A candidate's own `kafka.brokers` entry is what it advertises
+        // (#751), as a topology entry is for a partition's leader.
+        if let Some(mine) = self.own_broker_entry() {
+            return !names_no_host(&mine.host);
+        }
         match self
             .partitions
             .iter()
@@ -245,6 +271,236 @@ impl KafkaGatewayConfig {
                 .is_some_and(|host| !names_no_host(host)),
         }
     }
+}
+
+impl KafkaGatewayConfig {
+    /// This node's entry in `kafka.brokers`, found by its broker id: the
+    /// validation in [`kafka_brokers`] has already tied that id to this
+    /// node's uuid.
+    pub fn own_broker_entry(&self) -> Option<&KafkaBrokerEntry> {
+        self.brokers
+            .iter()
+            .find(|broker| broker.node_id == self.node_id)
+    }
+}
+
+/// The refusal for a `kafka.brokers` that cannot be served (#751): what is
+/// wrong, that the node did not start, and the line to fix.
+fn brokers_refusal(what: impl std::fmt::Display, fix: impl std::fmt::Display) -> String {
+    format!("`kafka.brokers` {what}. The node did not start. {fix}")
+}
+
+/// What a candidate's gateway needs before it binds (#751), or a refusal
+/// naming what is wrong.
+///
+/// A candidate lists every member's Kafka endpoint, because a client that is
+/// told only about a dead broker has nowhere to go: `kafka.brokers` must name
+/// each member of `peers` once, this node included and at its own
+/// `kafka.node_id`, under ids that are unique and in 0..=255, at hosts a
+/// client can dial and endpoints no two members share. A topology
+/// (`kafka.partitions`) names static leaders and a catalog (`kafka.topics`)
+/// routes names to backends a follower would serve on its own, so neither is
+/// served by a candidate yet; both are refused by name rather than ignored.
+/// Any other role must not set `kafka.brokers`: only a candidate's range moves
+/// between members.
+pub fn kafka_brokers(
+    kafka: &KafkaGatewayConfig,
+    role: DataRole,
+    node_uuid: Uuid,
+    peers: &[FollowerPeerConfig],
+) -> Result<(), String> {
+    if role != DataRole::Candidate {
+        if !kafka.brokers.is_empty() {
+            return Err(brokers_refusal(
+                format!(
+                    "is set on a {role:?} node: only a candidate's range moves between members"
+                ),
+                "Remove `kafka.brokers`, or run every member as `role: candidate`.",
+            ));
+        }
+        return Ok(());
+    }
+    if !kafka.partitions.is_empty() {
+        return Err(
+            "`kafka.partitions` is set on a candidate: a topology names a fixed leader for each \
+             partition, and a candidate's leader moves with the lease. The node did not start. \
+             Remove `kafka.partitions` and list this range's members in `kafka.brokers` (#751)."
+                .to_owned(),
+        );
+    }
+    if !kafka.topics.is_empty() {
+        return Err(
+            "`kafka.topics` is set on a candidate: its routes would be served by every member, \
+             leader or not. The node did not start. Remove `kafka.topics`, or serve them from a \
+             leader or standalone node (#751)."
+                .to_owned(),
+        );
+    }
+    if kafka.brokers.is_empty() {
+        return Err(brokers_refusal(
+            "is empty on a candidate: a client told only about this node has nowhere to go when \
+             it fails",
+            format!(
+                "Add one `{{ node_uuid, node_id, host, port }}` entry per member of `peers`, \
+                 this node ({node_uuid}) included, the same list on every member."
+            ),
+        ));
+    }
+    let mut ids = std::collections::BTreeMap::new();
+    let mut uuids = std::collections::BTreeSet::new();
+    let mut endpoints = std::collections::BTreeMap::new();
+    for broker in &kafka.brokers {
+        if !(0..=255).contains(&broker.node_id) {
+            return Err(brokers_refusal(
+                format!(
+                    "gives {} the broker id {}: a broker id is 0 to 255, the low byte of every \
+                     producer id the gateway mints (#457)",
+                    broker.node_uuid, broker.node_id
+                ),
+                format!(
+                    "Set `node_id` for {} to a value in 0..=255.",
+                    broker.node_uuid
+                ),
+            ));
+        }
+        if let Some(other) = ids.insert(broker.node_id, broker.node_uuid) {
+            return Err(brokers_refusal(
+                format!(
+                    "gives broker id {} to both {other} and {}: a client cannot tell two brokers \
+                     with one id apart",
+                    broker.node_id, broker.node_uuid
+                ),
+                format!("Give {} an id no other member has.", broker.node_uuid),
+            ));
+        }
+        if !uuids.insert(broker.node_uuid) {
+            return Err(brokers_refusal(
+                format!("lists {} more than once", broker.node_uuid),
+                format!("Keep one entry for {}.", broker.node_uuid),
+            ));
+        }
+        if !peers.iter().any(|peer| peer.node_uuid == broker.node_uuid) {
+            return Err(brokers_refusal(
+                format!(
+                    "names {} (broker id {}), which is not one of `peers`: the lease is only ever \
+                     held by a member",
+                    broker.node_uuid, broker.node_id
+                ),
+                format!(
+                    "Remove the entry for {}, or fix its `node_uuid` to the member it is.",
+                    broker.node_uuid
+                ),
+            ));
+        }
+        refuse_undialable_host(
+            &broker.host,
+            &format!(
+                "`kafka.brokers` gives {} (broker id {}) a host that",
+                broker.node_uuid, broker.node_id
+            ),
+        )
+        .map_err(|error| {
+            format!(
+                "{error}. The node did not start. Set `host` for {} to what clients dial.",
+                broker.node_uuid
+            )
+        })?;
+        if broker.port == 0 {
+            return Err(brokers_refusal(
+                format!(
+                    "gives {} (broker id {}) port 0",
+                    broker.node_uuid, broker.node_id
+                ),
+                format!(
+                    "Set `port` for {} to the port clients dial.",
+                    broker.node_uuid
+                ),
+            ));
+        }
+        let endpoint = (canonical_host(&broker.host), broker.port);
+        if let Some(other) = endpoints.insert(endpoint, broker.node_uuid) {
+            return Err(brokers_refusal(
+                format!(
+                    "puts {other} and {} both at {}:{}: one listener is there, so a client sent to \
+                     one may reach the other",
+                    broker.node_uuid, broker.host, broker.port
+                ),
+                format!(
+                    "Give {} the endpoint its own listener is reached at.",
+                    broker.node_uuid
+                ),
+            ));
+        }
+    }
+    for peer in peers {
+        if !uuids.contains(&peer.node_uuid) {
+            return Err(brokers_refusal(
+                format!(
+                    "has no entry for {}, a member of `peers`: while it holds the lease no \
+                     client could be sent to it",
+                    peer.node_uuid
+                ),
+                format!(
+                    "Add `{{ node_uuid: {}, node_id: <its kafka.node_id>, host: <what clients \
+                     dial>, port: <its kafka port> }}`.",
+                    peer.node_uuid
+                ),
+            ));
+        }
+    }
+    let Some(mine) = kafka
+        .brokers
+        .iter()
+        .find(|broker| broker.node_uuid == node_uuid)
+    else {
+        return Err(brokers_refusal(
+            format!("has no entry for this node ({node_uuid})"),
+            format!(
+                "Add `{{ node_uuid: {node_uuid}, node_id: {}, host: <what clients dial>, port: \
+                 <this node's kafka port> }}`.",
+                kafka.node_id
+            ),
+        ));
+    };
+    if mine.node_id != kafka.node_id {
+        return Err(brokers_refusal(
+            format!(
+                "gives this node ({node_uuid}) broker id {}, but its `kafka.node_id` is {}: a \
+                 client would be sent to a broker that answers as another",
+                mine.node_id, kafka.node_id
+            ),
+            format!(
+                "Make the two agree: `kafka.node_id: {}`, or `node_id: {}` in this node's entry.",
+                mine.node_id, kafka.node_id
+            ),
+        ));
+    }
+    if let Some(host) = kafka.advertised_host.as_deref() {
+        if canonical_host(host) != canonical_host(&mine.host) {
+            return Err(brokers_refusal(
+                format!(
+                    "gives this node the host {}, but `kafka.advertised_host` is {host}: Metadata \
+                     and FindCoordinator would name different addresses",
+                    mine.host
+                ),
+                "Remove `kafka.advertised_host`; this node's `kafka.brokers` entry is what it \
+                 advertises.",
+            ));
+        }
+    }
+    if let Some(port) = kafka.advertised_port {
+        if port != mine.port {
+            return Err(brokers_refusal(
+                format!(
+                    "gives this node port {}, but `kafka.advertised_port` is {port}",
+                    mine.port
+                ),
+                "Remove `kafka.advertised_port`; this node's `kafka.brokers` entry is what it \
+                 advertises.",
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn kafka_partitions(kafka: &KafkaGatewayConfig) -> Result<(), String> {
@@ -590,6 +846,12 @@ pub fn kafka_topics(kafka: &KafkaGatewayConfig) -> Result<(), String> {
 /// that disagrees with the override, so the order here settles nothing that
 /// was ever in dispute.
 pub fn kafka_advertised_endpoint(kafka: &KafkaGatewayConfig, bound: SocketAddr) -> (String, i32) {
+    // A candidate advertises its own `kafka.brokers` entry (#751): every
+    // member lists it, so the address a client is redirected to and the one
+    // this node names for itself are one string.
+    if let Some(mine) = kafka.own_broker_entry() {
+        return (mine.host.clone(), i32::from(mine.port));
+    }
     let mine = kafka
         .partitions
         .iter()
@@ -830,8 +1092,9 @@ fn default_kafka_max_fetch_wait_ms() -> u64 {
 }
 
 /// The gateway's own refusals (#225), judged from the config before a port
-/// is bound: only a leader or standalone serves one, and its listener stays
-/// on loopback unless the config says otherwise by name.
+/// is bound: a leader, a standalone node or a candidate serves one (a static
+/// follower never holds the range), and its listener stays on loopback
+/// unless the config says otherwise by name.
 pub fn refuse_kafka_gateway_misuse(
     role: DataRole,
     kafka: Option<&KafkaGatewayConfig>,
@@ -839,11 +1102,11 @@ pub fn refuse_kafka_gateway_misuse(
     let Some(kafka) = kafka else {
         return Ok(());
     };
-    if !matches!(role, DataRole::Leader | DataRole::Standalone) {
+    if role == DataRole::Follower {
         return Err(format!(
-            "`kafka` is configured on a {role:?} node: the gateway is served by a leader or \
-             standalone only — it holds one broker, and a candidate's changes with the lease \
-             (#225)"
+            "`kafka` is configured on a {role:?} node: the gateway is served by a leader, a \
+             standalone node or a candidate, the roles that can hold the range; a static \
+             follower never does (#225, #751)"
         ));
     }
     // An advertised endpoint clients cannot dial is refused before the bind
@@ -1602,10 +1865,10 @@ impl LeaseConfig {
 mod transport_tests {
     use super::*;
 
-    /// #225: the gateway is a leader's or standalone's, and stays on
+    /// #225: the gateway is never a static follower's, and stays on
     /// loopback unless asked off it by name.
     #[test]
-    fn a_kafka_gateway_is_refused_on_a_candidate_and_off_loopback_unless_named() {
+    fn a_kafka_gateway_is_refused_on_a_follower_and_off_loopback_unless_named() {
         let kafka = |listen: &str, any_interface| KafkaGatewayConfig {
             listen: listen.to_owned(),
             any_interface,
@@ -1618,6 +1881,7 @@ mod transport_tests {
             max_fetch_wait_ms: 5_000,
             producer_id: None,
             topics: Vec::new(),
+            brokers: Vec::new(),
         };
         assert!(refuse_kafka_gateway_misuse(DataRole::Leader, None).is_ok());
         assert!(refuse_kafka_gateway_misuse(
@@ -1630,10 +1894,10 @@ mod transport_tests {
                 .is_ok()
         );
         let refused =
-            refuse_kafka_gateway_misuse(DataRole::Candidate, Some(&kafka("127.0.0.1:9092", false)))
+            refuse_kafka_gateway_misuse(DataRole::Follower, Some(&kafka("127.0.0.1:9092", false)))
                 .unwrap_err();
         assert!(
-            refused.contains("Candidate") && refused.contains("lease"),
+            refused.contains("Follower") && refused.contains("hold the range"),
             "{refused}"
         );
         let refused =
@@ -1687,6 +1951,203 @@ mod transport_tests {
             .contains("advertised_port: 0"));
     }
 
+    fn member(n: u128) -> FollowerPeerConfig {
+        FollowerPeerConfig {
+            node_uuid: Uuid::from_u128(n),
+            addr: format!("10.0.0.{n}:9300"),
+            server_name: format!("node-{n}"),
+        }
+    }
+
+    fn broker(n: u128, node_id: i32, host: &str, port: u16) -> KafkaBrokerEntry {
+        KafkaBrokerEntry {
+            node_uuid: Uuid::from_u128(n),
+            node_id,
+            host: host.to_owned(),
+            port,
+        }
+    }
+
+    /// Three candidates, each listing all three, as node 1 sees it.
+    fn candidate_kafka() -> KafkaGatewayConfig {
+        KafkaGatewayConfig {
+            listen: "127.0.0.1:9092".to_owned(),
+            any_interface: false,
+            advertised_host: None,
+            advertised_port: None,
+            topic: None,
+            node_id: 1,
+            partition: 0,
+            partitions: Vec::new(),
+            max_fetch_wait_ms: 5_000,
+            producer_id: None,
+            topics: Vec::new(),
+            brokers: vec![
+                broker(1, 1, "kafka-1.example", 9092),
+                broker(2, 2, "kafka-2.example", 9092),
+                broker(3, 3, "kafka-3.example", 9092),
+            ],
+        }
+    }
+
+    /// #751: a candidate serves the gateway (it holds the range while it
+    /// holds the lease); a static follower never holds the range and is still
+    /// refused. Red before #751, when both were refused.
+    #[test]
+    fn kafka_on_a_candidate_is_accepted_and_on_a_follower_is_refused() {
+        let peers = [member(1), member(2), member(3)];
+        let kafka = candidate_kafka();
+        refuse_kafka_gateway_misuse(DataRole::Candidate, Some(&kafka)).unwrap();
+        kafka_brokers(&kafka, DataRole::Candidate, Uuid::from_u128(1), &peers).unwrap();
+        // The candidate advertises its own entry, which every member lists.
+        assert_eq!(
+            kafka_advertised_endpoint(&kafka, "127.0.0.1:9092".parse().unwrap()),
+            ("kafka-1.example".to_owned(), 9092)
+        );
+        let refused = refuse_kafka_gateway_misuse(DataRole::Follower, Some(&kafka)).unwrap_err();
+        assert!(refused.contains("Follower"), "{refused}");
+        // `kafka.brokers` is a candidate's alone: a leader's range never moves.
+        let refused =
+            kafka_brokers(&kafka, DataRole::Leader, Uuid::from_u128(1), &peers).unwrap_err();
+        assert!(refused.contains("only a candidate"), "{refused}");
+        let mut plain = candidate_kafka();
+        plain.brokers.clear();
+        kafka_brokers(&plain, DataRole::Leader, Uuid::from_u128(1), &[]).unwrap();
+        // A candidate with no brokers is refused, with what to add.
+        let refused =
+            kafka_brokers(&plain, DataRole::Candidate, Uuid::from_u128(1), &peers).unwrap_err();
+        assert!(refused.contains("is empty on a candidate"), "{refused}");
+        // A topology or a catalog is not served by a candidate yet, by name.
+        let mut topology = candidate_kafka();
+        topology.partitions = vec![KafkaPartitionPeer {
+            partition: 0,
+            node_id: 1,
+            host: "kafka-1.example".to_owned(),
+            port: 9092,
+            ..KafkaPartitionPeer::default()
+        }];
+        let refused =
+            kafka_brokers(&topology, DataRole::Candidate, Uuid::from_u128(1), &peers).unwrap_err();
+        assert!(
+            refused.contains("`kafka.partitions` is set on a candidate"),
+            "{refused}"
+        );
+        let mut catalog = candidate_kafka();
+        catalog.topics = vec![KafkaTopicRoute {
+            name: "events".to_owned(),
+            backend: "native".to_owned(),
+            ..KafkaTopicRoute::default()
+        }];
+        let refused =
+            kafka_brokers(&catalog, DataRole::Candidate, Uuid::from_u128(1), &peers).unwrap_err();
+        assert!(
+            refused.contains("`kafka.topics` is set on a candidate"),
+            "{refused}"
+        );
+    }
+
+    /// #751: `kafka.brokers` names every member once, this node at its own
+    /// `kafka.node_id`, under unique ids in 0..=255 at dialable, distinct
+    /// endpoints. Every refusal says what was wrong (which member, which id or
+    /// host), that the node did not start, and the line to fix.
+    #[test]
+    fn kafka_brokers_must_include_this_node_with_unique_ids() {
+        let peers = [member(1), member(2), member(3)];
+        let me = Uuid::from_u128(1);
+        let judge = |edit: &dyn Fn(&mut KafkaGatewayConfig)| {
+            let mut kafka = candidate_kafka();
+            edit(&mut kafka);
+            kafka_brokers(&kafka, DataRole::Candidate, me, &peers).unwrap_err()
+        };
+        let three_parts = |refused: &str, what: &[&str], fix: &str| {
+            for part in what {
+                assert!(refused.contains(part), "{part:?} missing: {refused}");
+            }
+            assert!(
+                refused.contains("The node did not start."),
+                "no outcome: {refused}"
+            );
+            assert!(refused.contains(fix), "{fix:?} missing: {refused}");
+        };
+
+        let refused = judge(&|k| k.brokers.retain(|b| b.node_uuid != me));
+        three_parts(
+            &refused,
+            &[&Uuid::from_u128(1).to_string()],
+            "node_uuid: 00000000-0000-0000-0000-000000000001",
+        );
+        let refused = judge(&|k| k.brokers[2].node_id = 2);
+        three_parts(
+            &refused,
+            &[
+                "broker id 2",
+                &Uuid::from_u128(2).to_string(),
+                &Uuid::from_u128(3).to_string(),
+            ],
+            "Give 00000000-0000-0000-0000-000000000003 an id",
+        );
+        let refused = judge(&|k| k.brokers[1].node_id = 256);
+        three_parts(&refused, &["broker id 256"], "0..=255");
+        let refused = judge(&|k| k.brokers[1].node_id = -1);
+        three_parts(&refused, &["broker id -1"], "0..=255");
+        let refused = judge(&|k| k.brokers[0].node_id = 7);
+        three_parts(
+            &refused,
+            &["broker id 7", "`kafka.node_id` is 1"],
+            "Make the two agree",
+        );
+        let refused = judge(&|k| k.brokers[1].host = "kafka 2.example".to_owned());
+        three_parts(
+            &refused,
+            &["kafka 2.example", "whitespace"],
+            "Set `host` for",
+        );
+        let refused = judge(&|k| k.brokers[1].host = "0.0.0.0".to_owned());
+        three_parts(&refused, &["0.0.0.0"], "Set `host` for");
+        let refused = judge(&|k| k.brokers[1].port = 0);
+        three_parts(&refused, &["port 0"], "Set `port` for");
+        let refused = judge(&|k| k.brokers[2].host = "KAFKA-2.example.".to_owned());
+        three_parts(
+            &refused,
+            &["both at"],
+            "Give 00000000-0000-0000-0000-000000000003 the endpoint",
+        );
+        let refused = judge(&|k| k.brokers[2].node_uuid = Uuid::from_u128(9));
+        three_parts(
+            &refused,
+            &["00000000-0000-0000-0000-000000000009", "not one of `peers`"],
+            "Remove the entry for",
+        );
+        let refused = judge(&|k| k.brokers.truncate(2));
+        three_parts(
+            &refused,
+            &["no entry for 00000000-0000-0000-0000-000000000003"],
+            "Add `{ node_uuid: 00000000-0000-0000-0000-000000000003",
+        );
+        let refused = judge(&|k| {
+            let again = k.brokers[1].clone();
+            k.brokers.push(KafkaBrokerEntry {
+                node_id: 9,
+                host: "kafka-9.example".to_owned(),
+                ..again
+            });
+        });
+        three_parts(&refused, &["more than once"], "Keep one entry");
+        let refused = judge(&|k| k.advertised_host = Some("elsewhere.example".to_owned()));
+        three_parts(
+            &refused,
+            &["elsewhere.example", "kafka-1.example"],
+            "Remove `kafka.advertised_host`",
+        );
+        let refused = judge(&|k| k.advertised_port = Some(9999));
+        three_parts(&refused, &["9999"], "Remove `kafka.advertised_port`");
+        // The advertised override may repeat what the entry says.
+        let mut agrees = candidate_kafka();
+        agrees.advertised_host = Some("kafka-1.example".to_owned());
+        agrees.advertised_port = Some(9092);
+        kafka_brokers(&agrees, DataRole::Candidate, me, &peers).unwrap();
+    }
+
     /// The gateway's producer identity is never the principal (review): the
     /// journal keys epochs by UUID, and the gateway's minted epoch would
     /// fence every native client appending as the principal.
@@ -1707,6 +2168,7 @@ mod transport_tests {
             max_fetch_wait_ms: 5_000,
             producer_id: None,
             topics: Vec::new(),
+            brokers: Vec::new(),
         };
         // Each peer at its own endpoint: two brokers are two servers, and a
         // topology that says otherwise is refused below on its own.
@@ -2244,6 +2706,7 @@ mod transport_tests {
             max_fetch_wait_ms: 5_000,
             producer_id: None,
             topics: Vec::new(),
+            brokers: Vec::new(),
         };
         assert!(kafka_topics(&base).is_ok());
         let native = KafkaGatewayConfig {
@@ -2530,6 +2993,7 @@ mod transport_tests {
             max_fetch_wait_ms: 5_000,
             producer_id: None,
             topics: Vec::new(),
+            brokers: Vec::new(),
         };
         let derived = kafka_producer_id(principal, &kafka).unwrap();
         assert_ne!(derived, principal);

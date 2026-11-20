@@ -312,6 +312,7 @@ pub struct Quiesced {
 #[derive(Clone)]
 pub struct GatewayHandle {
     jobs: Arc<Jobs>,
+    groups: Arc<Coordinator>,
     ceiling: Duration,
 }
 
@@ -327,6 +328,17 @@ impl GatewayHandle {
     /// for at shutdown.
     pub fn ceiling(&self) -> Duration {
         self.ceiling
+    }
+
+    /// Forget every consumer group this gateway coordinates and release the
+    /// joins and syncs parked on them (#751). A node calls this when its
+    /// leadership ends, so members stop waiting on a round that cannot finish
+    /// here and go to the new coordinator, and again when a new leadership
+    /// begins, so no group from an earlier one is judged against. Joins are
+    /// admitted afterwards; committed offsets are in the offset store and are
+    /// not touched.
+    pub fn reset_groups(&self) {
+        self.groups.reset();
     }
 
     /// Wait until every call that was in flight when this was called has
@@ -564,6 +576,7 @@ impl Gateway {
     pub fn handle(&self) -> GatewayHandle {
         GatewayHandle {
             jobs: Arc::clone(&self.jobs),
+            groups: Arc::clone(&self.groups),
             ceiling: self.config.max_produce_wait
                 + self.config.max_fetch_wait
                 + self.config.max_offset_wait
@@ -1486,6 +1499,15 @@ impl Gateway {
             .collect()
     }
 
+    /// The holder's listed endpoint, when there is one to name (#751).
+    fn holder_endpoint(&self) -> Option<MetadataBroker> {
+        let brokers = self.listed_brokers();
+        let holder = self.reachable_holder(&brokers)?;
+        brokers
+            .into_iter()
+            .find(|broker| broker.node_id == holder.broker_id)
+    }
+
     /// The holder, when naming it would help: another node than this one, and
     /// one a client can be told the address of.
     fn reachable_holder(&self, brokers: &[MetadataBroker]) -> Option<RangeHolder> {
@@ -1571,7 +1593,8 @@ impl Gateway {
     /// this group, the same answer from every gateway that has the topology.
     /// This gateway names itself only when it is that broker and still holds
     /// the lease; a fenced coordinator does not send clients to a node that
-    /// cannot take their commits. A gateway that is not the group's still
+    /// cannot take their commits, and names the lease holder instead when it
+    /// knows one (#751). A gateway that is not the group's still
     /// answers with the elected broker — that is how a client finds it. A
     /// transaction key is out of scope, by name; an empty key names no group.
     fn find_coordinator(&self, request: FindCoordinatorRequest) -> FindCoordinatorResponse {
@@ -1607,6 +1630,21 @@ impl Gateway {
             );
         };
         if elected.node_id == self.config.node_id {
+            // A candidate that does not hold the range names the node that
+            // does (#751): its coordinator moved with the lease, and a
+            // consumer told "not available" by every member but the holder
+            // would find it only by luck of which member it asked.
+            if !self.speaks_for_the_range() {
+                if let Some(holder) = self.holder_endpoint() {
+                    return FindCoordinatorResponse {
+                        error: ErrorCode::None,
+                        error_message: None,
+                        node_id: holder.node_id,
+                        host: holder.host,
+                        port: holder.port,
+                    };
+                }
+            }
             if let Some(error) = self.fenced("FindCoordinator") {
                 return refused(
                     error,
