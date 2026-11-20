@@ -11812,6 +11812,19 @@ mod tests {
                 .with_ansi(false)
                 .with_max_level(tracing::Level::WARN)
                 .finish();
+            // Whether an event's callsite is recorded at all is decided once for
+            // the process, the first time any thread reaches it, and cached. With
+            // exactly one dispatcher registered, `tracing` asks only the default of
+            // the thread that got there first: when that is another test with no
+            // subscriber of its own, the callsite is cached as never wanted and
+            // this capture misses the line. A second dispatcher, kept for the life
+            // of the process, means there is never exactly one (as `otel` does for
+            // spans, #791). It wants nothing, so it records nothing.
+            static ALWAYS_A_SECOND: std::sync::OnceLock<tracing::Dispatch> =
+                std::sync::OnceLock::new();
+            ALWAYS_A_SECOND.get_or_init(|| {
+                tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default())
+            });
             (logs, tracing::subscriber::set_default(subscriber))
         }
 
@@ -12197,6 +12210,25 @@ mod tests {
             "{summary:?}"
         );
         assert_committed_without_a_gap("a newer release's A, restarted", &third, 21).await;
+    }
+
+    fn reach_the_capture_probe() {
+        tracing::warn!(target: "vtop_cli::engine", "captured logs probe");
+    }
+
+    /// `a_hold_and_a_lowered_rewind_are_logged_and_counted` failed now and
+    /// then in a full `cargo test` run and passed alone: another test running
+    /// recovery beside it, with no subscriber of its own, reached the
+    /// recovery log lines first, and with one dispatcher registered `tracing`
+    /// cached them as never wanted, so the capture read nothing. Here the
+    /// other thread is made to reach the line first.
+    #[test]
+    fn a_line_first_reached_on_another_thread_is_still_captured_here() {
+        let (logs, guard) = CapturedLogs::start();
+        std::thread::spawn(reach_the_capture_probe).join().unwrap();
+        reach_the_capture_probe();
+        drop(guard);
+        logs.line("captured logs probe");
     }
 
     /// #782: the hold and the lowered rewind each say what happened, what
