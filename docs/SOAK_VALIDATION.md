@@ -228,8 +228,8 @@ that the engine does not leak.**
 
 It runs on a GitHub-hosted runner when dispatched with the profile
 `ci-smoke`, and on a pull request that changes only the soak's own files (the
-soak directory, the workflow, this page, the docs navigation and the benchmark
-test paths).
+soak directory, the workflow, this page, and the docs navigation, limitations
+table, benchmark test paths and actionlint label file that a soak change also edits).
 
 ### What the smoke run showed
 

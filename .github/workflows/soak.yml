@@ -42,10 +42,11 @@ concurrency:
 
 jobs:
   # A pull request runs the smoke only when every file it changes is one the
-  # soak owns: the soak's directory, this workflow, its docs page, and the two
-  # shared files a soak change has to touch (the docs navigation and the
-  # benchmark test paths). Anything else is another change's business, and the
-  # heavier job is not paid for on it.
+  # soak owns: the soak's directory, this workflow, its docs page, and the
+  # shared files a soak change has to touch (the docs navigation, the
+  # limitations table, the benchmark test paths and the runner label that
+  # actionlint is told about). Anything else is another
+  # change's business, and the heavier job is not paid for on it.
   scope:
     name: soak files only?
     if: github.event_name == 'pull_request'
@@ -66,7 +67,7 @@ jobs:
           set -euo pipefail
           gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename' > files.txt
           echo "changed files:"; cat files.txt
-          other="$(grep -Ev '^(benchmarks/soak/|\.github/workflows/soak\.yml$|docs/SOAK_VALIDATION\.md$|mkdocs\.yml$|benchmarks/pytest\.ini$)' files.txt || true)"
+          other="$(grep -Ev '^(benchmarks/soak/|\.github/workflows/soak\.yml$|docs/SOAK_VALIDATION\.md$|mkdocs\.yml$|docs/reference/limitations\.md$|benchmarks/pytest\.ini$|\.github/actionlint\.yaml$)' files.txt || true)"
           if [ -z "$other" ]; then
             echo "soak_only=true" >> "$GITHUB_OUTPUT"
           else
