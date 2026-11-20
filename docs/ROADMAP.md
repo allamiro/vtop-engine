@@ -734,7 +734,9 @@ test that failed first.
     commits instead of timing out (#663).
   - An operator egress ceiling (#481).
   - Each stream may choose its checksum algorithm, with
-    `require_strong_verification` as a floor (#669).
+    `require_strong_verification` as a floor (#669). Automatic selection
+    still needs a measured cost model
+    ([plan](https://github.com/allamiro/vtop-engine/issues/669#issuecomment-6806355703)).
   - `vtopctl validate --print-effective` shows what each stream runs with
     (#670).
   - The #483 gate kept TCP as the only egress path (#475 is closed).
@@ -1195,10 +1197,26 @@ mode_mismatch. The deployment profile is
   `scrub --check-retention` afterwards to find any unlocked object.
 - **Unknown keys inside `upload.object_lock` are refused,** like
   `manifest.mac`, so a later release's new key there is refused by this one.
-- **A reused object whose lock ended, or that was stored unlocked, fails on
-  every replay** of the same bytes (#626 reuses it) until the operator
-  extends its retention or deletes that unprotected version. The message says
-  so.
+- **Upgrade note (#709): a replay no longer reuses an object that is not
+  locked as configured.** Under the profile, a replay that resolves to an
+  object already archived under its derived key (#626) whose lock has ended,
+  that was stored unlocked (for example before the profile was enabled), that
+  is in the other mode, or that lacks the configured legal hold, writes the
+  batch as a fresh locked object under its per-attempt key and commits it,
+  where #684 failed that range on every replay until an operator extended the
+  old object's retention or deleted it. The old object is left untouched, so
+  each such range costs one extra object; the four cases are counted as
+  `fallback_lock_elapsed`, `fallback_unlocked`, `fallback_lock_mode` and
+  `fallback_hold_missing` in `vtop_object_key_decisions_total`, and logged
+  as a WARN. A mode mismatch falls back in both directions, a stronger
+  compliance lock included, because the committed object must be under the
+  configured mode. A retention the store cannot report still fails the
+  batch, so an outage does not multiply objects. The engine remembers the
+  fresh key per range for the process and reuses it on the next replay, and
+  when the store does not keep the lock it writes nothing for five minutes
+  (`lock_withheld`), so the extra objects are one per range per window, not
+  one per replay; a restart forgets it. An engine without #709 in a
+  mixed fleet still stalls on such a range until it is upgraded.
 - **Objects from failed attempts are locked too,** and under `compliance`
   nobody can remove them before the date: storage cost, said at startup.
 - **`vtopctl tier copy` refuses the block;** locking cold-tier copies is a

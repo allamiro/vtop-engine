@@ -3,8 +3,9 @@
 #
 #   pull_request        mkdocs build --strict (broken links, broken anchors,
 #                       pages missing from the nav all fail), plus the checks
-#                       that every config.yaml key has a reference row and
-#                       that SECURITY.md keeps the parts the policy needs.
+#                       that every config.yaml key has a reference row, that
+#                       SECURITY.md keeps the parts the policy needs, and that
+#                       every copied release version names Cargo.toml's.
 #   push to main        the same build, then deploy to GitHub Pages.
 #   workflow_dispatch   rebuild and redeploy main by hand.
 #

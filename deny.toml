@@ -39,25 +39,13 @@ confidence-threshold = 0.9
 # ---------------------------------------------------------------------------
 # `.cargo/audit.toml` is the SINGLE SOURCE OF TRUTH for advisory decisions and
 # carries the full justification for each entry; this list mirrors it so the two
-# tools cannot silently disagree. Any change must be made in BOTH, and each entry
-# re-evaluated when upstream ships a fix (docs/SECURITY_MODEL.md §11).
+# tools cannot silently disagree. Any change must be made in BOTH (the one
+# audit-only exception is noted at the end of the list), with the same
+# `# reviewed:` date, and each entry re-evaluated when upstream ships a fix
+# (docs/SECURITY_MODEL.md §13). scripts/check-advisory-review.py checks this.
 [advisories]
 yanked = "warn"
 ignore = [
-    # rustls-webpki 0.101.x, pulled transitively by aws-smithy-http-client,
-    # whose `__rustls` feature hard-depends on the legacy
-    # hyper-rustls 0.24 -> rustls 0.21 -> rustls-webpki 0.101 stack. No feature
-    # flag or `cargo update` removes it; it needs an upstream SDK release.
-    # Re-check and remove on the next AWS SDK bump.
-    "RUSTSEC-2026-0098", # name constraints accepted for URI names
-    "RUSTSEC-2026-0099", # name constraints accepted for wildcard certs
-    "RUSTSEC-2026-0104", # reachable panic parsing a CRL
-    # lru 0.16.4 — unsound `LruCache::pop()` under a panicking Drop. No fixed
-    # release exists (0.16.4 is the newest published), and it arrives only
-    # through aws-sdk-s3. Mirrors .cargo/audit.toml, which carries the full
-    # justification. Re-evaluate on the next AWS SDK bump.
-    "RUSTSEC-2026-0253",
-
     # unsafe-libyaml 0.2.11 — unmaintained (the upstream repository is archived).
     # UNMAINTAINED, not a vulnerability: no exploitable defect is reported, but
     # none will be fixed upstream either. It arrives only through `serde_yaml`
@@ -67,38 +55,38 @@ ignore = [
     # moving to one is a deliberate migration of every config type, not a
     # version bump, and is follow-up work. Mirrors .cargo/audit.toml, which is
     # the single source of truth.
-    "RUSTSEC-2024-0449",
+    "RUSTSEC-2024-0449", # reviewed: 2026-11-16
 
     # crypto-bigint 0.5.5 — timing-variability in constant-time operations.
     # Fixed only in crypto-bigint >=0.7.6 (a major bump); pinned to the 0.5.x
     # line by aws-sigv4 and elliptic-curve, so no `cargo update` reaches it.
     # Mirrors .cargo/audit.toml, which carries the full justification. Remove
     # when the AWS signing / RustCrypto stack adopts crypto-bigint >=0.7.6.
-    "RUSTSEC-2026-0387",
+    "RUSTSEC-2026-0387", # reviewed: 2026-11-16
 
     # libsqlite3-sys 0.30.1 — bundles a SQLite affected by CVE-2026-119375.
     # Fixed in libsqlite3-sys >=0.39.0, which needs a newer sqlx; sqlx-sqlite
     # 0.9.0 caps it at <0.38. SQLite parses only the engine's local, operator-
     # owned state-store file here, never network input. Mirrors
     # .cargo/audit.toml. Remove when sqlx depends on libsqlite3-sys >=0.39.
-    "RUSTSEC-2026-0459",
+    "RUSTSEC-2026-0459", # reviewed: 2026-11-16
 
     # pin-utils 0.1.0 — UNMAINTAINED (upstream archived; no fix will ship).
     # Reaches the build only through aws-smithy-http / aws-smithy-runtime.
     # cargo-deny's `unmaintained` check fails on it, so it is ignored here;
     # mirrored in .cargo/audit.toml. Remove when the AWS SDK drops pin-utils.
-    "RUSTSEC-2026-0441",
+    "RUSTSEC-2026-0441", # reviewed: 2026-11-16
     # chrono 0.4.45 — unmaintained, no fixed release. A direct dependency for
     # timestamps the engine writes and reads back; replacing it is a workspace
     # migration. cargo-deny's `unmaintained` check fails on it. Mirrors
     # .cargo/audit.toml, which carries the full justification.
     "RUSTSEC-2026-0543", # reviewed: 2026-11-20
-    # NOTE: RUSTSEC-2023-0071 (rsa) is ignored in .cargo/audit.toml but is NOT
-    # listed here on purpose. cargo-audit reads Cargo.lock, so it sees `rsa`;
-    # cargo-deny builds a feature-aware graph and does not, because `rsa` is
-    # reachable only through sqlx's MySQL driver, which this project never
-    # enables. That difference is independent corroboration of the audit.toml
-    # justification: the crate is a lockfile entry that is never compiled.
+    # NOTE: RUSTSEC-2026-0253 (lru, unsound) is ignored in .cargo/audit.toml but
+    # is NOT listed here on purpose. cargo-deny's default `unsound = "workspace"`
+    # reports an unsound advisory only for a direct dependency of a workspace
+    # crate, and lru arrives only through aws-sdk-s3, so this check never raises
+    # it; an ignore here would only print `advisory-not-detected`.
+    # scripts/check-advisory-review.py carries the same exception.
 ]
 
 # ---------------------------------------------------------------------------

@@ -318,6 +318,9 @@ jobs:
               - 'scripts/check-naming.sh'
               - 'scripts/check-egress-claims.sh'
               - 'scripts/naming-denylist.txt'
+              # The check that no shipped build carries the failpoints
+              # feature (#725), listed here and in the shellcheck step.
+              - 'scripts/check-failpoints-absent.sh'
               - 'scripts/tests/**'
               # The test-progress runner: developer tooling, but shell that people
               # will paste and rely on, so it is linted like the rest — listed here
@@ -455,6 +458,12 @@ jobs:
 
       - name: Release build
         run: cargo build --release --bin vtopctl --locked
+
+      # The engine crash sweep's failpoints (#725) kill the process on
+      # request; a release build must not contain them. The sweep's own
+      # build is the positive control (engine-crash-sweep.yml).
+      - name: Release build carries no failpoint
+        run: bash scripts/check-failpoints-absent.sh --binary target/release/vtopctl
 
   docker:
     name: docker image build
@@ -1242,7 +1251,7 @@ jobs:
             scripts/manifest-compat.sh scripts/ledger-compat.sh \
             scripts/traffic-snapshot.sh scripts/test-progress.sh \
             scripts/check-naming.sh scripts/check-egress-claims.sh \
-            scripts/kafka-broker.sh
+            scripts/check-failpoints-absent.sh scripts/kafka-broker.sh
 
       # `-P scripts/live-chaos/scenarios` resolves the scenarios' dynamic
       # `source "$(dirname …)/../lib.sh"`. Without it every scenario reports
@@ -1255,7 +1264,8 @@ jobs:
             scripts/live-chaos/lib.sh \
             scripts/live-chaos/run-all.sh \
             scripts/live-chaos/gen-certs.sh \
-            scripts/live-chaos/scenarios/*.sh
+            scripts/live-chaos/scenarios/*.sh \
+            scripts/live-chaos/engine/*.sh
 
       - name: bats
         run: |
@@ -1269,7 +1279,7 @@ jobs:
   # capable of failing by scripts/tests/naming-and-claims.bats in the shell
   # job; this job is the enforcement itself.
   claims:
-    name: naming + substantiation
+    name: naming + substantiation + format registry
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -1280,6 +1290,21 @@ jobs:
 
       - name: substantiation lint (every measurement row carries its conditions)
         run: bash scripts/check-egress-claims.sh
+
+      # The format registry (#743): every magic and version constant in the
+      # sources has an entry in scripts/compat/formats.yaml with the value
+      # written there, and the inventory on docs/reference/compatibility.md
+      # is what the registry generates. A version bump, a new magic, feature
+      # level or command kind therefore always edits the reviewed registry.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install the pinned PyYAML
+        run: python -m pip install --disable-pip-version-check --require-hashes -r scripts/compat/requirements.txt
+      - name: the registry check can fail for each drift it exists to catch
+        run: python -m unittest discover -s scripts/compat/tests -p 'test_format_registry.py' -v
+      - name: format registry (every magic and version constant has an entry)
+        run: python scripts/check-format-registry.py
 
   # Kafka was entirely untested in CI, which is how a P0 shipped: every read
   # returned zero records (a subscribe() per read forced a rebalance that
@@ -2121,6 +2146,35 @@ jobs:
           path: fuzz/artifacts/
           if-no-files-found: ignore
           retention-days: 14
+
+  # The group-commit coordinator's model test (#752). The coordinator hands
+  # the lead from one waiting producer thread to the next over a Mutex and
+  # Condvars; a lost wake-up there hangs every producer on the range, and a
+  # stress test only finds one by luck. loom explores every interleaving of a
+  # small model instead. `vtop_loom`, not `loom`: a plain `--cfg loom` turns
+  # on tokio's own loom paths and the tree no longer builds.
+  loom:
+    name: loom model (group commit)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-loom-${{ hashFiles('**/Cargo.lock') }}
+      - name: Explore the coordinator's interleavings
+        env:
+          RUSTFLAGS: --cfg vtop_loom
+        run: cargo test -p vtop-broker --lib --release --locked loom_model
 
   # Mutation testing on the commit path (#729): GATED. A mutant of the
   # state machine (`transition`, `can_transition`, `is_committable`) or of
