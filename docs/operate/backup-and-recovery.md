@@ -81,7 +81,41 @@ ledger's size and your storage set your RTO. See
 
 ### What the drill measured
 
-MEASURED_NUMBERS
+Each row is one run of the drill, with the conditions below it. They show
+that the procedures work and what their parts cost on a small ledger; they are
+not a promise about yours.
+
+| Mode | RPO | RTO | Backup took | Ledger rows lost, archived again |
+|---|---|---|---|---|
+| SQLite, `.backup` | 6.2 s | 0.23 s | 6 ms | 3 |
+| PostgreSQL 18, `pg_dump` | 8.3 s | 0.55 s | 0.11 s | 3 |
+| PostgreSQL 14, `pg_dump` | 8.3 s | 0.71 s | 0.10 s | 4 |
+| PostgreSQL 18, base backup and WAL archive | 0 s | 1.5 s | 0.21 s | 0 |
+| PostgreSQL 14, base backup and WAL archive | 0 s | 1.3 s | 0.17 s | 0 |
+
+Conditions: a `vtopctl` debug build; a file source grown by about 20 records a
+second of 85 bytes, in batches of up to 40 records or 2 seconds; the bucket a
+local directory; a ledger of a few dozen rows; Docker Desktop on an arm64
+laptop, two CPUs, PostgreSQL from `postgres:18-alpine` and the pinned
+`postgres:14` image. The backup interval is 8 seconds and `archive_timeout` 5
+seconds. Every run archived every source record (between 440 and 620 in these
+runs) and passed the checks under [The drill](#the-drill).
+
+Reading them:
+
+- The RPO of a backup taken at intervals is about the interval, less the time
+  since the engine's last write when the ledger was lost. The 6 to 8 seconds
+  above are an 8-second interval.
+- The RPO of WAL archiving falls anywhere from 0 to `archive_timeout`,
+  depending on where in that interval the server is lost: a lost host loses the
+  WAL it had not yet archived. These runs happened to land at 0.
+- The RTO is small because the ledger is small and the engine reads the
+  backlog (the records written since the backup) in one pass. The restore step
+  of the PostgreSQL modes was under a second.
+
+CI measures the same numbers on every run and keeps them in the workflow run's
+summary and as an artifact: `restore drill (sqlite)` in the CI workflow, and
+`restore drill (pg N)` in the `postgres matrix` workflow, nightly.
 
 ## SQLite
 
