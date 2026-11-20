@@ -50,7 +50,9 @@ digest="$(awk -v a="$ASSET" '$2 == a || $2 == "./" a { print $1 }' "$sums")"
 # under /out. An older release links librdkafka's shared libraries, which the
 # image lacks, so the container installs them as root and then runs the
 # scenario as a user with no entry in /etc/passwd (so the audit actor's name
-# comes from $USER, and the host name is the fixed one below).
+# comes from $USER, and the host name is the fixed one below). The ledger is
+# checkpointed by the scenario itself, inside the container, as that user: on
+# the host the files are another user's.
 mkdir -p "$scratch/out"
 chmod 0777 "$scratch/out"
 docker run --rm --hostname compat-fixture \
@@ -62,18 +64,19 @@ docker run --rm --hostname compat-fixture \
   "$IMAGE" bash -c '
     set -e
     apt-get update -qq > /dev/null
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libsasl2-2 libssl3t64 libcurl4t64 zlib1g > /dev/null
-    exec setpriv --reuid=10001 --regid=10001 --clear-groups bash /ledger-scenario.sh /bin-under-test/vtopctl /out/run
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libsasl2-2 libssl3t64 libcurl4t64 zlib1g sqlite3 > /dev/null
+    setpriv --reuid=10001 --regid=10001 --clear-groups bash /ledger-scenario.sh /bin-under-test/vtopctl /out/run
+    # The scenario user owns what it wrote: open it up, so whoever ran this
+    # (not that user, with a rootful Docker on Linux) can read and remove it.
+    setpriv --reuid=10001 --regid=10001 --clear-groups chmod -R a+rwX /out/run
   '
 
 run="$scratch/out/run"
-python3 - "$run/state.db" <<'PY'
-import sqlite3, sys
-# One file, no -wal or -shm beside it.
-con = sqlite3.connect(sys.argv[1])
-con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-con.close()
-PY
+# One file, no write-ahead log content beside it: the scenario checkpointed it.
+if [[ -s "$run/state.db-wal" ]]; then
+  echo "the ledger still has write-ahead log content; the scenario's checkpoint did not run" >&2
+  exit 1
+fi
 
 dest="$root/crates/vtop-cli/tests/fixtures/ledger-sqlite/$TAG"
 rm -rf "$dest"
