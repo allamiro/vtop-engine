@@ -775,7 +775,7 @@ async fn a_newer_snapshot_gap_replaces_a_refused_older_one() {
     assert_eq!(audited_frontier(&store), Some(20));
 }
 
-/// Codex review of #767: a snapshot install over a stale branch, with the
+/// Review of #767: a snapshot install over a stale branch, with the
 /// sink refusing its gap, then new entries applied and a LOCAL snapshot built
 /// on top - whose index and term the log agrees with, while the stale branch
 /// below the installed snapshot still sits in the log. A restart must still

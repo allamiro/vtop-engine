@@ -736,6 +736,10 @@ struct FileSink {
     /// the next record starts on a new line, so it is not glued to the
     /// fragment and lost to every reader (review of #767).
     needs_newline: bool,
+    /// The file's length after this sink's last append (or when it was
+    /// opened). Another length means another writer - a node, a `vtopctl`
+    /// run - appended since, so the file's last byte is read again.
+    end: Option<u64>,
 }
 
 /// Whether the file at `path` is non-empty and its last byte is not a
@@ -766,8 +770,29 @@ impl FileSink {
     /// disk) leaves a fragment: it is cut off again, and when it cannot be,
     /// the next record starts on a new line. Either way every record that
     /// is reported written is a line of its own that a reader parses.
+    ///
+    /// Other processes may append to the same file (a node and `vtopctl`
+    /// runs), so the append holds an exclusive lock on the file across the
+    /// length check, the write and the cut: without it a cut back to the
+    /// length seen before deleted a record another process appended in
+    /// between (review of #767). Where the file cannot be locked, a failed
+    /// write is never cut; the next record starts on a new line instead.
     fn append_line(&mut self, json: &str) -> std::io::Result<()> {
+        let locked = self.file.lock().is_ok();
+        let written = self.append_locked(json, locked);
+        if locked {
+            let _ = self.file.unlock();
+        }
+        written
+    }
+
+    fn append_locked(&mut self, json: &str, locked: bool) -> std::io::Result<()> {
         let before = self.file.metadata().map(|m| m.len()).ok();
+        if before.is_some() && before != self.end {
+            // Another writer appended since; it may have left the file
+            // inside a line it could not cut off.
+            self.needs_newline = ends_inside_a_line(&self.path);
+        }
         let mut line = String::with_capacity(json.len() + 2);
         if self.needs_newline {
             line.push('\n');
@@ -779,11 +804,17 @@ impl FileSink {
             .write_all(line.as_bytes())
             .and_then(|()| self.file.sync_data());
         match &written {
-            Ok(()) => self.needs_newline = false,
+            Ok(()) => {
+                self.needs_newline = false;
+                self.end = self.file.metadata().map(|m| m.len()).ok();
+            }
             Err(_) => {
-                let cut = before.is_some_and(|len| self.file.set_len(len).is_ok());
-                if !cut {
+                let cut = locked && before.is_some_and(|len| self.file.set_len(len).is_ok());
+                if cut {
+                    self.end = before;
+                } else {
                     self.needs_newline = true;
+                    self.end = None;
                 }
             }
         }
@@ -830,10 +861,12 @@ impl AuditSink {
         // by an earlier run) gets a newline before the next record, so that
         // record is not glued to the fragment (review of #767).
         let needs_newline = ends_inside_a_line(path);
+        let end = file.metadata().map(|m| m.len()).ok();
         *self.file.lock().unwrap_or_else(|e| e.into_inner()) = Some(FileSink {
             path: path.to_owned(),
             file,
             needs_newline,
+            end,
         });
         Ok(())
     }
@@ -1164,7 +1197,7 @@ fn passwd_lookup(text: &str, uid: u32) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// Review of #767 (Codex): a file an earlier run left ending inside a
+    /// Review of #767: a file an earlier run left ending inside a
     /// line - a crash part-way through an append - gets a newline before the
     /// first record of the next run, which the startup replay writes.
     #[test]
@@ -1256,6 +1289,67 @@ mod tests {
         assert!(
             serde_json::from_str::<AuditEvent>(lines[2]).is_ok(),
             "the record after the fragment parses: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review of #767: processes that share one audit file (a node
+    /// and `vtopctl` runs) each cut a failed append back to the length they
+    /// saw before it, which deleted a record another process had appended in
+    /// between. An append now holds an exclusive lock on the file across the
+    /// length check, the write and the cut, and starts on a new line when
+    /// another writer left the file inside one. The other writer here is a
+    /// second handle on the file, holding the lock while it appends a
+    /// fragment.
+    #[test]
+    fn an_append_waits_for_another_writer_of_the_same_file() {
+        let dir = std::env::temp_dir().join(format!("vtop-767l-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        let sink = std::sync::Arc::new(AuditSink::default());
+        sink.open_file(&path).unwrap();
+        let event = || {
+            AuditEvent::new(
+                Action::ClusterPropose,
+                Stage::Applied,
+                Actor::replica("meta-1"),
+                Target::new("cluster", None),
+                Outcome::Success,
+            )
+        };
+        sink.record(&event()).unwrap();
+
+        let mut other = OpenOptions::new().append(true).open(&path).unwrap();
+        other.lock().unwrap();
+        let writer = {
+            let sink = std::sync::Arc::clone(&sink);
+            std::thread::spawn(move || sink.record(&event()).map(|_| ()))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let while_locked = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            while_locked.lines().count(),
+            1,
+            "a record was appended while another writer held the file: {while_locked}"
+        );
+        other.write_all(br#"{"audit_version":1,"aud"#).unwrap();
+        other.unlock().unwrap();
+        writer.join().unwrap().unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(
+            serde_json::from_str::<AuditEvent>(lines[0]).is_ok(),
+            "{text}"
+        );
+        assert!(
+            serde_json::from_str::<AuditEvent>(lines[1]).is_err(),
+            "the other writer's fragment: {text}"
+        );
+        assert!(
+            serde_json::from_str::<AuditEvent>(lines[2]).is_ok(),
+            "the record after another writer's fragment is a line of its own: {text}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

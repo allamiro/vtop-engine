@@ -14,7 +14,7 @@
 //! `floor` is the highest index a snapshot install brought this replica
 //! past: entries at or below it were never applied here one by one, and the
 //! log below it may be a stale branch. A replay never reads at or below it
-//! (Codex review of #767: a later local snapshot can make that branch look
+//! (review of #767: a later local snapshot can make that branch look
 //! like the committed log again, so the boundary is kept durably).
 //!
 //! # Why a second frontier

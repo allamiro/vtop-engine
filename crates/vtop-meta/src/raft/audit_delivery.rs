@@ -372,7 +372,7 @@ impl MetaRaftStore {
         // older one still owed (review of #767: it was sent twice).
         delivery.pending_gap = None;
         // The boundary of what this replica never applied one by one, kept
-        // durably before anything else (Codex review of #767): a refused gap
+        // durably before anything else (review of #767): a refused gap
         // lives in memory only, and a later local snapshot can make a stale
         // branch below it look like the committed log.
         if let Err(error) = self.lock().storage.save_audited_floor(snapshot_index) {
