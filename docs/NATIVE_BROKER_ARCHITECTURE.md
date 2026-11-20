@@ -598,8 +598,9 @@ every request that arrives alone, and is refused at a second or more. The
 settings are judged at startup, before a port is bound or a lease taken: zero
 bounds, an over-long window, and a group the replica plane could not frame in
 one append (`max_bytes` and `max_records` with the per-request overhead
-against the frame limit) stop the node, and the section on a follower is
-refused. It is off by default until the evidence gates in #752 hold; a node
+against the frame limit) stop the node, and so does the section enabled on a follower. A follower
+accepts a disabled section and logs at INFO that it ignores it, so one config
+can be shared across roles. It is off by default until the evidence gates in #752 hold; a node
 that has it on logs its settings at INFO and exports
 `vtop_broker_group_commit_enabled` and the `vtop_broker_group_commit_*`
 series (see [node observability](NODE_OBSERVABILITY.md)).

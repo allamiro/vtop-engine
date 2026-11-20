@@ -1374,7 +1374,8 @@ pub struct DataNodeConfig {
     /// one fsync and one replication round. Absent = each request has its
     /// own barrier, the behaviour before this section existed. Leader,
     /// candidate and standalone only: a follower never takes a produce
-    /// request, so the section there is refused rather than ignored.
+    /// request, so it ignores a disabled section (one config can be shared
+    /// across roles) and refuses an enabled one.
     #[serde(default)]
     pub group_commit: Option<GroupCommitSection>,
 }
@@ -1482,11 +1483,18 @@ pub fn refuse_group_commit_misuse(
         return Ok(());
     };
     if role == DataRole::Follower {
+        // A disabled section is accepted so one config can be shared across
+        // roles; the node says it ignores it (`note_group_commit_ignored`).
+        // Only an enabled one is a mistake: it asks for batching on a node
+        // that never takes a produce request.
+        if !section.enabled {
+            return Ok(());
+        }
         return Err(
-            "`group_commit` is configured on a follower node: a follower never takes a produce \
-             request, so the section would change nothing. The node did not start. Remove the \
-             section from this follower's config; it belongs to the leader, standalone and \
-             candidate configs"
+            "`group_commit` is enabled on a follower node: a follower never takes a produce \
+             request, so it would batch nothing. The node did not start. Set \
+             `group_commit.enabled: false` or remove the section from this follower's config; \
+             enabled, it belongs to the leader, standalone and candidate configs"
                 .to_owned(),
         );
     }
@@ -3086,30 +3094,38 @@ mod tests {
         assert!(typo.to_string().contains("max_delay"), "{typo}");
     }
 
-    /// A follower never takes a produce request, so the section there is
-    /// refused (naming what to do), not ignored, whether it is on or off.
+    /// A follower never takes a produce request. A disabled section there is
+    /// accepted, so one config can be shared across roles; an enabled one is
+    /// refused (naming what to do), not ignored.
     #[test]
-    fn group_commit_on_a_follower_is_refused() {
+    fn group_commit_enabled_on_a_follower_is_refused_and_disabled_is_accepted() {
         let range = group_commit_range();
+        let enabled = data_config("group_commit: { enabled: true }\n").group_commit;
+        let refusal = refuse_group_commit_misuse(DataRole::Follower, &range, enabled.as_ref())
+            .expect_err("a follower with the section enabled is refused");
+        for part in [
+            "`group_commit` is enabled on a follower node",
+            "The node did not start",
+            "`group_commit.enabled: false`",
+        ] {
+            assert!(refusal.contains(part), "missing {part:?}: {refusal}");
+        }
         for extra in [
-            "group_commit: { enabled: true }\n",
             "group_commit: { enabled: false }\n",
+            "group_commit: { enabled: false, max_delay_ms: 5 }\n",
             "group_commit: {}\n",
         ] {
             let section = data_config(extra).group_commit;
-            let refusal = refuse_group_commit_misuse(DataRole::Follower, &range, section.as_ref())
-                .expect_err("a follower with the section is refused");
-            for part in [
-                "`group_commit` is configured on a follower node",
-                "The node did not start",
-                "Remove the section",
-            ] {
-                assert!(refusal.contains(part), "missing {part:?}: {refusal}");
-            }
-            for role in [DataRole::Leader, DataRole::Candidate, DataRole::Standalone] {
-                refuse_group_commit_misuse(role, &range, section.as_ref())
-                    .unwrap_or_else(|why| panic!("{role:?} takes the section: {why}"));
-            }
+            assert!(
+                !section.as_ref().unwrap().enabled,
+                "{extra} is off while the default is off"
+            );
+            refuse_group_commit_misuse(DataRole::Follower, &range, section.as_ref())
+                .unwrap_or_else(|why| panic!("a disabled section on a follower: {why}"));
+        }
+        for role in [DataRole::Leader, DataRole::Candidate, DataRole::Standalone] {
+            refuse_group_commit_misuse(role, &range, enabled.as_ref())
+                .unwrap_or_else(|why| panic!("{role:?} takes the section: {why}"));
         }
         refuse_group_commit_misuse(DataRole::Follower, &range, None)
             .expect("a follower without the section is fine");

@@ -1045,6 +1045,7 @@ async fn run_follower(
     metrics_addr: Option<std::net::SocketAddr>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
+    note_group_commit_ignored(&config);
     let listen = config
         .replica_listen
         .as_ref()
@@ -3212,6 +3213,21 @@ struct BuiltLeader {
     replicas: Arc<NetworkedReplicaSet>,
 }
 
+/// Say, at INFO, that a follower ignores a `group_commit:` section (#752). A
+/// disabled section is accepted on a follower so one config can be shared
+/// across roles; an enabled one never reaches here, it was refused at startup.
+fn note_group_commit_ignored(config: &DataNodeConfig) {
+    if config.group_commit.is_some() {
+        tracing::info!(
+            range = %config.range.range_id,
+            "this follower ignores its `group_commit` section: a follower never takes a \
+             produce request, so group commit applies only on the node that leads range {}. \
+             Nothing is needed; the section is kept so one config can be shared across roles",
+            config.range.range_id
+        );
+    }
+}
+
 /// Attach the group commit the node's `group_commit:` section asks for to a
 /// leader's broker (#752), and say so at INFO: whether concurrent produce
 /// requests share a barrier changes what an operator sees in latency and in
@@ -5242,6 +5258,29 @@ mod group_commit_wiring_tests {
         );
         drop(built);
         runtime.shutdown_timeout(Duration::from_secs(5));
+    }
+
+    /// A follower given a (disabled) section says it ignores it, so the
+    /// operator sees the section was read and is not in use.
+    #[test]
+    fn a_follower_says_it_ignores_a_disabled_group_commit_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = candidate_config_with(dir.path(), "group_commit: { enabled: false }\n");
+        let ((), logs) = capture_logs(|| note_group_commit_ignored(&config));
+        let info = logs
+            .lines()
+            .find(|line| line.contains("ignores its `group_commit` section"))
+            .unwrap_or_else(|| panic!("a follower with the section says so at INFO:\n{logs}"));
+        for part in [
+            "\"level\":\"INFO\"",
+            "a follower never takes a produce request",
+            "Nothing is needed",
+        ] {
+            assert!(info.contains(part), "missing {part:?} in {info}");
+        }
+        let bare = candidate_config_with(dir.path(), "");
+        let ((), logs) = capture_logs(|| note_group_commit_ignored(&bare));
+        assert!(logs.is_empty(), "no section, nothing said:\n{logs}");
     }
 
     /// A section tuned and then left off is a node that looks as if it

@@ -46,7 +46,8 @@ what each release does **not** yet do.
   defaults to 0 (natural batching), so a lone request pays nothing. A node
   logs its settings at INFO when it is on, refuses invalid settings at
   startup (a window of a second or more, a zero bound, a group the replica
-  plane could not frame in one append, and the section on a follower), and
+  plane could not frame in one append, and the section enabled on a follower;
+  a follower accepts a disabled section and logs that it ignores it), and
   exports `vtop_broker_group_commit_overloaded_total` and
   `vtop_broker_group_commit_split_groups_total` beside the existing
   `vtop_broker_group_commit_*` series. Live-chaos scenario 25 kills the leader
