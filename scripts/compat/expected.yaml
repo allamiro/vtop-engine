@@ -58,6 +58,17 @@ cells:
     since: v0.2.0
     directions: [upgrade]
 
+  # The native protocol (scripts/compat/cells/wire.sh, which runs
+  # scripts/upgrade-compat.sh with UPGRADE_WIRE): the release's vtop-node
+  # serves and this build's produce and verify are the client (upgrade), and
+  # the reverse (forward): a leader and a follower on quorum durability, 2000
+  # records produced and read back. The replica plane is exercised between
+  # nodes of the same release; an old follower under a new leader is live
+  # scenario 22's.
+  wire:
+    since: v0.2.0
+    directions: [upgrade, forward]
+
   # The PostgreSQL ledger (cells/ledger-postgres.sh). The published archives
   # have no `postgres` feature, so the release is built from its tag with it,
   # and a throwaway server runs beside it: nightly and on demand only.
