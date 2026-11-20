@@ -62,6 +62,7 @@ SOURCES = {
     ),
     "scripts/tests/test_x.py": "class T:\n    def test_it_holds(self):\n        pass\n",
     ".github/workflows/ci.yml": "jobs:\n  audit:\n    name: supply-chain (cargo audit)\n",
+    "deny.toml": "[sources]\nunknown-git = \"deny\"\n",
     "scripts/scenario.sh": "#!/usr/bin/env bash\necho ok\n",
 }
 
@@ -140,6 +141,15 @@ class CheckTests(unittest.TestCase):
         rows = good_rows()
         rows["A1"] = row("A1", control="`crates/a/src/lib.rs::enforce` and `ServerConfig::max_sessions` and `transfer_peers`")
         self.assertEqual(self.repo(document(rows)).problems(), [])
+
+    def test_a_file_at_the_repository_root_is_a_reference(self):
+        rows = good_rows()
+        rows["A1"] = row("A1", control="`deny.toml::unknown-git`")
+        self.assertEqual(self.repo(document(rows)).problems(), [])
+        rows["A1"] = row("A1", control="`deny.toml::unknown-registry`")
+        self.assert_fails(self.repo(document(rows)), "A1", "unknown-registry")
+        rows["A1"] = row("A1", control="`gone.toml::unknown-git`")
+        self.assert_fails(self.repo(document(rows)), "A1", "gone.toml", "does not exist")
 
     def test_a_missing_file_fails_naming_it(self):
         rows = good_rows()

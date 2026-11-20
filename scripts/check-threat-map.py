@@ -17,7 +17,8 @@ nothing, so this check reads the tables and fails when:
     row for a cell that is not a GAP, or a gaps row naming the wrong side.
 
 A reference is written in backticks, as `path` or `path::symbol`. The path is
-relative to the repository root and has a directory part; other inline code is
+relative to the repository root and has a directory part or a file extension
+(`deny.toml`); other inline code is
 prose and is not checked. A GAP cell may name references (the file whose
 absence is the gap, say), and they are checked too. The symbol is matched as a whole word, so a
 longer name does not stand in for a shorter one. Line numbers are not written
@@ -138,20 +139,22 @@ def is_gap(cell: str) -> bool:
 
 
 PATH = re.compile(r"[\w./-]+")
+# A file at the repository root (`deny.toml`) has no directory part.
+FILE = re.compile(r"\.(rs|py|sh|yml|yaml|toml|md|sql|json|tpl|txt)$")
 
 
 def refs(cell: str) -> list[tuple[str, str | None]]:
     """The references in a cell: backticked `path` or `path::symbol`.
 
     Any other inline code (a config key, a function named in prose) is not a
-    reference. A path has a directory part, so `ServerConfig::max_sessions`
-    and `i32::MAX` are prose.
+    reference. A path has a directory part or a file extension, so
+    `ServerConfig::max_sessions` and `i32::MAX` are prose, and `deny.toml` is not.
     """
     out = []
     for raw in REF.findall(cell):
         path, _, symbol = raw.partition("::")
         path = path.strip()
-        if "/" in path and PATH.fullmatch(path):
+        if PATH.fullmatch(path) and ("/" in path or FILE.search(path)):
             out.append((path, symbol.strip() or None))
     return out
 
