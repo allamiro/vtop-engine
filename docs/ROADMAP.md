@@ -1252,7 +1252,8 @@ mode_mismatch. The deployment profile is
 - **`vtopctl tier copy` refuses the block;** locking cold-tier copies is a
   separate decision.
 - **Proven against the S3 compatibility matrix's servers** (#722): the lab's
-  MinIO (RELEASE.2025-09-07), RustFS 1.0.5 and SeaweedFS 4.53 keep the lock;
+  MinIO (RELEASE.2025-09-07), RustFS 1.0.5, SeaweedFS 4.53, Versity S3 Gateway
+  v1.11.0 and Zenko CloudServer 9.5.5 keep the lock;
   Garage v2.5.0 implements no Object Lock and is refused at startup. Which
   server did what is the generated
   [S3 compatibility](reference/s3-compatibility.md) table. AWS S3 behaviour

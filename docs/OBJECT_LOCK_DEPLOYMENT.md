@@ -283,7 +283,8 @@ still reclaim them.
   profile).
 - **Stores the matrix has not run.** The live tests run against the S3
   compatibility matrix's servers (#722). On the lab's MinIO
-  (RELEASE.2025-09-07), RustFS 1.0.5 and SeaweedFS 4.53 they accept locked
+  (RELEASE.2025-09-07), RustFS 1.0.5, SeaweedFS 4.53, Versity S3 Gateway v1.11.0
+  and Zenko CloudServer 9.5.5 they accept locked
   writes for both checksum paths and for multipart, return the lock headers
   on `HeadObject`, refuse to delete a locked version, and still report an
   ended retention's mode and date. Garage v2.5.0 implements no Object Lock
