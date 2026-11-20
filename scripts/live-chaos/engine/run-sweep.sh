@@ -236,15 +236,44 @@ $multipart
 EOF
 }
 
-group_committed() { # <group> -> the group's committed offset, or -
-  local out
-  out="$(kafka_tool kafka-consumer-groups.sh --describe --group "$1" 2>/dev/null || true)"
-  awk -v t="$TOPIC" '$2 == t && $3 == "0" { print $4; found = 1 } END { if (!found) print "-" }' <<< "$out"
+# group_committed <group> — print the group's committed offset on the
+# partition, or `-` when the broker answered that it has none. Fails, with
+# what the tool printed on stderr, when the answer was not read: the tool
+# exits 0 even when its query timed out, and an unread offset taken for an
+# absent one would pass the very premature commit the sweep looks for.
+group_committed() {
+  local out code=0
+  out="$(kafka_tool kafka-consumer-groups.sh --describe --group "$1" 2>&1)" || code=$?
+  if (( code != 0 )); then
+    echo "kafka-consumer-groups.sh --describe --group $1 exited $code: $(tail -n 3 <<< "$out" | tr '\n' ' ')" >&2
+    return 1
+  fi
+  python3 "$CHECKS" group-offset "$1" "$TOPIC" 0 <<< "$out"
+}
+
+# group_committed_settled <group> — group_committed, tried up to
+# GROUP_QUERY_ATTEMPTS times. Used where the engine is not running, so the
+# offset cannot move between attempts; a query that never answers fails the
+# check, naming every attempt's error.
+GROUP_QUERY_ATTEMPTS=3
+group_committed_settled() {
+  local group="$1" attempt errors="" value
+  for ((attempt = 1; attempt <= GROUP_QUERY_ATTEMPTS; attempt++)); do
+    if value="$(group_committed "$group" 2> "$WORKDIR/group-query.err")"; then
+      echo "$value"
+      return 0
+    fi
+    errors+=" [attempt $attempt] $(tr '\n' ' ' < "$WORKDIR/group-query.err")"
+    (( attempt < GROUP_QUERY_ATTEMPTS )) && sleep 2
+  done
+  echo "could not read the committed offset of group $group from the broker in $GROUP_QUERY_ATTEMPTS attempts:$errors" >&2
+  return 1
 }
 
 check_commit_rule() { # <point> <dir> <group> <when>
   local point="$1" dir="$2" group="$3" when="$4" committed ledger
-  committed="$(group_committed "$group")"
+  committed="$(group_committed_settled "$group" 2> "$dir/group-query.err")" \
+    || fail "$point ($when): the commit rule was not checked: $(cat "$dir/group-query.err")"
   ledger="$(python3 "$CHECKS" ledger "$dir/state.db" "$TOPIC" 0 "$group")"
   printf '%s %s committed=%s ledger=%s\n' "$when" "$point" "$committed" "$ledger" >> "$dir/commit-rule.log"
   python3 "$CHECKS" commit-rule "$committed" "$ledger" "$point" "$when" >> "$dir/commit-rule.log" 2>&1 \
@@ -253,7 +282,12 @@ check_commit_rule() { # <point> <dir> <group> <when>
 
 drained() { # <dir> <group> — succeeds once every record is committed
   local dir="$1" group="$2" committed ledger
-  committed="$(group_committed "$group")"
+  # The engine is running, so a failed query is not retried here: it is
+  # "not drained yet", and engine_drain's bounded wait reports it.
+  if ! committed="$(group_committed "$group" 2>&1)"; then
+    echo "the group's committed offset was not read: $committed"
+    return 1
+  fi
   ledger="$(python3 "$CHECKS" ledger "$dir/state.db" "$TOPIC" 0 "$group")"
   if [[ "$committed" == "$RECORDS" ]] \
     && python3 -c 'import json,sys; s=json.loads(sys.argv[1]); sys.exit(0 if s["committed_end"] == int(sys.argv[2]) - 1 and not s["in_flight"] else 1)' \

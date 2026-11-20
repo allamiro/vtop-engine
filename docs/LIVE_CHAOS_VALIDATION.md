@@ -215,7 +215,7 @@ ledger, work directory and object prefix over one seeded topic.
 
 | Invariant | Kind | How |
 |---|---|---|
-| The commit rule at the source: the group's committed offset never passes the end of the highest range the ledger records as VERIFIED | safety | read from the broker (`kafka-consumer-groups.sh`) and from the ledger (opened read-only, so the WAL the kill left is not checkpointed), at the kill and again after the restart |
+| The commit rule at the source: the group's committed offset never passes the end of the highest range the ledger records as VERIFIED | safety | read from the broker (`kafka-consumer-groups.sh`) and from the ledger (opened read-only, so the WAL the kill left is not checkpointed), at the kill and again after the restart. "No committed offset" counts only when the broker said so (the offsets table without one, or the group not found); a query that failed or timed out, which the tool reports with exit status 0, is retried three times and then fails the check |
 | The commit rule in the ledger: no SOURCE_COMMITTED row lacks what the VERIFIED write leaves (the verification class, which only `mark_verified` sets, the object and the manifest) | safety | the same read-only ledger read, at the kill and after the restart |
 | No hole | safety | `vtopctl audit-coverage --check-storage` passes, `vtopctl scrub` is clean, and every produced record is found in the objects the store holds, copied out with `mc` and counted by the harness, not by the engine |
 | Duplicates only where the at-least-once window is open | safety | the extra copies are counted against the table below |

@@ -6,6 +6,8 @@ Run: python3 -m unittest discover -s scripts/live-chaos/engine -p 'test_*.py'
 import gzip
 import json
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -100,6 +102,85 @@ class LedgerTest(unittest.TestCase):
         self.assertEqual(s["rows"], 0)
         self.assertIsNone(s["verified_end"])
 
+# What `kafka-consumer-groups.sh --describe` (apache/kafka:4.3.1) printed,
+# stdout and stderr together as run-sweep.sh captures them. The tool exits 0
+# in every one of these cases.
+DESCRIBE_COMMITTED = """
+Consumer group 'g' has no active members.
+
+GROUP           TOPIC           PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG             CONSUMER-ID     HOST            CLIENT-ID
+g               other           0          7               9               2               -               -               -
+g               t               0          20              50              30              -               -               -
+"""
+DESCRIBE_ACTIVE_UNCOMMITTED = """
+GROUP           TOPIC           PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG             CONSUMER-ID                         HOST            CLIENT-ID
+g               t               0          -               50              -               rdkafka-1b2c-4d5e                   /10.0.0.2       rdkafka
+"""
+DESCRIBE_OTHER_TOPIC_ONLY = """
+Consumer group 'g' has no active members.
+
+GROUP           TOPIC           PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG             CONSUMER-ID     HOST            CLIENT-ID
+g               other           0          7               9               2               -               -               -
+"""
+DESCRIBE_NOT_FOUND = """
+Error: Executing consumer group command failed due to org.apache.kafka.common.errors.GroupIdNotFoundException: Group g not found.
+java.util.concurrent.ExecutionException: org.apache.kafka.common.errors.GroupIdNotFoundException: Group g not found.
+	at java.base/java.util.concurrent.CompletableFuture.reportGet(Unknown Source)
+"""
+DESCRIBE_TIMEOUT = """[2026-11-20 06:30:45,121] WARN [AdminClient clientId=adminclient-1] Connection to node -1 (localhost/127.0.0.1:9092) could not be established. Node may not be available. (org.apache.kafka.clients.NetworkClient)
+
+Error: Executing consumer group command failed due to org.apache.kafka.common.errors.TimeoutException: Timed out waiting for a node assignment. Call: describeConsumerGroups(api=FIND_COORDINATOR)
+java.util.concurrent.ExecutionException: org.apache.kafka.common.errors.TimeoutException: Timed out waiting for a node assignment. Call: describeConsumerGroups(api=FIND_COORDINATOR)
+"""
+
+
+class GroupOffsetTest(unittest.TestCase):
+    """An offset the harness could not read must never pass as no offset."""
+
+    def test_reads_the_partitions_committed_offset(self):
+        self.assertEqual(sc.group_offset(DESCRIBE_COMMITTED, "g", "t", 0), "20")
+
+    def test_an_active_member_without_a_commit_is_none(self):
+        self.assertEqual(sc.group_offset(DESCRIBE_ACTIVE_UNCOMMITTED, "g", "t", 0), "-")
+
+    def test_an_answered_table_without_the_partition_is_none(self):
+        self.assertEqual(sc.group_offset(DESCRIBE_OTHER_TOPIC_ONLY, "g", "t", 0), "-")
+
+    def test_a_group_the_broker_does_not_know_is_none(self):
+        self.assertEqual(sc.group_offset(DESCRIBE_NOT_FOUND, "g", "t", 0), "-")
+
+    def test_another_groups_not_found_is_not_this_groups_answer(self):
+        with self.assertRaises(ValueError):
+            sc.group_offset(DESCRIBE_NOT_FOUND, "g2", "t", 0)
+
+    def test_a_timed_out_query_is_an_error_naming_it(self):
+        with self.assertRaises(ValueError) as ctx:
+            sc.group_offset(DESCRIBE_TIMEOUT, "g", "t", 0)
+        self.assertIn("TimeoutException", str(ctx.exception))
+
+    def test_no_output_is_an_error(self):
+        with self.assertRaises(ValueError) as ctx:
+            sc.group_offset("", "g", "t", 0)
+        self.assertIn("(no output)", str(ctx.exception))
+
+    def test_an_offset_that_is_not_a_number_is_an_error(self):
+        bad = DESCRIBE_COMMITTED.replace(" 20 ", " 2x ")
+        with self.assertRaises(ValueError):
+            sc.group_offset(bad, "g", "t", 0)
+
+    def test_the_cli_fails_on_a_timeout_and_prints_nothing_on_stdout(self):
+        script = str(Path(sc.__file__))
+        out = subprocess.run(
+            [sys.executable, script, "group-offset", "g", "t", "0"],
+            input=DESCRIBE_TIMEOUT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(out.returncode, 1)
+        self.assertEqual(out.stdout, "")
+        self.assertIn("could not read the committed offset of group g", out.stderr)
+
 
 class CommitRuleTest(unittest.TestCase):
     def test_a_commit_at_the_verified_end_holds(self):
@@ -109,6 +190,11 @@ class CommitRuleTest(unittest.TestCase):
     def test_no_commit_holds(self):
         ok, _ = sc.commit_rule("-", {"verified_end": None, "states": {}}, "p", "at kill")
         self.assertTrue(ok)
+
+    def test_an_unread_offset_is_not_taken_for_no_commit(self):
+        ok, msg = sc.commit_rule("", {"verified_end": None, "states": {}}, "p", "at kill")
+        self.assertFalse(ok)
+        self.assertIn("was not read", msg)
 
     def test_a_commit_past_the_verified_end_is_a_violation_naming_both(self):
         ok, msg = sc.commit_rule(

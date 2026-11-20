@@ -19,9 +19,19 @@ the store holds.
       in-flight state, and the SOURCE_COMMITTED rows that carry no evidence
       of having been VERIFIED (no verification class, which only the VERIFIED
       write sets, or no object or manifest).
+  group-offset GROUP TOPIC PARTITION < DESCRIBE_OUTPUT
+      The group's committed offset for one partition, read from what
+      `kafka-consumer-groups.sh --describe --group GROUP` printed (stdin):
+      the number, or `-` only when the broker answered that the group has
+      none (the offsets table printed without a committed offset for the
+      partition, or the group not found). Anything else (a timeout, a
+      coordinator error, no output) exits 1 naming what was printed: the
+      tool exits 0 even when the query failed, and an unread offset is not
+      an absent one.
   commit-rule COMMITTED LEDGER_JSON POINT WHEN
       The commit rule at one instant, from both sides. At the source: the
-      group's committed offset on the broker (`-` for none) never passes the
+      group's committed offset on the broker (`-` for none, as group-offset
+      established it) never passes the
       end of the highest VERIFIED range, i.e. committed <= verified_end + 1
       (Kafka commits the NEXT offset to read). In the ledger: no
       SOURCE_COMMITTED row lacks the VERIFIED write's evidence. Exits 1
@@ -136,6 +146,67 @@ def ledger_summary(db: str, topic: str, partition: int, group: str) -> dict:
     return summary
 
 
+# The header of the offsets table `kafka-consumer-groups.sh --describe`
+# prints once the broker has answered for the group.
+DESCRIBE_HEADER = re.compile(r"^GROUP\s+TOPIC\s+PARTITION\s+CURRENT-OFFSET\b")
+OFFSET = re.compile(r"^(?:0|[1-9][0-9]*)$")
+
+
+def group_offset(text: str, group: str, topic: str, partition: int) -> str:
+    """The committed offset `--describe` reports, or `-` for an established none.
+
+    Raises ValueError when the output does not show the broker's answer. The
+    tool prints its errors (a coordinator timeout, a broker it cannot reach)
+    and still exits 0, so the absence of a row proves nothing by itself: an
+    absence counts only when the offsets table was printed, or when the
+    broker said the group does not exist.
+    """
+    header_seen = False
+    found: list[str] = []
+    for line in text.splitlines():
+        if DESCRIBE_HEADER.match(line):
+            header_seen = True
+            continue
+        fields = line.split()
+        if (
+            header_seen
+            and len(fields) >= 4
+            and fields[0] == group
+            and fields[1] == topic
+            and fields[2] == str(partition)
+        ):
+            found.append(fields[3])
+    if len(found) > 1:
+        raise ValueError(
+            f"the describe output lists {topic}/{partition} for group {group} "
+            f"{len(found)} times ({', '.join(found)}); expected once"
+        )
+    if found:
+        value = found[0]
+        if value == "-" or OFFSET.match(value):
+            return value
+        raise ValueError(
+            f"the committed offset of group {group} on {topic}/{partition} is "
+            f"'{value}', neither a number nor '-'"
+        )
+    if header_seen:
+        # The broker answered for the group and it has no committed offset
+        # for this partition.
+        return "-"
+    not_found = (
+        f"GroupIdNotFoundException: Group {group} not found",
+        f"Consumer group '{group}' does not exist",
+    )
+    if any(marker in text for marker in not_found):
+        return "-"
+    lines = [line for line in text.splitlines() if line.strip()]
+    shown = " | ".join(lines[:3]) if lines else "(no output)"
+    raise ValueError(
+        f"could not read the committed offset of group {group}: the describe "
+        f"output has no offsets table and does not say the group is absent: {shown}"
+    )
+
+
 def commit_rule(committed: str, ledger: dict, point: str, when: str) -> tuple[bool, str]:
     unverified = ledger.get("committed_unverified") or []
     if unverified:
@@ -144,8 +215,15 @@ def commit_rule(committed: str, ledger: dict, point: str, when: str) -> tuple[bo
             f"SOURCE_COMMITTED without the VERIFIED write's evidence: "
             f"{json.dumps(unverified)}. Ledger states: {json.dumps(ledger['states'])}"
         )
-    if committed in ("", "-"):
+    if committed == "-":
         return True, f"{point} ({when}): the group has no committed offset"
+    if not OFFSET.match(committed):
+        # Only group-offset's answer is accepted: an empty or unparsed value
+        # is an offset nobody read, not an absent one.
+        return False, (
+            f"{point} ({when}): the consumer group's committed offset was not read "
+            f"(got '{committed}'), so the commit rule cannot be checked"
+        )
     committed_at = int(committed)
     verified_end = ledger.get("verified_end")
     ceiling = 0 if verified_end is None else verified_end + 1
@@ -217,6 +295,13 @@ def main(argv: list[str]) -> int:
         return 0 if points else 1
     if cmd == "ledger" and len(args) == 4:
         print(json.dumps(ledger_summary(args[0], args[1], int(args[2]), args[3])))
+        return 0
+    if cmd == "group-offset" and len(args) == 3:
+        try:
+            print(group_offset(sys.stdin.read(), args[0], args[1], int(args[2])))
+        except ValueError as err:
+            print(err, file=sys.stderr)
+            return 1
         return 0
     if cmd == "commit-rule" and len(args) == 4:
         ok, message = commit_rule(args[0], json.loads(args[1]), args[2], args[3])
