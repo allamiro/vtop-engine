@@ -111,7 +111,13 @@ or set `image.tag: "0.8.0"`.
 ### 2. Then raise the cluster feature level
 
 Cluster plane only. v0.7.0 supports feature levels up to 5 and v0.8.0 up to 7.
-Raising is permanent: there is no lowering.
+Raising is permanent: there is no lowering. A release after v0.10.1 refuses to
+open, or to install a snapshot or apply a raise from, a metadata directory
+recorded at a level above the one it supports. The message names both levels
+and says to run a newer binary; the directory is left as it was. v0.8.0 and
+v0.9.0 do not refuse a level-8 directory: they open it and report level 3 or 8
+depending on where the raise sits, so keep every voter on a release that
+supports the level before you raise it.
 
 ```bash
 # What every registered node reports it runs.
