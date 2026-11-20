@@ -604,6 +604,44 @@ impl MetaRaftStore {
     }
 }
 
+/// Whether the log holds `snapshot`'s last entry with the snapshot's term.
+/// By Raft's log matching, the same index and term mean the same prefix:
+/// the log below agrees with the snapshot. Otherwise the log below it may be
+/// a stale branch that an installed snapshot replaced.
+fn log_agrees_with(
+    storage: &crate::storage::MetaStorage,
+    snapshot: &crate::storage::snapshot::SnapshotMeta,
+) -> bool {
+    storage
+        .log()
+        .read_range(snapshot.last_index, snapshot.last_index + 1)
+        .ok()
+        .and_then(|entries| entries.into_iter().next())
+        .is_some_and(|entry| entry.term == snapshot.last_term)
+}
+
+/// At open: when the newest snapshot lies above both the audit frontier and
+/// the install floor and the log does not agree with it, it was installed
+/// and its floor never saved (a crash between publishing it and saving the
+/// floor). Save the floor now, as the install would have. A replay already
+/// treats that range as a snapshot install while the snapshot is the newest;
+/// this keeps it so after a local snapshot is built on top (review of #767).
+pub(crate) fn recover_install_floor(
+    storage: &mut crate::storage::MetaStorage,
+) -> crate::storage::MetaStoreResult<()> {
+    let Some(snapshot) = storage.snapshots().newest() else {
+        return Ok(());
+    };
+    let covered = storage
+        .audited_frontier()
+        .unwrap_or(0)
+        .max(storage.audited_floor());
+    if snapshot.last_index <= covered || log_agrees_with(storage, &snapshot) {
+        return Ok(());
+    }
+    storage.save_audited_floor(snapshot.last_index)
+}
+
 /// The first index at or above `from` whose entry this replica can read as
 /// the committed one, and what cut the range below it. Below the log's
 /// first entry nothing can be read (`LogPurged`). Below the newest snapshot
@@ -639,17 +677,9 @@ fn readable_from(
         reason = GapReason::SnapshotInstall;
     }
     if let Some(snapshot) = &newest {
-        if readable <= snapshot.last_index {
-            let agrees = storage
-                .log()
-                .read_range(snapshot.last_index, snapshot.last_index + 1)
-                .ok()
-                .and_then(|entries| entries.into_iter().next())
-                .is_some_and(|entry| entry.term == snapshot.last_term);
-            if !agrees {
-                readable = snapshot.last_index + 1;
-                reason = GapReason::SnapshotInstall;
-            }
+        if readable <= snapshot.last_index && !log_agrees_with(storage, snapshot) {
+            readable = snapshot.last_index + 1;
+            reason = GapReason::SnapshotInstall;
         }
     }
     (readable, reason)

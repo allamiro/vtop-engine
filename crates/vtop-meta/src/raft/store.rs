@@ -85,6 +85,12 @@ impl MetaRaftStore {
         // none: its trail starts at the applied frontier, and nothing is
         // replayed from before it.
         storage.ensure_audited_frontier()?;
+        // A crash after an installed snapshot was published but before its
+        // install floor was saved leaves the floor behind; once a local
+        // snapshot is built on top, the stale branch below it would read as
+        // the committed log (review of #767). Recover the floor before Raft
+        // runs, so before any local snapshot.
+        super::audit_delivery::recover_install_floor(&mut storage)?;
         let delivered = storage
             .audited_frontier()
             .unwrap_or_else(|| storage.last_applied());

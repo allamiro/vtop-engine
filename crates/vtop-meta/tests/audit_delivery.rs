@@ -882,3 +882,147 @@ async fn a_stale_branch_stays_unread_after_a_later_local_snapshot() {
     );
     assert_eq!(audited_frontier(&store), Some(13));
 }
+
+/// Review of #767: the same stale branch, with a crash at every storage
+/// operation of the snapshot install. A crash after the snapshot is
+/// published but before the install floor is saved left the floor behind;
+/// the restart then named the range as a gap only while the installed
+/// snapshot was the newest, and once a local snapshot was built on top, a
+/// second restart read the stale branch as if it were the committed log.
+/// The floor is now recovered when the store opens, so for every crash
+/// point at which the snapshot survived, the second restart names 1..=10 as
+/// one gap and delivers 11..=13, nothing of the stale branch.
+#[tokio::test]
+async fn a_crash_during_a_snapshot_install_leaves_the_stale_branch_unread() {
+    use openraft::storage::RaftSnapshotBuilder;
+    let sim = SimStorage::new();
+    sim.create_dir_all(Path::new("/leader"));
+    sim.create_dir_all(Path::new("/n"));
+    let env = sim.env(0x70e);
+    let mut leader = MetaStorage::open_in(&env, "/leader", cluster()).unwrap();
+    let mut entries: Vec<MetaLogEntry> = workload(10)
+        .into_iter()
+        .map(|mut entry| {
+            entry.term = 2;
+            entry
+        })
+        .collect();
+    entries[0] = MetaLogEntry {
+        term: 2,
+        index: 1,
+        payload: MetaLogPayload::Membership(MetaMembership {
+            voters: vec![MetaNodeId(1), MetaNodeId(2)],
+            learners: vec![],
+            joint_outgoing: None,
+        }),
+    };
+    leader.append(&entries).unwrap();
+    leader.apply_through(10).unwrap();
+    let snapshot = leader.write_snapshot().unwrap();
+    let bytes = env.storage.read(&snapshot.path).unwrap();
+    let meta = SnapshotMeta {
+        last_log_id: Some(LogId::new(CommittedLeaderId::new(2, 0), 9)),
+        last_membership: StoredMembership::new(
+            Some(LogId::new(CommittedLeaderId::new(2, 0), 0)),
+            openraft::Membership::new(
+                vec![std::collections::BTreeSet::from([1u64, 2u64])],
+                None::<BTreeSet<u64>>,
+            ),
+        ),
+        snapshot_id: snapshot.snapshot_id.clone(),
+    };
+
+    // A stale term-1 branch ending exactly at the snapshot's index.
+    append(&env, &workload(10));
+    let disk = sim.snapshot();
+    let refusing = Sink::refusing();
+    let ops = {
+        let (_store, mut machine) = open(&env, &refusing);
+        let before = sim.op_count();
+        machine
+            .install_snapshot(&meta, Box::new(Cursor::new(bytes.clone())))
+            .await
+            .unwrap();
+        sim.op_count() - before
+    };
+    assert!(ops > 3, "{ops} operations");
+
+    let newer: Vec<MetaLogEntry> = (11..=13).map(|index| entry(2, index, true)).collect();
+    let mut survived = 0;
+    for crash_at in 0..=ops {
+        sim.restore(&disk);
+        {
+            let (_store, mut machine) = open(&env, &refusing);
+            let base = sim.op_count();
+            sim.set_fault(FaultPlan::CrashBefore(base + crash_at));
+            let _ = machine
+                .install_snapshot(&meta, Box::new(Cursor::new(bytes.clone())))
+                .await;
+        }
+        sim.set_fault(FaultPlan::None);
+        sim.crash();
+        sim.reboot();
+
+        // The first restart, with the sink still refusing.
+        let installed = {
+            let (store, _machine) = open(&env, &refusing);
+            let installed =
+                store.with_storage(|s| s.snapshots().newest().map(|snap| snap.last_index));
+            if installed == Some(10) {
+                assert!(!store.deliver_pending(ReplayReason::Restart));
+            }
+            installed
+        };
+        if installed != Some(10) {
+            // The crash came before the snapshot was published: nothing
+            // was installed, and there is no stale branch to guard.
+            continue;
+        }
+        survived += 1;
+        {
+            let mut storage = MetaStorage::open_in(&env, "/n", cluster()).unwrap();
+            storage.append(&newer).unwrap();
+        }
+        {
+            let (_store, mut machine) = open(&env, &refusing);
+            machine
+                .apply(newer.iter().map(raft_entry).collect::<Vec<_>>())
+                .await
+                .unwrap();
+            machine
+                .get_snapshot_builder()
+                .await
+                .build_snapshot()
+                .await
+                .unwrap();
+        }
+        sim.crash();
+        sim.reboot();
+
+        let sink = Arc::new(Sink::default());
+        let (store, _machine) = open(&env, &sink);
+        assert!(store.deliver_pending(ReplayReason::Restart));
+        let gaps: Vec<(String, String)> = sink
+            .gaps()
+            .iter()
+            .map(|gap| {
+                let params: BTreeMap<_, _> = gap.params.iter().cloned().collect();
+                (
+                    params["from_index"].clone(),
+                    params["through_index"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            gaps,
+            vec![("1".to_owned(), "10".to_owned())],
+            "crash at install op {crash_at}"
+        );
+        assert_eq!(
+            sink.indexes(),
+            vec![11, 12, 13],
+            "crash at install op {crash_at}: nothing of the stale branch"
+        );
+    }
+    assert!(survived > 0, "no crash point left the snapshot installed");
+}
