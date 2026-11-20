@@ -328,58 +328,16 @@ jobs:
           print(json.dumps(rec["runner"], indent=2))
           PY
 
-      # One row per run from each run's own summary.json, so the step summary
-      # and the artifact carry the numbers without anyone typing them.
+      # One row per run from each run's own summary.json, and the pairs, the
+      # medians and the committable bundle derived from those rows
+      # (benchmarks/competitor_pair_report.py), so no figure in the step
+      # summary, the artifact or the committed record is typed by hand.
       - name: Tabulate the runs
         if: always()
         run: |
           set -uo pipefail
-          python3 - "${RUNNER_TEMP}/pair" <<'PY' | tee -a "${GITHUB_STEP_SUMMARY}"
-          import csv, json, os, sys
-          out = sys.argv[1]
-          rows = []
-          runs = os.path.join(out, "runs.tsv")
-          if not os.path.exists(runs):
-              print("no runs.tsv: the pair never started")
-              sys.exit(0)
-          for r in csv.DictReader(open(runs), delimiter="\t"):
-              s_path = os.path.join(out, "results", r["run_id"], "summary.json")
-              s = json.load(open(s_path)) if r["run_id"] and os.path.exists(s_path) else {}
-              c = s.get("competitor") or {}
-              rows.append({
-                  "order": r["order"], "repetition": r["repetition"], "scenario": r["scenario"],
-                  "exit_code": r["exit_code"], "run_id": r["run_id"],
-                  "cap_bytes_per_second": s.get("upload_max_egress_bytes_per_second", ""),
-                  "emulator_validation_mbps": s.get("emulator_validation_mbps", ""),
-                  "alone_before_mbps": (c.get("alone_before") or {}).get("goodput_mbps", ""),
-                  "alone_after_mbps": (c.get("alone_after") or {}).get("goodput_mbps", ""),
-                  "competitor_goodput_mbps_without": s.get("competitor_goodput_mbps_without", ""),
-                  "competitor_goodput_mbps_with": s.get("competitor_goodput_mbps_with", ""),
-                  "share_of_solo_pct": c.get("share_of_solo_pct", ""),
-                  "solo_disagreement_pct": c.get("solo_disagreement_pct", ""),
-                  "competitor_goodput_mbps_over_vtop_window": s.get("competitor_goodput_mbps_over_vtop_window", ""),
-                  "vtop_goodput_mbps_with": s.get("vtop_goodput_mbps_with", ""),
-                  "competitor_jain_index": s.get("competitor_jain_index", ""),
-                  "vtop_attributed_cycles": c.get("vtop_attributed_cycles", ""),
-                  "vtop_window_seconds": c.get("vtop_window_seconds", ""),
-                  "sync_spread_seconds": c.get("competitor_window_sync_spread_seconds", ""),
-                  "final_line_delay_seconds": c.get("competitor_window_final_line_delay_seconds", ""),
-                  "successful_batches": s.get("successful_batches", ""),
-                  "failed_batches": s.get("failed_batches", ""),
-              })
-          with open(os.path.join(out, "pair_runs.csv"), "w", newline="") as f:
-              w = csv.DictWriter(f, fieldnames=list(rows[0]) if rows else ["order"])
-              w.writeheader()
-              w.writerows(rows)
-          cols = ["order", "scenario", "exit_code", "cap_bytes_per_second", "competitor_goodput_mbps_without",
-                  "competitor_goodput_mbps_with", "share_of_solo_pct", "vtop_goodput_mbps_with",
-                  "competitor_jain_index", "vtop_attributed_cycles"]
-          print("### Competitor pair runs\n")
-          print("| " + " | ".join(cols) + " |")
-          print("|" + "---|" * len(cols))
-          for r in rows:
-              print("| " + " | ".join(str(r[k]) for k in cols) + " |")
-          PY
+          python3 benchmarks/competitor_pair_report.py "${RUNNER_TEMP}/pair" \
+            --bundle "${RUNNER_TEMP}/bundle" | tee -a "${GITHUB_STEP_SUMMARY}"
 
       - name: Lab logs and teardown
         if: always()
@@ -396,6 +354,18 @@ jobs:
           path: ${{ runner.temp }}/pair
           retention-days: 30
           if-no-files-found: error
+
+      # What to commit under benchmarks/measurements/: the tables, the
+      # environment, the logs and each accepted half's summary.json and
+      # metrics.csv. A refused half's raw CSVs stay in the artifact above.
+      - name: Upload the bundle to commit
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: competitor-pair-bundle-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bundle
+          retention-days: 30
+          if-no-files-found: ignore
 
       - name: Every run completed
         env:
