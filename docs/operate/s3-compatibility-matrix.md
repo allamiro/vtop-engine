@@ -26,20 +26,26 @@ refusal has (what is wrong, what the engine did, what to do).
 
 ## In CI
 
-In `.github/workflows/ci.yml`, when a pull request touches the engine, the
-upload path, the test kit or a server's files:
+`.github/workflows/s3-compat-matrix.yml` runs the matrix. It builds the live
+test binaries once, then runs one leg per server, each on its own runner: it
+starts the server from `docker/s3-servers/<id>/compose.yml`, creates its
+buckets with the pinned AWS CLI, runs every binary (and the verification and
+Object Lock tests again with `AWS_REQUEST_CHECKSUM_CALCULATION=when_required`),
+writes the job summary (every case, and each unexpected one) and uploads the
+results lines as `s3-compat-results-<id>`. Which servers run:
 
-1. `s3-compat-build` compiles the live test binaries once.
-2. `s3-compat` runs one leg per server, each on its own runner: it starts the
-   server from `docker/s3-servers/<id>/compose.yml`, creates its buckets with
-   the pinned AWS CLI, runs every binary, writes the job summary (every
-   case, and each unexpected one) and uploads the results lines as
-   `s3-compat-results-<id>`.
-3. A server whose file says `gating: false` runs with `continue-on-error`: it
-   cannot fail the run, but its summary still shows every difference. A new
-   server starts there, and moves to `gating: true` in its own pull request
-   once every capability its cases need is settled and ten consecutive runs
-   have matched its file.
+| Trigger | Servers |
+|---|---|
+| `ci.yml`, on a pull request or a push to `main` that touches the engine, the upload path or the test kit | the lab's MinIO only (the per-PR cost of the single MinIO job it replaced) |
+| nightly, 03:47 UTC, and `workflow_dispatch` (an optional `servers` list such as `["garage"]` narrows it) | every server |
+| a pull request that changes the workflow, a server's compose file, the lab script or a capability file | every server, on that head, so a change to a server's setup is proven before it merges |
+
+A server whose file says `gating: false` runs with `continue-on-error`: it
+cannot fail the run, but its summary still shows every difference. A new
+server starts there, and moves to `gating: true` in its own pull request
+(a one-line change in the workflow's `LEGS` table and in its file) once every
+capability its cases need is settled and ten consecutive runs have matched
+its file.
 
 A weekly workflow, `s3-pins`, fails if a server image is not pinned by digest
 or its digest no longer resolves: registries delete tags, which is how the
@@ -55,10 +61,15 @@ by hand:
 - A cell is derived from a recorded outcome. A capability no case recorded
   is **not tested**, never assumed to pass.
 - The `s3-compat-results` workflow (weekly, and by hand) takes the results
-  of the newest successful CI run on `main`, writes them under
-  `tests/s3-compat/results/`, regenerates the page and the README line, and
-  opens a pull request with the change. Results reach `main` only through
-  that reviewed pull request.
+  of the newest nightly matrix run on `main` (and the newest AWS run, once
+  there is one), writes them under `tests/s3-compat/results/`, regenerates
+  the page and the README line, and uploads the changed files as the
+  `s3-compat-results-refresh` artifact. It holds read permissions only. The
+  maintainer copies the files over a branch of `main` and opens a pull
+  request that says `Refs #722`; results reach `main` only through that
+  reviewed pull request. (The first results were produced the same way from a
+  local run of the same binaries and images, labelled with the commit they
+  ran at.)
 - The `s3-compat-report` CI job regenerates both from the committed results
   and fails on any difference, and fails when a server's committed results
   name another image digest than the one its compose file pins. A digest
@@ -155,24 +166,32 @@ GitHub's OIDC provider, for a role that trusts only this repository's
    Deliberately absent: `s3:CreateBucket`, `s3:DeleteBucket`,
    `s3:PutBucketObjectLockConfiguration`, `s3:PutBucketVersioning`,
    `s3:BypassGovernanceRetention`, and anything outside the two buckets.
-4. **In the GitHub repository:** create the `aws-s3-tests` environment and
-   restrict it to the `main` branch; then add the repository **variables**
-   `AWS_S3_TEST_ROLE_ARN`, `AWS_S3_TEST_REGION`, `AWS_S3_TEST_BUCKET` (the
-   plain bucket) and `AWS_S3_TEST_LOCKED_BUCKET`. None of them is a
-   credential; the role's trust policy is the boundary. They are variables
-   rather than secrets because the guard that decides whether to run must
-   read them before the job enters the environment.
+4. **In the GitHub repository:** create the `aws-s3-tests` environment
+   (Settings, Environments) and restrict it to the `main` branch. Then add
+   the repository **secret** `AWS_S3_TEST_ROLE_ARN` (the role's ARN; Settings,
+   Secrets and variables, Actions, a *repository* secret, not an environment
+   secret: the guard that decides whether to run reads it before the job
+   enters the environment) and the repository **variables**
+   `AWS_S3_TEST_REGION`, `AWS_S3_TEST_BUCKET` (the plain bucket) and
+   `AWS_S3_TEST_LOCKED_BUCKET`. The region and the bucket names are variables
+   because a secret region would be masked wherever it appears in a log. The
+   role's trust policy, not the secrecy of its ARN, is the boundary. The leg
+   runs as soon as all four exist.
 5. **Run the workflow once by hand** (Actions, `s3-aws`, Run workflow) and
    read its first results before relying on the schedule. The
    `s3-compat-results` workflow takes the newest AWS run's results with the
-   matrix's and opens the pull request that commits them; settle
+   matrix's and prepares the files that commit them; settle
    `tests/s3-compat/servers/aws.yaml` from them in a reviewed pull request.
+   Issue #722 closes after this run.
 
 What the AWS run cannot do: the multipart tests that inject faults through
 a local forwarder need a plain-HTTP endpoint, so on AWS they are recorded
 `not_run`, with that reason, and the capability shows as not tested. The
 engine test's clean-up cannot bypass governance retention with this role;
-it leaves those objects to the lifecycle rule, and says so in the log.
+it leaves those objects to the lifecycle rule, and says so in the log. The
+replay-over-an-ended-lock engine test shortens a governance retention, which
+needs `s3:BypassGovernanceRetention`, so on AWS it is recorded `not_run` with
+that reason.
 
 ## Run a server yourself
 
@@ -192,14 +211,16 @@ Follow "Adding a server" in
 [tests/s3-compat/README.md](../../tests/s3-compat/README.md): a capability
 file starting `gating: false` with every capability `unknown`, a compose
 file and `server.env`, a run that settles each `unknown`, and a leg in the
-`s3-compat` matrix.
+`LEGS` table of `s3-compat-matrix.yml`.
 
 ## Licences
 
 The servers run as unmodified test containers. VTOP does not link them,
 ship them or distribute their images: each leg pulls the image (or, for the
-lab's MinIO, builds it from source). AGPL-3.0 servers, the MinIO line and
-Garage, are acceptable on those terms; the decision is recorded in #722.
+lab's MinIO, builds it from source). Two of them, the MinIO line and Garage,
+are AGPL-3.0; running an unmodified AGPL program as a test service is not
+distributing it, but the maintainer's confirmation of that position is still
+open (#722, open question 2).
 
 ## Not covered
 

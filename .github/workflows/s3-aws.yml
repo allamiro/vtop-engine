@@ -6,9 +6,10 @@ name: s3-aws
 #
 # OPT-IN AND INERT UNTIL THE MAINTAINER SETS IT UP. It needs an AWS account,
 # two buckets, an IAM role that trusts this repository's `aws-s3-tests`
-# environment through GitHub's OIDC provider, and the repository variables
-# below; docs/operate/s3-compatibility-matrix.md lists every step. Without
-# them the run skips, says so in its summary, and is green.
+# environment through GitHub's OIDC provider, the repository secret
+# AWS_S3_TEST_ROLE_ARN and the repository variables below;
+# docs/operate/s3-compatibility-matrix.md lists every step. Without them the
+# run skips, says so in its summary, and is green.
 #
 # A separate workflow from ci.yml on purpose: it needs `id-token: write`,
 # which ci.yml (run for every pull request) must never hold. It runs only on
@@ -32,12 +33,14 @@ permissions:
 
 jobs:
   # Says whether the run is configured, and skips cleanly when it is not.
-  # Everything it reads is a repository VARIABLE, not a secret: a role ARN, a
-  # region and two bucket names are not credentials (the role's trust policy,
+  # The role ARN is a repository SECRET (the one thing the maintainer adds to
+  # enable the leg; it is not a credential, since the role's trust policy,
   # which admits only this repository's aws-s3-tests environment, is the
-  # boundary), and a guard that ran before the environment could not see the
-  # environment's secrets anyway. It names no environment, so a run on an
-  # unconfigured repository creates none.
+  # boundary, but it is kept out of the logs); the region and the two bucket
+  # names are repository VARIABLES. Neither is read from the environment's
+  # own secrets, because this guard runs before the environment is entered.
+  # It names no environment, so a run on an unconfigured repository creates
+  # none.
   configured:
     name: AWS S3 tests configured?
     if: github.repository == 'allamiro/vtop-engine'
@@ -48,7 +51,7 @@ jobs:
     steps:
       - id: check
         env:
-          ROLE_ARN: ${{ vars.AWS_S3_TEST_ROLE_ARN }}
+          ROLE_ARN: ${{ secrets.AWS_S3_TEST_ROLE_ARN }}
           REGION: ${{ vars.AWS_S3_TEST_REGION }}
           PLAIN_BUCKET: ${{ vars.AWS_S3_TEST_BUCKET }}
           LOCKED_BUCKET: ${{ vars.AWS_S3_TEST_LOCKED_BUCKET }}
@@ -62,8 +65,9 @@ jobs:
             {
               echo "### AWS S3 tests skipped"
               echo
-              echo "Not configured: the repository variables AWS_S3_TEST_ROLE_ARN, AWS_S3_TEST_REGION,"
-              echo "AWS_S3_TEST_BUCKET and AWS_S3_TEST_LOCKED_BUCKET must all be set (missing:$missing)."
+              echo "Not configured: the repository secret AWS_S3_TEST_ROLE_ARN and the repository variables"
+              echo "AWS_S3_TEST_REGION, AWS_S3_TEST_BUCKET and AWS_S3_TEST_LOCKED_BUCKET must all be set"
+              echo "(missing:$missing)."
               echo "Nothing ran against AWS; this is not a pass. The setup is in"
               echo "docs/operate/s3-compatibility-matrix.md."
             } >> "$GITHUB_STEP_SUMMARY"
@@ -118,7 +122,7 @@ jobs:
       - name: Assume the test role (OIDC, no stored keys)
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ vars.AWS_S3_TEST_ROLE_ARN }}
+          role-to-assume: ${{ secrets.AWS_S3_TEST_ROLE_ARN }}
           aws-region: ${{ vars.AWS_S3_TEST_REGION }}
           role-duration-seconds: 3600
       # Twice (D13): with the SDK's default checksum calculation, whose
