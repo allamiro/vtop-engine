@@ -1,0 +1,5 @@
+# The test runner the benchmark-charts job uses beside the plotting stack,
+# hash-locked the same way (requirements-report-test.txt). Compiled with
+# requirements-report.txt as a constraint, so a package both need is the
+# version the plotting stack pins.
+pytest==9.2.0

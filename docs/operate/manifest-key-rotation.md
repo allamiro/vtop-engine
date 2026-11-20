@@ -187,7 +187,8 @@ result: they are all `unauthenticated`, and the detail names the key.
 
 `key_id` is never an id read from a manifest: that comes from storage and
 would be unbounded. Alert on any `result="unknown_key"`: it means a process
-is missing a key that signed part of the archive.
+is missing a key that signed part of the archive. The rule below is an
+example; it is not in the [shipped rule set](monitoring.md#alerts).
 
 ```yaml
 - alert: VtopManifestKeyUnknown

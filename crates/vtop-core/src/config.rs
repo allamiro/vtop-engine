@@ -811,10 +811,12 @@ pub struct FileSourceConfig {
     ///
     /// Also KEPT, each with a message saying why and what to do: a file whose
     /// mtime or ctime changed after the commit (a touch cannot be told from a
-    /// same-length rewrite between its first and last pages); a configured
-    /// path that is a symbolic link; and a file that cannot be renamed aside
-    /// within its own directory (`EXDEV` for a bind-mounted single file,
-    /// `EACCES` for a directory the engine cannot write).
+    /// same-length rewrite between its first and last pages); a file whose
+    /// link count changed (another name of it deleted, or a hard link made:
+    /// `links_changed`); a configured path that is a symbolic link; and a
+    /// file that cannot be renamed aside within its own directory (`EXDEV`
+    /// for a bind-mounted single file, `EACCES` for a directory the engine
+    /// cannot write).
     #[serde(default)]
     pub delete_after_commit: bool,
     /// How long, in seconds, a fully archived file must stay unwritten before
@@ -825,14 +827,20 @@ pub struct FileSourceConfig {
     /// has it open (see `delete_after_commit`). Default 3600.
     #[serde(default = "default_delete_quiet_seconds")]
     pub delete_quiet_seconds: u64,
-    /// Where the engine cannot check that no process holds a file open (see
-    /// `delete_after_commit`), delete it on `delete_quiet_seconds` alone
-    /// (#619). Default false: such a file is kept. With true, a writer that
-    /// still holds the file open loses lines in two ways: it is silent for
-    /// longer than the quiet period and then writes again, or its write
-    /// lands between the delete's final check and the unlink. Where the
+    /// Where the engine can't check that no process holds a file open
+    /// (macOS and other non-Linux platforms, NFS and other non-local
+    /// filesystems, another user's file when the engine lacks `CAP_LEASE`),
+    /// delete the file on `delete_quiet_seconds` alone (#619). Default
+    /// false: such a file is kept. A file a writer still holds open is
+    /// deleted with it: the writer's later lines go into a file no path
+    /// names and nothing archives them. That happens in two cases: the
+    /// writer is silent for longer than the quiet period and then writes, or
+    /// it writes between the engine's final check and the unlink. Where a
     /// check is possible it is always made, and a file some process has open
-    /// is kept whatever this says.
+    /// is kept whatever this says. Each unchecked delete is logged and
+    /// counted as `deleted_unchecked`. The engine warns at startup and in
+    /// `vtopctl validate`. Prefer fixing the cause: run the engine as the
+    /// files' owner, on Linux, on a local filesystem.
     #[serde(default)]
     pub delete_without_open_check: bool,
     /// Read each file as a single whole-file record instead of line by line.
@@ -951,8 +959,9 @@ pub struct UploadConfig {
     #[serde(default = "default_true")]
     pub require_strong_verification: bool,
     /// Hardened manifest profile (#135): require the backend to expose
-    /// immutable object versions, confirm bucket versioning is enabled before
-    /// the first upload to each bucket, and refuse to advance a batch whose
+    /// immutable object versions, confirm bucket versioning is enabled (at
+    /// startup for a literal bucket, #722; before the first upload to each
+    /// bucket a template names), and refuse to advance a batch whose
     /// manifest upload returned no version to pin. Recovery then reads the
     /// exact stored version, so overwriting or deleting the current manifest
     /// key cannot roll a batch back to an older validly-authenticated

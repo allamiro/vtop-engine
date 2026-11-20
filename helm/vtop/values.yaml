@@ -487,6 +487,20 @@ metrics:
     # reference (`ca.secret`) and `serverName`, or insecureSkipVerify for a
     # lab. Empty means Prometheus verifies against its own roots.
     tlsConfig: {}
+  # The engine's alert rules (observability/prometheus/vtop-rules.yaml) as a
+  # Prometheus Operator PrometheusRule. Requires the CRD, like the
+  # ServiceMonitor. This chart runs the cluster plane, not the engine: the
+  # rules fire for engines the same Prometheus scrapes. Each alert's
+  # runbook_url links a section of docs/operate/runbooks.md on the docs site.
+  prometheusRule:
+    enabled: false
+    # Extra labels for the PrometheusRule (e.g. release: prometheus) so your
+    # Prometheus's ruleSelector picks it up.
+    labels: {}
+    # Replaces https://allamiro.github.io/vtop-engine/operate/runbooks/ in
+    # every runbook_url (keep the trailing slash; the #section is appended),
+    # for a copy of the runbooks your on-call can reach. Empty keeps the site.
+    runbookBaseUrl: ""
 
 serviceAccount:
   # A dedicated ServiceAccount with automountServiceAccountToken: false —

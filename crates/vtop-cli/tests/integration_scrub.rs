@@ -739,7 +739,10 @@ async fn the_command_exits_non_zero_on_findings_and_writes_metrics() {
             "--json",
         ])
         .unwrap();
-        vtop_cli::commands::dispatch(cli)
+        // On the heap, as `run` below does: the debug build's command future
+        // sits close to a test thread's 2 MiB stack, and the ctime #619 adds
+        // to a file marker pushed it over on aarch64 Linux.
+        Box::pin(vtop_cli::commands::dispatch(cli))
     };
 
     assert_eq!(run().await, 0, "a clean archive exits 0");
@@ -887,7 +890,10 @@ async fn a_finding_whose_metrics_could_not_be_published_is_found_again() {
             metrics.to_str().unwrap(),
         ])
         .unwrap();
-        vtop_cli::commands::dispatch(cli)
+        // On the heap, as `run` below does: the debug build's command future
+        // sits close to a test thread's 2 MiB stack, and the ctime #619 adds
+        // to a file marker pushed it over on aarch64 Linux.
+        Box::pin(vtop_cli::commands::dispatch(cli))
     };
 
     // The write fails AFTER the scrub: a directory where the metrics file's

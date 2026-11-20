@@ -13,7 +13,7 @@ mod rotated;
 pub mod syslog_spool_source;
 mod write_lease;
 
-pub use base::{DiscoveredSource, ReadResult, SourceAdapter};
+pub use base::{DiscoveredSource, ReadResult, ReplayRange, SourceAdapter};
 pub use file_source::FileSource;
 #[cfg(feature = "kafka")]
 pub use kafka_source::KafkaSource;

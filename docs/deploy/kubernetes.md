@@ -120,6 +120,13 @@ failover.
   `networkPolicy.enabled` where your CNI enforces NetworkPolicy, or give it
   TLS with `observability.tls.secretName`.
 - `metrics.serviceMonitor.enabled` for the Prometheus Operator.
+- `metrics.prometheusRule.enabled` installs the engine's alert rules as a
+  `PrometheusRule` (it needs the Operator's CRDs, like the ServiceMonitor).
+  This chart runs the cluster plane, not the engine: the rules fire only for
+  engines your Prometheus also scrapes. `metrics.prometheusRule.labels` adds
+  the labels your Prometheus's rule selector matches, and
+  `metrics.prometheusRule.runbookBaseUrl` points the `runbook_url` links at
+  your own copy of the [alert runbooks](../operate/runbooks.md).
 - The cluster alert rules on [Metrics and alerts](../operate/monitoring.md#alerts),
   and the node metrics in [Node endpoints and metrics](../NODE_OBSERVABILITY.md).
 - A pod that goes not ready because metadata fenced it is behaving correctly.

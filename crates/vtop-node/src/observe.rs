@@ -239,6 +239,30 @@ impl CounterFamily {
     ///
     /// Label values are positional against the names given at construction.
     fn family<'a>(&self, samples: impl IntoIterator<Item = (Vec<&'a str>, u64)>) -> MetricFamily {
+        self.family_f64(
+            samples
+                .into_iter()
+                .map(|(values, total)| (values, total as f64)),
+        )
+    }
+
+    /// The same from nanosecond totals, exported in seconds: a `_seconds`
+    /// name carries seconds, whatever the source counts in.
+    fn family_seconds_from_nanos<'a>(
+        &self,
+        samples: impl IntoIterator<Item = (Vec<&'a str>, u64)>,
+    ) -> MetricFamily {
+        self.family_f64(
+            samples
+                .into_iter()
+                .map(|(values, nanos)| (values, nanos as f64 / 1e9)),
+        )
+    }
+
+    fn family_f64<'a>(
+        &self,
+        samples: impl IntoIterator<Item = (Vec<&'a str>, f64)>,
+    ) -> MetricFamily {
         let mut family = MetricFamily::default();
         family.set_name(self.desc.fq_name.clone());
         family.set_help(self.desc.help.clone());
@@ -252,7 +276,7 @@ impl CounterFamily {
                     // there below 2^53, which for a byte counter is nine
                     // petabytes — far past the point where a process restart
                     // has reset it anyway.
-                    counter.set_value(total as f64);
+                    counter.set_value(total);
                     let mut metric = prometheus::proto::Metric::default();
                     metric.set_label(
                         self.label_names
@@ -768,6 +792,7 @@ pub struct BrokerCollector {
 
     group_commit_last_batch_records: IntGauge,
     group_commit_last_batch_bytes: IntGauge,
+    group_commit_enabled: IntGauge,
     memory_used_bytes: IntGaugeVec,
     memory_queue_depth: IntGauge,
 
@@ -777,6 +802,7 @@ pub struct BrokerCollector {
     group_commit_bytes: CounterFamily,
     group_commit_sync_nanos: CounterFamily,
     group_commit_queue_wait_nanos: CounterFamily,
+    produce_phase_seconds: CounterFamily,
     memory_rejections: CounterFamily,
     backpressure_nanos: CounterFamily,
     backpressure_events: CounterFamily,
@@ -870,13 +896,29 @@ impl BrokerCollector {
             )?,
             group_commit_sync_nanos: CounterFamily::new(
                 "broker_group_commit_sync_nanoseconds_total",
-                "Nanoseconds spent in group fsync; divide by commits for mean sync cost",
+                "Nanoseconds spent flushing commit groups: the local fsync, the replication \
+                 round and the commit together, not the fsync alone; \
+                 vtop_broker_produce_phase_seconds_total splits them",
                 &[],
             )?,
             group_commit_queue_wait_nanos: CounterFamily::new(
                 "broker_group_commit_queue_wait_nanoseconds_total",
-                "Nanoseconds requests waited to join a group, summed over groups",
+                "Nanoseconds the longest-waiting request of each group waited to join it, \
+                 summed over groups (one wait per group, not per request)",
                 &[],
+            )?,
+            produce_phase_seconds: CounterFamily::new(
+                "broker_produce_phase_seconds_total",
+                "Seconds produce flushes spent in each phase: local_fsync (the leader's \
+                 append and fsync), replicate (until a quorum acked), commit (the \
+                 high-water mark advance and its propagation). One flush per request, \
+                 or per group with group commit on",
+                &["phase"],
+            )?,
+            group_commit_enabled: gauge(
+                "broker_group_commit_enabled",
+                "1 when concurrent produce requests on this range share one fsync and one \
+                 replication round (group commit), 0 when each request has its own",
             )?,
             group_commit_last_batch_records: gauge(
                 "broker_group_commit_last_batch_records",
@@ -927,6 +969,7 @@ impl BrokerCollector {
             &self.follower_connected,
             &self.group_commit_last_batch_records,
             &self.group_commit_last_batch_bytes,
+            &self.group_commit_enabled,
             &self.memory_used_bytes,
             &self.memory_queue_depth,
         ];
@@ -1016,6 +1059,8 @@ impl BrokerCollector {
             }
         }
 
+        self.group_commit_enabled
+            .set(i64::from(self.broker.group_commit().is_some()));
         if let Some(coordinator) = self.broker.group_commit() {
             let last = coordinator.metrics().last_sample();
             self.group_commit_last_batch_records
@@ -1045,6 +1090,14 @@ impl BrokerCollector {
     /// Counter families read straight from the broker's monotonic atomics.
     fn counter_families(&self) -> Vec<MetricFamily> {
         let mut families = Vec::new();
+        let phases = self.broker.produce_phases();
+        families.push(
+            self.produce_phase_seconds.family_seconds_from_nanos(
+                vtop_broker::produce_phases::ProducePhase::ALL
+                    .into_iter()
+                    .map(|phase| (vec![phase.as_str()], phases.nanos(phase))),
+            ),
+        );
         if let Some(coordinator) = self.broker.group_commit() {
             let metrics = coordinator.metrics();
             for (family, total) in [
@@ -1089,6 +1142,7 @@ impl BrokerCollector {
             &self.group_commit_bytes.desc,
             &self.group_commit_sync_nanos.desc,
             &self.group_commit_queue_wait_nanos.desc,
+            &self.produce_phase_seconds.desc,
             &self.memory_rejections.desc,
             &self.backpressure_nanos.desc,
             &self.backpressure_events.desc,
@@ -1915,6 +1969,53 @@ impl Collector for PromotionRefusalCollector {
             self.attested
                 .family([(vec![topic.as_str(), range.as_str()], self.counts.attested())]),
         ]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kafka gateway
+// ---------------------------------------------------------------------------
+
+/// Requests this node's Kafka gateway refused, by API and reason (#596).
+///
+/// The gateway logs each kind at powers of two only, so the log alone
+/// cannot say how often a client is refused; this can. Both labels are a
+/// closed set ([`vtop_kafka::Refusal`]): an api key a client sends is never a
+/// label, and every key the gateway does not serve is `api="unserved"`.
+/// Every series is exported from the first scrape, at zero.
+pub struct KafkaRefusalCollector {
+    refusals: Arc<vtop_kafka::Refusals>,
+    family: CounterFamily,
+}
+
+impl KafkaRefusalCollector {
+    pub fn new(refusals: Arc<vtop_kafka::Refusals>) -> Result<Self, String> {
+        Ok(Self {
+            refusals,
+            family: CounterFamily::new(
+                "kafka_requests_refused_total",
+                "Kafka requests this node's gateway refused, by api and reason; \
+                 no_offset_store is an OffsetCommit on a node with no metadata plane, \
+                 unserved_api a request (CreateTopics, DescribeConfigs, ...) the gateway \
+                 does not serve",
+                &["api", "reason"],
+            )?,
+        })
+    }
+}
+
+impl Collector for KafkaRefusalCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        vec![&self.family.desc]
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        vec![self.family.family(
+            self.refusals
+                .snapshot()
+                .into_iter()
+                .map(|(refusal, total)| (vec![refusal.api(), refusal.reason()], total)),
+        )]
     }
 }
 
@@ -2832,6 +2933,47 @@ mod tests {
         );
     }
 
+    /// #596: the gateway's refusals are exported under the bounded
+    /// `{api,reason}` pair, every series at zero from the first scrape, and
+    /// the value is the gateway's own total.
+    #[test]
+    fn kafka_refusals_are_exported_by_api_and_reason() {
+        let refusals = Arc::new(vtop_kafka::Refusals::default());
+        let registry = Registry::new_custom(Some("vtop".into()), None).unwrap();
+        registry
+            .register(Box::new(
+                KafkaRefusalCollector::new(Arc::clone(&refusals)).unwrap(),
+            ))
+            .unwrap();
+        let text = scrape(&registry);
+        for series in [
+            r#"vtop_kafka_requests_refused_total{api="offset_commit",reason="no_offset_store"} 0"#,
+            r#"vtop_kafka_requests_refused_total{api="unserved",reason="unserved_api"} 0"#,
+        ] {
+            assert!(text.contains(series), "{series} missing: {text}");
+        }
+        refusals.count(vtop_kafka::Refusal::OffsetCommitWithoutStore);
+        refusals.count(vtop_kafka::Refusal::OffsetCommitWithoutStore);
+        refusals.count(vtop_kafka::Refusal::UnservedApi);
+        let text = scrape(&registry);
+        assert!(
+            text.contains(
+                r#"vtop_kafka_requests_refused_total{api="offset_commit",reason="no_offset_store"} 2"#
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                r#"vtop_kafka_requests_refused_total{api="unserved",reason="unserved_api"} 1"#
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("# TYPE vtop_kafka_requests_refused_total counter"),
+            "{text}"
+        );
+    }
+
     /// #636: a promotion refused for want of provable lineage is counted
     /// apart from one refused for want of replicas, and every reason is
     /// exported from the first scrape, at zero, so an alert on it has a
@@ -3062,14 +3204,119 @@ mod tests {
         );
     }
 
+    fn local_produce(broker: &LocalBroker, producer: u128) -> vtop_protocol::WireFrame {
+        broker.handle(
+            vtop_protocol::Role::Producer,
+            vtop_protocol::WireFrame {
+                request_id: 1,
+                stream_id: 1,
+                message: vtop_protocol::Message::ProduceRequest(vtop_protocol::ProduceRequest {
+                    range: test_range(),
+                    fencing_epoch: 4,
+                    producer_id: Uuid::from_u128(producer),
+                    producer_epoch: 1,
+                    first_sequence: 0,
+                    durability: vtop_protocol::Durability::LocalFsync,
+                    records: vec![vtop_protocol::ProduceRecord {
+                        timestamp_millis: 1,
+                        key: b"k".to_vec(),
+                        value: b"v".to_vec(),
+                    }],
+                }),
+            },
+        )
+    }
+
+    /// The value of the one sample of `series` (name plus labels, exactly
+    /// as the text format prints it), or `None` when it is absent.
+    fn sample(text: &str, series: &str) -> Option<f64> {
+        text.lines()
+            .find_map(|line| line.strip_prefix(series)?.strip_prefix(' '))
+            .map(|value| value.parse().unwrap())
+    }
+
+    /// Where a produce's time goes (#752): the leader's local fsync, the
+    /// replication round and the commit, each its own total, so the 6 to
+    /// 7 ms a request costs can be split before the path is changed. All
+    /// three series exist from the first scrape; a LocalFsync produce on a
+    /// standalone broker spends time in the first only.
+    #[test]
+    fn a_leader_exports_where_its_produce_time_goes() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Arc::new(open_broker(dir.path()));
+        let registry = Registry::new_custom(Some("vtop".into()), None).unwrap();
+        registry
+            .register(Box::new(
+                BrokerCollector::new(Arc::clone(&broker), None, Vec::new()).unwrap(),
+            ))
+            .unwrap();
+        let phase =
+            |name: &str| format!("vtop_broker_produce_phase_seconds_total{{phase=\"{name}\"}}");
+
+        let before = scrape(&registry);
+        for name in ["local_fsync", "replicate", "commit"] {
+            assert_eq!(
+                sample(&before, &phase(name)),
+                Some(0.0),
+                "every phase must be exported from the start, at zero: {before}"
+            );
+        }
+        let response = local_produce(&broker, 0xB1);
+        assert!(
+            matches!(response.message, vtop_protocol::Message::ProduceResponse(_)),
+            "{response:?}"
+        );
+        let after = scrape(&registry);
+        assert!(
+            sample(&after, &phase("local_fsync")).unwrap() > 0.0,
+            "a produce fsyncs, and that time must be counted: {after}"
+        );
+        assert_eq!(sample(&after, &phase("replicate")), Some(0.0), "{after}");
+        assert_eq!(sample(&after, &phase("commit")), Some(0.0), "{after}");
+    }
+
+    /// Whether this broker batches its fsyncs is itself exported (#752), so
+    /// a dashboard reading the group-commit series can tell "no groups
+    /// sealed" from "group commit is off".
+    #[test]
+    fn a_leader_exports_whether_group_commit_is_on() {
+        let off_dir = tempfile::tempdir().unwrap();
+        let off = Arc::new(open_broker(off_dir.path()));
+        let on_dir = tempfile::tempdir().unwrap();
+        let on = Arc::new(
+            open_broker(on_dir.path())
+                .with_group_commit(vtop_broker::group_commit::GroupCommitConfig {
+                    max_delay: std::time::Duration::ZERO,
+                    ..Default::default()
+                })
+                .unwrap(),
+        );
+        for (broker, expected) in [(off, 0.0), (on, 1.0)] {
+            let registry = Registry::new_custom(Some("vtop".into()), None).unwrap();
+            registry
+                .register(Box::new(
+                    BrokerCollector::new(broker, None, Vec::new()).unwrap(),
+                ))
+                .unwrap();
+            let text = scrape(&registry);
+            assert_eq!(
+                sample(&text, "vtop_broker_group_commit_enabled"),
+                Some(expected),
+                "{text}"
+            );
+        }
+    }
+
     /// Cardinality guard, mirroring the archive engine's contract test: an
     /// unbounded label would grow the TSDB without limit.
     #[test]
     fn every_node_label_is_from_a_bounded_set() {
         // "signal" (traces, metrics) labels the OpenTelemetry exporter's
-        // own counters (#683); its "reason" is already here.
-        const BOUNDED: [&str; 9] = [
+        // own counters (#683); its "reason" is already here. "phase" has
+        // three values, the produce path's (#752).
+        const BOUNDED: [&str; 10] = [
             "role", "node_id", "state", "reason", "scope", "topic", "range", "follower", "signal",
+            "phase",
         ];
         let observability = NodeObservability::new("data", "abc").unwrap();
         let report = RecoveryReport {
@@ -3081,6 +3328,13 @@ mod tests {
         observability
             .register(Box::new(
                 SegmentRecoveryCollector::new(Some(&report)).unwrap(),
+            ))
+            .unwrap();
+        // A leader's own series too, the produce phases among them.
+        let dir = tempfile::tempdir().unwrap();
+        observability
+            .register(Box::new(
+                BrokerCollector::new(Arc::new(open_broker(dir.path())), None, Vec::new()).unwrap(),
             ))
             .unwrap();
         let text = scrape(&observability.registry);

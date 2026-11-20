@@ -12,7 +12,9 @@ every upgrade.
   directory, or a verified backup taken before the upgrade.
 
 The source for this page is the release notes in the [roadmap](../ROADMAP.md);
-read the section for the release you are moving to.
+read the section for the release you are moving to. What each format
+promises, and the rules for changing one, are in the
+[compatibility policy](../reference/compatibility.md).
 
 ## Upgrading from v0.7.0 to v0.8.0
 
@@ -73,7 +75,7 @@ as tampered: recovery leaves such a batch VERIFIED and pending, and
 `vtopctl scrub` reports `unsupported_version`. Readers before v0.8.0 cannot
 read `0.4`, so upgrade every engine and auditor before a later release turns
 `0.4` on. The details are under
-[v0.10.0 and beyond](../ROADMAP.md#v0100-and-beyond) in the roadmap.
+[v0.10.0 in detail](../ROADMAP.md#v0100-in-detail) in the roadmap.
 
 Verification receipts (`manifest.verification_receipts`) need no reader
 upgrade: a reader that does not know them never fetches them. Older engines
@@ -88,7 +90,7 @@ Engines of the next release refuse to start when a manifest key file, the
 file) or the `VTOP_AUDIT_LOG` file can be read or written by other local
 users, where earlier releases started. A `0644` ledger inside a `0700` data
 directory still starts, and so does a Kubernetes Secret mounted with
-`defaultMode: 0400` and `fsGroup`. Before upgrading, run the new
+`defaultMode: 0400` and `fsGroup`. Before upgrading, run the new release's
 `vtopctl validate` against each engine's config on its host or in its pod:
 it names every file that would be refused, with the `chmod` that fixes it.
 The rule, the mounting recipes and the

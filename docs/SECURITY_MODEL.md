@@ -4,6 +4,9 @@
 >
 > Protocol-level behavior referenced here (state machine, commit rule §13, replay rule §14, verification semantics §17, manifest spec §11) is normatively defined in [VTOP_PROTOCOL_DRAFT.md](VTOP_PROTOCOL_DRAFT.md); this document adds the security rules around it.
 
+To report a vulnerability, and for response times and supported versions, see
+the [security policy](../SECURITY.md).
+
 The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normative requirements for conformant behavior.
 
 ## Table of contents
@@ -712,6 +715,7 @@ Currently tracked (re-evaluate on every dependency bump):
 | RUSTSEC-2026-0387 | `crypto-bigint 0.5.5` | Timing variability in operations intended to be constant-time. Fixed only in `crypto-bigint >=0.7.6`, a major bump; pinned to the 0.5.x line by `aws-sigv4 1.4.5` and `elliptic-curve 0.13.8`, so no `cargo update` reaches it. Exercised only on the AWS SigV4/SigV4a request-signing path. Remove when the AWS signing / RustCrypto stack adopts `crypto-bigint >=0.7.6` (`elliptic-curve >=0.14`). |
 | RUSTSEC-2026-0459 | `libsqlite3-sys 0.30.1` | Bundles a SQLite affected by CVE-2026-119375. Fixed in `libsqlite3-sys >=0.39.0` (SQLite 3.54), reachable only through a newer sqlx — `sqlx-sqlite 0.9.0` caps it at `<0.38`. SQLite here parses only the engine's **local**, operator-owned state-store database, never network input, so a crafted-database CVE is not reachable by a remote party. Remove when sqlx depends on `libsqlite3-sys >=0.39`. |
 | RUSTSEC-2026-0441 | `pin-utils 0.1.0` | An **unmaintained** notice, not a vulnerability: upstream is archived and no fix will ship. `cargo audit` treats it as a non-failing warning; `cargo deny`'s `unmaintained` check fails on it, so it is tracked in both files. Reaches the build only through `aws-smithy-http` / `aws-smithy-runtime`. Remove when the AWS SDK drops its `pin-utils` dependency. |
+| RUSTSEC-2026-0543 | `chrono 0.4.45` | An **unmaintained** notice, not a vulnerability; no fixed release exists. `chrono` is a direct workspace dependency for the timestamps the engine writes and reads back (manifests, ledger, audit records, object keys). `cargo audit` warns; `cargo deny`'s `unmaintained` check fails, so it is tracked in both files. Replacing it (`jiff` or `time`) is a migration of every timestamp type, not a bump. Remove when that migration lands or chrono is maintained again. |
 
 When the AWS SDK ships an `aws-smithy-http-client` release that drops
 `hyper-rustls 0.24`, the three `rustls-webpki` entries **MUST** be removed from
