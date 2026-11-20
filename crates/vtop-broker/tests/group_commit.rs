@@ -592,93 +592,120 @@ fn one_members_sequence_conflict_does_not_fail_the_others() {
     );
 }
 
-/// Codex review of #780: a group split request by request must keep the
-/// admission its first pass gave each member. One producer's epoch-1
-/// request and then its epoch-2 request share a group; the first pass
-/// admits both in queue order, durably advancing the producer's epoch
-/// journal to 2. The two records together exceed the segment's group limit,
-/// so the log refuses the group whole and each member is re-run alone. The
-/// re-run judged the epoch-1 request against the journal its own group had
-/// just advanced and fenced it, a permanent refusal for a request that,
-/// sent on its own ahead of the epoch-2 one, is accepted.
-#[test]
-fn a_split_group_keeps_its_first_passes_producer_admissions() {
-    // One 700-byte record fits a group; two do not.
+/// `members`, each a `(producer, epoch)` request with one 700-byte record,
+/// queued in this order into one group that the log refuses as too large
+/// (one such record fits a group, two do not), so the group is split and
+/// each member re-run alone. Returns the answers, in order, and the
+/// cluster's committed offset.
+fn split_group(members: &[(u128, u64)]) -> (Vec<WireFrame>, u64) {
     let segment = SegmentConfig {
         max_record_bytes: 1024,
         max_group_bytes: 1024 + 128,
         ..SegmentConfig::default()
     };
     let (leader, cluster_committed, _dirs) =
-        replicated_leader_on(sealing_at(2), segment, |inner, _| {
+        replicated_leader_on(sealing_at(members.len()), segment, |inner, _| {
             inner as Arc<dyn ReplicaSet>
         });
-    let producer = Uuid::from_u128(0xB5);
-    let at_epoch = |producer_epoch: u64, request_id: u64| WireFrame {
-        request_id,
-        stream_id: 1,
-        message: Message::ProduceRequest(ProduceRequest {
-            range: range_identity(),
-            fencing_epoch: FENCING_EPOCH,
-            producer_id: producer,
-            producer_epoch,
-            first_sequence: 0,
-            durability: WireDurability::Quorum,
-            records: vec![ProduceRecord {
-                timestamp_millis: 1_000,
-                key: b"k".to_vec(),
-                value: vec![b'v'; 700],
-            }],
-        }),
-    };
-    // The epoch-1 request must be queued first, so the group's order, and
-    // the order a client sending them one after another would see, is
-    // epoch 1 then epoch 2.
-    let first = {
-        let leader = Arc::clone(&leader);
-        let frame = at_epoch(1, 1);
-        thread::spawn(move || leader.handle(Role::Producer, frame))
-    };
     let coordinator = leader.group_commit().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while coordinator.queued_requests() < 1 {
-        assert!(
-            Instant::now() < deadline,
-            "the epoch-1 request was not queued within 10 s"
-        );
-        thread::sleep(Duration::from_millis(1));
+    let mut handles = Vec::new();
+    for (index, &(producer, producer_epoch)) in members.iter().enumerate() {
+        let frame = WireFrame {
+            request_id: index as u64 + 1,
+            stream_id: 1,
+            message: Message::ProduceRequest(ProduceRequest {
+                range: range_identity(),
+                fencing_epoch: FENCING_EPOCH,
+                producer_id: Uuid::from_u128(producer),
+                producer_epoch,
+                first_sequence: 0,
+                durability: WireDurability::Quorum,
+                records: vec![ProduceRecord {
+                    timestamp_millis: 1_000,
+                    key: b"k".to_vec(),
+                    value: vec![b'v'; 700],
+                }],
+            }),
+        };
+        let sender = Arc::clone(&leader);
+        handles.push(thread::spawn(move || sender.handle(Role::Producer, frame)));
+        // Each request is queued before the next is sent, so the group's
+        // order does not depend on thread timing. The last one seals the
+        // group and is taken at once, so it is never seen queued.
+        if index + 1 == members.len() {
+            break;
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while coordinator.queued_requests() <= index {
+            assert!(
+                Instant::now() < deadline,
+                "request {} was not queued within 10 s",
+                index + 1
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
     }
-    let second = {
-        let leader = Arc::clone(&leader);
-        let frame = at_epoch(2, 2);
-        thread::spawn(move || leader.handle(Role::Producer, frame))
-    };
-    let answers = [first.join().unwrap(), second.join().unwrap()];
-
+    let answers = handles.into_iter().map(|h| h.join().unwrap()).collect();
     let metrics = coordinator.metrics();
     assert_eq!(
         (metrics.last_sample().requests, metrics.split_groups_total()),
-        (2, 1),
-        "the two requests must have shared a group and been split for this test to mean \
-         anything"
+        (members.len() as u64, 1),
+        "the requests must have shared a group and been split for this test to mean anything"
     );
-    for (epoch, answer) in [1, 2].into_iter().zip(answers) {
-        match answer.message {
-            Message::ProduceResponse(response) => assert_eq!(
-                response.outcomes.len(),
-                1,
-                "the epoch-{epoch} request is acknowledged with its record"
-            ),
-            other => {
-                panic!("the epoch-{epoch} request was refused after its group was split: {other:?}")
-            }
+    (answers, cluster_committed.get())
+}
+
+fn expect_acked(answer: &WireFrame, epoch: u64) {
+    match &answer.message {
+        Message::ProduceResponse(response) => assert_eq!(
+            response.outcomes.len(),
+            1,
+            "the epoch-{epoch} request is acknowledged with its record"
+        ),
+        other => {
+            panic!("the epoch-{epoch} request was refused after its group was split: {other:?}")
         }
     }
-    assert_eq!(
-        cluster_committed.get(),
-        2,
-        "both records are committed, epoch 1 first"
-    );
+}
+
+/// Review of #780: a group split request by request must keep the
+/// admission its first pass gave each member. One producer's epoch-1
+/// request and then its epoch-2 request share a group; the first pass
+/// admits both in queue order, durably advancing the producer's epoch
+/// journal to 2. The log refuses the group whole as too large and each
+/// member is re-run alone. The re-run judged the epoch-1 request against
+/// the journal its own group had just advanced and fenced it: a permanent
+/// refusal for a request that, sent alone ahead of the epoch-2 one, is
+/// accepted.
+#[test]
+fn a_split_group_keeps_its_first_passes_producer_admissions() {
+    let (answers, committed) = split_group(&[(0xB5, 1), (0xB5, 2)]);
+    expect_acked(&answers[0], 1);
+    expect_acked(&answers[1], 2);
+    assert_eq!(committed, 2, "both records are committed, epoch 1 first");
+}
+
+/// A guard for the fix above: keeping a split group's admissions must not
+/// weaken a fence. Producer B5's epoch-2 request, another producer's
+/// request, then B5's epoch-1 request: the first pass fences the epoch-1
+/// request behind epoch 2, the other two are too large together, and after
+/// the split the epoch-1 request is still fenced, exactly as it is sent
+/// alone after the epoch-2 one.
+#[test]
+fn a_split_group_still_fences_an_older_epoch_queued_behind_a_newer() {
+    let (answers, committed) = split_group(&[(0xB5, 2), (0xB6, 1), (0xB5, 1)]);
+    expect_acked(&answers[0], 2);
+    expect_acked(&answers[1], 1);
+    match &answers[2].message {
+        Message::Error(ErrorResponse { code, .. }) => assert_eq!(
+            *code,
+            ErrorCode::Fenced,
+            "the epoch-1 request is fenced: {:?}",
+            answers[2]
+        ),
+        other => panic!("the epoch-1 request must be fenced behind epoch 2: {other:?}"),
+    }
+    assert_eq!(committed, 2, "only the two admitted records are committed");
 }
 
 /// A replica set that loses the lease in the middle of the round: the

@@ -331,6 +331,18 @@ impl ProducerEpochJournal {
         self.current.insert(producer_id, epoch);
         Ok(())
     }
+
+    /// Whether an admission this journal gave `producer_id` at `epoch`
+    /// earlier in the same flush still stands: the journal is writable and
+    /// still at `left_at`, the epoch the flush's first pass left it at, which
+    /// `epoch` does not exceed. Then nothing outside that pass has moved the
+    /// producer on since, and the only newer epoch it can have recorded is a
+    /// later member of the same group, which comes after this one in queue
+    /// order exactly as it would sent alone (#752, D6). Anything else is
+    /// judged afresh by [`Self::accept`], so no fence is ever skipped.
+    fn still_admits(&self, producer_id: Uuid, epoch: u64, left_at: u64) -> bool {
+        !self.poisoned && epoch <= left_at && self.current(producer_id) == Some(left_at)
+    }
 }
 
 fn epoch_checksum(producer_id: Uuid, epoch: u64) -> blake3::Hash {
@@ -1997,6 +2009,14 @@ impl LocalBroker {
     /// Append every admitted member under one local durability barrier, then
     /// (for Quorum) one replica fan-out / HWM advance covering the group.
     fn flush_produce_group(&self, batch: &[QueuedProduce]) -> Vec<WireFrame> {
+        self.flush_admitted(batch, &[])
+    }
+
+    /// [`Self::flush_produce_group`], with `admitted[i]`, when present, the
+    /// epoch an earlier pass over the same group left the producer epoch
+    /// journal at after admitting `batch[i]` (see
+    /// [`ProducerEpochJournal::still_admits`]). Empty for a first pass.
+    fn flush_admitted(&self, batch: &[QueuedProduce], admitted: &[Option<u64>]) -> Vec<WireFrame> {
         if batch.is_empty() {
             return Vec::new();
         }
@@ -2010,8 +2030,10 @@ impl LocalBroker {
             .iter()
             .position(|item| item.request.durability != durability)
         {
-            let mut frames = self.flush_produce_group(&batch[..split]);
-            frames.extend(self.flush_produce_group(&batch[split..]));
+            let mut frames =
+                self.flush_admitted(&batch[..split], admitted.get(..split).unwrap_or(&[]));
+            frames
+                .extend(self.flush_admitted(&batch[split..], admitted.get(split..).unwrap_or(&[])));
             return frames;
         }
         // Lock order: metadata lease view, then broker state. Hold both only
@@ -2028,7 +2050,10 @@ impl LocalBroker {
             let mut records = Vec::new();
             let mut member_record_counts = Vec::with_capacity(batch.len());
             let mut early: Vec<Option<WireFrame>> = Vec::with_capacity(batch.len());
-            for item in batch {
+            // Which members this pass admitted, for a re-run of the group.
+            let mut admitted_here = Vec::with_capacity(batch.len());
+            for (index, item) in batch.iter().enumerate() {
+                admitted_here.push(false);
                 if let Err((code, message)) =
                     self.check_range(&meta, &item.request.range, item.request.fencing_epoch)
                 {
@@ -2036,10 +2061,27 @@ impl LocalBroker {
                     member_record_counts.push(0);
                     continue;
                 }
-                if let Err(problem) = state
-                    .producer_epochs
-                    .accept(item.request.producer_id, item.request.producer_epoch)
-                {
+                let (producer_id, producer_epoch) =
+                    (item.request.producer_id, item.request.producer_epoch);
+                // A member an earlier pass over this group admitted keeps
+                // that admission, while the journal still stands where that
+                // pass left it (#752, D6). Judged again, a member at epoch N
+                // would be fenced by the N+1 a later member of its own group
+                // had just recorded, where sent alone, ahead of it, it is
+                // accepted (review of #780).
+                let admission = match admitted.get(index).copied().flatten() {
+                    Some(left_at)
+                        if state.producer_epochs.still_admits(
+                            producer_id,
+                            producer_epoch,
+                            left_at,
+                        ) =>
+                    {
+                        Ok(())
+                    }
+                    _ => state.producer_epochs.accept(producer_id, producer_epoch),
+                };
+                if let Err(problem) = admission {
                     let frame = match problem {
                         BrokerError::ProducerFenced { .. } => error(
                             item.request_id,
@@ -2096,6 +2138,7 @@ impl LocalBroker {
                 member_record_counts.push(member_records.len());
                 records.append(&mut member_records);
                 early.push(None);
+                admitted_here[index] = true;
             }
 
             if records.is_empty() {
@@ -2153,7 +2196,23 @@ impl LocalBroker {
                 // locks are released, so only the member that caused it
                 // fails. A storage error still fails the whole group.
                 Err(problem) if batch.len() > 1 && member_can_cause(&problem) => {
-                    break 'prepared Err(problem);
+                    // The log wrote nothing, but this pass's admissions
+                    // are durable in the producer epoch journal: carry where
+                    // each admitted member's producer now stands, so the
+                    // re-run keeps them rather than judging a member against
+                    // an epoch a later member of its own group recorded.
+                    let readmit = batch
+                        .iter()
+                        .zip(&admitted_here)
+                        .map(|(item, &admitted)| {
+                            if admitted {
+                                state.producer_epochs.current(item.request.producer_id)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    break 'prepared Err((problem, readmit));
                 }
                 Err(problem) => {
                     let code = match &problem {
@@ -2182,7 +2241,7 @@ impl LocalBroker {
 
         let (tip_before, leader_committed, wire_by_member) = match prepared {
             Ok(prepared) => prepared,
-            Err(problem) => return self.flush_each_alone(batch, &problem),
+            Err((problem, readmit)) => return self.flush_each_alone(batch, &problem, &readmit),
         };
         if durability == WireDurability::LocalFsync {
             return batch
@@ -2376,6 +2435,7 @@ impl LocalBroker {
         &self,
         batch: &[QueuedProduce],
         problem: &vtop_log::LogError,
+        readmit: &[Option<u64>],
     ) -> Vec<WireFrame> {
         if let Some(coordinator) = &self.group_commit {
             coordinator.metrics().record_split();
@@ -2391,7 +2451,10 @@ impl LocalBroker {
         );
         batch
             .iter()
-            .flat_map(|item| self.flush_produce_group(std::slice::from_ref(item)))
+            .zip(readmit)
+            .flat_map(|(item, readmit)| {
+                self.flush_admitted(std::slice::from_ref(item), std::slice::from_ref(readmit))
+            })
             .collect()
     }
 
@@ -4287,6 +4350,42 @@ mod tests {
             reopened.accept(producer, 8),
             Err(BrokerError::ProducerFenced { .. })
         ));
+    }
+
+    /// A split group keeps an earlier pass's admission only while the
+    /// journal stands where that pass left it (review of #780): once
+    /// anything moves the producer further, or the writer is poisoned, the
+    /// member is judged afresh, so no fence is skipped.
+    #[test]
+    fn an_earlier_admission_stands_only_while_the_journal_has_not_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = ProducerEpochJournal::open(dir.path().join("epochs")).unwrap();
+        let producer = Uuid::from_u128(21);
+        journal.accept(producer, 1).unwrap();
+        journal.accept(producer, 2).unwrap();
+        assert!(
+            journal.still_admits(producer, 1, 2),
+            "left at 2 and still there"
+        );
+        assert!(journal.still_admits(producer, 2, 2));
+        assert!(
+            !journal.still_admits(producer, 3, 2),
+            "an epoch the pass never reached is not admitted by it"
+        );
+        assert!(
+            !journal.still_admits(Uuid::from_u128(22), 1, 1),
+            "a producer the journal never saw"
+        );
+        journal.accept(producer, 3).unwrap();
+        assert!(
+            !journal.still_admits(producer, 1, 2),
+            "the journal moved past where the pass left it"
+        );
+        journal.poisoned = true;
+        assert!(
+            !journal.still_admits(producer, 3, 3),
+            "a poisoned writer admits nothing"
+        );
     }
 
     #[test]
