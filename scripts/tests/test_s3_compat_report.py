@@ -67,6 +67,11 @@ def test_an_unexpected_outcome_marks_every_capability_of_the_case():
     assert report.cell(cases, "path_style") == report.UNEXPECTED
 
 
+def test_a_case_the_harness_could_not_run_tested_nothing():
+    cases = [case("m", ["multipart", "virtual_host"], "not_run")]
+    assert report.cell(cases, "multipart") == report.NOT_TESTED
+
+
 def test_xfail_and_unknown_are_labelled_as_what_they_are():
     xfail = [case("c", ["conditional_put"], "fail", "xfail (#9)", "conditional_put")]
     assert report.cell(xfail, "conditional_put") == "known failure (#9)"

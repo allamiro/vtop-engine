@@ -53,6 +53,10 @@ pub enum Outcome {
     Refused,
     /// Nothing ran: the capability does not apply.
     NotApplicable,
+    /// The test harness cannot run this case against this server (not the
+    /// server's gap: the fault-injecting forwarder needs plain HTTP, say).
+    /// Shown as "not tested", never as a pass.
+    NotRun,
     /// An `xfail` passed.
     UnexpectedPass,
     /// A `pass` failed, a refusal body failed, a case had no refusal for an
@@ -67,6 +71,7 @@ impl Outcome {
             Outcome::Fail => "fail",
             Outcome::Refused => "refused",
             Outcome::NotApplicable => "not_applicable",
+            Outcome::NotRun => "not_run",
             Outcome::UnexpectedPass => "unexpected_pass",
             Outcome::UnexpectedFail => "unexpected_fail",
         }
@@ -301,6 +306,36 @@ impl LiveS3 {
     /// The unexpected outcomes so far, each as its failure line.
     pub fn unexpected(&self) -> Vec<String> {
         self.unexpected.borrow().clone()
+    }
+
+    /// Record a case the test harness cannot run against this server, and
+    /// why (#722, the AWS leg: the multipart tests' forwarder speaks plain
+    /// HTTP). Its line says `not_run` with the reason, and the report shows
+    /// the capability as not tested; it never counts as a pass.
+    pub fn not_run(&self, name: &str, needs: &[Capability], why: &str) {
+        let mut needs = needs.to_vec();
+        if !needs.contains(&self.addressing()) {
+            needs.push(self.addressing());
+        }
+        let line = ResultLine {
+            server: self.server.id.clone(),
+            server_version: self.recorder.server_version.clone(),
+            image_digest: self.recorder.image_digest.clone(),
+            vtop_commit: self.recorder.vtop_commit.clone(),
+            case: name.to_owned(),
+            capabilities: needs.iter().map(|c| c.to_string()).collect(),
+            deciding_capability: None,
+            expectation: plan(&self.server, &needs, false).expectation().to_string(),
+            outcome: Outcome::NotRun.as_str().to_owned(),
+            expected: true,
+            method: None,
+            seconds: 0.0,
+            detail: Some(why.to_owned()),
+        };
+        if let Some(path) = &self.recorder.path {
+            write_line(path, &line);
+        }
+        eprintln!("s3-compat {} {name}: not_run ({why})", self.server.id);
     }
 
     /// Run a case with no refusal path: a server that lacks one of `needs`
@@ -909,5 +944,27 @@ mod tests {
         assert_eq!(l.outcome, "pass");
         assert_eq!(l.capabilities, vec!["put_get_head", "path_style"]);
         assert_eq!(l.sdk_checksum.as_deref(), Some("when_required"));
+    }
+
+    /// A case the harness cannot run is recorded as such, with why.
+    #[test]
+    fn a_case_the_harness_cannot_run_is_recorded_not_run_with_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = recorder(dir.path());
+        let path = r.path.clone().unwrap();
+        let live = LiveS3::new(server(false, &[]), settings(true), r).unwrap();
+        live.not_run(
+            "multipart.forwarded",
+            &[Capability::Multipart],
+            "the forwarder needs a plain-HTTP endpoint",
+        );
+        let l = &lines(&path)[0];
+        assert_eq!((l.outcome.as_str(), l.expected), ("not_run", true));
+        assert_eq!(
+            l.detail.as_deref(),
+            Some("the forwarder needs a plain-HTTP endpoint")
+        );
+        assert_eq!(l.capabilities, vec!["multipart", "path_style"]);
+        assert!(live.unexpected().is_empty());
     }
 }

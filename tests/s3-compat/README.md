@@ -70,10 +70,15 @@ server, `VTOP_TEST_S3_SERVER_VERSION`, `VTOP_TEST_S3_IMAGE_DIGEST`, the VTOP
 commit (`VTOP_TEST_COMMIT`, else `GITHUB_SHA`), the case, its capabilities,
 the expectation and the capability that decided it (`deciding_capability`,
 none when every capability is `pass`), the outcome (`pass`, `fail`,
-`refused`, `not_applicable`, `unexpected_pass`, `unexpected_fail`), whether
+`refused`, `not_applicable`, `not_run`, `unexpected_pass`, `unexpected_fail`), whether
 that was expected, the verification method the case saw (`store_checksum` or
 `read_back`), how long it took, and for a failed body or an unexpected
 outcome the first line of why (`detail`).
+
+`not_run` is a case the test harness cannot run against the server, with
+the reason in `detail` (the multipart tests' fault-injecting forwarder needs
+a plain-HTTP endpoint, so on AWS they are not run); the report shows its
+capabilities as not tested.
 
 An unexpected outcome fails the test with a line such as:
 

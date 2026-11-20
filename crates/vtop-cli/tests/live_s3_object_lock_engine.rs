@@ -161,6 +161,14 @@ async fn refused_at_startup(capability: Capability, at: RefusalAt) {
     }
 }
 
+/// An S3 AccessDenied: the AWS leg's role holds no
+/// s3:BypassGovernanceRetention, on purpose (#722).
+fn access_denied<E: aws_sdk_s3::error::ProvideErrorMetadata, R>(
+    e: &aws_sdk_s3::error::SdkError<E, R>,
+) -> bool {
+    e.as_service_error().and_then(|se| se.code()) == Some("AccessDenied")
+}
+
 #[tokio::test]
 #[ignore = "requires an S3-compatible endpoint with Object Lock"]
 async fn live_the_engine_refuses_a_bucket_without_object_lock_at_startup() {
@@ -281,58 +289,77 @@ async fn live_the_engine_archives_a_batch_under_the_configured_lock() {
             }
 
             // Clear the receipt's retention, as a principal allowed to bypass
-            // governance can (#710): the scrub reports the receipt, not the batch.
-            client
+            // governance can (#710): the scrub reports the receipt, not the
+            // batch. The lab's root credentials may; the AWS leg's role
+            // deliberately may not (#722: no s3:BypassGovernanceRetention), so
+            // there this half is not run, and the log says so.
+            let cleared = client
                 .put_object_retention()
                 .bucket(&bucket)
                 .key(key_of(&receipt))
                 .bypass_governance_retention(true)
                 .retention(aws_sdk_s3::types::ObjectLockRetention::builder().build())
                 .send()
-                .await
-                .expect("the lab's root credentials may clear a governance retention");
-            let rows = vtop_cli::scrub::committed_rows(
-                engine.store.list_batches().await.unwrap(),
-                Vec::new(),
-            );
-            let report = engine
-                .scrub(
-                    rows,
-                    &ScrubOptions {
-                        check_retention: Some(ObjectLockMode::Governance),
-                        check_receipts: true,
-                        ..ScrubOptions::default()
-                    },
-                )
-                .await
-                .unwrap();
-            assert!(!report.passed, "{report:#?}");
-            assert_eq!(report.retention.get(locked), Some(&1), "{report:#?}");
-            assert_eq!(
-                report
-                    .receipt_retention
-                    .get(RetentionResult::Missing.as_str()),
-                Some(&1),
-                "{report:#?}"
-            );
-            assert_eq!(report.findings.len(), 1, "{report:#?}");
-            assert_eq!(
-                report.findings[0].receipt_retention,
-                Some(RetentionResult::Missing),
-                "{report:#?}"
-            );
+                .await;
+            match cleared {
+                Ok(_) => {
+                    let rows = vtop_cli::scrub::committed_rows(
+                        engine.store.list_batches().await.unwrap(),
+                        Vec::new(),
+                    );
+                    let report = engine
+                        .scrub(
+                            rows,
+                            &ScrubOptions {
+                                check_retention: Some(ObjectLockMode::Governance),
+                                check_receipts: true,
+                                ..ScrubOptions::default()
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    assert!(!report.passed, "{report:#?}");
+                    assert_eq!(report.retention.get(locked), Some(&1), "{report:#?}");
+                    assert_eq!(
+                        report
+                            .receipt_retention
+                            .get(RetentionResult::Missing.as_str()),
+                        Some(&1),
+                        "{report:#?}"
+                    );
+                    assert_eq!(report.findings.len(), 1, "{report:#?}");
+                    assert_eq!(
+                        report.findings[0].receipt_retention,
+                        Some(RetentionResult::Missing),
+                        "{report:#?}"
+                    );
+                }
+                Err(e) if access_denied(&e) => eprintln!(
+                    "{receipt}: clearing a governance retention was refused (no bypass \
+                     permission); the scrub of a receipt without retention is not run here"
+                ),
+                Err(e) => panic!("clearing the receipt's retention: {e:?}"),
+            }
 
-            // Clean up: the lab's root credentials may bypass governance.
+            // Clean up: the lab's root credentials may bypass governance; the
+            // AWS leg's role may not, and there the bucket's lifecycle rule
+            // removes the versions once their one-day retention ends.
             for (uri, key, version) in written {
-                client
+                let deleted = client
                     .delete_object()
                     .bucket(&bucket)
                     .key(&key)
                     .version_id(&version)
                     .bypass_governance_retention(true)
                     .send()
-                    .await
-                    .unwrap_or_else(|e| panic!("cleaning up {uri}: {e:?}"));
+                    .await;
+                match deleted {
+                    Ok(_) => {}
+                    Err(e) if access_denied(&e) => {
+                        eprintln!("{uri}: governance bypass refused; left for the bucket's lifecycle rule")
+                    }
+                    Err(e) => panic!("cleaning up {uri}: {e:?}"),
+                }
             }
         },
         refused_at_startup,
@@ -351,142 +378,153 @@ async fn live_the_engine_archives_a_batch_under_the_configured_lock() {
 #[ignore = "requires an S3-compatible endpoint with Object Lock"]
 async fn live_a_replay_over_an_ended_lock_commits_a_fresh_locked_object() {
     let live = LiveS3::from_env();
-    live.case(
+    let (name, needs) = (
         "engine.object_lock.a_replay_over_an_ended_lock_commits_a_fresh_object",
-        &[Capability::Versioning, Capability::ObjectLock],
-        || async {
-            use aws_sdk_s3::types::{ObjectLockRetention, ObjectLockRetentionMode};
-            let dir = tempfile::tempdir().unwrap();
-            let bucket = locked_bucket();
-            let prefix = format!("vtop-it-709-engine-{}", unix_now());
-            let client = s3_client().await;
-            let key_of = |uri: &str| {
-                uri.strip_prefix(&format!("s3://{bucket}/"))
-                    .unwrap()
-                    .to_owned()
-            };
-            // No time in the path, so both engines resolve to one prefix whatever
-            // the hour.
-            let template = "tenant={tenant}/source={source}/format={format}/";
+        &[Capability::Versioning, Capability::ObjectLock][..],
+    );
+    // Shortening a governance retention takes s3:BypassGovernanceRetention,
+    // which the AWS leg's role deliberately lacks (no endpoint is set only
+    // for a server whose file says the SDK finds it, i.e. AWS): recorded
+    // not_run with why, never a pass (#722).
+    if live.settings.endpoint.is_none() {
+        return live.not_run(
+            name,
+            needs,
+            "the case shortens a governance retention, which needs s3:BypassGovernanceRetention; the AWS role deliberately lacks it",
+        );
+    }
+    live.case(name, needs, || async {
+        use aws_sdk_s3::types::{ObjectLockRetention, ObjectLockRetentionMode};
+        let dir = tempfile::tempdir().unwrap();
+        let bucket = locked_bucket();
+        let prefix = format!("vtop-it-709-engine-{}", unix_now());
+        let client = s3_client().await;
+        let key_of = |uri: &str| {
+            uri.strip_prefix(&format!("s3://{bucket}/"))
+                .unwrap()
+                .to_owned()
+        };
+        // No time in the path, so both engines resolve to one prefix whatever
+        // the hour.
+        let template = "tenant={tenant}/source={source}/format={format}/";
 
-            let mut cfg = config_named(dir.path(), &bucket, &prefix, "first");
-            cfg.partitioning.template = template.into();
-            let mut first = Engine::new_exclusive(cfg, StreamsConfig { streams: vec![] })
-                .await
-                .unwrap();
-            let out = first.process_once(SourceType::File).await.unwrap();
-            assert!(out[0].committed, "{out:?}");
-            let derived = out[0].object_uri.clone().unwrap();
-            let derived_key = key_of(&derived);
-            let head = client
-                .head_object()
-                .bucket(&bucket)
-                .key(&derived_key)
-                .send()
-                .await
-                .unwrap();
-            let version = head.version_id().unwrap().to_owned();
-            let ends = unix_now() + 2;
+        let mut cfg = config_named(dir.path(), &bucket, &prefix, "first");
+        cfg.partitioning.template = template.into();
+        let mut first = Engine::new_exclusive(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let out = first.process_once(SourceType::File).await.unwrap();
+        assert!(out[0].committed, "{out:?}");
+        let derived = out[0].object_uri.clone().unwrap();
+        let derived_key = key_of(&derived);
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(&derived_key)
+            .send()
+            .await
+            .unwrap();
+        let version = head.version_id().unwrap().to_owned();
+        let ends = unix_now() + 2;
+        client
+            .put_object_retention()
+            .bucket(&bucket)
+            .key(&derived_key)
+            .version_id(&version)
+            .bypass_governance_retention(true)
+            .retention(
+                ObjectLockRetention::builder()
+                    .mode(ObjectLockRetentionMode::Governance)
+                    .retain_until_date(aws_sdk_s3::primitives::DateTime::from_secs(ends))
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("shortening the retention of {derived}: {e:?}"));
+        drop(first);
+        while unix_now() <= ends + 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+
+        let mut cfg = config_named(dir.path(), &bucket, &prefix, "second");
+        cfg.partitioning.template = template.into();
+        let mut second = Engine::new_exclusive(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let before = unix_now();
+        let out = second.process_once(SourceType::File).await.unwrap();
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].committed, "the replay commits: {out:?}");
+        let landed = out[0].object_uri.clone().unwrap();
+        assert_ne!(landed, derived, "the ended lock was not reused");
+        assert!(
+            landed.contains(&out[0].batch_id),
+            "{landed} is the attempt key"
+        );
+
+        let fresh = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key_of(&landed))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            fresh.object_lock_mode().map(|m| m.as_str()),
+            Some("GOVERNANCE")
+        );
+        let until = fresh.object_lock_retain_until_date().unwrap().secs();
+        assert!(
+            until >= before + 86_400 && until <= unix_now() + 86_400 + 1,
+            "{landed} is retained one day from its write: {until}"
+        );
+        let old = client
+            .head_object()
+            .bucket(&bucket)
+            .key(&derived_key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            old.version_id(),
+            Some(version.as_str()),
+            "{derived} is untouched"
+        );
+        assert_eq!(
+            old.object_lock_retain_until_date().map(|d| d.secs()),
+            Some(ends),
+            "{derived} kept its ended retention"
+        );
+
+        // Clean up every version under the prefix; the lab's root credentials
+        // may bypass governance.
+        let listed = client
+            .list_object_versions()
+            .bucket(&bucket)
+            .prefix(&prefix)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            listed
+                .versions()
+                .iter()
+                .filter(|v| v.key() == Some(derived_key.as_str()))
+                .count(),
+            1,
+            "nothing was written over {derived}"
+        );
+        for v in listed.versions() {
             client
-                .put_object_retention()
+                .delete_object()
                 .bucket(&bucket)
-                .key(&derived_key)
-                .version_id(&version)
+                .key(v.key().unwrap())
+                .version_id(v.version_id().unwrap())
                 .bypass_governance_retention(true)
-                .retention(
-                    ObjectLockRetention::builder()
-                        .mode(ObjectLockRetentionMode::Governance)
-                        .retain_until_date(aws_sdk_s3::primitives::DateTime::from_secs(ends))
-                        .build(),
-                )
                 .send()
                 .await
-                .unwrap_or_else(|e| panic!("shortening the retention of {derived}: {e:?}"));
-            drop(first);
-            while unix_now() <= ends + 1 {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-
-            let mut cfg = config_named(dir.path(), &bucket, &prefix, "second");
-            cfg.partitioning.template = template.into();
-            let mut second = Engine::new_exclusive(cfg, StreamsConfig { streams: vec![] })
-                .await
-                .unwrap();
-            let before = unix_now();
-            let out = second.process_once(SourceType::File).await.unwrap();
-            assert_eq!(out.len(), 1, "{out:?}");
-            assert!(out[0].committed, "the replay commits: {out:?}");
-            let landed = out[0].object_uri.clone().unwrap();
-            assert_ne!(landed, derived, "the ended lock was not reused");
-            assert!(
-                landed.contains(&out[0].batch_id),
-                "{landed} is the attempt key"
-            );
-
-            let fresh = client
-                .head_object()
-                .bucket(&bucket)
-                .key(key_of(&landed))
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(
-                fresh.object_lock_mode().map(|m| m.as_str()),
-                Some("GOVERNANCE")
-            );
-            let until = fresh.object_lock_retain_until_date().unwrap().secs();
-            assert!(
-                until >= before + 86_400 && until <= unix_now() + 86_400 + 1,
-                "{landed} is retained one day from its write: {until}"
-            );
-            let old = client
-                .head_object()
-                .bucket(&bucket)
-                .key(&derived_key)
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(
-                old.version_id(),
-                Some(version.as_str()),
-                "{derived} is untouched"
-            );
-            assert_eq!(
-                old.object_lock_retain_until_date().map(|d| d.secs()),
-                Some(ends),
-                "{derived} kept its ended retention"
-            );
-
-            // Clean up every version under the prefix; the lab's root credentials
-            // may bypass governance.
-            let listed = client
-                .list_object_versions()
-                .bucket(&bucket)
-                .prefix(&prefix)
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(
-                listed
-                    .versions()
-                    .iter()
-                    .filter(|v| v.key() == Some(derived_key.as_str()))
-                    .count(),
-                1,
-                "nothing was written over {derived}"
-            );
-            for v in listed.versions() {
-                client
-                    .delete_object()
-                    .bucket(&bucket)
-                    .key(v.key().unwrap())
-                    .version_id(v.version_id().unwrap())
-                    .bypass_governance_retention(true)
-                    .send()
-                    .await
-                    .unwrap_or_else(|e| panic!("cleaning up {:?}: {e:?}", v.key()));
-            }
-        },
-    )
+                .unwrap_or_else(|e| panic!("cleaning up {:?}: {e:?}", v.key()));
+        }
+    })
     .await;
 }

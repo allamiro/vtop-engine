@@ -42,23 +42,38 @@ jobs:
       - name: Install the report's one dependency
         run: pip install --disable-pip-version-check pyyaml==6.0.3
 
-      # The newest successful run of ci.yml on main that ran the matrix
-      # (a run whose path filter skipped it uploaded no results).
+      # The newest successful run of ci.yml on main that ran the matrix (a
+      # run whose path filter skipped it uploaded no results), and the newest
+      # run of the opt-in s3-aws workflow that uploaded any (it skips, and
+      # uploads nothing, until the maintainer configures it).
       - name: Download the newest results from main
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/results"
-          for run in $(gh run list --workflow ci.yml --branch main --status success --limit 30 \
-              --json databaseId --jq '.[].databaseId'); do
-            if gh run download "$run" --pattern 's3-compat-results-*' --dir "$RUNNER_TEMP/results" 2>/dev/null; then
-              echo "RUN_ID=$run" >> "$GITHUB_ENV"
-              echo "Results from run $run"
-              exit 0
-            fi
-          done
-          echo "No successful run on main in the last 30 uploaded S3 compatibility results; nothing to refresh." >> "$GITHUB_STEP_SUMMARY"
+          newest() {
+            local workflow=$1 dest=$2 run
+            for run in $(gh run list --workflow "$workflow" --branch main --limit 30 \
+                --json databaseId,conclusion --jq '.[] | select(.conclusion == "success" or .conclusion == "failure") | .databaseId'); do
+              if gh run download "$run" --pattern 's3-compat-results-*' --dir "$dest" 2>/dev/null; then
+                echo "$run"
+                return 0
+              fi
+            done
+            return 1
+          }
+          if run=$(newest ci.yml "$RUNNER_TEMP/results/ci"); then
+            echo "RUN_ID=$run" >> "$GITHUB_ENV"
+            echo "Matrix results from run $run"
+          fi
+          if aws=$(newest s3-aws.yml "$RUNNER_TEMP/results/aws"); then
+            echo "AWS results from run $aws"
+            echo "RUN_ID=${run:-$aws}" >> "$GITHUB_ENV"
+          fi
+          if [ ! -d "$RUNNER_TEMP/results/ci" ] && [ ! -d "$RUNNER_TEMP/results/aws" ]; then
+            echo "No run on main in the last 30 of either workflow uploaded S3 compatibility results; nothing to refresh." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Regenerate from them
         if: env.RUN_ID != ''
