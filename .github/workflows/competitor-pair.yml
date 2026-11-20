@@ -26,8 +26,15 @@ name: competitor pair (netem lab)
 # -receiver.json and -line-stamps.json. The artifact below carries them, so a
 # refusal can be explained from what both ends of the flow reported (#610).
 #
-# OUT OF THE DEFAULT PATH ON PURPOSE. It runs for about an hour, so it is
-# dispatched by hand, and on a pull request only when this file itself changes.
+# A RESULT IS COMMITTED FROM THE RUN'S OWN FILES. The last steps write the pair
+# table and record (benchmarks/competitor_pair_report.py) and upload a bundle:
+# the tables, the environment, the logs, and each accepted half's summary.json
+# and metrics.csv. `gh run download <run> -n competitor-pair-bundle-<run>-<n>`
+# gives the directory to commit under benchmarks/measurements/. No figure is
+# typed by hand.
+#
+# OUT OF THE DEFAULT PATH ON PURPOSE. It runs for about an hour, so it runs on
+# `workflow_dispatch` only: never on a push, never on a pull request.
 on:
   workflow_dispatch:
     inputs:
@@ -35,9 +42,6 @@ on:
         description: "How many uncapped/capped pairs to run, 1-6 (each pair is about 15-18 minutes)"
         required: false
         default: "3"
-  pull_request:
-    paths:
-      - ".github/workflows/competitor-pair.yml"
 
 permissions:
   contents: read
@@ -251,8 +255,7 @@ jobs:
         if: always()
         env:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          TESTED_SHA: ${{ github.sha }}
+          HEAD_SHA: ${{ github.sha }}
         # Best effort, and -e off for the same reason as the loop: one probe
         # failing (the lab already down, the binary never built) must not
         # stop the rest of the record from being written.
@@ -291,7 +294,6 @@ jobs:
           rec = {
               "workflow_run": os.environ["RUN_URL"],
               "head_sha": os.environ["HEAD_SHA"],
-              "tested_sha": os.environ["TESTED_SHA"],
               "runner": {
                   "environment": os.environ.get("RUNNER_ENVIRONMENT"),
                   "name": os.environ.get("RUNNER_NAME"),

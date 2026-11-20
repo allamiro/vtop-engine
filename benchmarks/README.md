@@ -909,25 +909,48 @@ container with the docker socket mounted, or the competitor's stamps are read
 against another kernel's clock.
 
 A GitHub-hosted runner also has `ifb` (#610). `.github/workflows/competitor-pair.yml`
-runs scenarios 22 and 23 there. It is dispatched by hand and takes about an hour,
-so it is not part of the default CI path. The runner is a shared, noisy host, so
-any pair it produces is a comparison between the two halves of one job, not an
-absolute. Two runs are recorded in
-[`measurements/610-competitor-pair-hosted-runner/`](measurements/610-competitor-pair-hosted-runner/).
-They used the ubuntu26 image and kernel 7.0.0-1019-azure, ifb came from the stock
-modules, and calibration read 9.533–9.575 Mbit/s. They produced no pair. Every
-capped half and all but one uncapped half were refused, because the competitor's
-stream was missing the window's first 0.100–0.169 s. The one accepted half was
-uncapped: 5.046 Mbit/s beside VTOP against 9.564 alone, 53%, Jain 0.956.
+runs scenarios 22 and 23 there, a few repetitions with the order alternated. It
+runs on `workflow_dispatch` only and takes about an hour, so it is never part of
+the default CI path. It loads `ifb` and the qdiscs the middlebox installs from the
+runner's stock modules (and tries `linux-modules-extra` once if they are missing),
+and fails in seconds, naming the module, if the kernel lacks one. Its last step
+writes a bundle (`competitor_pair_report.py --bundle`) of the tables and each
+accepted half's `summary.json` and `metrics.csv`, so a result is committed from
+the run's own files and no figure is typed.
 
-The refused runs' raw reports show the cause (`record.json`, `refusal.cause`).
-The stream is the sender's and covers exactly `end.sum_sent.seconds`. The
-harness lays it into a window of `end.sum_received.seconds`, the receiver's
-clock, which is longer by the time the flow's tail takes to drain the queue
-(0.143–0.191 s measured). A window passes only when iperf3's first interval
-happens to straddle the omit restart and cover the gap. The fix proposed there
-is to place the stream on the sender's own window. It has not been applied yet,
-so the check is unchanged.
+The runner is a shared, noisy host, so a pair it produces is a comparison between
+the two halves of one job, not an absolute. The runs are recorded in
+[`measurements/610-competitor-pair-hosted-runner/`](measurements/610-competitor-pair-hosted-runner/).
+
+Two earlier runs (kernel 7.0.0-1019-azure) produced no pair. Every capped half and
+all but one uncapped half were refused, because the competitor's stream was
+missing the window's first 0.100–0.169 s. The refused runs' raw reports show the
+cause (`record.json`, `refusal.cause`). The stream is the sender's and covers
+exactly `end.sum_sent.seconds`. The harness laid it into a window of
+`end.sum_received.seconds`, the receiver's clock, which is longer by the time the
+flow's tail takes to drain the queue (0.143–0.191 s measured). A window passed
+only when iperf3's first interval happened to straddle the omit restart and cover
+the gap. The stream is now placed on the sender's own window and the goodput stays
+the receiver's bytes over the receiver's seconds. A hole inside the sender's own
+window is still refused.
+
+After that fix, run 44796334506 (kernel 7.0.0-1016-aws, Intel Xeon 6975P-C, ifb
+from the stock modules, calibration 9.572–9.573 Mbit/s) accepted all 6 halves, 3
+complete pairs, none refused. The medians over the three pairs, from
+`pair-run-44796334506/pair_record.json`, against each run's own solo windows
+(9.562–9.564 Mbit/s, solo windows within 0.02% of each other):
+
+| | competitor beside VTOP | share of its solo goodput | VTOP's committed-body rate | Jain's index |
+|---|---|---|---|---|
+| uncapped (scenario 22) | 6.631 Mbit/s | 69.33% | 2.282 Mbit/s | 0.807 |
+| capped at 256 KiB/s (scenario 23) | 7.513 Mbit/s | 78.55% | 1.641 Mbit/s | 0.708 |
+
+The cap gave the competitor 0.678–1.253 Mbit/s more in every pair. Jain's index is
+lower with the cap because VTOP's rate is lower: the index measures how equal the
+two rates are, not how well the link is used. The uncapped share here (65–71%) is
+higher than on the two azure runs' one accepted half (53%) and on #481's Lima VM
+(49%), on a different host and CPU, so compare the halves of one pair with each
+other and not with those.
 
 **Recorded** in [`measurements/481-egress-ceiling/`](measurements/481-egress-ceiling/)
 (local `results/` are never committed, so that directory is the record:
