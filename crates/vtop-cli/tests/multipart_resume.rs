@@ -325,11 +325,14 @@ async fn a_second_engine_waits_for_the_work_directory_and_then_resumes_the_sessi
     assert_eq!(sends(&backend), [1, 3, 1, 1]);
 }
 
-/// The source grew before the replay, so the replay's bytes differ: they
-/// name another object and start their own session. The old one is not
-/// resumed; it stays, with its upload, for the abandoned-session sweep.
+/// The source grew before the replay. The replay rebuilds the window as first
+/// cut (#626), so it names the same object and resumes the session the
+/// failed upload kept, sending only the part that failed; the appended
+/// records are the next window. Before, the replay read to the new end,
+/// named another object, sent every part again and left the old session for
+/// the sweep.
 #[tokio::test]
-async fn other_bytes_on_the_replay_start_their_own_session() {
+async fn a_replay_over_a_grown_source_resumes_the_session() {
     let _serial = SERIAL.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("app.log");
@@ -341,18 +344,88 @@ async fn other_bytes_on_the_replay_start_their_own_session() {
     assert_eq!(first[0].final_state, BatchState::Failed, "{first:?}");
     let old = sessions(dir.path());
     assert_eq!(old.len(), 1);
-    let (old_path, old_session) = old[0].clone();
+    let (_, old_session) = old[0].clone();
 
     write_records(&input, "more");
     let before = backend.part_sends_total();
     let second = engine.process_once(SourceType::File).await.unwrap();
+    assert_eq!(
+        second.len(),
+        2,
+        "the rebuilt window, then the new one: {second:?}"
+    );
+    assert!(second.iter().all(|o| o.committed), "{second:?}");
+    assert_eq!(
+        second[0].object_uri.as_deref(),
+        Some(old_session.object_uri.as_str()),
+        "the rebuilt window names the object the failed upload started"
+    );
+    let next = engine
+        .store
+        .get_batch(&second[1].batch_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let next_parts = (next.object_size_bytes.unwrap() as usize).div_ceil(1_000);
+    assert_eq!(
+        backend.part_sends_total() - before,
+        1 + next_parts,
+        "part 2 of the rebuilt window once more, and the new window's {next_parts} parts"
+    );
+    assert!(
+        sessions(dir.path()).is_empty(),
+        "no session is left for the sweep"
+    );
+}
+
+/// The replay's bytes differ (compression changed between the attempts, so
+/// the same range compresses to other bytes): they name another object and
+/// start their own session. The old one is not resumed; it stays, with its
+/// upload, for the abandoned-session sweep.
+#[tokio::test]
+async fn other_bytes_on_the_replay_start_their_own_session() {
+    let _serial = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    // Records that compress poorly, so the gzip replay is still multipart.
+    let mut f = std::fs::File::create(&input).unwrap();
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    for i in 0..40 {
+        let mut payload = String::new();
+        for _ in 0..10 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            payload.push_str(&format!("{x:016x}"));
+        }
+        writeln!(f, "other {i:04} {payload}").unwrap();
+    }
+    drop(f);
+    let backend = Arc::new(MockBackend::new().with_part_fault(2, PartFault::Reset, 2));
+    let cfg = with_part_attempts(config(dir.path(), &input), 2);
+    let (old_path, old_session) = {
+        let mut first = engine(cfg.clone(), &backend).await;
+        let out = first.process_once(SourceType::File).await.unwrap();
+        assert_eq!(out[0].final_state, BatchState::Failed, "{out:?}");
+        let old = sessions(dir.path());
+        assert_eq!(old.len(), 1);
+        old[0].clone()
+    };
+
+    let mut gzip = cfg;
+    gzip.compression.kind = CompressionType::Gzip;
+    gzip.compression.level = 1;
+    let mut restarted = engine(gzip, &backend).await;
+    restarted.recover().await.unwrap();
+    let before = backend.part_sends_total();
+    let second = restarted.process_once(SourceType::File).await.unwrap();
     assert!(second.iter().all(|o| o.committed), "{second:?}");
     assert_ne!(
         second[0].object_uri.as_deref(),
         Some(old_session.object_uri.as_str()),
         "other bytes name another object"
     );
-    let row = engine
+    let row = restarted
         .store
         .get_batch(&second[0].batch_id)
         .await
@@ -362,7 +435,7 @@ async fn other_bytes_on_the_replay_start_their_own_session() {
     assert_eq!(
         backend.part_sends_total() - before,
         size.div_ceil(1_000),
-        "every part of the grown range ({size} bytes) was sent, none reused"
+        "every part of the other bytes ({size} bytes) was sent, none reused"
     );
     assert!(old_path.exists(), "the old session was not adopted");
     assert!(
@@ -424,4 +497,64 @@ async fn a_complete_the_store_keeps_refusing_is_not_kept_for_the_replay() {
 
     let second = engine.process_once(SourceType::File).await.unwrap();
     assert!(second.iter().all(|o| o.committed), "{second:?}");
+}
+
+/// An instant, for a seal clock.
+fn at(rfc3339: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(rfc3339)
+        .unwrap()
+        .with_timezone(&chrono::Utc)
+}
+
+/// #626: the failed upload is sealed at 05:59:59 and its replay runs at
+/// 06:00:30, with keys that carry the hour. The replay is sealed at the first
+/// attempt's instant, so it names the same key and resumes the session the
+/// failed upload kept, sending only the part that failed. Before, it named a
+/// key under hour 06, started a second session and sent every part again,
+/// and the first session waited for the abandoned-session sweep.
+#[tokio::test]
+async fn a_replay_in_a_later_hour_resumes_the_session_the_failed_upload_kept() {
+    let _serial = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_records(&input, "hourly");
+    let backend = Arc::new(MockBackend::new().with_part_fault(2, PartFault::Reset, 2));
+    let mut cfg = with_part_attempts(config(dir.path(), &input), 2);
+    cfg.partitioning.template = vtop_core::partitioning::DEFAULT_TEMPLATE.into();
+    let mut engine = engine(cfg, &backend).await;
+    let (logs, _guard) = Logs::capture();
+
+    engine.set_seal_clock(|| at("2026-03-04T05:59:59.900Z"));
+    let first = engine.process_once(SourceType::File).await.unwrap();
+    assert_eq!(first[0].final_state, BatchState::Failed, "{first:?}");
+    let kept = sessions(dir.path());
+    assert_eq!(kept.len(), 1, "the failed upload's session is kept");
+    let (_, session) = &kept[0];
+    assert!(
+        session.object_uri.contains("hour=05"),
+        "{}",
+        session.object_uri
+    );
+
+    engine.set_seal_clock(|| at("2026-03-04T06:00:30Z"));
+    let second = engine.process_once(SourceType::File).await.unwrap();
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert!(second[0].committed, "{second:?}");
+    assert_eq!(
+        second[0].object_uri.as_deref(),
+        Some(session.object_uri.as_str()),
+        "the replay in hour 06 names the session's hour-05 key"
+    );
+    assert_eq!(
+        sends(&backend),
+        [1, 3, 1, 1],
+        "the replay sent part 2 once more and nothing else"
+    );
+    assert!(sessions(dir.path()).is_empty(), "no second session is left");
+    assert_eq!(
+        backend.pending_multipart_count(),
+        0,
+        "none waits for the sweep"
+    );
+    logs.one("multipart_session_resumed");
 }

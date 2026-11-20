@@ -76,7 +76,7 @@ as tampered: recovery leaves such a batch VERIFIED and pending, and
 `vtopctl scrub` reports `unsupported_version`. Readers before v0.8.0 cannot
 read `0.4`, so upgrade every engine and auditor before a later release turns
 `0.4` on. The details are under
-[v0.10.0 and beyond](../ROADMAP.md#v0100-and-beyond) in the roadmap.
+[v0.10.0 in detail](../ROADMAP.md#v0100-in-detail) in the roadmap.
 
 Verification receipts (`manifest.verification_receipts`) need no reader
 upgrade: a reader that does not know them never fetches them. Older engines

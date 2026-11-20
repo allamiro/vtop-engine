@@ -32,7 +32,7 @@ def test_capturing_the_environment_never_removes_a_volume(monkeypatch):
         return subprocess.CompletedProcess(args, 0, "Filesystem Type\n/dev/vda1 ext4 1 1 1 1% /probe\n", "")
 
     monkeypatch.setattr(run, "sh", fake_sh)
-    env = run.capture_environment("r", {}, "vtop-bench:x", {"cpus": "2"})
+    env = run.capture_environment("r", {}, "vtop-bench:x", {"cpus": "2"}, "Test SSD, SSD, NVMe, ext4")
     assert env["comparable"]["volume_filesystem"] == "/dev/vda1 ext4"
     assert not [args for args in calls if args[:3] == ["docker", "volume", "rm"]]
     assert not [args for args in calls if any("kc-fsprobe" in part for part in args)]

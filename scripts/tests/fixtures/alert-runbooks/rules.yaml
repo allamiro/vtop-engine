@@ -1,0 +1,23 @@
+# Fixture for scripts/tests/test_check_alert_runbooks.py: two alerts that
+# pass every check, which each test then breaks in one way.
+groups:
+  - name: fixture
+    rules:
+      - record: fixture:not_an_alert
+        expr: vector(1)
+      - alert: VtopFixtureOne
+        expr: up == 0
+        labels:
+          severity: page
+        annotations:
+          summary: "One"
+          description: "Do the first thing."
+          runbook_url: "https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopfixtureone"
+      - alert: VtopFixtureTwo
+        expr: up == 2
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Two"
+          description: "Do the second thing."
+          runbook_url: "https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopfixturetwo"

@@ -57,4 +57,5 @@ SBOM. Pick the form that matches where you will run them.
 </div>
 
 Whichever you choose, [verify the release](../RELEASE_VERIFICATION.md) before
-you run it.
+you run it. To read Kafka, check that your broker is in the
+[tested Kafka releases](kafka.md).
