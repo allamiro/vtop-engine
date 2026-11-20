@@ -338,9 +338,12 @@ wait_for_client_listener() {
 
 cmd_version() {
   if is_redpanda "$(broker_image)"; then
-    in_broker rpk version | awk '/^rpk version:/ { print $3; exit }'
+    # awk reads to the end: leaving at the first line would close the pipe on
+    # a tool that is still writing, which `set -o pipefail` in a caller
+    # reports as exit status 141.
+    in_broker rpk version | awk '/^rpk version:/ && !seen { print $3; seen = 1 }'
   else
-    in_broker "$BIN/kafka-topics.sh" --version | awk 'NF { print $1; exit }'
+    in_broker "$BIN/kafka-topics.sh" --version | awk 'NF && !seen { print $1; seen = 1 }'
   fi
 }
 
