@@ -304,6 +304,22 @@ impl LockFallbacks {
     }
 }
 
+/// What a replay finds when it asks for the object an earlier attempt
+/// recorded, on a backend that cannot report an absent key (#773).
+#[derive(Debug)]
+enum Adoption {
+    /// Nothing to ask about: no recorded object, no digest to verify against,
+    /// or the rebuilt bytes are not the recorded ones (`bytes_differ`, which
+    /// the rebuild report already says).
+    NotApplicable,
+    /// The recorded object, read back, holds exactly this batch's bytes.
+    Adopted(String),
+    /// The recorded object cannot be used, with why. It is never written to.
+    Rejected { key: String, why: String },
+    /// The store throttled the read-back: the batch fails and is retried.
+    Throttled { key: String, error: VtopError },
+}
+
 /// What the attempt key a replay wrote earlier for the same derived key
 /// holds now (#709).
 #[derive(Debug)]
@@ -419,6 +435,73 @@ impl<'a> Pipeline<'a> {
             }
         }
         crate::object_lock::judge_reuse(read, batch_id, tenant, uri, lock)
+    }
+
+    /// Whether the object an earlier attempt uploaded for exactly this window
+    /// can be used instead of writing another (#773).
+    ///
+    /// A backend that cannot tell a missing key from a refused request never
+    /// writes to a derived key, but nothing stops it reading a key the ledger
+    /// recorded. The recorded object is adopted only when a read of its
+    /// stored bytes verifies STRONGLY against this batch's size and full
+    /// digest: the name, the ledger's digest and a size match prove nothing
+    /// about what is stored. Whatever else is found there (damaged, missing,
+    /// size-only, unreadable) is left exactly as it is and the batch goes under
+    /// its own attempt key, so nothing is ever written to the recorded key. A
+    /// key outside the configured bucket and prefix is not read at all: the
+    /// ledger may name a store this engine is no longer pointed at.
+    async fn adopt_recorded_object(
+        &self,
+        window: &RecordedWindow,
+        bucket: &str,
+        size: u64,
+        checksum: ObjectChecksum<'_>,
+        labels: [&str; 3],
+    ) -> Adoption {
+        let (Some(key), Some(recorded)) = (window.object_uri.as_deref(), window.digest.as_deref())
+        else {
+            return Adoption::NotApplicable;
+        };
+        if recorded != checksum.hex {
+            return Adoption::NotApplicable;
+        }
+        if !partitioning::is_under_prefix(key, bucket, &self.config.upload.prefix) {
+            return Adoption::Rejected {
+                key: key.to_owned(),
+                why: format!(
+                    "it is not under the configured bucket {bucket} and upload.prefix, so it \
+                     was not read"
+                ),
+            };
+        }
+        match note_store_request(
+            self.backend.verify_object(key, size, Some(checksum)).await,
+            "object_probe_verify",
+            labels,
+            &self.attempts,
+            &self.throttles,
+        ) {
+            Ok(v) if v.passed && !v.backend_limited => Adoption::Adopted(key.to_owned()),
+            Ok(v) if v.passed => Adoption::Rejected {
+                key: key.to_owned(),
+                why: format!("the backend could confirm only its size ({})", v.message),
+            },
+            Ok(v) => Adoption::Rejected {
+                key: key.to_owned(),
+                why: format!("its bytes do not verify against this batch ({})", v.message),
+            },
+            Err(error) if error.is_upload_throttle() => Adoption::Throttled {
+                key: key.to_owned(),
+                error,
+            },
+            Err(error) => Adoption::Rejected {
+                key: key.to_owned(),
+                why: format!(
+                    "it could not be read back to verify it ({})",
+                    multipart::redact_urls(&error.to_string())
+                ),
+            },
+        }
     }
 
     /// What the attempt key written earlier for this range holds now (#709):
@@ -1191,25 +1274,114 @@ impl<'a> Pipeline<'a> {
                     .inc();
             }
         };
+        // Whether the object is the one an earlier attempt recorded and this
+        // replay adopted (#773), not one the key names.
+        let mut adopted = false;
         let (object_uri, reused, key_is_derived) = match derived_object_uri {
             Err(why) => {
-                decided("per_attempt");
-                if let Some(suppressed) = self.key_notices.admit("per_attempt", source_name) {
-                    tracing::info!(
-                        event = "object_key_per_attempt",
-                        batch_id,
-                        source = source_name,
-                        range,
-                        key = %attempt_object_uri,
-                        reason = %why,
-                        suppressed,
-                        "range {range} of {source_name} is written under its per-attempt key \
-                         {attempt_object_uri}, so a replay of it will write another object \
-                         (nothing is lost): {why} ({suppressed} more like this suppressed since \
-                         the last notice)"
-                    );
+                // A backend that cannot report an absent key can still read
+                // the object an earlier attempt recorded (#773). Only with a
+                // digest (a checksum-less batch has nothing to verify
+                // against), only for a window that rebuilds the recorded
+                // range, and not under the Object Lock profile, whose
+                // retention checks a command backend cannot make.
+                let adoption = match (&rebuild, object_ck) {
+                    (Some(earlier), Some(ck))
+                        if self.config.upload.object_lock.is_none()
+                            && !self.backend.reports_absent_objects() =>
+                    {
+                        self.adopt_recorded_object(
+                            earlier,
+                            &bucket,
+                            compressed.size_bytes,
+                            ck,
+                            labels,
+                        )
+                        .await
+                    }
+                    _ => Adoption::NotApplicable,
+                };
+                let earlier_batch = rebuild
+                    .as_ref()
+                    .and_then(|w| w.batch_id.as_deref())
+                    .unwrap_or("unrecorded");
+                match adoption {
+                    Adoption::Adopted(key) => {
+                        decided("adopted");
+                        adopted = true;
+                        tracing::info!(
+                            event = "object_key_adopted",
+                            batch_id,
+                            earlier_batch_id = earlier_batch,
+                            source = source_name,
+                            range,
+                            key = %key,
+                            "range {range} of {source_name} was uploaded by an earlier attempt \
+                             (batch {earlier_batch}) as {key}; its stored bytes were read back \
+                             and match this batch's digest, so it is adopted and nothing is \
+                             uploaded (this backend cannot tell a missing key from a refused \
+                             request, so it does not name keys by content); nothing to do"
+                        );
+                        (key, true, false)
+                    }
+                    Adoption::Rejected { key, why } => {
+                        decided("adopt_rejected");
+                        tracing::warn!(
+                            event = "object_key_adopt_rejected",
+                            batch_id,
+                            earlier_batch_id = earlier_batch,
+                            source = source_name,
+                            range,
+                            key = %key,
+                            fallback_key = %attempt_object_uri,
+                            reason = %why,
+                            "range {range} of {source_name} was uploaded by an earlier attempt \
+                             (batch {earlier_batch}) as {key}, but {why}; writing it under \
+                             {attempt_object_uri} instead, a second object, and leaving {key} \
+                             as it is (never written over or deleted); nothing is lost, run \
+                             `vtopctl scrub` to see whether a committed batch names {key}"
+                        );
+                        (attempt_object_uri, false, false)
+                    }
+                    Adoption::Throttled { key, error } => {
+                        decided("probe_throttled");
+                        tracing::warn!(
+                            event = "object_key_probe_throttled",
+                            batch_id,
+                            source = source_name,
+                            range,
+                            key = %key,
+                            error = %error,
+                            "the store throttled the read-back of {key}, the object an earlier \
+                             attempt uploaded for range {range} of {source_name}; nothing was \
+                             written, the batch fails and the range is handed back for retry; \
+                             nothing to do unless it persists, then reduce upload concurrency"
+                        );
+                        fail!(format!(
+                            "read-back of recorded object {key} failed: {error}"
+                        ))
+                    }
+                    Adoption::NotApplicable => {
+                        decided("per_attempt");
+                        if let Some(suppressed) = self.key_notices.admit("per_attempt", source_name)
+                        {
+                            tracing::info!(
+                                event = "object_key_per_attempt",
+                                batch_id,
+                                source = source_name,
+                                range,
+                                key = %attempt_object_uri,
+                                reason = %why,
+                                suppressed,
+                                "range {range} of {source_name} is written under its per-attempt \
+                                 key {attempt_object_uri}, so a replay of it will write another \
+                                 object (nothing is lost): {why} ({suppressed} more like this \
+                                 suppressed since the last notice)"
+                            );
+                        }
+                        (attempt_object_uri, false, false)
+                    }
                 }
-                (attempt_object_uri, false, false)
             }
             Ok(derived) => match match (
                 probe_object_key(
@@ -1987,7 +2159,9 @@ impl<'a> Pipeline<'a> {
                 &range,
                 &object_uri,
                 object_checksum.as_deref(),
-                key_is_derived,
+                // An adopted object is the earlier attempt's own: no second
+                // object, as under a derived key (#773).
+                key_is_derived || adopted,
                 batch.record_count,
                 labels,
             );
@@ -3903,6 +4077,7 @@ impl Engine {
                         end: read.progress_end.clone(),
                         sealed_at: Some(sealed_at),
                         digest: rebuild.as_ref().and_then(|w| w.digest.clone()),
+                        object_uri: rebuild.as_ref().and_then(|w| w.object_uri.clone()),
                         batch_id: None,
                         record_count: Some(read.records.len() as u64),
                         bounded: false,
@@ -4045,6 +4220,10 @@ impl Engine {
                                     crate::rebuild::recorded_digest(row.object_sha256.as_deref())
                                 {
                                     window.digest = Some(digest);
+                                    // The key goes with its digest (#773).
+                                    window.object_uri = crate::rebuild::recorded_object_uri(
+                                        row.object_uri.as_deref(),
+                                    );
                                 }
                             }
                             Ok(None) => {}

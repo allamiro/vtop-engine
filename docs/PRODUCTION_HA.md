@@ -173,7 +173,7 @@ section calls out the consequence.
 ### 2.5 Current vs. target behavior (read this before trusting any HA claim)
 | Property | Current code | Target for production HA |
 |---|---|---|
-| Object key | `vtop-<engine>-<source>-<range>[-i<inode>]-<digest>` for files and spools, `vtop-<source>-<range>-<digest>` for Kafka — **deterministic for the same bytes** (#626); falls back to the per-attempt `vtop-<UTCstamp>-<source>-<range>-<uuid8>` without a checksum, on a command backend, or when the derived key holds bytes that do not verify | **Deterministic or content-addressed** so retries are idempotent |
+| Object key | `vtop-<engine>-<source>-<range>[-i<inode>]-<digest>` for files and spools, `vtop-<source>-<range>-<digest>` for Kafka — **deterministic for the same bytes** (#626); falls back to the per-attempt `vtop-<UTCstamp>-<source>-<range>-<uuid8>` without a checksum, on a command backend (which adopts the recorded object of a failed attempt of the same window when its stored bytes verify, #773), or when the derived key holds bytes that do not verify | **Deterministic or content-addressed** so retries are idempotent |
 | Replay outcome | Same bytes → **the stored object is reused** after strong verification; other boundaries, a later seal-time hour for a row from before v0.10.0, or other bytes → **second object, no overwrite, no loss** | Retry resolves to the **same** object/version; duplicates impossible **[PROPOSED]** |
 | File/syslog cursor | Lives **only in the state store** (rebuilt from `SOURCE_COMMITTED` rows) | Same, but **migrate/drain on backend switch** (§6.4) |
 | Kafka offset | Committed to the **broker** after VERIFIED (resumes broker-side) | Same; consumer-group mode for multi-instance **[PROPOSED]** |
