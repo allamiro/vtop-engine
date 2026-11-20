@@ -2298,6 +2298,30 @@ impl PendingBuffer {
         self.batcher.is_empty()
     }
 
+    /// Whether appending `read` would take the buffered window past a size
+    /// threshold (`max_records` or `max_bytes`). If it would, the window is
+    /// sealed first and the read starts the next one, so a batch holds at
+    /// most `max_bytes` of records, as `batching.max_bytes` documents.
+    ///
+    /// Without this, `run` closed file batches at about twice `max_bytes`: a
+    /// read stops at `max_bytes` counting each line's newline, the batcher
+    /// counts records without it, so one full read stays just under the
+    /// threshold and the next full read was appended to it. A Kafka read
+    /// stops short of `max_bytes` when the next record does not fit, with the
+    /// same result. `process-once` makes one read, so it never doubled.
+    ///
+    /// A rebuilt window (#626) is never split here: it must reproduce the
+    /// recorded window, and it seals at its recorded end.
+    fn would_overflow(&self, read: &ReadResult) -> bool {
+        if self.is_empty() || self.rebuild_end.is_some() {
+            return false;
+        }
+        let limits = &self.batcher.limits;
+        let read_bytes: usize = read.records.iter().map(Vec::len).sum();
+        self.batcher.len().saturating_add(read.records.len()) > limits.max_records
+            || self.batcher.byte_len().saturating_add(read_bytes) > limits.max_bytes
+    }
+
     /// Whether a read starting at `start` picks up exactly where the buffered
     /// window ends. Byte-offset sources are continuous by construction until
     /// a rotation or truncation restarts the file at byte 0, or a different
@@ -3688,6 +3712,18 @@ impl Engine {
                         {
                             if let Some(done) = self.pending.remove(&key) {
                                 discontinued.push(done);
+                            }
+                        }
+                        // A read that would take the buffered window past
+                        // max_records or max_bytes starts the next window: the
+                        // buffered one is sealed first, this cycle.
+                        if self
+                            .pending
+                            .get(&key)
+                            .is_some_and(|buf| buf.would_overflow(&read))
+                        {
+                            if let Some(full) = self.pending.remove(&key) {
+                                discontinued.push(full);
                             }
                         }
                         let bounded_end = self.recorded.bounded_end(&read.progress_start);
@@ -9655,6 +9691,66 @@ mod tests {
         assert_ne!(
             committed[0].progress_end, committed[1].progress_end,
             "and the two are different files"
+        );
+    }
+
+    /// `run` keeps a window buffered across passes until a threshold seals
+    /// it. A file read stops at `max_bytes` counting each line's newline and
+    /// the batcher counts records without it, so one full read stayed just
+    /// under the threshold and the next full read was appended: batches came
+    /// out at about twice `max_bytes` (73,417,507 bytes at a 16 MiB setting
+    /// were cut into batches of 33,554,257). A read that would take the window
+    /// past `max_bytes` now seals it first.
+    #[tokio::test]
+    async fn run_mode_batches_stay_within_max_bytes_across_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("app.log");
+        // 1,000 lines of 9 bytes ("line 0000" is 9 bytes, then the newline
+        // makes 10): a read at max_bytes 1000 takes 100 lines, whose records
+        // hold 900 bytes, under the threshold on their own.
+        let body: String = (0..1000).map(|i| format!("line {i:04}\n")).collect();
+        std::fs::write(&input, &body).unwrap();
+        let mut cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.max_records = 1_000_000;
+        cfg.batching.max_bytes = 1_000;
+        cfg.batching.max_batch_age_seconds = 3_600;
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+
+        for _ in 0..15 {
+            engine.run_source(SourceType::File, false).await.unwrap();
+        }
+        engine.run_source(SourceType::File, true).await.unwrap();
+
+        let committed: Vec<_> = engine
+            .store
+            .list_batches()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|b| b.state == BatchState::SourceCommitted)
+            .collect();
+        let total: i64 = committed.iter().map(|b| b.record_count.unwrap_or(0)).sum();
+        assert_eq!(total, 1000, "every line archived once: {committed:?}");
+        for b in &committed {
+            let records = b.record_count.unwrap_or(0);
+            assert!(
+                records * 9 <= 1_000,
+                "a batch of {records} records holds {} bytes of records, over max_bytes 1000",
+                records * 9
+            );
+        }
+        assert!(
+            committed.len() >= 10,
+            "1,000 lines of 9 bytes at max_bytes 1000 make at least 10 batches, not about 5: \
+             {} batches",
+            committed.len()
         );
     }
 
