@@ -121,6 +121,15 @@ fn range_identity() -> RangeIdentity {
 }
 
 fn open_segment(dir: &TempDir, segment_id: u128, range: &RangeIdentity) -> ActiveSegment {
+    open_segment_with(dir, segment_id, range, SegmentConfig::default())
+}
+
+fn open_segment_with(
+    dir: &TempDir,
+    segment_id: u128,
+    range: &RangeIdentity,
+    config: SegmentConfig,
+) -> ActiveSegment {
     let descriptor = SegmentDescriptor {
         segment_id: Uuid::from_u128(segment_id),
         topic: range.topic.clone(),
@@ -133,12 +142,7 @@ fn open_segment(dir: &TempDir, segment_id: u128, range: &RangeIdentity) -> Activ
         },
         base_offset: 0,
     };
-    ActiveSegment::create(
-        dir.path().join("range.active"),
-        descriptor,
-        SegmentConfig::default(),
-    )
-    .unwrap()
+    ActiveSegment::create(dir.path().join("range.active"), descriptor, config).unwrap()
 }
 
 fn group_config() -> GroupCommitConfig {
@@ -477,11 +481,20 @@ fn replicated_leader(
     config: GroupCommitConfig,
     wrap: impl FnOnce(Arc<InProcessReplicaSet>, MetaFencingEpoch) -> Arc<dyn ReplicaSet>,
 ) -> (Arc<LocalBroker>, ClusterCommittedOffset, Vec<TempDir>) {
+    replicated_leader_on(config, SegmentConfig::default(), wrap)
+}
+
+/// [`replicated_leader`] whose own segment has `segment` limits.
+fn replicated_leader_on(
+    config: GroupCommitConfig,
+    segment: SegmentConfig,
+    wrap: impl FnOnce(Arc<InProcessReplicaSet>, MetaFencingEpoch) -> Arc<dyn ReplicaSet>,
+) -> (Arc<LocalBroker>, ClusterCommittedOffset, Vec<TempDir>) {
     let range = range_identity();
     let meta = MetaFencingEpoch::new(FENCING_EPOCH);
     let cluster_committed = ClusterCommittedOffset::new(0);
     let leader_dir = tempfile::tempdir().unwrap();
-    let leader_segment = open_segment(&leader_dir, 0xD1, &range);
+    let leader_segment = open_segment_with(&leader_dir, 0xD1, &range, segment);
     let leader_epochs = ProducerEpochJournal::open(leader_dir.path().join("epochs")).unwrap();
     let (mut dirs, followers) = build_followers(&range, &meta);
     let replicas = wrap(Arc::new(InProcessReplicaSet::new(followers)), meta.clone());
@@ -576,6 +589,95 @@ fn one_members_sequence_conflict_does_not_fail_the_others() {
         cluster_committed.get(),
         1,
         "exactly the good member's record is committed"
+    );
+}
+
+/// Codex review of #780: a group split request by request must keep the
+/// admission its first pass gave each member. One producer's epoch-1
+/// request and then its epoch-2 request share a group; the first pass
+/// admits both in queue order, durably advancing the producer's epoch
+/// journal to 2. The two records together exceed the segment's group limit,
+/// so the log refuses the group whole and each member is re-run alone. The
+/// re-run judged the epoch-1 request against the journal its own group had
+/// just advanced and fenced it, a permanent refusal for a request that,
+/// sent on its own ahead of the epoch-2 one, is accepted.
+#[test]
+fn a_split_group_keeps_its_first_passes_producer_admissions() {
+    // One 700-byte record fits a group; two do not.
+    let segment = SegmentConfig {
+        max_record_bytes: 1024,
+        max_group_bytes: 1024 + 128,
+        ..SegmentConfig::default()
+    };
+    let (leader, cluster_committed, _dirs) =
+        replicated_leader_on(sealing_at(2), segment, |inner, _| {
+            inner as Arc<dyn ReplicaSet>
+        });
+    let producer = Uuid::from_u128(0xB5);
+    let at_epoch = |producer_epoch: u64, request_id: u64| WireFrame {
+        request_id,
+        stream_id: 1,
+        message: Message::ProduceRequest(ProduceRequest {
+            range: range_identity(),
+            fencing_epoch: FENCING_EPOCH,
+            producer_id: producer,
+            producer_epoch,
+            first_sequence: 0,
+            durability: WireDurability::Quorum,
+            records: vec![ProduceRecord {
+                timestamp_millis: 1_000,
+                key: b"k".to_vec(),
+                value: vec![b'v'; 700],
+            }],
+        }),
+    };
+    // The epoch-1 request must be queued first, so the group's order, and
+    // the order a client sending them one after another would see, is
+    // epoch 1 then epoch 2.
+    let first = {
+        let leader = Arc::clone(&leader);
+        let frame = at_epoch(1, 1);
+        thread::spawn(move || leader.handle(Role::Producer, frame))
+    };
+    let coordinator = leader.group_commit().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while coordinator.queued_requests() < 1 {
+        assert!(
+            Instant::now() < deadline,
+            "the epoch-1 request was not queued within 10 s"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    let second = {
+        let leader = Arc::clone(&leader);
+        let frame = at_epoch(2, 2);
+        thread::spawn(move || leader.handle(Role::Producer, frame))
+    };
+    let answers = [first.join().unwrap(), second.join().unwrap()];
+
+    let metrics = coordinator.metrics();
+    assert_eq!(
+        (metrics.last_sample().requests, metrics.split_groups_total()),
+        (2, 1),
+        "the two requests must have shared a group and been split for this test to mean \
+         anything"
+    );
+    for (epoch, answer) in [1, 2].into_iter().zip(answers) {
+        match answer.message {
+            Message::ProduceResponse(response) => assert_eq!(
+                response.outcomes.len(),
+                1,
+                "the epoch-{epoch} request is acknowledged with its record"
+            ),
+            other => {
+                panic!("the epoch-{epoch} request was refused after its group was split: {other:?}")
+            }
+        }
+    }
+    assert_eq!(
+        cluster_committed.get(),
+        2,
+        "both records are committed, epoch 1 first"
     );
 }
 

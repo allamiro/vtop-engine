@@ -328,6 +328,15 @@ impl GroupCommitCoordinator {
         &self.metrics
     }
 
+    /// Requests queued and not yet taken into a group.
+    pub fn queued_requests(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pending
+            .len()
+    }
+
     /// Enqueue `item` and block until its commit group has been flushed.
     ///
     /// `flush` runs on the leader waiter for each sealed group and must return
