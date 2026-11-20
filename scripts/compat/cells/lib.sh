@@ -92,11 +92,19 @@ file_mode() {
 # mode its umask gave it (0644 under the usual 022), and this build refuses to
 # read a ledger other local users can (#733, #775). That is an upgrade step the
 # operator takes (`chmod 0600`), so the cell checks the refusal, checks that
-# it changed nothing, and then takes the step.
+# it changed nothing, and then takes the step. A release that creates the ledger
+# owner-only needs none, and the cell skips it.
 adopt_ledger() {
-  local head="$1" dir="$2" before f
-  [[ "$(file_mode "$dir/state.db")" == 0644 ]] \
-    || fail "the release left the ledger at mode $(file_mode "$dir/state.db"), not the 0644 its umask gives"
+  local head="$1" dir="$2" before f mode
+  mode="$(file_mode "$dir/state.db")"
+  if [[ "$mode" == 0600 ]]; then
+    # A release that already creates its ledger owner-only (the hardening of
+    # #733 and #775, from the release after v0.10.1) needs no step.
+    log "the release created the ledger owner-only (0600): nothing to adopt"
+    return 0
+  fi
+  [[ "$mode" == 0644 ]] \
+    || fail "the release left the ledger at mode $mode, neither the 0644 its umask gives nor the 0600 of a release that hardens it"
   before="$(ledger_digest "$dir/state.db")"
   run head-refuses-a-readable-ledger "$head" status --config "$dir/good.yaml"
   [[ "$RC" -ne 0 ]] || fail "this build opened a ledger with mode 0644; it must refuse one other users can read"
