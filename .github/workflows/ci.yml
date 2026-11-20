@@ -326,6 +326,10 @@ jobs:
               # will paste and rely on, so it is linted like the rest — listed here
               # AND in the shellcheck step, for the reason the comment above gives.
               - 'scripts/test-progress.sh'
+              # The Kafka broker helper the kafka matrix (#721) starts every
+              # broker with. Its own workflow runs on a change to it; this
+              # entry is the lint.
+              - 'scripts/kafka-broker.sh'
               # The release-notes generator only ever runs during a tag build,
               # where a failure means a published release with a broken body and
               # no second chance to get it right before people see it. Lint it
@@ -1247,7 +1251,7 @@ jobs:
             scripts/manifest-compat.sh scripts/ledger-compat.sh \
             scripts/traffic-snapshot.sh scripts/test-progress.sh \
             scripts/check-naming.sh scripts/check-egress-claims.sh \
-            scripts/check-failpoints-absent.sh
+            scripts/check-failpoints-absent.sh scripts/kafka-broker.sh
 
       # `-P scripts/live-chaos/scenarios` resolves the scenarios' dynamic
       # `source "$(dirname …)/../lib.sh"`. Without it every scenario reports
@@ -1379,6 +1383,18 @@ jobs:
         env:
           VTOP_TEST_KAFKA: localhost:9092
         run: cargo test -p vtop-cli --test integration_kafka_to_minio -- --ignored
+
+  # The same live-broker tests on the oldest Kafka release the docs declare
+  # supported (#721, docs/install/kafka.md). The job above stays the newest
+  # line's check; kafka-matrix.yml runs every pinned release nightly. Its
+  # check is named `kafka matrix / kafka integration (3.7.2)`.
+  kafka-matrix:
+    name: kafka matrix
+    needs: changes
+    if: needs.changes.outputs.kafka == 'true'
+    uses: ./.github/workflows/kafka-matrix.yml
+    with:
+      brokers: '["3.7.2"]'
 
   # The live S3 tests against a real store (#668). They are `#[ignore]` and
   # need `VTOP_TEST_S3_ENDPOINT`, so until this job they ran only by hand:
