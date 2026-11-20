@@ -28,10 +28,10 @@ Each release has six archives, named
   where you want a binary that loads no shared library at all: take the
   `-linux-musl` archive. On Alpine, `ldd --version` prints `musl libc`.
 
-Where both run, prefer the `-linux-gnu` archive: the test suite and the
-benchmarks run against glibc builds, while the musl archives are checked by
-the release smoke run described below and nothing more. They use musl's own
-memory allocator, which has not been measured under load here.
+Where both run, prefer the `-linux-gnu` archive: CI's test suite runs on
+glibc builds, while the musl archives are checked by the release smoke run
+described below and nothing more. They use musl's own memory allocator,
+whose performance under load has not been measured here.
 
 ### glibc floor
 

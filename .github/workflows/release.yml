@@ -267,8 +267,10 @@ jobs:
               set -euo pipefail
               # gcc 10 (devtoolset-10), make, perl, cmake and the zlib
               # headers come with the image. OpenSSL is built from source
-              # (ssl-vendored), and its Configure needs the IPC::Cmd module
-              # CentOS 7 packages apart. librdkafka includes curl/curl.h even
+              # (ssl-vendored), and its Configure needs Perl modules (IPC::Cmd,
+              # Time::Piece) that CentOS 7 packages apart: perl-core brings
+              # them, as docs/install/from-source.md says for the RHEL family.
+              # librdkafka includes curl/curl.h even
               # with curl off (docs/install/from-source.md), so the curl
               # headers are installed; nothing links libcurl, and the floor
               # check below fails if a library outside the base system ends
@@ -277,7 +279,7 @@ jobs:
               # (CentOS 7 vault), and one hiccup would otherwise fail a 10 to
               # 20 minute leg.
               for i in 1 2 3; do
-                yum -y -q install perl-IPC-Cmd libcurl-devel && break
+                yum -y -q install perl-core libcurl-devel && break
                 [ "$i" = 3 ] && { echo "yum install failed 3 times" >&2; exit 1; }
                 sleep 15
               done
@@ -579,11 +581,23 @@ jobs:
           "$A/vtopctl" scrub --config "$w/config.yaml"
           # One batch holds all 200 records, so the archived object, unpacked,
           # is the input file byte for byte.
-          objects="$(find "$w/out" -name '*.cef.gz')"
-          [ "$(find "$w/out" -name '*.cef.gz' | wc -l)" -eq 1 ] || { echo "expected one archived object, found: ${objects:-none}"; exit 1; }
-          [ "$(gzip -dc "$objects" | cksum)" = "$(cksum <"$w/in/a.cef")" ] \
-            || { echo "the archived object does not match the input file"; exit 1; }
-          echo "archived object matches the 200-record input"
+          # The object's path comes from the ledger (find is not in every
+          # image): s3://BUCKET/KEY is BUCKET/KEY under local_path.
+          uris="$("$A/vtopctl" list-batches --json --config "$w/config.yaml" \
+            | sed -n 's|^ *"object_uri": "s3://\(.*\)",\{0,1\}$|\1|p')"
+          [ "$(printf '%s\n' "$uris" | grep -c .)" -eq 1 ] || { echo "expected one archived object, found: ${uris:-none}"; exit 1; }
+          objects="$w/out/$uris"
+          [ -f "$objects" ] || { echo "the ledger's object $objects is not on disk"; exit 1; }
+          # The Amazon Linux 2 and 2023 images have no gzip. The scrub above
+          # has already checked the object against its manifest there; the
+          # byte-for-byte comparison runs on every other image.
+          if command -v gzip >/dev/null 2>&1; then
+            [ "$(gzip -dc "$objects" | cksum)" = "$(cksum <"$w/in/a.cef")" ] \
+              || { echo "the archived object does not match the input file"; exit 1; }
+            echo "archived object matches the 200-record input"
+          else
+            echo "no gzip in this image: byte-for-byte comparison skipped, scrub passed"
+          fi
           SMOKE
           if [ "$RUNNER_OS" = macOS ]; then
             A="$dir" sh "$smoke"
