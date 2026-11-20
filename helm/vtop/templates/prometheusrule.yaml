@@ -1,0 +1,32 @@
+{{- if .Values.metrics.prometheusRule.enabled }}
+{{- if not (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1") }}
+{{- fail "\n\nmetrics.prometheusRule.enabled is true but this cluster does not expose monitoring.coreos.com/v1 (Prometheus Operator CRDs). Install the CRDs first, or disable the PrometheusRule and load observability/prometheus/vtop-rules.yaml with rule_files instead. (For offline `helm template`, pass --api-versions monitoring.coreos.com/v1.)" }}
+{{- end }}
+{{- /*
+  The rules are the engine's shipped rule file, read verbatim from
+  files/vtop-rules.yaml: a copy of observability/prometheus/vtop-rules.yaml
+  that CI keeps identical, so the chart and the file cannot drift. Helm does
+  not template file contents, so the rules' own {{ $labels.x }} annotations
+  reach Prometheus as written. runbookBaseUrl only swaps the page the
+  runbook_url links point at; each link's #fragment is kept.
+*/}}
+{{- $rules := .Files.Get "files/vtop-rules.yaml" }}
+{{- if not (contains "groups:" $rules) }}
+{{- fail "files/vtop-rules.yaml is missing from the chart; copy observability/prometheus/vtop-rules.yaml there." }}
+{{- end }}
+{{- with .Values.metrics.prometheusRule.runbookBaseUrl }}
+{{- $rules = replace "https://allamiro.github.io/vtop-engine/operate/runbooks/" . $rules }}
+{{- end }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "vtop.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vtop.labels" . | nindent 4 }}
+    {{- with .Values.metrics.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- $rules | nindent 2 }}
+{{- end }}

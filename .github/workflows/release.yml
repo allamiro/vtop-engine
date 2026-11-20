@@ -48,6 +48,7 @@ jobs:
     outputs:
       version: ${{ steps.meta.outputs.version }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
+      latest: ${{ steps.meta.outputs.latest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -125,7 +126,24 @@ jobs:
           fi
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Releasing $version (prerelease=$prerelease)"
+          # `latest` (the image tag, and GitHub's "Latest release") names the
+          # NEWEST final release, not the one tagged most recently: a 0.9.1
+          # fix cut after 0.10.0 must not pull `latest` back to the older
+          # line. Compare against every final v* tag on the remote (this tag
+          # included); only a version no other final tag outranks is latest.
+          latest=false
+          if [ "$prerelease" = false ]; then
+            newest="$(git ls-remote --tags --refs origin 'v*' \
+              | sed 's|.*refs/tags/v||' \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+              | { cat; echo "$version"; } \
+              | sort -V | tail -n1)"
+            if [ "$newest" = "$version" ]; then
+              latest=true
+            fi
+          fi
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "Releasing $version (prerelease=$prerelease, latest=$latest)"
 
   # ---------------------------------------------------------------------------
   # Binaries. Each target builds on its native runner: librdkafka is compiled
@@ -166,13 +184,6 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
-      - name: Install build dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            cmake clang libssl-dev libsasl2-dev libcurl4-openssl-dev zlib1g-dev pkg-config
-
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
         # Since #677, rdkafka builds OpenSSL from source (`ssl-vendored`) and
@@ -197,7 +208,57 @@ jobs:
           echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
 
       - name: Build
+        if: runner.os == 'macOS'
         run: cargo build --release --bin vtop-node --bin vtopctl --target ${{ matrix.target }} --locked
+
+      # A Linux binary needs at least the glibc it was linked against: the C
+      # dependencies (librdkafka, zstd, sqlite, ...) pick up the newest symbol
+      # versions of the build host's headers. Built on the runner's Ubuntu
+      # 24.04 (glibc 2.39), v0.10.0's vtopctl needed GLIBC_2.39 and did not
+      # start on Debian 12, Ubuntu 22.04 or RHEL 8/9 (#808). Building inside
+      # AlmaLinux 8 (glibc 2.28) sets the floor at 2.28. Still native on both
+      # runners: librdkafka's cmake build does not cross-compile reliably.
+      # `docker run` rather than a job `container:`, so the JavaScript actions
+      # keep running on the host and not against an old glibc. The toolchain
+      # is the one the step above installed (mounted, not installed again), so
+      # the pin stays in one place.
+      - name: Build (Linux, inside AlmaLinux 8 for a glibc 2.28 floor)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          # almalinux:8, a multi-arch index; Docker picks the runner's arch.
+          BUILD_IMAGE: almalinux:8@sha256:2d0f2eb2a83cc09dbc2eb92fade4dbe8f709628149e81aa00aec70630406603b
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -e TARGET -e CARGO_TERM_COLOR -e RUST_BACKTRACE -e CARGO_INCREMENTAL \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            -e CARGO_HOME=/cargo -e RUSTUP_HOME=/rustup \
+            -v "${CARGO_HOME:-$HOME/.cargo}:/cargo" \
+            -v "${RUSTUP_HOME:-$HOME/.rustup}:/rustup" \
+            -v "$GITHUB_WORKSPACE:/src" -w /src \
+            "$BUILD_IMAGE" bash -c '
+              set -euo pipefail
+              # gcc 8 and cmake from the distribution. OpenSSL is built from
+              # source (ssl-vendored, which needs perl); the -devel packages
+              # are what librdkafka probes for, and the floor check below
+              # fails if one of them ends up linked.
+              # Retried: the only step that needs the distribution mirrors,
+              # and one hiccup would otherwise fail a 10 to 20 minute leg.
+              for i in 1 2 3; do
+                dnf -y -q install gcc gcc-c++ make cmake perl \
+                  openssl-devel cyrus-sasl-devel libcurl-devel zlib-devel && break
+                [ "$i" = 3 ] && { echo "dnf install failed 3 times" >&2; exit 1; }
+                sleep 15
+              done
+              # Hand the root-owned outputs back to the runner user.
+              trap "chown -R \"\$HOST_UID:\$HOST_GID\" /src/target /cargo/registry /cargo/git 2>/dev/null || true" EXIT
+              export PATH="/cargo/bin:$PATH"
+              echo "$(getconf GNU_LIBC_VERSION), gcc $(gcc -dumpfullversion)"
+              cargo --version
+              cargo build --release --bin vtop-node --bin vtopctl --target "$TARGET" --locked
+            '
 
       - name: Check macOS binaries load only system libraries (#677)
         if: runner.os == 'macOS'
@@ -274,6 +335,135 @@ jobs:
           done
           tar -czf "dist/$name.tar.gz" -C dist "$name"
           echo "artifact=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+      # The checks below read the binaries back out of the archive, so they
+      # judge exactly what ships. Inline, not a script: a workflow_dispatch
+      # dry-run builds an older tag's tree, which would not have a new script.
+      - name: Check the Linux archive's library floor (#808)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          ARCHIVE: ${{ steps.pkg.outputs.artifact }}
+        run: |
+          set -euo pipefail
+          command -v objdump >/dev/null || { sudo apt-get update && sudo apt-get install -y --no-install-recommends binutils; }
+          x="$RUNNER_TEMP/archive"
+          rm -rf "$x" && mkdir -p "$x"
+          tar -xzf "$ARCHIVE" -C "$x"
+          dir="$x/$(basename "$ARCHIVE" .tar.gz)"
+          # The highest symbol version each library may be asked for: what
+          # AlmaLinux / RHEL 8, the oldest supported distribution, ships
+          # (glibc 2.28, libgcc_s and libstdc++ from gcc 8).
+          declare -A floor=([GLIBC]=2.28 [GCC]=7.0.0 [GLIBCXX]=3.4.25 [CXXABI]=1.3.11)
+          # Libraries every supported distribution's base install carries.
+          # Anything else (libssl, libsasl2, libcurl, ...) is a package the
+          # user would have to install, which docs/install/binaries.md says
+          # they do not.
+          allowed='^(libc\.so\.6|libm\.so\.6|libdl\.so\.2|libpthread\.so\.0|librt\.so\.1|libgcc_s\.so\.1|libstdc\+\+\.so\.6|libz\.so\.1|ld-linux-(x86-64|aarch64)\.so\.[12])$'
+          bad=0
+          for bin in vtop-node vtopctl; do
+            f="$dir/$bin"
+            syms="$(objdump -T "$f")"
+            for lib in GLIBC GCC GLIBCXX CXXABI; do
+              max="$(grep -oE "\b${lib}_[0-9]+(\.[0-9]+)*\b" <<<"$syms" | sed "s/^${lib}_//" | sort -uV | tail -n1 || true)"
+              [ -n "$max" ] || continue
+              echo "$bin: highest ${lib}_ symbol version $max (floor ${floor[$lib]})"
+              if [ "$(printf '%s\n%s\n' "$max" "${floor[$lib]}" | sort -V | tail -n1)" != "${floor[$lib]}" ]; then
+                echo "::error::$bin needs ${lib}_$max, newer than the supported floor ${lib}_${floor[$lib]}:"
+                grep -E "\b${lib}_${max//./\\.}\b" <<<"$syms" || true
+                bad=1
+              fi
+            done
+            while read -r needed; do
+              echo "$bin: NEEDED $needed"
+              if ! grep -qE "$allowed" <<<"$needed"; then
+                echo "::error::$bin links $needed, which is not part of a base install"
+                bad=1
+              fi
+            done < <(objdump -p "$f" | awk '$1 == "NEEDED" { print $2 }')
+          done
+          exit "$bad"
+
+      # Run what ships on the oldest distribution of each family the docs
+      # name, with nothing installed: the version check, then an archive-only
+      # round trip (file source to a local directory, then the coverage audit
+      # and a scrub that reads every object back). No network, no Kafka.
+      - name: Smoke the Linux archive on Debian 12, Ubuntu 22.04 and AlmaLinux 8 (#808)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          ARCHIVE: ${{ steps.pkg.outputs.artifact }}
+          # Not VERSION: /etc/os-release, sourced below, sets that.
+          EXPECTED_VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Its own extraction, so this step does not depend on the floor
+          # check above having run.
+          x="$RUNNER_TEMP/smoke-archive"
+          rm -rf "$x" && mkdir -p "$x"
+          tar -xzf "$ARCHIVE" -C "$x"
+          dir="$x/$(basename "$ARCHIVE" .tar.gz)"
+          smoke="$RUNNER_TEMP/smoke.sh"
+          cat >"$smoke" <<'SMOKE'
+          set -euo pipefail
+          umask 077
+          . /etc/os-release
+          echo "== $PRETTY_NAME, $(getconf GNU_LIBC_VERSION)"
+          v="$(/a/vtopctl --version)"; echo "$v"
+          [ "$v" = "vtopctl $EXPECTED_VERSION" ] || { echo "expected vtopctl $EXPECTED_VERSION"; exit 1; }
+          v="$(/a/vtop-node --version 2>/dev/null)"; echo "$v"
+          [ "$v" = "vtop-node $EXPECTED_VERSION" ] || { echo "expected vtop-node $EXPECTED_VERSION"; exit 1; }
+          w="$(mktemp -d)"
+          mkdir -p "$w/in" "$w/out" "$w/work"
+          i=1
+          while [ "$i" -le 200 ]; do
+            printf 'CEF:0|VTOP|smoke|1.0|100|event %d|3|src=10.0.0.1 cnt=%d\n' "$i" "$i"
+            i=$((i + 1))
+          done >"$w/in/a.cef"
+          cat >"$w/config.yaml" <<CONFIG
+          engine:
+            name: smoke
+            tenant: default
+            state_store: "sqlite://$w/state.db"
+            work_dir: $w/work
+            log_level: warn
+          batching:
+            max_records: 1000
+            max_bytes: 1048576
+            max_batch_age_seconds: 1
+          compression:
+            type: gzip
+            level: 6
+          checksum:
+            algorithm: sha256
+          sources:
+            file:
+              enabled: true
+              paths: ["$w/in/*.cef"]
+          upload:
+            backend: localfs
+            local_path: $w/out
+            bucket: smoke
+            prefix: ""
+          CONFIG
+          /a/vtopctl validate --config "$w/config.yaml"
+          /a/vtopctl process-once --source file --config "$w/config.yaml"
+          /a/vtopctl audit-coverage --check-storage --config "$w/config.yaml"
+          /a/vtopctl scrub --config "$w/config.yaml"
+          # One batch holds all 200 records, so the archived object, unpacked,
+          # is the input file byte for byte.
+          objects="$(find "$w/out" -name '*.cef.gz')"
+          [ "$(find "$w/out" -name '*.cef.gz' | wc -l)" -eq 1 ] || { echo "expected one archived object, found: ${objects:-none}"; exit 1; }
+          [ "$(gzip -dc "$objects" | cksum)" = "$(cksum <"$w/in/a.cef")" ] \
+            || { echo "the archived object does not match the input file"; exit 1; }
+          echo "archived object matches the 200-record input"
+          SMOKE
+          for image in \
+            debian:12@sha256:268fb24c39bca92d326dd83ea3abebe4a3f7751c804ffef23bb6d857dd343ff8 \
+            ubuntu:22.04@sha256:74b12b11ffa550fba1929ad4d8d16533c34f6612728469671afba1b03b66881c \
+            almalinux:8@sha256:2d0f2eb2a83cc09dbc2eb92fade4dbe8f709628149e81aa00aec70630406603b; do
+            docker run --rm -e EXPECTED_VERSION -v "$dir:/a:ro" -v "$smoke:/smoke.sh:ro" "$image" bash /smoke.sh
+          done
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -414,13 +604,19 @@ jobs:
           DOCKER_METADATA_ANNOTATIONS_LEVELS: index
         with:
           images: ${{ env.IMAGE_NAME }}
-          # `latest` follows the current recommended release, which now
-          # includes 0.x (see the prerelease classification above). Only a
-          # pre-release SUFFIX withholds it: an -rc must never become what a
-          # bare `docker pull` resolves to.
+          # `latest` follows the newest final release, which includes 0.x
+          # (see the prerelease classification above). A pre-release SUFFIX
+          # withholds it (an -rc must never become what a bare `docker pull`
+          # resolves to), and so does a fix for an older line (the verify
+          # job's `latest` output).
+          # metadata-action's default `flavor: latest=auto` adds `latest` to
+          # every semver entry on its own, which would bypass the gate below;
+          # turn it off so the raw entry is the only source of `latest`.
+          flavor: |
+            latest=false
           tags: |
             type=semver,pattern={{version}},value=v${{ needs.verify.outputs.version }}
-            type=raw,value=latest,enable=${{ needs.verify.outputs.prerelease == 'false' }}
+            type=raw,value=latest,enable=${{ needs.verify.outputs.latest == 'true' }}
 
       - name: Create multi-arch manifest
         working-directory: /tmp/digests
@@ -482,6 +678,28 @@ jobs:
           set -euo pipefail
           digest="$(docker buildx imagetools inspect "$IMAGE_NAME:${{ needs.verify.outputs.version }}" --format '{{ .Manifest.Digest }}')"
           cosign sign --yes "${IMAGE_NAME}@${digest}"
+
+      - name: latest names the newest release
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          IS_NEWEST: ${{ needs.verify.outputs.latest }}
+        run: |
+          set -euo pipefail
+          # The registry, not the tag list we asked for, is what `docker pull
+          # :latest` resolves. When this release is the newest, `latest` must
+          # be its digest; when it is not (an -rc, or an older line's fix),
+          # `latest` must not have moved to it.
+          this="$(docker buildx imagetools inspect "$IMAGE_NAME:$VERSION" --format '{{ .Manifest.Digest }}')"
+          latest="$(docker buildx imagetools inspect "$IMAGE_NAME:latest" --format '{{ .Manifest.Digest }}' 2>/dev/null || true)"
+          if [ "$IS_NEWEST" = true ] && [ "$latest" != "$this" ]; then
+            echo "::error::$IMAGE_NAME:latest is ${latest:-missing}, but $VERSION ($this) is the newest release"
+            exit 1
+          fi
+          if [ "$IS_NEWEST" != true ] && [ "$latest" = "$this" ]; then
+            echo "::error::$IMAGE_NAME:latest moved to $VERSION, which is not the newest final release"
+            exit 1
+          fi
+          echo "$IMAGE_NAME:latest = ${latest:-missing}; $VERSION = $this (newest: $IS_NEWEST)"
 
   # ---------------------------------------------------------------------------
   # Source SBOM (SPDX) attached to the release.
@@ -600,6 +818,10 @@ jobs:
           name: v${{ needs.verify.outputs.version }}
           tag_name: ${{ github.ref_name }}
           prerelease: ${{ needs.verify.outputs.prerelease == 'true' }}
+          # GitHub's "Latest release" badge follows the same rule as the
+          # image's `latest` tag: the newest final release, never an older
+          # line's fix.
+          make_latest: ${{ needs.verify.outputs.latest == 'true' }}
           files: artifacts/*
           # PROSE PARAGRAPHS MUST BE ONE LINE EACH.
           #

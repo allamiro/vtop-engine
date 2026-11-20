@@ -237,6 +237,7 @@ def load_failover_run(run_dir: str) -> FailoverRun:
             raise schema.ReportRefused(f"{env_path} is not JSON: {exc}") from exc
     if environment.get("kind") != "failover":
         raise schema.ReportRefused(f"{env_path} is not a failover run (kind={environment.get('kind')!r})")
+    schema.check_schema_version(environment, env_path)
     if environment.get("run_state") != "complete":
         raise schema.ReportRefused(
             f"{env_path} says run_state={environment.get('run_state')!r}: the run did not finish"

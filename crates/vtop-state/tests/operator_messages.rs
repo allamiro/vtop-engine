@@ -134,3 +134,130 @@ async fn adding_the_class_column_to_an_existing_sqlite_ledger_says_what_it_did()
         "a second open adds nothing and says nothing"
     );
 }
+
+/// Opening a SQLite ledger a v0.9.0 engine left (schema version 1: the
+/// verification class, no seal instant) says what it did (#626): the column
+/// it added, how many rows it left without a seal instant, what that means
+/// for a replay of one of them, and that nothing needs doing. The file is
+/// still at version 1 afterwards, so v0.9.0 can open it again. Opening it
+/// again says nothing.
+#[tokio::test]
+async fn adding_the_sealed_at_column_to_a_version_1_sqlite_ledger_says_what_it_did() {
+    use sqlx::ConnectOptions;
+    let logs = logs();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v1.db");
+    pre_664_file(&path, 2).await;
+    {
+        let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .connect()
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "ALTER TABLE batches ADD COLUMN verification_class TEXT; PRAGMA user_version = 1;",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+    let url = format!("sqlite://{}", path.display());
+    let said = |logs: &Captured| logs.lines_with("added the sealed_at column; 2 existing");
+    let before = said(logs).len();
+    let store = SqliteStateStore::connect(&url).await.unwrap();
+    let lines = said(logs);
+    assert_eq!(lines.len(), before + 1, "{lines:?}");
+    let line = lines.last().unwrap();
+    for part in [
+        "2 existing rows left NULL (seal instant unknown)",
+        "filed under the hour it is replayed in",
+        "may write a second object",
+        "Nothing to do",
+        r#""backend":"SQLite""#,
+        r#""existing_rows":2"#,
+        r#""column":"sealed_at""#,
+        r#""level":"INFO""#,
+    ] {
+        assert!(line.contains(part), "{part:?} missing from: {line}");
+    }
+    assert!(
+        logs.lines_with("added the verification_class column; 2 existing")
+            .is_empty(),
+        "only the column that was missing is reported"
+    );
+    let row = store.get_batch("legacy-0").await.unwrap().unwrap();
+    assert_eq!((row.state, row.sealed_at), (BatchState::Verified, None));
+    drop(store);
+    let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&path)
+        .connect()
+        .await
+        .unwrap();
+    let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(version, 1, "a new nullable column raises no version");
+    drop(conn);
+    SqliteStateStore::connect(&url).await.unwrap();
+    assert_eq!(
+        said(logs).len(),
+        before + 1,
+        "a second open adds nothing and says nothing"
+    );
+}
+
+/// #626: a `sealed_at` that is not an RFC 3339 instant is read as unknown,
+/// and the operator is told which row, what it means for its replay and
+/// what to do - with the row and the column as fields, and not the value,
+/// which no writer produced.
+#[tokio::test]
+async fn a_seal_instant_that_is_not_one_is_read_as_unknown_and_says_so() {
+    use sqlx::ConnectOptions;
+    let logs = logs();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("odd.db");
+    pre_664_file(&path, 1).await;
+    let url = format!("sqlite://{}", path.display());
+    let store = SqliteStateStore::connect(&url).await.unwrap();
+    let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&path)
+        .connect()
+        .await
+        .unwrap();
+    sqlx::query("UPDATE batches SET sealed_at = 'not-a-time' WHERE batch_id = 'legacy-0'")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    let said = |logs: &Captured| logs.lines_with("ledger row legacy-0 holds a sealed_at");
+    let before = said(logs).len();
+    let row = store.get_batch("legacy-0").await.unwrap().unwrap();
+    assert_eq!(row.sealed_at, None);
+    // Read again: rate-limited, not said again.
+    store.list_batches().await.unwrap();
+    store.get_batch("legacy-0").await.unwrap();
+    let lines = said(logs);
+    assert_eq!(
+        lines.len(),
+        before + 1,
+        "said once, not on every read: {lines:?}"
+    );
+    let line = lines.last().unwrap();
+    for part in [
+        "is not an RFC 3339 instant",
+        "it is read as unknown",
+        "filed under the hour it runs in",
+        "Nothing to do unless this repeats",
+        r#""batch_id":"legacy-0""#,
+        r#""column":"sealed_at""#,
+        r#""stored_len":10"#,
+        r#""suppressed":0"#,
+        r#""level":"WARN""#,
+    ] {
+        assert!(line.contains(part), "{part:?} missing from: {line}");
+    }
+    assert!(
+        !line.contains("not-a-time"),
+        "the stored value is not logged: {line}"
+    );
+}
