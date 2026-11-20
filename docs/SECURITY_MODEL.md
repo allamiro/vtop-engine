@@ -698,21 +698,42 @@ block merges while known, unfixable transitive advisories are still printed.
 
 Currently tracked (re-evaluate on every dependency bump):
 
-| Advisory | Crate | Why it is accepted for now |
-|----------|-------|----------------------------|
-| RUSTSEC-2023-0071 | `rsa` | Pulled only by sqlx's optional MySQL driver, which is **not enabled** (sqlite-only). Not compiled or executed in any VTOP build. No upstream fix exists. |
-| RUSTSEC-2026-0235 | `rkyv 0.7.46` | Optional `rust_decimal` feature pulled into `Cargo.lock` through `openraft → byte-unit`; the feature is not enabled and `rkyv` is absent from every build graph. Current `rust_decimal 1.42.1` still pins the vulnerable major; remove this exception when upstream adopts `rkyv >=0.8.17`. |
-| RUSTSEC-2026-0098 / -0099 / -0104 | `rustls-webpki 0.101.x` | Transitive via `aws-smithy-http-client`'s legacy `hyper-rustls 0.24` connector. Not removable by feature flags in the current AWS SDK; requires an upstream release. The modern `rustls 0.23` / `rustls-webpki 0.103` stack is also present and used by the default HTTPS path. |
-| RUSTSEC-2026-0253 | `lru 0.16.4` | An **unsoundness**, not a vulnerability: `LruCache::pop()` lacks panic safety, reachable only if a cached value's `Drop` panics during eviction. No fixed release exists — 0.16.4 is the newest published version. Reaches the build solely through `aws-sdk-s3`, whose cached values are SDK-internal types this project neither supplies nor controls. Remove when upstream publishes a fix, or re-evaluate on the next AWS SDK bump. |
-| RUSTSEC-2024-0449 | `unsafe-libyaml 0.2.11` | An **unmaintained** notice, not a vulnerability: the upstream repository is archived, so no fix will arrive. Reached only through `serde_yaml 0.9` (itself deprecated), which parses operator-written YAML configuration, not network input. The advisory points at safe-Rust YAML parsers; moving to one is a deliberate migration of every config type. Remove this exception when that migration lands. |
-| RUSTSEC-2026-0387 | `crypto-bigint 0.5.5` | Timing variability in operations intended to be constant-time. Fixed only in `crypto-bigint >=0.7.6`, a major bump; pinned to the 0.5.x line by `aws-sigv4 1.4.5` and `elliptic-curve 0.13.8`, so no `cargo update` reaches it. Exercised only on the AWS SigV4/SigV4a request-signing path. Remove when the AWS signing / RustCrypto stack adopts `crypto-bigint >=0.7.6` (`elliptic-curve >=0.14`). |
-| RUSTSEC-2026-0459 | `libsqlite3-sys 0.30.1` | Bundles a SQLite affected by CVE-2026-119375. Fixed in `libsqlite3-sys >=0.39.0` (SQLite 3.54), reachable only through a newer sqlx — `sqlx-sqlite 0.9.0` caps it at `<0.38`. SQLite here parses only the engine's **local**, operator-owned state-store database, never network input, so a crafted-database CVE is not reachable by a remote party. Remove when sqlx depends on `libsqlite3-sys >=0.39`. |
-| RUSTSEC-2026-0441 | `pin-utils 0.1.0` | An **unmaintained** notice, not a vulnerability: upstream is archived and no fix will ship. `cargo audit` treats it as a non-failing warning; `cargo deny`'s `unmaintained` check fails on it, so it is tracked in both files. Reaches the build only through `aws-smithy-http` / `aws-smithy-runtime`. Remove when the AWS SDK drops its `pin-utils` dependency. |
-| RUSTSEC-2026-0543 | `chrono 0.4.45` | An **unmaintained** notice, not a vulnerability; no fixed release exists. `chrono` is a direct workspace dependency for the timestamps the engine writes and reads back (manifests, ledger, audit records, object keys). `cargo audit` warns; `cargo deny`'s `unmaintained` check fails, so it is tracked in both files. Replacing it (`jiff` or `time`) is a migration of every timestamp type, not a bump. Remove when that migration lands or chrono is maintained again. |
+| Advisory | Crate | Why it is accepted for now | Last reviewed |
+|----------|-------|----------------------------|---------------|
+| RUSTSEC-2026-0253 | `lru 0.16.4` | An **unsoundness**, not a vulnerability: `LruCache::pop()` lacks panic safety, reachable only if a cached value's `Drop` panics during eviction. Fixed in `lru >=0.18.2`, a semver-incompatible line; it reaches the build solely through `aws-sdk-s3 1.137.0`, which requires `lru ^0.16`, so `cargo update -p lru` moves nothing. `aws-sdk-s3 1.159.0` requires `lru ^0.18.2`, but `cargo update -p aws-sdk-s3` keeps 1.137.0, so the fix needs a deliberate AWS SDK bump. The cached values are SDK-internal types this project neither supplies nor controls. Ignored by `cargo audit` only: `cargo deny`'s default `unsound = "workspace"` reports unsound advisories only for direct dependencies, so it never raises this one. Remove when `aws-sdk-s3` moves to a release that depends on `lru >=0.18.2`. | 2026-11-16 |
+| RUSTSEC-2024-0449 | `unsafe-libyaml 0.2.11` | An **unmaintained** notice, not a vulnerability: the upstream repository is archived, so no fix will arrive. Reached only through `serde_yaml 0.9` (itself deprecated), which parses operator-written YAML configuration, not network input. The advisory points at safe-Rust YAML parsers; moving to one is a deliberate migration of every config type. Remove this exception when that migration lands. | 2026-11-16 |
+| RUSTSEC-2026-0387 | `crypto-bigint 0.5.5` | Timing variability in operations intended to be constant-time. Fixed only in `crypto-bigint >=0.7.6`, a major bump; pinned to the 0.5.x line by `aws-sigv4 1.4.5` and `elliptic-curve 0.13.8`, so no `cargo update` reaches it. Exercised only on the AWS SigV4/SigV4a request-signing path. Remove when the AWS signing / RustCrypto stack adopts `crypto-bigint >=0.7.6` (`elliptic-curve >=0.14`). | 2026-11-16 |
+| RUSTSEC-2026-0459 | `libsqlite3-sys 0.30.1` | Bundles a SQLite affected by CVE-2026-119375. Fixed in `libsqlite3-sys >=0.39.0` (SQLite 3.54), reachable only through a newer sqlx — `sqlx-sqlite 0.9.0` caps it at `<0.38`. SQLite here parses only the engine's **local**, operator-owned state-store database, never network input, so a crafted-database CVE is not reachable by a remote party. Remove when sqlx depends on `libsqlite3-sys >=0.39`. | 2026-11-16 |
+| RUSTSEC-2026-0441 | `pin-utils 0.1.0` | An **unmaintained** notice, not a vulnerability: upstream is archived and no fix will ship. `cargo audit` treats it as a non-failing warning; `cargo deny`'s `unmaintained` check fails on it, so it is tracked in both files. Reaches the build only through `aws-smithy-http` / `aws-smithy-runtime`. Remove when the AWS SDK drops its `pin-utils` dependency. | 2026-11-16 |
+| RUSTSEC-2026-0543 | `chrono 0.4.45` | An **unmaintained** notice, not a vulnerability; no fixed release exists. `chrono` is a direct workspace dependency for the timestamps the engine writes and reads back (manifests, ledger, audit records, object keys). `cargo audit` warns; `cargo deny`'s `unmaintained` check fails, so it is tracked in both files. Replacing it (`jiff` or `time`) is a migration of every timestamp type, not a bump. Remove when that migration lands or chrono is maintained again. | 2026-11-20 |
 
-When the AWS SDK ships an `aws-smithy-http-client` release that drops
-`hyper-rustls 0.24`, the three `rustls-webpki` entries **MUST** be removed from
-the ignore list and the build re-audited.
+#### Review dates
+
+Every ignored advisory carries the date it was last reviewed, written as
+`# reviewed: YYYY-MM-DD` on its line in `.cargo/audit.toml` and `deny.toml` and
+in the "Last reviewed" column above. An exception that nobody re-checks becomes
+a permanent one, so a date older than 90 days fails CI: the `advisory review
+dates` check (`scripts/check-advisory-review.py`, workflow
+`.github/workflows/advisory-review.yml`) runs on every pull request, on every
+push to `main` and weekly, warns from day 75 and fails from day 91. It also fails
+when an id has no date, a malformed or future date, a different date in the two
+files or in this table, or appears in one place and not the others. The only
+allowed difference is an id that `cargo deny` never reports and so is listed in
+`.cargo/audit.toml` alone; the script names each such id (today only
+RUSTSEC-2026-0253).
+
+The maintainer owns the review. A review of an id means:
+
+1. Read the advisory's patched range (`https://rustsec.org/advisories/<id>`).
+2. Run `cargo update -p <crate> --dry-run`: if the newest version the graph
+   allows crosses the patched range, update the lockfile and remove the ignore.
+3. Run `cargo tree --target all -i <crate>`: if the crate has left the graph,
+   remove the ignore; if the path that pulls it in changed, update the
+   justification.
+4. Otherwise move the date to the day of the review in all three places, in one
+   pull request that says what was checked.
+
+Removing an ignore removes it from both files and this table together.
 
 ## 14. Security properties provided vs. not provided
 
