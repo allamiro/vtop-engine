@@ -410,15 +410,21 @@ impl GroupCommitCoordinator {
         F: FnMut(&[QueuedProduce]) -> Vec<WireFrame>,
     {
         let (members, slots, reason, max_queue_wait) = self.collect_group();
+        // From here the group's answers and the lead are owed whatever the
+        // flush does: `duty` pays both when it is dropped, on the way out of
+        // this function or while a panic in `flush` unwinds through it.
+        let mut duty = LeaderDuty {
+            coordinator: self,
+            unanswered: members
+                .iter()
+                .zip(slots)
+                .map(|(item, slot)| (item.request_id, item.stream_id, slot))
+                .collect(),
+        };
         if !members.is_empty() {
             let started = Instant::now();
             let frames = flush(&members);
             let sync_duration = started.elapsed();
-            debug_assert_eq!(
-                frames.len(),
-                slots.len(),
-                "flush must return one frame per queued produce"
-            );
             let records = members.iter().map(|item| item.record_count as u64).sum();
             let bytes = members.iter().map(|item| item.payload_bytes).sum();
             self.metrics.record(GroupCommitSample {
@@ -429,11 +435,14 @@ impl GroupCommitCoordinator {
                 max_queue_wait,
                 flush_reason: Some(reason),
             });
-            for (slot, frame) in slots.into_iter().zip(frames) {
-                slot.publish(frame);
-            }
+            duty.publish(frames);
         }
+    }
 
+    /// Pass the lead to the front of the queue or, with nothing queued, give
+    /// it up. Only [`LeaderDuty`]'s drop calls this, so a leader cannot leave
+    /// without it.
+    fn pass_lead(&self) {
         let mut state = self
             .state
             .lock()
@@ -566,14 +575,87 @@ fn pending_totals(pending: &VecDeque<PendingEntry>) -> (usize, u64) {
 }
 
 fn overloaded_frame(request_id: u64, stream_id: u64, message: &str) -> WireFrame {
+    retryable_error(request_id, stream_id, ErrorCode::Overloaded, message)
+}
+
+fn retryable_error(request_id: u64, stream_id: u64, code: ErrorCode, message: &str) -> WireFrame {
     WireFrame {
         request_id,
         stream_id,
         message: Message::Error(vtop_protocol::ErrorResponse {
-            code: ErrorCode::Overloaded,
+            code,
             message: message.to_owned(),
             retryable: true,
         }),
+    }
+}
+
+/// What a leader owes once it has taken a group off the queue: one answer to
+/// every member, and the lead to the request behind them. Every other member
+/// is blocked in [`WaitSlot::recv`] until it is answered, and every later
+/// request on the range waits for the lead, so both are paid when this is
+/// dropped, however the leader leaves. A flush that panicked, or one that
+/// returned fewer frames than the group has members, left those members
+/// waiting forever, and with the lead never passed on, every later request on
+/// the range too (found while merging #780).
+struct LeaderDuty<'a> {
+    coordinator: &'a GroupCommitCoordinator,
+    /// `(request_id, stream_id, slot)` of each member not yet answered, in
+    /// group order.
+    unanswered: VecDeque<(u64, u64, Arc<WaitSlot>)>,
+}
+
+impl LeaderDuty<'_> {
+    /// Hand each member its frame, in order. A member left without one is
+    /// answered when `self` is dropped.
+    fn publish(&mut self, frames: Vec<WireFrame>) {
+        let expected = self.unanswered.len();
+        let returned = frames.len();
+        for frame in frames {
+            let Some((_, _, slot)) = self.unanswered.pop_front() else {
+                break;
+            };
+            slot.publish(frame);
+        }
+        if returned != expected {
+            vtop_meta::transport::warn_rate_limited(
+                "group-commit-frame-count",
+                &format!(
+                    "group commit: the flush of a group of {expected} requests returned \
+                     {returned} answers. Each request left without one was answered with a \
+                     retryable storage error, and whether its records were appended is unknown. \
+                     This is a broker defect: report it with this line"
+                ),
+            );
+        }
+    }
+}
+
+impl Drop for LeaderDuty<'_> {
+    fn drop(&mut self) {
+        if !self.unanswered.is_empty() {
+            // The outcome is unknown either way: the flush may have stopped
+            // after the fsync or the quorum ack. So the answer is retryable,
+            // as a quorum miss is, and a retry is deduplicated by the
+            // producer's sequence window.
+            let message = if std::thread::panicking() {
+                "the group commit's flush panicked before this request was answered; whether \
+                 its records were appended is unknown, so retry it with the same producer \
+                 sequence"
+            } else {
+                "the group commit's flush returned no answer for this request; whether its \
+                 records were appended is unknown, so retry it with the same producer sequence"
+            };
+            for (request_id, stream_id, slot) in self.unanswered.drain(..) {
+                slot.publish(retryable_error(
+                    request_id,
+                    stream_id,
+                    ErrorCode::Storage,
+                    message,
+                ));
+            }
+        }
+        self.coordinator.pass_lead();
     }
 }
 

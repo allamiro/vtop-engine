@@ -159,7 +159,11 @@ next waiting request, so every member is answered as soon as its own group's
 barrier is done; a group never mixes durabilities; and a group the log
 refuses whole for something one member caused (a sequence, fencing or size
 refusal, all judged before a byte is written) is re-run request by request,
-so only that member fails (#752). Weighted fair scheduling and soak deltas
+so only that member fails (#752). A leader whose flush panics, or returns
+fewer answers than its group has members, still answers every member left
+without one (a retryable storage error: whether its records were appended is
+unknown) and still passes the lead, so one failed group cannot stall the
+range. Weighted fair scheduling and soak deltas
 remain follow-ups (see issues #185, #92, #98).
 
 This remains a library slice by default. It does not provide an operator
