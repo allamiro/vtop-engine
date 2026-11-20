@@ -37,7 +37,8 @@ mod redact;
 pub mod settings;
 pub mod stats;
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use opentelemetry::trace::TracerProvider as _;
@@ -61,6 +62,15 @@ pub use settings::{
 /// and a process that outlives its grace is killed mid-way through its work.
 pub const SHUTDOWN_FLUSH_DEADLINE: Duration = Duration::from_secs(5);
 
+/// The longest the final flush waits for exported spans that are still open
+/// (#798). A span is exported when its last handle drops, and that is not
+/// always on the thread that finished the work: a library's worker thread
+/// can hold a clone for the few microseconds after it has answered. Flushing
+/// without waiting would miss exactly the span of the last piece of work.
+/// Normally nothing is open and the wait is nil; a span that a bug leaves open
+/// costs a stop this long, once, and is named in a warning.
+pub const OPEN_SPAN_GRACE: Duration = Duration::from_secs(1);
+
 /// Who is exporting, for the resource attributes.
 #[derive(Debug, Clone, Copy)]
 pub struct Process<'a> {
@@ -77,6 +87,7 @@ pub struct Process<'a> {
 struct Running {
     traces: Option<SdkTracerProvider>,
     metrics: Option<metrics::Pusher>,
+    open: OpenSpans,
 }
 
 static RUNNING: Mutex<Option<Running>> = Mutex::new(None);
@@ -140,7 +151,10 @@ pub fn init(level: &str, json: bool, process: Process<'_>) -> Result<(), ConfigE
             }
         },
     };
-    let layer = traces.as_ref().map(layer);
+    let open = OpenSpans::default();
+    let layer = traces
+        .as_ref()
+        .map(|provider| counted_layer(provider, &open));
     if !crate::logging::init_with_layer(level, json, layer, traces.is_some()) {
         // A subscriber was already in place: nothing would reach the layer.
         if let Some(provider) = traces {
@@ -167,7 +181,11 @@ pub fn init(level: &str, json: bool, process: Process<'_>) -> Result<(), ConfigE
             }
         },
     };
-    *RUNNING.lock().unwrap_or_else(|e| e.into_inner()) = Some(Running { traces, metrics });
+    *RUNNING.lock().unwrap_or_else(|e| e.into_inner()) = Some(Running {
+        traces,
+        metrics,
+        open,
+    });
     tracing::info!("{}", export.describe());
     Ok(())
 }
@@ -289,6 +307,15 @@ pub fn layer<S>(provider: &SdkTracerProvider) -> impl Layer<S> + Send + Sync
 where
     S: Subscriber + for<'a> LookupSpan<'a> + Send + Sync,
 {
+    counted_layer(provider, &OpenSpans::default())
+}
+
+/// [`layer`], with the spans it exports counted into `open` while they are
+/// open, so that the final flush can wait for them (#798).
+fn counted_layer<S>(provider: &SdkTracerProvider, open: &OpenSpans) -> impl Layer<S> + Send + Sync
+where
+    S: Subscriber + for<'a> LookupSpan<'a> + Send + Sync,
+{
     tracing_opentelemetry::layer()
         .with_tracer(provider.tracer("vtop"))
         // Source location, thread and target attributes describe the build,
@@ -299,6 +326,96 @@ where
         .with_target(false)
         .with_tracked_inactivity(false)
         .with_filter(ExportedOnly)
+        .and_then(SpanLifecycle { open: open.clone() }.with_filter(ExportedOnly))
+}
+
+/// How many exported spans are open: created, and not yet closed by the drop
+/// of their last handle.
+#[derive(Debug, Clone, Default)]
+pub struct OpenSpans(Arc<AtomicUsize>);
+
+impl OpenSpans {
+    /// Spans open now.
+    pub fn count(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    fn opened(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn closed(&self) {
+        // Saturating: a close the count never saw open must not wrap it into
+        // a number the final flush would wait on until its grace ran out.
+        let mut n = self.0.load(Ordering::SeqCst);
+        while n > 0 {
+            match self
+                .0
+                .compare_exchange(n, n - 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return,
+                Err(now) => n = now,
+            }
+        }
+    }
+
+    /// Block until no span is open, or `grace` has passed; the number still
+    /// open. For a thread that may block (the flush runs on the blocking pool).
+    fn wait_closed(&self, grace: Duration) -> usize {
+        let deadline = std::time::Instant::now() + grace;
+        loop {
+            let open = self.count();
+            if open == 0 || std::time::Instant::now() >= deadline {
+                return open;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+/// The target of the DEBUG lines that say when an exported root span closed,
+/// when the export queue took a span in, and when it began its final flush
+/// (#798). They are off at the default log level; a test that has to tell
+/// "the span closed after the final flush" from "the span never reached the
+/// queue" turns them on with `RUST_LOG`.
+pub(crate) const LIFECYCLE_TARGET: &str = "vtop_observe::otel::lifecycle";
+
+/// Counts the exported spans that are open, and logs, at DEBUG, the final
+/// close of each root span (a batch, a recovery scan, a scrub check). A span
+/// closes when its last handle drops, which is not where the code that
+/// finishes the batch ends: a clone that outlives the commit holds the span
+/// open, and a span still open when the final flush runs is never exported.
+/// Only the close is logged: a line written while a span is being created
+/// would run inside the per-layer filter's bookkeeping for that very span.
+struct SpanLifecycle {
+    open: OpenSpans,
+}
+
+impl<S> Layer<S> for SpanLifecycle
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        _: &tracing::span::Attributes<'_>,
+        _: &tracing::span::Id,
+        _: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        self.open.opened();
+    }
+
+    fn on_close(&self, id: tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let Some(span) = ctx.span(&id) else { return };
+        self.open.closed();
+        if span.parent().is_none() {
+            tracing::debug!(
+                target: LIFECYCLE_TARGET,
+                span = span.name(),
+                id = id.into_u64(),
+                "root span closed"
+            );
+        }
+    }
 }
 
 /// [`exported`] as a per-layer filter that decides once per callsite.
@@ -364,8 +481,9 @@ pub fn metrics_running() -> bool {
         .is_some_and(|r| r.metrics.is_some())
 }
 
-/// Flush and stop export, waiting at most [`SHUTDOWN_FLUSH_DEADLINE`], and not
-/// at all once another SIGINT or SIGTERM arrives. A no-op when export is off.
+/// Flush and stop export, waiting at most [`SHUTDOWN_FLUSH_DEADLINE`] (and
+/// [`OPEN_SPAN_GRACE`] first, only if a span is still open), and not at all
+/// once another SIGINT or SIGTERM arrives. A no-op when export is off.
 ///
 /// The extra signal matters after a second one has already abandoned the
 /// engine's own flush: that is the operator asking to exit now, and Tokio has
@@ -376,7 +494,14 @@ pub async fn shutdown() {
     let Some(running) = RUNNING.lock().unwrap_or_else(|e| e.into_inner()).take() else {
         return;
     };
-    shutdown_unless(running.traces, running.metrics, stop_signal()).await;
+    shutdown_unless(
+        running.traces,
+        running.metrics,
+        running.open,
+        OPEN_SPAN_GRACE,
+        stop_signal(),
+    )
+    .await;
 }
 
 /// [`shutdown`]'s work, ended early by `stop`. Public for the tests.
@@ -384,12 +509,21 @@ pub async fn flush_unless(
     provider: SdkTracerProvider,
     stop: impl std::future::Future<Output = ()>,
 ) {
-    shutdown_unless(Some(provider), None, stop).await;
+    shutdown_unless(
+        Some(provider),
+        None,
+        OpenSpans::default(),
+        OPEN_SPAN_GRACE,
+        stop,
+    )
+    .await;
 }
 
 async fn shutdown_unless(
     traces: Option<SdkTracerProvider>,
     metrics: Option<metrics::Pusher>,
+    open: OpenSpans,
+    grace: Duration,
     stop: impl std::future::Future<Output = ()>,
 ) {
     // The SDK's shutdown blocks its caller until the export thread answers,
@@ -401,18 +535,34 @@ async fn shutdown_unless(
     // Started before waiting, and owned by the blocking task: if `stop` wins,
     // nothing here drops the provider (whose drop would itself block for the
     // SDK's shutdown).
+    //
+    // The same blocking task first waits, at most `grace`, for the spans that
+    // are still open to close (#798): a span reaches the queue when its last
+    // handle drops, and a library's thread (sqlx's SQLite worker) can still
+    // hold one for a moment after it has answered, so a flush that began at
+    // once would miss the span of the last piece of work.
+    let bound = grace + SHUTDOWN_FLUSH_DEADLINE + Duration::from_secs(1);
     let traces = traces.map(|provider| {
-        tokio::task::spawn_blocking(move || provider.shutdown_with_timeout(SHUTDOWN_FLUSH_DEADLINE))
+        tokio::task::spawn_blocking(move || {
+            let still_open = open.wait_closed(grace);
+            if still_open > 0 {
+                tracing::warn!(
+                    open_spans = still_open,
+                    "{still_open} OpenTelemetry span(s) were still open {} ms into the final \
+                     flush, so they are not exported; batches are unaffected. A span is being \
+                     held past the end of its work: report it",
+                    grace.as_millis()
+                );
+            }
+            provider.shutdown_with_timeout(SHUTDOWN_FLUSH_DEADLINE)
+        })
     });
     let traces = async {
         if let Some(flush) = traces {
-            if tokio::time::timeout(SHUTDOWN_FLUSH_DEADLINE + Duration::from_secs(1), flush)
-                .await
-                .is_err()
-            {
+            if tokio::time::timeout(bound, flush).await.is_err() {
                 tracing::warn!(
                     "OpenTelemetry trace flush gave up after {}s; exiting without it",
-                    SHUTDOWN_FLUSH_DEADLINE.as_secs() + 1
+                    bound.as_secs()
                 );
             }
         }
@@ -486,5 +636,149 @@ mod tests {
         assert_eq!(span_id.len(), 16);
         assert_eq!(ids_inside_a_span(Sampler::AlwaysOff), None);
         assert_eq!(current_ids(), None, "no ids outside a span");
+    }
+    /// What an exporter was handed, by span name.
+    #[derive(Debug, Clone, Default)]
+    struct Recorder(Arc<Mutex<Vec<String>>>);
+
+    impl opentelemetry_sdk::trace::SpanExporter for Recorder {
+        async fn export(
+            &self,
+            batch: Vec<opentelemetry_sdk::trace::SpanData>,
+        ) -> opentelemetry_sdk::error::OTelSdkResult {
+            self.0
+                .lock()
+                .unwrap()
+                .extend(batch.iter().map(|s| s.name.to_string()));
+            Ok(())
+        }
+    }
+
+    fn recording_provider() -> (SdkTracerProvider, Recorder) {
+        let recorder = Recorder::default();
+        let queue = ExportQueue::new(
+            recorder.clone(),
+            QueueSettings {
+                max_queue: 64,
+                max_batch: 16,
+                schedule_delay: Duration::from_secs(60),
+            },
+        );
+        (tracer_provider(queue, Sampler::AlwaysOn, &[]), recorder)
+    }
+
+    /// A batch span with a handle that another thread drops after the work is
+    /// done and the final flush has begun, as sqlx's SQLite worker does with
+    /// the span current when a command was sent (#798). Returns the thread
+    /// and the sender that makes it drop the handle.
+    fn span_held_by_another_thread(
+        open: &OpenSpans,
+        provider: &SdkTracerProvider,
+    ) -> (
+        tracing::subscriber::DefaultGuard,
+        std::thread::JoinHandle<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let subscriber = tracing_subscriber::registry().with(counted_layer(provider, open));
+        let guard = tracing::subscriber::set_default(subscriber);
+        let span = tracing::debug_span!(target: "vtop_test", "batch");
+        let held = span.clone();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            // Dropped on this thread once told to, or when the sender goes.
+            let _ = released.recv();
+            drop(held);
+        });
+        // The work's own handle: the batch is over on this thread.
+        drop(span);
+        (guard, thread, release)
+    }
+
+    /// #798: a span another thread still holds when the final flush begins is
+    /// exported all the same. Before, the flush ran at once, the handle
+    /// dropped a moment later, and the span of the last batch was lost.
+    #[tokio::test]
+    async fn the_final_flush_waits_for_a_span_another_thread_still_holds() {
+        let open = OpenSpans::default();
+        let (provider, recorder) = recording_provider();
+        let (_guard, thread, release) = span_held_by_another_thread(&open, &provider);
+        assert_eq!(open.count(), 1, "the span is open: a handle is held");
+
+        let flush = tokio::spawn(shutdown_unless(
+            Some(provider),
+            None,
+            open.clone(),
+            Duration::from_secs(30),
+            std::future::pending(),
+        ));
+        // The flush has every reason to have finished by now, if it were not
+        // waiting for the span: nothing else is queued.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !flush.is_finished(),
+            "the flush ran with a span still open; it exports {:?}",
+            recorder.0.lock().unwrap()
+        );
+
+        release.send(()).unwrap();
+        thread.join().unwrap();
+        flush.await.unwrap();
+        assert_eq!(*recorder.0.lock().unwrap(), ["batch"]);
+        assert_eq!(open.count(), 0);
+    }
+
+    /// The wait is bounded: a span nothing ever closes costs the stop its
+    /// grace and a warning, never the stop itself.
+    #[tokio::test]
+    async fn a_span_nothing_closes_costs_the_grace_and_no_more() {
+        let open = OpenSpans::default();
+        let (provider, recorder) = recording_provider();
+        let (_guard, thread, release) = span_held_by_another_thread(&open, &provider);
+        let started = std::time::Instant::now();
+        shutdown_unless(
+            Some(provider),
+            None,
+            open.clone(),
+            Duration::from_millis(200),
+            std::future::pending(),
+        )
+        .await;
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(200),
+            "the flush did not wait for the grace: {waited:?}"
+        );
+        assert!(
+            waited < SHUTDOWN_FLUSH_DEADLINE,
+            "the flush waited {waited:?} for a span that never closed"
+        );
+        assert!(recorder.0.lock().unwrap().is_empty());
+        drop(release);
+        thread.join().unwrap();
+    }
+
+    /// With no span open the flush adds no wait at all.
+    #[tokio::test]
+    async fn with_nothing_open_the_flush_does_not_wait() {
+        let open = OpenSpans::default();
+        let (provider, recorder) = recording_provider();
+        {
+            let subscriber = tracing_subscriber::registry().with(counted_layer(&provider, &open));
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let span = tracing::debug_span!(target: "vtop_test", "batch");
+            drop(span);
+        }
+        assert_eq!(open.count(), 0);
+        let started = std::time::Instant::now();
+        shutdown_unless(
+            Some(provider),
+            None,
+            open,
+            Duration::from_secs(30),
+            std::future::pending(),
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(*recorder.0.lock().unwrap(), ["batch"]);
     }
 }

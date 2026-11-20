@@ -155,7 +155,10 @@ with an endpoint set.
   - On a stop, the process flushes for 5 s after its own shutdown flush (6 s
     at the outside: a 1 s backstop over the queue's own bound), or not at all
     once another stop signal arrives, then exits whatever the collector is
-    doing.
+    doing. Before that flush it waits up to 1 s for spans that are still open
+    (a library's thread can hold a span for a moment after it has answered), so
+    the span of the last batch is not lost; if one stays open the stop warns
+    and goes on without it.
 
 ### Authentication mechanisms
 
