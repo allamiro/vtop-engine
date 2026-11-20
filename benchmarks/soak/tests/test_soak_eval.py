@@ -267,6 +267,27 @@ def test_commits_ahead_of_verifications_in_two_samples_in_a_row_fails():
     assert failed(verdict_of(samples, events, finals)) == {"commit_rule"}
 
 
+def test_a_lag_only_record_between_two_breaching_scrapes_does_not_hide_the_breach():
+    samples, events, finals = healthy_run()
+    for s in samples[40:42]:
+        s["metrics"][soak_eval.M_COMMITS] = s["metrics"][soak_eval.M_VERIFIED] + 3
+    between = {
+        "elapsed_s": (samples[40]["elapsed_s"] + samples[41]["elapsed_s"]) / 2,
+        "lifetime": samples[40]["lifetime"],
+        "lag": {"end": 1, "committed": 1},
+    }
+    samples.insert(41, between)
+    assert failed(verdict_of(samples, events, finals)) == {"commit_rule"}
+
+
+def test_a_restart_between_two_breaching_scrapes_is_not_one_breach():
+    samples, events, finals = healthy_run()
+    for s in samples[40:42]:
+        s["metrics"][soak_eval.M_COMMITS] = s["metrics"][soak_eval.M_VERIFIED] + 3
+    samples[41]["lifetime"] = samples[40]["lifetime"] + 10  # a different engine process
+    assert "commit_rule" not in failed(verdict_of(samples, events, finals))
+
+
 def test_one_scrape_that_caught_a_commit_before_its_verification_is_not_a_breach():
     samples, events, finals = healthy_run()
     samples[40]["metrics"][soak_eval.M_COMMITS] = samples[40]["metrics"][soak_eval.M_VERIFIED] + 1

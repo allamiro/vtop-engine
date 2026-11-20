@@ -282,9 +282,16 @@ class Driver:
     def audit(self, trigger: str, storage: bool = False) -> dict:
         args = ["audit-coverage"] + (["--check-storage"] if storage else [])
         result = self.lab.vtopctl(*args, timeout=self.profile["check_timeout_s"])
-        out = {"ok": result.ok, "exit": result.code, "detail": tail(result.text(), 20)}
-        self.rec.event("audit", trigger=trigger, ok=result.ok, storage=storage, detail=tail(result.text()))
-        return out
+        # The audit exits 0 over a gap in a Kafka partition (compaction and
+        # transaction markers can explain one). This workload has neither, so
+        # a gap it reports is a record nothing archived.
+        gaps = soak_lab.audit_gaps(result.out)
+        ok = result.ok and not gaps
+        detail = tail(result.text(), 20)
+        if gaps:
+            detail = f"{len(gaps)} unexplained gap(s): {'; '.join(gaps[:5])}\n{detail}"
+        self.rec.event("audit", trigger=trigger, ok=ok, storage=storage, gaps=len(gaps), detail=detail[:2000])
+        return {"ok": ok, "exit": result.code, "gaps": len(gaps), "detail": detail[:4000]}
 
     # -- faults --------------------------------------------------------
 

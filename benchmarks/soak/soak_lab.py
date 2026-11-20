@@ -171,6 +171,18 @@ def scrub_summary(report: dict) -> dict:
     }
 
 
+GAP_LINE = re.compile(r"^\s+gap \[(\d+), (\d+)\):")
+
+
+def audit_gaps(text: str) -> list[str]:
+    """The stretches `audit-coverage` reports as archived by nothing, as the
+    lines it printed them on. For a Kafka partition it prints them without
+    failing, because a production topic can have gaps that compaction or
+    transaction markers explain; the soak's producer is neither compacting nor
+    transactional, so for it a gap is a hole and the exit status is not enough."""
+    return [line.strip() for line in text.splitlines() if GAP_LINE.match(line)]
+
+
 def parse_pruned(text: str) -> int | None:
     """Rows a `prune-ledger` run deleted: from its JSON status or its sentence."""
     try:

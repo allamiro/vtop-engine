@@ -443,7 +443,12 @@ def check_commit_rule(samples: list[dict]) -> Criterion:
     previous_bad: dict | None = None
     failures = []
     for sample in samples:
-        metrics = sample.get("metrics") or {}
+        metrics = sample.get("metrics")
+        if not metrics:
+            # A lag-only row, or a scrape that failed: it says nothing about
+            # the counters, so it neither shows a breach nor ends a candidate.
+            # (A restart ends it: the lifetime is compared below.)
+            continue
         failures.append(metrics.get(M_VERIFY_FAILURES))
         if M_COMMITS not in metrics or M_VERIFIED not in metrics:
             previous_bad = None

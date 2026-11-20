@@ -122,6 +122,7 @@ class FakeLab:
         self.scrapes = 0
         self.producer_stopped = False
         self.audit_ok = True
+        self.audit_gap = False  # a Kafka gap the audit prints and still exits 0 over
         self.scrub_ok = True
         self.calls = []
 
@@ -169,6 +170,13 @@ class FakeLab:
         self.calls.append(args)
         command = args[0]
         if command == "audit-coverage":
+            if self.audit_gap:
+                text = (
+                    "ok   kafka soak-topic[0] group vtop-soak: 3 committed range(s) over [0, 90), 0 duplicated\n"
+                    "     gap [40, 50): no records archived (compaction or transaction markers can leave such gaps)\n"
+                    "coverage audit PASSED\n"
+                )
+                return soak_lab.Result(0, text, "")
             return soak_lab.Result(0 if self.audit_ok else 1, "" if self.audit_ok else "hole at offsets 10..19", "")
         if command == "scrub":
             ok = self.scrub_ok

@@ -93,7 +93,7 @@ sampled nothing, or ran no scrub does not pass.
 | `lag_steady` | the archive lag, outside fault windows, has a 95th percentile of at most 180 s |
 | `rate` | the topic's end offset advanced by at least 90% of the stated rate while the load ran (up to the producer's stop; the drain and the final checks after it are not production) |
 | `ledger_prune` | `prune-ledger` ran on its schedule, at least 90% of the runs it should have, and none failed |
-| `zero_coverage_holes` | `audit-coverage` was clean after every fault, and `audit-coverage --check-storage` was clean at the end |
+| `zero_coverage_holes` | `audit-coverage` was clean after every fault, and `audit-coverage --check-storage` was clean at the end. A Kafka partition's gap (a stretch nothing archived) does not fail the command, because compaction and transaction markers can explain one on a production topic; this lab has neither, so the soak reads the report and fails on any gap |
 | `scrub_clean` | every sampled `scrub` and the final full `scrub` were clean, and the final one read at least 1,000 batches |
 | `tail_drained` | after the load stopped, the group's committed offset equals the end offset on every partition |
 | `clean_shutdown` | the drained engine exits 0 on `SIGTERM` |

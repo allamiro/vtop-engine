@@ -73,6 +73,25 @@ def test_scrub_summary_counts_findings():
     assert s == {"report_mode": "all", "batches_checked": 12, "committed_rows": 12, "findings": 2, "passed": False}
 
 
+def test_audit_gaps_finds_the_stretches_the_audit_printed_without_failing_over():
+    text = (
+        "audited 12 ledger row(s) and 0 digested row(s) from 0 digest file(s); 2 source unit(s)\n"
+        "ok   kafka soak-topic[0] group vtop-soak: 6 committed range(s) over [0, 10875), 0 duplicated\n"
+        "     gap [4000, 6000): no records archived (compaction or transaction markers can leave such gaps)\n"
+        "ok   kafka soak-topic[1] group vtop-soak: 6 committed range(s) over [0, 10000), 0 duplicated\n"
+        "     gap [10, 12): no records archived (compaction or transaction markers can leave such gaps)\n"
+        "coverage audit PASSED\n"
+    )
+    assert soak_lab.audit_gaps(text) == [
+        "gap [4000, 6000): no records archived (compaction or transaction markers can leave such gaps)",
+        "gap [10, 12): no records archived (compaction or transaction markers can leave such gaps)",
+    ]
+    clean = (
+        "ok   kafka soak-topic[0] group vtop-soak: 6 committed range(s) over [0, 10875), 0 dup\ncoverage audit PASSED\n"
+    )
+    assert soak_lab.audit_gaps(clean) == []
+
+
 def test_parse_pruned_reads_the_status_or_the_sentence():
     assert soak_lab.parse_pruned('{"status": "ok", "deleted": 17, "digest": null}') == 17
     assert soak_lab.parse_pruned("pruned 3 committed ledger row(s); digest /x; audit record a") == 3

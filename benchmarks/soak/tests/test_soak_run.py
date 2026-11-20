@@ -170,6 +170,24 @@ def test_every_fault_is_followed_by_an_audit_once_the_engine_recovered(healthy):
         assert recovered["ok"] and audit["elapsed_s"] >= recovered["elapsed_s"]
 
 
+def test_a_kafka_gap_the_audit_prints_but_exits_zero_over_fails_the_run(profile, tmp_path):
+    # `audit-coverage` does not fail a Kafka partition for a gap, since
+    # compaction and transaction markers can explain one. This lab has neither,
+    # so an omitted range must fail the soak.
+    lab = FakeLab()
+    lab.audit_gap = True
+    code, _, run_dir, _ = run(profile, tmp_path, lab)
+    assert code == 1 and "zero_coverage_holes" in failed(run_dir)
+    audits = [e for e in events(run_dir) if e["kind"] == "audit"]
+    assert audits and all(not e["ok"] and e["gaps"] == 1 for e in audits)
+    assert (
+        "gap [40, 50)"
+        in verdict(run_dir)["criteria"][[c["id"] for c in verdict(run_dir)["criteria"]].index("zero_coverage_holes")][
+            "detail"
+        ]
+    )
+
+
 def test_a_hole_and_a_dirty_scrub_each_fail_their_own_criterion(profile, tmp_path):
     lab = FakeLab()
     lab.audit_ok = False
