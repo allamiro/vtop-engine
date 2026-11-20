@@ -207,6 +207,39 @@ def parse_structs(source: str) -> dict[str, Struct]:
     return structs
 
 
+@dataclass
+class Enum:
+    name: str
+    untagged: bool
+    variant_types: list[str]  # the type held by each variant with data
+
+
+def parse_enums(source: str) -> dict[str, Enum]:
+    """Every `pub enum Name { ... }`: whether it is untagged, and the types its
+    variants hold (a unit variant holds none)."""
+    enums: dict[str, Enum] = {}
+    for found in re.finditer(r"^pub enum (\w+)\s*\{", source, re.M):
+        open_at = found.end() - 1
+        body = _strip_comments(source[open_at + 1 : _match_brace(source, open_at)])
+        above = source[: found.start()].rstrip("\n").split("\n")
+        header: list[str] = []
+        while above and above[-1].lstrip().startswith(("#[", "//", ")]")):
+            header.append(above.pop())
+        attrs = [a for a in _attributes("\n".join(header)) if a.startswith("serde")]
+        types: list[str] = []
+        for chunk in _split_top_level(body):
+            chunk = re.sub(r"#\[(?:[^\[\]]|\[[^\]]*\])*\]", "", chunk).strip()
+            held = re.match(r"\w+\s*\((.*)\)$", chunk, re.S)
+            if held:
+                types.append(" ".join(held.group(1).split()))
+            elif re.match(r"\w+\s*\{", chunk):
+                types.append("{struct variant}")
+        enums[found.group(1)] = Enum(
+            found.group(1), any(re.search(r"\buntagged\b", a) for a in attrs), types
+        )
+    return enums
+
+
 def _unwrap(type_text: str) -> tuple[str, str]:
     """(inner type name, path suffix) for a field type.
 
@@ -230,8 +263,17 @@ def _unwrap(type_text: str) -> tuple[str, str]:
     return re.sub(r"^.*::", "", text), suffix
 
 
-def walk(structs: dict[str, Struct], root: str) -> dict[str, Key]:
-    """Every key path reachable from `root`, with where it is declared."""
+def walk(
+    structs: dict[str, Struct], enums: dict[str, Enum], root: str
+) -> dict[str, Key]:
+    """Every key path reachable from `root`, with where it is declared.
+
+    An untagged enum is read as each of its variants' structs at the same
+    path (`engine.state_store` is a URL or `{env: ...}` or `{file: ...}`). An
+    enum whose variants carry data and is not untagged is keyed by variant
+    name, which this does not read, so it stops rather than list a schema it
+    only half understood.
+    """
     keys: dict[str, Key] = {}
 
     def visit(struct_name: str, base: str, active: tuple[str, ...]) -> None:
@@ -248,6 +290,17 @@ def walk(structs: dict[str, Struct], root: str) -> dict[str, Key]:
             inner, suffix = _unwrap(item.type_text)
             if inner in structs and inner not in active:
                 visit(inner, path + suffix, active + (struct_name,))
+            elif inner in enums and enums[inner].variant_types:
+                if not enums[inner].untagged:
+                    raise ValueError(
+                        f"{struct_name}.{item.key}: enum {inner} holds data but is not "
+                        "untagged; scripts/config-keys-since.py does not read it, so its "
+                        "keys would be missing from the list"
+                    )
+                for variant in enums[inner].variant_types:
+                    held, held_suffix = _unwrap(variant)
+                    if held in structs and held not in active:
+                        visit(held, path + suffix + held_suffix, active + (struct_name,))
 
     visit(root, "", ())
     return keys
@@ -255,10 +308,11 @@ def walk(structs: dict[str, Struct], root: str) -> dict[str, Key]:
 
 def schema(source: str) -> dict[str, Key]:
     structs = parse_structs(source)
+    enums = parse_enums(source)
     keys: dict[str, Key] = {}
     for _file, root, _page, _prefix in ROOTS:
         if root in structs:
-            keys.update(walk(structs, root))
+            keys.update(walk(structs, enums, root))
     return keys
 
 
@@ -533,7 +587,10 @@ def main(argv: list[str] | None = None) -> int:
         page: git_show(args.repo, args.to_ref, page) or ""
         for page in (REFERENCE_MD, STREAMS_MD)
     }
-    added = added_keys(old_source, new_source, pages)
+    try:
+        added = added_keys(old_source, new_source, pages)
+    except ValueError as error:
+        sys.exit(f"config-keys-since: {error}")
     if args.json:
         print(
             json.dumps(

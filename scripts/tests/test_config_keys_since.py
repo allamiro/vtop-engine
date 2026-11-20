@@ -240,6 +240,68 @@ pub struct ExtraConfig {
         self.assertEqual([(a.path, a.note_kind) for a in added], [("extra.more", "refused")])
 
 
+class UntaggedEnums(unittest.TestCase):
+    """A key written through an untagged enum's variant is a key."""
+
+    BEFORE = """
+pub struct VtopConfig {
+    pub store: StoreConfig,
+}
+
+#[serde(untagged)]
+pub enum StoreConfig {
+    Url(String),
+    Env(EnvRef),
+}
+
+#[serde(deny_unknown_fields)]
+pub struct EnvRef {
+    pub env: String,
+}
+"""
+    AFTER = BEFORE.replace(
+        "    Env(EnvRef),\n", "    Env(EnvRef),\n    File(FileRef),\n"
+    ) + """
+#[serde(deny_unknown_fields)]
+pub struct FileRef {
+    pub file: String,
+}
+"""
+
+    def test_the_keys_of_each_variant_are_keys_at_the_enums_path(self):
+        self.assertEqual(sorted(MOD.schema(self.BEFORE)), ["store", "store.env"])
+        self.assertEqual(sorted(MOD.schema(self.AFTER)), ["store", "store.env", "store.file"])
+
+    def test_a_new_variant_is_a_new_key(self):
+        added = MOD.added_keys(self.BEFORE, self.AFTER, {})
+        self.assertEqual([a.path for a in added], ["store.file"])
+
+    def test_a_field_added_to_a_strict_variant_is_refused(self):
+        newer = self.BEFORE.replace(
+            "    pub env: String,\n", "    pub env: String,\n    pub extra: String,\n"
+        )
+        added = MOD.added_keys(self.BEFORE, newer, {})
+        self.assertEqual([(a.path, a.note_kind) for a in added], [("store.extra", "refused")])
+
+    def test_an_enum_keyed_by_variant_name_stops_the_list_instead_of_shortening_it(self):
+        source = """
+pub struct VtopConfig {
+    pub mode: Mode,
+}
+
+pub enum Mode {
+    Fast(FastConfig),
+    Slow,
+}
+
+pub struct FastConfig {
+    pub depth: u32,
+}
+"""
+        with self.assertRaises(ValueError):
+            MOD.schema(source)
+
+
 class RealSchema(unittest.TestCase):
     """The parser against this repository's config.rs."""
 
@@ -251,6 +313,8 @@ class RealSchema(unittest.TestCase):
     def test_known_keys_are_found_under_their_paths(self):
         for path in (
             "engine.state_store",
+            "engine.state_store.env",
+            "engine.state_store.file",
             "batching.adaptive_width.enabled",
             "manifest.mac.keys[].id",
             "upload.object_lock.retain_days",
