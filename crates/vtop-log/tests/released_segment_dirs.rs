@@ -12,6 +12,7 @@
 //! rule 4).
 //!
 //! Profiles:
+//!
 //! - `legacy`, a release before v0.3.0, which cannot roll: one `.active`;
 //! - `rolling`, sealed segments, their indexes, commit markers, manifests and
 //!   producer snapshots, in format v1;

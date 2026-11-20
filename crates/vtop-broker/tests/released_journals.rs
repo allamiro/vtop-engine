@@ -6,10 +6,12 @@
 //! records produced with quorum durability, then SIGKILL; see
 //! `scripts/compat/regenerate-segment-fixtures.sh` and each tag's
 //! `PROVENANCE`). Two journals sit beside the segments:
+//!
 //! - `epochs`, the producer-epoch journal (`VTOPEPC1`): the producer that
 //!   wrote, at the epoch the client config names;
 //! - `fencing-epochs`, the fencing-epoch journal (`VTOPFNC1`): the leader's
 //!   fencing epoch of the fixture's config.
+//!
 //! A release's journal the current build cannot read, or reads as another
 //! epoch, would reject the leader's producers or its own history after an
 //! upgrade, with the data intact.
