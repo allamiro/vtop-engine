@@ -84,14 +84,14 @@ sampled nothing, or ran no scrub does not pass.
 | Criterion | Passes when |
 |---|---|
 | `run_completed` | the run ended without being aborted, and sampled to the profile's duration |
-| `samples` | at least 90% of the expected samples exist and none is more than 5 minutes after the one before |
+| `samples` | the resource samples (every 30 s) and the lag samples (every 60 s) are each counted on their own over the run's duration: at least 90% of each kind's expected number exist, and none is more than 5 minutes after the one before |
 | `faults_executed` | every fault in the plan was injected, landed, and the engine recovered from it |
 | `recovery_time` | the slowest recovery was within the timeout (15 minutes) |
 | `no_unplanned_exit` | the engine never exited except when a fault stopped it |
 | `commit_rule` | `vtop_commits_total` never exceeded `vtop_verified_total` (two samples in a row, within one engine process, since a scrape reads the two a moment apart), and `vtop_verification_failures_total` never rose |
 | `trend_rss_bytes`, `trend_open_fds`, `trend_ledger_bytes`, `trend_work_dir_bytes`, `trend_batch_seconds`, `trend_lag_seconds` | no growth trend over the last 80% of the run: see below |
 | `lag_steady` | the archive lag, outside fault windows, has a 95th percentile of at most 180 s |
-| `rate` | the topic's end offset advanced by at least 90% of the stated rate over the run |
+| `rate` | the topic's end offset advanced by at least 90% of the stated rate while the load ran (up to the producer's stop; the drain and the final checks after it are not production) |
 | `ledger_prune` | `prune-ledger` ran on its schedule, at least 90% of the runs it should have, and none failed |
 | `zero_coverage_holes` | `audit-coverage` was clean after every fault, and `audit-coverage --check-storage` was clean at the end |
 | `scrub_clean` | every sampled `scrub` and the final full `scrub` were clean, and the final one read at least 1,000 batches |

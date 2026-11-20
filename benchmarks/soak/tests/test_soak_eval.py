@@ -397,6 +397,51 @@ def test_a_sampler_that_stopped_fails():
     assert "samples" in failed(verdict_of(samples, events, finals))
 
 
+def test_the_drain_after_the_load_stops_does_not_dilute_the_rate():
+    # Producing exactly on target for the whole run, then five idle minutes of
+    # draining and checks: the rate is the production interval's.
+    samples, events, finals = healthy_run()
+    last = samples[-1]
+    for i in range(1, 60):
+        row = copy.deepcopy(last)
+        row["elapsed_s"] = PROFILE["duration_s"] + 5 + i * 5
+        row["lag"] = {"end": last["lag"]["end"], "committed": last["lag"]["end"]}
+        samples.append(row)
+    events.append({"elapsed_s": float(PROFILE["duration_s"]), "kind": "producer_stopped"})
+    v = verdict_of(samples, events, finals)
+    assert "rate" not in failed(v), next(c for c in v["criteria"] if c["id"] == "rate")
+
+
+def test_a_rate_that_really_is_low_still_fails_with_the_load_end_recorded():
+    samples, events, finals = healthy_run()
+    for i, s in enumerate(samples):
+        s["lag"]["end"] = i * 100
+        s["lag"]["committed"] = max(0, i * 100 - 6000)
+    events.append({"elapsed_s": float(PROFILE["duration_s"]), "kind": "producer_stopped"})
+    assert "rate" in failed(verdict_of(samples, events, finals))
+
+
+def test_lag_records_cannot_stand_in_for_missing_resource_samples():
+    # Half the resource samples are missing, but lag-only records fill the file:
+    # the count of rows is fine and the resource coverage is not.
+    samples, events, finals = healthy_run()
+    for i, s in enumerate(samples):
+        if i % 2:
+            for key in ("engine_up", "rss_bytes", "open_fds", "work_dir_bytes", "ledger_bytes", "metrics"):
+                s.pop(key, None)
+    v = verdict_of(samples, events, finals)
+    criterion = next(c for c in v["criteria"] if c["id"] == "samples")
+    assert not criterion["passed"] and "resource samples" in criterion["observed"]
+
+
+def test_missing_lag_samples_fail_the_sampling_criterion_on_their_own():
+    samples, events, finals = healthy_run()
+    for i, s in enumerate(samples):
+        if i % 4:
+            s.pop("lag", None)
+    assert "samples" in failed(verdict_of(samples, events, finals))
+
+
 def test_no_samples_at_all_fails_without_raising():
     v = verdict_of([], healthy_run()[1], healthy_run()[2])
     assert v["passed"] is False and "samples" in failed(v)

@@ -251,6 +251,7 @@ def in_any(t: float, windows: list[tuple[float, float]]) -> bool:
 def series_points(profile: dict, samples: list[dict], events: list[dict], name: str) -> list[tuple[float, float, int]]:
     """(elapsed_s, value, lifetime) for one trend series, with the samples the
     series leaves out already removed (see soak_profile.TREND_SERIES)."""
+    stop = load_end(profile, events)
     exclude = soak_profile.TREND_SERIES[name]["fault_windows"] == "exclude"
     windows = fault_windows(profile, events) if exclude else []
     points: list[tuple[float, float, int]] = []
@@ -278,7 +279,7 @@ def series_points(profile: dict, samples: list[dict], events: list[dict], name: 
                 previous = sample
         elif name == "lag_seconds":
             lag = sample.get("lag")
-            if lag and lag.get("end") is not None and lag.get("committed") is not None:
+            if lag and lag.get("end") is not None and lag.get("committed") is not None and t <= stop:
                 value = max(0, lag["end"] - lag["committed"]) / profile["rate_records_per_s"]
         else:
             if sample.get("engine_up"):
@@ -327,16 +328,49 @@ def check_run_completed(profile: dict, samples: list[dict], events: list[dict]) 
     return Criterion("run_completed", "the run completed", True, f"sampled to {last:.0f} s", expected)
 
 
+def load_end(profile: dict, events: list[dict]) -> float:
+    """When the load stopped: the producer's stop, or the profile's duration when
+    no stop was recorded. What comes after is the engine draining and the final
+    checks running, with nothing being produced, so it is not part of the rate
+    or of the steady state."""
+    stops = [e["elapsed_s"] for e in events if e.get("kind") == "producer_stopped"]
+    return min(stops) if stops else float(profile["duration_s"])
+
+
+def _coverage(times: list[float], wanted: float, limit: float, high: float) -> tuple[bool, str]:
+    """Whether `times` (inside [0, high]) number at least `wanted` with no gap
+    over `limit`, and how to say so."""
+    inside = sorted(t for t in times if 0 <= t <= high)
+    gap = max((b - a for a, b in zip(inside, inside[1:])), default=math.inf)
+    ok = len(inside) >= wanted and gap <= limit
+    return ok, f"{len(inside)} (of at least {wanted:.0f}), largest gap {gap:.0f} s" if len(
+        inside
+    ) > 1 else f"{len(inside)}"
+
+
 def check_samples(profile: dict, samples: list[dict]) -> Criterion:
+    """Each kind of observation is counted on its own: the resource samples (the
+    engine's memory, open files, ledger and work directory, one record each
+    `sample_interval_s`) and the lag samples (the topic and the group, one each
+    `lag_interval_s`) share a file, and one kind must not stand in for the
+    other."""
     criteria = profile["criteria"]
-    wanted = profile["duration_s"] / profile["sample_interval_s"]
-    minimum = criteria["min_samples_fraction"] * wanted
-    times = sorted(s["elapsed_s"] for s in samples)
-    gap = max((b - a for a, b in zip(times, times[1:])), default=math.inf)
-    expected = f"at least {minimum:.0f} samples, none more than {criteria['max_sample_gap_s']} s apart"
-    observed = f"{len(samples)} samples, largest gap {gap:.0f} s" if len(times) > 1 else f"{len(samples)} samples"
-    ok = len(samples) >= minimum and gap <= criteria["max_sample_gap_s"]
-    return Criterion("samples", "the run was sampled throughout", ok, observed, expected)
+    duration = float(profile["duration_s"])
+    limit = criteria["max_sample_gap_s"]
+    fraction = criteria["min_samples_fraction"]
+    resource = [s["elapsed_s"] for s in samples if "engine_up" in s]
+    lag = [s["elapsed_s"] for s in samples if "lag" in s]
+    ok_resource, said_resource = _coverage(
+        resource, fraction * duration / profile["sample_interval_s"], limit, duration
+    )
+    ok_lag, said_lag = _coverage(lag, fraction * duration / profile["lag_interval_s"], limit, duration)
+    return Criterion(
+        "samples",
+        "the run was sampled throughout",
+        ok_resource and ok_lag,
+        f"resource samples {said_resource}; lag samples {said_lag}",
+        f"each kind at least {fraction:.0%} of its interval's worth over {duration:.0f} s, no gap over {limit} s",
+    )
 
 
 def check_faults(profile: dict, events: list[dict]) -> list[Criterion]:
@@ -501,18 +535,24 @@ def check_lag(profile: dict, samples: list[dict], events: list[dict]) -> Criteri
     )
 
 
-def check_rate(profile: dict, samples: list[dict]) -> Criterion:
-    ends = [s["lag"]["end"] for s in samples if s.get("lag") and s["lag"].get("end") is not None]
+def check_rate(profile: dict, samples: list[dict], events: list[dict]) -> Criterion:
+    """The rate the topic's end offset advanced at while the load ran: the
+    drain and the final checks after the producer stops are not production."""
+    stop = load_end(profile, events)
+    points = sorted(
+        (s["elapsed_s"], s["lag"]["end"])
+        for s in samples
+        if s.get("lag") and s["lag"].get("end") is not None and s["elapsed_s"] <= stop
+    )
     target = profile["rate_records_per_s"]
     fraction = profile["criteria"]["min_rate_fraction"]
-    expected = f"at least {fraction:.0%} of {target} records/s over the run"
-    if len(ends) < 2:
+    expected = f"at least {fraction:.0%} of {target} records/s while the load ran"
+    if len(points) < 2:
         return Criterion(
             "rate", "the stated rate was produced", False, "fewer than two topic end-offset samples", expected
         )
-    times = [s["elapsed_s"] for s in samples if s.get("lag") and s["lag"].get("end") is not None]
-    produced = ends[-1] - ends[0]
-    seconds = times[-1] - times[0]
+    produced = points[-1][1] - points[0][1]
+    seconds = points[-1][0] - points[0][0]
     rate = produced / seconds if seconds > 0 else 0.0
     return Criterion(
         "rate",
@@ -645,7 +685,7 @@ def evaluate(profile: dict, samples: list[dict], events: list[dict], finals: dic
         check_commit_rule(samples),
         *check_trends(profile, samples, events),
         check_lag(profile, samples, events),
-        check_rate(profile, samples),
+        check_rate(profile, samples, events),
         check_prune(profile, events),
         check_audits(events, finals),
         check_scrub(profile, events, finals),
