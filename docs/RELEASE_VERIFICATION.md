@@ -66,6 +66,51 @@ different questions, so check both.
 An SPDX SBOM (`vtop-engine-sbom.spdx.json`) is attached to every release, and
 the container image carries an SBOM attestation.
 
+## Reproducing a build
+
+Every release run (a `v*` tag, and a dry-run dispatch) also rebuilds each
+binary archive target on a second, clean runner and compares the result with
+the archive the first build made. The job is named `reproduce <target>
+(report only)`. It is report only: it never blocks or delays a release, its
+failures show as a red job inside a green run, and what it uploads
+(`repro-report-<target>`, and `repro-binaries-<target>` when a build differs)
+is kept out of the release assets.
+
+What it compares is `vtop-node` and `vtopctl`, by SHA-256, against the copies
+inside the archive. The tarball's own hash is printed but not compared, because
+`tar` and `gzip` record file times, so two correct builds of one tree give two
+archive hashes. To check an archive, use `SHA256SUMS` and the signatures above;
+to ask whether the binaries inside it come from the tagged source, run the same
+comparison yourself:
+
+```
+tar -xzf vtop-engine-VERSION-TARGET.tar.gz
+sha256sum vtop-engine-VERSION-TARGET/vtop-node vtop-engine-VERSION-TARGET/vtopctl
+```
+
+Then build the tag the way `release.yml` does (the `build` steps of its
+`binaries` job: AlmaLinux 8 for the Linux targets, the macOS runner for the
+Apple ones) and hash `target/TARGET/release/vtop-node` and `vtopctl`.
+
+### When a rebuild differs
+
+A difference is documented, not hidden: the job summary lists both hashes, the
+versions the rebuild used, and, for a Linux binary, the compiler version
+recorded inside each copy. Three build inputs are not pinned yet, and each can
+change a binary without any change to the source:
+
+- **The Rust toolchain.** The workflow installs `stable`, which moves every six
+  weeks. A rebuild after a new stable release uses a newer compiler.
+- **The distribution packages in the Linux build image.** The AlmaLinux 8 image
+  is pinned by digest; the compiler, cmake, perl and `-devel` packages installed
+  into it are whatever the mirrors serve on the day.
+- **The macOS runner image.** Xcode, the SDK and Homebrew's cmake change with
+  the runner image.
+
+Cargo dependencies are not on this list: `--locked` builds use the versions in
+`Cargo.lock`. If a run shows drift, the fix is to pin the input in
+`release.yml`, for both the `binaries` job and the `reproduce` job.
+
 ## Maturity
 
 VTOP is a **prototype / reference implementation**. Each release is signed,
