@@ -174,6 +174,8 @@ What an older binary does with newer data, by case:
 | Surface | Deprecated in | Earliest removal | Replacement |
 |---|---|---|---|
 | `manifest.write_version: "0.3"` (planned) | v0.12.0, when `0.4` becomes the default | 2.0 | `"0.4"` |
+| The manifest field `verification_status` (on `main`, in no release yet) | v0.10.0 (#671 release B) | Not set. It is still written, also in `0.4` manifests, because v0.8.0 readers require it; its value is always `not_verified`. | `verification_plan` in a `0.4` manifest, and the ledger or a verification receipt for what verification found ([protocol §11.2](../VTOP_PROTOCOL_DRAFT.md#112-field-reference)) |
+| The `CancelRetention` metadata command, and `vtopctl meta cancel-retention` that proposes it | v0.1.0 (#184). The subcommand's help says "Deprecated", and the state machine rejects every proposal ("retention cannot be cancelled after deletion is authorized"). | Not scheduled. The command stays on the wire so a peer of any release decodes it. | None. A `RetentionPlanned` segment is terminal: recovery completes the retention, or a repair establishes fresh verified placement. |
 
 ## Config, JSON output and the wire, before 1.0
 

@@ -318,6 +318,9 @@ jobs:
               - 'scripts/check-naming.sh'
               - 'scripts/check-egress-claims.sh'
               - 'scripts/naming-denylist.txt'
+              # The check that no shipped build carries the failpoints
+              # feature (#725), listed here and in the shellcheck step.
+              - 'scripts/check-failpoints-absent.sh'
               - 'scripts/tests/**'
               # The test-progress runner: developer tooling, but shell that people
               # will paste and rely on, so it is linted like the rest — listed here
@@ -455,6 +458,12 @@ jobs:
 
       - name: Release build
         run: cargo build --release --bin vtopctl --locked
+
+      # The engine crash sweep's failpoints (#725) kill the process on
+      # request; a release build must not contain them. The sweep's own
+      # build is the positive control (engine-crash-sweep.yml).
+      - name: Release build carries no failpoint
+        run: bash scripts/check-failpoints-absent.sh --binary target/release/vtopctl
 
   docker:
     name: docker image build
@@ -1242,7 +1251,7 @@ jobs:
             scripts/manifest-compat.sh scripts/ledger-compat.sh \
             scripts/traffic-snapshot.sh scripts/test-progress.sh \
             scripts/check-naming.sh scripts/check-egress-claims.sh \
-            scripts/kafka-broker.sh
+            scripts/check-failpoints-absent.sh scripts/kafka-broker.sh
 
       # `-P scripts/live-chaos/scenarios` resolves the scenarios' dynamic
       # `source "$(dirname …)/../lib.sh"`. Without it every scenario reports
@@ -1255,7 +1264,8 @@ jobs:
             scripts/live-chaos/lib.sh \
             scripts/live-chaos/run-all.sh \
             scripts/live-chaos/gen-certs.sh \
-            scripts/live-chaos/scenarios/*.sh
+            scripts/live-chaos/scenarios/*.sh \
+            scripts/live-chaos/engine/*.sh
 
       - name: bats
         run: |
@@ -2447,8 +2457,16 @@ jobs:
     # fixed `vtop_test_*` databases and roles, and the workflow's concurrency
     # group is per ref. One at a time across the repository; a run waits
     # rather than cancel another's half-done restore.
+    #
+    # GitHub keeps one PENDING job per concurrency group and cancels the older
+    # pending one when a third arrives, whatever cancel-in-progress says, so a
+    # shared group cancels (and reddens) other PRs' runs while two or more
+    # wait. When no managed database is configured the job does nothing, so
+    # it then gets a group of its own per run and never queues. The client
+    # image variable is required whenever the smoke is enabled (the gate step
+    # refuses without it), and unlike a secret, `vars` may name a group.
     concurrency:
-      group: postgres-managed-smoke
+      group: ${{ vars.VTOP_MANAGED_POSTGRES_CLIENT_IMAGE != '' && 'postgres-managed-smoke' || format('postgres-managed-smoke-off-{0}-{1}', github.run_id, github.run_attempt) }}
       cancel-in-progress: false
     env:
       VTOP_TEST_POSTGRES: ${{ secrets.VTOP_MANAGED_POSTGRES_URL }}
