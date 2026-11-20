@@ -19,16 +19,19 @@ use crate::base::{
     StoredObject, UploadBackend, VerificationResult,
 };
 use async_trait::async_trait;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use vtop_core::errors::VtopError;
 
 /// The two durability calls a write makes. They sit behind a trait so a test
 /// can see that each write makes them, and in what order relative to the
 /// rename; a power loss cannot be unit-tested, a missing call can.
 pub(crate) trait DurabilitySync: Send + Sync {
-    /// Flush the file's data and metadata to stable storage.
-    fn sync_file(&self, path: &Path) -> std::io::Result<()>;
+    /// Flush the file's data and metadata to stable storage. The handle is
+    /// the one the file was written through, so a file whose copied mode is
+    /// read-only (a read-only source) is synced without reopening it.
+    fn sync_file(&self, file: &std::fs::File, path: &Path) -> std::io::Result<()>;
     /// Flush a directory's entries (a create, a rename) to stable storage.
     fn sync_dir(&self, path: &Path) -> std::io::Result<()>;
 }
@@ -38,11 +41,8 @@ pub(crate) trait DurabilitySync: Send + Sync {
 struct OsSync;
 
 impl DurabilitySync for OsSync {
-    fn sync_file(&self, path: &Path) -> std::io::Result<()> {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(path)?
-            .sync_all()
+    fn sync_file(&self, file: &std::fs::File, _path: &Path) -> std::io::Result<()> {
+        file.sync_all()
     }
 
     fn sync_dir(&self, path: &Path) -> std::io::Result<()> {
@@ -61,29 +61,51 @@ impl DurabilitySync for OsSync {
 pub struct LocalFsBackend {
     root: PathBuf,
     sync: Arc<dyn DurabilitySync>,
+    /// Directories this backend created whose own sync and whose parent's sync
+    /// have not both succeeded yet. A directory that exists is not a directory
+    /// that is durable: a sync that failed, or a concurrent writer still
+    /// creating the tree, leaves it visible to the next put, which must finish
+    /// the job rather than trust that it exists.
+    unsynced_dirs: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
-/// `create_dir_all`, then sync what it created: each new directory's parent
-/// (the entry that names it) and the new directories themselves. Without this
-/// a new bucket or partition directory, and every object under it, can vanish
-/// after a power loss even though the file inside was synced.
-fn create_dirs_durably(dir: &Path, sync: &dyn DurabilitySync) -> std::io::Result<()> {
-    let mut created = Vec::new();
-    let mut at = Some(dir);
-    while let Some(d) = at {
-        if d.as_os_str().is_empty() || d.exists() {
-            break;
+/// `create_dir_all`, then sync what it created: each new directory and the
+/// parent that holds its entry. Without this a new bucket or partition
+/// directory, and every object under it, can vanish after a power loss even
+/// though the file inside was synced. A directory counts as done only once
+/// both syncs succeeded (see `LocalFsBackend::unsynced_dirs`), so a retry after
+/// a failed sync, or a put racing the writer that is creating the tree, syncs
+/// the ancestors it finds already present.
+fn create_dirs_durably(
+    dir: &Path,
+    sync: &dyn DurabilitySync,
+    unsynced: &Mutex<HashSet<PathBuf>>,
+) -> std::io::Result<()> {
+    let mut todo = Vec::new();
+    {
+        let mut pending = unsynced.lock().unwrap_or_else(|p| p.into_inner());
+        let mut at = Some(dir);
+        while let Some(d) = at {
+            if d.as_os_str().is_empty() {
+                break;
+            }
+            if !d.exists() {
+                pending.insert(d.to_path_buf());
+            } else if !pending.contains(d) {
+                break;
+            }
+            todo.push(d.to_path_buf());
+            at = d.parent();
         }
-        created.push(d.to_path_buf());
-        at = d.parent();
     }
     std::fs::create_dir_all(dir)?;
     // Deepest first: a directory is synced before the entry that names it.
-    for d in &created {
+    for d in &todo {
         sync.sync_dir(d)?;
         if let Some(parent) = d.parent().filter(|p| !p.as_os_str().is_empty()) {
             sync.sync_dir(parent)?;
         }
+        unsynced.lock().unwrap_or_else(|p| p.into_inner()).remove(d);
     }
     Ok(())
 }
@@ -93,13 +115,14 @@ fn create_dirs_durably(dir: &Path, sync: &dyn DurabilitySync) -> std::io::Result
 /// the directory again. Nothing is reported done before the syncs return.
 fn store_blocking(
     sync: &dyn DurabilitySync,
+    unsynced: &Mutex<HashSet<PathBuf>>,
     local_path: &Path,
     dest: &Path,
     checksum: Option<&str>,
 ) -> std::io::Result<()> {
     let parent = dest.parent().filter(|p| !p.as_os_str().is_empty());
     if let Some(parent) = parent {
-        create_dirs_durably(parent, sync)?;
+        create_dirs_durably(parent, sync, unsynced)?;
     }
     // Copy beside the key, then rename onto it (review of #626): a
     // derived key can have a second writer of the same bytes, and a copy
@@ -111,9 +134,21 @@ fn store_blocking(
     staging.push(format!(".{}-{n}.partial", std::process::id()));
     let staging = PathBuf::from(staging);
     let publish = || -> std::io::Result<()> {
-        std::fs::copy(local_path, &staging)?;
+        use std::io::Write;
+        let mut src = std::fs::File::open(local_path)?;
+        let mode = src.metadata()?.permissions();
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)?;
+        std::io::copy(&mut src, &mut out)?;
+        out.flush()?;
+        // The source's mode, as a copy keeps it, set through the handle so a
+        // read-only source leaves a staging file this handle can still sync.
+        out.set_permissions(mode)?;
         // The data before the rename, so the key never names unwritten bytes.
-        sync.sync_file(&staging)?;
+        sync.sync_file(&out, &staging)?;
+        drop(out);
         std::fs::rename(&staging, dest)
     };
     if let Err(e) = publish() {
@@ -123,8 +158,10 @@ fn store_blocking(
     let sidecar = LocalFsBackend::checksum_sidecar(dest);
     match checksum {
         Some(c) => {
-            std::fs::write(&sidecar, c)?;
-            sync.sync_file(&sidecar)?;
+            use std::io::Write;
+            let mut f = std::fs::File::create(&sidecar)?;
+            f.write_all(c.as_bytes())?;
+            sync.sync_file(&f, &sidecar)?;
         }
         None => {
             let _ = std::fs::remove_file(&sidecar);
@@ -155,6 +192,7 @@ impl LocalFsBackend {
         Self {
             root: root.into(),
             sync: Arc::new(OsSync),
+            unsynced_dirs: Arc::default(),
         }
     }
 
@@ -163,6 +201,7 @@ impl LocalFsBackend {
         Self {
             root: root.into(),
             sync,
+            unsynced_dirs: Arc::default(),
         }
     }
 
@@ -200,11 +239,18 @@ impl LocalFsBackend {
     ) -> Result<(), VtopError> {
         let dest = self.object_path(uri)?;
         let sync = Arc::clone(&self.sync);
+        let unsynced = Arc::clone(&self.unsynced_dirs);
         let local_path = local_path.to_path_buf();
         let checksum = checksum.map(str::to_owned);
         let target = dest.clone();
         tokio::task::spawn_blocking(move || {
-            store_blocking(sync.as_ref(), &local_path, &target, checksum.as_deref())
+            store_blocking(
+                sync.as_ref(),
+                &unsynced,
+                &local_path,
+                &target,
+                checksum.as_deref(),
+            )
         })
         .await
         .map_err(|e| VtopError::Upload(format!("localfs write task: {e}")))??;
@@ -292,7 +338,8 @@ impl UploadBackend for LocalFsBackend {
     async fn ensure_bucket(&self, bucket: &str) -> Result<(), VtopError> {
         let dir = self.root.join(bucket);
         let sync = Arc::clone(&self.sync);
-        tokio::task::spawn_blocking(move || create_dirs_durably(&dir, sync.as_ref()))
+        let unsynced = Arc::clone(&self.unsynced_dirs);
+        tokio::task::spawn_blocking(move || create_dirs_durably(&dir, sync.as_ref(), &unsynced))
             .await
             .map_err(|e| VtopError::Upload(format!("localfs mkdir task: {e}")))??;
         Ok(())
@@ -445,9 +492,9 @@ mod tests {
     }
 
     impl DurabilitySync for Recorder {
-        fn sync_file(&self, path: &Path) -> std::io::Result<()> {
+        fn sync_file(&self, file: &std::fs::File, path: &Path) -> std::io::Result<()> {
             self.log("file", path);
-            OsSync.sync_file(path)
+            OsSync.sync_file(file, path)
         }
         fn sync_dir(&self, path: &Path) -> std::io::Result<()> {
             self.log("dir", path);
@@ -523,7 +570,7 @@ mod tests {
     async fn a_failed_sync_fails_the_write() {
         struct Failing;
         impl DurabilitySync for Failing {
-            fn sync_file(&self, _: &Path) -> std::io::Result<()> {
+            fn sync_file(&self, _: &std::fs::File, _: &Path) -> std::io::Result<()> {
                 Err(std::io::Error::other("fsync failed"))
             }
             fn sync_dir(&self, _: &Path) -> std::io::Result<()> {
@@ -554,5 +601,71 @@ mod tests {
             let want = format!("dir {} ", d.display());
             assert!(ev.iter().any(|e| e.starts_with(&want)), "{ev:?}");
         }
+    }
+
+    /// A directory that exists is not a directory that is durable. When the
+    /// first put's directory sync fails, the directories it created stay
+    /// visible, so the retry must still sync them and the parents that name
+    /// them, not stop at the first ancestor that exists.
+    #[tokio::test]
+    async fn a_retry_after_a_failed_directory_sync_still_syncs_the_ancestors() {
+        struct FailsOnce {
+            failed: std::sync::atomic::AtomicBool,
+            dirs: Mutex<Vec<PathBuf>>,
+        }
+        impl DurabilitySync for FailsOnce {
+            fn sync_file(&self, file: &std::fs::File, _: &Path) -> std::io::Result<()> {
+                file.sync_all()
+            }
+            fn sync_dir(&self, path: &Path) -> std::io::Result<()> {
+                if !self.failed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    return Err(std::io::Error::other("dir fsync failed"));
+                }
+                self.dirs.lock().unwrap().push(path.to_path_buf());
+                Ok(())
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let sync = Arc::new(FailsOnce {
+            failed: Default::default(),
+            dirs: Default::default(),
+        });
+        let b = LocalFsBackend::with_sync(root.path(), sync.clone());
+        let f = tmp(b"payload");
+        let uri = "s3://bkt/y=2026/obj.gz";
+        assert!(b.put_object(f.path(), uri, None).await.is_err());
+        b.put_object(f.path(), uri, None).await.unwrap();
+        let dirs = sync.dirs.lock().unwrap().clone();
+        for d in [
+            root.path().join("bkt/y=2026"),
+            root.path().join("bkt"),
+            root.path().to_path_buf(),
+        ] {
+            assert!(
+                dirs.contains(&d),
+                "{} not synced on retry: {dirs:?}",
+                d.display()
+            );
+        }
+    }
+
+    /// A read-only source leaves a read-only staging file, as a copy keeps the
+    /// mode. The put still works and syncs it (the sync goes through the
+    /// handle the file was written with, not a reopen for writing).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_read_only_source_is_still_uploaded_and_synced() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let (b, rec) = recording(root.path());
+        let f = tmp(b"payload");
+        std::fs::set_permissions(f.path(), std::fs::Permissions::from_mode(0o444)).unwrap();
+        let uri = "s3://bkt/ro.gz";
+        b.put_object(f.path(), uri, None).await.unwrap();
+        assert_eq!(
+            std::fs::read(b.object_path(uri).unwrap()).unwrap(),
+            b"payload"
+        );
+        assert!(rec.events().iter().any(|e| e.starts_with("file ")));
     }
 }
