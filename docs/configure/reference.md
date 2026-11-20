@@ -174,6 +174,9 @@ Each source is optional. A source block that is present but has
 
 ### `sources.kafka`
 
+The Kafka releases the source is tested against are listed in
+[Supported Kafka brokers](../install/kafka.md).
+
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | Read Kafka. |
