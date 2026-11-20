@@ -157,6 +157,12 @@ CREATE INDEX IF NOT EXISTS idx_audit_events_time ON audit_events(time);
 ///   A row whose end offset or identity is missing compares as NULL and has
 ///   no better row, so it is kept.
 ///
+///   Either kind of Kafka row is also kept while no NEWER row of its (topic,
+///   partition, consumer group) exists, whatever the id: the answer that holds
+///   the unit's newest-created row is what the adapter falls back to when it
+///   cannot learn the topic's id, and pruning a lower-ending row of that
+///   incarnation (interleaved with rows of no id) would move it to another.
+///
 /// "Newer" is a row-value comparison on `(created_at, batch_id)`: the same
 /// order as `created_at >, or equal and batch_id >`, written so the planner
 /// can serve it as a range on the index's last two columns. With the OR form,
@@ -199,6 +205,18 @@ macro_rules! prune_predicate_sql {
                     > (CAST(json_extract(b.progress_end_json, '$.end_offset') AS INTEGER), \
                        b.created_at, b.batch_id) \
               ) \
+              AND EXISTS ( \
+                SELECT 1 FROM batches n \
+                WHERE n.state = ?1 \
+                  AND n.source_type = 'kafka' \
+                  AND json_extract(n.progress_end_json, '$.topic') \
+                      = json_extract(b.progress_end_json, '$.topic') \
+                  AND json_extract(n.progress_end_json, '$.partition') \
+                      = json_extract(b.progress_end_json, '$.partition') \
+                  AND json_extract(n.progress_end_json, '$.consumer_group') \
+                      = json_extract(b.progress_end_json, '$.consumer_group') \
+                  AND (n.created_at, n.batch_id) > (b.created_at, b.batch_id) \
+              ) \
               WHEN b.source_type = 'kafka' THEN EXISTS ( \
                 SELECT 1 FROM batches n \
                 WHERE n.state = ?1 \
@@ -210,6 +228,18 @@ macro_rules! prune_predicate_sql {
                   AND json_extract(n.progress_end_json, '$.consumer_group') \
                       = json_extract(b.progress_end_json, '$.consumer_group') \
                   AND json_extract(n.progress_end_json, '$.topic_id') IS NULL \
+                  AND (n.created_at, n.batch_id) > (b.created_at, b.batch_id) \
+              ) \
+              AND EXISTS ( \
+                SELECT 1 FROM batches n \
+                WHERE n.state = ?1 \
+                  AND n.source_type = 'kafka' \
+                  AND json_extract(n.progress_end_json, '$.topic') \
+                      = json_extract(b.progress_end_json, '$.topic') \
+                  AND json_extract(n.progress_end_json, '$.partition') \
+                      = json_extract(b.progress_end_json, '$.partition') \
+                  AND json_extract(n.progress_end_json, '$.consumer_group') \
+                      = json_extract(b.progress_end_json, '$.consumer_group') \
                   AND (n.created_at, n.batch_id) > (b.created_at, b.batch_id) \
               ) \
               ELSE EXISTS ( \
@@ -2026,12 +2056,13 @@ mod tests {
             "successor probe no longer uses idx_batches_commit_newest:\n{plan}"
         );
         // Both Kafka branches' probes - for a row of a known topic id ending
-        // higher, and for a row of no id with a newer one - are bounded by
-        // the partial index, for the same reason.
+        // higher, and for a row of no id with a newer one - and each one's
+        // probe for a newer row of the unit are bounded by the partial index,
+        // for the same reason.
         let kafka_probes = plan.matches("idx_batches_kafka_max_end").count();
         assert!(
-            kafka_probes >= 2,
-            "{kafka_probes} of the 2 Kafka probes use idx_batches_kafka_max_end:\n{plan}"
+            kafka_probes >= 4,
+            "{kafka_probes} of the 4 Kafka probes use idx_batches_kafka_max_end:\n{plan}"
         );
     }
 }

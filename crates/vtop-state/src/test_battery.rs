@@ -304,6 +304,7 @@ pub async fn run_fencing_battery(a: &dyn StateStore, b: &dyn StateStore) {
 pub async fn run_prune_battery(store: &dyn StateStore) {
     prune_preserves_cursor_seeds_and_bounds_deletion(store).await;
     prune_keeps_the_max_end_row_of_each_topic_incarnation(store).await;
+    pruning_does_not_move_the_answer_that_holds_the_newest_kafka_row(store).await;
     listed_prune_deletes_only_what_was_listed(store).await;
     superseded_rows_are_pruned_like_committed_history(store).await;
     prune_never_touches_the_audit_table(store).await;
@@ -2462,6 +2463,50 @@ async fn prune_preserves_cursor_seeds_and_bounds_deletion(store: &dyn StateStore
             "{deleted} must be pruned"
         );
     }
+}
+
+/// The answer that holds the newest-created committed row is what the adapter
+/// falls back to when it cannot learn the topic's id, so pruning must not move
+/// it: with rows of a known id and of none interleaved, a lower-ending row of
+/// the newest incarnation is not the highest of its id and not the newest of
+/// the rows with no id, and was deleted, which made another answer the newest.
+async fn pruning_does_not_move_the_answer_that_holds_the_newest_kafka_row(store: &dyn StateStore) {
+    let topic = "kafka_prune_newest";
+    for (id, topic_id, range, at) in [
+        ("a", Some("inc-1"), (0, 19), "00:00:01"),
+        ("b", None, (0, 5), "00:00:02"),
+        ("c", Some("inc-1"), (0, 9), "00:00:03"),
+    ] {
+        commit_kafka_row(
+            store,
+            &kafka_row(
+                topic,
+                0,
+                topic_id,
+                &format!("{topic}-{id}"),
+                range,
+                &format!("2030-05-01T{at}Z"),
+            ),
+        )
+        .await;
+    }
+    let before = vec![
+        kafka_answer(topic, 0, None, 5, false),
+        kafka_answer(topic, 0, Some("inc-1"), 19, true),
+    ];
+    assert_eq!(kafka_answers(store, topic, 0).await, before);
+    let future = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+    while store.prune_committed_history(&future, 2).await.unwrap() > 0 {}
+    assert_eq!(
+        kafka_answers(store, topic, 0).await,
+        before,
+        "the newest-created row (c) holds the fallback answer and must be kept"
+    );
+    assert!(store
+        .get_batch(&format!("{topic}-c"))
+        .await
+        .unwrap()
+        .is_some());
 }
 
 /// Pruning keeps the row the Kafka restart resumes from, for every incarnation
