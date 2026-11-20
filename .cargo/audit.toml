@@ -83,4 +83,16 @@ ignore = [
     # aws-smithy-http / aws-smithy-runtime. Remove when the AWS SDK drops its
     # dependency on pin-utils.
     "RUSTSEC-2026-0441",
+
+    # chrono 0.4.45 — unmaintained. An UNMAINTAINED notice, not a
+    # vulnerability: no exploitable defect is reported. chrono is a direct
+    # workspace dependency used for timestamps in manifests, the ledger, audit
+    # records and object keys (RFC 3339 formatting and parsing of values this
+    # engine writes, plus UTC arithmetic); no fixed release exists to move to.
+    # `cargo audit` reports it as a warning, but cargo-deny's `unmaintained`
+    # check fails on it, so it is ignored in both files. Replacing chrono (for
+    # example with `jiff` or `time`) changes every timestamp type in the
+    # workspace and is a deliberate migration, not a version bump. Remove when
+    # that migration lands, or when chrono is maintained again.
+    "RUSTSEC-2026-0543", # reviewed: 2026-11-20
 ]

@@ -169,7 +169,7 @@ Do not add AI-assistant co-author trailers or "generated with" lines.
 
 ## Security
 
-Do not open a public issue for a vulnerability. Contact the maintainer
-directly, and give the version, the configuration, and what an attacker gains —
-the security model this engine holds itself to is written down in
-[docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md).
+Do not open a public issue for a vulnerability. [SECURITY.md](SECURITY.md)
+says how to report one privately, how fast you will hear back, and which
+versions receive fixes. The security model this engine holds itself to is
+written down in [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md).
