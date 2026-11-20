@@ -472,6 +472,16 @@ def test_records_that_observed_nothing_are_not_samples():
     assert not criterion["passed"]
 
 
+def test_a_blind_prefix_or_suffix_fails_even_when_what_remains_is_evenly_spaced():
+    # No gap between the observations that exist, and a third of the run
+    # unobserved at one end.
+    samples, events, finals = healthy_run()
+    prefix_gone = [s for s in samples if s["elapsed_s"] >= 180]
+    assert "samples" in failed(verdict_of(prefix_gone, events, finals))
+    suffix_gone = [s for s in samples if s["elapsed_s"] <= 360]
+    assert "samples" in failed(verdict_of(suffix_gone, events, finals))
+
+
 def test_missing_lag_samples_fail_the_sampling_criterion_on_their_own():
     samples, events, finals = healthy_run()
     for i, s in enumerate(samples):

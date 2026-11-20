@@ -444,15 +444,22 @@ class Lab:
 
     def skew_marker(self) -> int | None:
         """The wall-clock second the shim recorded when the engine started
-        (already shifted by the skew), or None when no shim loaded."""
-        path = self.run_dir / "ctl" / "skew-loaded"
+        (already shifted by the skew), or None when no shim loaded. Read inside
+        the engine's container: the shim creates the file with mode 0600 as
+        the image's own user, whom the host's user is not."""
+        result = self.engine_exec("cat", f"{CONTAINER_CTL}/skew-loaded", timeout=30)
         try:
-            return int(path.read_text().strip())
-        except (OSError, ValueError):
+            return int(result.out.strip()) if result.ok else None
+        except ValueError:
             return None
 
     def clear_skew_marker(self) -> None:
-        (self.run_dir / "ctl" / "skew-loaded").unlink(missing_ok=True)
+        # The directory is world-writable, so the host may remove a file the
+        # engine's user made; the entrypoint removes it at start as well.
+        try:
+            (self.run_dir / "ctl" / "skew-loaded").unlink(missing_ok=True)
+        except PermissionError:
+            pass
 
     def start_engine(self, timeout: float = 120) -> None:
         self.require(self.docker("start", self.container("engine"), timeout=60), "docker start engine")

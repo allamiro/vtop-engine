@@ -341,11 +341,12 @@ def _coverage(times: list[float], wanted: float, limit: float, high: float) -> t
     """Whether `times` (inside [0, high]) number at least `wanted` with no gap
     over `limit`, and how to say so."""
     inside = sorted(t for t in times if 0 <= t <= high)
-    gap = max((b - a for a, b in zip(inside, inside[1:])), default=math.inf)
+    # The ends count: a run unobserved for its first hours has no gap between
+    # the observations it does have.
+    edges = [0.0, *inside, high]
+    gap = max(b - a for a, b in zip(edges, edges[1:]))
     ok = len(inside) >= wanted and gap <= limit
-    return ok, f"{len(inside)} (of at least {wanted:.0f}), largest gap {gap:.0f} s" if len(
-        inside
-    ) > 1 else f"{len(inside)}"
+    return ok, f"{len(inside)} (of at least {wanted:.0f}), largest gap {gap:.0f} s"
 
 
 def check_samples(profile: dict, samples: list[dict]) -> Criterion:

@@ -234,13 +234,31 @@ def test_set_preload_writes_and_clears_the_file_the_entrypoint_reads(tmp_path):
     assert not (tmp_path / "ctl" / "ld_preload").exists()
 
 
-def test_skew_marker_reads_the_time_the_shim_recorded(tmp_path):
-    lab = make_lab(tmp_path)
-    assert lab.skew_marker() is None
-    (tmp_path / "ctl" / "skew-loaded").write_text("1700003600\n")
+def test_skew_marker_is_read_inside_the_engine_container_as_the_user_that_wrote_it(tmp_path):
+    # The shim makes the file 0600 as the image's user; on a Linux host the
+    # driver's user cannot read it, so the host never opens it.
+    runner = Recorder({"cat": soak_lab.Result(0, "1700003600\n", "")})
+    lab = make_lab(tmp_path, runner)
+    (tmp_path / "ctl" / "skew-loaded").write_text("999")
+    (tmp_path / "ctl" / "skew-loaded").chmod(0)
     assert lab.skew_marker() == 1700003600
+    assert runner.calls[-1][:3] == ["docker", "exec", "vtop-t-engine"]
+    assert runner.calls[-1][3:] == ["cat", "/soak/ctl/skew-loaded"]
+
+
+def test_skew_marker_is_none_when_no_shim_loaded_or_the_file_is_unreadable(tmp_path):
+    absent = Recorder({"cat": soak_lab.Result(1, "", "cat: /soak/ctl/skew-loaded: No such file or directory")})
+    assert make_lab(tmp_path, absent).skew_marker() is None
+    garbled = Recorder({"cat": soak_lab.Result(0, "not a number", "")})
+    assert make_lab(tmp_path, garbled).skew_marker() is None
+
+
+def test_clearing_the_marker_tolerates_a_file_the_host_user_may_not_remove(tmp_path):
+    lab = make_lab(tmp_path)
+    (tmp_path / "ctl" / "skew-loaded").write_text("1")
     lab.clear_skew_marker()
-    assert lab.skew_marker() is None
+    assert not (tmp_path / "ctl" / "skew-loaded").exists()
+    lab.clear_skew_marker()  # absent: no error
 
 
 def test_toxiproxy_calls_go_to_the_proxy_api_and_a_refusal_is_an_error(tmp_path):
