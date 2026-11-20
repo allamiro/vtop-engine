@@ -178,22 +178,87 @@ async fn shutdown_signalled(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
 /// wait for it (review): `serve` returning means no such work still holds
 /// the bridge or the store, not merely that no session is open. A deadline
 /// abandons the WAIT for a call, never the call, which cannot be cancelled.
+///
+/// The count is kept twice (#751): in total, which the shutdown drain waits
+/// on because nothing new can arrive then, and per GENERATION, which a
+/// demotion waits on. A node that demotes keeps listening, so clients keep
+/// sending requests, and every one of them is a job. A drain of the total
+/// could be held open for ever by traffic that never touches the retired
+/// bridge; a drain of the generation that was running when the slot was
+/// cleared ends when that work does, whatever arrives after.
 #[derive(Default)]
 struct Jobs {
     active: std::sync::atomic::AtomicUsize,
     idle: tokio::sync::Notify,
+    generation: std::sync::Mutex<Arc<Generation>>,
+}
+
+/// The jobs started between two rotations.
+#[derive(Default)]
+struct Generation {
+    active: std::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+impl Generation {
+    fn active(&self) -> usize {
+        self.active.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Resolves once every job of this generation has ended. The wakeup is
+    /// registered before the count is read, so a job ending in between is not
+    /// missed.
+    async fn idle(&self) {
+        loop {
+            let notified = self.idle.notified();
+            if self.active() == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 impl Jobs {
+    /// Count a job in, in the current generation and in total. Counted
+    /// under the generation's lock, so a rotation sees the job either in the
+    /// generation it closes or not at all: it joins the next.
+    fn enter(self: &Arc<Self>) -> JobDone {
+        let generation = {
+            let current = self
+                .generation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            current
+                .active
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.active
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Arc::clone(&current)
+        };
+        JobDone {
+            jobs: Arc::clone(self),
+            generation,
+        }
+    }
+
+    /// Close the current generation and start the next, returning the one
+    /// closed: the jobs that were running or queued when this was called.
+    fn rotate(&self) -> Arc<Generation> {
+        let mut current = self
+            .generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut *current)
+    }
+
     fn blocking<T: Send + 'static>(
         self: &Arc<Self>,
         call: impl FnOnce() -> T + Send + 'static,
     ) -> tokio::task::JoinHandle<T> {
-        self.active
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let jobs = Arc::clone(self);
+        let done = self.enter();
         tokio::task::spawn_blocking(move || {
-            let _done = JobDone(jobs);
+            let _done = done;
             call()
         })
     }
@@ -202,11 +267,9 @@ impl Jobs {
         self: &Arc<Self>,
         work: impl std::future::Future<Output = T> + Send + 'static,
     ) -> tokio::task::JoinHandle<T> {
-        self.active
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let jobs = Arc::clone(self);
+        let done = self.enter();
         tokio::spawn(async move {
-            let _done = JobDone(jobs);
+            let _done = done;
             work.await
         })
     }
@@ -231,7 +294,8 @@ impl Jobs {
 /// What a quiesce found (#751).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Quiesced {
-    /// Calls handed to another task and still running when the wait began.
+    /// Calls handed to another task and still running when the wait began:
+    /// the ones the wait was for.
     pub in_flight: usize,
     /// How long the wait took.
     pub waited: Duration,
@@ -265,27 +329,35 @@ impl GatewayHandle {
         self.ceiling
     }
 
-    /// Wait until no call is in flight.
+    /// Wait until every call that was in flight when this was called has
+    /// ended.
     ///
     /// The caller empties the [`crate::slot::BridgeSlot`] FIRST: every call
-    /// that starts after that is refused without touching a bridge, and a
-    /// call counted here began before it, so when this returns no call holds
-    /// the retired bridge and the caller may drop it. This does NOT give up at
-    /// the ceiling. A call that outlives its ceiling is a bug the node reports
-    /// (`on_ceiling` runs once, with the count still in flight, when the wait
-    /// passes it), and the wait goes on, because dropping the broker under a
-    /// running call is the one outcome this exists to prevent.
+    /// that starts after that is refused without touching a bridge, so a call
+    /// that could hold the retired bridge began before it, and is counted in
+    /// the generation this closes. Work that arrives while this waits (a
+    /// follower still answers Metadata, and every request is a job) joins the
+    /// next generation and is never waited for: draining the gateway's total
+    /// would let unrelated traffic hold a demotion open for ever. When this
+    /// returns no call holds the retired bridge and the caller may drop it.
+    ///
+    /// This does NOT give up at the ceiling. A call that outlives its ceiling
+    /// is a bug the node reports (`on_ceiling` runs once, with the count of
+    /// that generation still running, when the wait passes it), and the wait
+    /// goes on, because dropping the broker under a running call is the one
+    /// outcome this exists to prevent.
     pub async fn quiesce(&self, on_ceiling: impl FnOnce(usize)) -> Quiesced {
         let started = std::time::Instant::now();
-        let in_flight = self.jobs.active();
+        let closed = self.jobs.rotate();
+        let in_flight = closed.active();
         let mut passed_ceiling = false;
-        if tokio::time::timeout(self.ceiling, self.jobs.idle())
+        if tokio::time::timeout(self.ceiling, closed.idle())
             .await
             .is_err()
         {
             passed_ceiling = true;
-            on_ceiling(self.jobs.active());
-            self.jobs.idle().await;
+            on_ceiling(closed.active());
+            closed.idle().await;
         }
         Quiesced {
             in_flight,
@@ -295,17 +367,28 @@ impl GatewayHandle {
     }
 }
 
-struct JobDone(Arc<Jobs>);
+struct JobDone {
+    jobs: Arc<Jobs>,
+    generation: Arc<Generation>,
+}
 
 impl Drop for JobDone {
     fn drop(&mut self) {
         if self
-            .0
+            .generation
             .active
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
             == 1
         {
-            self.0.idle.notify_waiters();
+            self.generation.idle.notify_waiters();
+        }
+        if self
+            .jobs
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            self.jobs.idle.notify_waiters();
         }
     }
 }

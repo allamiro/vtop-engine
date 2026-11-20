@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use vtop_kafka::{
     Appended, Bridge, BridgeSlot, ErrorCode, Fetched, Gateway, GatewayConfig, MemoryBridge,
-    RecordBatch, Refusal, Sequenced,
+    RecordBatch, Refusal, Sequenced, TopicBinding, TopicMap,
 };
 
 const NOT_LEADER: i16 = 6;
@@ -452,4 +452,119 @@ fn a_call_that_starts_after_the_slot_is_cleared_never_reaches_the_old_bridge() {
         0
     );
     drop(retired);
+}
+
+/// A node that demotes keeps listening, and every request a client sends is
+/// work the gateway counts. The quiesce waits for what was running when the
+/// slot was cleared, not for the gateway to go idle: traffic that never
+/// touches the retired bridge must not hold a demotion open. Red against a
+/// quiesce that waited on the gateway's total (a Codex finding on this PR).
+#[test]
+fn work_that_arrives_during_a_demotion_does_not_hold_it_open() {
+    fn gate() -> (
+        Arc<Gated>,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let bridge = Arc::new(Gated {
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+            appended: std::sync::atomic::AtomicUsize::new(0),
+        });
+        (bridge, entered, release)
+    }
+    let (leader, leader_entered, release_leader) = gate();
+    let (unrelated, unrelated_entered, release_unrelated) = gate();
+    let slot = Arc::new(BridgeSlot::new([TOPIC]));
+    slot.install(Arc::clone(&leader) as Arc<dyn Bridge>);
+    // Two Kafka names: the range's, behind the slot, and another backend this
+    // node's range has nothing to do with.
+    let topics = TopicMap::routed(vec![
+        TopicBinding {
+            name: TOPIC.to_owned(),
+            backend: Arc::clone(&slot) as Arc<dyn Bridge>,
+            backend_topic: TOPIC.to_owned(),
+        },
+        TopicBinding {
+            name: "other".to_owned(),
+            backend: Arc::clone(&unrelated) as Arc<dyn Bridge>,
+            backend_topic: TOPIC.to_owned(),
+        },
+    ])
+    .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let gateway = Gateway::from_topics(
+        topics,
+        GatewayConfig {
+            advertised_port: i32::from(addr.port()),
+            ..GatewayConfig::default()
+        },
+    );
+    let handle = gateway.handle();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (shutdown, rx) = tokio::sync::watch::channel(false);
+    runtime.spawn(async move {
+        let _keep = shutdown;
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let _ = gateway.serve(listener, rx).await;
+    });
+    // A failed assertion below must not hang the suite on a call parked in a
+    // gate: the gates are opened and the runtime abandoned on the way out.
+    struct Teardown(
+        Option<tokio::runtime::Runtime>,
+        Vec<std::sync::mpsc::Sender<()>>,
+    );
+    impl Drop for Teardown {
+        fn drop(&mut self) {
+            for gate in &self.1 {
+                let _ = gate.send(());
+            }
+            if let Some(runtime) = self.0.take() {
+                runtime.shutdown_background();
+            }
+        }
+    }
+    let teardown = Teardown(
+        Some(runtime),
+        vec![release_leader.clone(), release_unrelated.clone()],
+    );
+    let runtime = teardown.0.as_ref().unwrap();
+
+    let held = std::thread::spawn(move || produce(addr, TOPIC, &["held"]));
+    leader_entered.recv().unwrap();
+    let retired = slot.clear();
+    let quiescing = handle.clone();
+    let quiesce = runtime.spawn(async move { quiescing.quiesce(|_| ()).await });
+    std::thread::sleep(Duration::from_millis(300)); // the generation is closed
+    let arrives_later = std::thread::spawn(move || produce(addr, "other", &["unrelated"]));
+    unrelated_entered.recv().unwrap();
+    assert!(handle.in_flight() >= 2, "both calls are running");
+
+    release_leader.send(()).unwrap();
+    let report = runtime
+        .block_on(async { tokio::time::timeout(Duration::from_secs(5), quiesce).await })
+        .expect("the quiesce waited for work that arrived after it began")
+        .unwrap();
+    assert_eq!(
+        report.in_flight, 1,
+        "it was for the one call that held the bridge"
+    );
+    assert!(
+        handle.in_flight() >= 1,
+        "the unrelated call is still running"
+    );
+
+    release_unrelated.send(()).unwrap();
+    assert_eq!(held.join().unwrap(), (0, 0));
+    let _ = arrives_later.join().unwrap();
+    drop(retired);
+    drop(teardown);
 }
