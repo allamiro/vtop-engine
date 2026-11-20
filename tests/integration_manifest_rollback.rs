@@ -117,6 +117,7 @@ async fn seed_version(
         mtime: String::new(),
         content_fingerprint: None,
         tail_fingerprint: None,
+        ctime: None,
     };
     let object_bytes = b"archived-bytes";
     let object_digest = vtop_core::checksum::sha256_bytes(object_bytes);
@@ -195,6 +196,7 @@ async fn seed_version(
         manifest_version_id: None,
         object_size_bytes: Some(object_bytes.len() as i64),
         verification_class: None,
+        sealed_at: None,
         record_count: Some(1),
         error_message: None,
         owner: None,
@@ -259,6 +261,7 @@ async fn overwrite_current_manifest(sc: &Scenario, dir: &Path, replayed_count: u
         mtime: String::new(),
         content_fingerprint: None,
         tail_fingerprint: None,
+        ctime: None,
     };
     let (replayed, replayed_path) = build_manifest(
         &attack_work,

@@ -1,0 +1,565 @@
+# promtool unit tests for ../vtop-rules.yaml:
+#   promtool test rules observability/prometheus/tests/vtop-rules.test.yaml
+#
+# Every alert has a case that fires and a near miss that must stay quiet
+# (scripts/check-alert-runbooks.py fails an alert that lacks either). The
+# expected labels and annotations are the rendered ones, so a broken template
+# or a dropped label fails here.
+#
+# Series use the engine's real label sets: job and instance from the scrape,
+# tenant/source_type/format from the engine. `_` is a missing sample.
+
+rule_files:
+- ../vtop-rules.yaml
+evaluation_interval: 1m
+tests:
+- name: 'VtopVerificationFailures: fires when the counter increases'
+  interval: 1m
+  input_series:
+  - series: vtop_verification_failures_total{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="file",format="jsonl"}
+    values: 1x15 2x15
+  alert_rule_test:
+  - eval_time: 10m
+    alertname: VtopVerificationFailures
+    exp_alerts: []
+  - eval_time: 20m
+    alertname: VtopVerificationFailures
+    exp_alerts:
+    - exp_labels:
+        severity: page
+        job: vtop-engine
+        instance: engine-1:9090
+        tenant: default
+        source_type: file
+        format: jsonl
+      exp_annotations:
+        summary: Verification failed for default/file/jsonl on engine-1:9090
+        description: A stored object or manifest did not match what the engine uploaded. The batch was not committed and its data is still in the source. Find the batch id in the engine's verification WARN lines, check the object store, then run vtopctl scrub over the affected range.
+        runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopverificationfailures
+- name: 'VtopVerificationFailures: fires on the first failure, when the series first appears'
+  interval: 1m
+  input_series:
+  - series: vtop_verification_failures_total{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="file",format="jsonl"}
+    values: _x5 1x20
+  alert_rule_test:
+  - eval_time: 4m
+    alertname: VtopVerificationFailures
+    exp_alerts: []
+  - eval_time: 8m
+    alertname: VtopVerificationFailures
+    exp_alerts:
+    - exp_labels:
+        severity: page
+        job: vtop-engine
+        instance: engine-1:9090
+        tenant: default
+        source_type: file
+        format: jsonl
+      exp_annotations:
+        summary: Verification failed for default/file/jsonl on engine-1:9090
+        description: A stored object or manifest did not match what the engine uploaded. The batch was not committed and its data is still in the source. Find the batch id in the engine's verification WARN lines, check the object store, then run vtopctl scrub over the affected range.
+        runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopverificationfailures
+  - eval_time: 20m
+    alertname: VtopVerificationFailures
+    exp_alerts: []
+- name: 'VtopVerificationFailures: quiet for a counter that stays flat (an old failure)'
+  interval: 1m
+  input_series:
+  - series: vtop_verification_failures_total{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="file",format="jsonl"}
+    values: 1x60
+  alert_rule_test:
+  - eval_time: 40m
+    alertname: VtopVerificationFailures
+    exp_alerts: []
+- name: 'VtopNoCommits: fires 30 minutes after the last commit while data is waiting'
+  interval: 1m
+  input_series:
+  - series: vtop_commits_total{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="file",format="jsonl"}
+    values: 0+1x20 20x60
+  - series: vtop_inflight_batches{job="vtop-engine",instance="engine-1:9090"}
+    values: 1x80
+  alert_rule_test:
+  - eval_time: 45m
+    alertname: VtopNoCommits
+    exp_alerts: []
+  - eval_time: 50m
+    alertname: VtopNoCommits
+    exp_alerts:
+    - exp_labels:
+        severity: page
+        job: vtop-engine
+        instance: engine-1:9090
+      exp_annotations:
+        summary: No batch committed for 30 minutes on engine-1:9090 while data is waiting
+        description: The engine has batches in memory but has not committed one for 30 minutes, so nothing is being archived and source progress is not moving. Check the engine's WARN and ERROR lines and vtopctl status for where batches stop (upload, verify or the state store).
+        runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopnocommits
+- name: 'VtopNoCommits: quiet for an idle engine (nothing waiting)'
+  interval: 1m
+  input_series:
+  - series: vtop_commits_total{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="file",format="jsonl"}
+    values: 20x80
+  - series: vtop_inflight_batches{job="vtop-engine",instance="engine-1:9090"}
+    values: '0x80'
+  alert_rule_test:
+  - eval_time: 50m
+    alertname: VtopNoCommits
+    exp_alerts: []
+  - eval_time: 75m
+    alertname: VtopNoCommits
+    exp_alerts: []
+- name: 'VtopNoCommits: quiet while batches commit'
+  interval: 1m
+  input_series:
+  - series: vtop_commits_total{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="file",format="jsonl"}
+    values: 0+1x80
+  - series: vtop_inflight_batches{job="vtop-engine",instance="engine-1:9090"}
+    values: 1x80
+  alert_rule_test:
+  - eval_time: 50m
+    alertname: VtopNoCommits
+    exp_alerts: []
+  - eval_time: 75m
+    alertname: VtopNoCommits
+    exp_alerts: []
+- name: 'VtopNoCommits: fires for an engine that has not committed once since it started'
+  interval: 1m
+  input_series:
+  - series: vtop_inflight_batches{job="vtop-engine",instance="engine-1:9090"}
+    values: 1x40
+  alert_rule_test:
+  - eval_time: 15m
+    alertname: VtopNoCommits
+    exp_alerts: []
+  - eval_time: 25m
+    alertname: VtopNoCommits
+    exp_alerts:
+    - exp_labels:
+        severity: page
+        job: vtop-engine
+        instance: engine-1:9090
+      exp_annotations:
+        summary: No batch committed for 30 minutes on engine-1:9090 while data is waiting
+        description: The engine has batches in memory but has not committed one for 30 minutes, so nothing is being archived and source progress is not moving. Check the engine's WARN and ERROR lines and vtopctl status for where batches stop (upload, verify or the state store).
+        runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopnocommits
+- name: 'VtopReplayRateSpike: fires on a spike over a quiet baseline'
+  interval: 1m
+  input_series:
+  - series: vtop_replay_required_total{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="file",format="jsonl"}
+    values: 0x400 0+20x30
+  alert_rule_test:
+  - eval_time: 400m
+    alertname: VtopReplayRateSpike
+    exp_alerts: []
+  - eval_time: 420m
+    alertname: VtopReplayRateSpike
+    exp_alerts:
+    - exp_labels:
+        severity: ticket
+        job: vtop-engine
+        instance: engine-1:9090
+        tenant: default
+        source_type: file
+        format: jsonl
+      exp_annotations:
+        summary: Replays of default/file/jsonl on engine-1:9090 are well above their usual rate
+        description: Batches are failing after they were sealed and are being re-read from the source. Nothing is lost while the source still holds the data, but the work is repeated. Read the engine's WARN lines for why batches fail (upload, verification, Object Lock or the state store) and fix that cause.
+        runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopreplayratespike
+- name: 'VtopReplayRateSpike: quiet at a high rate that is this stream''s usual rate'
+  interval: 1m
+  input_series:
+  - series: vtop_replay_required_total{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="file",format="jsonl"}
+    values: 0+20x450
+  alert_rule_test:
+  - eval_time: 420m
+    alertname: VtopReplayRateSpike
+    exp_alerts: []
+- name: 'VtopReplayRateSpike: quiet for a rise below the floor'
+  interval: 1m
+  input_series:
+  - series: vtop_replay_required_total{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="file",format="jsonl"}
+    values: 0x400 0+0.1x30
+  alert_rule_test:
+  - eval_time: 420m
+    alertname: VtopReplayRateSpike
+    exp_alerts: []
+- name: 'VtopSourceLagGrowing: fires on lag that rises for 30 minutes'
+  interval: 1m
+  input_series:
+  - series: kafka_consumergroup_lag{job="kafka-exporter",instance="kafka-exporter:9308",consumergroup="vtop-engine",topic="telemetry",partition="0"}
+    values: 0+10x60
+  - series: kafka_consumergroup_lag{job="kafka-exporter",instance="kafka-exporter:9308",consumergroup="vtop-engine",topic="telemetry",partition="1"}
+    values: 5x60
+  alert_rule_test:
+  - eval_time: 20m
+    alertname: VtopSourceLagGrowing
+    exp_alerts: []
+  - eval_time: 35m
+    alertname: VtopSourceLagGrowing
+    exp_alerts:
+    - exp_labels:
+        severity: ticket
+        job: kafka-exporter
+        instance: kafka-exporter:9308
+        consumergroup: vtop-engine
+        topic: telemetry
+      exp_annotations:
+        summary: Kafka lag of consumer group vtop-engine on telemetry (kafka-exporter:9308) has risen for 30 minutes
+        description: The engine is reading this topic more slowly than it is written. If the lag reaches the topic's retention, records are deleted before they are archived (VtopRetentionLoss). Check upload throughput and throttling, then scale the engine or raise the topic's retention.
+        runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopsourcelaggrowing
+- name: 'VtopSourceLagGrowing: fires per Kafka cluster, so a falling lag elsewhere does not cancel a rising one'
+  interval: 1m
+  input_series:
+  - series: kafka_consumergroup_lag{job="kafka-exporter",instance="cluster-a-exporter:9308",consumergroup="vtop-engine",topic="telemetry",partition="0"}
+    values: 0+10x60
+  - series: kafka_consumergroup_lag{job="kafka-exporter",instance="cluster-b-exporter:9308",consumergroup="vtop-engine",topic="telemetry",partition="0"}
+    values: 1000-10x60
+  alert_rule_test:
+  - eval_time: 35m
+    alertname: VtopSourceLagGrowing
+    exp_alerts:
+    - exp_labels:
+        severity: ticket
+        job: kafka-exporter
+        instance: cluster-a-exporter:9308
+        consumergroup: vtop-engine
+        topic: telemetry
+      exp_annotations:
+        summary: Kafka lag of consumer group vtop-engine on telemetry (cluster-a-exporter:9308) has risen for 30 minutes
+        description: The engine is reading this topic more slowly than it is written. If the lag reaches the topic's retention, records are deleted before they are archived (VtopRetentionLoss). Check upload throughput and throttling, then scale the engine or raise the topic's retention.
+        runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopsourcelaggrowing
+- name: 'VtopSourceLagGrowing: quiet for lag that is high but not rising'
+  interval: 1m
+  input_series:
+  - series: kafka_consumergroup_lag{job="kafka-exporter",instance="kafka-exporter:9308",consumergroup="vtop-engine",topic="telemetry",partition="0"}
+    values: 1000x60
+  alert_rule_test:
+  - eval_time: 45m
+    alertname: VtopSourceLagGrowing
+    exp_alerts: []
+- name: 'VtopSourceLagGrowing: quiet for another consumer group''s lag'
+  interval: 1m
+  input_series:
+  - series: kafka_consumergroup_lag{job="kafka-exporter",instance="kafka-exporter:9308",consumergroup="other-app",topic="telemetry",partition="0"}
+    values: 0+10x60
+  alert_rule_test:
+  - eval_time: 45m
+    alertname: VtopSourceLagGrowing
+    exp_alerts: []
+- name: 'VtopSizeOnlyVerification: fires when the engine started in size_only mode'
+  interval: 1m
+  input_series:
+  - series: vtop_verification_mode{job="vtop-engine",instance="engine-1:9090",tenant="default",mode="size_only"}
+    values: 1x10
+  - series: vtop_verification_mode{job="vtop-engine",instance="engine-1:9090",tenant="default",mode="strong"}
+    values: '0x10'
+  alert_rule_test:
+  - eval_time: 5m
+    alertname: VtopSizeOnlyVerification
+    exp_alerts:
+    - exp_labels:
+        severity: ticket
+        job: vtop-engine
+        instance: engine-1:9090
+        tenant: default
+        mode: size_only
+      exp_annotations:
+        summary: Engine engine-1:9090 verifies tenant default by size only
+        description: upload.require_strong_verification is false, so a stored object of the right size but wrong content is committed. Turn on strong verification (a backend and checksum that can hash the stored bytes), or record why this deployment accepts size-only checks.
+        runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopsizeonlyverification
+- name: 'VtopSizeOnlyVerification: quiet under strong verification'
+  interval: 1m
+  input_series:
+  - series: vtop_verification_mode{job="vtop-engine",instance="engine-1:9090",tenant="default",mode="size_only"}
+    values: '0x10'
+  - series: vtop_verification_mode{job="vtop-engine",instance="engine-1:9090",tenant="default",mode="strong"}
+    values: 1x10
+  alert_rule_test:
+  - eval_time: 5m
+    alertname: VtopSizeOnlyVerification
+    exp_alerts: []
+- name: 'VtopObjectLockCheckFailed: fires on a check result other than ok'
+  interval: 1m
+  input_series:
+  - series: vtop_object_lock_checks_total{job="vtop-engine",instance="engine-1:9090",tenant="default",result="ok"}
+    values: 0+2x30
+  - series: vtop_object_lock_checks_total{job="vtop-engine",instance="engine-1:9090",tenant="default",result="missing"}
+    values: 0x10 1x20
+  alert_rule_test:
+  - eval_time: 15m
+    alertname: VtopObjectLockCheckFailed
+    exp_alerts:
+    - exp_labels:
+        severity: page
+        job: vtop-engine
+        instance: engine-1:9090
+        tenant: default
+        result: missing
+      exp_annotations:
+        summary: Object Lock check failed (missing) for tenant default on engine-1:9090
+        description: A written or reused object or manifest is not under the retention upload.object_lock asks for, or its bucket has no Object Lock. The batch failed and will be replayed. Read the object_lock_check_failed or object_lock_bucket_refused ERROR line, then fix the bucket or the credentials' retention permissions.
+        runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopobjectlockcheckfailed
+# Review of #772: primed at zero in the engine, but a check can fail before
+# Prometheus's first scrape, so the first sample it sees is already 1 and
+# increase() never moves.
+- name: 'VtopObjectLockCheckFailed: fires on a failure Prometheus first sees as non-zero'
+  interval: 1m
+  input_series:
+  - series: vtop_object_lock_checks_total{job="vtop-engine",instance="engine-1:9090",tenant="default",result="ok"}
+    values: _x5 3+2x25
+  - series: vtop_object_lock_checks_total{job="vtop-engine",instance="engine-1:9090",tenant="default",result="missing"}
+    values: _x5 1x25
+  alert_rule_test:
+  - eval_time: 8m
+    alertname: VtopObjectLockCheckFailed
+    exp_alerts:
+    - exp_labels:
+        severity: page
+        job: vtop-engine
+        instance: engine-1:9090
+        tenant: default
+        result: missing
+      exp_annotations:
+        summary: Object Lock check failed (missing) for tenant default on engine-1:9090
+        description: A written or reused object or manifest is not under the retention upload.object_lock asks for, or its bucket has no Object Lock. The batch failed and will be replayed. Read the object_lock_check_failed or object_lock_bucket_refused ERROR line, then fix the bucket or the credentials' retention permissions.
+        runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopobjectlockcheckfailed
+- name: 'VtopObjectLockCheckFailed: quiet while every check is ok'
+  interval: 1m
+  input_series:
+  - series: vtop_object_lock_checks_total{job="vtop-engine",instance="engine-1:9090",tenant="default",result="ok"}
+    values: 0+2x30
+  - series: vtop_object_lock_checks_total{job="vtop-engine",instance="engine-1:9090",tenant="default",result="missing"}
+    values: '0x30'
+  - series: vtop_object_lock_checks_total{job="vtop-engine",instance="engine-1:9090",tenant="default",result="bucket_not_locked"}
+    values: '0x30'
+  alert_rule_test:
+  - eval_time: 20m
+    alertname: VtopObjectLockCheckFailed
+    exp_alerts: []
+- name: 'VtopRetentionLoss: fires on an increase of the primed counter'
+  interval: 1m
+  input_series:
+  - series: vtop_retention_lost_records_total{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="kafka"}
+    values: 0x10 500x20
+  alert_rule_test:
+  - eval_time: 15m
+    alertname: VtopRetentionLoss
+    exp_alerts:
+    - exp_labels:
+        severity: page
+        job: vtop-engine
+        instance: engine-1:9090
+        tenant: default
+        source_type: kafka
+      exp_annotations:
+        summary: Source retention deleted records engine-1:9090 had not read (default/kafka)
+        description: Records were removed by the source's retention before the engine read them. They will never be archived. Read the WARN line for the topic and partition, record the loss, and raise the topic's retention above the engine's worst-case lag.
+        runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopretentionloss
+- name: 'VtopRetentionLoss: fires on a series that first appears with the loss'
+  interval: 1m
+  input_series:
+  - series: vtop_retention_lost_records_total{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="kafka"}
+    values: _x5 500x20
+  alert_rule_test:
+  - eval_time: 8m
+    alertname: VtopRetentionLoss
+    exp_alerts:
+    - exp_labels:
+        severity: page
+        job: vtop-engine
+        instance: engine-1:9090
+        tenant: default
+        source_type: kafka
+      exp_annotations:
+        summary: Source retention deleted records engine-1:9090 had not read (default/kafka)
+        description: Records were removed by the source's retention before the engine read them. They will never be archived. Read the WARN line for the topic and partition, record the loss, and raise the topic's retention above the engine's worst-case lag.
+        runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopretentionloss
+- name: 'VtopRetentionLoss: quiet while nothing is lost'
+  interval: 1m
+  input_series:
+  - series: vtop_retention_lost_records_total{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="kafka"}
+    values: '0x40'
+  alert_rule_test:
+  - eval_time: 30m
+    alertname: VtopRetentionLoss
+    exp_alerts: []
+- name: 'VtopSourceReplayRefused: fires on a refused range'
+  interval: 1m
+  input_series:
+  - series: vtop_source_replay_refused_total{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="file"}
+    values: 0x10 1x20
+  alert_rule_test:
+  - eval_time: 15m
+    alertname: VtopSourceReplayRefused
+    exp_alerts:
+    - exp_labels:
+        severity: page
+        job: vtop-engine
+        instance: engine-1:9090
+        tenant: default
+        source_type: file
+      exp_annotations:
+        summary: A failed range could not be re-read from file on engine-1:9090
+        description: 'A batch failed and its source refused to hand the range back (for a file: truncated, rewritten, or rotated away and removed). That range is missing from the archive. The path is in the ERROR line beside the count; recover the data from another copy if one exists.'
+        runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopsourcereplayrefused
+# Review of #772: as for Object Lock, a range refused before the first
+# scrape shows up as a series whose first sample is already 1.
+- name: 'VtopSourceReplayRefused: fires on a refusal Prometheus first sees as non-zero'
+  interval: 1m
+  input_series:
+  - series: vtop_source_replay_refused_total{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="file"}
+    values: _x5 1x25
+  alert_rule_test:
+  - eval_time: 8m
+    alertname: VtopSourceReplayRefused
+    exp_alerts:
+    - exp_labels:
+        severity: page
+        job: vtop-engine
+        instance: engine-1:9090
+        tenant: default
+        source_type: file
+      exp_annotations:
+        summary: A failed range could not be re-read from file on engine-1:9090
+        description: 'A batch failed and its source refused to hand the range back (for a file: truncated, rewritten, or rotated away and removed). That range is missing from the archive. The path is in the ERROR line beside the count; recover the data from another copy if one exists.'
+        runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopsourcereplayrefused
+- name: 'VtopSourceReplayRefused: quiet while every failed range is re-read'
+  interval: 1m
+  input_series:
+  - series: vtop_source_replay_refused_total{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="file"}
+    values: '0x30'
+  alert_rule_test:
+  - eval_time: 20m
+    alertname: VtopSourceReplayRefused
+    exp_alerts: []
+# The counter is not primed: its series appears with the first hold, at
+# startup, and stays flat until the engine restarts. increase() would see
+# nothing, so the rule fires on the value (#785's example did the same).
+- name: 'VtopRecoveryLedgerWriteFailed: fires when the series first appears with a hold, and stays firing until a restart'
+  interval: 1m
+  input_series:
+  - series: vtop_recovery_held_total{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="kafka",reason="ledger_write_failed"}
+    values: _x5 2x25
+  alert_rule_test:
+  - eval_time: 4m
+    alertname: VtopRecoveryLedgerWriteFailed
+    exp_alerts: []
+  - eval_time: 6m
+    alertname: VtopRecoveryLedgerWriteFailed
+    exp_alerts:
+    - exp_labels:
+        severity: page
+        job: vtop-engine
+        instance: engine-1:9090
+        tenant: default
+        source_type: kafka
+        reason: ledger_write_failed
+      exp_annotations:
+        summary: Recovery on engine-1:9090 could not record its replay decision for default/kafka ranges
+        description: "At startup the state store refused recovery's write of a replay decision, so recovery held those ranges instead of rewinding them. Nothing is lost: each held range is read again with the ranges above it, which are archived twice. Check the state store's disk, permissions and connectivity; the batch ids are in the ERROR lines beside the count. The alert clears when the engine restarts without a hold."
+        runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtoprecoveryledgerwritefailed
+  - eval_time: 29m
+    alertname: VtopRecoveryLedgerWriteFailed
+    exp_alerts:
+    - exp_labels:
+        severity: page
+        job: vtop-engine
+        instance: engine-1:9090
+        tenant: default
+        source_type: kafka
+        reason: ledger_write_failed
+      exp_annotations:
+        summary: Recovery on engine-1:9090 could not record its replay decision for default/kafka ranges
+        description: "At startup the state store refused recovery's write of a replay decision, so recovery held those ranges instead of rewinding them. Nothing is lost: each held range is read again with the ranges above it, which are archived twice. Check the state store's disk, permissions and connectivity; the batch ids are in the ERROR lines beside the count. The alert clears when the engine restarts without a hold."
+        runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtoprecoveryledgerwritefailed
+- name: 'VtopRecoveryLedgerWriteFailed: quiet for a range held because a newer release wrote its manifest'
+  interval: 1m
+  input_series:
+  - series: vtop_recovery_held_total{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="kafka",reason="newer_manifest"}
+    values: _x5 1x25
+  alert_rule_test:
+  - eval_time: 10m
+    alertname: VtopRecoveryLedgerWriteFailed
+    exp_alerts: []
+- name: 'VtopRecoveryLedgerWriteFailed: quiet after a restart that held nothing'
+  interval: 1m
+  input_series:
+  # Held at the first start; after the restart at 10m the series is gone.
+  - series: vtop_recovery_held_total{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="kafka",reason="ledger_write_failed"}
+    values: 1x10 _x20
+  alert_rule_test:
+  - eval_time: 20m
+    alertname: VtopRecoveryLedgerWriteFailed
+    exp_alerts: []
+- name: 'VtopMultipartSessionsPiling: fires when kept sessions are neither resumed nor swept'
+  interval: 30m
+  input_series:
+  # One session kept at 2 h, never resumed and never swept.
+  - series: vtop_multipart_sessions_total{job="vtop-engine",instance="engine-1:9090",outcome="kept_after_failure"}
+    values: 0x3 1x90
+  - series: vtop_multipart_sessions_total{job="vtop-engine",instance="engine-1:9090",outcome="resumed"}
+    values: '0x93'
+  - series: vtop_multipart_sessions_total{job="vtop-engine",instance="engine-1:9090",outcome="swept"}
+    values: '0x93'
+  - series: vtop_multipart_sessions_total{job="vtop-engine",instance="engine-1:9090",outcome="completed"}
+    values: 0+5x93
+  alert_rule_test:
+  - eval_time: 34h
+    alertname: VtopMultipartSessionsPiling
+    exp_alerts:
+    - exp_labels:
+        severity: ticket
+        job: vtop-engine
+        instance: engine-1:9090
+      exp_annotations:
+        summary: Incomplete multipart uploads on engine-1:9090 are kept and never resumed or swept
+        description: Failed uploads kept their multipart sessions for the replay, but for over a day none was resumed and none swept, so their parts stay billed in the bucket. Check the engine's multipart_sweep_failed events and the bucket's lifecycle rule for incomplete uploads.
+        runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopmultipartsessionspiling
+# Review of #772: the session is younger than the abandon window plus one
+# sweep interval, so the sweep has not been due yet. The rule as first
+# written fired an hour after the session was kept.
+- name: 'VtopMultipartSessionsPiling: quiet while a kept session is within the abandon window'
+  interval: 30m
+  input_series:
+  - series: vtop_multipart_sessions_total{job="vtop-engine",instance="engine-1:9090",outcome="kept_after_failure"}
+    values: 0x3 1x90
+  - series: vtop_multipart_sessions_total{job="vtop-engine",instance="engine-1:9090",outcome="resumed"}
+    values: '0x93'
+  - series: vtop_multipart_sessions_total{job="vtop-engine",instance="engine-1:9090",outcome="swept"}
+    values: '0x93'
+  alert_rule_test:
+  - eval_time: 4h
+    alertname: VtopMultipartSessionsPiling
+    exp_alerts: []
+  - eval_time: 26h
+    alertname: VtopMultipartSessionsPiling
+    exp_alerts: []
+  - eval_time: 31h
+    alertname: VtopMultipartSessionsPiling
+    exp_alerts: []
+- name: 'VtopMultipartSessionsPiling: quiet when a kept session is resumed'
+  interval: 30m
+  input_series:
+  - series: vtop_multipart_sessions_total{job="vtop-engine",instance="engine-1:9090",outcome="kept_after_failure"}
+    values: 0x3 1x90
+  - series: vtop_multipart_sessions_total{job="vtop-engine",instance="engine-1:9090",outcome="resumed"}
+    values: 0x5 1x88
+  - series: vtop_multipart_sessions_total{job="vtop-engine",instance="engine-1:9090",outcome="swept"}
+    values: '0x93'
+  alert_rule_test:
+  - eval_time: 34h
+    alertname: VtopMultipartSessionsPiling
+    exp_alerts: []
+- name: 'VtopMultipartSessionsPiling: quiet when the sweep aborts kept sessions'
+  interval: 30m
+  input_series:
+  - series: vtop_multipart_sessions_total{job="vtop-engine",instance="engine-1:9090",outcome="kept_after_failure"}
+    values: 0x3 1x90
+  - series: vtop_multipart_sessions_total{job="vtop-engine",instance="engine-1:9090",outcome="resumed"}
+    values: '0x93'
+  # The sweep aborts it at 27 h, past the 24 h window.
+  - series: vtop_multipart_sessions_total{job="vtop-engine",instance="engine-1:9090",outcome="swept"}
+    values: 0x53 1x40
+  alert_rule_test:
+  - eval_time: 34h
+    alertname: VtopMultipartSessionsPiling
+    exp_alerts: []

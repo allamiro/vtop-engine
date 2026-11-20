@@ -88,6 +88,11 @@ ignore = [
     # cargo-deny's `unmaintained` check fails on it, so it is ignored here;
     # mirrored in .cargo/audit.toml. Remove when the AWS SDK drops pin-utils.
     "RUSTSEC-2026-0441",
+    # chrono 0.4.45 — unmaintained, no fixed release. A direct dependency for
+    # timestamps the engine writes and reads back; replacing it is a workspace
+    # migration. cargo-deny's `unmaintained` check fails on it. Mirrors
+    # .cargo/audit.toml, which carries the full justification.
+    "RUSTSEC-2026-0543", # reviewed: 2026-11-20
     # NOTE: RUSTSEC-2023-0071 (rsa) is ignored in .cargo/audit.toml but is NOT
     # listed here on purpose. cargo-audit reads Cargo.lock, so it sees `rsa`;
     # cargo-deny builds a feature-aware graph and does not, because `rsa` is

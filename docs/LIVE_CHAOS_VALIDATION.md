@@ -115,7 +115,7 @@ checks is a gate that silently stops working.
 | `11-admin-authorization` | Admin transport authorization enforced by the running binary over real mTLS (#238) | An operator certificate retains the full surface; a data-node certificate is refused membership changes (and the refusal says so), may still read, and can still acquire its **own** range lease — so the policy does not break the failover path. |
 | `12-data-replica-replacement` | A data replica is lost permanently; a fresh node joins, is repaired from a survivor, and the dead replica is retired (#242) | The replica set committed is the one placement computed; `vtopctl node repair` populates the newcomer byte-for-byte and the artifact verifies independently; retirement is **refused before** the replacement proof commits and accepted after; every previously acknowledged record remains readable. |
 | `13-orderly-shutdown` | The range leader and a follower are stopped with SIGTERM instead of SIGKILL (#280) | The signal is handled within a deadline (an ignored SIGTERM fails the scenario); the departing leader releases its range lease so the replacement acquires it without waiting out the lease deadline; every acknowledged record is readable after the handoff; both stopping nodes write their final commit boundary; the stopped leader's sealed artifact verifies offline. |
-| `14-candidate-failover` | Three identical candidate configs; the range leader is SIGKILLed mid-hold (#284) | Exactly one candidate takes the range from ONE config shape — the winner is not scripted; quorum produce lands at the winner's own native address; after the kill a SURVIVOR takes the range with no process started, no config rewritten, and no port moved — the promotion appears in its log as a role change, not a restart; quorum produce resumes at the new epoch on the survivor's own address; every record acknowledged before the kill is intact. |
+| `14-candidate-failover` | Three identical candidate configs; the range leader is SIGKILLed mid-hold (#284) | Exactly one candidate takes the range from ONE config shape — the winner is not scripted; quorum produce lands at the winner's own native address; after the kill a SURVIVOR takes the range with no process started, no config rewritten, and no port moved — the promotion appears in its log as a role change, not a restart; quorum produce resumes at the new epoch on the survivor's own address; every record acknowledged before the kill is intact; the survivor serves within 3 s (`CHAOS_PROMOTION_SERVE_LIMIT_MS`) of the lease changing hands, at a write quorum of replica streams, and logs that it serves with 1 of 2 streams connected (#750: it used to wait its whole 10 s deadline for the killed leader's stream). |
 | `15-plaintext-lab` | The whole cluster on loopback without a certificate: every plane `transport: plaintext` (#294) | The lab boots and serves; a leased replicated leader is refused on a plaintext replica plane, naming the knob to turn (`replica_transport: tls`); a plaintext listener off loopback is refused, naming the way out; the warnings are on the log. |
 | `16-kafka-gateway` | A standalone node serves Kafka's wire protocol beside its native plane (#225), exercised with nothing but bash and `/dev/tcp` | ApiVersions v0 answers with the served keys; Metadata v1 names the range's topic behind the gateway; a version outside the served range is refused by closing the connection; the ready line names the listener and the node warns that the protocol carries no vtop identity. |
 | `17-kafka-stock-client` | librdkafka (`kcat`) against the gateway on a leader with two followers; one follower is `SIGKILL`ed while ONE paced producer is mid-stream (#225 acceptance) | 20,000 keyed records produced with `acks=all` by one process, every delivery a quorum acknowledgement; the kill lands after a watermark floor and before the stream ends (the scenario fails if the producer had already finished); the same process finishes with no failed delivery and the watermark reaches 20,000; the same client reads everything back byte-exact and in order from `-o beginning`; the surviving follower's committed offset covers every acknowledgement; the leader's and the follower's sealed segments pass `vtopctl segment verify`. |
@@ -162,6 +162,115 @@ truncates any tail beyond the durable commit boundary, then `vtopctl segment
 verify` checks the resulting sealed bundle. For the disk-full follower, the
 quiesced namespace-visible active file and commit boundary are copied out
 before its private tmpfs disappears.
+
+## Engine crash sweep (#725)
+
+The scenarios above drive the cluster plane. The archive engine (`vtopctl
+run`: a source, batches, the object store, the ledger) has its own harness,
+`scripts/live-chaos/engine/run-sweep.sh`, which sources the same `lib.sh`. It
+kills the engine with `SIGKILL` at every failpoint, against a real Kafka
+broker, the lab's MinIO and a SQLite ledger, restarts it and checks what the
+restart made of it.
+
+**System model.** One crash-recovery engine process; a partially synchronous
+network; honest processes. The only fault is the `SIGKILL`.
+
+**How the kill lands.** A failpoint, not a timer: a build with the cargo
+feature `failpoints` reads `VTOP_FAILPOINT=<point>` (or `<point>:<n>` for the
+nth hit) and, on reaching that line, sends itself `SIGKILL`: no destructor
+runs and nothing is flushed. The feature is off by default; without it the
+hook is an empty inline function and the variable is not read. No release
+archive, container image or chart enables it, and
+`scripts/check-failpoints-absent.sh` (the `failpoints absent from release
+builds` job) fails if the workspace's default features, `release.yml` or the
+Dockerfile ever would. The same script, given a built binary, looks for the
+line the failpoint prints before the kill: ci.yml's test job runs it on its
+release build of `vtopctl` (it must be absent), and the sweep runs it on its
+own build (it must be present, the positive control). An unknown point refuses to start and lists the valid
+ones; the sweep reads its point list from that refusal, so the list lives in
+one place (`crates/vtop-cli/src/failpoints.rs`) and a full run fails if it
+did not run every entry.
+
+**The points.** Ledger points are placed by a decorator around the state
+store, so every path that writes a transition (the pipeline, recovery, the
+settle pass) has them; the others are explicit calls.
+
+| Point | Where the engine is when it dies | Ledger row at the kill |
+|---|---|---|
+| `before_insert`, `after_insert` | around the row's first write | none / `BATCHING` |
+| `before_ledger_<S>`, `after_ledger_<S>` for S in `sealed`, `compressed`, `checksummed`, `object_uploaded`, `manifest_uploaded`, `verified`, `source_committed` | around the transition to S | the state before S / S |
+| `mid_object_put` | a multipart upload has stored a part and is not complete (the sweep sends this leg's objects as multipart) | `CHECKSUMMED` |
+| `after_object_put_before_ledger` | the object is in the store, the ledger does not say so | `CHECKSUMMED` |
+| `after_manifest_put_before_ledger` | the manifest is in the store, the ledger does not say so | `OBJECT_UPLOADED` |
+| `before_source_commit` | VERIFIED is in the ledger, the Kafka offset is not committed | `VERIFIED` |
+| `after_source_commit_before_ledger` | the Kafka offset is committed, SOURCE_COMMITTED is not written | `VERIFIED` |
+
+`crates/vtop-cli/tests/failpoints.rs` pins this table on every build of the
+feature: each point kills a real `vtopctl process-once` (exit by signal 9),
+the ledger is in the state above, and a restart archives every record of a
+local file into a local store.
+
+**What is checked, per point.** Each point has its own consumer group,
+ledger, work directory and object prefix over one seeded topic.
+
+| Invariant | Kind | How |
+|---|---|---|
+| The commit rule at the source: the group's committed offset never passes the end of the highest range the ledger records as VERIFIED | safety | read from the broker (`kafka-consumer-groups.sh`) and from the ledger (opened read-only, so the WAL the kill left is not checkpointed), at the kill and again after the restart. "No committed offset" counts only when the broker said so (the offsets table without one, or the group not found); a query that failed or timed out, which the tool reports with exit status 0, is retried three times and then fails the check |
+| The commit rule in the ledger: no SOURCE_COMMITTED row lacks what the VERIFIED write leaves (the verification class, which only `mark_verified` sets, the object and the manifest) | safety | the same read-only ledger read, at the kill and after the restart |
+| No hole | safety | `vtopctl audit-coverage --check-storage` passes, `vtopctl scrub` is clean, and every produced record is found in the objects the store holds, copied out with `mc` and counted by the harness, not by the engine |
+| Duplicates only where the at-least-once window is open | safety | the extra copies are counted against the table below |
+| The restart commits every record and stops cleanly | liveness | bounded poll on the group's committed offset and the ledger, then `SIGTERM` and exit 0 |
+
+| Points | Extra record copies allowed | Why |
+|---|---|---|
+| `before_insert` to `after_ledger_checksummed`, and `mid_object_put` | 0 | no object of the batch is in the store yet; the replay builds it from the source |
+| every later point | one batch (`ENGINE_SWEEP_BATCH_RECORDS`, 20) | the store holds the batch's object while its range is uncommitted; a replay that cannot rebuild the same bytes writes a second object ([ARCHITECTURE](ARCHITECTURE.md) section 13, item 3) |
+
+The sweep runs one batch at a time (`batching.max_concurrent_batches: 1`), so
+the batch the kill interrupts is the only one in flight.
+
+**Running it.**
+
+```bash
+cargo build -p vtop-cli --features failpoints --bin vtopctl
+docker compose build minio && docker compose up -d --wait minio
+# a broker that advertises an address the engine can reach, for example the
+# kafka service of the `engine crash sweep` workflow, then:
+CHAOS_PROFILE=debug scripts/live-chaos/engine/run-sweep.sh
+ENGINE_SWEEP_POINTS=before_source_commit CHAOS_PROFILE=debug scripts/live-chaos/engine/run-sweep.sh
+```
+
+Knobs (`ENGINE_SWEEP_POINTS`, `ENGINE_SWEEP_RECORDS`,
+`ENGINE_SWEEP_BATCH_RECORDS`, `ENGINE_SWEEP_POINT_TIMEOUT_SECONDS`, the Kafka
+bootstrap and container, the S3 endpoint and bucket) are documented and
+validated in the script header. `CHAOS_VTOPCTL` points at the failpoints
+build when it is not `target/$CHAOS_PROFILE/vtopctl`.
+
+**Where it runs.** The `engine crash sweep` workflow
+(`.github/workflows/engine-crash-sweep.yml`): every point nightly at 06:37
+UTC and on dispatch (which can name points and a record count); the five
+commit-boundary points (`mid_object_put`, `after_object_put_before_ledger`,
+`after_manifest_put_before_ledger`, `before_source_commit`,
+`after_source_commit_before_ledger`) on a pull request that changes the
+engine, the ledger, the upload path, the adapters or the harness.
+
+**Measured.** A full local run (21 points, 50 records each, batches of 20, a
+debug build in a container capped at two CPUs, `apache/kafka:4.3.1` capped
+at one, and the lab's MinIO, all on one laptop) took 239 s, 11 to 12 s a
+point, with no duplicate at any point. The five pull-request points took
+55 s. With `mark_verified` moved behind the source commit (a deliberate
+mutation: the ledger's transitions stay legal, so only the comparison with
+the broker can see it), the five pull-request points fail at
+`after_source_commit_before_ledger`: "COMMIT RULE VIOLATED: the consumer
+group's committed offset is 20, but in the ledger no range is recorded as
+VERIFIED or SOURCE_COMMITTED, so offsets 0..19 were committed at the source
+before they were verified. Ledger states: {"MANIFEST_UPLOADED": 1}". With
+the mutation reverted they pass.
+
+**Not covered yet.** PostgreSQL as the ledger, the file source, a store
+outage before the kill and ENOSPC (the second part of #725); the syslog
+source (no cursor to compare); power loss, which `kill -9` does not model
+(the page cache survives it), stays with `crates/vtop-cli/tests/ledger_power_loss.rs`.
 
 ## Scope boundaries
 

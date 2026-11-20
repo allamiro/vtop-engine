@@ -1885,10 +1885,10 @@ impl AdminReadRangeLeaseResponse {
                     _ => None,
                 },
             }),
-            _ => {
-                return Err(CodecError::InvalidValue {
+            other => {
+                return Err(CodecError::UnknownTag {
                     what: "lease presence",
-                    reason: "lease presence byte must be 0, 1, or 2",
+                    tag: u32::from(other),
                 })
             }
         };
@@ -3048,6 +3048,312 @@ mod tests {
             future.state_name(),
             None,
             "a tag from a newer leader must read as unknown, not as the nearest known state"
+        );
+    }
+    /// `fuzz/corpus/vtpm_frame`, where the fuzz target's committed seeds live
+    /// (#729).
+    fn fuzz_seed_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus/vtpm_frame")
+    }
+
+    /// The seeds: a frame per kind. Where a payload is simple to build here
+    /// it is a real one (`kind-NN`); the other kinds carry an empty payload
+    /// (`bare-kind-NN`), a valid frame the fuzzer grows a payload into.
+    fn fuzz_seeds() -> Vec<(String, Vec<u8>)> {
+        let ids = |topic: u128, range: u128| (Uuid::from_u128(topic), Uuid::from_u128(range));
+        let (topic_uuid, range_uuid) = ids(7, 8);
+        let membership = MetaMembership {
+            voters: vec![MetaNodeId(1), MetaNodeId(2), MetaNodeId(3)],
+            learners: vec![(MetaNodeId(5), String::new())],
+            joint_outgoing: Some(vec![MetaNodeId(1), MetaNodeId(2)]),
+        };
+        let full: Vec<(u16, Vec<u8>)> = vec![
+            (
+                KIND_VOTE_REQ,
+                PeerVoteRequest {
+                    vote: sample_vote(),
+                    last_log_id: Some(WireLogId { term: 6, index: 2 }),
+                }
+                .encode()
+                .unwrap(),
+            ),
+            (
+                KIND_VOTE_RESP,
+                PeerVoteResponse {
+                    vote: sample_vote(),
+                    vote_granted: true,
+                    last_log_id: Some(WireLogId { term: 1, index: 1 }),
+                }
+                .encode()
+                .unwrap(),
+            ),
+            (
+                KIND_APPEND_REQ,
+                PeerAppendRequest {
+                    vote: sample_vote(),
+                    prev_log_id: Some(WireLogId { term: 7, index: 2 }),
+                    entries: vec![
+                        sample_entry(),
+                        MetaLogEntry {
+                            term: 7,
+                            index: 4,
+                            payload: MetaLogPayload::Membership(membership.clone()),
+                        },
+                    ],
+                    leader_commit: Some(WireLogId { term: 7, index: 2 }),
+                }
+                .encode()
+                .unwrap(),
+            ),
+            (
+                KIND_APPEND_RESP,
+                PeerAppendResponse::PartialSuccess(Some(WireLogId { term: 1, index: 2 }))
+                    .encode()
+                    .unwrap(),
+            ),
+            (
+                KIND_INSTALL_REQ,
+                PeerInstallRequest {
+                    vote: sample_vote(),
+                    last_log_id: Some(WireLogId { term: 7, index: 9 }),
+                    membership_log_id: Some(WireLogId { term: 7, index: 4 }),
+                    last_membership: membership.clone(),
+                    snapshot_id: "snap-1".to_owned(),
+                    offset: 0,
+                    data: vec![1, 2, 3, 4],
+                    done: true,
+                }
+                .encode()
+                .unwrap(),
+            ),
+            (
+                KIND_INSTALL_RESP,
+                PeerInstallResponse {
+                    vote: sample_vote(),
+                }
+                .encode()
+                .unwrap(),
+            ),
+            (KIND_ADMIN_STATUS_REQ, AdminStatusRequest.encode()),
+            (
+                KIND_ADMIN_STATUS_RESP,
+                AdminStatusResponse {
+                    node_id: MetaNodeId(1),
+                    current_term: 4,
+                    vote: sample_vote(),
+                    current_leader: Some(MetaNodeId(1)),
+                    server_state: "Leader".to_owned(),
+                    last_applied: Some(WireLogId { term: 4, index: 10 }),
+                    membership: membership.clone(),
+                }
+                .encode()
+                .unwrap(),
+            ),
+            (
+                KIND_ADMIN_PROPOSE_REQ,
+                AdminProposeRequest {
+                    command: match sample_entry().payload {
+                        MetaLogPayload::Normal(command) => command,
+                        _ => unreachable!(),
+                    },
+                }
+                .encode()
+                .unwrap(),
+            ),
+            (
+                KIND_ADMIN_ERROR,
+                AdminError {
+                    message: "not the leader".to_owned(),
+                    not_leader: Some(NotLeaderHint {
+                        leader: Some(MetaNodeId(7)),
+                    }),
+                }
+                .encode()
+                .unwrap(),
+            ),
+            (
+                KIND_ADMIN_INIT_REQ,
+                AdminInitRequest {
+                    members: vec![1, 2, 3],
+                }
+                .encode()
+                .unwrap(),
+            ),
+            (
+                KIND_ADMIN_ADD_LEARNER_REQ,
+                AdminAddLearnerRequest { node_id: 4 }.encode().unwrap(),
+            ),
+            (
+                KIND_ADMIN_CHANGE_MEMBERSHIP_REQ,
+                AdminChangeMembershipRequest {
+                    voters: vec![1, 2, 3, 4],
+                    retain_removed_as_learners: true,
+                }
+                .encode()
+                .unwrap(),
+            ),
+            (
+                KIND_ADMIN_MEMBERSHIP_RESP,
+                AdminMembershipResponse {
+                    membership: membership.clone(),
+                }
+                .encode()
+                .unwrap(),
+            ),
+            (
+                KIND_ADMIN_READ_RANGE_LEASE_REQ,
+                AdminReadRangeLeaseRequest {
+                    topic_uuid,
+                    range_uuid,
+                }
+                .encode(),
+            ),
+            (
+                KIND_ADMIN_READ_RANGE_LEASE_RESP,
+                AdminReadRangeLeaseResponse {
+                    found: true,
+                    range_generation: 12,
+                    fencing_epoch: 4,
+                    lease: Some(AdminLeaseView {
+                        holder_node_uuid: Uuid::from_u128(9),
+                        fencing_epoch: 4,
+                        expires_at_ms: Some(1_700_000_000_000),
+                    }),
+                    read_at_applied_index: 99,
+                }
+                .encode(),
+            ),
+            (
+                KIND_ADMIN_READ_GROUP_CURSOR_REQ,
+                AdminReadGroupCursorRequest {
+                    group_uuid: Uuid::from_u128(6),
+                    topic_uuid,
+                    range_uuid,
+                }
+                .encode(),
+            ),
+            (
+                KIND_ADMIN_READ_RANGE_REPLICA_SET_REQ,
+                AdminReadRangeReplicaSetRequest {
+                    topic_uuid,
+                    range_uuid,
+                }
+                .encode(),
+            ),
+            (
+                KIND_ADMIN_READ_PROMOTION_ATTESTATION_REQ,
+                AdminReadPromotionAttestationRequest {
+                    topic_uuid,
+                    range_uuid,
+                }
+                .encode(),
+            ),
+            (
+                KIND_ADMIN_READ_CLUSTER_VERSIONS_REQ,
+                AdminReadClusterVersionsRequest {
+                    include_nodes: true,
+                }
+                .encode(),
+            ),
+        ];
+        let bare = [
+            KIND_ADMIN_PROPOSE_RESP,
+            KIND_ADMIN_READ_SEGMENT_PLACEMENT_REQ,
+            KIND_ADMIN_READ_SEGMENT_PLACEMENT_RESP,
+            KIND_ADMIN_READ_RANGE_TRANSITIONS_REQ,
+            KIND_ADMIN_READ_RANGE_TRANSITIONS_RESP,
+            KIND_ADMIN_READ_GROUP_CURSOR_RESP,
+            KIND_ADMIN_READ_RANGE_REPLICA_SET_RESP,
+            KIND_ADMIN_READ_CLUSTER_VERSIONS_RESP,
+            KIND_ADMIN_READ_PROMOTION_ATTESTATION_RESP,
+        ];
+        let frame = |kind: u16, payload: Vec<u8>| VtpmFrame { kind, payload }.encode().unwrap();
+        full.into_iter()
+            .map(|(kind, payload)| (format!("kind-{kind:02}"), frame(kind, payload)))
+            .chain(
+                bare.into_iter()
+                    .map(|kind| (format!("bare-kind-{kind:02}"), frame(kind, Vec::new()))),
+            )
+            .collect()
+    }
+
+    /// Rewrites the committed seeds. Run on purpose after a format change:
+    /// `cargo test -p vtop-meta --lib -- --ignored write_fuzz_seeds`.
+    #[test]
+    #[ignore = "writes fuzz/corpus/vtpm_frame; run on purpose"]
+    fn write_fuzz_seeds() {
+        let dir = fuzz_seed_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, bytes) in fuzz_seeds() {
+            std::fs::write(dir.join(format!("{name}.seed")), bytes).unwrap();
+        }
+    }
+
+    /// #729: every committed seed is a VTPM frame this build decodes, and a
+    /// `kind-NN` seed's payload decodes as that kind, so the fuzzer starts
+    /// inside the payload decoders. Every kind in the closed list has one.
+    #[test]
+    fn the_committed_fuzz_seeds_decode() {
+        let mut kinds = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(fuzz_seed_dir()).unwrap() {
+            let path = entry.unwrap().path();
+            // Only the committed seeds: a local fuzzing run leaves the inputs it
+            // found here too (git-ignored), and those may rightly not decode.
+            if path.extension().and_then(|e| e.to_str()) != Some("seed") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let frame = VtpmFrame::decode(&std::fs::read(&path).unwrap())
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            kinds.insert(frame.kind);
+            if name.starts_with("bare-") {
+                continue;
+            }
+            let payload = &frame.payload;
+            let decoded = match frame.kind {
+                KIND_VOTE_REQ => PeerVoteRequest::decode(payload).map(drop),
+                KIND_VOTE_RESP => PeerVoteResponse::decode(payload).map(drop),
+                KIND_APPEND_REQ => PeerAppendRequest::decode(payload).map(drop),
+                KIND_APPEND_RESP => PeerAppendResponse::decode(payload).map(drop),
+                KIND_INSTALL_REQ => PeerInstallRequest::decode(payload).map(drop),
+                KIND_INSTALL_RESP => PeerInstallResponse::decode(payload).map(drop),
+                KIND_ADMIN_STATUS_REQ => AdminStatusRequest::decode(payload).map(drop),
+                KIND_ADMIN_STATUS_RESP => AdminStatusResponse::decode(payload).map(drop),
+                KIND_ADMIN_PROPOSE_REQ => AdminProposeRequest::decode(payload).map(drop),
+                KIND_ADMIN_ERROR => AdminError::decode(payload).map(drop),
+                KIND_ADMIN_INIT_REQ => AdminInitRequest::decode(payload).map(drop),
+                KIND_ADMIN_ADD_LEARNER_REQ => AdminAddLearnerRequest::decode(payload).map(drop),
+                KIND_ADMIN_CHANGE_MEMBERSHIP_REQ => {
+                    AdminChangeMembershipRequest::decode(payload).map(drop)
+                }
+                KIND_ADMIN_MEMBERSHIP_RESP => AdminMembershipResponse::decode(payload).map(drop),
+                KIND_ADMIN_READ_RANGE_LEASE_REQ => {
+                    AdminReadRangeLeaseRequest::decode(payload).map(drop)
+                }
+                KIND_ADMIN_READ_RANGE_LEASE_RESP => {
+                    AdminReadRangeLeaseResponse::decode(payload).map(drop)
+                }
+                KIND_ADMIN_READ_GROUP_CURSOR_REQ => {
+                    AdminReadGroupCursorRequest::decode(payload).map(drop)
+                }
+                KIND_ADMIN_READ_RANGE_REPLICA_SET_REQ => {
+                    AdminReadRangeReplicaSetRequest::decode(payload).map(drop)
+                }
+                KIND_ADMIN_READ_PROMOTION_ATTESTATION_REQ => {
+                    AdminReadPromotionAttestationRequest::decode(payload).map(drop)
+                }
+                KIND_ADMIN_READ_CLUSTER_VERSIONS_REQ => {
+                    AdminReadClusterVersionsRequest::decode(payload).map(drop)
+                }
+                other => panic!("{name}: kind {other} has no payload check here"),
+            };
+            decoded.unwrap_or_else(|error| panic!("{name}: {error}"));
+        }
+        // The closed list of kinds: 1-6 (peer) and 10-32 (admin).
+        let expected: std::collections::BTreeSet<u16> = (1..=6).chain(10..=32).collect();
+        assert_eq!(
+            kinds, expected,
+            "a VTPM kind has no seed; run write_fuzz_seeds"
         );
     }
 }

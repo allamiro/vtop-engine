@@ -510,6 +510,9 @@ mod tests {
         let unknown = |what| TransportError::Codec(CodecError::UnknownTag { what, tag: 99 });
         assert!(from_newer_release(&unknown("log entry kind")));
         assert!(from_newer_release(&unknown("command kind")));
+        // Inside a command in an AppendEntries request (#743).
+        assert!(from_newer_release(&unknown("node state")));
+        assert!(from_newer_release(&unknown("verification method")));
         assert!(!from_newer_release(&unknown("append response kind")));
         assert!(from_newer_release(&TransportError::BadVersion(
             super::super::wire::VTPM_VERSION + 1

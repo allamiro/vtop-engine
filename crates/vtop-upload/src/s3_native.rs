@@ -14,9 +14,9 @@
 //! (backend-limited).
 
 use crate::base::{
-    judge_retention, parse_s3_uri, read_bounded, CreatedUpload, ObjectChecksum, ObjectHead,
-    ObjectLockPolicy, RequestedRetention, RetentionCheck, RetentionExpectation, StoredManifest,
-    StoredObject, StoredRetention, UploadBackend, UploadedPart, VerificationResult,
+    judge_retention, parse_s3_uri, read_bounded, BucketFeature, CreatedUpload, ObjectChecksum,
+    ObjectHead, ObjectLockPolicy, RequestedRetention, RetentionCheck, RetentionExpectation,
+    StoredManifest, StoredObject, StoredRetention, UploadBackend, UploadedPart, VerificationResult,
 };
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
@@ -214,6 +214,16 @@ pub struct S3NativeBackend {
     request_min_bytes_per_second: u64,
     /// See [`S3NativeConfig::object_lock`] (#684).
     object_lock: Option<crate::base::ObjectLockPolicy>,
+    /// Whether a write the engine has no SHA-256 for (the BLAKE3 and
+    /// no-checksum paths) carries a whole-object `x-amz-checksum-sha256` the
+    /// backend computes itself (#778). True wherever the SDK would otherwise
+    /// send its CRC32 as an `aws-chunked` trailer, which Garage and Zenko
+    /// CloudServer refuse: under the default
+    /// `AWS_REQUEST_CHECKSUM_CALCULATION=when_supported`, and always under
+    /// the Object Lock profile, which pins that (#708). False only when the
+    /// operator chose `when_required` without the profile: then the SDK sends
+    /// no checksum, and neither does the backend.
+    body_sha256_header: bool,
 }
 
 /// Enforce the transport policy BEFORE any client is built (#75).
@@ -727,6 +737,11 @@ impl S3NativeBackend {
                 aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported,
             );
         }
+        let body_sha256_header = cfg.object_lock.is_some()
+            || !matches!(
+                shared.request_checksum_calculation(),
+                Some(aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired)
+            );
         let s3_conf =
             install_transport_then_the_last_gate(builder, &transport, cfg.verify_tls)?.build();
 
@@ -739,6 +754,7 @@ impl S3NativeBackend {
             request_timeout_seconds: cfg.request_timeout_seconds,
             request_min_bytes_per_second: cfg.request_min_bytes_per_second,
             object_lock: cfg.object_lock,
+            body_sha256_header,
         })
     }
 
@@ -832,20 +848,37 @@ impl S3NativeBackend {
             .content_type(content_type)
             .body(self.egress_body(body));
 
+        // The engine's own SHA-256, when it has one.
+        let engine_sha256 = checksum
+            .filter(|c| c.is_sha256())
+            .and_then(|c| hex_to_b64_sha256(c.hex));
         if let Some(c) = checksum {
             // Always retain the hex digest as user metadata (any algorithm),
             // for tooling and verification of objects from older writers.
             req = req.metadata(CHECKSUM_META_KEY, c.hex);
-            // For SHA-256 only, also request server-validated integrity: S3
-            // recomputes SHA-256 over the body and rejects the upload
-            // (BadDigest) if it does not match, so in-transit corruption fails
-            // the PUT itself. (BLAKE3 is 32 bytes too, so it MUST NOT be sent
-            // here — S3 would recompute SHA-256 and reject it.)
-            if c.is_sha256() {
-                if let Some(b64) = hex_to_b64_sha256(c.hex) {
-                    req = req.checksum_sha256(b64);
-                }
-            }
+        }
+        // Server-validated integrity: S3 recomputes SHA-256 over the body and
+        // rejects the upload (BadDigest) if it does not match, so in-transit
+        // corruption fails the PUT itself. The SHA-256 path sends the engine's
+        // own digest. (A BLAKE3 digest is 32 bytes too, so it MUST NOT be sent
+        // here — S3 would recompute SHA-256 and reject it.)
+        //
+        // The BLAKE3 and no-checksum paths send a SHA-256 the backend computes
+        // over the file itself (#778), as a header. Left to the SDK, the
+        // default `when_supported` sends a CRC32 as a trailer in an
+        // `aws-chunked` body, and Garage ("Invalid payload signature") and
+        // Zenko CloudServer (400) refuse every such write. A checksum value on
+        // the request makes the SDK send a plain body with no trailer.
+        // SHA-256 because it is the header the SHA-256 path already sends,
+        // which every store in the #722 matrix accepts. It costs one more
+        // read of the local file, and gains these paths the store-side check.
+        let self_sha256 = match engine_sha256 {
+            Some(_) => None,
+            None if self.body_sha256_header => Some(file_sha256_b64(local_path).await?),
+            None => None,
+        };
+        if let Some(b64) = engine_sha256.clone().or_else(|| self_sha256.clone()) {
+            req = req.checksum_sha256(b64);
         }
 
         // The S3 Object Lock profile (#684): every write, object or
@@ -864,7 +897,7 @@ impl S3NativeBackend {
             if asked.legal_hold {
                 req = req.object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On);
             }
-            req = lock_integrity(req, checksum);
+            req = lock_integrity(req, engine_sha256.is_some() || self_sha256.is_some());
         }
 
         let out = req
@@ -872,7 +905,15 @@ impl S3NativeBackend {
             .config_override(self.body_timeouts("put_object", uri, body_bytes))
             .send()
             .await
-            .map_err(|e| sdk_failure("put_object", uri, e))?;
+            .map_err(|e| {
+                let refused = refused_checksum_header(&e);
+                let failure = sdk_failure("put_object", uri, e);
+                if refused && self_sha256.is_some() {
+                    with_checksum_header_advice(failure, retention.is_some())
+                } else {
+                    failure
+                }
+            })?;
         tracing::info!(uri, "object uploaded via s3_native");
         // A suspended-versioning bucket reports the literal version "null",
         // which later writes overwrite — it is not an immutable pin. Surface
@@ -948,6 +989,26 @@ impl S3NativeBackend {
                 ))
             })?
     }
+}
+
+/// A store's definite "I do not implement this operation" (#722): HTTP 501,
+/// or S3's `NotImplemented` error code under whatever status it came with.
+/// Told apart from a check that could not be made (a 403, a 503, a timeout),
+/// which proves nothing either way: the SDK does not retry a 501, so this is
+/// the store's first and only answer. Other codes a store may use for the
+/// same answer are added when a live run shows one, each with a wire test.
+fn not_implemented<E>(error: &SdkError<E, HttpResponse>) -> bool
+where
+    E: ProvideErrorMetadata,
+{
+    let (status, code) = match error {
+        SdkError::ServiceError(context) => {
+            (Some(context.raw().status().as_u16()), context.err().code())
+        }
+        SdkError::ResponseError(context) => (Some(context.raw().status().as_u16()), None),
+        _ => (None, None),
+    };
+    status == Some(501) || code == Some("NotImplemented")
 }
 
 /// The engine's error for a failed SDK call, telling a throttle apart (#102).
@@ -1116,28 +1177,31 @@ impl UploadBackend for S3NativeBackend {
         true
     }
 
-    async fn verify_bucket_versioning(&self, bucket: &str) -> Result<(), VtopError> {
-        let out = self
+    async fn bucket_versioning(&self, bucket: &str) -> Result<BucketFeature, VtopError> {
+        let out = match self
             .client
             .get_bucket_versioning()
             .bucket(bucket)
             .send()
             .await
-            .map_err(|e| sdk_failure("get_bucket_versioning", bucket, e))?;
-        match out.status() {
-            Some(BucketVersioningStatus::Enabled) => Ok(()),
-            other => Err(VtopError::Upload(format!(
-                "bucket {bucket} does not have versioning enabled (status: {other:?}); \
-                 the hardened manifest profile requires it"
-            ))),
-        }
+        {
+            Ok(out) => out,
+            Err(e) if not_implemented(&e) => return Ok(BucketFeature::NotSupported),
+            Err(e) => return Err(sdk_failure("get_bucket_versioning", bucket, e)),
+        };
+        // Suspended, or no status at all (a bucket versioning was never
+        // turned on for): either way overwritten versions are not kept.
+        Ok(match out.status() {
+            Some(BucketVersioningStatus::Enabled) => BucketFeature::Enabled,
+            _ => BucketFeature::NotEnabled,
+        })
     }
 
     fn object_lock(&self) -> Option<ObjectLockPolicy> {
         self.object_lock
     }
 
-    async fn bucket_object_lock_enabled(&self, bucket: &str) -> Result<bool, VtopError> {
+    async fn bucket_object_lock(&self, bucket: &str) -> Result<BucketFeature, VtopError> {
         match self
             .client
             .get_object_lock_configuration()
@@ -1145,17 +1209,28 @@ impl UploadBackend for S3NativeBackend {
             .send()
             .await
         {
-            Ok(out) => Ok(out
-                .object_lock_configuration()
-                .and_then(|c| c.object_lock_enabled())
-                .is_some_and(|e| *e == ObjectLockEnabled::Enabled)),
+            Ok(out) => Ok(
+                if out
+                    .object_lock_configuration()
+                    .and_then(|c| c.object_lock_enabled())
+                    .is_some_and(|e| *e == ObjectLockEnabled::Enabled)
+                {
+                    BucketFeature::Enabled
+                } else {
+                    BucketFeature::NotEnabled
+                },
+            ),
             // S3's answer for a bucket that has no Object Lock configuration
             // at all: a definite "not enabled", not a failed check.
             Err(SdkError::ServiceError(context))
                 if context.err().code() == Some("ObjectLockConfigurationNotFoundError") =>
             {
-                Ok(false)
+                Ok(BucketFeature::NotEnabled)
             }
+            // The store does not implement Object Lock at all (#722; Garage
+            // documents every Object Lock call as missing). No bucket setting
+            // changes that, so it is an answer, not a check that failed.
+            Err(e) if not_implemented(&e) => Ok(BucketFeature::NotSupported),
             Err(e) => Err(sdk_failure("get_object_lock_configuration", bucket, e)),
         }
     }
@@ -1576,20 +1651,90 @@ fn lock_mode(asked: RequestedRetention) -> aws_sdk_s3::types::ObjectLockMode {
 }
 
 /// The integrity header a write under retention needs (#684): S3 requires
-/// `Content-MD5` or `x-amz-sdk-checksum-algorithm` on it. The engine's own
-/// SHA-256 rides in `x-amz-checksum-sha256`, which S3 checks against the
-/// body; naming the algorithm adds the header S3 asks for without the SDK
-/// computing anything (a checksum value it was given is sent as is). The
-/// BLAKE3 and no-checksum paths send no checksum of their own, so the SDK is
-/// asked for its CRC32, computed over the body as it is sent.
+/// `Content-MD5` or `x-amz-sdk-checksum-algorithm` on it. A write that
+/// carries `x-amz-checksum-sha256` — the engine's own SHA-256, or the one the
+/// backend computed on the BLAKE3 and no-checksum paths (#778) — names that
+/// algorithm, which adds the header S3 asks for without the SDK computing
+/// anything (a checksum value it was given is sent as is). Under the profile
+/// every write carries one, because the profile pins `when_supported`; the
+/// CRC32 arm, the SDK computing its own, is kept for a write that somehow
+/// does not, so no locked write ever goes without the header.
 fn lock_integrity(
     req: aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder,
-    checksum: Option<ObjectChecksum<'_>>,
+    carries_sha256: bool,
 ) -> aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder {
-    if checksum.is_some_and(|c| c.is_sha256() && hex_to_b64_sha256(c.hex).is_some()) {
+    if carries_sha256 {
         req.checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Sha256)
     } else {
         req.checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Crc32)
+    }
+}
+
+/// The SHA-256 of a local file, base64 as `x-amz-checksum-sha256` spells
+/// it (#778). Streamed, never buffered whole.
+async fn file_sha256_b64(path: &Path) -> Result<String, VtopError> {
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| VtopError::Upload(format!("reading {}: {e}", path.display())))?;
+    let (hex, _) = digest_reader(ChecksumAlgorithm::Sha256, file)
+        .await?
+        .ok_or_else(|| VtopError::Upload("SHA-256 digest unavailable".into()))?;
+    hex_to_b64_sha256(&hex).ok_or_else(|| VtopError::Upload(format!("not a SHA-256 digest: {hex}")))
+}
+
+/// Whether a failed write may be the store refusing its checksum header
+/// (#778): a 400 that is not `BadDigest` (the store checked the header and
+/// the body did not match it, which is corruption, not a refusal), or a 501.
+/// Garage answers `400 InvalidRequest`, Zenko CloudServer `400 BadRequest`.
+fn refused_checksum_header<E>(error: &SdkError<E, HttpResponse>) -> bool
+where
+    E: ProvideErrorMetadata,
+{
+    let (status, code) = match error {
+        SdkError::ServiceError(context) => {
+            (Some(context.raw().status().as_u16()), context.err().code())
+        }
+        SdkError::ResponseError(context) => (Some(context.raw().status().as_u16()), None),
+        _ => (None, None),
+    };
+    match status {
+        Some(400) => code != Some("BadDigest"),
+        Some(501) => true,
+        _ => false,
+    }
+}
+
+/// A refused write that carried the backend's own `x-amz-checksum-sha256`
+/// (#778), told as what happened, what the engine did and what to do. The
+/// failure stays the kind it was, so retries and the batch's state are as
+/// for any other refused PUT.
+fn with_checksum_header_advice(failure: VtopError, locked: bool) -> VtopError {
+    let what_to_do = if locked {
+        "If this store refuses checksum headers, it cannot hold this engine's \
+         Object Lock writes: S3 requires an integrity header on a write under \
+         retention, so the Object Lock profile always sends one, and \
+         AWS_REQUEST_CHECKSUM_CALCULATION does not change that. Use a store that \
+         accepts x-amz-checksum-sha256 for Object Lock."
+    } else {
+        "If this store refuses checksum headers, set \
+         AWS_REQUEST_CHECKSUM_CALCULATION=when_required in the engine's \
+         environment: no checksum header is sent, and the object is still \
+         verified by read-back after the upload."
+    };
+    let advice = |detail: String| {
+        format!(
+            "{detail}. The write carried a whole-object x-amz-checksum-sha256 \
+             header the engine computed itself (BLAKE3 or no-checksum mode), \
+             and the store may have refused that header. The write failed and \
+             nothing was committed: the batch stays uncommitted, as after any \
+             refused write. {what_to_do}"
+        )
+    };
+    match failure {
+        VtopError::Upload(detail) => VtopError::Upload(advice(detail)),
+        VtopError::UploadThrottled(detail) => VtopError::UploadThrottled(advice(detail)),
+        VtopError::UploadSessionGone(detail) => VtopError::UploadSessionGone(advice(detail)),
+        other => other,
     }
 }
 
@@ -3419,6 +3564,7 @@ mod egress_ceiling {
             request_timeout_seconds: 300,
             request_min_bytes_per_second: 4 * 1024,
             object_lock: None,
+            body_sha256_header: true,
         };
         let payload = Bytes::from_static(b"bytes the process ceiling must see");
         let untouched = |b: ByteStream| {
@@ -3613,6 +3759,7 @@ mod egress_ceiling {
             request_timeout_seconds: 300,
             request_min_bytes_per_second: 4 * 1024,
             object_lock: None,
+            body_sha256_header: true,
         };
         let payload = Bytes::from_static(b"the pipeline an unset cap must not touch");
 
@@ -3717,6 +3864,7 @@ mod egress_ceiling {
             request_timeout_seconds: 300,
             request_min_bytes_per_second: 4 * 1024,
             object_lock: None,
+            body_sha256_header: true,
         }
     }
 
@@ -3749,8 +3897,9 @@ mod egress_ceiling {
     /// Through the REAL SDK request path (#481): a capped backend sends the
     /// same body bytes and the same length, payload-hash and checksum headers
     /// as an uncapped one — for a SHA-256-checked object PUT, an unchecked PUT
-    /// the SDK sends aws-chunked with a CRC trailer, and an in-memory multipart
-    /// part — and a 503 the SDK retries is paid for, and counted, twice.
+    /// carrying the SHA-256 the backend computed itself (#778), and an
+    /// in-memory multipart part — and a 503 the SDK retries is paid for, and
+    /// counted, twice.
     #[tokio::test]
     async fn a_capped_backend_sends_the_same_request_as_an_uncapped_one_and_counts_every_attempt() {
         let payload: Vec<u8> = (0..(6 * 1024 * 1024 + 3))
@@ -3824,8 +3973,8 @@ mod egress_ceiling {
             .iter()
             .map(|(_, body)| body.len() as u64)
             .sum::<u64>();
-        // The aws-chunked PUT's wire body carries framing and a trailer; the
-        // account is of PAYLOAD bytes admitted, three payloads' worth.
+        // A wire body may carry framing the payload does not; the account is
+        // of PAYLOAD bytes admitted, three payloads' worth.
         assert!(per_request >= 3 * payload.len() as u64);
         assert_eq!(
             shaper.admitted_bytes(),
