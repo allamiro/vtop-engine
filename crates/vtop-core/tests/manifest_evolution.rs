@@ -30,6 +30,7 @@ fn legacy() -> Value {
                 mtime: String::new(),
                 content_fingerprint: None,
                 tail_fingerprint: None,
+                ctime: None,
             },
             object_uri: "s3://archive/object".into(),
             object_size: 4,

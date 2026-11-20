@@ -153,6 +153,7 @@ nav:
       - How it works: concepts/how-it-works.md
       - Architecture: concepts/architecture.md
       - Security: concepts/security.md
+      - Security policy: security-policy.md
   - Getting started:
       - getting-started/index.md
       - Quick start (Docker lab): getting-started/quickstart.md
@@ -163,6 +164,7 @@ nav:
       - Container image: install/container.md
       - Helm chart: install/helm.md
       - Build from source: install/from-source.md
+      - Kafka brokers: install/kafka.md
       - Verify a release: RELEASE_VERIFICATION.md
   - Deploy:
       - deploy/index.md
@@ -181,6 +183,8 @@ nav:
   - Operate:
       - operate/index.md
       - Metrics and alerts: operate/monitoring.md
+      - Alert runbooks: operate/runbooks.md
+      - Service level objectives: operate/slos.md
       - Node endpoints and metrics: NODE_OBSERVABILITY.md
       - Logs and auditing: operate/logs-and-auditing.md
       - Auditing: operate/auditing.md
@@ -217,5 +221,6 @@ nav:
       - Live chaos validation: LIVE_CHAOS_VALIDATION.md
   - Roadmap and releases:
       - Roadmap: ROADMAP.md
+      - Versioning and support: SUPPORT.md
       - Releases: https://github.com/allamiro/vtop-engine/releases
   - Contributing: contributing.md

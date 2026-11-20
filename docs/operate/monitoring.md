@@ -45,6 +45,7 @@ These carry the commit rule:
 | `vtop_object_lock_checks_total{result}` | With `upload.object_lock`: any result but `ok` is a batch that failed because the store did not keep the retention asked for (or its bucket has no Object Lock, `bucket_not_locked`, or the store does not implement Object Lock, `store_unsupported`). See [S3 Object Lock](../OBJECT_LOCK_DEPLOYMENT.md). |
 | `vtop_retention_lost_records_total` | Kafka records deleted by broker retention before the engine read them. Never archived; any increase is an incident. |
 | `vtop_source_replay_refused_total` | A failed range its source could not hand back, so it is missing from the archive. |
+| `vtop_recovery_held_total{reason}` | A range recovery held instead of rewinding (#782). `reason="ledger_write_failed"`: the state store refused the replay decision; check its disk, permissions and connectivity. The range is read again with the ranges above it, so nothing is lost. |
 | `vtop_source_read_errors_total` | A source that cannot be read. |
 | `vtop_replay_required_total`, `vtop_failed_total` | Work repeated, batches failed. |
 | `vtop_stage_duration_seconds{stage}`, `vtop_batch_duration_seconds` | Where time goes, per stage and end to end. |
@@ -56,8 +57,44 @@ object URIs are in the logs, not in labels.
 
 ## Alerts
 
-Two alert sets ship with the repository. Both are starting points, not a
-complete production rule set.
+Two alert sets ship with the repository, side by side: a Prometheus rule set
+for the engine, and the Grafana rules the lab provisions, most of them for the
+cluster plane.
+
+**The engine's Prometheus rules.**
+[`observability/prometheus/vtop-rules.yaml`](../../observability/prometheus/vtop-rules.yaml)
+is a plain Prometheus rule file. Load it with `rule_files:` in
+`prometheus.yml`, or, on Kubernetes with the Prometheus Operator, through the
+chart's `PrometheusRule` (`metrics.prometheusRule.enabled`, see
+[Kubernetes with Helm](../deploy/kubernetes.md)). Each alert has a promtool unit
+test, a runbook section, and an objective on [Service level objectives](slos.md):
+
+| Alert | Severity | Fires on |
+|---|---|---|
+| [VtopVerificationFailures](runbooks.md#vtopverificationfailures) | page | Any increase of `vtop_verification_failures_total`, or the series first appearing non-zero |
+| [VtopNoCommits](runbooks.md#vtopnocommits) | page | No commit for 30 minutes while `vtop_inflight_batches` shows data waiting |
+| [VtopReplayRateSpike](runbooks.md#vtopreplayratespike) | ticket | `vtop_replay_required_total` above 0.01/s and above three times its 6-hour rate |
+| [VtopSourceLagGrowing](runbooks.md#vtopsourcelaggrowing) | ticket | `kafka_consumergroup_lag` (kafka-exporter) rising for 30 minutes |
+| [VtopSizeOnlyVerification](runbooks.md#vtopsizeonlyverification) | ticket | `vtop_verification_mode{mode="size_only"} == 1` |
+| [VtopObjectLockCheckFailed](runbooks.md#vtopobjectlockcheckfailed) | page | Any increase of `vtop_object_lock_checks_total` with a result other than `ok`, or such a series first appearing non-zero |
+| [VtopRetentionLoss](runbooks.md#vtopretentionloss) | page | Any increase of `vtop_retention_lost_records_total` |
+| [VtopSourceReplayRefused](runbooks.md#vtopsourcereplayrefused) | page | Any increase of `vtop_source_replay_refused_total`, or the series first appearing non-zero |
+| [VtopRecoveryLedgerWriteFailed](runbooks.md#vtoprecoveryledgerwritefailed) | page | `vtop_recovery_held_total{reason="ledger_write_failed"}` above zero: at startup the state store refused recovery's replay decision (the series appears with the first hold, so the rule fires on the value, until a restart that holds nothing) |
+| [VtopMultipartSessionsPiling](runbooks.md#vtopmultipartsessionspiling) | ticket | A session kept 30 to 36 hours ago (past the 24 h abandon window and the 6 h sweep interval), and none resumed or swept for 36 hours |
+
+The thresholds are defaults, listed at the top of the file. The rules route
+nowhere by themselves: point Prometheus at your Alertmanager and route on the
+`severity` label (`page` or `ticket`).
+
+Three pages show further rules that are examples, not part of the shipped
+file, with no unit test or runbook section here: `VtopManifestKeyUnknown` on
+[Manifest key rotation](manifest-key-rotation.md#metrics),
+`VtopVerificationReceiptsFailing` on
+[Verification receipts](verification-receipts.md), and the three
+`VtopArchiveScrub*` rules in the
+[observability README](../../observability/README.md#archive-scrub), which read
+the metrics file `vtopctl scrub` writes rather than the engine's endpoint. Add
+them to your own rule files if you use those features.
 
 **Provisioned in the lab.**
 [`observability/grafana/provisioning/alerting/vtop-alerts.yaml`](../../observability/grafana/provisioning/alerting/vtop-alerts.yaml)
@@ -76,31 +113,12 @@ holds the Grafana rules the optional observability stack loads:
 | Consumer group cursor below log start | A group's committed cursor below the serving replica's log start, for 5 minutes |
 | Consumer group near eviction | A group's cursor close to log start, for 15 minutes |
 
-The first rule is about the engine; the rest are about the cluster plane.
+The first rule is about the engine, and overlaps `VtopRetentionLoss`; the rest
+are about the cluster plane and have no Prometheus-format equivalent yet.
 
 **For the scrub.** `vtopctl scrub` writes its own metrics to a file, and the
 [observability README](../../observability/README.md#archive-scrub) has an
 example Prometheus rule set for it. See [Scrub and coverage audit](scrub-and-audit.md).
-
-Worth adding for any engine (examples; tune them to your deployment):
-
-```yaml
-groups:
-  - name: vtop-engine
-    rules:
-      # The series appears at the first failure, so increase() would miss
-      # that one: alert on the value. It clears when the engine restarts.
-      - alert: VtopVerificationFailures
-        expr: sum(vtop_verification_failures_total) > 0
-      - alert: VtopSizeOnlyVerification
-        expr: vtop_verification_mode{mode="size_only"} == 1
-      # Primed at zero at startup with upload.object_lock set.
-      - alert: VtopObjectLockCheckFailed
-        expr: increase(vtop_object_lock_checks_total{result!="ok"}[15m]) > 0
-      # Primed at zero at startup, so increase() sees the first one.
-      - alert: VtopSourceReplayRefused
-        expr: increase(vtop_source_replay_refused_total[15m]) > 0
-```
 
 ## The lab's Grafana stack
 

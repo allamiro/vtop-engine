@@ -69,47 +69,25 @@ cleanup() {
 trap cleanup EXIT
 
 FORWARDS=""
-forward_ns() { # namespace pod localport remoteport
-  kubectl -n "$1" port-forward "pod/$2" "$3:$4" >/dev/null 2>&1 &
-  FORWARDS="$FORWARDS $!"
-  disown 2>/dev/null || true
-  sleep 4
+# The forward helpers and their readiness wait (#786) live in their own file so
+# the bats suite can drive them against a fake kubectl.
+# shellcheck source=scripts/k8s-forward.sh disable=SC1091
+. "$(dirname "$0")/k8s-forward.sh"
+
+fail_forward() { # namespace pod localport remoteport
+  fail "no port-forward to pod/$2 port $4 in namespace $1 on localhost:$3; see the forward's output above"
 }
 
-# A forward that OUTLIVES its pod (#515). `kubectl port-forward` binds to a
-# pod, not a Service, and exits for good when that pod is deleted — which the
-# per-attempt forwards below handle by re-forwarding on every attempt, on a
-# fresh port. A forward named in a CONFIG FILE cannot do that: the port is
-# baked into the file, so the only way to keep that endpoint meaning "this
-# pod" across a restart is to re-attach on the same port whenever kubectl
-# exits. The one-second pause is not a settle: it keeps a pod that does not
-# exist yet from turning the loop into a busy spin of API calls.
-#
-# The subshell's TERM trap takes the current kubectl down with it, so the
-# cleanup's `kill` on the recorded pid still leaves no port-forward behind.
+forward_ns() { # namespace pod localport remoteport
+  forward_open "$@" || fail_forward "$@"
+}
+
 forward_supervised() { # namespace pod localport remoteport
-  (
-    child=""
-    trap 'kill "$child" 2>/dev/null; exit 0' TERM
-    while :; do
-      kubectl -n "$1" port-forward "pod/$2" "$3:$4" >/dev/null 2>&1 &
-      child=$!
-      wait "$child" || true
-      sleep 1
-    done
-  ) &
-  FORWARDS="$FORWARDS $!"
-  disown 2>/dev/null || true
-  sleep 4
+  forward_supervised_open "$@"
 }
 
 forward() { # pod localport remoteport
-  kubectl -n "$NS" port-forward "pod/$1" "$2:$3" >/dev/null 2>&1 &
-  FORWARDS="$FORWARDS $!"
-  # Job control off for this shell, so tearing the forwards down at exit does
-  # not print a "Terminated" line per child over the test's own output.
-  disown 2>/dev/null || true
-  sleep 4
+  forward_ns "$NS" "$@"
 }
 
 # Wait for the StatefulSet to CREATE its pods before waiting for them to be
@@ -470,7 +448,7 @@ log "streamed $EXPECTED records"
 # value and fail with it in the message, so an empty string reports "the endpoint
 # did not answer" exactly where it happened.
 committed_offset() {
-  { curl -sf "localhost:$1/metrics" || true; } \
+  { curl -sf --retry 5 --retry-connrefused --retry-delay 1 --max-time 10 "localhost:$1/metrics" || true; } \
     | awk '/^vtop_broker_local_committed_offset\{/ { print $NF }' | head -1
 }
 
@@ -483,7 +461,7 @@ log "committed offset is $got, as produced"
 # pod nobody produced to must still be empty. If this ever reports records, the
 # deployment is not the shape the chart documents.
 forward "${REL}-1" 19501 9500
-other="$(curl -sf localhost:19501/metrics | awk '/^vtop_broker_next_offset\{/ { print $NF }' | head -1)"
+other="$(curl -sf --retry 5 --retry-connrefused --retry-delay 1 --max-time 10 localhost:19501/metrics | awk '/^vtop_broker_next_offset\{/ { print $NF }' | head -1)"
 [ "${other:-0}" = "0" ] || fail "pod 1 holds $other records; ranges are not independent as documented"
 log "pod 1 is empty, confirming per-pod independent ranges"
 
@@ -766,8 +744,11 @@ alloc_port() {
   r_port=$((r_port + 1))
 }
 
-# 90 attempts, not 30. Each costs the 4s forward settle plus the attempt, so
-# this is roughly six minutes of patience against roughly two before.
+# Six minutes of attempts, bounded by elapsed time (`retry_for`), not by a
+# count. Each attempt costs the forward's readiness wait (bounded at 10s,
+# usually well under one) plus the attempt. Before #786 it also cost a fixed 4s
+# settle, so 90 attempts were six minutes; without the settle, an init that
+# fails at once would spend 90 attempts in under one (review of #789).
 #
 # The budget is not arbitrary and the earlier one was tuned to the wrong
 # cluster. A cold replicated install can restart while peer DNS settles — a
@@ -782,9 +763,9 @@ alloc_port() {
 #
 # So the loop is the wait. It re-establishes the forward every attempt and keeps
 # going until the process stays up long enough to answer, which is the actual
-# condition being waited for.
-r_init=""
-for _ in $(seq 1 90); do
+# condition being waited for. The 2s pause after a failed attempt keeps a server
+# that refuses at once from turning the window into a busy spin.
+r_init_attempt() {
   r_port=$((r_port + 1))
   cat > "$WORK/r-admin.yaml" <<EOF
 endpoint: localhost:${r_port}
@@ -793,11 +774,14 @@ ca_cert: $CERTS/ca.pem
 client_cert: $CERTS/r-operator.pem
 client_key: $CERTS/r-operator-key.pem
 EOF
-  forward_ns "$R_NS" "$(meta_pod 0)" "$r_port" 9200
-  if vtopctl meta init --members 1,2,3 --config "$WORK/r-admin.yaml" >/dev/null 2>&1; then
-    r_init="yes"; break
-  fi
-done
+  # A forward that never opens is one failed attempt, not a failed run.
+  FORWARD_WAIT_SECONDS=10 forward_open "$R_NS" "$(meta_pod 0)" "$r_port" 9200 || return 1
+  vtopctl meta init --members 1,2,3 --config "$WORK/r-admin.yaml" >/dev/null 2>&1
+}
+r_init=""
+if retry_for 360 2 r_init_attempt; then
+  r_init="yes"
+fi
 [ -n "$r_init" ] || {
   vtopctl meta init --members 1,2,3 --config "$WORK/r-admin.yaml" || true
   kubectl -n "$R_NS" get pods || true
@@ -1106,7 +1090,8 @@ r_produce() { # <ordinal> <fencing-epoch> <producer-epoch> <records>
   # loop above records. Torn down because this call sits in a retry loop:
   # sixty abandoned port-forwards would be sixty kubectl processes and sixty
   # API streams held open for the length of the wait.
-  forward_ns "$R_NS" "$(data_pod "$ordinal")" "$pport" 9400
+  # A forward that never opens is one failed attempt: the caller retries.
+  FORWARD_WAIT_SECONDS=10 forward_open "$R_NS" "$(data_pod "$ordinal")" "$pport" 9400 || return 1
   local fwd="${FORWARDS##* }"
   local fqdn
   fqdn="$(data_fqdn "$ordinal")"

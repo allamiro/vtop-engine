@@ -7,6 +7,62 @@ and the commit-rule invariant trigger exist (the trigger enforces
 database layer; durable state persistence implements §14), then operates with
 table DML only.
 
+## Supported PostgreSQL versions
+
+| Major | Minor CI runs | Upstream support ends |
+|---|---|---|
+| 18 | 18.7 | 2030-11-14 |
+| 17 | 17.12 | 2029-11-08 |
+| 16 | 16.16 | 2028-11-09 |
+| 15 | 15.20 | 2027-11-11 |
+| 14 | 14.25 | 2026-11-12 (ended, see below) |
+
+Each major is a leg of the job `postgres backend (battery)` in
+`.github/workflows/postgres-matrix.yml`, run against the official
+`postgres:<major>` image pinned by digest there, in one place. All five run
+every night (00:47 UTC) on `main`, and on a manual dispatch. A pull request
+whose change the `postgres` path filter in `.github/workflows/ci.yml` matches
+(the state store, `vtop-core`, the two test files, the build files and
+`ci.yml`) runs the oldest and the newest major, 14 and 18, as the checks
+`postgres / postgres backend (battery) (pg 14)` and `(pg 18)`; a pull request
+that changes `postgres-matrix.yml` itself, a pin for instance, runs all five.
+Every leg
+checks that the server reports its major, then runs:
+
+- the state-store battery (`crates/vtop-state/tests/pg_battery.rs`): the
+  behaviour shared with SQLite, the commit-rule trigger and the
+  `audit_events` trigger refusing a bypass, the migration's repairs and
+  refusals, the schema marker, and the narrow runtime role;
+- `vtopctl migrate` run twice on an empty database, the second leaving the
+  schema exactly as the first left it
+  (`crates/vtop-cli/tests/postgres_migrate_restore.rs`);
+- a ledger dumped with `pg_dump` and restored into a migrated schema in each
+  way "Restoring the ledger from a backup" under
+  [Upgrades and rollback](#upgrades-and-rollback) describes, with the client
+  tools of the same major (same file);
+- the engine's recovery over a PostgreSQL ledger
+  (`tests/integration_state_recovery.rs`).
+
+The minor in the table is the one each pinned image held when the pins were
+last refreshed; other minors of the same major are not run. The end dates
+are PostgreSQL's own [versioning policy](https://www.postgresql.org/support/versioning/),
+read on 2026-11-14.
+
+PostgreSQL 14 left upstream support on 2026-11-12. It stays in the CI matrix
+and in this list until the next minor release of VTOP, whose upgrade notes
+say it is dropped. PostgreSQL 13 and older are not supported: no CI leg runs
+them.
+
+A major is added to the CI matrix first and listed here once its leg passes.
+One is dropped in the first release after its upstream end of life, named in
+that release's upgrade notes, and its leg and its row go together.
+
+Not covered by the matrix: managed services (see
+[Managed-service smoke test](#managed-service-smoke-test)), the
+PostgreSQL-compatible stores [PRODUCTION_HA.md](PRODUCTION_HA.md) mentions
+(YugabyteDB, CockroachDB), and moving a ledger between majors
+(`pg_upgrade`, or a dump from one major restored into another).
+
 ## Identities
 
 Use two database identities:
@@ -98,7 +154,8 @@ reference keeps credentials out of config serialization and command arguments.
 
 ## Failure behavior
 
-If the table, required columns (`verification_class` since #664), or
+If the table, required columns (`verification_class` since #664,
+`sealed_at` since #626), or
 invariant trigger are absent, the
 trigger is disabled or its function lacks a current schema version marker,
 or the `state_enum` CHECK does not admit every state the engine writes
@@ -161,6 +218,20 @@ migration job per database; engine replicas should start only after it succeeds.
   does not affect them while they run. The schema marker is not bumped (see
   below). A rollback may keep the column; do not drop it while any engine of
   that release can reach the database.
+- **`sealed_at` (#626) needs the migration.** v0.10.0 records, with each
+  row's first write, the instant the batch's contents were fixed, in a
+  nullable `sealed_at` column (`ADD COLUMN IF NOT EXISTS`, no default, no
+  rewrite of existing rows); a replay reads it back to file its object under
+  the same hour, so it names the same key. Engines of that release name the
+  column at startup and refuse a schema without it, asking for `vtopctl
+  migrate`; run it before rolling them out. Engines of the release before
+  (v0.9.0) keep running on the migrated schema with no restart: they name
+  their columns, so a connection open during the migration is unaffected,
+  and they never write this one, so a row they insert keeps NULL and its
+  replay is filed under the hour it runs in, as in v0.9.0
+  (`scripts/ledger-compat.sh` runs this). The marker is not bumped (see
+  below). A rollback to v0.9.0 may keep the column; do not drop it while any
+  engine of v0.10.0 or later can reach the database.
 - Changes to the JSON inside ledger rows need no migration step. The content
   fingerprint added to file and spool markers (#578) is such a change: no
   DDL, older rows keep being read and judged as before. See the ledger format
@@ -191,8 +262,8 @@ migration job per database; engine replicas should start only after it succeeds.
   with `MIN_SCHEMA_VERSION` and `SCHEMA_VERSION` in `pg_store.rs`. A new
   nullable column that startup names and older engines never name does not:
   startup already refuses a schema without it, and an older release's
-  migration never drops it. The `verification_class` column (#664) is such a
-  change, and leaves the marker at 3.
+  migration never drops it. The `verification_class` column (#664) and the
+  `sealed_at` column (#626) are such changes, and leave the marker at 3.
 - **A newer schema is refused (since #664).** Engines and `vtopctl migrate`
   from #664 on read markers from `MIN_SCHEMA_VERSION` to `SCHEMA_VERSION`
   (both 3 today). A higher marker means a newer release migrated the
@@ -218,7 +289,24 @@ migration job per database; engine replicas should start only after it succeeds.
   function, and the migration's `CREATE OR REPLACE` installs the current one
   and re-creates the trigger enabled. A data-only restore into a migrated
   schema (`pg_restore --data-only`) is refused by the trigger, as it already
-  was for `source_committed` rows. Restore the data in one of two ways:
+  was for `source_committed` rows.
+
+  **Into a database `vtopctl migrate` has just created, clear its audit
+  records first.** Since #694 the migration writes two records (its
+  attempt and its outcome) to `audit_events`, which take `seq` 1 and 2.
+  The audit rows in a backup start at 1 too, so their restore fails on
+  the table's primary key (`duplicate key value violates unique constraint
+  "audit_events_pkey"`); `pg_restore` goes on to restore `batches` and
+  exits non-zero, leaving a ledger without its audit trail. Before the
+  data-only restore, have the owner (the migration identity) run
+  `TRUNCATE audit_events`. Only the owner may: the table's trigger refuses
+  it to every other role. The two records stay in the log stream (target
+  `vtop::audit`) and in the audit file when one is configured (see
+  [Auditing](operate/auditing.md)), and the `vtopctl migrate` run after
+  the restore writes its own records after the restored ones;
+  `vtopctl audit verify` passes on the result.
+
+  Restore the data in one of two ways:
   - `pg_restore --data-only --disable-triggers`. This issues
     `ALTER TABLE batches DISABLE TRIGGER ALL`, which only the table's owner
     (the migration identity) or a superuser may run; the runtime role is
@@ -235,3 +323,36 @@ migration job per database; engine replicas should start only after it succeeds.
   has no current marker.
 - Test grants after role changes: runtime must be able to read/write ledger
   rows but must fail `CREATE TABLE`, `ALTER TABLE`, `DELETE`, and `TRUNCATE`.
+
+## Managed-service smoke test
+
+The CI job `postgres managed smoke (opt-in)` runs the battery, `vtopctl
+migrate` twice, the restore test and the recovery test against a managed
+PostgreSQL service (Amazon RDS, Google Cloud SQL and the like). It needs a
+cloud account and repository secrets, which only a maintainer can set up;
+until they exist, the job reports that it skipped, and no managed service
+has been tested by the project. A pull request from a fork never sees the
+secrets, so the job skips there too.
+
+To turn it on:
+
+1. Create a **throwaway** instance of a supported major. The tests drop and
+   create databases named `vtop_test_*`, truncate the ledger tables of the
+   database the URL names, and create the roles `vtop_runtime_test` and
+   `vtop_restore_owner`. Never point it at a database that holds a ledger.
+2. Allow connections to it from GitHub-hosted runners.
+3. Add these repository secrets:
+
+   | Secret | Value |
+   |---|---|
+   | `VTOP_MANAGED_POSTGRES_URL` | The instance's admin user (the RDS master user, Cloud SQL's `postgres` user), which may create databases and roles: `postgres://<admin>:<password>@<host>:5432/<database>?sslmode=verify-full&sslrootcert=/tmp/vtop-managed-postgres-ca.pem` |
+   | `VTOP_MANAGED_POSTGRES_RUNTIME_URL` | `postgres://vtop_runtime_test:vtop-runtime-test@<host>:5432/<database>?sslmode=verify-full&sslrootcert=/tmp/vtop-managed-postgres-ca.pem`. The battery creates the role with this password. |
+   | `VTOP_MANAGED_POSTGRES_CA` | The service's CA bundle (PEM). RDS and Cloud SQL sign with a private CA, which `sslmode=verify-full` needs; the job writes it to the path the URLs name. |
+
+4. Add the repository variable `VTOP_MANAGED_POSTGRES_CLIENT_IMAGE`: the image
+   whose major is the instance's, as pinned in
+   `.github/workflows/postgres-matrix.yml` (`postgres:<major>@sha256:...`). `pg_dump` and `pg_restore` run from it;
+   the test refuses client tools of another major.
+
+With the URL secret set and either of the others missing, the job fails and
+names what is missing, rather than running part of the smoke.

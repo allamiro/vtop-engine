@@ -97,9 +97,10 @@ As of **August 2026** (repo at v0.3.0):
 - Phase 4: deterministic / content-addressed object keys + idempotent retry.
   **Objects done (#626):** the object key is derived from the source, the
   range and the content digest, and an existing object is reused only after
-  it verifies strongly. Remaining: batch boundaries are not reproduced after a
-  power loss, a seal-time partition moves a replay in a later hour, and
-  manifests stay per attempt ([ARCHITECTURE.md](ARCHITECTURE.md) §13 item 3).
+  it verifies strongly, and a replay in a later hour is sealed at the
+  recorded instant of the window it rebuilds (v0.10.0). Remaining: batch
+  boundaries are not reproduced after a power loss, a row from before
+  v0.10.0 records no seal instant, and manifests stay per attempt ([ARCHITECTURE.md](ARCHITECTURE.md) §13 item 3).
 - Phase 5: Kafka consumer-group fleet mode. The consumer still uses per-read
   `assign()`; no `VTOP_KAFKA_GROUP_MODE` toggle; no multi-writer recovery
   (`FOR UPDATE SKIP LOCKED` / leases, #93).
@@ -107,8 +108,10 @@ As of **August 2026** (repo at v0.3.0):
   the engine.
 
 **Partially done**
-- Phase 6 (observability & ops): metrics, readiness, dashboards and OTLP trace
-  export exist; Alertmanager rules do not.
+- Phase 6 (observability & ops): metrics, readiness, dashboards, OTLP trace
+  export and a unit-tested Prometheus alert rule set with runbooks and
+  documented SLOs exist (#720); a store write-latency SLO and its alert do
+  not.
 - Phase 8 (retention/backup/DR/security): retention shipped; backup/restore
   runbook, DR drills, and the divergence checker have not been exercised.
 
@@ -137,8 +140,10 @@ transfer engine, **without weakening the core guarantee**:
 - **Replay safety** — a crash at any stage is recoverable with **no data loss**.
 - **Delivery semantics (accurate):** today the system is **at-least-once**. A
   replay of the same bytes reuses the stored object (content-addressed keys,
-  #626); a replay with other batch boundaries, a later seal-time hour, no
-  checksum or a command backend can still leave a duplicate object (§2.5, §7).
+  #626), and a replay is rebuilt as first cut (v0.10.0); a replay that could
+  not be rebuilt as cut,
+  a later seal-time hour for a row from before v0.10.0, no checksum or a
+  command backend can still leave a duplicate object (§2.5, §7).
   Protocol §15.1's deterministic naming MUST is narrowed by #626, not closed.
 
 ### 2.3 Non-goals
@@ -165,7 +170,7 @@ section calls out the consequence.
 | Property | Current code | Target for production HA |
 |---|---|---|
 | Object key | `vtop-<engine>-<source>-<range>[-i<inode>]-<digest>` for files and spools, `vtop-<source>-<range>-<digest>` for Kafka — **deterministic for the same bytes** (#626); falls back to the per-attempt `vtop-<UTCstamp>-<source>-<range>-<uuid8>` without a checksum, on a command backend, or when the derived key holds bytes that do not verify | **Deterministic or content-addressed** so retries are idempotent |
-| Replay outcome | Same bytes → **the stored object is reused** after strong verification; other boundaries, a later seal-time hour, or other bytes → **second object, no overwrite, no loss** | Retry resolves to the **same** object/version; duplicates impossible **[PROPOSED]** |
+| Replay outcome | Same bytes → **the stored object is reused** after strong verification; other boundaries, a later seal-time hour for a row from before v0.10.0, or other bytes → **second object, no overwrite, no loss** | Retry resolves to the **same** object/version; duplicates impossible **[PROPOSED]** |
 | File/syslog cursor | Lives **only in the state store** (rebuilt from `SOURCE_COMMITTED` rows) | Same, but **migrate/drain on backend switch** (§6.4) |
 | Kafka offset | Committed to the **broker** after VERIFIED (resumes broker-side) | Same; consumer-group mode for multi-instance **[PROPOSED]** |
 | Concurrency | Single process, **single-instance lock enforced at startup** (#66) | N replicas via Kafka consumer groups **[PROPOSED]** |
@@ -1157,7 +1162,7 @@ path needed by the distributed options is already implemented (§6.3).
 | `manifest.write_version` | `"0.3"` (default) or `"0.4"`, quoted; anything else fails config load (#671). `0.4` adds `verification_plan` to new manifests. Set it only once every engine, `vtopctl scrub` and auditor of the archive runs v0.8.0 or later: v0.7.0 and earlier report `0.4` manifests as tampered. Engines before this release ignore the key and keep writing `0.3`; setting `"0.3"` again goes back, and `0.4` manifests already written stay readable |
 | `manifest.verification_receipts` | `false` (default) or `true` (#671): write `<batch_id>.receipt.json` beside each manifest once its batch is verified (class, method the store ran, signed like the manifest). Never part of the commit: a receipt that cannot be written is a WARN and `vtop_verification_receipts_total{result="failed"}`; recovery writes a missing one for a VERIFIED batch; `vtopctl scrub` reports missing ones. Older engines ignore the key |
 | `sources.kafka.*` | brokers, group, include/exclude, `enable_auto_commit:false` |
-| `sources.file.*` | paths, `delete_after_commit`, `delete_quiet_seconds`, `delete_without_open_check`, `whole_file`. `delete_after_commit` is for files nothing writes to any more: whole-file drops, and rotated logs once the writer has reopened its new file. A fully archived file is deleted only after it has stayed unwritten for `delete_quiet_seconds` (default 3600) from the commit that covered it, so the engine catching up on a live log does not delete it out from under a writer that still holds it open (#619). A file whose mtime or ctime moves after the commit (a touch, a chmod, a producer stamping a finished drop) is **kept**, with a warning: a same-length rewrite between its first page and the page below the committed end looks the same, and only the ctime, which no process can set, shows it. A configured path that is a symbolic link is never deleted (point the pattern at the target). The delete renames the file within its directory first, so the directory must be writable by the engine and on the file's own filesystem; a bind-mounted single file fails with `EXDEV`, and the file is kept with that errno in the warning. A file a crash (or a failed put-back) leaves under a hidden `.vtop-delete.*` name is archived as a source of its own and then deleted. The wait is kept in memory: a restart starts it again, from the newest committed row, and only when that row names the file's inode and first page, its batch read the file to its end, and the file still has the mtime that batch recorded; otherwise the file stays until a new commit covers it. A quiet file is not a closed one, so the delete also needs proof that no process has the file open: a Linux write lease, held from before the file is moved aside until after the unlink. A writer that still holds the file - silent however long - or opens it while it is being deleted keeps it, and the wait starts again. `delete_quiet_seconds: 0` deletes at the covering commit, through the same lease, rename and check. The lease needs Linux, a local filesystem (ext2/3/4, xfs, btrfs, tmpfs, overlay, f2fs, zfs or bcachefs; never NFS, CIFS, FUSE, 9p, virtiofs or CephFS, where it could not see a writer on another machine), and the engine running as the files' owner or with `CAP_LEASE` in its effective set. In Kubernetes, `securityContext.capabilities.add: ["LEASE"]` reaches the effective set only of a container running as root. The chart runs the engine as uid 10001 with every capability dropped and `allowPrivilegeEscalation: false`, under which neither an added capability nor a file capability (`setcap`) takes effect, so there the engine must run as the uid that owns the files. **On upgrade**, an engine that deleted files written by another user, or on a network or FUSE mount, stops deleting them. Without the lease a fully archived file is **kept**, with a warning naming the reason; `delete_without_open_check: true` deletes it on the quiet period alone instead, and then a writer that keeps the file open loses lines in two cases: it is silent for longer than the quiet period and then writes again, or its write lands between the delete's final check and the unlink. That opt-out is warned about on every start and by `vtopctl validate`. Every delete, and every file kept, logs one line saying what happened, what the engine did and what to do, with `path`, `inode` and `archived_bytes` fields. Do not point the option at a live log. Two directory entries naming one file — a symlink beside its target, two hard links — are **two sources** by ruling (#378): each is archived under its own name, so the file's records are archived twice, and discovery warns once per alias group naming every spelling. Narrow the patterns to one spelling if one source is meant. There is no merge and no knob, because a merge needs a cursor identity that survives an alias being removed and none is safe: keyed by the surviving spelling, `delete_after_commit` removes it and the target is re-read from zero; keyed by inode, a freed inode reused by a new file inherits the old cursor and that file's opening records are skipped. A duplicate costs storage; a merge risks data. |
+| `sources.file.*` | paths, `delete_after_commit`, `delete_quiet_seconds`, `delete_without_open_check`, `whole_file`. `delete_after_commit` is for files nothing writes to any more: whole-file drops, and rotated logs once the writer has reopened its new file. A fully archived file is deleted only after it has stayed unwritten for `delete_quiet_seconds` (default 3600) from the commit that covered it, so the engine catching up on a live log does not delete it out from under a writer that still holds it open (#619). A file whose mtime or ctime moves after the commit (a touch, a chmod, a producer stamping a finished drop) is **kept**, with a warning: a same-length rewrite between its first page and the page below the committed end looks the same, and only the ctime, which no process can set, shows it. A configured path that is a symbolic link is never deleted (point the pattern at the target). The delete renames the file within its directory first, so the directory must be writable by the engine and on the file's own filesystem; a bind-mounted single file fails with `EXDEV`, and the file is kept with that errno in the warning. A file a crash (or a failed put-back) leaves under a hidden `.vtop-delete.*` name is archived as a source of its own and then deleted. The wait is kept in memory: a restart starts it again, from the newest committed row, and only when that row names the file's inode and first page, its batch read the file to its end, and the file still has the mtime that batch recorded; otherwise the file stays until a new commit covers it. A quiet file is not a closed one, so the delete also needs proof that no process has the file open: a Linux write lease, held from before the file is moved aside until after the unlink. A writer that still holds the file - silent however long - or opens it while it is being deleted keeps it, and the wait starts again. `delete_quiet_seconds: 0` deletes at the covering commit, through the same lease, rename and check. The lease needs Linux, a local filesystem (ext2/3/4, xfs, btrfs, tmpfs, overlay, f2fs, zfs or bcachefs; never NFS, CIFS, FUSE, 9p, virtiofs or CephFS, where it could not see a writer on another machine), and the engine running as the files' owner or with `CAP_LEASE` in its effective set. In Kubernetes, `securityContext.capabilities.add: ["LEASE"]` reaches the effective set only of a container running as root. The chart runs the engine as uid 10001 with every capability dropped and `allowPrivilegeEscalation: false`, under which neither an added capability nor a file capability (`setcap`) takes effect, so there the engine must run as the uid that owns the files. **On upgrade**, an engine that deleted files written by another user, or on a network or FUSE mount, stops deleting them. Without the lease a fully archived file is **kept**, with a warning naming the reason; `delete_without_open_check: true` deletes it on the quiet period alone instead (on macOS, NFS or FUSE, or another user's file without `CAP_LEASE`, the only way a file is deleted), and then **a file a writer still holds open is deleted with it**: the writer's later lines go into a file no path names and nothing archives them, when it is silent for longer than the quiet period and then writes again, or when its write lands between the delete's final check and the unlink. That opt-out is warned about on every start and by `vtopctl validate`, and each such delete is logged as "deleted P without proof that no process had it open" and counted as `deleted_unchecked` (alert on any increase). Every delete, and every file kept, logs one line saying what happened, what the engine did and what to do, with `path`, `inode` and `archived_bytes` fields. Do not point the option at a live log. With `delete_after_commit`, deleting one hard-linked name changes the file's link count, so the other name is **kept** with "its link count changed since it was archived (from 2 to 1) - most likely another path this engine archived was deleted, or a hard link was made", counted as `links_changed`; its own copy is archived, so nothing is lost, and the remaining name is removed by hand. A hard link made after the commit keeps the file the same way. Two directory entries naming one file — a symlink beside its target, two hard links — are **two sources** by ruling (#378): each is archived under its own name, so the file's records are archived twice, and discovery warns once per alias group naming every spelling. Narrow the patterns to one spelling if one source is meant. There is no merge and no knob, because a merge needs a cursor identity that survives an alias being removed and none is safe: keyed by the surviving spelling, `delete_after_commit` removes it and the target is re-read from zero; keyed by inode, a freed inode reused by a new file inherits the old cursor and that file's opening records are skipped. A duplicate costs storage; a merge risks data. |
 | `sources.syslog_spool.*` | spool paths |
 | `upload.backend` | `s3_native` \| `s3cmd` \| `awscli` \| `minio` \| `localfs` \| `mock` |
 | `upload.bucket` | bucket (supports `telemetry-{format}`) |
@@ -1239,10 +1244,19 @@ path needed by the distributed options is already implemented (§6.3).
   as a textfile; the [observability README](../observability/README.md#archive-scrub)
   has an example alert rule set.
 
+- **Alerting rules** (#720): `observability/prometheus/vtop-rules.yaml`, also
+  shipped as the chart's `PrometheusRule`: verification failures, no commits
+  while data waits, replay-rate spike, Kafka lag growth (from kafka-exporter),
+  size-only verification, failed Object Lock checks, retention loss, refused
+  replays, a state store refusing recovery's replay decisions, and piling
+  multipart sessions. Each has a promtool unit test and a
+  section in [Alert runbooks](operate/runbooks.md); the objectives are on
+  [Service level objectives](operate/slos.md).
+
 **Still needed for production [PROPOSED]:**
-- **Alerting rules** (Alertmanager): verification failures > 0; replay-rate
-  spike; lag growth; store write-latency SLO breach; no committed batches in N
-  minutes.
+- **Alerting rules:** a store write-latency SLO breach (the engine has no
+  write-latency objective yet; `vtop_stage_duration_seconds{stage="state_write"}`
+  is the metric it would read).
 - Metric coverage review: **verification-failure rate**, **replay /
   REPLAY_REQUIRED rate**, Kafka **consumer lag**, state-store write latency,
   **duplicate-object rate** (needed until deterministic keys land).
@@ -1264,7 +1278,7 @@ Invariant preserved: source progress is NEVER advanced for unverified data.
 | Failure | Behavior | Why it's safe |
 |---|---|---|
 | Engine crash mid-batch | `recover()`: pre-VERIFIED → replay from last committed source position; VERIFIED-but-not-committed → retry commit | Progress never advanced for unverified data |
-| Replay after crash | **Today (#626):** same bytes → same key, existing verified object = success; other boundaries or partition hour → second object (no loss) | At-least-once; idempotent for a replay of the same bytes |
+| Replay after crash | **Today (#626):** same bytes → same key, existing verified object = success; replays rebuilt as first cut and sealed at the recorded instant (v0.10.0); a bound refused or too large, or a row from before v0.10.0 → second object (no loss) | At-least-once; idempotent for a replay of the same bytes |
 | State store unavailable | Cannot transition → stops committing (fails safe) | No commit-before-verify possible |
 | Kafka rebalance (fleet) | Revoked partitions: finish/abandon in-flight, no commit; reassigned replica resumes from committed offset | Offsets commit only post-verify |
 | File-owner replica dies (Tier 3) | Lease expires; another replica resumes from stored byte cursor | Cursor in shared durable store |
@@ -1642,9 +1656,9 @@ Short procedures now; expand into a full ops runbook before go-live.
   configuration is unsupported and warned about at startup. Do not scale
   replicas.
 - **Object keys are deterministic only for the same bytes** (#626) — a replay
-  with the same batch boundaries reuses the stored object; one whose
-  boundaries, seal-time hour or bytes differ still writes a second object (no
-  loss), and manifests stay per attempt. This narrows the gap against protocol
+  with the same batch boundaries reuses the stored object, in a later hour
+  too (v0.10.0); one whose boundaries or bytes differ still writes a second
+  object (no loss), and manifests stay per attempt. This narrows the gap against protocol
   §15.1 without closing it (ARCHITECTURE.md §13 item 3).
 - **Engine loop is single-process** — no horizontal scale until Kafka
   consumer-group fleet mode lands (Phase 5).
@@ -1752,10 +1766,14 @@ deployment identity; the live battery proves the runtime role cannot run DDL,
   `vtop-observe`); structured per-stage events; `observability/` compose stack
   (Grafana, Loki, Mimir, Tempo, Alloy) with generated dashboards; OTLP trace
   export from the engine into that Tempo (#683).
-- **Remaining:** Alertmanager rules (verification failures > 0, replay-rate
-  spike, lag growth, store-latency SLO breach, no-commits-in-N-minutes); metric
-  coverage review (duplicate-object rate until Phase 4 lands, consumer lag,
-  state-store write latency); documented SLOs.
+- **Done (#720):** Prometheus alert rules (verification failures, replay-rate
+  spike, lag growth, no commits in 30 minutes while data waits, and six more),
+  each unit-tested with promtool in CI and linked to a runbook section;
+  documented SLOs ([operate/slos.md](operate/slos.md)).
+- **Remaining:** a store-latency SLO and its alert; metric coverage review
+  (duplicate-object rate until Phase 4 lands, an engine-side consumer lag,
+  state-store write latency); wiring the rules to an Alertmanager is the
+  deployment's.
 - **Test plan:** force a verification failure and confirm the alert; load test
   and watch lag/replay panels.
 - **Exit criteria:** operators see throughput, lag, replay, failures; alerts
@@ -1887,7 +1905,8 @@ Object storage
 Operability
   [x] Prometheus metrics endpoint + readiness probe (VTOP_METRICS_ADDR)
   [x] dashboards defined (observability/ stack)
-  [ ] Alertmanager rules wired                                         (Phase 6)
+  [x] Prometheus alert rules, unit-tested, with runbooks (#720)       (Phase 6)
+  [ ] Alertmanager routing wired (deployment-side)                    (Phase 6)
   [x] OpenTelemetry traces exported (opt-in, OTEL_EXPORTER_OTLP_ENDPOINT)
   [ ] engine k8s chart: probes, limits, PDB, NetworkPolicy, runbook    (Phase 7)
 
@@ -1960,8 +1979,9 @@ proven by a scenario that drives real processes, not only by unit coverage.
   yet enable the feature).
 - **Two current-behavior caveats the design must still fix for fleet HA:**
   (a) object keys are **deterministic only for the same bytes** (#626) → a replay
-  with other boundaries still makes **duplicates**; reproducible boundaries
-  (the rest of Phase 4) close it, and protocol §15.1 stays narrowed until then.
+  that could not be rebuilt as first cut still makes **duplicates**; replays
+  reproduce their boundaries since v0.10.0, and protocol §15.1 is met for
+  objects whenever the ledger row survives.
   (b) the engine is **single-instance by design** until Kafka consumer-group
   fleet mode and multi-writer recovery land (Phase 5).
 - **VERIFIED is defined precisely (§4); strong content-derived verification is

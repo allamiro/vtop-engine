@@ -14,7 +14,8 @@ every upgrade.
 The source for this page is the release notes in the [roadmap](../ROADMAP.md);
 read the section for the release you are moving to. What each format
 promises, and the rules for changing one, are in the
-[compatibility policy](../reference/compatibility.md).
+[compatibility policy](../reference/compatibility.md); which releases get
+fixes is in [Versioning and support](../SUPPORT.md).
 
 ## Upgrading from v0.7.0 to v0.8.0
 
@@ -83,7 +84,7 @@ as tampered: recovery leaves such a batch VERIFIED and pending, and
 `vtopctl scrub` reports `unsupported_version`. Readers before v0.8.0 cannot
 read `0.4`, so upgrade every engine and auditor before a later release turns
 `0.4` on. The details are under
-[v0.10.0 and beyond](../ROADMAP.md#v0100-and-beyond) in the roadmap.
+[v0.10.0 in detail](../ROADMAP.md#v0100-in-detail) in the roadmap.
 
 Verification receipts (`manifest.verification_receipts`) need no reader
 upgrade: a reader that does not know them never fetches them. Older engines

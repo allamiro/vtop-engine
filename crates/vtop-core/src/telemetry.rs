@@ -52,6 +52,31 @@ pub const OBJECT_KEY_DECISIONS: [&str; 8] = [
     "per_attempt",
 ];
 
+/// The values of `result` on `vtop_replay_rebuilds_total` (#626): what a
+/// replay of a window an earlier attempt sealed came to. `exact`: the window
+/// was rebuilt over exactly the recorded range, filed under the hour it was
+/// first sealed in, with the bytes the earlier attempt uploaded where the
+/// ledger recorded them. `bytes_differ`: rebuilt over exactly the recorded
+/// range, but its digest differs from the object the earlier attempt
+/// uploaded, so a second object is written and the earlier one is left as
+/// it is. `fallback`: rebuilt over exactly the recorded range with the same
+/// bytes, but the key decision fell back to the per-attempt key
+/// (`vtop_object_key_decisions_total` says which fallback), so a second
+/// object is written. `refused`: the source could not stop the re-read at the
+/// recorded end (a line crosses it, the file under it was replaced, a rotated
+/// file's re-read, an adapter that cannot bound), so it is read to the
+/// current end as before. `too_large`: the window is over 4x the current
+/// batching limits and is not bounded. `dropped_at_stop`: the engine stopped
+/// inside a rebuild and dropped the partial window rather than flush it.
+pub const REPLAY_REBUILD_RESULTS: [&str; 6] = [
+    "exact",
+    "bytes_differ",
+    "fallback",
+    "refused",
+    "too_large",
+    "dropped_at_stop",
+];
+
 /// The values of `result` on `vtop_multipart_parts_total` (#668): a part
 /// sent in this upload call, a part an earlier call left in the session and
 /// this one did not send again, an extra attempt at a part, and a part whose
@@ -92,19 +117,29 @@ pub const OBJECT_LOCK_CHECK_RESULTS: [&str; 8] = [
 /// none.
 pub const RECEIPT_WRITE_RESULTS: [&str; 3] = ["written", "failed", "repaired"];
 
+/// The values of `reason` on `vtop_recovery_held_total` (#782): why recovery
+/// held a range instead of rewinding it. `ledger_write_failed`: the state
+/// store refused the write of its replay decision (#639). `newer_manifest`:
+/// a VERIFIED batch whose manifest a newer release wrote (#671).
+pub const RECOVERY_HOLD_REASONS: [&str; 2] = ["ledger_write_failed", "newer_manifest"];
+
 /// The values of `mode` on `vtop_object_lock_mode` (#684).
 pub const OBJECT_LOCK_MODES: [&str; 3] = ["off", "governance", "compliance"];
 
 /// The values of `outcome` on `vtop_file_delete_decisions_total` (#619):
-/// `deleted`, or why `delete_after_commit` kept a fully archived file.
-pub const FILE_DELETE_OUTCOMES: [&str; 16] = [
+/// `deleted`, `deleted_unchecked` (deleted under `delete_without_open_check`
+/// with no lease to prove no process had it open), or why
+/// `delete_after_commit` kept a fully archived file.
+pub const FILE_DELETE_OUTCOMES: [&str; 18] = [
     "deleted",
+    "deleted_unchecked",
     "appended",
     "shorter",
     "other_file",
     "rewritten",
     "unprovable",
     "metadata_changed",
+    "links_changed",
     "gone",
     "symlink",
     "open",
@@ -177,6 +212,17 @@ pub struct Metrics {
     /// Non-zero means an engine is older than a writer sharing its ledger,
     /// which the upgrade order rules out: upgrade this engine.
     pub recovery_unsupported_manifest_total: IntCounterVec,
+    /// Ranges recovery held instead of rewinding (#639, #782), by tenant,
+    /// source type and [`RECOVERY_HOLD_REASONS`]. A held range holds back
+    /// every VERIFIED range above it in its source unit, and lowers every
+    /// rewind above it to its start.
+    /// `ledger_write_failed` above zero means the state store is refusing
+    /// writes.
+    pub recovery_held_total: IntCounterVec,
+    /// Rewinds recovery applied at a held start below them instead of their
+    /// own (#782): applied at their own, they moved the read head past the
+    /// held range. Each means the ranges above it are archived twice.
+    pub recovery_rewinds_lowered_total: IntCounterVec,
     /// VERIFIED batches recovery re-checked against storage, by the class the
     /// ledger recorded they were verified with and what the re-check found
     /// (#664). `verification_class="strong", result="size_only"` is the one
@@ -267,6 +313,11 @@ pub struct Metrics {
     /// bounded set [`OBJECT_KEY_DECISIONS`]: a rising `fallback_*` or
     /// `per_attempt` rate means replays are writing second objects.
     pub object_key_decisions_total: IntCounterVec,
+    /// What each replay of a window an earlier attempt sealed came to (#626),
+    /// by the bounded set [`REPLAY_REBUILD_RESULTS`]. Any result but `exact`
+    /// means a second object is likely: an alert on it sizes what replays
+    /// cost in storage, and under Object Lock in retained storage.
+    pub replay_rebuilds_total: IntCounterVec,
 
     /// Request-body bytes admitted through the egress shaper (#481) — VTOP's
     /// own account of what it handed the wire under
@@ -284,15 +335,19 @@ pub struct Metrics {
     pub upload_egress_bytes_total: IntCounterVec,
 
     /// Every decision `sources.file.delete_after_commit` takes about a fully
-    /// archived file (#619), by `outcome`: `deleted`, or why it was kept -
-    /// `appended`, `shorter`, `other_file`, `rewritten`, `unprovable`,
-    /// `metadata_changed`, `gone`, `symlink`, `open`, `no_open_check`,
-    /// `rename_refused`, `failed`, `stale_commit` - plus `leftover_archived`
-    /// for a file found under a delete's hidden name, and
-    /// `opened_at_unlink` for a delete a late open slipped past. A fixed set,
+    /// archived file (#619), by `outcome`: `deleted`, `deleted_unchecked`
+    /// (deleted under `delete_without_open_check` with no lease, so nothing
+    /// proved no process had it open), or why it was kept - `appended`,
+    /// `shorter`, `other_file`, `rewritten`, `unprovable`,
+    /// `metadata_changed`, `links_changed`, `gone`, `symlink`, `open`,
+    /// `no_open_check`, `rename_refused`, `failed`, `stale_commit` - plus
+    /// `leftover_archived` for a file found under a delete's hidden name, and
+    /// `opened_at_unlink` for a delete a late open slipped past (also counted
+    /// as `deleted`, so the two are not added). A fixed set,
     /// never the path: the path is in the log line beside each count. A
     /// rising `no_open_check` or `rename_refused` means files that will not
-    /// be deleted until the operator acts.
+    /// be deleted until the operator acts; any `deleted_unchecked` means the
+    /// operator is living with the opt-in's two windows.
     pub file_delete_decisions_total: IntCounterVec,
 
     /// Changes to a Kafka topic's partition list seen while reading, and what
@@ -432,6 +487,16 @@ impl Metrics {
             "VERIFIED batches whose manifest recovery found to be from a newer release than this engine reads (#671); upgrade the engine",
             labels3(),
         )?;
+        let recovery_held_total = cv(
+            "recovery_held_total",
+            "Ranges recovery held instead of rewinding, by reason (ledger_write_failed: the state store refused the replay decision; newer_manifest: a newer release wrote the batch); a held range holds back every VERIFIED range above it in its source unit, and a rewind above it starts at it instead (#782)",
+            vec!["tenant", "source_type", "reason"],
+        )?;
+        let recovery_rewinds_lowered_total = cv(
+            "recovery_rewinds_lowered_total",
+            "Rewinds recovery applied at the start of a held range of the same source unit below them instead of their own, so the held range is read again with them; the ranges above it are archived twice (#782)",
+            vec!["tenant", "source_type"],
+        )?;
         let recovery_rechecks_total = cv(
             "recovery_rechecks_total",
             "VERIFIED batches recovery re-checked against storage, by the class they were verified with (strong, size_only; unknown for a row from before #664 or with a newer release's class) and the re-check's result (strong, size_only, failed, unsupported_version). verification_class=strong with result=size_only: the store can no longer confirm content verified strongly; restore checksum support on the backend, then run vtopctl scrub",
@@ -481,6 +546,11 @@ impl Metrics {
             "object_key_decisions_total",
             "How each batch's object key was decided (#626): derived (uploaded under its content-derived key), reused (the verified object was already stored, no upload), fallback_differs / fallback_size_only / fallback_unreadable (an object is at the derived key and does not verify, verifies by size only, or could not be read) and fallback_unchecked (the store refused or failed the check of the key): the batch was written under its per-attempt key instead of overwriting anything, probe_throttled (the batch failed and was handed back), per_attempt (no checksum, or a backend that cannot report an absent key)",
             vec!["tenant", "source_type", "format", "decision"],
+        )?;
+        let replay_rebuilds_total = cv(
+            "replay_rebuilds_total",
+            "What each replay of a window an earlier attempt sealed came to (#626): exact (rebuilt over exactly the recorded range, filed under the hour it was first sealed in, with the bytes the earlier attempt uploaded where the ledger recorded them, under the derived key), bytes_differ (rebuilt over exactly the recorded range, but its bytes differ from the object the earlier attempt uploaded: a second object is written and the earlier one is left as it is), fallback (the same bytes, but the key decision fell back to the per-attempt key, see vtop_object_key_decisions_total: a second object is written), refused (the source could not stop the re-read at the recorded end; read to the current end as before), too_large (over 4x the current batching limits; not bounded) or dropped_at_stop (the engine stopped inside a rebuild and dropped the partial window; the next start reads it again)",
+            vec!["tenant", "source_type", "format", "result"],
         )?;
         let upload_throttled_total = cv(
             "upload_throttled_total",
@@ -606,6 +676,8 @@ impl Metrics {
             replay_required_total,
             failed_total,
             recovery_unsupported_manifest_total,
+            recovery_held_total,
+            recovery_rewinds_lowered_total,
             recovery_rechecks_total,
             manifests_written_total,
             verification_receipts_total,
@@ -625,6 +697,7 @@ impl Metrics {
             upload_egress_bytes_total,
             file_delete_decisions_total,
             object_key_decisions_total,
+            replay_rebuilds_total,
             kafka_partition_events_total,
             audit_events_total,
             audit_write_failures_total,
