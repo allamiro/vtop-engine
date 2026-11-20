@@ -1,8 +1,8 @@
 # Logs and auditing
 
 Metrics show trends; logs explain what the engine decided; audit evidence
-shows who changed state. This page covers what exists today and what is
-planned.
+shows who changed state. This page covers the log format and levels, the
+audit trail, and where the other evidence lives.
 
 ## Logs
 

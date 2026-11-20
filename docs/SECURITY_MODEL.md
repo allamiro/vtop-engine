@@ -751,7 +751,7 @@ Removing an ignore removes it from both files and this table together.
 | Object immutability (WORM) | Yes, with `upload.object_lock` on `s3_native` | Objects and manifests written under an S3 Object Lock retention, the bucket's Object Lock checked first, and the stored retention of the exact versions verified before `VERIFIED` (§7, #684). The bucket's Object Lock and its default retention are created by the operator; `vtopctl tier copy` refuses the profile. |
 | MAC key rotation | Yes | Key ids in version 0.4 manifests and a keyring (§8.3). |
 | Public-key manifest signing | Not yet | MAC keys are shared secrets: an auditor needs the key to verify. |
-| Multipart upload integrity for very large objects | Not yet | Native backend uses single-part `put_object`. |
+| Multipart upload integrity for very large objects | Yes, on `s3_native` | Above `upload.multipart_threshold_bytes` the engine uploads in parts (#482); a failed part is retried alone and the replay of the same bytes resumes the session (#668). Part ETags are never evidence: the whole stored object is verified before `VERIFIED`, as for a single-part upload. The command backends (`awscli`, `s3cmd`, `minio`) hand the whole object to their tool, which may split it internally but cannot resume a failed upload; `localfs` writes one file. |
 | Authorization / multi-tenant isolation | Not by VTOP | Relies on storage-side IAM and least-privilege credentials. |
 
 ## 15. Summary of normative rules

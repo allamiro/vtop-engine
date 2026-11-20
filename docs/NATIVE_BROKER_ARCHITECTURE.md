@@ -79,12 +79,19 @@ replaced by broker acknowledgements.
 
 ### 2.3 Review of the first `vtop-log` slice
 
-The current slice establishes useful local primitives: bounded frames,
+This review describes the first slice (segment format v1) as of this ADR's
+date, and is kept as the record of what that slice lacked. Segment format v2
+(§6.3; `SegmentManifestV2` in `crates/vtop-log/src/types.rs`) has since added
+a chunk-verifiable BLAKE3 tree, a committed high-water mark, the sealing node
+and fencing epoch, an optional commit statement, and replica and tier
+evidence. v1 is still the default writer (`segment_format`, default `v1`).
+
+The first slice established useful local primitives: bounded frames,
 checksums, single-write record bodies, idempotent producer sequences, sparse
 indexes, active/sealed files, a committed read boundary, and strict recovery
 of torn versus corrupt frames.
 
-It is not yet a proof-carrying or cluster-safe segment implementation:
+It was not yet a proof-carrying or cluster-safe segment implementation:
 
 - `SegmentManifest::blake3_root` is one linear digest, not a chunk-verifiable
   BLAKE3 tree.

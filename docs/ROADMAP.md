@@ -734,7 +734,9 @@ test that failed first.
     commits instead of timing out (#663).
   - An operator egress ceiling (#481).
   - Each stream may choose its checksum algorithm, with
-    `require_strong_verification` as a floor (#669).
+    `require_strong_verification` as a floor (#669). Automatic selection
+    still needs a measured cost model
+    ([plan](https://github.com/allamiro/vtop-engine/issues/669#issuecomment-6806355703)).
   - `vtopctl validate --print-effective` shows what each stream runs with
     (#670).
   - The #483 gate kept TCP as the only egress path (#475 is closed).

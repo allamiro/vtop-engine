@@ -277,9 +277,14 @@ source (no cursor to compare); power loss, which `kill -9` does not model
 This harness is an integration foundation for issue #215, not the final
 production cluster daemon.
 
-- Metadata and native data-plane processes are assembled separately. The
-  native broker does not yet consume metadata membership or lease changes
-  from the live Raft group.
+- Metadata and native data-plane processes are assembled separately, except
+  in scenario 10, which hosts both in one process. Range leadership on the
+  data plane follows metadata leases from the live Raft group: scenarios 09,
+  14 and 23 kill a range leader and assert that another node takes the range
+  under a lease (09 also asserts that the restarted old leader is refused as
+  fenced). Membership changes (scenarios 01 to 03) and data replica-set
+  changes (scenario 12) are driven by the operator; the harness does not
+  claim that a data node reacts to a membership change on its own.
 - Scenario 03 validates metadata voter replacement, and only that. The
   #180/#181 replacement-proof lifecycle for a sealed DATA replica is
   exercised end to end by scenario 12 — operator-driven, through
@@ -287,13 +292,15 @@ production cluster daemon.
   into the transferable prefix and asserts the repaired replica holds the
   full acknowledged floor (the closure #306 tracked) — so the one thing
   still unproven here is automated repair with no operator in the loop.
-- The native data plane has quorum replication but no live leader election.
-  Scenario 04 therefore proves acknowledged durability and same-directory
-  recovery, not automatic data-plane failover.
-- Durable consumer-group cursor proposals are covered by the metadata state
-  machine and deterministic Raft tests. They are not yet wired to the live
-  native fetch client, so this harness does not claim end-to-end cursor
-  continuity across membership changes.
+- Scenario 04 proves acknowledged durability and same-directory recovery;
+  it does not fail over. Lease-driven failover is scenarios 09, 14 and 23.
+- Consumer-group cursors are exercised live through the Kafka gateway:
+  scenario 20 commits a group's offset as a cursor on the metadata plane, and
+  a second consumer resumes from it (scenarios 19 and 21 run groups on nodes
+  with no metadata plane, where every commit is refused by name). The native
+  protocol's own cursor commit is covered by the metadata state machine and
+  deterministic Raft tests, not by this harness, so it claims no end-to-end
+  cursor continuity across membership changes.
 - Offline segment verification applies to scenarios that create data-plane
   artifacts. Metadata-only scenarios have no segment files to verify.
 

@@ -65,7 +65,8 @@
 
 ## 1. Where things stand
 
-As of **August 2026** (repo at v0.3.0):
+This section describes `main`. What each release shipped, and the limits
+it shipped with, are in [ROADMAP.md](ROADMAP.md).
 
 **Done**
 - `StateStore` trait extracted; engine holds `Box<dyn StateStore>`; scheme
@@ -94,13 +95,6 @@ As of **August 2026** (repo at v0.3.0):
   (part of Phase 8's security baseline).
 
 **Not started — the critical path to a fleet**
-- Phase 4: deterministic / content-addressed object keys + idempotent retry.
-  **Objects done (#626):** the object key is derived from the source, the
-  range and the content digest, and an existing object is reused only after
-  it verifies strongly, and a replay in a later hour is sealed at the
-  recorded instant of the window it rebuilds (v0.10.0). Remaining: batch
-  boundaries are not reproduced after a power loss, a row from before
-  v0.10.0 records no seal instant, and manifests stay per attempt ([ARCHITECTURE.md](ARCHITECTURE.md) §13 item 3).
 - Phase 5: Kafka consumer-group fleet mode. The consumer still uses per-read
   `assign()`; no `VTOP_KAFKA_GROUP_MODE` toggle; no multi-writer recovery
   (`FOR UPDATE SKIP LOCKED` / leases, #93).
@@ -108,12 +102,22 @@ As of **August 2026** (repo at v0.3.0):
   the engine.
 
 **Partially done**
+- Phase 4: deterministic / content-addressed object keys + idempotent retry.
+  **Objects done (#626, #688):** the object key is derived from the source,
+  the range and the content digest, and an existing object is reused only
+  after it verifies strongly, and a replay in a later hour is sealed at the
+  recorded instant of the window it rebuilds (v0.10.0). Remaining: batch
+  boundaries are not reproduced after a power loss, a row from before
+  v0.10.0 records no seal instant, and manifests stay per attempt
+  ([ARCHITECTURE.md](ARCHITECTURE.md) §13 item 3).
 - Phase 6 (observability & ops): metrics, readiness, dashboards, OTLP trace
   export and a unit-tested Prometheus alert rule set with runbooks and
   documented SLOs exist (#720); a store write-latency SLO and its alert do
   not.
-- Phase 8 (retention/backup/DR/security): retention shipped; backup/restore
-  runbook, DR drills, and the divergence checker have not been exercised.
+- Phase 8 (retention/backup/DR/security): retention shipped, and an
+  attributable audit trail for every state-changing command (#694); a
+  backup/restore runbook (#734), DR drills (#735), and the divergence checker
+  have not been exercised.
 
 **Optional / gated**
 - Phase 9 (file/syslog HA via leases) — only if distributed file/syslog
@@ -1730,9 +1734,17 @@ deployment identity; the live battery proves the runtime role cannot run DDL,
   (`build_object_name`); an object already at the key is reused only after a
   strong verification, and anything else there is never overwritten (the
   batch falls back to its per-attempt key). There is no key-mode toggle: the
-  attempt key is the fallback, not a mode. Not done: reproducing batch
-  boundaries after a power loss, a partition hour stable under
-  `time_source = seal`, per-range manifests, and the Object Lock compose test.
+  attempt key is the fallback, not a mode. Under the Object Lock profile
+  (#684) a reused object must still be locked, and a damaged object at the
+  derived key is never written over (`crates/vtop-cli/tests/object_lock.rs`,
+  against the mock store); the store's own behaviour, an overwrite that makes
+  a new version and a locked version that survives a delete, is tested
+  against the lab's MinIO in CI (`minio-integration`). A replay in a later
+  hour is sealed at the instant its row recorded (#755), and a replay over a
+  source that grew is rebuilt as first cut (#793, #796), so both reuse the
+  object (v0.10.0). Not done: reproducing batch boundaries after a power
+  loss, a stable partition hour for a row written before v0.10.0, and
+  per-range manifests.
   See [ARCHITECTURE.md](ARCHITECTURE.md) §13 item 3.
 
 ### Phase 5 — Kafka consumer-group fleet mode ⬜ NOT STARTED
@@ -1756,7 +1768,9 @@ deployment identity; the live battery proves the runtime role cannot run DDL,
 - **Done:** Prometheus metrics + readiness endpoint (`VTOP_METRICS_ADDR`,
   `vtop-observe`); structured per-stage events; `observability/` compose stack
   (Grafana, Loki, Mimir, Tempo, Alloy) with generated dashboards; OTLP trace
-  export from the engine into that Tempo (#683).
+  export from the engine into that Tempo (#683); Grafana alert rules for the
+  lab (retention loss, replication health, consumer-group eviction: #454,
+  #561, #571).
 - **Done (#720):** Prometheus alert rules (verification failures, replay-rate
   spike, lag growth, no commits in 30 minutes while data waits, and six more),
   each unit-tested with promtool in CI and linked to a runbook section;
@@ -1873,8 +1887,9 @@ Correctness & invariant
   [x] verify-before-commit enforced in core AND database (state-aware CHECKs)
   [x] crash before VERIFIED → replay; crash after VERIFIED/before COMMIT → safe
   [x] require_strong_verification defaults true
-  [ ] deterministic or content-addressed object keys enabled           (Phase 4)
-  [ ] Object Lock behavior tested (retry never overwrites)             (Phase 4)
+  [x] content-addressed object keys (#626, #688)
+  [ ] batch boundaries reproduced after power loss; per-range manifests (Phase 4)
+  [x] Object Lock behavior tested (retry never overwrites; #684)
 
 State store
   [x] StateStore trait + shared test battery green on SQLite AND Postgres
