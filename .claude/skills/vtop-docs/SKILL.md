@@ -61,6 +61,10 @@ To add a chart or a measured page:
 4. In the README, use a `<picture>` with the light and dark SVG so both GitHub themes work; add the page to `mkdocs.yml` `nav` if it is a page.
 5. Say in the PR which command regenerates it and that CI's drift step passed on the exact head.
 
+## The threat map is hand-written and checked
+
+`docs/SECURITY_MODEL.md` section 17 maps each threat to a control and a test as `path::symbol` references. `scripts/check-threat-map.py` runs in the `claims` job of `ci.yml` (every pull request, so a test renamed in a crate fails it, not only a docs change) and fails when a named file, function or test is gone or `#[ignore]`d, when a group of rows is missing, or when the gaps table disagrees with the rows. Rename a control or a test, and you edit its row in the same PR. `--lines` prints the current `file:line` of each reference. A threat with no control or no test is a GAP in its cell and a row in the gaps table, not an issue.
+
 ## Adding a page: checklist
 
 - [ ] The path is new (no existing path renamed), under `docs/`, named like its neighbours (`UPPER_SNAKE.md` for long-form reference such as `POSTGRES_DEPLOYMENT.md`; lower-case folders for the site's install, deploy, configure and operate pages).
