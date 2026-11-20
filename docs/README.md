@@ -62,6 +62,7 @@ different subjects** — each doc says which it means.
 | [POSTGRES_DEPLOYMENT.md](POSTGRES_DEPLOYMENT.md) | PostgreSQL state-store rollout: `vtopctl migrate`, identity/privilege split, TLS requirements, scheduled pruning. | Deploy the engine against a Postgres ledger. |
 | [SECURITY_MODEL.md](SECURITY_MODEL.md) | Threat model, transport security, credential handling, manifest confidentiality/authentication, integrity verification, immutability, hardening, supply chain, normative-rules summary. | Understand the threat model and operational security rules. |
 | [NODE_OBSERVABILITY.md](NODE_OBSERVABILITY.md) | The `/metrics`, `/healthz`, `/readyz` contract shared by the engine and the cluster nodes, the full metric catalogue, and what readiness means per role (#224). | Scrape, alert on, or health-gate a VTOP process. |
+| [SUPPORT.md](SUPPORT.md) | Versioning and support: which releases get fixes, what a 0.x minor may break, what 1.x will commit to, and the 1.x support window. Format rules and the deprecation table are in the [compatibility policy](reference/compatibility.md). | Decide which release to run, or plan an upgrade. |
 | [RELEASE_VERIFICATION.md](RELEASE_VERIFICATION.md) | Verifying release artifacts (checksums, cosign signatures, SBOM). | Validate a downloaded release. |
 | [ROADMAP.md](ROADMAP.md) | Release-by-release narrative for the archive engine and the cluster plane (v0.1.0+), with known limitations and upgrade notes per release, and the versioning rules. | Decide whether to depend on a version, or plan an upgrade. |
 
