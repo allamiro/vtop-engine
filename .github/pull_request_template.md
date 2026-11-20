@@ -36,10 +36,11 @@ Durable formats (manifest, segment log, ledger schema, Raft log), wire
 (vtop-protocol frames, what Kafka clients see), config keys (added, renamed,
 new default; does an older node ignore, refuse or misread the key?), and a
 mixed-version cluster mid-upgrade. "None" is fine, with the reason.
-A format change follows docs/reference/compatibility.md: name the format's
-row there, say whether the change is one-way (and the operator action that
-takes it), and add the fixture and the matrix cell it needs (until the
-matrix exists, the upgrade-compat or manifest-compat coverage).
+A format change follows docs/reference/compatibility.md: edit the format's
+entry in scripts/compat/formats.yaml (scripts/check-format-registry.py
+fails until you do), say whether the change is one-way (and the operator
+action that takes it), and add the fixture and the matrix cell it needs
+(until the matrix exists, the upgrade-compat or manifest-compat coverage).
 -->
 
 ## Docs
