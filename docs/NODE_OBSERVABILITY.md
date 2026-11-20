@@ -331,7 +331,6 @@ shutdown, startup refusing an unsupported setting) are in
 
 ## What is not here yet
 
-* Proof-verification and evidence-gate counters cover segment recovery today;
-  the retention/tier evidence lag metrics are follow-up work.
-* `vtopctl node status`, the starter Grafana dashboard, and the compose scrape
-  wiring land with the same issue.
+* Proof-verification and evidence-gate counters cover segment recovery.
+  Retention is visible (`vtop_broker_retention_*`), but no metric says how far
+  tier or retention evidence lags behind sealing.
