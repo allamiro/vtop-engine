@@ -193,6 +193,46 @@ class RegistryCheck(unittest.TestCase):
         self.source(SOURCE + nested.replace("    }\n}\n", "    }\n\n    const INNER_VERSION: u8 = 1;\n}\n"))
         self.assertIn("INNER_VERSION", " ".join(self.problems()))
 
+    def test_a_commented_out_declaration_does_not_mask_a_version_bump(self):
+        # Review of #783: comments were scanned as code, so an old
+        # declaration kept in a comment after the live one overwrote its
+        # value and a bump passed against a registry that still said 1.
+        bumped = SOURCE.replace("DEMO_VERSION: u32 = 1", "DEMO_VERSION: u32 = 2")
+        for comment in (
+            "/* was:\npub const DEMO_VERSION: u32 = 1;\n*/\n",
+            "// pub const DEMO_VERSION: u32 = 1;\n",
+            "/* /* nested */\nconst DEMO_VERSION: u32 = 1;\n*/\n",
+        ):
+            self.source(bumped.replace("const COMMAND_KIND_FIRST", comment + "const COMMAND_KIND_FIRST"))
+            self.assertIn("DEMO_VERSION is 2", " ".join(self.problems()), comment)
+
+    def test_a_commented_out_declaration_does_not_stand_in_for_a_removed_one(self):
+        self.source(SOURCE.replace("pub const DEMO_VERSION: u32 = 1;", "/*\npub const DEMO_VERSION: u32 = 1;\n*/"))
+        self.assertIn("no longer hold", " ".join(self.problems()))
+        # Nor is a commented-out tag a new one.
+        self.source(SOURCE.replace("const COMMAND_KIND_SECOND", "/*\nconst COMMAND_KIND_THIRD: u16 = 3;\n*/\nconst COMMAND_KIND_SECOND"))
+        self.assertEqual(self.problems(), [])
+
+    def test_a_magic_named_in_a_comment_is_not_a_format(self):
+        self.source(SOURCE.replace("pub const DEMO_VERSION", '/// Replaces the old `b"VTOPOLD1"` header.\n/* b"VTOPOLD2" */\npub const DEMO_VERSION'))
+        self.assertEqual(self.problems(), [])
+        # A comment marker inside a string is not a comment.
+        self.source(SOURCE + 'const URL: &str = "http://x";\nconst OTHER: [u8; 8] = *b"VTOPNEW1";\n')
+        self.assertIn("magic VTOPNEW1", " ".join(self.problems()))
+
+    def test_the_same_constant_in_two_scopes_of_one_file_fails(self):
+        # Review of #783: a second declaration of a listed name in another
+        # module of the same file overwrote the first, so the registered one
+        # could change unseen.
+        legacy = "\nmod legacy {\n    pub const DEMO_VERSION: u32 = 1;\n}\n"
+        self.source(SOURCE.replace("DEMO_VERSION: u32 = 1", "DEMO_VERSION: u32 = 2") + legacy)
+        self.assertIn("DEMO_VERSION is declared 2 times", " ".join(self.problems()))
+        self.source(SOURCE + legacy)
+        self.assertIn("DEMO_VERSION is declared 2 times", " ".join(self.problems()))
+        # A tag too.
+        self.source(SOURCE + "\nmod legacy {\n    const COMMAND_KIND_FIRST: u16 = 1;\n}\n")
+        self.assertIn("COMMAND_KIND_FIRST is declared 2 times", " ".join(self.problems()))
+
     def test_a_hand_edited_inventory_table_fails_and_write_restores_it(self):
         page = self.root / "docs/reference/compatibility.md"
         page.write_text(page.read_text().replace("| evolving |", "| stable |"))

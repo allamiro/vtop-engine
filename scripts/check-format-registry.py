@@ -15,12 +15,16 @@ fails when:
 * the highest tag of a listed tag set (command kinds, snapshot value tags,
   key categories) differs from the registry's;
 * the registry names something the sources no longer hold;
+* a format constant, or a tag, is declared twice in one file (in two
+  modules): the registry names a constant by file and name, so it could not
+  tell which declaration it records;
 * the inventory table on docs/reference/compatibility.md differs from what
   the registry generates.
 
 Test code is not scanned: ``crates/*/tests``, ``benches``, and every
 ``#[cfg(test)]`` module (its braces matched, skipping strings, raw and byte
-strings, char literals and nested comments).
+strings, char literals and nested comments). Nor are comments: a declaration
+or magic kept in one is not code.
 
 Not covered, so a reviewer still has to look: native protocol and VTPM
 message kinds (match arms, not constants), ``effective_version`` (a literal
@@ -67,51 +71,78 @@ CHAR_LITERAL = re.compile(r"'(\\.|[^\\'])'")
 TEST_MODULE = re.compile(r"^[ \t]*#\[cfg\(test\)\]\s*\n\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*", re.M)
 
 
+def _literal_or_comment(text: str, i: int) -> tuple[str, int] | None:
+    """("comment" | "literal", end) when a comment, a string (plain, raw,
+    byte or C) or a char literal starts at ``i``; None otherwise."""
+    if text.startswith("//", i):
+        newline = text.find("\n", i)
+        return "comment", len(text) if newline < 0 else newline
+    if text.startswith("/*", i):
+        # Block comments nest in Rust.
+        nesting = 0
+        j = i
+        while j < len(text):
+            if text.startswith("/*", j):
+                nesting += 1
+                j += 2
+            elif text.startswith("*/", j):
+                nesting -= 1
+                j += 2
+                if nesting == 0:
+                    return "comment", j
+            else:
+                j += 1
+        return "comment", len(text)
+    raw = RAW_STRING.match(text, i)
+    if raw and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
+        closing = '"' + raw.group(1)
+        j = text.find(closing, raw.end())
+        return "literal", len(text) if j < 0 else j + len(closing)
+    if text[i] == '"':
+        j = i + 1
+        while j < len(text) and text[j] != '"':
+            j += 2 if text[j] == "\\" else 1
+        return "literal", min(j + 1, len(text))
+    char = CHAR_LITERAL.match(text, i) if text[i] == "'" else None
+    if char:
+        return "literal", char.end()
+    return None
+
+
+def without_comments(text: str) -> str:
+    """The text with every comment blanked (line breaks kept), and string
+    and char literals untouched: a declaration or magic kept in a comment
+    is not code, and must neither satisfy the registry nor shadow the live
+    declaration's value (review of #783)."""
+    out: list[str] = []
+    i = 0
+    plain = 0
+    while i < len(text):
+        found = _literal_or_comment(text, i)
+        if found is None:
+            i += 1
+            continue
+        kind, end = found
+        if kind == "comment":
+            out.append(text[plain:i])
+            out.append(re.sub(r"[^\n]", " ", text[i:end]))
+            plain = end
+        i = end
+    out.append(text[plain:])
+    return "".join(out)
+
+
 def _block_end(text: str, opening: int) -> int:
     """The index just past the brace that closes the one at ``opening``,
     skipping braces inside comments, string and char literals."""
     depth = 0
     i = opening
     while i < len(text):
+        found = _literal_or_comment(text, i)
+        if found is not None:
+            i = found[1]
+            continue
         c = text[i]
-        if text.startswith("//", i):
-            i = text.find("\n", i)
-            if i < 0:
-                return len(text)
-            continue
-        if text.startswith("/*", i):
-            # Block comments nest in Rust.
-            nesting = 0
-            while i < len(text):
-                if text.startswith("/*", i):
-                    nesting += 1
-                    i += 2
-                elif text.startswith("*/", i):
-                    nesting -= 1
-                    i += 2
-                    if nesting == 0:
-                        break
-                else:
-                    i += 1
-            continue
-        raw = RAW_STRING.match(text, i)
-        if raw and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
-            closing = '"' + raw.group(1)
-            i = text.find(closing, raw.end())
-            if i < 0:
-                return len(text)
-            i += len(closing)
-            continue
-        if c == '"':
-            i += 1
-            while i < len(text) and text[i] != '"':
-                i += 2 if text[i] == "\\" else 1
-            i += 1
-            continue
-        char = CHAR_LITERAL.match(text, i) if c == "'" else None
-        if char:
-            i = char.end()
-            continue
         if c == "{":
             depth += 1
         elif c == "}":
@@ -164,13 +195,18 @@ def int_value(value: str) -> int | None:
 
 
 def scan(root: pathlib.Path):
-    """(constants, magics, sources) of the production code under crates/*/src.
+    """(constants, magics, sources, repeated) of the production code under
+    crates/*/src, comments blanked.
 
     constants: {(file, NAME): value} for format-like names;
     magics: {(file, MAGIC)};
-    sources: {file: production text}, for the tag sets.
+    sources: {file: production text}, for the tag sets;
+    repeated: {(file, NAME): count} for every constant name declared more
+    than once in one file (in different modules), whose value the check
+    could otherwise take from either declaration.
     """
     constants: dict[tuple[str, str], str] = {}
+    repeated: dict[tuple[str, str], int] = {}
     magics: set[tuple[str, str]] = set()
     sources: dict[str, str] = {}
     paths = sorted(root.glob("crates/*/src/**/*.rs"))
@@ -178,7 +214,7 @@ def scan(root: pathlib.Path):
     test_files: set[pathlib.Path] = set()
     for path in paths:
         names: list[str] = []
-        texts[path] = production_source(path.read_text(encoding="utf-8"), names)
+        texts[path] = production_source(without_comments(path.read_text(encoding="utf-8")), names)
         # A child module's file sits beside a mod.rs, lib.rs or main.rs, and
         # in a directory named after any other file.
         base = path.parent if path.name in ("mod.rs", "lib.rs", "main.rs") else path.with_suffix("")
@@ -191,12 +227,15 @@ def scan(root: pathlib.Path):
         rel = path.relative_to(root).as_posix()
         text = texts[path]
         sources[rel] = text
+        counts: dict[str, int] = {}
         for match in CONST.finditer(text):
+            counts[match.group(1)] = counts.get(match.group(1), 0) + 1
             if is_format_name(match.group(1)):
                 constants[(rel, match.group(1))] = normalise(match.group(2))
+        repeated.update({(rel, name): n for name, n in counts.items() if n > 1})
         for match in MAGIC.finditer(text):
             magics.add((rel, match.group(1)))
-    return constants, magics, sources
+    return constants, magics, sources, repeated
 
 
 def tag_set(text: str, prefix: str) -> dict[str, str]:
@@ -216,8 +255,22 @@ def load(root: pathlib.Path) -> dict:
 
 
 def check_source(root: pathlib.Path, registry: dict) -> list[str]:
-    constants, magics, sources = scan(root)
+    constants, magics, sources, repeated = scan(root)
     problems: list[str] = []
+    # A name declared in two modules of one file has two values, and the
+    # registry, which keys on (file, name), cannot say which one is the
+    # format: one of them could change unseen (review of #783).
+    tag_prefixes = {
+        (item["file"], item["prefix"])
+        for entry in registry.get("formats") or []
+        for item in entry.get("tag_sets") or []
+    }
+    for (file, name), count in sorted(repeated.items()):
+        if is_format_name(name) or any(f == file and name.startswith(p) for f, p in tag_prefixes):
+            problems.append(
+                f"{file}: {name} is declared {count} times in different modules of one file; the "
+                f"registry names a constant by file and name, so give each its own name"
+            )
     claimed_constants: dict[tuple[str, str], str] = {}
     claimed_magics: set[tuple[str, str]] = set()
     seen_ids = set()
