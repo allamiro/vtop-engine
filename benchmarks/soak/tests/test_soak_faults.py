@@ -105,7 +105,8 @@ def test_a_probe_that_cannot_connect_even_before_the_fault_is_an_error(ctx):
 def test_clock_step_runs_the_engine_in_a_shifted_clock_then_back(ctx):
     detail = soak_faults.inject(ctx, planned("clock_step", 25), 0)
     log = [x for x in ctx.lab.log if x.startswith("preload") or x in ("stop", "start")]
-    assert log == ["stop", "preload 3600", "start", "stop", "preload None", "start"]
+    # the last preload None is the one that guarantees the next start is on the real clock
+    assert log == ["stop", "preload 3600", "start", "stop", "preload None", "start", "preload None"]
     assert "+3600" in detail
     assert [e["reason"] for e in events(ctx) if e["kind"] == "engine_start"] == ["clock_step_+3600s", "clock_step_back"]
     assert ctx.state.current_lifetime() == 3
@@ -114,6 +115,23 @@ def test_clock_step_runs_the_engine_in_a_shifted_clock_then_back(ctx):
 def test_the_second_clock_step_goes_the_other_way(ctx):
     soak_faults.inject(ctx, planned("clock_step", 25), 1)
     assert "preload -3600" in ctx.lab.log
+
+
+def test_an_engine_that_exits_during_the_skewed_hold_is_a_failure_not_a_planned_stop(ctx):
+    seconds = {"n": 0}
+
+    def sleep(_):
+        seconds["n"] += 1
+        if seconds["n"] == 5:
+            ctx.lab.engine_running = False  # it dies on its own, mid-hold
+
+    ctx.sleep = sleep
+    with pytest.raises(soak_faults.FaultError, match="exited .* during the .*hold"):
+        soak_faults.inject(ctx, planned("clock_step", 25), 0)
+    assert ctx.lab.preload is None  # whatever restarts it starts on the real clock
+    assert ctx.state.is_down_planned() is False  # the sampler will see this exit as unplanned
+    assert [e for e in events(ctx) if e["kind"] == "engine_exit"][-1]["planned"] is True  # only the deliberate stop
+    assert len([e for e in events(ctx) if e["kind"] == "engine_exit"]) == 1
 
 
 def test_a_shim_that_did_not_load_fails_the_step(ctx):

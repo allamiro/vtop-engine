@@ -183,6 +183,48 @@ def audit_gaps(text: str) -> list[str]:
     return [line.strip() for line in text.splitlines() if GAP_LINE.match(line)]
 
 
+AUDIT_UNIT = re.compile(
+    r"^\S+\s+kafka (?P<topic>.+)\[(?P<partition>\d+)\] group .+: \d+ committed range\(s\) "
+    r"over \[(?P<start>\d+), (?P<end>\d+)\)"
+)
+
+
+def audit_ranges(text: str, topic: str) -> dict[int, tuple[int, int]]:
+    """The span `audit-coverage` judged for each partition of the topic, from
+    its `over [start, end)` field."""
+    spans: dict[int, tuple[int, int]] = {}
+    for line in text.splitlines():
+        match = AUDIT_UNIT.match(line)
+        if match and match["topic"] == topic:
+            spans[int(match["partition"])] = (int(match["start"]), int(match["end"]))
+    return spans
+
+
+def coverage_problems(spans: dict[int, tuple[int, int]], partitions: int, ends: dict[int, int] | None) -> list[str]:
+    """What the audit's spans leave unproven about the archive's boundaries.
+    The audit judges gaps between committed ranges and leaves what lies below
+    the first one unjudged, so a prefix the engine never archived reads as a
+    clean audit. The soak's topic is new, its first record is offset 0, and the
+    engine reads from the beginning: the archive must start at 0 on every
+    partition, and, once the load has stopped and the engine drained, end where
+    the partition does (`ends`)."""
+    problems = []
+    for partition in range(partitions):
+        if partition not in spans:
+            problems.append(f"partition {partition}: the audit reported no committed range")
+            continue
+        start, end = spans[partition]
+        if start != 0:
+            problems.append(
+                f"partition {partition}: the archive starts at offset {start}, not 0; [0, {start}) is unjudged"
+            )
+        if ends is not None and end != ends.get(partition):
+            problems.append(
+                f"partition {partition}: the archive ends at offset {end}, the partition at {ends.get(partition)}"
+            )
+    return problems
+
+
 def parse_pruned(text: str) -> int | None:
     """Rows a `prune-ledger` run deleted: from its JSON status or its sentence."""
     try:

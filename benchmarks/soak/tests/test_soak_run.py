@@ -179,13 +179,31 @@ def test_a_kafka_gap_the_audit_prints_but_exits_zero_over_fails_the_run(profile,
     code, _, run_dir, _ = run(profile, tmp_path, lab)
     assert code == 1 and "zero_coverage_holes" in failed(run_dir)
     audits = [e for e in events(run_dir) if e["kind"] == "audit"]
-    assert audits and all(not e["ok"] and e["gaps"] == 1 for e in audits)
+    assert audits and all(not e["ok"] and e["gaps"] >= 1 for e in audits)
     assert (
         "gap [40, 50)"
         in verdict(run_dir)["criteria"][[c["id"] for c in verdict(run_dir)["criteria"]].index("zero_coverage_holes")][
             "detail"
         ]
     )
+
+
+def test_an_archive_that_does_not_start_at_the_topics_first_record_fails_the_run(profile, tmp_path):
+    # audit-coverage leaves what lies below a partition's first committed range
+    # unjudged, so a skipped prefix prints no gap and exits 0.
+    lab = FakeLab()
+    lab.audit_prefix_from = 100
+    code, _, run_dir, _ = run(profile, tmp_path, lab)
+    assert code == 1 and "zero_coverage_holes" in failed(run_dir)
+    assert "starts at offset 100, not 0" in json.dumps(verdict(run_dir))
+
+
+def test_a_final_archive_that_stops_short_of_the_partitions_end_fails_the_run(profile, tmp_path):
+    lab = FakeLab()
+    lab.audit_end_short = -10
+    code, _, run_dir, _ = run(profile, tmp_path, lab)
+    final = json.loads((run_dir / "finals.json").read_text())["audit_coverage"]
+    assert code == 1 and not final["ok"] and "the archive ends at offset" in final["detail"]
 
 
 def test_a_hole_and_a_dirty_scrub_each_fail_their_own_criterion(profile, tmp_path):

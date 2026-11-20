@@ -92,6 +92,30 @@ def test_audit_gaps_finds_the_stretches_the_audit_printed_without_failing_over()
     assert soak_lab.audit_gaps(clean) == []
 
 
+REPORT = (
+    "audited 19 ledger row(s) and 105 digested row(s) from 8 digest file(s); 2 source unit(s)\n"
+    "ok   kafka soak-topic[0] group vtop-soak: 46 committed range(s) over [0, 81348), 0 duplicated\n"
+    "ok   kafka soak-topic[1] group vtop-soak: 46 committed range(s) over [7, 79943), 3 duplicated\n"
+    "ok   kafka other-topic[0] group vtop-soak: 1 committed range(s) over [0, 5), 0 duplicated\n"
+    "coverage audit PASSED\n"
+)
+
+
+def test_audit_ranges_reads_the_span_judged_for_each_partition_of_the_topic():
+    assert soak_lab.audit_ranges(REPORT, "soak-topic") == {0: (0, 81348), 1: (7, 79943)}
+
+
+def test_coverage_problems_names_a_prefix_the_audit_did_not_judge_and_a_short_end():
+    spans = soak_lab.audit_ranges(REPORT, "soak-topic")
+    assert soak_lab.coverage_problems(spans, 2, None) == [
+        "partition 1: the archive starts at offset 7, not 0; [0, 7) is unjudged"
+    ]
+    problems = soak_lab.coverage_problems({0: (0, 100), 1: (0, 90)}, 2, {0: 100, 1: 95})
+    assert problems == ["partition 1: the archive ends at offset 90, the partition at 95"]
+    assert soak_lab.coverage_problems({0: (0, 100)}, 2, None) == ["partition 1: the audit reported no committed range"]
+    assert soak_lab.coverage_problems({0: (0, 100), 1: (0, 90)}, 2, {0: 100, 1: 90}) == []
+
+
 def test_parse_pruned_reads_the_status_or_the_sentence():
     assert soak_lab.parse_pruned('{"status": "ok", "deleted": 17, "digest": null}') == 17
     assert soak_lab.parse_pruned("pruned 3 committed ledger row(s); digest /x; audit record a") == 3

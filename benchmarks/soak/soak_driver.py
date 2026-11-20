@@ -279,19 +279,25 @@ class Driver:
         except ValueError:
             return {}
 
-    def audit(self, trigger: str, storage: bool = False) -> dict:
+    def audit(self, trigger: str, storage: bool = False, ends: dict[int, int] | None = None) -> dict:
         args = ["audit-coverage"] + (["--check-storage"] if storage else [])
         result = self.lab.vtopctl(*args, timeout=self.profile["check_timeout_s"])
         # The audit exits 0 over a gap in a Kafka partition (compaction and
-        # transaction markers can explain one). This workload has neither, so
-        # a gap it reports is a record nothing archived.
+        # transaction markers can explain one) and does not judge what lies
+        # below a partition's first committed range. This workload has no
+        # compaction and no transactions, and its topic starts at offset 0, so
+        # both are findings here.
         gaps = soak_lab.audit_gaps(result.out)
-        ok = result.ok and not gaps
+        spans = soak_lab.audit_ranges(result.out, soak_lab.TOPIC)
+        problems = soak_lab.coverage_problems(spans, self.profile["partitions"], ends) if result.ok else []
+        ok = result.ok and not gaps and not problems
         detail = tail(result.text(), 20)
         if gaps:
             detail = f"{len(gaps)} unexplained gap(s): {'; '.join(gaps[:5])}\n{detail}"
+        if problems:
+            detail = f"{'; '.join(problems)}\n{detail}"
         self.rec.event("audit", trigger=trigger, ok=ok, storage=storage, gaps=len(gaps), detail=detail[:2000])
-        return {"ok": ok, "exit": result.code, "gaps": len(gaps), "detail": detail[:4000]}
+        return {"ok": ok, "exit": result.code, "gaps": len(gaps), "spans": spans, "detail": detail[:4000]}
 
     # -- faults --------------------------------------------------------
 
@@ -413,7 +419,9 @@ class Driver:
             self.finals["tail"] = {"partitions": {str(k): v for k, v in sorted(offsets.items())}}
         except soak_lab.LabError as error:
             self.finals["tail"] = {"error": str(error)[:300]}
-        self.finals["audit_coverage"] = self.audit("final", storage=True)
+        partitions = self.finals["tail"].get("partitions")
+        ends = {int(k): v["end"] for k, v in partitions.items()} if partitions else None
+        self.finals["audit_coverage"] = self.audit("final", storage=True, ends=ends)
         scrub = lab.vtopctl("scrub", timeout=p["check_timeout_s"], json_report=True)
         summary = self._scrub_summary(scrub)
         ok = scrub.ok and bool(summary.get("passed"))

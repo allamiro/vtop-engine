@@ -155,6 +155,21 @@ def _check_skew(ctx: Context, step: int) -> int:
     return round(shifted)
 
 
+def _hold_watching_engine(ctx: Context, seconds: int, what: str) -> None:
+    """Hold a fault for `seconds`, looking at the engine every second. The
+    engine is meant to survive the hold; one that exits during it is a finding,
+    not a planned stop, so the hold ends with an error and the sampler, which
+    sees the exit outside any planned stop, records it."""
+    for _ in range(seconds):
+        ctx.sleep(1)
+        state = ctx.lab.state("engine")
+        if not state.get("running"):
+            ctx.lab.set_preload(None)  # so whatever restarts it starts on the real clock
+            raise FaultError(
+                f"the engine exited (status {state.get('exit_code')}) during the {what} instead of surviving it"
+            )
+
+
 def clock_step(ctx: Context, fault: soak_profile.PlannedFault, occurrence: int) -> str:
     lab = ctx.lab
     step = soak_profile.clock_step_for(ctx.profile, occurrence)
@@ -162,25 +177,30 @@ def clock_step(ctx: Context, fault: soak_profile.PlannedFault, occurrence: int) 
         raise FaultError("the engine was not running when its clock step was due")
     # An engine's clock cannot be moved from outside its process, so the step
     # is taken the way a host's clock step meets a daemon: the daemon is
-    # started, or restarted, into a clock that is no longer where it was.
-    with ctx.state.planned_down():
-        stopped = lab.stop_engine()
-        ctx.rec.event(
-            "engine_exit", lifetime=ctx.state.current_lifetime(), planned=True, exit_code=stopped.get("exit_code")
-        )
-        lab.set_preload(step)
-        lab.clear_skew_marker()
-        _restart_engine(ctx, f"clock_step_{step:+d}s")
+    # started, or restarted, into a clock that is no longer where it was. Only
+    # the two restarts are planned downtime; the hold between them is not.
+    try:
+        with ctx.state.planned_down():
+            stopped = lab.stop_engine()
+            ctx.rec.event(
+                "engine_exit", lifetime=ctx.state.current_lifetime(), planned=True, exit_code=stopped.get("exit_code")
+            )
+            lab.set_preload(step)
+            lab.clear_skew_marker()
+            _restart_engine(ctx, f"clock_step_{step:+d}s")
         applied = _check_skew(ctx, step)
-        ctx.sleep(fault.hold_s)
-        stopped = lab.stop_engine()
-        ctx.rec.event(
-            "engine_exit", lifetime=ctx.state.current_lifetime(), planned=True, exit_code=stopped.get("exit_code")
-        )
-        lab.set_preload(None)
-        lab.clear_skew_marker()
-        _restart_engine(ctx, "clock_step_back")
+        _hold_watching_engine(ctx, fault.hold_s, f"{fault.hold_s} s hold with its clock {applied:+d} s off")
+        with ctx.state.planned_down():
+            stopped = lab.stop_engine()
+            ctx.rec.event(
+                "engine_exit", lifetime=ctx.state.current_lifetime(), planned=True, exit_code=stopped.get("exit_code")
+            )
+            lab.set_preload(None)
+            lab.clear_skew_marker()
+            _restart_engine(ctx, "clock_step_back")
         _check_skew(ctx, 0)
+    finally:
+        lab.set_preload(None)  # a fault must not leave the next start on a skewed clock
     return f"engine ran with its clock {applied:+d} s from the host's for {fault.hold_s} s, then restarted with it back"
 
 

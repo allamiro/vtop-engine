@@ -123,6 +123,9 @@ class FakeLab:
         self.producer_stopped = False
         self.audit_ok = True
         self.audit_gap = False  # a Kafka gap the audit prints and still exits 0 over
+        self.partitions = 2
+        self.audit_prefix_from = 0  # where the audit says the archive starts
+        self.audit_end_short = 0  # how far short of the partition's end it says the archive stops
         self.scrub_ok = True
         self.calls = []
 
@@ -170,14 +173,19 @@ class FakeLab:
         self.calls.append(args)
         command = args[0]
         if command == "audit-coverage":
-            if self.audit_gap:
-                text = (
-                    "ok   kafka soak-topic[0] group vtop-soak: 3 committed range(s) over [0, 90), 0 duplicated\n"
-                    "     gap [40, 50): no records archived (compaction or transaction markers can leave such gaps)\n"
-                    "coverage audit PASSED\n"
-                )
-                return soak_lab.Result(0, text, "")
-            return soak_lab.Result(0 if self.audit_ok else 1, "" if self.audit_ok else "hole at offsets 10..19", "")
+            if not self.audit_ok:
+                return soak_lab.Result(1, "hole at offsets 10..19", "")
+            lines = []
+            for p in range(self.partitions):
+                start = self.audit_prefix_from
+                end = 50 + p + self.audit_end_short
+                unit = f"kafka soak-topic[{p}] group vtop-soak"
+                lines.append(f"ok   {unit}: 3 committed range(s) over [{start}, {end}), 0 duplicated")
+                if self.audit_gap:
+                    lines.append(
+                        "     gap [40, 50): no records archived (compaction or transaction markers can leave such gaps)"
+                    )
+            return soak_lab.Result(0, "\n".join(lines) + "\ncoverage audit PASSED\n", "")
         if command == "scrub":
             ok = self.scrub_ok
             body = {"mode": "all", "checked": 50, "committed_rows": 50, "passed": ok, "findings": [] if ok else [{}]}
