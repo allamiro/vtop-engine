@@ -124,6 +124,14 @@ async fn s3_client() -> aws_sdk_s3::Client {
     aws_sdk_s3::Client::from_conf(conf)
 }
 
+/// An S3 AccessDenied: the AWS leg's role holds no
+/// s3:BypassGovernanceRetention, on purpose (#722).
+fn access_denied<E: aws_sdk_s3::error::ProvideErrorMetadata, R>(
+    e: &aws_sdk_s3::error::SdkError<E, R>,
+) -> bool {
+    e.as_service_error().and_then(|se| se.code()) == Some("AccessDenied")
+}
+
 /// The refusal on a store without Object Lock or versioning (#722; Garage):
 /// the engine, started as `vtopctl run` starts it, refuses at startup in three
 /// parts (#770). Against the plain bucket: such a store has no locked one.
@@ -161,14 +169,6 @@ async fn refused_at_startup(capability: Capability, at: RefusalAt) {
     }
 }
 
-/// An S3 AccessDenied: the AWS leg's role holds no
-/// s3:BypassGovernanceRetention, on purpose (#722).
-fn access_denied<E: aws_sdk_s3::error::ProvideErrorMetadata, R>(
-    e: &aws_sdk_s3::error::SdkError<E, R>,
-) -> bool {
-    e.as_service_error().and_then(|se| se.code()) == Some("AccessDenied")
-}
-
 #[tokio::test]
 #[ignore = "requires an S3-compatible endpoint with Object Lock"]
 async fn live_the_engine_refuses_a_bucket_without_object_lock_at_startup() {
@@ -199,6 +199,131 @@ async fn live_the_engine_refuses_a_bucket_without_object_lock_at_startup() {
     .await;
 }
 
+/// One batch the engine archived under the lock into the locked bucket, and
+/// what the cases below need to look at it and clean it up.
+struct Archived {
+    engine: Engine,
+    client: aws_sdk_s3::Client,
+    bucket: String,
+    /// The receipt's uri.
+    receipt: String,
+    /// The object, the manifest and the receipt: uri, key and version id.
+    written: Vec<(String, String, String)>,
+    // Held so the engine's state directory outlives the case.
+    _dir: tempfile::TempDir,
+}
+
+fn key_of(bucket: &str, uri: &str) -> String {
+    uri.strip_prefix(&format!("s3://{bucket}/"))
+        .unwrap()
+        .to_owned()
+}
+
+async fn archive_one_locked_batch() -> Archived {
+    let dir = tempfile::tempdir().unwrap();
+    let bucket = locked_bucket();
+    let prefix = format!("vtop-it-684-engine-{}", unix_now());
+    let mut engine = Engine::new_exclusive(
+        config(dir.path(), &bucket, &prefix),
+        StreamsConfig { streams: vec![] },
+    )
+    .await
+    .expect("a locked bucket passes the startup check");
+    let before = unix_now();
+    let out = engine.process_once(SourceType::File).await.unwrap();
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert!(out[0].committed, "{out:?}");
+    let row = engine
+        .store
+        .get_batch(&out[0].batch_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let client = s3_client().await;
+    let receipt =
+        vtop_core::partitioning::receipt_uri(row.manifest_uri.as_deref().unwrap()).unwrap();
+    let mut written = Vec::new();
+    for uri in [
+        row.object_uri.clone().unwrap(),
+        row.manifest_uri.clone().unwrap(),
+        receipt.clone(),
+    ] {
+        let key = key_of(&bucket, &uri);
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            head.object_lock_mode().map(|m| m.as_str()),
+            Some("GOVERNANCE"),
+            "{uri}"
+        );
+        let until = head.object_lock_retain_until_date().unwrap().secs();
+        assert!(
+            until >= before + 86_400 && until <= unix_now() + 86_400 + 1,
+            "{uri} is retained one day from its write: {until}"
+        );
+        written.push((uri, key, head.version_id().unwrap().to_owned()));
+    }
+    Archived {
+        engine,
+        client,
+        bucket,
+        receipt,
+        written,
+        _dir: dir,
+    }
+}
+
+impl Archived {
+    /// The scrub, reading the retention of the batch's object and manifest
+    /// and of the receipt back through the backend (#710).
+    async fn scrub(&self) -> vtop_cli::scrub::ScrubReport {
+        let rows = vtop_cli::scrub::committed_rows(
+            self.engine.store.list_batches().await.unwrap(),
+            Vec::new(),
+        );
+        self.engine
+            .scrub(
+                rows,
+                &ScrubOptions {
+                    check_retention: Some(ObjectLockMode::Governance),
+                    check_receipts: true,
+                    ..ScrubOptions::default()
+                },
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Delete what the batch wrote: the lab's root credentials may bypass
+    /// governance. The AWS leg's role may not, and there the bucket's
+    /// lifecycle rule removes the versions; the log says so.
+    async fn clean_up(self) {
+        for (uri, key, version) in self.written {
+            let deleted = self
+                .client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .version_id(&version)
+                .bypass_governance_retention(true)
+                .send()
+                .await;
+            match deleted {
+                Ok(_) => {}
+                Err(e) if access_denied(&e) => eprintln!(
+                    "{uri}: governance bypass refused; left for the bucket's lifecycle rule"
+                ),
+                Err(e) => panic!("cleaning up {uri}: {e:?}"),
+            }
+        }
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires an S3-compatible endpoint with Object Lock"]
 async fn live_the_engine_archives_a_batch_under_the_configured_lock() {
@@ -207,43 +332,10 @@ async fn live_the_engine_archives_a_batch_under_the_configured_lock() {
         "engine.object_lock.archives_a_batch_locked",
         &[Capability::ObjectLock, Capability::Versioning],
         || async {
-            let dir = tempfile::tempdir().unwrap();
-            let bucket = locked_bucket();
-            let prefix = format!("vtop-it-684-engine-{}", unix_now());
-            let mut engine = Engine::new_exclusive(
-                config(dir.path(), &bucket, &prefix),
-                StreamsConfig { streams: vec![] },
-            )
-            .await
-            .expect("a locked bucket passes the startup check");
-            let before = unix_now();
-            let out = engine.process_once(SourceType::File).await.unwrap();
-            assert_eq!(out.len(), 1, "{out:?}");
-            assert!(out[0].committed, "{out:?}");
-            let row = engine
-                .store
-                .get_batch(&out[0].batch_id)
-                .await
-                .unwrap()
-                .unwrap();
-
-            // The scrub reads the retention back through the backend (#710): the
-            // batch's object and manifest, and the receipt at its key.
-            let rows = vtop_cli::scrub::committed_rows(
-                engine.store.list_batches().await.unwrap(),
-                Vec::new(),
-            );
-            let report = engine
-                .scrub(
-                    rows,
-                    &ScrubOptions {
-                        check_retention: Some(ObjectLockMode::Governance),
-                        check_receipts: true,
-                        ..ScrubOptions::default()
-                    },
-                )
-                .await
-                .unwrap();
+            // The scrub finds the batch's and the receipt's retention locked
+            // (#710).
+            let archived = archive_one_locked_batch().await;
+            let report = archived.scrub().await;
             assert!(report.passed, "{report:#?}");
             let locked = RetentionResult::Locked.as_str();
             assert_eq!(report.retention.get(locked), Some(&1), "{report:#?}");
@@ -252,115 +344,59 @@ async fn live_the_engine_archives_a_batch_under_the_configured_lock() {
                 Some(&1),
                 "{report:#?}"
             );
+            archived.clean_up().await;
+        },
+        refused_at_startup,
+    )
+    .await;
+}
 
-            let client = s3_client().await;
-            let receipt =
-                vtop_core::partitioning::receipt_uri(row.manifest_uri.as_deref().unwrap()).unwrap();
-            let key_of = |uri: &str| {
-                uri.strip_prefix(&format!("s3://{bucket}/"))
-                    .unwrap()
-                    .to_owned()
-            };
-            let mut written = Vec::new();
-            for uri in [
-                row.object_uri.clone().unwrap(),
-                row.manifest_uri.clone().unwrap(),
-                receipt.clone(),
-            ] {
-                let key = key_of(&uri);
-                let head = client
-                    .head_object()
-                    .bucket(&bucket)
-                    .key(&key)
-                    .send()
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    head.object_lock_mode().map(|m| m.as_str()),
-                    Some("GOVERNANCE"),
-                    "{uri}"
-                );
-                let until = head.object_lock_retain_until_date().unwrap().secs();
-                assert!(
-                    until >= before + 86_400 && until <= unix_now() + 86_400 + 1,
-                    "{uri} is retained one day from its write: {until}"
-                );
-                written.push((uri, key, head.version_id().unwrap().to_owned()));
-            }
-
-            // Clear the receipt's retention, as a principal allowed to bypass
-            // governance can (#710): the scrub reports the receipt, not the
-            // batch. The lab's root credentials may; the AWS leg's role
-            // deliberately may not (#722: no s3:BypassGovernanceRetention), so
-            // there this half is not run, and the log says so.
-            let cleared = client
+/// The scrub's `missing` finding (#710) against a real store: the receipt's
+/// retention is cleared by a principal allowed to bypass governance, and the
+/// scrub reports the receipt, and only the receipt. Clearing takes an empty
+/// `PutObjectRetention`, which not every store accepts
+/// (`object_lock_retention_clear`).
+#[tokio::test]
+#[ignore = "requires an S3-compatible endpoint with Object Lock"]
+async fn live_a_receipt_whose_retention_was_cleared_is_reported_by_the_scrub() {
+    let live = LiveS3::from_env();
+    live.case_with_refusal(
+        "engine.object_lock.scrub_reports_a_receipt_without_retention",
+        &[
+            Capability::ObjectLock,
+            Capability::Versioning,
+            Capability::ObjectLockRetentionClear,
+        ],
+        || async {
+            let archived = archive_one_locked_batch().await;
+            archived
+                .client
                 .put_object_retention()
-                .bucket(&bucket)
-                .key(key_of(&receipt))
+                .bucket(&archived.bucket)
+                .key(key_of(&archived.bucket, &archived.receipt))
                 .bypass_governance_retention(true)
                 .retention(aws_sdk_s3::types::ObjectLockRetention::builder().build())
                 .send()
-                .await;
-            match cleared {
-                Ok(_) => {
-                    let rows = vtop_cli::scrub::committed_rows(
-                        engine.store.list_batches().await.unwrap(),
-                        Vec::new(),
-                    );
-                    let report = engine
-                        .scrub(
-                            rows,
-                            &ScrubOptions {
-                                check_retention: Some(ObjectLockMode::Governance),
-                                check_receipts: true,
-                                ..ScrubOptions::default()
-                            },
-                        )
-                        .await
-                        .unwrap();
-                    assert!(!report.passed, "{report:#?}");
-                    assert_eq!(report.retention.get(locked), Some(&1), "{report:#?}");
-                    assert_eq!(
-                        report
-                            .receipt_retention
-                            .get(RetentionResult::Missing.as_str()),
-                        Some(&1),
-                        "{report:#?}"
-                    );
-                    assert_eq!(report.findings.len(), 1, "{report:#?}");
-                    assert_eq!(
-                        report.findings[0].receipt_retention,
-                        Some(RetentionResult::Missing),
-                        "{report:#?}"
-                    );
-                }
-                Err(e) if access_denied(&e) => eprintln!(
-                    "{receipt}: clearing a governance retention was refused (no bypass \
-                     permission); the scrub of a receipt without retention is not run here"
-                ),
-                Err(e) => panic!("clearing the receipt's retention: {e:?}"),
-            }
-
-            // Clean up: the lab's root credentials may bypass governance; the
-            // AWS leg's role may not, and there the bucket's lifecycle rule
-            // removes the versions once their one-day retention ends.
-            for (uri, key, version) in written {
-                let deleted = client
-                    .delete_object()
-                    .bucket(&bucket)
-                    .key(&key)
-                    .version_id(&version)
-                    .bypass_governance_retention(true)
-                    .send()
-                    .await;
-                match deleted {
-                    Ok(_) => {}
-                    Err(e) if access_denied(&e) => {
-                        eprintln!("{uri}: governance bypass refused; left for the bucket's lifecycle rule")
-                    }
-                    Err(e) => panic!("cleaning up {uri}: {e:?}"),
-                }
-            }
+                .await
+                .expect("the lab's root credentials may clear a governance retention");
+            let report = archived.scrub().await;
+            let locked = RetentionResult::Locked.as_str();
+            assert!(!report.passed, "{report:#?}");
+            assert_eq!(report.retention.get(locked), Some(&1), "{report:#?}");
+            assert_eq!(
+                report
+                    .receipt_retention
+                    .get(RetentionResult::Missing.as_str()),
+                Some(&1),
+                "{report:#?}"
+            );
+            assert_eq!(report.findings.len(), 1, "{report:#?}");
+            assert_eq!(
+                report.findings[0].receipt_retention,
+                Some(RetentionResult::Missing),
+                "{report:#?}"
+            );
+            archived.clean_up().await;
         },
         refused_at_startup,
     )

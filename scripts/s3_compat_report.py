@@ -57,6 +57,7 @@ CAPABILITIES = [
     "versioning",
     "object_lock",
     "object_lock_enforced",
+    "object_lock_retention_clear",
     "conditional_put",
 ]
 

@@ -24,6 +24,7 @@ capability. The run is compared with it, case by case, by the test kit in
 | `versioning` | version ids on PUT, HEAD and GET by `versionId` |
 | `object_lock` | the Object Lock configuration read, retention and legal hold written and read back |
 | `object_lock_enforced` | a locked version cannot be deleted |
+| `object_lock_retention_clear` | a governance retention can be cleared with the bypass header (an empty `PutObjectRetention`); VTOP never does, the live tests do to tamper with a receipt and see the scrub report it |
 | `conditional_put` | `If-None-Match: *` on PUT; informational, VTOP does not use it |
 
 Every case adds the addressing it ran with (`path_style` or `virtual_host`)
@@ -143,13 +144,16 @@ pinned by digest and that the digest still resolves.
 
 ## Probes and the second checksum pass
 
-`crates/vtop-upload/tests/live_s3_probes.rs` asks each server two things
+`crates/vtop-upload/tests/live_s3_probes.rs` asks each server three things
 VTOP's guarantees lean on or may: whether a PUT with a wrong
 `x-amz-checksum-sha256` is refused and nothing stored
 (`checksum_sha256_enforced`; `store_checksum` verification trusts the
 SHA-256 a store reports, so a store that echoed an unchecked header would
 pass corrupt data), and whether `If-None-Match: *` on PUT is honoured
-(`conditional_put`, informational).
+(`conditional_put`, informational), and whether the SDK's default CRC32
+trailer on a PUT with no checksum of its own is accepted
+(`checksum_crc32_default`, informational: Garage and Zenko CloudServer refuse
+it, and since #788 no VTOP write sends it).
 
 Each leg also reruns the verification and Object Lock write tests with
 `AWS_REQUEST_CHECKSUM_CALCULATION=when_required` (D13), into

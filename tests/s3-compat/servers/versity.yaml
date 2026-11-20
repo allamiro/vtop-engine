@@ -20,4 +20,7 @@ capabilities:
   versioning: pass
   object_lock: pass
   object_lock_enforced: pass
+  object_lock_retention_clear:
+    state: not_applicable
+    note: "PutObjectRetention with an empty retention answers 400 InvalidArgument (The retain until date must be in the future!), so the case that clears a receipt's retention to see the scrub report it cannot run here. VTOP never clears a retention; only that test does."
   conditional_put: pass

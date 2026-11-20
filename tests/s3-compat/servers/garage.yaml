@@ -33,6 +33,7 @@ capabilities:
     refusal: startup
     note: "GetObjectLockConfiguration answers 501 NotImplemented: upload.object_lock is refused at startup, saying the store does not implement S3 Object Lock."
   object_lock_enforced: { state: unsupported, refusal: startup }
+  object_lock_retention_clear: not_applicable
   conditional_put:
     state: xfail
     issue: 722
