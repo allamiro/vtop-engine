@@ -153,6 +153,11 @@ jobs:
   # from source via cmake, so cross-compiling is unreliable. Windows is
   # deliberately NOT built (rdkafka + cmake there is not validated) — shipping
   # nothing beats shipping a broken binary.
+  #
+  # Linux ships two archives per architecture (#724): a glibc one (`-gnu`)
+  # built inside manylinux2014 for a glibc 2.17 floor, and a fully static musl
+  # one (`-musl`) built inside Alpine, which needs no C library at all on the
+  # host. `build_image` is each Linux leg's build container, pinned by digest.
   # ---------------------------------------------------------------------------
   binaries:
     name: build ${{ matrix.target }}
@@ -163,10 +168,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # manylinux2014 is CentOS 7 (glibc 2.17) with devtoolset-10 (gcc 10)
+          # and a current cmake; one image per architecture, not an index.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            build_image: quay.io/pypa/manylinux2014_x86_64@sha256:e6a785657009c612fe2a85fa933051d03a50ba62b1c5e47d62abcab546a2e423
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            build_image: quay.io/pypa/manylinux2014_aarch64@sha256:c2995cae5e2d433fbe757d1466486727b3edd68ba644cd60df253365f35fda9e
+          # rust:1-alpine (Alpine 3.24), a multi-arch index; Docker picks the
+          # runner's arch. The image's own Rust is not used: the build
+          # installs the version the toolchain step below resolved, so every
+          # archive comes from the same compiler.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            build_image: rust:1-alpine@sha256:8d0e82abfdf9a38071e07cabc5afba4ddbe077631a80e4e742a760c38beadc33
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            build_image: rust:1-alpine@sha256:8d0e82abfdf9a38071e07cabc5afba4ddbe077631a80e4e742a760c38beadc33
           # macos-14 was retired by GitHub ("The configuration 'macos-14-arm64-us-default'
           # is not supported", v0.7.0 release run); macos-15 is the arm64 runner.
           - os: macos-15
@@ -218,20 +237,23 @@ jobs:
       # dependencies (librdkafka, zstd, sqlite, ...) pick up the newest symbol
       # versions of the build host's headers. Built on the runner's Ubuntu
       # 24.04 (glibc 2.39), v0.10.0's vtopctl needed GLIBC_2.39 and did not
-      # start on Debian 12, Ubuntu 22.04 or RHEL 8/9 (#808). Building inside
-      # AlmaLinux 8 (glibc 2.28) sets the floor at 2.28. Still native on both
-      # runners: librdkafka's cmake build does not cross-compile reliably.
+      # start on Debian 12, Ubuntu 22.04 or RHEL 8/9 (#808); v0.10.1 built
+      # inside AlmaLinux 8 for a 2.28 floor, which still left out Amazon Linux
+      # 2 (glibc 2.26). Building inside manylinux2014 (CentOS 7, glibc 2.17)
+      # sets the floor at 2.17. Its devtoolset-10 gcc links any libstdc++ or
+      # libgcc piece newer than CentOS 7's gcc 4.8 statically, so the C++
+      # floor stays at gcc 4.8 too. Still native on both runners: librdkafka's
+      # cmake build does not cross-compile reliably.
       # `docker run` rather than a job `container:`, so the JavaScript actions
       # keep running on the host and not against an old glibc. The toolchain
       # is the one the step above installed (mounted, not installed again), so
-      # the pin stays in one place.
-      - name: Build (Linux, inside AlmaLinux 8 for a glibc 2.28 floor)
-        if: runner.os == 'Linux'
+      # the pin stays in one place; Rust's -gnu targets support glibc 2.17.
+      - name: Build (Linux glibc, inside manylinux2014 for a glibc 2.17 floor)
+        if: endsWith(matrix.target, '-linux-gnu')
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-          # almalinux:8, a multi-arch index; Docker picks the runner's arch.
-          BUILD_IMAGE: almalinux:8@sha256:2d0f2eb2a83cc09dbc2eb92fade4dbe8f709628149e81aa00aec70630406603b
+          BUILD_IMAGE: ${{ matrix.build_image }}
         run: |
           set -euo pipefail
           docker run --rm \
@@ -243,24 +265,69 @@ jobs:
             -v "$GITHUB_WORKSPACE:/src" -w /src \
             "$BUILD_IMAGE" bash -c '
               set -euo pipefail
-              # gcc 8 and cmake from the distribution. OpenSSL is built from
-              # source (ssl-vendored, which needs perl); the -devel packages
-              # are what librdkafka probes for, and the floor check below
-              # fails if one of them ends up linked.
-              # Retried: the only step that needs the distribution mirrors,
-              # and one hiccup would otherwise fail a 10 to 20 minute leg.
+              # gcc 10 (devtoolset-10), make, perl, cmake and the zlib
+              # headers come with the image. OpenSSL is built from source
+              # (ssl-vendored), and its Configure needs the IPC::Cmd module
+              # CentOS 7 packages apart. librdkafka includes curl/curl.h even
+              # with curl off (docs/install/from-source.md), so the curl
+              # headers are installed; nothing links libcurl, and the floor
+              # check below fails if a library outside the base system ends
+              # up linked.
+              # Retried: the only step that needs the distribution mirrors
+              # (CentOS 7 vault), and one hiccup would otherwise fail a 10 to
+              # 20 minute leg.
               for i in 1 2 3; do
-                dnf -y -q install gcc gcc-c++ make cmake perl \
-                  openssl-devel cyrus-sasl-devel libcurl-devel zlib-devel && break
-                [ "$i" = 3 ] && { echo "dnf install failed 3 times" >&2; exit 1; }
+                yum -y -q install perl-IPC-Cmd libcurl-devel && break
+                [ "$i" = 3 ] && { echo "yum install failed 3 times" >&2; exit 1; }
                 sleep 15
               done
               # Hand the root-owned outputs back to the runner user.
               trap "chown -R \"\$HOST_UID:\$HOST_GID\" /src/target /cargo/registry /cargo/git 2>/dev/null || true" EXIT
               export PATH="/cargo/bin:$PATH"
-              echo "$(getconf GNU_LIBC_VERSION), gcc $(gcc -dumpfullversion)"
+              echo "$(getconf GNU_LIBC_VERSION), gcc $(gcc -dumpfullversion), $(cmake --version | head -n1)"
               cargo --version
               cargo build --release --bin vtop-node --bin vtopctl --target "$TARGET" --locked
+            '
+
+      # Fully static musl binaries: no C library, loader or other shared
+      # object is needed on the host, so they run on Alpine and other musl
+      # distributions, and on any glibc system too. Built natively inside
+      # Alpine, whose gcc targets musl, so librdkafka, OpenSSL (ssl-vendored)
+      # and the other C dependencies compile against musl as well. zlib is
+      # built from source (LIBZ_SYS_STATIC) instead of probed from the image;
+      # curl-dev is there for librdkafka's curl/curl.h include only.
+      # Rust's musl targets link statically by default; the check below
+      # fails if either binary has an interpreter or a NEEDED entry.
+      - name: Build (Linux musl, static, inside Alpine)
+        if: endsWith(matrix.target, '-linux-musl')
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          BUILD_IMAGE: ${{ matrix.build_image }}
+        run: |
+          set -euo pipefail
+          # The exact version the toolchain step resolved for the other legs.
+          rust_version="$(rustc --version | awk '{ print $2 }')"
+          docker run --rm \
+            -e TARGET -e CARGO_TERM_COLOR -e RUST_BACKTRACE -e CARGO_INCREMENTAL \
+            -e RUST_VERSION="$rust_version" -e LIBZ_SYS_STATIC=1 \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            -v "$GITHUB_WORKSPACE:/src" -w /src \
+            "$BUILD_IMAGE" sh -c '
+              set -eu
+              # Retried, as above: the only step besides rustup that needs a
+              # network mirror.
+              i=1
+              until apk add --no-cache -q build-base cmake perl linux-headers curl-dev; do
+                [ "$i" = 3 ] && { echo "apk add failed 3 times" >&2; exit 1; }
+                i=$((i + 1)); sleep 15
+              done
+              # Hand the root-owned outputs back to the runner user.
+              trap "chown -R \"\$HOST_UID:\$HOST_GID\" /src/target 2>/dev/null || true" EXIT
+              rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
+              echo "Alpine $(cat /etc/alpine-release), musl $(apk info -e -v musl | sed "s/^musl-//"), gcc $(gcc -dumpfullversion), $(cmake --version | head -n1)"
+              cargo +"$RUST_VERSION" --version
+              cargo +"$RUST_VERSION" build --release --bin vtop-node --bin vtopctl --target "$TARGET" --locked
             '
 
       - name: Check macOS binaries load only system libraries (#677)
@@ -342,8 +409,8 @@ jobs:
       # The checks below read the binaries back out of the archive, so they
       # judge exactly what ships. Inline, not a script: a workflow_dispatch
       # dry-run builds an older tag's tree, which would not have a new script.
-      - name: Check the Linux archive's library floor (#808)
-        if: runner.os == 'Linux'
+      - name: Check the Linux glibc archive's library floor (#808)
+        if: endsWith(matrix.target, '-linux-gnu')
         shell: bash
         env:
           ARCHIVE: ${{ steps.pkg.outputs.artifact }}
@@ -355,9 +422,10 @@ jobs:
           tar -xzf "$ARCHIVE" -C "$x"
           dir="$x/$(basename "$ARCHIVE" .tar.gz)"
           # The highest symbol version each library may be asked for: what
-          # AlmaLinux / RHEL 8, the oldest supported distribution, ships
-          # (glibc 2.28, libgcc_s and libstdc++ from gcc 8).
-          declare -A floor=([GLIBC]=2.28 [GCC]=7.0.0 [GLIBCXX]=3.4.25 [CXXABI]=1.3.11)
+          # the glibc 2.17 generation ships (CentOS / RHEL 7: glibc 2.17,
+          # libgcc_s and libstdc++ from gcc 4.8). Amazon Linux 2 (glibc 2.26,
+          # gcc 7) and every later distribution carry at least these.
+          declare -A floor=([GLIBC]=2.17 [GCC]=4.8.0 [GLIBCXX]=3.4.19 [CXXABI]=1.3.7)
           # Libraries every supported distribution's base install carries.
           # Anything else (libssl, libsasl2, libcurl, ...) is a package the
           # user would have to install, which docs/install/binaries.md says
@@ -387,15 +455,61 @@ jobs:
           done
           exit "$bad"
 
-      # Run what ships on the oldest distribution of each family the docs
-      # name, with nothing installed: the version check, then an archive-only
-      # round trip (file source to a local directory, then the coverage audit
-      # and a scrub that reads every object back). No network, no Kafka.
-      - name: Smoke the Linux archive on Debian 12, Ubuntu 22.04 and AlmaLinux 8 (#808)
-        if: runner.os == 'Linux'
+      # A static binary has no program interpreter (PT_INTERP, the dynamic
+      # loader) and no NEEDED entry. Either one would make it look for a
+      # shared object at run time, which a musl or minimal host may lack.
+      - name: Check the Linux musl archive is fully static (#724)
+        if: endsWith(matrix.target, '-linux-musl')
         shell: bash
         env:
           ARCHIVE: ${{ steps.pkg.outputs.artifact }}
+        run: |
+          set -euo pipefail
+          command -v objdump >/dev/null || { sudo apt-get update && sudo apt-get install -y --no-install-recommends binutils; }
+          command -v file >/dev/null || { sudo apt-get update && sudo apt-get install -y --no-install-recommends file; }
+          x="$RUNNER_TEMP/archive"
+          rm -rf "$x" && mkdir -p "$x"
+          tar -xzf "$ARCHIVE" -C "$x"
+          dir="$x/$(basename "$ARCHIVE" .tar.gz)"
+          bad=0
+          for bin in vtop-node vtopctl; do
+            f="$dir/$bin"
+            desc="$(file -b "$f")"
+            echo "$bin: $desc"
+            # file(1) says "statically linked", or "static-pie linked" for
+            # the position-independent static executables Rust emits.
+            if ! grep -qE 'static(ally|-pie) linked' <<<"$desc"; then
+              echo "::error::$bin is not a static executable"
+              bad=1
+            fi
+            if readelf -lW "$f" | grep -q 'INTERP'; then
+              echo "::error::$bin asks for a program interpreter:"
+              readelf -lW "$f" | grep -A1 'INTERP' || true
+              bad=1
+            fi
+            needed="$(objdump -p "$f" | awk '$1 == "NEEDED" { print $2 }')"
+            if [ -n "$needed" ]; then
+              echo "::error::$bin has NEEDED entries: $(tr '\n' ' ' <<<"$needed")"
+              bad=1
+            else
+              echo "$bin: no NEEDED entries, no interpreter"
+            fi
+          done
+          exit "$bad"
+
+      # Run what ships, with nothing installed: the version check, then an
+      # archive-only round trip (file source to a local directory, then the
+      # coverage audit and a scrub that reads every object back). No network,
+      # no Kafka. Linux archives run in a container of each distribution the
+      # docs name, from the oldest glibc (Amazon Linux 2, 2.26) up; the musl
+      # archives run on every one of those and on Alpine. The macOS archives
+      # run on their own runner, which is the oldest macOS GitHub offers.
+      # POSIX sh, not bash: Alpine has no bash.
+      - name: Smoke the archive (#808, #724)
+        shell: bash
+        env:
+          ARCHIVE: ${{ steps.pkg.outputs.artifact }}
+          TARGET: ${{ matrix.target }}
           # Not VERSION: /etc/os-release, sourced below, sets that.
           EXPECTED_VERSION: ${{ needs.verify.outputs.version }}
         run: |
@@ -408,13 +522,23 @@ jobs:
           dir="$x/$(basename "$ARCHIVE" .tar.gz)"
           smoke="$RUNNER_TEMP/smoke.sh"
           cat >"$smoke" <<'SMOKE'
-          set -euo pipefail
+          set -eu
           umask 077
-          . /etc/os-release
-          echo "== $PRETTY_NAME, $(getconf GNU_LIBC_VERSION)"
-          v="$(/a/vtopctl --version)"; echo "$v"
+          # The directory holding the two binaries: /a in a container.
+          A="${A:-/a}"
+          if [ -r /etc/os-release ]; then
+            . /etc/os-release
+          else
+            PRETTY_NAME="$(sw_vers -productName 2>/dev/null) $(sw_vers -productVersion 2>/dev/null)"
+          fi
+          # glibc names itself to getconf; musl's ldd names itself on stderr.
+          if libc="$(getconf GNU_LIBC_VERSION 2>/dev/null)"; then :
+          elif command -v ldd >/dev/null 2>&1; then libc="$(ldd --version 2>&1 | head -n1)"
+          else libc="$(uname -sr)"; fi
+          echo "== $PRETTY_NAME, $(uname -m), $libc"
+          v="$("$A/vtopctl" --version)"; echo "$v"
           [ "$v" = "vtopctl $EXPECTED_VERSION" ] || { echo "expected vtopctl $EXPECTED_VERSION"; exit 1; }
-          v="$(/a/vtop-node --version 2>/dev/null)"; echo "$v"
+          v="$("$A/vtop-node" --version 2>/dev/null)"; echo "$v"
           [ "$v" = "vtop-node $EXPECTED_VERSION" ] || { echo "expected vtop-node $EXPECTED_VERSION"; exit 1; }
           w="$(mktemp -d)"
           mkdir -p "$w/in" "$w/out" "$w/work"
@@ -449,10 +573,10 @@ jobs:
             bucket: smoke
             prefix: ""
           CONFIG
-          /a/vtopctl validate --config "$w/config.yaml"
-          /a/vtopctl process-once --source file --config "$w/config.yaml"
-          /a/vtopctl audit-coverage --check-storage --config "$w/config.yaml"
-          /a/vtopctl scrub --config "$w/config.yaml"
+          "$A/vtopctl" validate --config "$w/config.yaml"
+          "$A/vtopctl" process-once --source file --config "$w/config.yaml"
+          "$A/vtopctl" audit-coverage --check-storage --config "$w/config.yaml"
+          "$A/vtopctl" scrub --config "$w/config.yaml"
           # One batch holds all 200 records, so the archived object, unpacked,
           # is the input file byte for byte.
           objects="$(find "$w/out" -name '*.cef.gz')"
@@ -461,11 +585,29 @@ jobs:
             || { echo "the archived object does not match the input file"; exit 1; }
           echo "archived object matches the 200-record input"
           SMOKE
-          for image in \
-            debian:12@sha256:268fb24c39bca92d326dd83ea3abebe4a3f7751c804ffef23bb6d857dd343ff8 \
-            ubuntu:22.04@sha256:74b12b11ffa550fba1929ad4d8d16533c34f6612728469671afba1b03b66881c \
-            almalinux:8@sha256:2d0f2eb2a83cc09dbc2eb92fade4dbe8f709628149e81aa00aec70630406603b; do
-            docker run --rm -e EXPECTED_VERSION -v "$dir:/a:ro" -v "$smoke:/smoke.sh:ro" "$image" bash /smoke.sh
+          if [ "$RUNNER_OS" = macOS ]; then
+            A="$dir" sh "$smoke"
+            exit 0
+          fi
+          # Multi-arch indexes, pinned by digest; Docker picks the runner's
+          # arch. Amazon Linux 2 has the oldest glibc (2.26) of the set.
+          images=(
+            amazonlinux:2@sha256:7c78b2e1be42be4552d59e4b1590cc915836748b46050aff98b7dbb04a87db59
+            amazonlinux:2023@sha256:9cf762f5099b606bcd851391317af7cd75b11363c4816ebcb5e91292dd5736a7
+            debian:12@sha256:268fb24c39bca92d326dd83ea3abebe4a3f7751c804ffef23bb6d857dd343ff8
+            debian:13@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6
+            ubuntu:22.04@sha256:74b12b11ffa550fba1929ad4d8d16533c34f6612728469671afba1b03b66881c
+            ubuntu:24.04@sha256:9c7f200c07e3d4a03e7249d2c16bf66a51120fb876aa2242cf31451412543289
+            almalinux:8@sha256:2d0f2eb2a83cc09dbc2eb92fade4dbe8f709628149e81aa00aec70630406603b
+            almalinux:9@sha256:02df05719ef287ebd0df0a1eedb9172a00bd70703aed7b25660e426b8e0d6047
+            almalinux:10@sha256:ccf217024b3d5e268cc208d1edb384a1edee6359370cf6ea1ecbc42254e57375
+          )
+          # musl: no glibc at all. Only the static archives can run there.
+          if [[ "$TARGET" == *-linux-musl ]]; then
+            images+=(alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf)
+          fi
+          for image in "${images[@]}"; do
+            docker run --rm -e EXPECTED_VERSION -v "$dir:/a:ro" -v "$smoke:/smoke.sh:ro" "$image" sh /smoke.sh
           done
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -772,6 +914,8 @@ jobs:
 
       - name: Sign binary archives (keyless)
         shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -780,6 +924,14 @@ jobs:
             echo "::error::no binary archives found to sign"
             exit 1
           fi
+          # Every target the binaries matrix builds, so a release never goes
+          # out with an archive (and its SHA256SUMS line) missing.
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+            x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
+            aarch64-apple-darwin x86_64-apple-darwin; do
+            f="artifacts/${BUNDLE_NAME}-${VERSION}-${target}.tar.gz"
+            [ -f "$f" ] || { echo "::error::$f is missing from the release"; exit 1; }
+          done
           for archive in "${archives[@]}"; do
             bundle="${archive}.sigstore.json"
             cosign sign-blob --yes --bundle "$bundle" "$archive"
@@ -848,6 +1000,6 @@ jobs:
             docker pull ${{ env.IMAGE_NAME }}:${{ needs.verify.outputs.version }}
             ```
 
-            Binaries for `linux` (x86_64, aarch64) and `macOS` (arm64, x86_64) are attached below, each containing `vtop-node` and `vtopctl`. Windows is not built.
+            Binaries for `linux` (x86_64, aarch64) and `macOS` (arm64, x86_64) are attached below, each containing `vtop-node` and `vtopctl`. Each Linux architecture has two archives: `-unknown-linux-gnu` needs glibc 2.17 or newer (Amazon Linux 2, RHEL 7 and later, Debian, Ubuntu), and `-unknown-linux-musl` is fully static and runs on any Linux, Alpine included. The macOS archives need macOS 11 or newer. **[Which archive to pick](https://github.com/${{ github.repository }}/blob/main/docs/install/binaries.md#supported-platforms)**. Windows is not built.
 
             Every artifact is signed (keyless Sigstore) and an SPDX SBOM is attached. **[How to verify a release](https://github.com/${{ github.repository }}/blob/main/docs/RELEASE_VERIFICATION.md)** — cosign commands for the image and the archives, and what `SHA256SUMS` does and does not tell you.
