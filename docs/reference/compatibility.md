@@ -114,10 +114,25 @@ warning. Verification receipts stay opt-in for 1.0.
 
 What is tested today:
 
-- A data node's directory (segment log v1), written by the newest patch of
-  each minor from v0.2, built from each tag's source, must open under the
-  current build, serve its records byte for byte, and still serve them after
-  a restart ([`scripts/upgrade-compat.sh`](../../scripts/upgrade-compat.sh)).
+- **A data node's directory, in the compatibility matrix** (the `segments`
+  cell of [`scripts/compat/expected.yaml`](../../scripts/compat/expected.yaml),
+  which runs [`scripts/upgrade-compat.sh`](../../scripts/upgrade-compat.sh)).
+  For the newest patch of each minor since v0.2 (the newest minor on a pull
+  request, all of them nightly) the release's **published** `vtop-node`,
+  checked against its `SHA256SUMS` and Sigstore bundle, writes a directory:
+  the single `range.active` before v0.3.0, sealed segments with their indexes,
+  commit markers, manifests, producer snapshots and the broker's epoch
+  journals from v0.3.0, and segment format v2 with its chunk sidecar from
+  v0.5.0 (`segment_format: v2`, which the default writer does not produce).
+  The current build must open it, quarantine nothing, serve every record byte
+  for byte, and serve them again after a restart. The directories written by
+  v0.2.1, v0.3.1, v0.5.0, v0.8.0 and v0.10.1 are also committed as fixtures
+  (`crates/vtop-log/tests/fixtures/segments/<tag>/<profile>/`, each tag with
+  a `PROVENANCE`), which `released_segment_dirs` (every record reads, every
+  sealed segment verifies) and `released_journals` (the producer-epoch and
+  fencing-epoch journals read as what the release recorded) open on every
+  build. The retention and truncate intents are not among them: a clean run
+  never leaves one, so no released binary's intent is captured yet.
 - The metadata tier rolls from the newest release to the current build, one
   voter at a time (live-chaos scenario 22).
 - The released `vtopctl` of v0.7.0 and later is run over a manifest archive
