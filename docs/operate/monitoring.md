@@ -78,6 +78,7 @@ test, a runbook section, and an objective on [Service level objectives](slos.md)
 | [VtopSourceLagGrowing](runbooks.md#vtopsourcelaggrowing) | ticket | `kafka_consumergroup_lag` (kafka-exporter) rising for 30 minutes |
 | [VtopSizeOnlyVerification](runbooks.md#vtopsizeonlyverification) | ticket | `vtop_verification_mode{mode="size_only"} == 1` |
 | [VtopObjectLockCheckFailed](runbooks.md#vtopobjectlockcheckfailed) | page | Any increase of `vtop_object_lock_checks_total` with a result other than `ok`, or such a series first appearing non-zero |
+| [VtopObjectLockFallback](runbooks.md#vtopobjectlockfallback) | ticket | Any increase of `vtop_object_key_decisions_total` with `decision` `fallback_unlocked`, `fallback_lock_mode`, `fallback_hold_missing` or `lock_withheld` over an hour, or such a series first appearing non-zero (#709). `fallback_lock_elapsed` is left out: storage cost, not a finding |
 | [VtopRetentionLoss](runbooks.md#vtopretentionloss) | page | Any increase of `vtop_retention_lost_records_total` |
 | [VtopSourceReplayRefused](runbooks.md#vtopsourcereplayrefused) | page | Any increase of `vtop_source_replay_refused_total`, or the series first appearing non-zero |
 | [VtopRecoveryLedgerWriteFailed](runbooks.md#vtoprecoveryledgerwritefailed) | page | `vtop_recovery_held_total{reason="ledger_write_failed"}` above zero: at startup the state store refused recovery's replay decision (the series appears with the first hold, so the rule fires on the value, until a restart that holds nothing) |

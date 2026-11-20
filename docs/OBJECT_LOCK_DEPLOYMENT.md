@@ -210,11 +210,12 @@ and every result other than `ok` is a failed batch. The look a replay takes
 at an object before reusing it is a key decision, not a check: a fallback is
 counted in `vtop_object_key_decisions_total{decision}` (the four
 `fallback_*` values and `lock_withheld` above), and only a read that fails is
-counted here, as `error`. Alert on `fallback_unlocked`, `fallback_lock_mode`,
-`fallback_hold_missing` and `lock_withheld` as a warning (an object that
-should be locked is not, or the store is not keeping locks); an ended lock
-(`fallback_lock_elapsed`) is storage cost, not a finding. See
-[Monitoring](operate/monitoring.md). Missing, shorter,
+counted here, as `error`. The shipped rule
+[VtopObjectLockFallback](operate/runbooks.md#vtopobjectlockfallback) raises a
+ticket on `fallback_unlocked`, `fallback_lock_mode`, `fallback_hold_missing`
+and `lock_withheld` (an object that should be locked is not, or the store is
+not keeping locks); an ended lock (`fallback_lock_elapsed`) is storage cost,
+not a finding. Missing, shorter,
 other-mode and hold-less locks are also counted in
 `vtop_verification_failures_total`. `vtop_object_lock_mode{tenant,mode}`
 reads 1 for the mode in force (`off` without the profile). See

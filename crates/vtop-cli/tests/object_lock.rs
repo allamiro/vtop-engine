@@ -683,6 +683,11 @@ async fn a_reused_object_whose_lock_has_ended_falls_back_to_a_fresh_locked_objec
     assert_eq!(decisions(tenant, "reused"), 0);
     assert_eq!(checks(tenant, "too_short"), 0, "no check failed");
     assert_eq!(checks(tenant, "ok"), 2, "the fresh object and its manifest");
+    // The replay rebuilt the recorded window (#626), but the object it
+    // committed is not at the derived key, so the rebuild is a `fallback`
+    // (a second object), never `exact`.
+    assert_eq!(rebuilds(tenant, "fallback"), 1, "the rebuild fell back");
+    assert_eq!(rebuilds(tenant, "exact"), 0, "not claimed as exact");
 }
 
 /// Decision 5 of #709: a reused object locked in the OTHER mode falls back
@@ -1045,6 +1050,10 @@ async fn a_replay_after_a_fallback_reuses_the_fresh_object_and_writes_no_third()
     assert_eq!(backend.version_count(&fresh), 1, "no second put of it");
     assert_eq!(decisions(tenant, "reused"), 1);
     assert_eq!(decisions(tenant, "fallback_unlocked"), 1, "no third object");
+    // Reused, but not at the derived key: a second object of the range, so
+    // the rebuild (#626) is a `fallback`, not `exact`.
+    assert_eq!(rebuilds(tenant, "fallback"), 1, "the rebuild fell back");
+    assert_eq!(rebuilds(tenant, "exact"), 0, "not claimed as exact");
     assert_eq!(
         checks(tenant, "ok"),
         ok_before + 2,
