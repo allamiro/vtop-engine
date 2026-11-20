@@ -2314,6 +2314,80 @@ async fn a_follower_and_a_leader_below_the_level_never_wrap() {
     assert_eq!(logged_kinds(cluster.leader()).len(), before);
 }
 
+/// #706: from level 9 an operator's raise of the level is attributed like any
+/// audited command, and the wrapper must not carry it past the check of the
+/// metadata members that a bare raise gets.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn an_attributed_raise_is_judged_on_the_members_like_a_bare_one() {
+    use vtop_meta::transport::admin::ProposalCaller;
+    use vtop_meta::transport::authz::AdminIdentity;
+    use vtop_meta::{
+        AdminHandler, MemberVersion, MemberVersionProbe, MetaNodeId, OpenraftConsensus,
+        TransportError, ATTRIBUTED_COMMANDS_FEATURE_LEVEL,
+    };
+
+    /// A member that answers as v0.9.0 does: it closes the connection.
+    struct Silent;
+    #[async_trait::async_trait]
+    impl MemberVersionProbe for Silent {
+        async fn ask(&self, _: MetaNodeId) -> MemberVersion {
+            MemberVersion::NoAnswer
+        }
+    }
+
+    let seed = SEED ^ 0x7063;
+    let mut cluster = Cluster::boot(seed).await;
+    let consensus = OpenraftConsensus::new(cluster.leader().raft.clone())
+        .with_store(cluster.leader().store.clone())
+        .with_member_probe(this_build());
+    let env = cluster.envelope();
+    consensus
+        .propose(MetadataCommand::SetFeatureLevel {
+            env,
+            feature_level: ATTRIBUTED_COMMANDS_FEATURE_LEVEL,
+        })
+        .await
+        .unwrap();
+    // The same leader, now asking members that cannot answer.
+    let doubtful = OpenraftConsensus::new(cluster.leader().raft.clone())
+        .with_store(cluster.leader().store.clone())
+        .with_member_probe(std::sync::Arc::new(Silent));
+    let caller = ProposalCaller {
+        identity: AdminIdentity::Named("ops".to_owned()),
+        peer: None,
+    };
+    let last_log = |cluster: &Cluster| {
+        cluster
+            .leader()
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .unwrap_or(0)
+    };
+    let before = last_log(&cluster);
+    let env = cluster.envelope();
+    let refused = AdminHandler::propose_as(
+        &doubtful,
+        // A level above the one in force, as a later release's raise is.
+        MetadataCommand::SetFeatureLevel {
+            env,
+            feature_level: ATTRIBUTED_COMMANDS_FEATURE_LEVEL + 1,
+        },
+        &caller,
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(TransportError::Refused(_))),
+        "a raise wrapped in its actor skipped the members' check (seed={seed:#x}): {refused:?}"
+    );
+    assert_eq!(
+        last_log(&cluster),
+        before,
+        "the refused raise reached the log"
+    );
+}
+
 /// Every metadata member answers as this build (#706): what a raise judged
 /// on the members' own word sees once every voter is upgraded.
 struct ThisBuild;

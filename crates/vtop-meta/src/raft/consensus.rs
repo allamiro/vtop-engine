@@ -1190,7 +1190,11 @@ impl Consensus for OpenraftConsensus {
     async fn propose(&self, command: MetadataCommand) -> ConsensusResult<CommitReceipt> {
         // A raise the metadata members must all implement is judged on
         // their own answers first (#706).
-        if let MetadataCommand::SetFeatureLevel { feature_level, .. } = &command {
+        //
+        // Looked at through the wrapper (#706): from level 9 an operator's
+        // later raise is attributed like any audited command, and must be
+        // judged on the members exactly as a bare one is.
+        if let MetadataCommand::SetFeatureLevel { feature_level, .. } = command.subject() {
             self.judge_members_for(*feature_level).await?;
         }
         // The feature gate (#554), judged before the command is replicated.
