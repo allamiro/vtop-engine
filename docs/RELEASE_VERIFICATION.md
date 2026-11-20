@@ -56,8 +56,8 @@ Linux has two archives per architecture: `TARGET` is
 `x86_64-unknown-linux-gnu` or `aarch64-unknown-linux-gnu` (glibc 2.17 or
 newer), or `x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl`
 (fully static, any Linux). On macOS it is `aarch64-apple-darwin` or
-`x86_64-apple-darwin`. Six archives in all, each with its own Sigstore bundle
-and its own line in `SHA256SUMS`;
+`x86_64-apple-darwin`. Six archives in all, each with its own Sigstore
+bundle, build provenance attestation and line in `SHA256SUMS`;
 [install/binaries.md](install/binaries.md#supported-platforms) says which to
 pick.
 
