@@ -335,6 +335,76 @@ tests:
   - eval_time: 20m
     alertname: VtopObjectLockCheckFailed
     exp_alerts: []
+# #709: a replay over an object that is not locked as configured writes a
+# fresh locked one. The decisions counter is not primed, so a series that
+# Prometheus first sees at 1 must fire as well as one that rises.
+- name: 'VtopObjectLockFallback: fires when a replay falls back over an unlocked object'
+  interval: 1m
+  input_series:
+  - series: vtop_object_key_decisions_total{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="kafka",format="ndjson",decision="reused"}
+    values: 0+1x90
+  - series: vtop_object_key_decisions_total{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="kafka",format="ndjson",decision="fallback_unlocked"}
+    values: 1x30 2x60
+  alert_rule_test:
+  - eval_time: 40m
+    alertname: VtopObjectLockFallback
+    exp_alerts:
+    - exp_labels:
+        severity: ticket
+        job: vtop-engine
+        instance: engine-1:9090
+        tenant: default
+        source_type: kafka
+        format: ndjson
+        decision: fallback_unlocked
+      exp_annotations:
+        summary: Object Lock fallback (fallback_unlocked) for tenant default on engine-1:9090
+        description: A replay found the object already archived for its range not locked as upload.object_lock asks (no lock, the other mode, or no legal hold) and wrote a fresh locked object under its attempt key, leaving the old one as it is; or (lock_withheld) the fresh object it wrote is not usable either, so nothing was written and the batch failed. Read the object_key_fallback WARN line for the two keys and the reason, then check the bucket's Object Lock configuration and the credentials' retention and legal-hold permissions.
+        runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopobjectlockfallback
+- name: 'VtopObjectLockFallback: fires on a withheld write Prometheus first sees as non-zero'
+  interval: 1m
+  input_series:
+  - series: vtop_object_key_decisions_total{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="kafka",format="ndjson",decision="lock_withheld"}
+    values: _x5 1x85
+  alert_rule_test:
+  - eval_time: 8m
+    alertname: VtopObjectLockFallback
+    exp_alerts:
+    - exp_labels:
+        severity: ticket
+        job: vtop-engine
+        instance: engine-1:9090
+        tenant: default
+        source_type: kafka
+        format: ndjson
+        decision: lock_withheld
+      exp_annotations:
+        summary: Object Lock fallback (lock_withheld) for tenant default on engine-1:9090
+        description: A replay found the object already archived for its range not locked as upload.object_lock asks (no lock, the other mode, or no legal hold) and wrote a fresh locked object under its attempt key, leaving the old one as it is; or (lock_withheld) the fresh object it wrote is not usable either, so nothing was written and the batch failed. Read the object_key_fallback WARN line for the two keys and the reason, then check the bucket's Object Lock configuration and the credentials' retention and legal-hold permissions.
+        runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopobjectlockfallback
+  - eval_time: 70m
+    alertname: VtopObjectLockFallback
+    exp_alerts: []
+# An ended lock is storage cost, not a finding, and the normal decisions are
+# not fallbacks.
+- name: 'VtopObjectLockFallback: quiet on an ended lock and on the normal decisions'
+  interval: 1m
+  input_series:
+  - series: vtop_object_key_decisions_total{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="kafka",format="ndjson",decision="fallback_lock_elapsed"}
+    values: _x5 1+1x85
+  - series: vtop_object_key_decisions_total{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="kafka",format="ndjson",decision="derived"}
+    values: 0+3x90
+  - series: vtop_object_key_decisions_total{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="kafka",format="ndjson",decision="reused"}
+    values: _x5 2+1x85
+  - series: vtop_object_key_decisions_total{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="kafka",format="ndjson",decision="fallback_differs"}
+    values: _x5 1+1x85
+  alert_rule_test:
+  - eval_time: 8m
+    alertname: VtopObjectLockFallback
+    exp_alerts: []
+  - eval_time: 60m
+    alertname: VtopObjectLockFallback
+    exp_alerts: []
 - name: 'VtopRetentionLoss: fires on an increase of the primed counter'
   interval: 1m
   input_series:
