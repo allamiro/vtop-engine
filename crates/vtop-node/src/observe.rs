@@ -2083,6 +2083,53 @@ impl Collector for PromotionRefusalCollector {
 }
 
 // ---------------------------------------------------------------------------
+// Kafka gateway
+// ---------------------------------------------------------------------------
+
+/// Requests this node's Kafka gateway refused, by API and reason (#596).
+///
+/// The gateway logs each kind at powers of two only, so the log alone
+/// cannot say how often a client is refused; this can. Both labels are a
+/// closed set ([`vtop_kafka::Refusal`]): an api key a client sends is never a
+/// label, and every key the gateway does not serve is `api="unserved"`.
+/// Every series is exported from the first scrape, at zero.
+pub struct KafkaRefusalCollector {
+    refusals: Arc<vtop_kafka::Refusals>,
+    family: CounterFamily,
+}
+
+impl KafkaRefusalCollector {
+    pub fn new(refusals: Arc<vtop_kafka::Refusals>) -> Result<Self, String> {
+        Ok(Self {
+            refusals,
+            family: CounterFamily::new(
+                "kafka_requests_refused_total",
+                "Kafka requests this node's gateway refused, by api and reason; \
+                 no_offset_store is an OffsetCommit on a node with no metadata plane, \
+                 unserved_api a request (CreateTopics, DescribeConfigs, ...) the gateway \
+                 does not serve",
+                &["api", "reason"],
+            )?,
+        })
+    }
+}
+
+impl Collector for KafkaRefusalCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        vec![&self.family.desc]
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        vec![self.family.family(
+            self.refusals
+                .snapshot()
+                .into_iter()
+                .map(|(refusal, total)| (vec![refusal.api(), refusal.reason()], total)),
+        )]
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Integrity
 // ---------------------------------------------------------------------------
 
@@ -3047,6 +3094,47 @@ mod tests {
         assert!(
             text.contains(r#"vtop_broker_request_duration_seconds_sum{kind="produce"}"#),
             "without _sum an average is unanswerable: {text}"
+        );
+    }
+
+    /// #596: the gateway's refusals are exported under the bounded
+    /// `{api,reason}` pair, every series at zero from the first scrape, and
+    /// the value is the gateway's own total.
+    #[test]
+    fn kafka_refusals_are_exported_by_api_and_reason() {
+        let refusals = Arc::new(vtop_kafka::Refusals::default());
+        let registry = Registry::new_custom(Some("vtop".into()), None).unwrap();
+        registry
+            .register(Box::new(
+                KafkaRefusalCollector::new(Arc::clone(&refusals)).unwrap(),
+            ))
+            .unwrap();
+        let text = scrape(&registry);
+        for series in [
+            r#"vtop_kafka_requests_refused_total{api="offset_commit",reason="no_offset_store"} 0"#,
+            r#"vtop_kafka_requests_refused_total{api="unserved",reason="unserved_api"} 0"#,
+        ] {
+            assert!(text.contains(series), "{series} missing: {text}");
+        }
+        refusals.count(vtop_kafka::Refusal::OffsetCommitWithoutStore);
+        refusals.count(vtop_kafka::Refusal::OffsetCommitWithoutStore);
+        refusals.count(vtop_kafka::Refusal::UnservedApi);
+        let text = scrape(&registry);
+        assert!(
+            text.contains(
+                r#"vtop_kafka_requests_refused_total{api="offset_commit",reason="no_offset_store"} 2"#
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                r#"vtop_kafka_requests_refused_total{api="unserved",reason="unserved_api"} 1"#
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("# TYPE vtop_kafka_requests_refused_total counter"),
+            "{text}"
         );
     }
 

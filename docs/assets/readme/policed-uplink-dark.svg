@@ -6,6 +6,7 @@
   <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
    <cc:Work>
     <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
+    <dc:description>Data: benchmarks/measurements/663-policed-uplink/runs.csv (#663). Single host, Lima VM; per-run goodput and the cause capture are in the same directory.</dc:description>
     <dc:format>image/svg+xml</dc:format>
    </cc:Work>
   </rdf:RDF>
@@ -2051,8 +2052,8 @@ z
    </g>
   </g>
   <g id="text_18">
-   <!-- Data: benchmarks/measurements/663-policed-uplink/runs.csv (#663). Single host, Lima VM; per-run goodput and the cause capture are in the same directory. -->
-   <g style="fill: #c3c2b7" transform="translate(7.776 246.764219) scale(0.07 -0.07)">
+   <!-- Data: benchmarks/measurements/663-policed-uplink/runs.csv (#663). Single host, Lima VM; per-run goodput and the cause capture are in the same -->
+   <g style="fill: #c3c2b7" transform="translate(7.776 237.861969) scale(0.07 -0.07)">
     <defs>
      <path id="DejaVuSans-44" d="M 1259 4147 
 L 1259 519 
@@ -2334,17 +2335,19 @@ z
     <use xlink:href="#DejaVuSans-61" transform="translate(7239.804688 0)"/>
     <use xlink:href="#DejaVuSans-6d" transform="translate(7301.083984 0)"/>
     <use xlink:href="#DejaVuSans-65" transform="translate(7398.496094 0)"/>
-    <use xlink:href="#DejaVuSans-20" transform="translate(7460.019531 0)"/>
-    <use xlink:href="#DejaVuSans-64" transform="translate(7491.806641 0)"/>
-    <use xlink:href="#DejaVuSans-69" transform="translate(7555.283203 0)"/>
-    <use xlink:href="#DejaVuSans-72" transform="translate(7583.066406 0)"/>
-    <use xlink:href="#DejaVuSans-65" transform="translate(7621.929688 0)"/>
-    <use xlink:href="#DejaVuSans-63" transform="translate(7683.453125 0)"/>
-    <use xlink:href="#DejaVuSans-74" transform="translate(7738.433594 0)"/>
-    <use xlink:href="#DejaVuSans-6f" transform="translate(7777.642578 0)"/>
-    <use xlink:href="#DejaVuSans-72" transform="translate(7838.824219 0)"/>
-    <use xlink:href="#DejaVuSans-79" transform="translate(7879.9375 0)"/>
-    <use xlink:href="#DejaVuSans-2e" transform="translate(7924.867188 0)"/>
+   </g>
+   <!-- directory. -->
+   <g style="fill: #c3c2b7" transform="translate(7.776 246.764219) scale(0.07 -0.07)">
+    <use xlink:href="#DejaVuSans-64"/>
+    <use xlink:href="#DejaVuSans-69" transform="translate(63.476562 0)"/>
+    <use xlink:href="#DejaVuSans-72" transform="translate(91.259766 0)"/>
+    <use xlink:href="#DejaVuSans-65" transform="translate(130.123047 0)"/>
+    <use xlink:href="#DejaVuSans-63" transform="translate(191.646484 0)"/>
+    <use xlink:href="#DejaVuSans-74" transform="translate(246.626953 0)"/>
+    <use xlink:href="#DejaVuSans-6f" transform="translate(285.835938 0)"/>
+    <use xlink:href="#DejaVuSans-72" transform="translate(347.017578 0)"/>
+    <use xlink:href="#DejaVuSans-79" transform="translate(388.130859 0)"/>
+    <use xlink:href="#DejaVuSans-2e" transform="translate(433.060547 0)"/>
    </g>
   </g>
   <g id="legend_1">
