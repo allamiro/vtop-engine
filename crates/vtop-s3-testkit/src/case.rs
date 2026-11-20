@@ -322,6 +322,7 @@ impl LiveS3 {
             server_version: self.recorder.server_version.clone(),
             image_digest: self.recorder.image_digest.clone(),
             vtop_commit: self.recorder.vtop_commit.clone(),
+            sdk_checksum: self.recorder.sdk_checksum.clone(),
             case: name.to_owned(),
             capabilities: needs.iter().map(|c| c.to_string()).collect(),
             deciding_capability: None,
