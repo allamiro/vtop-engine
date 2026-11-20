@@ -11290,7 +11290,20 @@ mod tests {
     impl CapturedLogs {
         /// Capture WARN and above on this thread until the guard drops (a
         /// `#[tokio::test]` runs its tasks on the one thread).
+        ///
+        /// A dispatcher that wants nothing stays registered for the life of
+        /// the process first, as in `otel.rs` (#791): with exactly one
+        /// registered, `tracing` decides a callsite once, by the default of
+        /// the thread that reaches it first, so another test with no
+        /// subscriber running recovery beside this one could leave its
+        /// WARN and ERROR lines cached as never wanted, and nothing here
+        /// would be captured.
         fn start() -> (Self, tracing::subscriber::DefaultGuard) {
+            static ALWAYS_A_SECOND: std::sync::OnceLock<tracing::Dispatch> =
+                std::sync::OnceLock::new();
+            ALWAYS_A_SECOND.get_or_init(|| {
+                tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default())
+            });
             let logs = Self::default();
             let writer = logs.clone();
             let subscriber = tracing_subscriber::fmt()
