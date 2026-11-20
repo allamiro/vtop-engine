@@ -338,9 +338,9 @@ formats:
           CATEGORY_PROMOTION_ATTESTATION: 22
 
   - id: 18
-    name: Metadata hard state, applied, purged, membership log id
+    name: Metadata hard state, applied, purged, membership log id, audit frontier
     class: B
-    marker: "`VTOPMHS1`, `VTOPMAP1`, `VTOPMPG1`, `VTOPMML1`"
+    marker: "`VTOPMHS1`, `VTOPMAP1`, `VTOPMPG1`, `VTOPMML1`, `VTOPMAU1`"
     status: evolving
     at_1_0: "follows #740"
     constants:
@@ -352,6 +352,8 @@ formats:
       - {file: crates/vtop-meta/src/storage/purged.rs, name: PURGED_VERSION, value: '1'}
       - {file: crates/vtop-meta/src/storage/membership_log_id.rs, name: MEMBERSHIP_LOG_ID_MAGIC, value: 'b"VTOPMML1"'}
       - {file: crates/vtop-meta/src/storage/membership_log_id.rs, name: MEMBERSHIP_LOG_ID_VERSION, value: '1'}
+      - {file: crates/vtop-meta/src/storage/audited.rs, name: AUDITED_MAGIC, value: 'b"VTOPMAU1"'}
+      - {file: crates/vtop-meta/src/storage/audited.rs, name: AUDITED_VERSION, value: '1'}
 
   - id: 19
     name: Native protocol
