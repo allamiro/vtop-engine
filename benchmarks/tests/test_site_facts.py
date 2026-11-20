@@ -169,6 +169,47 @@ def test_the_kafka_versions_are_the_runs_the_lab_s_and_ci_s():
         assert "Docker lab" in by_version[tag]
 
 
+# ------------------------------------------------------ the matrix workflows
+
+
+def test_the_kafka_range_is_the_workflow_s_pinned_list():
+    with open(os.path.join(readme_charts.REPO, site_facts.KAFKA_MATRIX), encoding="utf-8") as handle:
+        pinned = re.findall(r"^\s+(\d+\.\d+\.\d+) apache/kafka:", handle.read(), re.M)
+    chip = site_facts.kafka_matrix()
+    assert chip["version"] == f"{pinned[0]} to {pinned[-1]}"
+    assert chip["ran"].startswith(f"{len(pinned)} releases")
+    assert chip["source"] == site_facts.KAFKA_MATRIX
+
+
+def test_the_postgres_range_is_the_workflow_s_pinned_list():
+    with open(os.path.join(readme_charts.REPO, site_facts.POSTGRES_MATRIX), encoding="utf-8") as handle:
+        pinned = re.findall(r"^\s+(\d+) postgres:", handle.read(), re.M)
+    chip = site_facts.postgres_matrix()
+    assert chip["version"] == f"{pinned[0]} to {pinned[-1]}"
+    assert chip["ran"].startswith(f"{len(pinned)} majors")
+    assert site_facts.site_facts()["tested"]["state_store"] == [chip]
+
+
+def test_a_pin_added_to_the_kafka_workflow_changes_the_chip_and_the_alt_text(data_tree):
+    digest = "a" * 64
+    pin = f"          PINNED_IMAGES: |\n            9.9.9 apache/kafka:9.9.9@sha256:{digest}\n"
+    root = data_tree({site_facts.KAFKA_MATRIX: lambda text: text.replace("          PINNED_IMAGES: |\n", pin, 1)})
+    facts = site_facts.site_facts(root)
+    assert facts["tested"]["kafka"][0]["version"].endswith("to 9.9.9")
+    assert "to 9.9.9" in facts["alts"]["card-tested"]
+
+
+def test_a_workflow_with_no_nightly_schedule_is_not_called_nightly(data_tree):
+    root = data_tree({site_facts.POSTGRES_MATRIX: lambda text: text.replace("schedule:", "unscheduled:")})
+    assert "nightly" not in site_facts.postgres_matrix(root)["ran"]
+
+
+def test_a_matrix_workflow_with_no_pins_is_refused(data_tree):
+    root = data_tree({site_facts.KAFKA_MATRIX: lambda text: text.replace("apache/kafka:", "apache/other:")})
+    with pytest.raises(site_facts.Refused, match="no pinned Kafka release"):
+        site_facts.site_facts(root)
+
+
 # ---------------------------------------------------------------- alt text
 
 

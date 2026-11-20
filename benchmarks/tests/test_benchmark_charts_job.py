@@ -167,7 +167,8 @@ def test_every_input_of_the_readme_cards_starts_the_chart_job():
 
     globs = filter_block("benchmark_charts")
     inputs = ["benchmarks/readme_cards.py", "benchmarks/site_facts.py", "benchmarks/tests/conftest.py",
-              site_facts.README, site_facts.COMPOSE, site_facts.CI, site_facts.CARGO_TOML, site_facts.CARGO_LOCK,
+              site_facts.README, site_facts.COMPOSE, site_facts.CI, site_facts.KAFKA_MATRIX, site_facts.POSTGRES_MATRIX,
+              site_facts.CARGO_TOML, site_facts.CARGO_LOCK,
               site_facts.EGRESS_ENV, f"{site_facts.S3_RESULTS}/garage.json",
               site_facts.readme_charts.EGRESS, site_facts.readme_charts.POLICED,
               f"{site_facts.readme_charts.FAILOVER_RUN}/failover.csv",

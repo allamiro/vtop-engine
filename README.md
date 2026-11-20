@@ -174,7 +174,7 @@ Data, latency and consume results: [kafka-comparison.md](docs/benchmarks/kafka-c
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/card-tested-dark.svg">
-  <img alt="Tested against: Apache Kafka 4.3.2 (benchmarks); Apache Kafka 4.3.1 (Docker lab and live-broker tests in CI); Kafka JVM client 4.3.2 (benchmarks); librdkafka 2.12.1 (the engine's Kafka source); MinIO RELEASE.2025-09-07T16-13-09Z (Docker lab and live S3 tests in CI). More S3 servers: when the matrix is published (#722)." src="docs/assets/readme/card-tested-light.svg" width="600">
+  <img alt="Tested against: Apache Kafka 3.7.2 to 4.4.0 (8 releases, live-broker tests, nightly); Apache Kafka 4.3.2 (benchmarks); Apache Kafka 4.3.1 (Docker lab and live-broker tests in CI); Kafka JVM client 4.3.2 (benchmarks); librdkafka 2.12.1 (the engine's Kafka source); PostgreSQL 14 to 18 (5 majors, state-store tests, nightly); MinIO RELEASE.2025-09-07T16-13-09Z (Docker lab and live S3 tests in CI). More S3 servers: when the matrix is published (#722)." src="docs/assets/readme/card-tested-light.svg" width="600">
 </picture>
 
 ---

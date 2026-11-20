@@ -52,6 +52,8 @@ SCHEMA = 1
 README = "README.md"
 COMPOSE = "docker-compose.yml"
 CI = ".github/workflows/ci.yml"
+KAFKA_MATRIX = ".github/workflows/kafka-matrix.yml"
+POSTGRES_MATRIX = ".github/workflows/postgres-matrix.yml"
 CARGO_TOML = "Cargo.toml"
 CARGO_LOCK = "Cargo.lock"
 EGRESS_ENV = "benchmarks/measurements/483-tcp-baseline/environment.json"
@@ -118,6 +120,43 @@ def version(repo: str = REPO) -> str:
 
 def _images(text: str, name: str) -> list[str]:
     return sorted(set(re.findall(rf"^\s*image:\s*{re.escape(name)}:(\S+)\s*$", text, re.M)))
+
+
+def _pins(path: str, pattern: str, what: str, repo: str) -> list[str]:
+    """The releases a matrix workflow pins, in the order of its `PINNED_IMAGES` list, and nothing that
+    only looks like one: each line must name its image with the same release it starts with."""
+    found = re.findall(pattern, _read(path, repo), re.M)
+    if not found:
+        raise Refused(f"{path}: no pinned {what} found")
+    return found
+
+
+def _span(releases: list[str], key) -> tuple[str, str]:
+    ordered = sorted(releases, key=key)
+    return ordered[0], ordered[-1]
+
+
+def _nightly(path: str, repo: str) -> str:
+    return "nightly" if re.search(r"^\s+schedule:\s*$", _read(path, repo), re.M) else "on pull requests"
+
+
+def kafka_matrix(repo: str = REPO) -> dict[str, str]:
+    """The Apache Kafka releases the live-broker suite runs against, from the workflow that pins them."""
+    pin = r"^\s+(\d+(?:\.\d+)+) apache/kafka:\1@sha256:[0-9a-f]{64}\s*$"
+    releases = _pins(KAFKA_MATRIX, pin, "Kafka release", repo)
+    low, high = _span(releases, lambda v: tuple(int(n) for n in v.split(".")))
+    return {"name": "Apache Kafka", "version": f"{low} to {high}",
+            "ran": f"{len(releases)} releases, live-broker tests, {_nightly(KAFKA_MATRIX, repo)}",
+            "source": KAFKA_MATRIX}
+
+
+def postgres_matrix(repo: str = REPO) -> dict[str, str]:
+    """The PostgreSQL majors the state store's battery runs against, from the workflow that pins them."""
+    majors = _pins(POSTGRES_MATRIX, r"^\s+(\d+) postgres:\1@sha256:[0-9a-f]{64}\s*$", "PostgreSQL major", repo)
+    low, high = _span(majors, int)
+    return {"name": "PostgreSQL", "version": f"{low} to {high}",
+            "ran": f"{len(majors)} majors, state-store tests, {_nightly(POSTGRES_MATRIX, repo)}",
+            "source": POSTGRES_MATRIX}
 
 
 def link_conditions(repo: str = REPO) -> dict[str, str]:
@@ -344,8 +383,8 @@ def _tested(repo, tp, fo, s3) -> dict[str, Any]:
         places.setdefault(tag, []).append("live-broker tests in CI")
     if not places:
         raise Refused("no Kafka version found in the runs, docker-compose.yml or ci.yml")
-    kafka = [{"name": "Apache Kafka", "version": tag, "ran": " and ".join(where)}
-             for tag, where in sorted(places.items(), reverse=True)]
+    kafka = [kafka_matrix(repo)] + [{"name": "Apache Kafka", "version": tag, "ran": " and ".join(where)}
+                                    for tag, where in sorted(places.items(), reverse=True)]
     clients = {}
     for env, key in ((tp["environment"], "client"), (fo["environment"], "client_kafka")):
         runtime, ver = _client(env["comparable"][key], f"{env['run_id']}/environment.json {key}")
@@ -354,7 +393,8 @@ def _tested(repo, tp, fo, s3) -> dict[str, Any]:
                 "rdkafka-sys with a bundled librdkafka version")
     client_list = list(clients.values()) + [
         {"name": "librdkafka", "version": lock.group(1), "ran": "the engine's Kafka source"}]
-    return {"kafka": kafka, "clients": client_list, "s3": [s3["lab"]] + s3["matrix"]["entries"],
+    return {"kafka": kafka, "clients": client_list, "state_store": [postgres_matrix(repo)],
+            "s3": [s3["lab"]] + s3["matrix"]["entries"],
             "s3_matrix": s3["matrix"]}
 
 
@@ -424,7 +464,7 @@ def alts(facts: dict[str, Any]) -> dict[str, str]:
                       f"{tp['series']['vtop']} {group['vtop']['text']}." for group in tp["groups"])
     tested = facts["tested"]
     chips = "; ".join(f"{item['name']} {item['version']} ({item['ran']})"
-                      for item in tested["kafka"] + tested["clients"] + tested["s3"])
+                      for item in tested["kafka"] + tested["clients"] + tested["state_store"] + tested["s3"])
     out = {
         "card-hero": f"{hero['pill']}. {hero['headline']} The rule: {hero['rule']} {hero['section']} "
                      f"({hero['caveat'][0].lower()}{hero['caveat'][1:].rstrip('.')}). {tiles}",

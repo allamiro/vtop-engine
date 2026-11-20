@@ -328,9 +328,10 @@ def throughput(canvas: Canvas, facts: dict[str, Any]) -> tuple[float, str]:
 def tested(canvas: Canvas, facts: dict[str, Any]) -> tuple[float, str]:
     t = canvas.theme
     data = facts["tested"]
-    y = _title(canvas, PAD, "Tested against", "Versions as the benchmark runs, the Docker lab, CI and Cargo.lock "
-               "record them.") + 18
-    groups = (("Kafka brokers", data["kafka"]), ("Kafka clients", data["clients"]), ("S3 storage", data["s3"]))
+    y = _title(canvas, PAD, "Tested against", "Versions as the benchmark runs, the Docker lab, the CI "
+               "workflows and Cargo.lock record them.") + 18
+    groups = (("Kafka brokers", data["kafka"]), ("Kafka clients", data["clients"]),
+              ("State store", data["state_store"]), ("S3 storage", data["s3"]))
     sources = []
     for name, items in groups:
         y += canvas.text(PAD, y, name, BODY, t["ink2"], "bold") + 8
@@ -342,6 +343,7 @@ def tested(canvas: Canvas, facts: dict[str, Any]) -> tuple[float, str]:
         y = _chips(canvas, chips, y) + 18
     y += PAD - 18
     return y, "Versions read from: " + ", ".join(sorted({site_facts.COMPOSE, site_facts.CI, site_facts.CARGO_LOCK,
+                                                         site_facts.KAFKA_MATRIX, site_facts.POSTGRES_MATRIX,
                                                          readme_charts.THROUGHPUT_RUN + "/environment.json",
                                                          readme_charts.FAILOVER_RUN + "/environment.json",
                                                          *filter(None, sources)}))

@@ -250,6 +250,10 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'tests/s3-compat/**'
+              # The matrix workflows pin the Kafka releases and PostgreSQL
+              # majors the tested-against card names.
+              - '.github/workflows/kafka-matrix.yml'
+              - '.github/workflows/postgres-matrix.yml'
               # The tests this job runs: a change to a test alone must run
               # it (tests/test_benchmark_charts_job.py checks the list).
               - 'benchmarks/tests/test_readme_charts.py'
