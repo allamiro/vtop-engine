@@ -105,7 +105,7 @@ formats:
   - id: 7
     name: Progress markers (ledger, digests, manifests)
     class: B
-    marker: "none: optional fields"
+    marker: "none: optional fields (Kafka `topic_id`: ledger only, never in a manifest)"
     status: evolving; key names frozen
     at_1_0: stable
     fuzz: [ledger_rows]

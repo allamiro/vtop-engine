@@ -202,6 +202,7 @@ What an older binary does with newer data, by case:
 | Newer data | The N-1 binary | Policy (target) | Tested today |
 |---|---|---|---|
 | A nullable ledger column | Names its own columns, ignores the new one and writes `NULL` in the rows it inserts. A later release reads `NULL` as unknown. | Supported. No marker bump, and the column is never dropped. Only N-1 shares a PostgreSQL ledger with N. | Yes: `sealed_at` (#626) against the previous release, SQLite on every pull request and PostgreSQL nightly (`ledger-sqlite`, `ledger-postgres`, forward) |
+| A Kafka progress marker with a `topic_id` | Ignores the key. It resumes a partition from the newest committed row, as it always did, and its pruning keeps that row. | Supported: an optional field in an unhashed document, read as unknown when absent. | No |
 | A ledger row in a state, or of a source type, N-1 does not know | Fails closed. | One-way: needs a marker or version bump, so the refusal comes at startup and not mid-run. | No |
 | A `0.4` manifest | v0.8.0 and later verify it; v0.7.0 and earlier report it as tampered. | The documented cutoff. Archives are never rewritten; set `write_version: "0.3"` to stop writing more. | Yes: v0.7.0, and v0.8.0 and later (`manifest-compat`) |
 | A metadata log entry or snapshot record from a raised feature level | The voter refuses to start, saying *newer format*, and changes nothing. Today that holds for a new command kind, log entry kind, value tag or key category; other enum values inside records are reported as corrupt until [#763](https://github.com/allamiro/vtop-engine/pull/763). | One-way at the raise, which is operator-gated and permanent. The notes say which level first puts a new kind in the log. | No |
@@ -255,7 +256,21 @@ What an older binary does with newer data, by case:
 
 Every persisted and wire format, its version marker, its class and its
 status now and at 1.0. The progress-marker JSON key names `path` and
-`end_byte` are frozen as they are: PostgreSQL indexes read them.
+`end_byte`, and for a Kafka marker `topic`, `partition`, `consumer_group`,
+`end_offset` and `topic_id`, are frozen as they are: PostgreSQL indexes read
+them.
+
+The Kafka marker's `topic_id` (the broker's UUID for the topic, base64url
+without padding) is optional and **ledger only**: a manifest never carries it
+(`for_manifest` clears it, as for a file marker's fingerprints), so manifests
+are byte for byte what every released reader verifies. A row written before
+the field existed has none and reads as unknown, and so does a row written
+against a broker that gives topics no id (before Kafka 2.8) or did not answer.
+The ledger resumes a Kafka partition from the highest committed end among the
+rows of one topic id; rows with no id keep the older rule (the newest row), and
+the two kinds are never ranked against each other. An older release ignores the
+key, resumes by the older rule and prunes by it; going back to it restores
+that rule and the duplicate it allows after a failed source commit.
 
 The table is generated from the format registry,
 [`scripts/compat/formats.yaml`](../../scripts/compat/formats.yaml), which also
@@ -278,7 +293,7 @@ table differs from what the registry generates. Edit the registry and run
 | 4 | Ledger digest (`ledger-digest-*.jsonl`) | `vtop_ledger_digest` `1` | A | evolving | stable, read forever |
 | 5 | State ledger, SQLite | `PRAGMA user_version` `1` | B | evolving | stable |
 | 6 | State ledger, PostgreSQL | schema marker `3` | B | evolving | stable |
-| 7 | Progress markers (ledger, digests, manifests) | none: optional fields | B | evolving; key names frozen | stable |
+| 7 | Progress markers (ledger, digests, manifests) | none: optional fields (Kafka `topic_id`: ledger only, never in a manifest) | B | evolving; key names frozen | stable |
 | 8 | `audit_events` table and hash chain | `audit_version` column | B | evolving | stable |
 | 9 | Audit record (JSONL) | `audit_version` `1` | B | evolving | stable |
 | 10 | Segment log v1 and v2, index, chunk sidecar, commit marker | `VTOPSEG1`, `VTOPREC1`, `VTOPIDX1`; `VTOPSEG2`, `VTOPREC2`; `VTOPCHK1`; `VTOPCMT1` | B | v1 stable, v2 evolving | v1 stable; v2's status and the release that makes it the default writer are decided in their own issue |
