@@ -33,7 +33,7 @@ use crate::env::Env;
 use crate::producer_snapshot::ProducerSnapshot;
 use crate::retention_intent::{RetainedSegment, RetentionIntent, RETENTION_INTENT_FILE};
 use crate::segment::{
-    io_error, rewrite_empty_header_in_place, roll_in, roll_in_with, segment_stem, write_atomic,
+    io_error, rewrite_empty_header_in_place, roll_in_with, segment_stem, write_atomic,
     ActiveSegment, SegmentReader, SuccessorConfig,
 };
 use crate::truncate_intent::{DoomedSegment, TruncateIntent, TRUNCATE_INTENT_FILE};
@@ -261,14 +261,20 @@ pub struct SegmentSet {
     /// Sealed segments in ascending offset order, contiguous with each other
     /// and with `active`.
     sealed: Vec<SegmentReader>,
-    /// `Option` only so the tail can be moved out by value: during a roll,
-    /// which `roll_in` requires, and during a cross-segment truncation, which
-    /// deletes the file the tail has open. It is `None` for the duration of
-    /// those calls — and permanently if either fails part-way, which every
-    /// accessor treats as a programming error rather than a state to serve
-    /// from. An earlier version parked a throwaway segment in the range
-    /// directory instead, and its orphaned sidecars made discovery quarantine
-    /// the whole range on the next open.
+    /// `Option` only so the tail can be moved out by value during a
+    /// cross-segment truncation, which deletes the file the tail has open,
+    /// and during the empty-tail header rewrite of a reconfigure. It is
+    /// `None` for the duration of those calls — and permanently if either
+    /// fails part-way, which every accessor treats as a programming error
+    /// rather than a state to serve from. An earlier version parked a
+    /// throwaway segment in the range directory instead, and its orphaned
+    /// sidecars made discovery quarantine the whole range on the next open.
+    ///
+    /// A ROLL never takes it (#881). A roll that fails leaves the tail in
+    /// place — unchanged, poisoned, or sealed underneath and still readable —
+    /// and the next write rebuilds it from disk ([`Self::heal_tail`]). A
+    /// full disk at a roll used to leave this `None`, and every later call
+    /// panicked, `/metrics` included, until the process restarted.
     active: Option<ActiveSegment>,
 }
 
@@ -828,7 +834,94 @@ impl SegmentSet {
     /// follower batching appends under one durability barrier does not have
     /// to know which segment the barrier lands on.
     pub fn commit(&mut self) -> VtopLogResult<u64> {
+        self.heal_tail()?;
         self.tail_mut().commit()
+    }
+
+    /// Rebuild a tail that can no longer write from what is on disk, so a
+    /// range recovers from a transient storage failure — a full disk, above
+    /// all — without a process restart (#881).
+    ///
+    /// Two states reach here. A tail POISONED by a failed write, which refuses
+    /// every later append for good, by design: after a failed write or fsync
+    /// its in-memory state cannot be trusted to match the file. And a tail
+    /// SEALED underneath a roll that failed after its rename, which refuses
+    /// appends because its file is no longer active. Either way the durable
+    /// state is a crash state the open path already recovers, so this does
+    /// what a restart would do for this range: reopen it — and, for the
+    /// stranded seal only, adopt a successor onto the sealed tail, the step
+    /// the failed roll was about to take.
+    ///
+    /// It is a no-op for a healthy tail, so every write path calls it first.
+    ///
+    /// The rebuilt range must hold EXACTLY what this one does: the same
+    /// first offset, the same next offset, all of it committed. Records the
+    /// failed write itself left past that offset are cut, since its caller
+    /// was told it failed. Any other difference is refused and the range
+    /// stays as it is, failing closed, because the broker above has served
+    /// and replicated from this view and a silent rewind would put two
+    /// histories under one epoch.
+    ///
+    /// That is also why a tail holding records it has not committed is not
+    /// rebuilt at all: recovery would cut them. Production appends commit
+    /// every group, so that only arises under the fault harness's fsync hold.
+    fn heal_tail(&mut self) -> VtopLogResult<()> {
+        let Some(tail) = self.active.as_ref() else {
+            // A failed cross-segment truncation or header rewrite: not a
+            // state this rebuild was written for. Unchanged behaviour.
+            return Ok(());
+        };
+        if !tail.is_poisoned() && !tail.is_sealed() {
+            return Ok(());
+        }
+        let stranded = tail.is_sealed();
+        let base = self.base_offset();
+        let next = tail.next_offset();
+        if tail.committed_offset() != next {
+            return Err(LogError::WriterPoisoned);
+        }
+        let mut rebuilt = match Self::open_in(&self.env, &self.directory) {
+            Ok(Some(rebuilt)) => rebuilt,
+            Ok(None) => {
+                return Err(LogError::InvalidDescriptor(format!(
+                    "range at {} holds no segments on disk, but this process was serving \
+                     offsets {base}..{next} from it; refusing to rebuild an empty range in \
+                     its place",
+                    self.directory.display()
+                )))
+            }
+            Err(LogError::TailSealedWithoutSuccessor { .. }) if stranded => {
+                let successor_id = Uuid::from_u128(self.env.rng.next_u128());
+                Self::adopt_in(&self.env, &self.directory, successor_id)?
+            }
+            Err(error) => return Err(error),
+        };
+        // Records past `next` are the failed write itself: it reached the
+        // disk — a commit boundary published before the directory fsync that
+        // failed, say — but its append reported the failure, so nothing
+        // acknowledged them and no fetch saw them (fetches stop at the
+        // committed offset this view never advanced). A restart would serve
+        // them; this rebuild cuts them, so the range is exactly the one the
+        // broker above has been answering from.
+        if rebuilt.base_offset() == base && rebuilt.next_offset() > next {
+            rebuilt.truncate_to(next)?;
+        }
+        if rebuilt.base_offset() != base
+            || rebuilt.next_offset() != next
+            || rebuilt.committed_offset() != next
+        {
+            return Err(LogError::InvalidDescriptor(format!(
+                "range at {} reopened as offsets {}..{} (committed through {}), but this \
+                 process was serving {base}..{next}; refusing to replace the range it served \
+                 with a different one. Restart the node so the range is recovered as a whole.",
+                self.directory.display(),
+                rebuilt.base_offset(),
+                rebuilt.next_offset(),
+                rebuilt.committed_offset(),
+            )));
+        }
+        *self = rebuilt;
+        Ok(())
     }
 
     /// Every segment must begin where the previous one ended.
@@ -899,19 +992,20 @@ impl SegmentSet {
         self.tail_mut()
     }
 
-    /// The tail. Present except transiently inside [`Self::roll`] and
-    /// [`Self::truncate_to`]'s cross-segment path — or permanently after
-    /// either fails, which poisons the set.
+    /// The tail. Present except transiently inside [`Self::truncate_to`]'s
+    /// cross-segment path and [`Self::reconfigure`]'s empty-tail rewrite — or
+    /// permanently after either fails, which poisons the set. A failed roll
+    /// keeps it (#881).
     fn tail(&self) -> &ActiveSegment {
         self.active
             .as_ref()
-            .expect("the tail is absent only mid-roll, mid-truncation, or after one failed")
+            .expect("the tail is absent only mid-truncation or mid-rewrite, or after one failed")
     }
 
     fn tail_mut(&mut self) -> &mut ActiveSegment {
         self.active
             .as_mut()
-            .expect("the tail is absent only mid-roll, mid-truncation, or after one failed")
+            .expect("the tail is absent only mid-truncation or mid-rewrite, or after one failed")
     }
 
     /// Append a group, rolling if it does not fit in the tail.
@@ -942,6 +1036,7 @@ impl SegmentSet {
         records: &[LogRecord],
         durability: Durability,
     ) -> VtopLogResult<Vec<crate::AppendOutcome>> {
+        self.heal_tail()?;
         self.tail_mut().append_group(records, durability)
     }
 
@@ -951,6 +1046,7 @@ impl SegmentSet {
         durability: Durability,
         successor_id: Uuid,
     ) -> VtopLogResult<Vec<crate::AppendOutcome>> {
+        self.heal_tail()?;
         match self.tail_mut().append_group(records, durability) {
             Err(LogError::SegmentByteLimit { .. }) | Err(LogError::SegmentRecordLimit { .. }) => {}
             other => return other,
@@ -972,22 +1068,23 @@ impl SegmentSet {
     /// roll thresholds: a segment's limits live in its header, and a range
     /// carries them forward from the moment it was created.
     pub fn roll(&mut self, successor_id: Uuid) -> VtopLogResult<()> {
+        self.heal_tail()?;
         // A segment holding nothing would seal into an empty sealed segment and
         // an identically-based successor, so rolling it is a no-op that costs a
         // file.
         if self.tail().next_offset() == self.tail().base_offset() {
             return Ok(());
         }
-        let active = self
+        // The tail is borrowed, not taken (#881). If the roll fails it stays
+        // here — unchanged, poisoned, or sealed underneath and still readable
+        // — so the range keeps answering, and the next write rebuilds it from
+        // disk. It used to be taken and left `None` on failure, and a full
+        // disk at a roll then made every later call panic.
+        let tail = self
             .active
-            .take()
-            .expect("the tail is absent only mid-roll, mid-truncation, or after one failed");
-        // If this fails the tail stays `None`, which every accessor treats as a
-        // programming error rather than a state to serve from. That is
-        // deliberate: a set whose roll failed part-way has no coherent tail, and
-        // continuing to answer reads from a half-rolled range would be worse
-        // than stopping.
-        let (sealed, successor) = roll_in(&self.env, active, successor_id)?;
+            .as_mut()
+            .expect("the tail is absent only mid-truncation or mid-rewrite, or after one failed");
+        let (sealed, successor) = roll_in_with(&self.env, tail, successor_id, None)?;
         self.active = Some(successor);
         self.sealed.push(sealed);
         Ok(())
@@ -1031,6 +1128,7 @@ impl SegmentSet {
         thresholds: RollThresholds,
         successor_id: Uuid,
     ) -> VtopLogResult<ReconfigureOutcome> {
+        self.heal_tail()?;
         let candidate = match self.tail().config_v2() {
             Some(current) => {
                 let applied = thresholds.applied_to_v2(current);
@@ -1049,19 +1147,19 @@ impl SegmentSet {
             }
         };
         if self.tail().next_offset() == self.tail().base_offset() {
-            let active = self
-                .active
-                .take()
-                .expect("the tail is absent only mid-roll, mid-truncation, or after one failed");
+            let active = self.active.take().expect(
+                "the tail is absent only mid-truncation or mid-rewrite, or after one failed",
+            );
             let replacement = rewrite_empty_header_in_place(&self.env, active, candidate)?;
             self.active = Some(replacement);
             return Ok(ReconfigureOutcome::RewrittenInPlace);
         }
-        let active = self
+        // Borrowed, as in `roll` (#881): a failed roll keeps the tail.
+        let tail = self
             .active
-            .take()
-            .expect("the tail is absent only mid-roll, mid-truncation, or after one failed");
-        let (sealed, successor) = roll_in_with(&self.env, active, successor_id, Some(candidate))?;
+            .as_mut()
+            .expect("the tail is absent only mid-truncation or mid-rewrite, or after one failed");
+        let (sealed, successor) = roll_in_with(&self.env, tail, successor_id, Some(candidate))?;
         let successor_base = successor.base_offset();
         self.active = Some(successor);
         self.sealed.push(sealed);
@@ -1256,6 +1354,7 @@ impl SegmentSet {
     /// only crash-safe under a durable intent marker; see
     /// [`Self::truncate_across_segments`] for the protocol.
     pub fn truncate_to(&mut self, offset: u64) -> VtopLogResult<crate::TruncateOutcome> {
+        self.heal_tail()?;
         if offset > self.next_offset() {
             return Err(LogError::TruncateBeyondTail {
                 requested: offset,
@@ -1423,9 +1522,9 @@ impl SegmentSet {
         // give up the tail so a failure below leaves the set refusing to
         // serve rather than serving a range that is no longer on disk.
         drop(
-            self.active
-                .take()
-                .expect("the tail is absent only mid-roll, mid-truncation, or after one failed"),
+            self.active.take().expect(
+                "the tail is absent only mid-truncation or mid-rewrite, or after one failed",
+            ),
         );
         self.sealed.truncate(cut_index);
         finish_truncation(&self.env, &self.directory, &intent)?;
