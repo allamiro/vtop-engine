@@ -11,13 +11,12 @@
 //! crash-recoverable, and `commit_progress` is invoked on the source adapter
 //! only after the batch reaches `VERIFIED`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use futures::StreamExt;
 use tracing::instrument::WithSubscriber;
 use tracing::Instrument;
 use vtop_adapters::base::{DiscoveredSource, ReadResult, SourceAdapter};
@@ -2992,10 +2991,127 @@ pub struct Engine {
     /// The clock a drained window's seal instant is read from. `Utc::now`,
     /// except in tests that replay a window in another hour.
     seal_clock: SealClock,
+    /// Batches sealed and handed to the pipeline whose outcome this engine
+    /// has not yet acted on, per source type, in the order they were sealed.
+    /// They are carried through upload and verification by tasks that
+    /// outlive the cycle that sealed them, so reading goes on while earlier
+    /// batches are still on the wire; commits are applied from the front of
+    /// the queue only, so a batch still commits after IT is VERIFIED and
+    /// after every batch sealed before it has settled.
+    inflight: HashMap<SourceType, VecDeque<InFlight>>,
+    /// Upload slots: at most this many batches are between seal and VERIFIED
+    /// at once, whichever cycle sealed them. Sized to the upload width.
+    upload_slots: Arc<tokio::sync::Semaphore>,
+    /// The width `upload_slots` currently stands for.
+    upload_slots_size: usize,
+    /// Signalled by each batch task as it finishes.
+    batch_done: Arc<tokio::sync::Notify>,
+    /// Permits still to be withdrawn after the width narrowed while they
+    /// were in use.
+    upload_slots_debt: usize,
     /// Exclusive work-dir lock held for the engine's lifetime (#66).
     /// Held only by [`Engine::new_exclusive`] instances; empty for read-only
     /// construction (#66).
     _instance_locks: Vec<InstanceLock>,
+}
+
+/// One sealed batch between seal and settlement; see [`Engine::inflight`].
+struct InFlight {
+    /// The unit (Kafka partition, file at its inode) the window was read from.
+    unit: String,
+    window: Box<RecordedWindow>,
+    /// The window's uncompressed bytes, held in memory until it settles.
+    bytes: usize,
+    /// A window of the same unit sealed BEFORE this one did not reach
+    /// VERIFIED and was handed back: this window's range is read again, so it
+    /// must not commit. If it verifies it is held, as an in-cycle hold was
+    /// (#626 PR 2); if it fails, it hands nothing back (the rewind below it
+    /// covers it).
+    superseded: bool,
+    /// Set once this window's failure has been acted on.
+    failure_handled: bool,
+    task: Option<tokio::task::JoinHandle<Result<VerifyStep, VtopError>>>,
+    result: Option<Result<VerifyStep, VtopError>>,
+}
+
+/// How long [`Engine::wait_for_inflight`] waits.
+enum Wait {
+    /// Every batch task of the source type.
+    All,
+    /// Until any one has finished, or the limit has passed.
+    Any(Option<Duration>),
+}
+
+/// A batch task's result; a task that panicked or was cancelled is an error
+/// before VERIFIED, whose range is handed back like any other.
+fn joined(
+    result: Result<Result<VerifyStep, VtopError>, tokio::task::JoinError>,
+) -> Result<VerifyStep, VtopError> {
+    result.unwrap_or_else(|e| {
+        Err(VtopError::Other(format!(
+            "batch task ended abnormally: {e}"
+        )))
+    })
+}
+
+impl InFlight {
+    fn failed(&self) -> bool {
+        match &self.result {
+            Some(Ok(VerifyStep::Finished(outcome))) => outcome.final_state == BatchState::Failed,
+            Some(Ok(VerifyStep::Verified(_))) | None => false,
+            Some(Err(_)) => true,
+        }
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // A batch task outliving its engine would go on writing the ledger
+        // of an engine that is gone. Cut it off, as dropping the engine's
+        // future cut off a batch before tasks carried them: whatever it had
+        // reached is recovered or re-read on the next start, as after a crash.
+        for queue in self.inflight.values() {
+            for entry in queue {
+                if let Some(task) = &entry.task {
+                    task.abort();
+                }
+            }
+        }
+    }
+}
+
+/// [`Pipeline`]'s context, owned, so a batch task can carry it.
+#[derive(Clone)]
+struct OwnedPipeline {
+    store: Arc<dyn StateStore>,
+    backend: Arc<dyn UploadBackend>,
+    config: Arc<VtopConfig>,
+    manifest_keyring: Arc<ManifestKeyring>,
+    versioned_buckets: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    throttles: Arc<AtomicU64>,
+    attempts: Arc<AtomicU64>,
+    provisioned_buckets: ProvisionedBuckets,
+    key_notices: Arc<KeyNotices>,
+    locked_buckets: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    lock_fallbacks: Arc<LockFallbacks>,
+}
+
+impl OwnedPipeline {
+    fn pipeline(&self) -> Pipeline<'_> {
+        Pipeline {
+            store: self.store.as_ref(),
+            backend: Arc::clone(&self.backend),
+            config: &self.config,
+            manifest_keyring: Arc::clone(&self.manifest_keyring),
+            versioned_buckets: Arc::clone(&self.versioned_buckets),
+            throttles: Arc::clone(&self.throttles),
+            attempts: Arc::clone(&self.attempts),
+            provisioned_buckets: Arc::clone(&self.provisioned_buckets),
+            key_notices: Arc::clone(&self.key_notices),
+            locked_buckets: Arc::clone(&self.locked_buckets),
+            lock_fallbacks: Arc::clone(&self.lock_fallbacks),
+        }
+    }
 }
 
 /// Where a drained window's seal instant comes from; see
@@ -3331,6 +3447,8 @@ impl Engine {
             config.batching.adaptive_width.min_width,
             config.upload.max_concurrency_ceiling,
         );
+        let upload_slots = Arc::new(tokio::sync::Semaphore::new(width.width().max(1)));
+        let upload_slots_size = width.width().max(1);
         Ok(Self {
             config,
             streams,
@@ -3355,6 +3473,11 @@ impl Engine {
             unsettled: Vec::new(),
             recorded: RecordedWindows::default(),
             seal_clock: Arc::new(Utc::now),
+            inflight: HashMap::new(),
+            upload_slots,
+            upload_slots_size,
+            batch_done: Arc::default(),
+            upload_slots_debt: 0,
             _instance_locks: Vec::new(),
         })
     }
@@ -3414,6 +3537,22 @@ impl Engine {
             max_records: self.config.batching.max_records,
             max_bytes: self.config.batching.max_bytes,
             max_batch_age_seconds: self.config.batching.max_batch_age_seconds,
+        }
+    }
+
+    fn owned_pipeline(&self) -> OwnedPipeline {
+        OwnedPipeline {
+            store: Arc::clone(&self.store),
+            backend: Arc::clone(&self.backend),
+            config: Arc::new(self.config.clone()),
+            manifest_keyring: Arc::clone(&self.manifest_keyring),
+            versioned_buckets: Arc::clone(&self.versioned_buckets),
+            throttles: Arc::clone(&self.throttles),
+            attempts: Arc::clone(&self.attempts),
+            provisioned_buckets: Arc::clone(&self.provisioned_buckets),
+            key_notices: Arc::clone(&self.key_notices),
+            locked_buckets: Arc::clone(&self.locked_buckets),
+            lock_fallbacks: Arc::clone(&self.lock_fallbacks),
         }
     }
 
@@ -3757,6 +3896,12 @@ impl Engine {
         source_type: &SourceType,
         force_flush: bool,
     ) -> Result<Vec<BatchOutcome>, VtopError> {
+        // Backpressure: while the batches in flight hold the byte budget, read
+        // nothing more; wait for one of them to finish and act on it.
+        if !force_flush && self.inflight_bytes(source_type) >= self.inflight_byte_budget() {
+            self.wait_for_inflight(source_type, Wait::Any(None)).await;
+            return self.settle_inflight(adapter, source_type).await;
+        }
         let sources = adapter.discover_sources().await?;
         // How long ONE PASS may wait for data. Whether that is paid once or
         // once per source is the adapter's business, not this loop's: the
@@ -4126,46 +4271,53 @@ impl Engine {
         if let Some(mx) = telemetry::metrics() {
             mx.upload_width.set(limit as i64);
         }
+        self.resize_upload_slots(limit);
         let throttles_before = self.throttles.load(Ordering::Relaxed);
         // A cycle that ISSUED no upload probes nothing (review): idle polling
         // after a throttle must not walk the width back up, and neither may a
         // cycle whose batches all failed before reaching the store.
         let attempts_before = self.attempts.load(Ordering::Relaxed);
-        let pipeline = self.pipeline();
-        // buffer_unordered keeps `limit` verifies in flight and yields each as
-        // it finishes, so a slow upload never holds up the ones behind it.
-        // `work` is MOVED into the futures rather than iterated by reference.
-        // Cloning each ReadResult here would duplicate every payload before
-        // buffer_unordered bounds anything, so with max_bytes at 100 MiB and a
-        // concurrency of 8 the queue alone could hold ~800 MiB of avoidable
-        // copies — the clone is not bounded by the concurrency limit, only the
-        // execution is.
+
+        // ---- Hand the sealed windows to the pipeline -------------------
         //
-        // Each result travels with the order its window was read in and the
-        // marker its batch STARTED at: commits are applied in read order (see
-        // below), and a batch that does not reach VERIFIED must hand its range
-        // back to the source (see the rewind below), by when the `ReadResult`
-        // that held the marker has been consumed.
+        // Each window is carried to VERIFIED (or FAILED) by a task of its
+        // own, which waits for one of `limit` upload slots shared by every
+        // cycle. The task does NOT end the cycle: reading goes on while it is
+        // on the wire, so a long round trip to the store is paid once per
+        // pipeline depth rather than once per cycle. What it decides is acted
+        // on by `settle_inflight`, in the order the windows were sealed.
         //
-        // It also carries what the window was (#626): if it does not reach
-        // VERIFIED, its range, seal instant and the digest an earlier attempt
-        // recorded are remembered, so the re-read rebuilds it under the same
-        // key.
-        let mut verified: Vec<(usize, Box<RecordedWindow>, Result<VerifyStep, VtopError>)> =
-            futures::stream::iter(work.into_iter().enumerate().map(
-                |(order, (source, read, stream, sealed_at, rebuild))| {
-                    let pipeline = &pipeline;
-                    let window = Box::new(RecordedWindow {
-                        start: read.progress_start.clone(),
-                        end: read.progress_end.clone(),
-                        sealed_at: Some(sealed_at),
-                        digest: rebuild.as_ref().and_then(|w| w.digest.clone()),
-                        object_uri: rebuild.as_ref().and_then(|w| w.object_uri.clone()),
-                        batch_id: None,
-                        record_count: Some(read.records.len() as u64),
-                        bounded: false,
-                    });
+        // `work` is MOVED into the tasks rather than iterated by reference:
+        // cloning each ReadResult would duplicate every payload.
+        //
+        // Each entry carries the marker its batch STARTED at and what the
+        // window was (#626): a batch that does not reach VERIFIED hands its
+        // range back to the source, and is remembered so the re-read
+        // rebuilds it under the same key.
+        if !work.is_empty() {
+            let owned = self.owned_pipeline();
+            let queue = self.inflight.entry(source_type.clone()).or_default();
+            for (source, read, stream, sealed_at, rebuild) in work {
+                let window = Box::new(RecordedWindow {
+                    start: read.progress_start.clone(),
+                    end: read.progress_end.clone(),
+                    sealed_at: Some(sealed_at),
+                    digest: rebuild.as_ref().and_then(|w| w.digest.clone()),
+                    object_uri: rebuild.as_ref().and_then(|w| w.object_uri.clone()),
+                    batch_id: None,
+                    record_count: Some(read.records.len() as u64),
+                    bounded: false,
+                });
+                let bytes = read.records.iter().map(Vec::len).sum();
+                let owned = owned.clone();
+                let slots = Arc::clone(&self.upload_slots);
+                let done = Arc::clone(&self.batch_done);
+                // The task carries the cycle's span and subscriber, as the
+                // future polled inside the cycle did.
+                let task = tokio::spawn(
                     async move {
+                        let _slot = slots.acquire_owned().await;
+                        let pipeline = owned.pipeline();
                         let step = pipeline
                             .process_until_verified(
                                 &source,
@@ -4175,21 +4327,38 @@ impl Engine {
                                 rebuild,
                             )
                             .await;
-                        (order, window, step)
+                        done.notify_one();
+                        step
                     }
-                },
-            ))
-            .buffer_unordered(limit)
-            .collect()
-            .await;
-        // Verification finishes in whatever order the store answers, but the
-        // commits are applied in the order the windows were READ. When a
-        // rotation seals the old file's window and starts a new one in the
-        // same cycle, both are in flight at once; committing the new file's
-        // window first would leave the OLD one as the most recent commit, and
-        // the restart seed (the newest committed row's inode) would then name a
-        // file that is no longer there and re-read the live one from byte 0.
-        verified.sort_by_key(|(order, _, _)| *order);
+                    .in_current_span()
+                    .with_current_subscriber(),
+                );
+                queue.push_back(InFlight {
+                    unit: unit_key(&window.start),
+                    window,
+                    bytes,
+                    superseded: false,
+                    failure_handled: false,
+                    task: Some(task),
+                    result: None,
+                });
+            }
+        }
+
+        self.export_inflight();
+        if force_flush {
+            // A forced flush (`process-once`, the shutdown flush) returns
+            // only once every batch of this source type has settled.
+            self.wait_for_inflight(source_type, Wait::All).await;
+        } else if records_read == 0 {
+            // Nothing new this pass: wait for a batch to finish rather than
+            // poll the source again at once, but no longer than one poll
+            // wait. An empty pass is often a source between fetches, not an
+            // idle one, and the batches on the wire must not hold up the next
+            // read for longer than the source itself would have.
+            self.wait_for_inflight(source_type, Wait::Any(Some(max_wait)))
+                .await;
+        }
 
         // The cycle's verdict for the width controller (#102): any throttle
         // in it halves the next width; none grows it by one.
@@ -4209,63 +4378,213 @@ impl Engine {
             }
         }
 
-        // Do NOT bail on the first error. Verify runs concurrently, so by the
-        // time one batch fails, others may already be persisted as VERIFIED —
-        // and their buffers have been drained from `pending`. Returning early
-        // would drop those VerifiedBatch values without committing source
-        // progress, leaving them verified-but-uncommitted until a restart ran
-        // recovery.
-        //
-        // So: commit every batch that succeeded, then report the first error.
-        // Nothing verified is abandoned, and the caller still sees the failure.
-        //
-        // A batch that did NOT reach VERIFIED is a different matter, and the
-        // read head is the reason. Adapters advance their read position when
-        // they READ, not when the batch commits, so a failed batch's records
-        // are already behind the head: left alone, the next cycle reads on
-        // from the end of the failed range, and the first later range to
-        // verify commits PAST it. The failed bytes are then never archived,
-        // and the restart that was supposed to repair this clamps its rewind
-        // to the committed point (#552). Each such range is therefore handed
-        // back to its source here, immediately, so the very next read starts
-        // at the first byte that has not been archived.
+        self.settle_inflight(adapter, source_type).await
+    }
+
+    /// Publish how many sealed batches have not settled, across source types.
+    fn export_inflight(&self) {
+        if let Some(mx) = telemetry::metrics() {
+            let n: usize = self.inflight.values().map(VecDeque::len).sum();
+            mx.sealed_batches_in_flight.set(n as i64);
+        }
+    }
+
+    /// Bytes held by the batches of `source_type` that have not settled.
+    fn inflight_bytes(&self, source_type: &SourceType) -> usize {
+        self.inflight
+            .get(source_type)
+            .map_or(0, |q| q.iter().map(|e| e.bytes).sum())
+    }
+
+    /// How many uncompressed bytes may be between seal and settlement before
+    /// the engine stops reading: one full batch per upload slot.
+    fn inflight_byte_budget(&self) -> usize {
+        self.upload_width()
+            .max(1)
+            .saturating_mul(self.config.batching.max_bytes.max(1))
+    }
+
+    /// Make `upload_slots` stand for `width` (#102: the controller can move
+    /// it between cycles). Permits in use when it narrows are withdrawn as
+    /// they come back.
+    fn resize_upload_slots(&mut self, width: usize) {
+        let width = width.max(1);
+        if width > self.upload_slots_size {
+            let mut grow = width - self.upload_slots_size;
+            let repaid = grow.min(self.upload_slots_debt);
+            self.upload_slots_debt -= repaid;
+            grow -= repaid;
+            self.upload_slots.add_permits(grow);
+        } else if width < self.upload_slots_size {
+            self.upload_slots_debt += self.upload_slots_size - width;
+        }
+        self.upload_slots_size = width;
+        if self.upload_slots_debt > 0 {
+            let taken = self.upload_slots.forget_permits(self.upload_slots_debt);
+            self.upload_slots_debt -= taken;
+        }
+    }
+
+    /// Wait for the batch tasks of `source_type`: all of them, or until any
+    /// one has finished (bounded by `Wait::Any`'s limit, if it has one).
+    async fn wait_for_inflight(&mut self, source_type: &SourceType, wait: Wait) {
+        match wait {
+            Wait::All => {
+                if let Some(queue) = self.inflight.get_mut(source_type) {
+                    for entry in queue.iter_mut() {
+                        if let Some(task) = entry.task.take() {
+                            entry.result = Some(joined(task.await));
+                        }
+                    }
+                }
+            }
+            Wait::Any(limit) => {
+                let deadline = limit.map(|d| tokio::time::Instant::now() + d);
+                loop {
+                    let Some(queue) = self.inflight.get(source_type) else {
+                        return;
+                    };
+                    let mut running = queue.iter().filter_map(|e| e.task.as_ref()).peekable();
+                    if running.peek().is_none() {
+                        return;
+                    }
+                    if running.any(|t| t.is_finished()) {
+                        return;
+                    }
+                    let notified = self.batch_done.notified();
+                    match deadline {
+                        Some(at) => {
+                            if tokio::time::timeout_at(at, notified).await.is_err() {
+                                return;
+                            }
+                        }
+                        None => notified.await,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Act on what the batch tasks of `source_type` have decided, in the
+    /// order their windows were sealed.
+    ///
+    /// The commit rule, per batch: SOURCE_COMMITTED only after IT reached
+    /// VERIFIED. Two more rules keep the source's committed point from
+    /// passing a range that is not archived:
+    ///
+    /// - Commits are applied from the FRONT of the queue only. A batch that
+    ///   verified waits until every batch sealed before it has settled, so
+    ///   commits land in read order exactly as they did when a cycle waited
+    ///   for all of its batches: the Kafka frontier and a file's restart seed
+    ///   (the newest committed row) only ever move forward.
+    /// - A batch that does not reach VERIFIED hands its range back to its
+    ///   source at once, before the next read, and every later window of the
+    ///   same unit is SUPERSEDED: it may still be uploading, but the source
+    ///   reads its range again, so it must not commit. A superseded window
+    ///   that verifies is held, as an in-cycle hold was (#626 PR 2), and
+    ///   settles once the re-read has committed through its end; one that
+    ///   fails hands nothing back, because the rewind below it already covers
+    ///   it, and handing back its higher start would move the read head
+    ///   forward over the range below. Only the lowest failed start of a
+    ///   unit is ever rewound to.
+    ///
+    /// Do NOT bail on the first error: batches that verified must still be
+    /// committed; the first error is reported after.
+    async fn settle_inflight(
+        &mut self,
+        adapter: &mut dyn SourceAdapter,
+        source_type: &SourceType,
+    ) -> Result<Vec<BatchOutcome>, VtopError> {
+        let Some(mut queue) = self.inflight.remove(source_type) else {
+            return Ok(Vec::new());
+        };
+        for entry in queue.iter_mut() {
+            if entry.task.as_ref().is_some_and(|t| t.is_finished()) {
+                if let Some(task) = entry.task.take() {
+                    entry.result = Some(joined(task.await));
+                }
+            }
+        }
+
         let mut outcomes = Vec::new();
         let mut first_err: Option<VtopError> = None;
         let mut rewinds: Vec<ProgressMarker> = Vec::new();
         let mut handed_back: Vec<RecordedWindow> = Vec::new();
-        // Per unit (a file at its inode, a Kafka partition), where the first
-        // window that did not reach VERIFIED this cycle starts. A window of
-        // the same unit read after it must not commit (review of #626 PR 2):
-        // a rebuilt window and the bytes after it are two windows of one unit
-        // in the same cycle, and committing the later one would move the
-        // source's committed point past the failed range, so the rewind below
-        // would be clamped to that point and the failed bytes never archived.
-        let mut failed_from: HashMap<String, i128> = HashMap::new();
-        for (_, window, step) in &verified {
-            let failed = match step {
-                Ok(VerifyStep::Finished(outcome)) => outcome.final_state == BatchState::Failed,
-                Ok(VerifyStep::Verified(_)) => false,
-                Err(_) => true,
-            };
-            if failed {
-                let at = start_position(&window.start);
-                failed_from
-                    .entry(unit_key(&window.start))
-                    .and_modify(|first| *first = (*first).min(at))
-                    .or_insert(at);
+
+        // Failures first, wherever they are in the queue: the read head is
+        // past them, and the next read must start at their first byte.
+        for i in 0..queue.len() {
+            if queue[i].failure_handled || !queue[i].failed() {
+                continue;
             }
-        }
-        for (_, mut window, step) in verified {
-            let started_at = window.start.clone();
-            let step = match step {
-                Ok(VerifyStep::Verified(v))
-                    if failed_from
-                        .get(&unit_key(&window.start))
-                        .is_some_and(|first| start_position(&window.start) > *first) =>
+            queue[i].failure_handled = true;
+            if queue[i].superseded {
+                tracing::debug!(
+                    source = queue[i].window.source(),
+                    range = %queue[i].window.range(),
+                    "a superseded window did not reach VERIFIED; the rewind below it covers it"
+                );
+                continue;
+            }
+            // Only windows of the same unit AND content generation: a
+            // same-inode replacement whose fingerprint proves it another
+            // file keeps its own rewind, since the old content's rewind is
+            // refused once its bytes are gone (review of #891).
+            let unit = queue[i].unit.clone();
+            let content = queue[i].window.start.content_fingerprint().cloned();
+            for later in queue.iter_mut().skip(i + 1) {
+                if later.unit == unit
+                    && !proven_other(content.as_ref(), later.window.start.content_fingerprint())
                 {
+                    later.superseded = true;
+                }
+            }
+            let entry = &mut queue[i];
+            rewinds.push(entry.window.start.clone());
+            if let Some(Ok(VerifyStep::Finished(outcome))) = &entry.result {
+                // The digest of an object this attempt uploaded, as the
+                // ledger recorded it: the object a rebuild of the window
+                // compares itself with.
+                match self.store.get_batch(&outcome.batch_id).await {
+                    Ok(Some(row)) => {
+                        if let Some(digest) =
+                            crate::rebuild::recorded_digest(row.object_sha256.as_deref())
+                        {
+                            entry.window.digest = Some(digest);
+                            // The key goes with its digest (#773).
+                            entry.window.object_uri =
+                                crate::rebuild::recorded_object_uri(row.object_uri.as_deref());
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::debug!(
+                        batch_id = %outcome.batch_id,
+                        error = %e,
+                        "could not read the failed batch's row; its replay is judged on \
+                         its range alone"
+                    ),
+                }
+                entry.window.batch_id = Some(outcome.batch_id.clone());
+            }
+            // An error before VERIFIED (a ledger write that failed, say):
+            // whether the ledger holds a row is unknown, and re-reading the
+            // range costs a duplicate at worst where skipping it costs the
+            // data (#627). Remembered from memory.
+            handed_back.push((*entry.window).clone());
+            self.recorded.remember((*entry.window).clone());
+        }
+
+        // Then commits, from the front only.
+        while queue.front().is_some_and(|e| e.result.is_some()) {
+            let Some(mut entry) = queue.pop_front() else {
+                break;
+            };
+            let window = entry.window;
+            match entry.result.take() {
+                Some(Ok(VerifyStep::Verified(v))) if entry.superseded => {
                     // Held VERIFIED, as recovery holds a row above a range
-                    // being read again (#624): it settles once the source has
-                    // committed through its end, which only the failed
+                    // being read again (#624): it settles once the source
+                    // has committed through its end, which only the failed
                     // range's re-read can bring about.
                     let committed_at_hold = adapter.committed_through(&window.end);
                     tracing::warn!(
@@ -4273,8 +4592,8 @@ impl Engine {
                         batch_id = %v.batch_id,
                         source = window.source(),
                         range = %window.range(),
-                        "batch {} of {} is VERIFIED, but an earlier range of the same source failed \
-                         this cycle; its source commit is held back so the failed range is read \
+                        "batch {} of {} is VERIFIED, but an earlier range of the same source \
+                         failed; its source commit is held back so the failed range is read \
                          again rather than skipped, and it is committed once that range is; \
                          nothing to do unless the earlier range keeps failing (see its error)",
                         v.batch_id,
@@ -4286,49 +4605,13 @@ impl Engine {
                         committed_at_hold,
                     ));
                     outcomes.push(Pipeline::hold_verified(v));
-                    continue;
                 }
-                step => step,
-            };
-            match step {
-                Ok(VerifyStep::Finished(outcome)) => {
-                    if outcome.final_state == BatchState::Failed {
-                        rewinds.push(started_at);
-                        // The digest of an object this attempt uploaded, as
-                        // the ledger recorded it: the object a rebuild of
-                        // the window compares itself with.
-                        match self.store.get_batch(&outcome.batch_id).await {
-                            Ok(Some(row)) => {
-                                if let Some(digest) =
-                                    crate::rebuild::recorded_digest(row.object_sha256.as_deref())
-                                {
-                                    window.digest = Some(digest);
-                                    // The key goes with its digest (#773).
-                                    window.object_uri = crate::rebuild::recorded_object_uri(
-                                        row.object_uri.as_deref(),
-                                    );
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(e) => tracing::debug!(
-                                batch_id = %outcome.batch_id,
-                                error = %e,
-                                "could not read the failed batch's row; its replay is judged on \
-                                 its range alone"
-                            ),
-                        }
-                        window.batch_id = Some(outcome.batch_id.clone());
-                        handed_back.push((*window).clone());
-                        self.recorded.remember(*window);
-                    }
-                    outcomes.push(outcome);
-                }
-                Ok(VerifyStep::Verified(v)) => {
+                Some(Ok(VerifyStep::Verified(v))) => {
                     let batch_id = v.batch_id.clone();
                     match self.pipeline().commit_verified(adapter, v).await {
                         Ok(outcome) => {
-                            // The source commit failed: the row stays VERIFIED,
-                            // and a later pass retries it (#624).
+                            // The source commit failed: the row stays
+                            // VERIFIED, and a later pass retries it (#624).
                             if !outcome.committed {
                                 self.unsettled
                                     .push(Unsettled::commit_failed(&batch_id, source_type));
@@ -4339,8 +4622,8 @@ impl Engine {
                             // Already VERIFIED and durable (the source may
                             // have committed, the ledger write did not); a
                             // later pass retries it (#624), and recovery
-                            // after a restart. Keep going so siblings still
-                            // commit.
+                            // after a restart. Keep going so the batches
+                            // after it still commit.
                             tracing::error!(batch_id, error = %e, "commit failed after verify");
                             self.unsettled
                                 .push(Unsettled::commit_failed(&batch_id, source_type));
@@ -4348,30 +4631,20 @@ impl Engine {
                         }
                     }
                 }
-                Err(e) => {
-                    // An error before the batch was VERIFIED (a ledger write
-                    // that failed, say — the FAILED write of `fail!` included).
-                    // Whether the ledger holds a row for it is unknown, and
-                    // re-reading the range costs a duplicate at worst where
-                    // skipping it costs the data.
-                    //
-                    // This is where the running path parts from recovery, which
-                    // never rewinds on a decision the ledger did not record
-                    // (#123). At startup the read head sits at the committed
-                    // point, at or below every uncommitted range, so a withheld
-                    // rewind there leaves the range ahead of the head. Here the
-                    // head is already PAST the range: withheld, the next cycle
-                    // reads on, a later batch commits past it, and the restart
-                    // that marks the row for replay clamps its rewind to that
-                    // commit — the range is never archived (#627).
-                    rewinds.push(started_at);
-                    // Remembered from memory: the ledger may hold no row.
-                    handed_back.push((*window).clone());
-                    self.recorded.remember(*window);
+                Some(Ok(VerifyStep::Finished(outcome))) => outcomes.push(outcome),
+                Some(Err(e)) => {
                     first_err.get_or_insert(e);
                 }
+                None => {}
             }
         }
+        if !queue.is_empty() {
+            // Batches still on the wire: come straight back for them.
+            self.cycle_had_data = true;
+        }
+        self.inflight.insert(source_type.clone(), queue);
+        self.export_inflight();
+
         if !rewinds.is_empty() {
             self.cycle_had_failure = true;
         }
@@ -7341,7 +7614,7 @@ mod tests {
             .collect();
 
         let (logs, _guard) = CapturedLogs::start_at(tracing::Level::INFO);
-        let outcomes = engine.run_source(SourceType::File, false).await.unwrap();
+        let outcomes = run_until_settled(&mut engine, SourceType::File).await;
         assert_eq!(outcomes.len(), 1, "the threshold sealed one batch");
         let outcome = &outcomes[0];
         assert!(outcome.committed, "the batch committed");
@@ -7851,6 +8124,349 @@ mod tests {
             vec![(Some(inode), 0, 7, Some(1)), (Some(inode), 7, len, Some(1))],
             "the failed range is archived as first cut, and nothing is skipped"
         );
+    }
+
+    /// A mock store whose object puts can be held at a gate, and refused
+    /// once, by a piece of the object key (a range token such as `b0-14`):
+    /// several batches of one file are then in flight at once, and settle in
+    /// the order a test chooses.
+    struct GatedObjects {
+        inner: Arc<vtop_upload::MockBackend>,
+        gates: std::sync::Mutex<Vec<(String, Arc<tokio::sync::Semaphore>)>>,
+        refused: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl GatedObjects {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: Arc::new(vtop_upload::MockBackend::new()),
+                gates: std::sync::Mutex::new(Vec::new()),
+                refused: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        /// Hold every object put whose key contains `part` until the gate
+        /// returned is opened (`add_permits`).
+        fn gate(&self, part: &str) -> Arc<tokio::sync::Semaphore> {
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            self.gates
+                .lock()
+                .unwrap()
+                .push((part.to_owned(), Arc::clone(&gate)));
+            gate
+        }
+
+        /// Refuse the next object put whose key contains `part`.
+        fn refuse_once(&self, part: &str) {
+            self.refused.lock().unwrap().push(part.to_owned());
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl UploadBackend for GatedObjects {
+        async fn put_object(
+            &self,
+            local_path: &std::path::Path,
+            object_uri: &str,
+            checksum: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::StoredObject, VtopError> {
+            let gate = self
+                .gates
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(part, _)| object_uri.contains(part.as_str()))
+                .map(|(_, gate)| Arc::clone(gate));
+            if let Some(gate) = gate {
+                drop(gate.acquire().await.unwrap());
+            }
+            let refuse = {
+                let mut refused = self.refused.lock().unwrap();
+                match refused.iter().position(|p| object_uri.contains(p.as_str())) {
+                    Some(i) => {
+                        refused.remove(i);
+                        true
+                    }
+                    None => false,
+                }
+            };
+            if refuse {
+                return Err(VtopError::Upload(format!(
+                    "test: put of {object_uri} refused"
+                )));
+            }
+            self.inner
+                .put_object(local_path, object_uri, checksum)
+                .await
+        }
+        async fn put_manifest(
+            &self,
+            local_path: &std::path::Path,
+            manifest_uri: &str,
+            checksum: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::StoredManifest, VtopError> {
+            self.inner
+                .put_manifest(local_path, manifest_uri, checksum)
+                .await
+        }
+        async fn head_object(&self, uri: &str) -> Result<vtop_upload::ObjectHead, VtopError> {
+            self.inner.head_object(uri).await
+        }
+        async fn get_object(&self, uri: &str) -> Result<Vec<u8>, VtopError> {
+            self.inner.get_object(uri).await
+        }
+        async fn get_object_bounded(&self, uri: &str, max: usize) -> Result<Vec<u8>, VtopError> {
+            self.inner.get_object_bounded(uri, max).await
+        }
+        async fn verify_object(
+            &self,
+            uri: &str,
+            size: u64,
+            expected: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::VerificationResult, VtopError> {
+            self.inner.verify_object(uri, size, expected).await
+        }
+        async fn delete_object(&self, uri: &str) -> Result<(), VtopError> {
+            self.inner.delete_object(uri).await
+        }
+        fn backend_name(&self) -> &'static str {
+            "gated"
+        }
+        fn supports_checksum_verification(&self) -> bool {
+            true
+        }
+        fn supports_multipart(&self) -> bool {
+            false
+        }
+        fn reports_absent_objects(&self) -> bool {
+            true
+        }
+    }
+
+    /// A file of `lines` lines of seven bytes ("line N\n", N < 10), read two
+    /// lines per batch, by an engine on a [`GatedObjects`] store.
+    async fn pipelined_file_engine(
+        dir: &std::path::Path,
+        lines: usize,
+    ) -> (Engine, Arc<GatedObjects>, std::path::PathBuf) {
+        let input = dir.join("in.log");
+        let body: String = (1..=lines).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(&input, body).unwrap();
+        let mut cfg = file_config(
+            dir.join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.max_records = 2;
+        cfg.batching.max_batch_age_seconds = 3_600;
+        cfg.batching.idle_poll_interval_ms = 20;
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let store = GatedObjects::new();
+        engine.backend = store.clone();
+        (engine, store, input)
+    }
+
+    /// Unforced passes until every batch they sealed has settled: a pass
+    /// returns what settled in it, and a batch sealed by one settles in a
+    /// later one once its task is done. Errors are passed over, as the run
+    /// loop does.
+    async fn run_until_settled(engine: &mut Engine, source_type: SourceType) -> Vec<BatchOutcome> {
+        let mut outcomes = Vec::new();
+        for _ in 0..500 {
+            if let Ok(mut settled) = engine.run_source(source_type.clone(), false).await {
+                outcomes.append(&mut settled);
+            }
+            if engine.inflight.values().all(VecDeque::is_empty) {
+                return outcomes;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("batches still in flight after 500 passes: {outcomes:?}");
+    }
+
+    /// The upload slots follow the width the controller chooses (#102). A
+    /// narrower width withdraws permits as they come back, so batches
+    /// already holding a slot are never cut off and never exceed the old
+    /// width; a wider one adds them at once.
+    #[tokio::test]
+    async fn the_upload_slots_follow_the_width_held_permits_included() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![],
+            "mock",
+        );
+        cfg.batching.max_concurrent_batches = 4;
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let slots = Arc::clone(&engine.upload_slots);
+        assert_eq!(slots.available_permits(), 4);
+
+        // Three batches hold a slot when the width drops to two.
+        let held = Arc::clone(&slots).acquire_many_owned(3).await.unwrap();
+        engine.resize_upload_slots(2);
+        assert_eq!(
+            slots.available_permits(),
+            0,
+            "a narrower width must not leave a free slot while three are held"
+        );
+        drop(held);
+        // The next cycle withdraws what came back above the new width.
+        engine.resize_upload_slots(2);
+        assert_eq!(slots.available_permits(), 2);
+
+        engine.resize_upload_slots(5);
+        assert_eq!(slots.available_permits(), 5);
+        engine.resize_upload_slots(1);
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    /// A batch task does not outlive its engine: dropping the engine (a test,
+    /// or a run abandoned mid-flush) aborts the tasks, which then release
+    /// what they held, as dropping the engine's future did when batches were
+    /// polled inside the cycle. A restart recovers them as after a crash.
+    #[tokio::test]
+    async fn dropping_the_engine_aborts_its_batch_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, store, _input) = pipelined_file_engine(dir.path(), 2).await;
+        let _gate = store.gate("b0-14");
+        engine.run_source(SourceType::File, false).await.unwrap();
+        assert!(
+            engine.inflight.values().any(|q| !q.is_empty()),
+            "the window waits at the gate"
+        );
+        let held_by_tasks = Arc::strong_count(&store);
+        assert!(held_by_tasks > 2, "the batch task holds the store: {held_by_tasks}");
+        drop(engine);
+        for _ in 0..100 {
+            if Arc::strong_count(&store) == 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!(
+            "the batch task outlived its engine: the store still has {} owners",
+            Arc::strong_count(&store)
+        );
+    }
+
+    /// The ledger states of the file batches that start at `start`.
+    async fn states_of_range(engine: &Engine, start: u64) -> Vec<BatchState> {
+        engine
+            .store
+            .list_batches()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|b| {
+                matches!(b.progress_start, ProgressMarker::File { start_byte, .. } if start_byte == start)
+            })
+            .map(|b| b.state)
+            .collect()
+    }
+
+    /// Run passes until the batch at `start` reaches `state` (the batch
+    /// tasks run between passes), or fail after a bound.
+    async fn pass_until(engine: &mut Engine, start: u64, state: BatchState) {
+        for _ in 0..200 {
+            if states_of_range(engine, start).await.contains(&state) {
+                return;
+            }
+            let _ = engine.run_source(SourceType::File, false).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!(
+            "the batch at byte {start} never reached {state:?}: {:?}",
+            states_of_range(engine, start).await
+        );
+    }
+
+    /// Pipelining: a batch on the wire does not stop the engine reading,
+    /// sealing and uploading the windows after it; but a window that
+    /// verifies first does NOT commit before the one sealed before it.
+    #[tokio::test]
+    async fn a_window_verified_while_an_earlier_one_is_on_the_wire_commits_after_it() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, store, input) = pipelined_file_engine(dir.path(), 6).await;
+        let first = store.gate("b0-14");
+
+        // The first window waits at the gate; the second and third are read,
+        // sealed, uploaded and verified behind it.
+        pass_until(&mut engine, 14, BatchState::Verified).await;
+        pass_until(&mut engine, 28, BatchState::Verified).await;
+        engine.run_source(SourceType::File, false).await.unwrap();
+        assert!(
+            committed_file_ranges(&engine).await.is_empty(),
+            "nothing may commit while the window below it is still on the wire"
+        );
+        let below = states_of_range(&engine, 0).await;
+        assert!(
+            below.len() == 1
+                && !matches!(below[0], BatchState::Verified | BatchState::SourceCommitted),
+            "the first window is still on the wire: {below:?}"
+        );
+
+        first.add_permits(1_000);
+        engine.run_source(SourceType::File, true).await.unwrap();
+        let inode = std::fs::metadata(&input).unwrap().ino();
+        assert_eq!(
+            committed_file_ranges(&engine).await,
+            vec![
+                (Some(inode), 0, 14, Some(2)),
+                (Some(inode), 14, 28, Some(2)),
+                (Some(inode), 28, 42, Some(2)),
+            ],
+            "every window commits, each once, in read order"
+        );
+    }
+
+    /// A window that fails AFTER the windows read behind it verified: they
+    /// are held, the failed range is read again, and nothing is skipped.
+    #[tokio::test]
+    async fn an_earlier_window_failing_behind_verified_ones_holds_them_and_loses_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, store, input) = pipelined_file_engine(dir.path(), 6).await;
+        let first = store.gate("b0-14");
+        store.refuse_once("b0-14");
+        pass_until(&mut engine, 14, BatchState::Verified).await;
+        pass_until(&mut engine, 28, BatchState::Verified).await;
+
+        first.add_permits(1_000);
+        for _ in 0..6 {
+            let _ = engine.run_source(SourceType::File, true).await;
+        }
+        let len = std::fs::metadata(&input).unwrap().len() as i128;
+        assert_committed_without_a_gap("earlier window failed last", &engine, len).await;
+        assert!(
+            engine.inflight.values().all(VecDeque::is_empty),
+            "every batch settled"
+        );
+    }
+
+    /// The later window fails first, and is handed back; then the earlier
+    /// one fails. The read head must land at the EARLIER start: rewinding
+    /// to the later one last would skip the range between them.
+    #[tokio::test]
+    async fn two_windows_of_one_file_failing_out_of_order_rewind_to_the_lower_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, store, input) = pipelined_file_engine(dir.path(), 6).await;
+        let first = store.gate("b0-14");
+        store.refuse_once("b0-14");
+        store.refuse_once("b14-28");
+        pass_until(&mut engine, 14, BatchState::ReplayRequired).await;
+
+        first.add_permits(1_000);
+        for _ in 0..8 {
+            let _ = engine.run_source(SourceType::File, true).await;
+        }
+        let len = std::fs::metadata(&input).unwrap().len() as i128;
+        assert_committed_without_a_gap("later window failed first", &engine, len).await;
     }
 
     /// Every committed file batch as (inode, start byte, end byte, records).
@@ -8929,7 +9545,7 @@ mod tests {
             .unwrap();
         let mock = Arc::new(vtop_upload::MockBackend::new().with_throttled_manifest_puts(1));
         engine.backend = mock.clone();
-        let first = engine.run_source(SourceType::File, false).await.unwrap();
+        let first = run_until_settled(&mut engine, SourceType::File).await;
         assert_eq!(first.len(), 1, "sealed by its age: {first:?}");
         assert_eq!(first[0].final_state, BatchState::Failed);
         let orphan = engine
@@ -8942,7 +9558,7 @@ mod tests {
             .unwrap();
         let n = std::fs::metadata(&input).unwrap().len();
         append_line(&input, "line 3");
-        let second = engine.run_source(SourceType::File, false).await.unwrap();
+        let second = run_until_settled(&mut engine, SourceType::File).await;
         assert_eq!(second.len(), 2, "{second:?}");
         assert!(second.iter().all(|o| o.committed), "{second:?}");
         assert_eq!(second[0].object_uri.as_deref(), Some(orphan.as_str()));

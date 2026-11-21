@@ -124,6 +124,21 @@ Batches should reach `source_committed`, the audit should print
 Back up the SQLite file and its `<database file>.ledger-digests/` directory:
 [Backup and recovery](../operate/backup-and-recovery.md).
 
+## A long link to the object store
+
+When the object store is far away (a bucket in another region, a satellite or cellular uplink), each batch's requests pay the round trip, and on Linux an idle connection restarts TCP slow start. The engine keeps a pooled connection to the store, and an idle gap between batches longer than the retransmission timeout sends the next upload back to the initial congestion window: on a 200 ms link a 1.4 MiB object then takes several round trips to ramp up again.
+
+On the engine's host, or in its container's network namespace, turn that restart off:
+
+```bash
+sysctl -w net.ipv4.tcp_slow_start_after_idle=0
+# persistently: echo 'net.ipv4.tcp_slow_start_after_idle = 0' > /etc/sysctl.d/90-vtop.conf
+```
+
+In a container, `docker run --sysctl net.ipv4.tcp_slow_start_after_idle=0`; in Kubernetes, the pod's `securityContext.sysctls` (the kubelet must allow it, as it is not a safe sysctl by default).
+
+**What it was measured to do.** v0.10.3 drained a 1 GiB Kafka backlog to MinIO across an emulated 200 ms round trip with no bandwidth cap: 16 MiB batches, zstd level 3 objects of about 1.3–1.5 MiB, SHA-256, eight batches wide. Turning the restart off raised throughput by 27% with one partition (7.8 to 9.9 MiB/s, medians of 4 and 3 runs) and by 32% with four (8.8 to 11.6 MiB/s), and cut the object upload from about 680–900 ms to 240–290 ms. With batches in flight across cycles ([§5.2 of the architecture](../ARCHITECTURE.md#52-batches-in-flight-across-cycles)), the connections rarely idle, and the same setting changed throughput by about 3%, within run-to-run noise. The rig, the data and every run are in `benchmarks/long_link/`. It is an emulated link on one shared host, so the numbers compare configurations; they are not what a given real link will do.
+
 ## Upgrade notes
 
 Stop the engine with SIGTERM, back up the ledger, replace the binary, start
