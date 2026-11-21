@@ -119,6 +119,15 @@ What is tested today:
   a restart ([`scripts/upgrade-compat.sh`](../../scripts/upgrade-compat.sh)).
 - The metadata tier rolls from the newest release to the current build, one
   voter at a time (live-chaos scenario 22).
+- A metadata voter's directory (the Raft log, the snapshot, the applied,
+  purged and hard-state files), written by the published `vtop-node` of
+  v0.8.0, v0.9.0 and v0.10.1 at the highest feature level each accepts, must
+  open under the current build: the same applied index, voter set, feature
+  level and record generations the release reported, a read-only open that
+  rewrites nothing, and a new write that survives a reopen
+  (`released_meta_dirs` in `vtop-meta`; the fixtures carry a `PROVENANCE`).
+  [`scripts/compat/cells/meta.sh`](../../scripts/compat/cells/meta.sh) runs
+  the same live, in both directions, against a released binary.
 - The released `vtopctl` of v0.7.0 and later is run over a manifest archive
   the current build wrote: v0.8.0 and later must verify it, and v0.7.0 must
   report the documented self-hash failure
@@ -158,7 +167,7 @@ What an older binary does with newer data, by case:
 | A Kafka progress marker with a `topic_id` | Ignores the key. It resumes a partition from the newest committed row, as it always did, and its pruning keeps that row. | Supported: an optional field in an unhashed document, read as unknown when absent. | No |
 | A ledger row in a state, or of a source type, N-1 does not know | Fails closed. | One-way: needs a marker or version bump, so the refusal comes at startup and not mid-run. | No |
 | A `0.4` manifest | v0.8.0 and later verify it; v0.7.0 and earlier report it as tampered. | The documented cutoff. Archives are never rewritten; set `write_version: "0.3"` to stop writing more. | Yes: v0.7.0, and v0.8.0 and later (the `manifest` cell of the Compat workflow) |
-| A metadata log entry or snapshot record from a raised feature level | The voter refuses to start, saying *newer format*, and changes nothing. Today that holds for a new command kind, log entry kind, value tag or key category; other enum values inside records are reported as corrupt until [#763](https://github.com/allamiro/vtop-engine/pull/763). | One-way at the raise, which is operator-gated and permanent. The notes say which level first puts a new kind in the log. | No |
+| A metadata log entry or snapshot record from a raised feature level | The voter refuses to start, saying *newer format*, and changes nothing. Today that holds for a new command kind, log entry kind, value tag or key category; other enum values inside records are reported as corrupt until [#763](https://github.com/allamiro/vtop-engine/pull/763). A raise whose level a release does not support is not such a record: the command is one it decodes, and it applies it as a rejection. | One-way at the raise, which is operator-gated and permanent. The notes say which level first puts a new kind in the log. | Partly. Level 8 is the highest raise today and adds no kind: v0.10.1 reads it, and v0.8.0 and v0.9.0 (level 7) open the directory and take writes: they report level 3 while the raise is still in the log (they apply it as a rejection) and level 8 once it is inside a snapshot (they install the snapshot as it is), so the downgrade is silent, not refused. No release writes a kind an older one cannot decode yet, so the refusal has no live case (`meta.sh` takes `refuse` for the release that adds one) |
 | A segment v2 directory | Every release since v0.5.0 reads v2. | Supported. A later segment version follows [reader first](#reader-first). | No |
 
 ## Deprecation
