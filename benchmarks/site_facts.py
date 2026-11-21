@@ -235,6 +235,18 @@ def _tiles(fo, egress, conditions, policed, tp, ratios) -> list[dict[str, Any]]:
     kill = {system: fo["cells"][("kill9_leader", system)].median for system in ("kafka", "vtop")}
     sooner = "Kafka" if kill["kafka"] < kill["vtop"] else "VTOP"
     safe = vtop["lost"] == 0 and vtop["duplicates"] == 0 and vtop["read_back"] == vtop["repetitions"]
+    # A failover whose read-back did not finish (verify FAILED, or a failed or refused row) has no lost or
+    # duplicated count: the tile must not read "0 lost" over it.
+    unverified = vtop["repetitions"] - vtop["read_back"]
+    counted = f"{vtop['lost']} lost, {vtop['duplicates']} duplicated"
+    if unverified:
+        value = f"{unverified} of {vtop['repetitions']} not verified"
+        detail = (f"The read-back did not finish in {unverified} of {vtop['repetitions']} leader failovers, so "
+                  f"their lost and duplicated records are not known; the other {vtop['read_back']}: {counted}. ")
+    else:
+        value = counted
+        detail = f"{vtop['repetitions']} leader failovers, {vtop['acked']:,} records read back, through " \
+                 f"{CLIENT_PATHS[vtop['client_path']]}. "
     lossy = egress["default"]["wan100-loss1"]
     single = egress["grid"][("wan100-loss1", 1)][0]
     before, after = policed[("policed", "before")], policed[("policed", "after")]
@@ -242,9 +254,8 @@ def _tiles(fo, egress, conditions, policed, tp, ratios) -> list[dict[str, Any]]:
     failover_csv = f"{readme_charts.FAILOVER_RUN}/failover.csv"
     return [
         {"id": "failover", "label": "Acknowledged records lost or duplicated, VTOP",
-         "value": f"{vtop['lost']} lost, {vtop['duplicates']} duplicated",
-         "detail": f"{vtop['repetitions']} leader failovers, {vtop['acked']:,} records read back, through "
-                   f"{CLIENT_PATHS[vtop['client_path']]}. {sooner} resumed sooner after a "
+         "value": value,
+         "detail": f"{detail}{sooner} resumed sooner after a "
                    f"{FAULT_LABELS['kill9_leader']}: {_seconds(kill['kafka'])} for Kafka, "
                    f"{_seconds(kill['vtop'])} for VTOP.",
          "condition": f"{fo['per_cell']} repetitions per fault, {len(readme_charts.FAULT_ORDER)} faults, one host",
@@ -330,7 +341,8 @@ def _throughput(tp, ratios) -> dict[str, Any]:
 
 
 def _results(fo, egress, policed, ratios, tp) -> list[dict[str, Any]]:
-    clean = fo["lost"] == 0 and fo["duplicates"] == 0
+    unverified = fo["repetitions"] - fo["read_back"]
+    clean = fo["lost"] == 0 and fo["duplicates"] == 0 and not unverified
     kill = {system: fo["cells"][("kill9_leader", system)].median for system in ("kafka", "vtop")}
     sooner = "Kafka" if kill["kafka"] < kill["vtop"] else "VTOP"
     grid = egress["grid"][("wan100-loss1", 1)]
@@ -340,9 +352,12 @@ def _results(fo, egress, policed, ratios, tp) -> list[dict[str, Any]]:
     return [
         {"id": "failover",
          "finding": ("No acknowledged record was lost or duplicated by either system in the run. " if clean else
+                     f"The read-back did not finish in {unverified} of {fo['repetitions']} failovers, so what "
+                     "they lost or duplicated is not known. " if unverified else
                      "Acknowledged records were lost or duplicated in the run. ")
          + f"{sooner} resumed sooner after a {FAULT_LABELS['kill9_leader']}.",
-         "figure": f"{fo['lost']} lost, {fo['duplicates']} duplicated, {fo['repetitions']} failovers",
+         "figure": f"{fo['lost']} lost, {fo['duplicates']} duplicated, {fo['repetitions']} failovers"
+                   + (f", {unverified} not verified" if unverified else ""),
          "condition": f"{fo['per_cell']} repetitions per fault and system, one host",
          "data": f"{readme_charts.FAILOVER_RUN}/failover.csv", "method": "docs/benchmarks/kafka-failover.md"},
         {"id": "link-share",

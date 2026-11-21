@@ -68,6 +68,33 @@ def test_a_kafka_loss_does_not_reach_the_vtop_tile(data_tree):
     assert "was lost or duplicated by either system" not in facts["results"][0]["finding"]
 
 
+def test_a_failover_whose_read_back_failed_is_not_counted_as_zero_lost(data_tree):
+    # verify FAILED leaves acked_lost and duplicates empty (failover_schema): the tile and the finding must
+    # say the counts are unknown, not "0 lost, 0 duplicated".
+    csv_path = f"{readme_charts.FAILOVER_RUN}/failover.csv"
+
+    def one_vtop_read_back_failed(text):
+        rows = list(csv.DictReader(io.StringIO(text)))
+        row = next(row for row in rows if row["system"] == "vtop")
+        row.update(verify="FAILED: record 7 differs from what was acknowledged", acked_lost="", duplicates="")
+        out = io.StringIO()
+        writer = csv.DictWriter(out, fieldnames=list(rows[0]), lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+        return out.getvalue()
+
+    facts = site_facts.site_facts(data_tree({csv_path: one_vtop_read_back_failed}))
+    reps = readme_charts.failover()["per_system"]["vtop"]["repetitions"]
+    failover = tile(facts, "failover")
+    assert failover["value"] == f"1 of {reps} not verified"
+    assert failover["tone"] == "neutral"
+    assert "not known" in failover["detail"]
+    assert f"1 of {reps} not verified" in facts["alts"]["card-hero"]
+    assert "was lost or duplicated by either system" not in facts["results"][0]["finding"]
+    assert "did not finish in 1 of" in facts["results"][0]["finding"]
+    assert facts["results"][0]["figure"].endswith(", 1 not verified")
+
+
 def test_a_changed_count_changes_the_tile_the_alt_text_and_the_json(data_tree):
     before = site_facts.site_facts()
     after = site_facts.site_facts(data_tree({readme_charts.POLICED: one_policed_object_failed}))
