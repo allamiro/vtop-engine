@@ -193,8 +193,9 @@ pub fn record_value(sequence: u64, value_bytes: usize) -> Vec<u8> {
 /// killed mid-run leaves every event it got to.
 ///
 /// Produce: an `invoke` before a batch goes out, then exactly one of `ok`
-/// (acknowledged, with the committed next offset after it, so the batch's
-/// records sit at `[committed_next_offset - count, committed_next_offset)`),
+/// (acknowledged, with the committed next offset after it and the offsets the
+/// broker answered with: `first_offset`, plus `offsets` when they are not
+/// consecutive),
 /// `fail` (refused before anything was appended, see [`refusal_is_definite`]:
 /// the records must never be visible) or `info` (no answer, or one that does
 /// not settle it: indeterminate, the records may or may not be visible).
@@ -334,6 +335,7 @@ enum ProduceBatchError {
     /// committed (recorded as such), and the run fails.
     AckedOutOfPlace {
         committed_next_offset: u64,
+        offsets: Vec<u64>,
         message: String,
     },
     /// The broker answered with an error. Whether the records can still
@@ -479,10 +481,12 @@ pub async fn produce(config: &ClientConfig, args: ProduceArgs) -> Result<i32, St
                 })?;
             match reply.message {
                 Message::ProduceResponse(response) => {
+                    let offsets: Vec<u64> = response.outcomes.iter().map(|o| o.offset).collect();
                     if let Some(expected) = expected_offset {
                         if response.committed_next_offset != expected {
                             return Err(ProduceBatchError::AckedOutOfPlace {
                                 committed_next_offset: response.committed_next_offset,
+                                offsets,
                                 message: format!(
                                     "committed_next_offset {} after acking {count} records; \
                                      expected {expected}",
@@ -491,7 +495,7 @@ pub async fn produce(config: &ClientConfig, args: ProduceArgs) -> Result<i32, St
                             });
                         }
                     }
-                    Ok(response.committed_next_offset)
+                    Ok((response.committed_next_offset, offsets))
                 }
                 Message::Error(ErrorResponse { code, message, .. }) => {
                     Err(ProduceBatchError::Refused { code, message })
@@ -501,7 +505,7 @@ pub async fn produce(config: &ClientConfig, args: ProduceArgs) -> Result<i32, St
                 ))),
             }
         };
-        let outcome: Result<u64, ProduceBatchError> = if args.request_timeout_ms == 0 {
+        let outcome: Result<(u64, Vec<u64>), ProduceBatchError> = if args.request_timeout_ms == 0 {
             exchange.await
         } else {
             let limit = std::time::Duration::from_millis(args.request_timeout_ms);
@@ -514,12 +518,18 @@ pub async fn produce(config: &ClientConfig, args: ProduceArgs) -> Result<i32, St
             }
         };
         if let Some(history) = history.as_mut() {
-            let (mut kind, offset, error) = match &outcome {
-                Ok(next) => ("ok", Some(*next), None),
+            let (mut kind, offset, offsets, error) = match &outcome {
+                Ok((next, offsets)) => ("ok", Some(*next), Some(offsets.as_slice()), None),
                 Err(ProduceBatchError::AckedOutOfPlace {
                     committed_next_offset,
+                    offsets,
                     message,
-                }) => ("ok", Some(*committed_next_offset), Some(message.clone())),
+                }) => (
+                    "ok",
+                    Some(*committed_next_offset),
+                    Some(offsets.as_slice()),
+                    Some(message.clone()),
+                ),
                 Err(ProduceBatchError::Refused { code, message }) => (
                     if refusal_is_definite(*code) {
                         "fail"
@@ -527,12 +537,15 @@ pub async fn produce(config: &ClientConfig, args: ProduceArgs) -> Result<i32, St
                         "info"
                     },
                     None,
+                    None,
                     Some(format!("{code:?} {message}")),
                 ),
                 // A reply this client did not expect: what the broker did
                 // with the batch is unknown.
-                Err(ProduceBatchError::Failed(error)) => ("info", None, Some(error.clone())),
-                Err(ProduceBatchError::Interrupted(error)) => ("info", None, Some(error.clone())),
+                Err(ProduceBatchError::Failed(error)) => ("info", None, None, Some(error.clone())),
+                Err(ProduceBatchError::Interrupted(error)) => {
+                    ("info", None, None, Some(error.clone()))
+                }
             };
             if args.fenced_probe && kind == "info" {
                 kind = "fail";
@@ -547,13 +560,25 @@ pub async fn produce(config: &ClientConfig, args: ProduceArgs) -> Result<i32, St
             if let Some(offset) = offset {
                 event.insert("committed_next_offset".into(), offset.into());
             }
+            // Where the broker placed each record. A resent batch it already
+            // holds is answered with its ORIGINAL offsets under the range's
+            // current watermark, so the watermark alone would misplace it
+            // (review of #878).
+            if let Some(offsets) = offsets.filter(|o| o.len() as u64 == count) {
+                if let Some(&first_offset) = offsets.first() {
+                    event.insert("first_offset".into(), first_offset.into());
+                }
+                if !offsets_are_consecutive(offsets) {
+                    event.insert("offsets".into(), offsets.to_vec().into());
+                }
+            }
             if let Some(error) = error {
                 event.insert("error".into(), error.into());
             }
             history.event(event)?;
         }
         match outcome {
-            Ok(committed_next_offset) => {
+            Ok((committed_next_offset, _)) => {
                 let latency = sent_at.elapsed();
                 // Stamped on the answer, before the floor's fsync below: the
                 // ack log is the benchmark's acknowledgement time, and local
@@ -646,6 +671,11 @@ struct ReadRun {
     count: u64,
     /// Every value in the run is the producer's value for its key's sequence.
     values_match: bool,
+}
+
+/// Whether `offsets` run one after another, so the first names them all.
+fn offsets_are_consecutive(offsets: &[u64]) -> bool {
+    offsets.windows(2).all(|pair| pair[1] == pair[0] + 1)
 }
 
 /// The producer sequence a record's key carries, when it is one.
@@ -1067,6 +1097,15 @@ mod history_tests {
 
     /// The read dump's runs are keyed by the producer's sequence, which
     /// `produce` writes as the key: eight big-endian bytes, nothing else.
+    #[test]
+    fn a_batch_is_named_by_its_first_offset_only_when_its_offsets_are_consecutive() {
+        assert!(offsets_are_consecutive(&[4, 5, 6]));
+        assert!(offsets_are_consecutive(&[9]));
+        assert!(offsets_are_consecutive(&[]));
+        assert!(!offsets_are_consecutive(&[4, 6, 7]));
+        assert!(!offsets_are_consecutive(&[5, 4]));
+    }
+
     #[test]
     fn a_key_is_a_producer_sequence_only_at_eight_bytes() {
         assert_eq!(key_sequence(&42u64.to_be_bytes()), Some(42));

@@ -6,7 +6,11 @@ A scenario records what its clients did and saw, as JSON lines that
 
   produce  invoke  before a batch goes out: its producer sequences
                    [first_sequence, first_sequence + count)
-           ok      acknowledged: the batch's records sit at
+           ok      acknowledged: the batch's records sit at the offsets the
+                   broker answered with (`first_offset`, or `offsets` when
+                   they are not consecutive: a resent batch is answered with
+                   its original offsets under a later watermark); a history
+                   without them places the records at
                    [committed_next_offset - count, committed_next_offset)
            fail    refused by the broker before anything was appended (a
                    wrong range, a sequence conflict), or any refusal from a
@@ -51,6 +55,10 @@ is unproven, and counted lost. The invariants:
   rewritten     a record an earlier read saw is the same record in every
                 later read that covers its offset (from the later read's
                 start offset to its high watermark)
+  missed        a read holds every record a later read holds inside the
+                earlier read's window (its start offset to its high
+                watermark): a committed record is visible to every read that
+                covers it
   hwm           the committed high watermark never goes backwards across reads
   unkeyed       no visible record lacks a producer key (with --allow-unkeyed,
                 such records are reported and not counted as violations)
@@ -81,8 +89,17 @@ class Batch:
     count: int
     outcome: str = "info"  # ok | fail | info
     committed_next_offset: int | None = None
+    # The offsets the broker answered with, one per record, when the history
+    # records them.
+    offsets: list[int] | None = None
     fencing_epoch: int | None = None
     time_us: int = 0
+
+    def offset_of(self, index: int) -> int:
+        """Where record `index` of an acknowledged batch sits."""
+        if self.offsets is not None:
+            return self.offsets[index]
+        return self.committed_next_offset - self.count + index
 
     def name(self) -> str:
         return (
@@ -159,7 +176,16 @@ def load(lines: list[str]) -> tuple[list[Batch], list[Read]]:
                     raise ValueError(f"line {number}: {kind} for a batch never invoked: {key}")
                 batches[key].outcome = kind
                 if kind == "ok":
-                    batches[key].committed_next_offset = event["committed_next_offset"]
+                    batch = batches[key]
+                    batch.committed_next_offset = event["committed_next_offset"]
+                    if "offsets" in event:
+                        batch.offsets = [int(o) for o in event["offsets"]]
+                    elif "first_offset" in event:
+                        batch.offsets = [event["first_offset"] + i for i in range(batch.count)]
+                    if batch.offsets is not None and len(batch.offsets) != batch.count:
+                        raise ValueError(
+                            f"line {number}: {len(batch.offsets)} offsets for a {batch.count}-record batch"
+                        )
             else:
                 raise ValueError(f"line {number}: unknown produce event {kind!r}")
         elif op == "read":
@@ -200,21 +226,30 @@ def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) 
                 f"the committed high watermark went back from {before.high_watermark} "
                 f"({before.process}) to {after.high_watermark} ({after.process})"
             )
+    # Offsets a read covered and did not see: a later read that holds a
+    # record there shows the earlier one missed a committed record. Promotion
+    # markers are holes in every read, and never filled.
+    holes: dict[int, Read] = {}
     records: dict[int, tuple[int | None, bool]] = {}
     for read in reads:
         records = read.records()
-        if latest:
-            for offset in range(read.start_offset, read.high_watermark):
-                seen = latest.get(offset)
-                if seen is None:
-                    continue
-                now = records.get(offset)
-                if now != seen[0]:
-                    violations["rewritten"].append(
-                        f"offset {offset} held {seen[0]} in {seen[1].process} and holds {now} "
-                        f"in {read.process}"
-                    )
+        for offset in range(read.start_offset, read.high_watermark):
+            now = records.get(offset)
+            if now is None:
+                holes.setdefault(offset, read)
+            seen = latest.get(offset)
+            if seen is not None and now != seen[0]:
+                violations["rewritten"].append(
+                    f"offset {offset} held {seen[0]} in {seen[1].process} and holds {now} "
+                    f"in {read.process}"
+                )
         for offset, record in records.items():
+            hole = holes.pop(offset, None)
+            if hole is not None:
+                violations["missed"].append(
+                    f"offset {offset} holds {record} in {read.process} but {hole.process} did not "
+                    f"see it below its high watermark {hole.high_watermark}"
+                )
             latest[offset] = (record, read)
     # What the history shows at each offset: the last read, and below its start
     # offset whatever the newest earlier read saw there.
@@ -233,10 +268,9 @@ def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) 
     placed: dict[tuple[str, int], tuple[int, Batch]] = {}
     acked = [b for b in batches if b.outcome == "ok"]
     for batch in acked:
-        start = batch.committed_next_offset - batch.count
         identity = batch.identity()
         for i in range(batch.count):
-            offset, sequence = start + i, batch.first_sequence + i
+            offset, sequence = batch.offset_of(i), batch.first_sequence + i
             record = (identity, sequence)
             other = claimed.get(offset)
             if other is not None and other[1] != record:
@@ -280,12 +314,11 @@ def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) 
     for process, mine in by_process.items():
         mine.sort(key=lambda b: b.batch)
         for before, after in zip(mine, mine[1:]):
-            if after.committed_next_offset - after.count < before.committed_next_offset:
+            if after.offset_of(0) <= before.offset_of(before.count - 1):
                 violations["order"].append(
                     f"{after.name()} was acknowledged at offsets "
-                    f"{after.committed_next_offset - after.count}.."
-                    f"{after.committed_next_offset - 1}, not above {before.name()} at .."
-                    f"{before.committed_next_offset - 1}"
+                    f"{after.offset_of(0)}..{after.offset_of(after.count - 1)}, not above "
+                    f"{before.name()} at ..{before.offset_of(before.count - 1)}"
                 )
 
     # Everything visible and unclaimed must be a whole indeterminate batch.
@@ -311,8 +344,27 @@ def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) 
     surfaced: set[tuple[str, int]] = set()
     for batch in acked:
         surfaced |= batch.logical()
+    keyed = [g for g in groups if visible[g[0]][0] is not None]
+    # First, one assignment of whole unanswered batches to every keyed group
+    # at once: committing to the first tiling of one group can leave a later
+    # group none, where another tiling of the first would have served both
+    # (review of #878). When there is none, each group is explained on its
+    # own below, which is what names the groups that cannot be.
+    tasks = [
+        ([visible[o][0] for o in g], all(visible[o][1] for o in g)) for g in keyed
+    ]
+    if _explain_all(tasks, indeterminate, used, surfaced):
+        keyed_explained = True
+    else:
+        keyed_explained = False
+        used.clear()
+        surfaced.clear()
+        for batch in acked:
+            surfaced |= batch.logical()
     for group in groups:
         sequences = [visible[o][0] for o in group]
+        if sequences[0] is not None and keyed_explained:
+            continue
         if sequences[0] is None:
             message = f"offsets {group[0]}..{group[-1]} hold records with no producer key"
             if allow_unkeyed:
@@ -321,8 +373,7 @@ def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) 
                 violations["unkeyed"].append(message)
             continue
         all_values_match = all(visible[o][1] for o in group)
-        explained = _explain(sequences, all_values_match, indeterminate, used, surfaced)
-        if explained is not None:
+        if _explain(sequences, all_values_match, indeterminate, used, surfaced):
             continue
         matching_refused = [b.name() for b in refused if _covers(b, sequences)]
         already_visible = [
@@ -354,34 +405,36 @@ def _covers(batch: Batch, sequences: list[int]) -> bool:
     return batch.first_sequence <= sequences[0] and sequences[-1] < batch.first_sequence + batch.count
 
 
-def _explain(
+def _tilings(
     sequences: list[int],
     values_match: bool,
     indeterminate: list[Batch],
     used: set[tuple[str, int]],
     surfaced: set[tuple[str, int]],
-) -> list[Batch] | None:
-    """Indeterminate batches that tile `sequences` whole, in order, each used
-    once and none repeating a logical record already visible; `None` when no
-    tiling exists. A batch is appended whole or not at all. The search
-    backtracks: the first batch that fits a position can lead to a dead end
-    another would not (an unanswered 0..4 and an unanswered 0..9 under a
-    visible 0..9). Batches of one producer with the same sequences are
-    interchangeable, so each position tries one of each shape, the earliest."""
+    budget: list[int],
+):
+    """Each way indeterminate batches tile `sequences` whole, in order, each
+    used once and none repeating a logical record already visible. Yields with
+    the tiling applied to `used` and `surfaced` (a batch is appended whole or
+    not at all) and takes it back when resumed, so a caller that stops at a
+    tiling keeps it. The search backtracks: the first batch that fits a
+    position can lead to a dead end another would not (an unanswered 0..4 and
+    an unanswered 0..9 under a visible 0..9). Batches of one producer with the
+    same sequences are interchangeable, so each position tries one of each
+    shape, the earliest. `budget` bounds the steps across every search."""
     if not values_match:
-        return None
+        return
     by_start: dict[int, list[Batch]] = defaultdict(list)
     for batch in sorted(indeterminate, key=lambda b: (b.time_us, b.process, b.batch)):
         by_start[batch.first_sequence].append(batch)
-    chosen: list[Batch] = []
-    budget = [SEARCH_BUDGET]
 
-    def search(position: int) -> bool:
+    def search(position: int):
         if position == len(sequences):
-            return True
+            yield
+            return
         budget[0] -= 1
         if budget[0] < 0:
-            return False
+            return
         shapes: set[tuple[str, int]] = set()
         for batch in by_start.get(sequences[position], []):
             shape = (batch.identity(), batch.count)
@@ -398,15 +451,46 @@ def _explain(
             shapes.add(shape)
             used.add((batch.process, batch.batch))
             surfaced.update(logical)
-            chosen.append(batch)
-            if search(position + batch.count):
-                return True
-            chosen.pop()
+            yield from search(position + batch.count)
             surfaced.difference_update(logical)
             used.discard((batch.process, batch.batch))
+
+    yield from search(0)
+
+
+def _explain(
+    sequences: list[int],
+    values_match: bool,
+    indeterminate: list[Batch],
+    used: set[tuple[str, int]],
+    surfaced: set[tuple[str, int]],
+) -> bool:
+    """Whether one group has a tiling; the first found is kept applied."""
+    tilings = _tilings(sequences, values_match, indeterminate, used, surfaced, [SEARCH_BUDGET])
+    return next(tilings, False) is None
+
+
+def _explain_all(
+    tasks: list[tuple[list[int], bool]],
+    indeterminate: list[Batch],
+    used: set[tuple[str, int]],
+    surfaced: set[tuple[str, int]],
+) -> bool:
+    """Whether every group has a tiling at once, backtracking across groups;
+    the assignment found is kept applied, and nothing is when there is none."""
+    budget = [SEARCH_BUDGET]
+
+    def assign(index: int) -> bool:
+        if index == len(tasks):
+            return True
+        sequences, values_match = tasks[index]
+        for _ in _tilings(sequences, values_match, indeterminate, used, surfaced, budget):
+            if assign(index + 1):
+                return True
         return False
 
-    return list(chosen) if search(0) else None
+    return assign(0)
+
 
 def summarize(batches, reads, violations, notes) -> dict:
     counts = defaultdict(int)
