@@ -91,16 +91,14 @@ Method and every condition: [EGRESS_TRANSPORT_RESEARCH.md](docs/EGRESS_TRANSPORT
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/policed-uplink-dark.svg">
-  <img alt="Bar chart of objects committed at the shipped upload defaults. On a 10 Mbit/s policed uplink, 0 of 32 before the fix and 96 of 96 after. On clean and lossy 100 ms links, every object committed before and after." src="docs/assets/readme/policed-uplink-light.svg">
+  <img alt="Bar chart of objects committed at the shipped upload defaults. On a 10 Mbit/s policed uplink, 0 of 32 with a fixed request deadline and 96 of 96 with one that grows with the body. On clean and lossy 100 ms links, every object committed both ways." src="docs/assets/readme/policed-uplink-light.svg">
 </picture>
 
 On a 10 Mbit/s policed uplink, which drops what exceeds its rate instead of
-queueing it, the shipped defaults committed
-**0 of 32** objects. Every part upload hit a fixed 300 s deadline and was sent
-again from its first byte, so every object ended `failed` and no source
-position moved. Since [#666](https://github.com/allamiro/vtop-engine/pull/666),
-a request's deadline grows with the size of its body, and the same link
-committed **96 of 96**.
+queueing it, a fixed 300 s request deadline committed **0 of 32** objects:
+every part upload hit the deadline and was sent again from its first byte, so
+no source position moved. With a deadline that grows with the size of the
+request body, as shipped since v0.8.0, the same link committed **96 of 96**.
 Data: [`663-policed-uplink/runs.csv`](benchmarks/measurements/663-policed-uplink/runs.csv).
 
 ### Leader failover, against Apache Kafka
@@ -255,7 +253,7 @@ Kafka is an optional edge adapter; see
 The limits that matter most when evaluating it:
 
 - **A replay reuses the stored object only when it produces the same bytes.**
-  Objects are named by source, range and content digest (#626), so a replay of
+  Objects are named by source, range and content digest, so a replay of
   the same bytes reuses what is stored and never overwrites anything, and a
   replay is rebuilt as first cut. A replay that cannot be rebuilt as cut (the
   source rewrote or dropped the range), a replay of a row from before v0.10.0 in a later hour under
