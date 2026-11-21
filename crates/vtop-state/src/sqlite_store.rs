@@ -85,17 +85,23 @@ const fn newest_version(steps: &[OneWayStep]) -> i64 {
 /// misread - the version is raised for nothing else - and this release
 /// refuses the file rather than run on it. Releases before #664 never read
 /// the version; this is the refusal path for the releases from here on.
-/// `migrate` computes it from the steps it is given, so the tests can drive
-/// the gate with a step of their own; this is the production value.
-#[cfg(test)]
-const SQLITE_SCHEMA_VERSION: i64 = newest_version(ONE_WAY_STEPS);
+/// A literal, so a bump edits it and the format registry
+/// (`scripts/compat/formats.yaml`) together; the build fails unless it is the
+/// newest version [`ONE_WAY_STEPS`] reach. `migrate` computes the newest from
+/// the steps it is given, so the tests can drive the gate with a step of
+/// their own.
+const SQLITE_SCHEMA_VERSION: i64 = 1;
+const _: () = assert!(
+    SQLITE_SCHEMA_VERSION == newest_version(ONE_WAY_STEPS),
+    "SQLITE_SCHEMA_VERSION must be the newest version ONE_WAY_STEPS reach"
+);
 
 /// Whether a migration may take the one-way steps ([`OneWayStep`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Opening {
     /// An ordinary open: only what [`SQLITE_OPEN_VERSION`] covers.
     Open,
-    /// `vtopctl migrate`: every step in [`ONE_WAY_STEPS`].
+    /// `vtopctl migrate`: every step up to [`SQLITE_SCHEMA_VERSION`].
     Migrate,
 }
 
