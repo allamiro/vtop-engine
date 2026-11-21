@@ -699,6 +699,20 @@ fn object_key_decisions_are_exported_by_bounded_decision() {
         let label = format!(r#"decision="{d}""#);
         assert!(text.contains(&label), "missing {label}");
     }
+    // #773: a command backend adopting the earlier attempt's object, or
+    // finding it unusable, has a value of its own in the pinned set.
+    for d in ["adopted", "adopt_rejected"] {
+        assert!(
+            vtop_core::telemetry::OBJECT_KEY_DECISIONS.contains(&d),
+            "{d} is a pinned decision"
+        );
+        let label = format!(r#"decision="{d}""#);
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("vtop_object_key_decisions_total{") && l.contains(&label)),
+            "missing a vtop_object_key_decisions_total series with {label}"
+        );
+    }
 }
 
 /// #626: what each replay of a recorded window came to is exported by

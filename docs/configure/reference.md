@@ -46,7 +46,7 @@ Default column means the key is unset unless you set it.
 | `work_retention_seconds` | `86400` | Staging files left by a crash and older than this are removed. Successful batches remove theirs at once. |
 | `work_max_bytes` | `10737418240` (10 GiB) | Ceiling on VTOP staging files in `work_dir`. Startup removes the oldest until the directory is under it. |
 | `log_level` | `INFO` | Log level. `--log-level` overrides it, and `RUST_LOG` overrides both. |
-| `ledger_retention_days` | - (no pruning) | Prune `SOURCE_COMMITTED` rows older than this many days, on idle cycles. The newest committed row per source path is always kept. Refused on PostgreSQL; schedule `vtopctl prune-ledger` there instead. |
+| `ledger_retention_days` | - (no pruning) | Prune `SOURCE_COMMITTED` rows older than this many days, on idle cycles. The newest committed row per source path is always kept, and for Kafka the committed row with the highest end offset per topic, partition, consumer group and topic id (the newest row for rows recorded without a topic id). Refused on PostgreSQL; schedule `vtopctl prune-ledger` there instead. |
 | `ledger_prune_batch` | `500` | Most rows deleted per prune pass. Must be at least 1. |
 | `state_store_timeout_seconds` | `30` | Limit for one state-store request. Whole-ledger scans (startup recovery, pruning) get ten times it. Must be > 0. |
 | `ledger_digest_dir` | - | Where prune digests are written and read. Unset: `<database file>.ledger-digests` beside a SQLite file, otherwise `<work_dir>/ledger-digests`, which is scratch; name a durable directory for PostgreSQL. |
