@@ -138,6 +138,56 @@ pub fn transfer(
     let _ = vtop_observe::audit::record(&event);
 }
 
+/// The record of a native produce/fetch session this node refused at its
+/// hello: who the certificate says the client is (`presented`, the
+/// certificate's Common Name, `None` when there was no readable one), the
+/// principal and role it asked for, and why it was refused.
+pub fn native_session_refusal(
+    node: Uuid,
+    presented: Option<&str>,
+    declared_principal: Uuid,
+    served_principal: Uuid,
+    role: &str,
+    reason: &str,
+) -> AuditEvent {
+    let actor = match presented {
+        Some(cn) => Actor::certificate(ActorKind::Certificate, cn),
+        None => Actor::anonymous(),
+    };
+    AuditEvent::new(
+        Action::NativeSession,
+        Stage::Edge,
+        actor,
+        Target::new("principal", Some(declared_principal.to_string())),
+        Outcome::Refused,
+    )
+    .param("role", role)
+    .param("served_principal", served_principal)
+    .reason(reason)
+    .engine(node)
+}
+
+/// Write [`native_session_refusal`]. Never sampled or rate-limited: a
+/// refused session is the evidence of an attempt, and the log line is the
+/// operator's message.
+pub fn native_session_refused(
+    node: Uuid,
+    presented: Option<&str>,
+    declared_principal: Uuid,
+    served_principal: Uuid,
+    role: &str,
+    reason: &str,
+) {
+    let _ = vtop_observe::audit::record(&native_session_refusal(
+        node,
+        presented,
+        declared_principal,
+        served_principal,
+        role,
+        reason,
+    ));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
