@@ -394,11 +394,15 @@ pub async fn produce(config: &ClientConfig, args: ProduceArgs) -> Result<i32, St
     let mut history = match args.history.as_ref() {
         Some(path) => Some(History::open(
             path,
+            // The start time with the pid: a pid can come round again under
+            // the same producer id and epoch, and each invocation numbers its
+            // batches from 1 (review of #878).
             &format!(
-                "produce:{}:{}:{}",
+                "produce:{}:{}:{}:{}",
                 config.producer_id,
                 config.producer_epoch,
-                std::process::id()
+                std::process::id(),
+                unix_micros()?
             ),
         )?),
         None => None,

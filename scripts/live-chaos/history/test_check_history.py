@@ -173,6 +173,34 @@ class CleanHistories(unittest.TestCase):
         h.read("r", [(0, 0, 10)], 10)
         self.assertTrue(h.check()["valid"], h.check())
 
+    def test_a_thousand_unanswered_batches_in_one_run_get_a_verdict(self):
+        # Review of #878: the search keeps its own stack, so a run explained by
+        # a thousand one-record batches is not a RecursionError.
+        h = History()
+        for i in range(1000):
+            h.produce(f"produce:P:{i + 1}:{i}", 1, 0, 1, "info")
+        h.read("r", [(i, 0, 1) for i in range(1000)], 1000)
+        self.assertTrue(h.check()["valid"])
+        # And one run of a thousand sequences, a batch each.
+        h = History()
+        for i in range(1000):
+            h.produce("a", i + 1, i, 1, "info")
+        h.read("r", [(0, 0, 1000)], 1000)
+        self.assertTrue(h.check()["valid"])
+
+    def test_a_search_out_of_steps_leaves_nothing_applied(self):
+        saved = ch.SEARCH_BUDGET
+        ch.SEARCH_BUDGET = 3
+        try:
+            h = History()
+            for i in range(10):
+                h.produce("a", i + 1, i, 1, "info")
+            h.read("r", [(0, 0, 10)], 10)
+            result = h.check()
+        finally:
+            ch.SEARCH_BUDGET = saved
+        self.assertEqual(kinds(result), {"phantom"})
+
 class Violations(unittest.TestCase):
     def test_611_an_acknowledged_suffix_truncated_at_failover_is_lost(self):
         h = History()
@@ -303,6 +331,18 @@ class Violations(unittest.TestCase):
         result = h.check()
         self.assertEqual(result["reads"], 2)
         self.assertIn("rewritten", kinds(result))
+
+    def test_a_producer_name_that_comes_round_again_keeps_both_invocations(self):
+        # Review of #878: a reused pid under the same producer id and epoch
+        # numbers its batches from 1 again; the first invocation's
+        # acknowledgements still count.
+        h = History()
+        h.produce("produce:P:1:7", 1, 0, 10, "ok", 10)
+        h.produce("produce:P:1:7", 1, 10, 10, "ok", 20)
+        h.read("r", [(10, 10, 10)], 20)
+        result = h.check()
+        self.assertIn("lost", kinds(result))
+        self.assertEqual(result["acknowledged_records"], 20)
 
     def test_the_high_watermark_never_goes_back(self):
         h = History()
