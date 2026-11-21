@@ -261,9 +261,9 @@ is a real and silent condition.
   (`unclean.leader.election.enable`, off by default) keeps the topic id and
   reuses offsets it had already handed out, so taking the highest end would
   resume above the replacement records once the log regrows past it. The
-  ledger sees the reuse: a committed row that OVERLAPS the range of an
-  earlier-created committed row of the same id archived offsets a second time
-  (the A, B, C sequence does not, because C fills the hole below B). Such an id
+  ledger sees the reuse: two committed rows of the same id whose ranges
+  OVERLAP archived offsets a second time (the A, B, C sequence does not,
+  because C fills the hole below B). Such an id
   resumes from its newest committed row, as rows with no id do: a re-read of
   the replacement records, never a skip. Retention keeps every row of an id
   while the id is unresolved (its highest end is above its newest row's end),

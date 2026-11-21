@@ -960,8 +960,8 @@ impl StateStore for PgStateStore {
         // See the SQLite implementation: per (topic, partition, consumer
         // group, topic id), the HIGHEST end offset any committed row of a
         // known id reached, the NEWEST row's end for rows of no id, and the
-        // newest row's end for an id whose log was truncated (a committed row
-        // overlapping the range of an earlier-created one of the same id).
+        // newest row's end for an id whose log was truncated (two committed rows of
+        // the id whose ranges overlap).
         let rows = sqlx::query(
             "WITH committed AS ( \
                  SELECT progress_end_json::jsonb ->> 'topic' AS topic, \
@@ -975,22 +975,16 @@ impl StateStore for PgStateStore {
                         (progress_end_json::jsonb ->> 'end_offset')::bigint AS end_offset, \
                         created_at, batch_id \
                  FROM batches WHERE state = $1 AND source_type = $2 \
-             ), descending AS ( \
-                 SELECT topic, part, grp, tid, start_offset, end_offset, created_at, batch_id, \
+             ), ordered AS ( \
+                 SELECT topic, part, grp, tid, start_offset, \
                         MAX(end_offset) OVER ( \
                             PARTITION BY topic, part, grp, tid \
-                            ORDER BY created_at, batch_id \
+                            ORDER BY start_offset, end_offset, batch_id \
                             ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prior_max \
                  FROM committed WHERE tid IS NOT NULL \
              ), broken AS ( \
-                 SELECT DISTINCT c.topic, c.part, c.grp, c.tid FROM descending c \
-                 WHERE c.prior_max >= c.start_offset \
-                   AND EXISTS ( \
-                       SELECT 1 FROM committed x \
-                       WHERE x.topic = c.topic AND x.part = c.part AND x.grp = c.grp \
-                         AND x.tid = c.tid \
-                         AND (x.created_at, x.batch_id) < (c.created_at, c.batch_id) \
-                         AND x.start_offset <= c.end_offset AND x.end_offset >= c.start_offset) \
+                 SELECT DISTINCT topic, part, grp, tid FROM ordered \
+                 WHERE prior_max >= start_offset \
              ), ranked AS ( \
                  SELECT topic, part, grp, tid, end_offset, \
                         ROW_NUMBER() OVER ( \

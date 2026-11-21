@@ -553,22 +553,16 @@ const COMMITTED_KAFKA_OFFSETS_SQL: &str =
                         CAST(json_extract(progress_end_json, '$.end_offset') AS INTEGER) AS end_offset, \
                         created_at, batch_id \
                  FROM batches WHERE state = ? AND source_type = ? \
-             ), descending AS ( \
-                 SELECT topic, part, grp, tid, start_offset, end_offset, created_at, batch_id, \
+             ), ordered AS ( \
+                 SELECT topic, part, grp, tid, start_offset, \
                         MAX(end_offset) OVER ( \
                             PARTITION BY topic, part, grp, tid \
-                            ORDER BY created_at, batch_id \
+                            ORDER BY start_offset, end_offset, batch_id \
                             ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prior_max \
                  FROM committed WHERE tid IS NOT NULL \
              ), broken AS ( \
-                 SELECT DISTINCT c.topic, c.part, c.grp, c.tid FROM descending c \
-                 WHERE c.prior_max >= c.start_offset \
-                   AND EXISTS ( \
-                       SELECT 1 FROM committed x \
-                       WHERE x.topic = c.topic AND x.part = c.part AND x.grp = c.grp \
-                         AND x.tid = c.tid \
-                         AND (x.created_at, x.batch_id) < (c.created_at, c.batch_id) \
-                         AND x.start_offset <= c.end_offset AND x.end_offset >= c.start_offset) \
+                 SELECT DISTINCT topic, part, grp, tid FROM ordered \
+                 WHERE prior_max >= start_offset \
              ), ranked AS ( \
                  SELECT topic, part, grp, tid, end_offset, \
                         ROW_NUMBER() OVER ( \
@@ -756,14 +750,16 @@ impl StateStore for SqliteStateStore {
         //
         // A known id's maximum is also not taken when its log was truncated:
         // an unclean leader election keeps the topic id and reuses offsets, so
-        // a committed row that OVERLAPS the range of an earlier-created
-        // committed row of the same id archived offsets a second time. Such an
+        // two committed rows of the same id whose ranges OVERLAP archived
+        // offsets a second time. Such an
         // id (`broken`) answers with its NEWEST row's end, as rows of no id
         // do: a re-read of the replacement records, never a skip of them. The
         // A, B, C sequence does not overlap (C fills the hole below B), so it
-        // keeps the maximum. Only a row that starts at or below the end of
-        // everything created before it (`prior_max`) can overlap, so the
-        // pairwise check runs for those rows alone. Pruning keeps what this
+        // keeps the maximum. Two overlapping rows have one created before the
+        // other, so an id is broken when ANY two of its committed rows
+        // overlap, found by one sweep in start order (a row that starts at or
+        // below the highest end before it, `prior_max`), not a pairwise scan,
+        // which was quadratic in the retained history. Pruning keeps what this
         // reads (`prune_predicate_sql`).
         //
         // `newest_end` is the newest-created row's own end, on the answer of
@@ -2199,6 +2195,63 @@ mod tests {
         assert!(
             newest.iter().any(|l| !l.contains("created_at>?")),
             "the newest-row-of-an-id lookup no longer walks idx_batches_kafka_newest:\n{plan}"
+        );
+    }
+
+    /// The overlap test reads the retained history in one sweep, not pairwise:
+    /// many overlapping ranges (replacement records archived after a
+    /// truncation, here every range twice) must not make the resume query
+    /// quadratic. Quadratic, 6,000 rows took tens of seconds; the bound is
+    /// generous so a slow machine does not fail it.
+    #[tokio::test]
+    async fn the_resume_query_stays_linear_over_overlapping_history() {
+        let store = SqliteStateStore::connect("sqlite::memory:").await.unwrap();
+        let n = 3000u32;
+        for i in 0..2 * n {
+            let k = i % n;
+            let m = format!(
+                r#"{{"source_type":"kafka","topic":"t","partition":0,"start_offset":{},"end_offset":{},"consumer_group":"g","topic_id":"inc"}}"#,
+                k * 10,
+                k * 10 + 9
+            );
+            sqlx::query(
+                "INSERT INTO batches (batch_id, tenant, source_type, source_name, format, \
+                 state, progress_start_json, progress_end_json, created_at, updated_at, \
+                 claim_gen) VALUES (?, 'd', 'kafka', 't', 'raw', 'batching', ?, ?, ?, \
+                 '2020-01-01T00:00:00Z', 0)",
+            )
+            .bind(format!("b{i:06}"))
+            .bind(&m)
+            .bind(&m)
+            .bind(format!(
+                "2030-01-01T{:02}:{:02}:{:02}.{:03}Z",
+                (i / 3600) % 24,
+                (i / 60) % 60,
+                i % 60,
+                0
+            ))
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("UPDATE batches SET state = 'source_committed'")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let answers = store.committed_kafka_offsets().await.unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(
+            answers[0].end_offset,
+            i64::from(n) * 10 - 1,
+            "every range was archived twice, so the id is broken and answers with the newest \
+             row's end, which is the last copy's"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "{} overlapping rows took {elapsed:?}: the overlap test is not linear",
+            2 * n
         );
     }
 }

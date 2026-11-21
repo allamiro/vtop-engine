@@ -277,8 +277,7 @@ pub trait StateStore: Send + Sync {
     /// zero, and the old log's highest end would skip the new log's first
     /// records. Nor is it safe across a truncation: a log cut short by an
     /// unclean leader election keeps its id and reuses offsets, which shows as
-    /// a committed row overlapping the range of an earlier-created one of the
-    /// id (the A, B, C sequence does not overlap: C fills the hole below B). An
+    /// two committed rows of the id whose ranges overlap (the A, B, C sequence does not overlap: C fills the hole below B). An
     /// id so marked answers with its NEWEST row's end, as rows of no id do, so
     /// the replacement records are read again and never skipped.
     ///

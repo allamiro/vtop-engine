@@ -372,8 +372,8 @@ pub struct CommittedKafkaOffset {
     /// The partition resumes at the offset after this one.
     ///
     /// For a known `topic_id`: the HIGHEST last offset of any committed batch
-    /// of that id, not the newest-created row's - unless a committed batch's
-    /// range overlaps an earlier-created one of the id, which means offsets
+    /// of that id, not the newest-created row's - unless two committed batches'
+    /// ranges of the id overlap, which means offsets
     /// were reused (a log truncated by an unclean leader election keeps its
     /// topic id), and then the NEWEST batch's last offset, so the replacement
     /// records are read again and never skipped. Recovery can commit a window
