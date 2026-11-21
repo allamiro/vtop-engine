@@ -484,7 +484,7 @@ def test_minted_private_keys_are_owner_only_and_the_ca_key_is_gone(tmp_path, mon
     monkeypatch.setattr(failover, "sh", fake_gen_certs)
     monkeypatch.setattr(failover.platform, "system", lambda: "Darwin")
     directory = str(tmp_path / "certs")
-    failover.mint_certs(directory)
+    failover.mint_certs(directory, "vtop-bench:test")
     modes = {name: os.stat(os.path.join(directory, name)).st_mode & 0o777 for name in os.listdir(directory)}
     assert "ca-key.pem" not in modes
     assert {name: mode for name, mode in modes.items() if name.endswith("-key.pem")} == \
@@ -492,11 +492,51 @@ def test_minted_private_keys_are_owner_only_and_the_ca_key_is_gone(tmp_path, mon
     assert all(mode == 0o644 for name, mode in modes.items() if not name.endswith("-key.pem"))
 
 
-def test_a_native_linux_daemon_gets_keys_the_container_user_can_read(monkeypatch):
+def test_a_native_linux_daemon_gets_keys_owner_only_for_the_container_user(tmp_path, monkeypatch):
+    """vtop-node refuses a key other users can read (#732): on a native Linux
+    daemon the keys stay owner-only and are handed to the container user
+    (uid 10001) by a root container, never made world-readable."""
     from kafka_compare import failover
 
+    calls = []
+
+    def fake_sh(args, **_kwargs):
+        if args[:2] == ["bash", os.path.join(failover.REPO, "scripts", "live-chaos", "gen-certs.sh")]:
+            directory = args[2]
+            os.makedirs(directory, exist_ok=True)
+            for base in ("ca", "meta-1", "data-1", "admin"):
+                for suffix in (".pem", "-key.pem"):
+                    with open(os.path.join(directory, base + suffix), "w") as handle:
+                        handle.write(base)
+        else:
+            calls.append(args)
+
+    monkeypatch.setattr(failover, "sh", fake_sh)
     monkeypatch.setattr(failover.platform, "system", lambda: "Linux")
-    assert failover.key_mode() == 0o644
+    assert failover.key_mode() == 0o600
+    directory = str(tmp_path / "certs")
+    failover.mint_certs(directory, "vtop-bench:test")
+    modes = {name: os.stat(os.path.join(directory, name)).st_mode & 0o777 for name in os.listdir(directory)}
+    assert all(mode == 0o600 for name, mode in modes.items() if name.endswith("-key.pem"))
+    assert len(calls) == 1
+    chown = calls[0]
+    assert chown[:4] == ["docker", "run", "--rm", "--user"] and "vtop-bench:test" in chown
+    assert f"{directory}:/certs" in chown
+    script = chown[-1]
+    assert "chown 10001:10001 admin-key.pem data-1-key.pem meta-1-key.pem" in script
+    assert "chmod 0400 admin-key.pem data-1-key.pem meta-1-key.pem" in script
+    assert "ca-key.pem" not in script and "meta-1.pem" not in script.replace("meta-1-key.pem", "")
+
+
+def test_docker_desktop_needs_no_chown(tmp_path, monkeypatch):
+    from kafka_compare import failover
+
+    calls = []
+    monkeypatch.setattr(failover, "sh", lambda args, **_kwargs: calls.append(args))
+    monkeypatch.setattr(failover.platform, "system", lambda: "Darwin")
+    (tmp_path / "admin-key.pem").write_text("k")
+    failover.give_keys_to_container_user(str(tmp_path), "vtop-bench:test")
+    assert calls == []
 
 
 def test_ha_nodes_mount_only_their_own_keys_and_never_the_ca_key():
