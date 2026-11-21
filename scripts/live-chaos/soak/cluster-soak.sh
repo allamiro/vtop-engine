@@ -198,8 +198,11 @@ start_soak_meta() { # <id> [env assignments...]
   local id="$1" life pid peers=() p; shift
   for p in 1 2 3; do [[ "$p" != "$id" ]] && peers+=("$p"); done
   life="$(next_life "meta-$id")"
-  pid="$(start_command "meta-$id-$life" "meta_node_ready" env "$@" \
-    ip netns exec "vtop-meta-$id" "$VTOP_NODE" meta --config "$(emit_meta_config "$id" "${peers[@]}")")" \
+  # The environment (the clock shim) goes to the node alone, inside the
+  # namespace: on `ip` itself, the shim would write its marker from `ip` even
+  # when the node cannot load it (review of #881).
+  pid="$(start_command "meta-$id-$life" "meta_node_ready" \
+    ip netns exec "vtop-meta-$id" env "$@" "$VTOP_NODE" meta --config "$(emit_meta_config "$id" "${peers[@]}")")" \
     || return 1
   node_started "meta-$id" "$pid" "$life"
 }
@@ -216,8 +219,8 @@ emit_soak_candidate_config() { # <n>
 start_soak_candidate() { # <n> [env assignments...]
   local n="$1" life pid; shift
   life="$(next_life "data-$n")"
-  pid="$(start_command "data-candidate-$n-$life" "data_node_ready" env "$@" \
-    ip netns exec "vtop-data-$n" "$VTOP_NODE" data --config "$(emit_soak_candidate_config "$n")")" \
+  pid="$(start_command "data-candidate-$n-$life" "data_node_ready" \
+    ip netns exec "vtop-data-$n" env "$@" "$VTOP_NODE" data --config "$(emit_soak_candidate_config "$n")")" \
     || return 1
   node_started "data-$n" "$pid" "$life"
 }
@@ -630,6 +633,16 @@ if [[ -n "$leader" ]]; then
     done
   done
 fi
+# One sample past the duration before the sampler stops: the run is judged
+# complete only when it was observed to the end (review of #881).
+deadline=$((SECONDS + 3 * SAMPLE_INTERVAL + 30))
+until python3 -c "
+import json, sys
+rows = open(sys.argv[1]).read().splitlines()
+sys.exit(0 if rows and json.loads(rows[-1])['elapsed_s'] >= float(sys.argv[2]) else 1)
+" "$RUN_DIR/samples.jsonl" "$DURATION" 2> /dev/null || (( SECONDS >= deadline )); do
+  sleep 1
+done
 touch "$RUN_DIR/stop-sampler"
 for name in data-1 data-2 data-3 meta-1 meta-2 meta-3; do stop_node_named "$name" TERM; done
 
