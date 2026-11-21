@@ -818,6 +818,97 @@ async fn live_a_swapped_in_valid_manifest_of_another_batch_is_unauthenticated() 
     }
 }
 
+/// `vtopctl verify-manifest` on `uri`, with `engine`'s ledger and store.
+async fn verify_manifest_on(
+    engine: &Engine,
+    uri: String,
+    keyring: &vtop_core::manifest::ManifestKeyring,
+) -> vtop_cli::commands::VerifyReport {
+    vtop_cli::commands::verify_manifest_deep(
+        engine.store.as_ref(),
+        engine.backend.as_ref(),
+        &uri,
+        keyring,
+    )
+    .await
+    .unwrap()
+}
+
+/// (b2) The same swap, checked by `vtopctl verify-manifest` on the victim's
+/// key, with the archive's ledger and with a ledger that has never seen the
+/// archive (an auditor holding only the bucket). The donated manifest is
+/// genuine, so its self-hash, its MAC, its object and its ledger row all
+/// check out; what fails is the key: the manifest names the key it was
+/// written to, and it was not written to this one. Under the MAC that name is
+/// authenticated. The donor's manifest at its own key still passes.
+#[tokio::test]
+#[ignore = "requires an S3-compatible endpoint"]
+async fn live_verify_manifest_fails_another_batchs_valid_manifest_at_this_key() {
+    for (case, setup) in [
+        ("verify-swap-mac", mac_q4()),
+        ("verify-swap-nomac", Setup::default()),
+    ] {
+        let a = Archive::new(case, &plain_bucket(), 2, setup).await;
+        let donor = a.rows[1].clone();
+        let (victim_uri, donor_uri) = (a.manifest_uri(0), a.manifest_uri(1));
+        let auditor = Engine::new(
+            a.config("state-auditor", None),
+            StreamsConfig { streams: vec![] },
+        )
+        .await
+        .unwrap();
+        assert!(auditor.store.list_batches().await.unwrap().is_empty());
+        let keyring = a.engine.config.resolve_manifest_keyring().unwrap();
+        let verify = |ledger: &str, uri: String| {
+            let engine = if ledger == "ledger" {
+                &a.engine
+            } else {
+                &auditor
+            };
+            verify_manifest_on(engine, uri, &keyring)
+        };
+        for ledger in ["ledger", "no ledger"] {
+            let report = verify(ledger, victim_uri.clone()).await;
+            assert!(report.passed, "[{case}, {ledger}] {:#?}", report.lines);
+        }
+
+        let donated = a.get(&donor_uri).await;
+        a.put(&victim_uri, &donated).await;
+
+        for ledger in ["ledger", "no ledger"] {
+            let report = verify(ledger, victim_uri.clone()).await;
+            assert!(!report.passed, "[{case}, {ledger}] {:#?}", report.lines);
+            assert_eq!(report.json["manifest_key_ok"], false, "[{case}, {ledger}]");
+            assert_eq!(report.json["self_hash_ok"], true, "[{case}, {ledger}]");
+            let line = report
+                .lines
+                .iter()
+                .find(|l| l.starts_with("manifest key"))
+                .unwrap();
+            assert!(
+                line.contains(&victim_uri)
+                    && line.contains(&donor_uri)
+                    && line.contains(&donor.batch_id),
+                "[{case}, {ledger}] {line}"
+            );
+            if case == "verify-swap-mac" {
+                assert!(
+                    report.json["manifest_authentication"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("OK"),
+                    "[{case}, {ledger}] the MAC verifies: the manifest is genuine {:#?}",
+                    report.json
+                );
+            }
+            let genuine = verify(ledger, donor_uri.clone()).await;
+            assert!(genuine.passed, "[{case}, {ledger}] {:#?}", genuine.lines);
+        }
+        drop(auditor);
+        a.cleanup().await;
+    }
+}
+
 /// (c) A forgery signed with a key the attacker made up, under a key id of
 /// the attacker's choosing, valid in itself (its hash and MAC agree), and the
 /// ledger rewritten to match. The reader uses the key a manifest names and
