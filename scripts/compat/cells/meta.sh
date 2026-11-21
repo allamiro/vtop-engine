@@ -51,6 +51,7 @@ esac
 rm -rf "${WORKDIR:?}"
 mkdir -p "$WORKDIR"
 NODE_PID=
+NODE_EXIT=
 trap '[[ -z "$NODE_PID" ]] || kill -9 "$NODE_PID" 2> /dev/null || true' EXIT
 
 expect_value() { awk -v k="$2" '$1 == k { print $2 }' "$1/expect.txt"; }
@@ -67,7 +68,9 @@ digest() {
 json() { python3 -I -c 'import json,sys; d=json.load(sys.stdin); print('"$2"')' < "$1"; }
 
 # start <vtop-node> <scenario-dir> <log-name>: run the voter on the directory.
-# Returns 0 once it is ready, 1 if it exited first (the log says why).
+# Returns 0 once it is ready, 1 if it exited first (the log says why), with
+# its exit status in NODE_EXIT: a refusal is a non-zero exit, and a node that
+# printed the refusal's message and exited 0 must not pass for one.
 start() {
   local node="$1" dir="$2" name="$3"
   "$node" meta --config "$dir/meta.yaml" > "$dir/logs/$name.log" 2>&1 &
@@ -75,7 +78,12 @@ start() {
   local _
   for _ in $(seq 1 150); do
     grep -q '^meta_node_ready' "$dir/logs/$name.log" 2> /dev/null && return 0
-    kill -0 "$NODE_PID" 2> /dev/null || { wait "$NODE_PID" 2> /dev/null || true; NODE_PID=; return 1; }
+    kill -0 "$NODE_PID" 2> /dev/null || {
+      NODE_EXIT=0
+      wait "$NODE_PID" 2> /dev/null || NODE_EXIT=$?
+      NODE_PID=
+      return 1
+    }
     sleep 0.1
   done
   fail "$name: the node neither became ready nor exited"
@@ -183,6 +191,8 @@ case "$DIRECTION" in
           stop
           fail "the release opened the raised directory; it was expected to refuse"
         fi
+        [[ "$NODE_EXIT" -ne 0 ]] \
+          || { sed 's/^/    /' "$dir/logs/released-refuses.log" >&2; fail "the release exited 0 on the raised directory without becoming ready; a refusal exits non-zero"; }
         grep -q -- "$MESSAGE" "$dir/logs/released-refuses.log" \
           || { sed 's/^/    /' "$dir/logs/released-refuses.log" >&2; fail "the release's refusal does not say: $MESSAGE"; }
         [[ "$(digest "$dir/data")" == "$before" ]] || fail "the refusal changed the directory"
