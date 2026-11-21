@@ -67,7 +67,7 @@ an unplanned exit and started again, so one finding does not end the run.
 | Criterion | Pass when |
 |---|---|
 | The run completed | `run_end` recorded and samples reach the full duration |
-| Every node was sampled throughout | six nodes, each at least 90% of its samples, no gap over 300 s |
+| Every node was sampled throughout | six nodes, each measured and its `/metrics` scraped in at least 90% of its samples, no gap over 300 s in either |
 | Every planned fault landed and the cluster recovered | all 167, each landed, each recovered |
 | Recovery is within the timeout | the slowest at most 600 s |
 | No unplanned exit | no node exited unless a fault stopped it |

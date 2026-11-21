@@ -164,6 +164,13 @@ class Evaluator(unittest.TestCase):
         result = verdict(self.profile, self.run)
         self.assertTrue(result["passed"], [c for c in result["criteria"] if not c["passed"]])
 
+    def test_metrics_that_stop_answering_fail_the_sampling(self):
+        # Review of #881: processes measured, /metrics silent after the start.
+        for sample in self.run["samples"][1:]:
+            for node in sample["nodes"].values():
+                node.pop("metrics", None)
+        self.assertIn("samples", failed(verdict(self.profile, self.run)))
+
     def test_two_data_nodes_leading_one_epoch_fails(self):
         self.run["leaders"].append({"node": "data-3", "lifetime": 2, "epoch": 1, "log": "x", "line": 1})
         self.assertEqual(failed(verdict(self.profile, self.run)), {"one_range_leader_per_epoch"})

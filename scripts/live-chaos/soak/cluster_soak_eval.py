@@ -70,12 +70,22 @@ def check_samples(profile: dict, samples: list[dict]) -> Criterion:
         ok = ok and good
         if not good:
             said.append(f"{name}: {text}")
+        # Its /metrics too, on its own: the leadership checks read them, and a
+        # node measured but never scraped would leave them nothing to judge
+        # (review of #881).
+        scraped = [
+            s["elapsed_s"] for s in samples if (s.get("nodes") or {}).get(name, {}).get("metrics")
+        ]
+        good, text = _coverage(scraped, wanted, criteria["max_sample_gap_s"], duration)
+        ok = ok and good
+        if not good:
+            said.append(f"{name} /metrics: {text}")
     return Criterion(
         "samples",
         "every node was sampled throughout",
         ok and len(nodes) == 6,
         f"{len(nodes)} nodes sampled" + (f"; short: {'; '.join(said)}" if said else ""),
-        f"six nodes, each at least {criteria['min_samples_fraction']:.0%} of its interval's worth "
+        f"six nodes, each measured and scraped at least {criteria['min_samples_fraction']:.0%} of its interval's worth "
         f"over {duration:.0f} s, no gap over {criteria['max_sample_gap_s']} s",
     )
 
