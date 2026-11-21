@@ -376,7 +376,7 @@ counters, on the engine's and every node's `/metrics`:
 
 | Metric | Labels | Meaning |
 |---|---|---|
-| `vtop_audit_events_total` | `action` (`ledger.prune`, `ledger.replay`, `ledger.migrate`, `scrub.cursor`, `cluster.*`, `node.repair`, `node.reconfigure_range`, `promotion.attest`), `outcome` (`attempt`, `success`, `failure`, `refused`) | Records written. |
+| `vtop_audit_events_total` | `action` (`ledger.prune`, `ledger.replay`, `ledger.migrate`, `scrub.cursor`, `cluster.*`, `node.repair`, `node.reconfigure_range`, `promotion.attest`, `native.session`), `outcome` (`attempt`, `success`, `failure`, `refused`) | Records written. |
 | `vtop_audit_write_failures_total` | `sink` (`log`, `file`, `ledger`) | Records a sink could not take. Any increase needs a look: a destructive ledger command was refused, or a record is in fewer places than configured. |
 
 With JSON logs, the records in Loki (the lab's Alloy labels lines by
