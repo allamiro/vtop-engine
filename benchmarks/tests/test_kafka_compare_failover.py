@@ -492,6 +492,29 @@ def test_minted_private_keys_are_owner_only_and_the_ca_key_is_gone(tmp_path, mon
     assert all(mode == 0o644 for name, mode in modes.items() if not name.endswith("-key.pem"))
 
 
+def test_the_native_client_certificate_is_minted_for_the_principal_the_nodes_serve(tmp_path, monkeypatch):
+    """A node admits a native session only on the certificate issued to its principal, so the
+    benchmark's clients present `client.pem` (CN = the principal), never a node's own certificate."""
+    from kafka_compare import failover
+
+    seen = {}
+
+    def fake_gen_certs(args, **kwargs):
+        seen.update(kwargs.get("env") or {})
+        os.makedirs(args[2], exist_ok=True)
+        for base in ("ca-key",):
+            open(os.path.join(args[2], base + ".pem"), "w").close()
+
+    monkeypatch.setattr(failover, "sh", fake_gen_certs)
+    monkeypatch.setattr(failover.platform, "system", lambda: "Darwin")
+    failover.mint_certs(str(tmp_path / "certs"), "vtop-bench:test")
+    assert seen == {"NATIVE_CLIENT_CN": failover.PRINCIPAL_UUID}
+    node_config = open(os.path.join(failover.REPO, "benchmarks", "kafka_compare", "vtop", "ha-node-1.yaml")).read()
+    assert f"principal_id: {failover.PRINCIPAL_UUID}" in node_config
+    driver = open(os.path.join(failover.REPO, "benchmarks", "kafka_compare", "vtop", "failover-driver.sh")).read()
+    assert "cert: /etc/vtop/tls/client.pem" in driver and "data-1.pem" not in driver
+
+
 def test_a_native_linux_daemon_gets_keys_owner_only_for_the_container_user(tmp_path, monkeypatch):
     """vtop-node refuses a key other users can read (#732): on a native Linux
     daemon the keys stay owner-only and are handed to the container user

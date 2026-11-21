@@ -5476,6 +5476,7 @@ mod tests {
             start_offset: 0,
             end_offset: 0,
             consumer_group: "g".into(),
+            topic_id: None,
         };
         let results = fs
             .replay_from_markers(&[good.clone(), wrong_kind, good])

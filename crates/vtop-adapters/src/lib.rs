@@ -9,6 +9,8 @@ pub mod continuity;
 pub mod file_source;
 #[cfg(feature = "kafka")]
 pub mod kafka_source;
+#[cfg(feature = "kafka")]
+mod kafka_topic_id;
 mod rotated;
 pub mod syslog_spool_source;
 mod write_lease;

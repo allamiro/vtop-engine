@@ -3267,7 +3267,9 @@ async fn serve_connection(
     let (authorized, refusal) = if stream.is_encrypted() {
         (
             authorizer.authorize(&peer_chain_der, hello.principal_id, hello.role),
-            "certificate is not authorized for the requested principal and role",
+            "the client certificate is not authorized for the requested principal and role. The \
+             node refused the session; the node's log says which check failed. Check that the \
+             certificate was issued to that principal and that the role is producer or consumer.",
         )
     } else {
         // Say what was actually judged: there is no certificate on a

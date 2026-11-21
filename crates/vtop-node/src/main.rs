@@ -13,6 +13,7 @@ mod data_node;
 mod lease_agent;
 mod lease_watcher;
 mod meta_node;
+mod native_auth;
 mod observe;
 mod promotion;
 #[cfg(test)]
