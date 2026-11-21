@@ -47,9 +47,9 @@ is unproven, and counted lost. The invariants:
                 acknowledged or indeterminate record is visible a second time:
                 a record is its producer's (id, epoch, sequence), so a retry
                 from a new process sends the same records, not new ones
-  order         a producer's acknowledgements move forward: each acknowledged
-                batch sits above the one acknowledged before it, and its
-                records in sequence order
+  order         a producer's records sit in sequence order: per producer id
+                and epoch, across its processes, a higher sequence is
+                acknowledged at a higher offset
   phantom       every visible record is an acknowledged one, or a whole
                 indeterminate batch; a refused batch (`fail`) is never visible,
                 which is what a fenced leader's records would be
@@ -323,26 +323,22 @@ def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) 
                     + f", not acknowledged record {sequence} of {batch.name()}"
                 )
 
-    # A producer's acknowledgements move forward, and within a batch its
-    # records sit in sequence order (review of #878).
-    by_process: dict[str, list[Batch]] = defaultdict(list)
-    for batch in acked:
-        by_process[batch.process].append(batch)
-        for i in range(1, batch.count):
-            if batch.offset_of(i) <= batch.offset_of(i - 1):
+    # A producer's records sit in sequence order: per logical producer (id
+    # and epoch, across its invocations), a higher sequence is acknowledged at
+    # a higher offset. That covers records within a batch, batches of one
+    # process, and a restarted process under the same id and epoch, while a
+    # retry acknowledged at its original offsets places nothing new (review
+    # of #878).
+    by_identity: dict[str, list[tuple[int, int, Batch]]] = defaultdict(list)
+    for (identity, sequence), (offset, batch) in placed.items():
+        by_identity[identity].append((sequence, offset, batch))
+    for identity, records in by_identity.items():
+        records.sort(key=lambda r: r[0])
+        for (s0, o0, b0), (s1, o1, b1) in zip(records, records[1:]):
+            if o1 <= o0:
                 violations["order"].append(
-                    f"{batch.name()} was acknowledged with record {batch.first_sequence + i} at "
-                    f"offset {batch.offset_of(i)}, not above record {batch.first_sequence + i - 1} "
-                    f"at {batch.offset_of(i - 1)}"
-                )
-    for process, mine in by_process.items():
-        mine.sort(key=lambda b: b.batch)
-        for before, after in zip(mine, mine[1:]):
-            if after.offset_of(0) <= before.offset_of(before.count - 1):
-                violations["order"].append(
-                    f"{after.name()} was acknowledged at offsets "
-                    f"{after.offset_of(0)}..{after.offset_of(after.count - 1)}, not above "
-                    f"{before.name()} at ..{before.offset_of(before.count - 1)}"
+                    f"record {s1} of {identity} was acknowledged at offset {o1} ({b1.name()}), "
+                    f"not above record {s0} at offset {o0} ({b0.name()})"
                 )
 
     # Everything visible and unclaimed must be a whole indeterminate batch.
