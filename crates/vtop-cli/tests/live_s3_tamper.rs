@@ -84,6 +84,8 @@ fn locked_bucket() -> String {
 const VERSIONED_BUCKET: &str = "telemetry-tamper-versioned";
 /// Created, versioned, and then suspended by the test that does so.
 const SUSPENDED_BUCKET: &str = "telemetry-tamper-suspended";
+/// The same, for the test that suspends it under a running engine.
+const SUSPENDED_RUNNING_BUCKET: &str = "telemetry-tamper-suspended-running";
 
 fn nanos() -> u128 {
     SystemTime::now()
@@ -1282,6 +1284,120 @@ async fn live_suspended_versioning_makes_the_engine_refuse_the_bucket() {
         client
             .delete_object()
             .bucket(SUSPENDED_BUCKET)
+            .key(&key)
+            .version_id(&version)
+            .send()
+            .await
+            .unwrap();
+    }
+}
+
+/// The external tamper evaluation of v0.10.2: versioning suspended under an
+/// engine that had checked the bucket at startup and was archiving. Every
+/// retry used to put one more manifest, each failing "no object version to
+/// pin": 10 objects in 25 s, nothing committed. Now the batch in flight
+/// writes its object, its manifest is not written, and nothing more is
+/// written however often the range is retried, including at a check that
+/// still finds versioning suspended. Once versioning is enabled again the
+/// engine resumes on its own and the range commits.
+#[tokio::test]
+#[ignore = "requires an S3-compatible endpoint"]
+async fn live_suspended_versioning_under_a_running_engine_writes_one_object_and_resumes() {
+    let client = s3_client().await;
+    ensure_bucket(&client, SUSPENDED_RUNNING_BUCKET, true).await;
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    std::fs::write(&input, "tamper suspended-running record 1\n").unwrap();
+    let inputs = vec![input.clone()];
+    let prefix = format!("vtop-it-tamper-suspended-running-{}", nanos());
+    let setup = Setup {
+        versioning: true,
+        ..Setup::default()
+    };
+    let cfg = config(
+        dir.path(),
+        "running",
+        SUSPENDED_RUNNING_BUCKET,
+        &prefix,
+        &inputs,
+        &setup,
+    );
+    // Started with the bucket versioned: the startup check passes, as it
+    // did for the evaluated engine.
+    let mut engine = Engine::new_exclusive(cfg, StreamsConfig { streams: vec![] })
+        .await
+        .expect("a versioned bucket is accepted");
+    let out = engine.process_once(SourceType::File).await.unwrap();
+    assert!(
+        out.iter().all(|o| o.committed) && !out.is_empty(),
+        "{out:?}"
+    );
+    let stored = |client: &aws_sdk_s3::Client| {
+        let (client, prefix) = (client.clone(), prefix.clone());
+        async move { versions_under(&client, SUSPENDED_RUNNING_BUCKET, &prefix).await }
+    };
+    let committed = stored(&client).await;
+    assert_eq!(
+        committed.len(),
+        2,
+        "one object and one manifest: {committed:?}"
+    );
+
+    set_versioning(
+        &client,
+        SUSPENDED_RUNNING_BUCKET,
+        BucketVersioningStatus::Suspended,
+    )
+    .await;
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&input)
+        .unwrap();
+    writeln!(f, "tamper suspended-running record 2").unwrap();
+    drop(f);
+    for retry in 0..10 {
+        let out = engine.process_once(SourceType::File).await.unwrap();
+        assert!(
+            out.iter().all(|o| !o.committed),
+            "retry {retry}: nothing commits into a bucket that keeps no versions: {out:?}"
+        );
+    }
+    let after = stored(&client).await;
+    let written: Vec<_> = after.iter().filter(|v| !committed.contains(v)).collect();
+    assert_eq!(
+        written.len(),
+        1,
+        "the batch in flight wrote its object and no manifest, and ten retries wrote \
+         nothing: {written:?}"
+    );
+    assert!(!written[0].0.ends_with(".manifest.json"), "{written:?}");
+
+    // Past the first check (5 s): versioning is still suspended, so the
+    // check writes nothing either.
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    let out = engine.process_once(SourceType::File).await.unwrap();
+    assert!(out.iter().all(|o| !o.committed), "{out:?}");
+    assert_eq!(stored(&client).await, after, "a check writes nothing");
+
+    // Enabled again: past the next check (10 s), the engine resumes and the
+    // range commits.
+    set_versioning(
+        &client,
+        SUSPENDED_RUNNING_BUCKET,
+        BucketVersioningStatus::Enabled,
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_secs(11)).await;
+    let out = engine.process_once(SourceType::File).await.unwrap();
+    assert!(
+        out.iter().all(|o| o.committed) && !out.is_empty(),
+        "the engine resumed: {out:?}"
+    );
+    drop(engine);
+    for (key, version, _) in stored(&client).await {
+        client
+            .delete_object()
+            .bucket(SUSPENDED_RUNNING_BUCKET)
             .key(&key)
             .version_id(&version)
             .send()

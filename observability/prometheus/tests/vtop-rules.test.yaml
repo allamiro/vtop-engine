@@ -633,3 +633,33 @@ tests:
   - eval_time: 34h
     alertname: VtopMultipartSessionsPiling
     exp_alerts: []
+- name: 'VtopBucketVersioningPaused: fires when writes to a bucket stay paused for 5 minutes'
+  interval: 1m
+  input_series:
+  - series: vtop_bucket_versioning_paused{job="vtop-engine",instance="engine-1:9090"}
+    values: 0x5 1x20
+  alert_rule_test:
+  - eval_time: 9m
+    alertname: VtopBucketVersioningPaused
+    exp_alerts: []
+  - eval_time: 12m
+    alertname: VtopBucketVersioningPaused
+    exp_alerts:
+    - exp_labels:
+        severity: page
+        job: vtop-engine
+        instance: engine-1:9090
+      exp_annotations:
+        summary: engine-1:9090 stopped writing to 1 bucket(s) that no longer keep object versions
+        description: "With upload.require_object_versioning set, a bucket's versioning was suspended or turned off, so the engine stopped writing to it: nothing in it commits, each batch for it fails before writing anything and is replayed. The bucket is named in the bucket_versioning_paused ERROR line. Re-enable versioning on that bucket (PutBucketVersioning with Status=Enabled); the engine resumes on its own within about two minutes (its next check, then the next retry)."
+        runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopbucketversioningpaused
+- name: 'VtopBucketVersioningPaused: quiet when the engine resumes within the hold'
+  interval: 1m
+  input_series:
+  # Paused for three minutes, then versioning was enabled again.
+  - series: vtop_bucket_versioning_paused{job="vtop-engine",instance="engine-1:9090"}
+    values: 0x5 1x3 0x20
+  alert_rule_test:
+  - eval_time: 15m
+    alertname: VtopBucketVersioningPaused
+    exp_alerts: []

@@ -332,3 +332,39 @@ abandon window, as a backstop.
 
 **When it is safe to ignore.** When the bucket's lifecycle rule is known to
 clean up incomplete uploads and the cost of a day's parts is acceptable.
+
+## VtopBucketVersioningPaused
+
+**What it means.** With `upload.require_object_versioning` set, a bucket
+stopped keeping object versions under a running engine: an object or
+manifest PUT returned no version to pin, or the store answered
+GetBucketVersioning that versioning is not enabled. Someone suspended (or
+never enabled) the bucket's versioning. A manifest the bucket does not keep a
+version of cannot be pinned, so nothing in that bucket can commit.
+
+**What the engine already did.** It stopped writing to the bucket. Each batch
+for it fails before its first PUT and is replayed
+(`vtop_bucket_versioning_paused_batches_total`), so the bucket does not grow
+with a new manifest per retry. The batches that were already uploading when
+versioning was turned off wrote at most one object or manifest each, and
+committed nothing. The engine asks the store for the bucket's versioning 5 s
+after it stopped, then on a backoff doubling to 60 s, and resumes writing when
+the answer is `Enabled`: an INFO `bucket_versioning_resumed` line, and the
+gauge drops. The ERROR `bucket_versioning_paused` line names the bucket, the
+cause, and repeats at most once a minute per bucket while it stays off.
+
+**What to check.** Who changed the bucket's versioning, and whether on
+purpose: an unexpected change to versioning is a tampering signal (see
+[Tamper evidence](../reference/tamper-evidence.md)). `GetBucketVersioning` on
+the bucket named in the ERROR line.
+
+**What to do.** Re-enable versioning on the bucket (PutBucketVersioning with
+Status=Enabled). The engine resumes within about two minutes (its next
+check comes at most 60 s after the last, and the batch that makes it at most
+60 s after that) and replays what failed meanwhile; nothing to restart. If the bucket is meant to run without
+versioning, set `upload.require_object_versioning: false` and restart, which
+gives up version pinning ([Security model](../SECURITY_MODEL.md) §8.1).
+
+**When it is safe to ignore.** Never: the engine archives nothing into that
+bucket until it is fixed, and the sources keep the data only as long as their
+retention does.

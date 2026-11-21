@@ -195,6 +195,22 @@ fn every_metric_the_dashboards_query_is_exported() {
     }
 }
 
+/// The shipped alert `VtopBucketVersioningPaused` reads this gauge: it is
+/// exported from startup, at zero, so the rule sees the first bucket the
+/// engine stops writing to.
+#[test]
+fn the_bucket_versioning_pause_gauge_is_exported_for_its_alert() {
+    let text = populated();
+    assert!(
+        text.contains("# TYPE vtop_bucket_versioning_paused gauge"),
+        "missing vtop_bucket_versioning_paused"
+    );
+    assert!(
+        text.lines().any(|l| l == "vtop_bucket_versioning_paused 0"),
+        "the gauge starts at zero"
+    );
+}
+
 /// Histograms must expose `_bucket`, or `histogram_quantile()` returns nothing
 /// and every p95 panel is empty while looking perfectly healthy.
 #[test]

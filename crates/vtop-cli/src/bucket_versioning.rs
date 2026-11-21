@@ -3,11 +3,13 @@
 //! versions it pins, at startup for a literal bucket and at the first upload
 //! for a templated one (#722).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use vtop_core::config::VtopConfig;
 use vtop_core::errors::VtopError;
+use vtop_core::telemetry;
 use vtop_upload::multipart::redact_urls;
 use vtop_upload::{BucketFeature, UploadBackend};
 
@@ -180,4 +182,232 @@ pub(crate) async fn preflight(
         }
     }
     Ok(())
+}
+
+/// How long the engine waits before its first check of a bucket it stopped
+/// writing to, and the longest it waits between checks: the wait doubles at
+/// every check that still finds versioning off.
+const RECHECK_FIRST: Duration = Duration::from_secs(5);
+const RECHECK_CAP: Duration = Duration::from_secs(60);
+
+/// What paused writes to a bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PauseCause {
+    /// A manifest PUT returned no object version to pin.
+    ManifestPut,
+    /// An object PUT returned no object version, and GetBucketVersioning
+    /// then said versioning is not enabled.
+    ObjectPut,
+    /// GetBucketVersioning said versioning is not enabled, at the first
+    /// upload to the bucket.
+    Check,
+}
+
+/// Buckets the engine stopped writing to under
+/// `upload.require_object_versioning`, because the bucket no longer keeps
+/// object versions: a PUT returned no version to pin, or the store said
+/// versioning is not enabled.
+///
+/// That is the bucket's state, not a transient upload failure: retrying the
+/// batch writes another object or manifest the bucket cannot pin, and
+/// commits nothing (the external tamper evaluation of v0.10.2 saw one new
+/// manifest per retry). So nothing more is written to the bucket. Each batch
+/// for it fails before its first PUT and is replayed, and the bucket's
+/// versioning is checked again on a bounded backoff (5 s, doubling to 60 s);
+/// writes resume once the store says it is enabled. Owned by [`crate::Engine`]
+/// and shared into every pipeline, like the versioning preflight cache.
+#[derive(Debug)]
+pub struct VersioningPauses {
+    first: Duration,
+    cap: Duration,
+    paused: Mutex<HashMap<String, Pause>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Pause {
+    since: Instant,
+    next_check: Instant,
+    /// The wait after the next check that finds versioning still off.
+    wait: Duration,
+    checks: u64,
+}
+
+/// What a batch may do with a bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Gate {
+    /// Not paused: upload as usual.
+    Open,
+    /// Paused and not yet due for a check: write nothing.
+    Wait { next_check_in: Duration },
+    /// Paused and due: this batch checks the bucket's versioning. Other
+    /// batches wait meanwhile.
+    Check,
+}
+
+/// After a check that found versioning still off.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StillOff {
+    pub next_check_in: Duration,
+    pub checks: u64,
+    pub paused_for: Duration,
+}
+
+impl Default for VersioningPauses {
+    fn default() -> Self {
+        Self {
+            first: RECHECK_FIRST,
+            cap: RECHECK_CAP,
+            paused: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl VersioningPauses {
+    pub(crate) fn gate(&self, bucket: &str) -> Gate {
+        let mut paused = self.paused.lock().unwrap();
+        let Some(pause) = paused.get_mut(bucket) else {
+            return Gate::Open;
+        };
+        let now = Instant::now();
+        if now < pause.next_check {
+            return Gate::Wait {
+                next_check_in: pause.next_check - now,
+            };
+        }
+        // Claimed by this batch: the others wait for its answer.
+        pause.next_check = now + pause.wait;
+        Gate::Check
+    }
+
+    pub(crate) fn is_paused(&self, bucket: &str) -> bool {
+        self.paused.lock().unwrap().contains_key(bucket)
+    }
+
+    /// Stop writing to `bucket`. `Some(first wait)` when it was not paused
+    /// already.
+    pub(crate) fn pause(&self, bucket: &str) -> Option<Duration> {
+        let mut paused = self.paused.lock().unwrap();
+        if paused.contains_key(bucket) {
+            return None;
+        }
+        let now = Instant::now();
+        paused.insert(
+            bucket.to_owned(),
+            Pause {
+                since: now,
+                next_check: now + self.first,
+                wait: (self.first * 2).min(self.cap),
+                checks: 0,
+            },
+        );
+        if let Some(mx) = telemetry::metrics() {
+            mx.bucket_versioning_paused.inc();
+        }
+        Some(self.first)
+    }
+
+    /// A check found versioning still off: the next one waits longer, up to
+    /// the cap.
+    pub(crate) fn still_off(&self, bucket: &str) -> StillOff {
+        let mut paused = self.paused.lock().unwrap();
+        let now = Instant::now();
+        let pause = paused.entry(bucket.to_owned()).or_insert_with(|| {
+            if let Some(mx) = telemetry::metrics() {
+                mx.bucket_versioning_paused.inc();
+            }
+            Pause {
+                since: now,
+                next_check: now,
+                wait: self.first,
+                checks: 0,
+            }
+        });
+        let wait = pause.wait;
+        pause.next_check = now + wait;
+        pause.wait = (wait * 2).min(self.cap);
+        pause.checks += 1;
+        StillOff {
+            next_check_in: wait,
+            checks: pause.checks,
+            paused_for: now - pause.since,
+        }
+    }
+
+    /// Versioning is enabled again: writes resume. How long they were
+    /// paused, when they were.
+    pub(crate) fn resume(&self, bucket: &str) -> Option<Duration> {
+        let pause = self.paused.lock().unwrap().remove(bucket)?;
+        if let Some(mx) = telemetry::metrics() {
+            mx.bucket_versioning_paused.dec();
+        }
+        Some(pause.since.elapsed())
+    }
+
+    /// How many buckets are paused.
+    #[cfg(test)]
+    pub(crate) fn paused(&self) -> usize {
+        self.paused.lock().unwrap().len()
+    }
+
+    /// Make every paused bucket due for its check now.
+    #[cfg(test)]
+    pub(crate) fn make_due(&self) {
+        let now = Instant::now();
+        for pause in self.paused.lock().unwrap().values_mut() {
+            pause.next_check = now;
+        }
+    }
+}
+
+/// The ERROR when writes to a bucket stop: what happened, what the engine
+/// does, and what to do.
+pub(crate) fn paused_message(bucket: &str, cause: PauseCause, first: Duration) -> String {
+    let what = match cause {
+        PauseCause::ManifestPut => format!(
+            "a manifest PUT to bucket {bucket} returned no object version to pin, so the \
+             bucket no longer keeps versions (its versioning was suspended or turned off)"
+        ),
+        PauseCause::ObjectPut => format!(
+            "an object PUT to bucket {bucket} returned no object version, and the store says \
+             the bucket's versioning is not enabled (it was suspended or turned off)"
+        ),
+        PauseCause::Check => format!(
+            "the store says bucket {bucket} does not have versioning enabled, so it would not \
+             keep the manifest versions the hardened profile pins"
+        ),
+    };
+    format!(
+        "{what}; upload.require_object_versioning is set, so the engine stopped writing to the \
+         bucket: nothing in it commits, each batch for it fails before writing anything and is \
+         replayed, and the bucket's versioning is checked again in {}s (then at most every {}s), \
+         and writing resumes once it is Enabled. To resume, re-enable versioning on bucket \
+         {bucket} (PutBucketVersioning with Status=Enabled), or set \
+         upload.require_object_versioning: false",
+        first.as_secs(),
+        RECHECK_CAP.as_secs()
+    )
+}
+
+/// The ERROR when a check finds versioning still off.
+pub(crate) fn still_off_message(bucket: &str, off: StillOff, suppressed: u64) -> String {
+    format!(
+        "bucket {bucket} still does not have versioning enabled ({} checks over {}s); the \
+         engine is still not writing to it and nothing in it commits; next check in {}s. \
+         Re-enable versioning on bucket {bucket} (PutBucketVersioning with Status=Enabled), or \
+         set upload.require_object_versioning: false ({suppressed} more like this suppressed \
+         since the last notice)",
+        off.checks,
+        off.paused_for.as_secs(),
+        off.next_check_in.as_secs()
+    )
+}
+
+/// Why a batch for a paused bucket failed without writing.
+pub(crate) fn paused_batch(bucket: &str, next_check_in: Duration) -> String {
+    format!(
+        "writes to bucket {bucket} are paused: it does not keep object versions and \
+         upload.require_object_versioning is set; nothing was written and the batch will be \
+         replayed; the bucket's versioning is checked again in {}s",
+        next_check_in.as_secs().max(1)
+    )
 }

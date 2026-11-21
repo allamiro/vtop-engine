@@ -19,6 +19,7 @@ section in [Alert runbooks](runbooks.md) says what to do.
 | Retention under Object Lock | Every check `ok` | Any 15 minutes, and a series that first appears non-zero | `vtop_object_lock_checks_total{result}` | [VtopObjectLockCheckFailed](runbooks.md#vtopobjectlockcheckfailed) (page) |
 | Locks kept on replay | No replay finds its object without the lock configured, and no fresh object is withheld | Any hour, and a series that first appears non-zero | `vtop_object_key_decisions_total{decision}` (`fallback_unlocked`, `fallback_lock_mode`, `fallback_hold_missing`, `lock_withheld`) | [VtopObjectLockFallback](runbooks.md#vtopobjectlockfallback) (ticket) |
 | Strong verification | On for every production engine | At startup | `vtop_verification_mode{mode}` | [VtopSizeOnlyVerification](runbooks.md#vtopsizeonlyverification) (ticket) |
+| Versioned buckets written to | No bucket's writes paused because it stopped keeping object versions (`upload.require_object_versioning`) | Held for 5 minutes (the engine rechecks at most every 60 s) | `vtop_bucket_versioning_paused` | [VtopBucketVersioningPaused](runbooks.md#vtopbucketversioningpaused) (page) |
 | Incomplete multipart uploads | Kept sessions resumed or swept within the abandon window plus one sweep interval | a session kept 30 to 36 hours ago and nothing resumed or swept for 36 hours, held for 1 | `vtop_multipart_sessions_total{outcome}` | [VtopMultipartSessionsPiling](runbooks.md#vtopmultipartsessionspiling) (ticket) |
 
 ## How to read them
