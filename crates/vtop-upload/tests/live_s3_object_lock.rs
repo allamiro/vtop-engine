@@ -188,11 +188,7 @@ async fn live_every_write_path_lands_under_the_lock_it_asked_for() {
     let live = LiveS3::from_env();
     live.case(
         "object_lock.every_write_path_lands_locked",
-        &[
-            Capability::Versioning,
-            Capability::ObjectLock,
-            Capability::ChecksumCrc32Default,
-        ],
+        &[Capability::ObjectLock, Capability::Versioning],
         || async {
             let bucket = locked_bucket();
             let prefix = unique("writes");

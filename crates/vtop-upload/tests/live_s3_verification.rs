@@ -117,11 +117,12 @@ async fn native_s3_verifies_service_sha256_and_streamed_blake3() {
     )
     .await;
 
-    // BLAKE3 has no service checksum: the SDK's default CRC32 goes on the
-    // PUT, and the verification is a bounded read-back, still strong.
+    // BLAKE3 has no service checksum: the PUT carries a whole-object SHA-256
+    // the backend computes (#778), and the verification is a bounded
+    // read-back, still strong.
     live.case(
         "verification.blake3_by_read_back",
-        &[Capability::PutGetHead, Capability::ChecksumCrc32Default],
+        &[Capability::PutGetHead],
         || async {
             let r = put_verify_delete(s, "blake3", "blake3").await;
             assert!(r.passed, "{}", r.message);
