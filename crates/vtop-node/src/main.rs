@@ -107,8 +107,19 @@ enum Command {
         /// the producer on a socket that never answers or closes.
         #[arg(long, default_value_t = 0)]
         request_timeout_ms: u64,
+        /// Append every batch's invocation and outcome here as JSON lines,
+        /// for the history checker (#728).
+        #[arg(long)]
+        history: Option<PathBuf>,
+        /// The target is a leader the caller has fenced: record any answer
+        /// short of an acknowledgement as a refusal whose records must never
+        /// become visible, whatever the error code (`Fenced` alone cannot say
+        /// whether the batch was appended first).
+        #[arg(long)]
+        fenced_probe: bool,
     },
-    /// Fetch from offset 0 and byte-verify everything below the committed HWM.
+    /// Fetch from offset 0 (or `--from-offset`) and byte-verify everything
+    /// below the committed HWM.
     Verify {
         #[arg(long)]
         client_config: PathBuf,
@@ -139,6 +150,19 @@ enum Command {
         batch: u32,
         #[arg(long, default_value_t = 128)]
         value_bytes: usize,
+        /// Append every visible record (as runs) and the high watermark
+        /// here as JSON lines, the read half of a history (#728).
+        #[arg(long)]
+        dump: Option<PathBuf>,
+        /// Start reading here instead of at offset 0: a range under
+        /// retention (#290) refuses a fetch below its log start, so a
+        /// reader of a long-running range starts at the
+        /// `vtop_broker_log_start_offset` it scraped (the cluster soak,
+        /// #727). The floor and the gap budget count from here; content
+        /// verification by position assumes offset 0, so pass
+        /// `--verify-content-through 0` with it.
+        #[arg(long, default_value_t = 0)]
+        from_offset: u64,
     },
     /// Query a follower's local committed offset over the replica plane.
     ReplicaStatus {
@@ -293,6 +317,8 @@ async fn run(cli: Cli) -> Result<i32, String> {
             rate_anchor_unix_micros,
             ack_log,
             request_timeout_ms,
+            history,
+            fenced_probe,
         } => {
             let config = client::ClientConfig::load(&client_config)?;
             client::produce(
@@ -309,6 +335,8 @@ async fn run(cli: Cli) -> Result<i32, String> {
                     rate_anchor_unix_micros,
                     ack_log,
                     request_timeout_ms,
+                    history,
+                    fenced_probe,
                 },
             )
             .await
@@ -321,6 +349,8 @@ async fn run(cli: Cli) -> Result<i32, String> {
             max_offset_gaps,
             batch,
             value_bytes,
+            dump,
+            from_offset,
         } => {
             let config = client::ClientConfig::load(&client_config)?;
             client::verify(
@@ -332,6 +362,8 @@ async fn run(cli: Cli) -> Result<i32, String> {
                     max_offset_gaps,
                     batch,
                     value_bytes,
+                    dump,
+                    from_offset,
                 },
             )
             .await

@@ -4,7 +4,11 @@
 # Invariants: every acknowledged record survives a hard leader death (byte
 # exact after recovery of the same directory), the committed HWM never
 # regresses below the acknowledged floor, and nothing above the HWM is ever
-# exposed to a consumer.
+# exposed to a consumer. The producer and the recovery read are recorded as
+# an operation history (#728), and the history checker holds them to the
+# stricter claim: each acknowledged batch at exactly the offset it was
+# acknowledged at, once, and nothing visible beyond those batches but whole
+# batches the kill left unanswered.
 #
 # Honest scope: the native data plane has no leader election yet — this
 # validates durability and recovery, NOT failover. The restart re-opens the
@@ -31,7 +35,8 @@ log "data plane up, leader pid=$LEADER_PID"
 # the stream is in flight.
 "$VTOP_NODE" produce --client-config "$CLIENT_CFG" --addr "$(native_addr)" \
   --records "$RECORDS" --batch "$BATCH" --durability quorum \
-  --acked-file "$WORKDIR/acked" > "$WORKDIR/logs/produce.log" 2>&1 &
+  --acked-file "$WORKDIR/acked" --history "$(history_file produce)" \
+  > "$WORKDIR/logs/produce.log" 2>&1 &
 PRODUCER=$!
 echo "$PRODUCER" >> "$WORKDIR/pids"
 
@@ -59,9 +64,11 @@ log "acknowledged floor at kill: $FLOOR records"
 # served: it reads records strictly below the HWM and must end exactly there.
 STANDALONE_PID="$(start_standalone)"
 "$VTOP_NODE" verify --client-config "$CLIENT_CFG" --addr "$(native_addr)" \
-  --expect-at-least "$FLOOR" > "$WORKDIR/logs/verify.log" 2>&1 \
+  --expect-at-least "$FLOOR" --dump "$(history_file read)" \
+  > "$WORKDIR/logs/verify.log" 2>&1 \
   || { tail -3 "$WORKDIR/logs/verify.log" >&2; fail "acked records lost after kill -9"; }
 log "recovery verified: $(grep verify_done "$WORKDIR/logs/verify.log")"
+check_history
 
 # The followers hold the replicated prefix too: each one's local committed
 # offset must be at (or beyond) the acknowledged floor.
