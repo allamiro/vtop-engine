@@ -802,6 +802,8 @@ pub struct BrokerCollector {
     group_commit_bytes: CounterFamily,
     group_commit_sync_nanos: CounterFamily,
     group_commit_queue_wait_nanos: CounterFamily,
+    group_commit_overloaded: CounterFamily,
+    group_commit_split_groups: CounterFamily,
     produce_phase_seconds: CounterFamily,
     memory_rejections: CounterFamily,
     backpressure_nanos: CounterFamily,
@@ -905,6 +907,19 @@ impl BrokerCollector {
                 "broker_group_commit_queue_wait_nanoseconds_total",
                 "Nanoseconds the longest-waiting request of each group waited to join it, \
                  summed over groups (one wait per group, not per request)",
+                &[],
+            )?,
+            group_commit_overloaded: CounterFamily::new(
+                "broker_group_commit_overloaded_total",
+                "Produce requests answered Overloaded (retryable, nothing appended) because \
+                 the group-commit queue was full",
+                &[],
+            )?,
+            group_commit_split_groups: CounterFamily::new(
+                "broker_group_commit_split_groups_total",
+                "Commit groups the log refused as a whole for something one member caused \
+                 (a sequence, fencing or size refusal) and re-ran request by request, so \
+                 only that member failed",
                 &[],
             )?,
             produce_phase_seconds: CounterFamily::new(
@@ -1110,6 +1125,11 @@ impl BrokerCollector {
                     &self.group_commit_queue_wait_nanos,
                     metrics.queue_wait_nanos_total(),
                 ),
+                (&self.group_commit_overloaded, metrics.overloaded_total()),
+                (
+                    &self.group_commit_split_groups,
+                    metrics.split_groups_total(),
+                ),
             ] {
                 families.push(family.family([(Vec::new(), total)]));
             }
@@ -1142,6 +1162,8 @@ impl BrokerCollector {
             &self.group_commit_bytes.desc,
             &self.group_commit_sync_nanos.desc,
             &self.group_commit_queue_wait_nanos.desc,
+            &self.group_commit_overloaded.desc,
+            &self.group_commit_split_groups.desc,
             &self.produce_phase_seconds.desc,
             &self.memory_rejections.desc,
             &self.backpressure_nanos.desc,
