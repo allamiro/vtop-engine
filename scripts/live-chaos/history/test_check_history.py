@@ -130,6 +130,16 @@ class CleanHistories(unittest.TestCase):
         h.read("r", [(0, 0, 10), (10, 0, 10)], 20)
         self.assertTrue(h.check()["valid"])
 
+    def test_a_restarted_producer_acknowledged_again_at_the_same_offsets_is_one_copy(self):
+        # Review of #878: the broker answers a resent, already-acknowledged
+        # batch with its original offsets, so two acknowledgements of one
+        # offset for the same logical records are one copy, not two.
+        h = History()
+        h.produce("produce:P:1:100", 1, 0, 10, "ok", 10)
+        h.produce("produce:P:1:200", 1, 0, 10, "ok", 10)
+        h.read("r", [(0, 0, 10)], 10)
+        self.assertTrue(h.check()["valid"], h.check())
+
 class Violations(unittest.TestCase):
     def test_611_an_acknowledged_suffix_truncated_at_failover_is_lost(self):
         h = History()
@@ -200,6 +210,19 @@ class Violations(unittest.TestCase):
         h.produce("p2", 1, 0, 10, "ok", 10)
         h.read("r", [(0, 0, 10)], 10)
         self.assertIn("duplicate", kinds(h.check()))
+
+    def test_one_logical_record_acknowledged_at_two_offsets_is_a_duplicate(self):
+        # Review of #878: a retry under the same producer id and epoch that
+        # the broker appended again instead of deduplicating. Both copies are
+        # visible where they were acknowledged, so nothing is lost; the second
+        # placement is the violation.
+        h = History()
+        h.produce("produce:P:1:100", 1, 0, 10, "ok", 10)
+        h.produce("produce:P:1:200", 1, 0, 10, "ok", 20)
+        h.read("r", [(0, 0, 10), (10, 0, 10)], 20)
+        result = h.check()
+        self.assertEqual(kinds(result), {"duplicate"}, result)
+        self.assertIn("acknowledged at offset 0", result["violations"]["duplicate"]["first"][0])
 
     def test_an_acknowledgement_behind_the_previous_one_is_out_of_order(self):
         h = History()

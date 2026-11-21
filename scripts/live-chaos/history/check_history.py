@@ -33,7 +33,8 @@ it too. The invariants:
 
   lost          every acknowledged record is visible at its acknowledged
                 offset, with its own key and value
-  duplicate     no two acknowledged batches claim one offset, and no
+  duplicate     no offset is acknowledged for two different records, no
+                record is acknowledged at two offsets, and no
                 acknowledged or indeterminate record is visible a second time:
                 a record is its producer's (id, epoch, sequence), so a retry
                 from a new process sends the same records, not new ones
@@ -169,19 +170,34 @@ def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) 
     last = reads[-1]
     visible = last.records
 
-    # Acknowledged batches: each record at its acknowledged offset.
-    claimed: dict[int, Batch] = {}
+    # Acknowledged batches: each record at its acknowledged offset. One offset
+    # may be acknowledged again for the same logical record (the broker
+    # answers a resent, already-acknowledged batch with its original offsets),
+    # never for a different one; and one logical record is acknowledged at one
+    # offset only, or a retry was appended a second time.
+    claimed: dict[int, tuple[Batch, tuple[str, int]]] = {}
+    placed: dict[tuple[str, int], tuple[int, Batch]] = {}
     acked = [b for b in batches if b.outcome == "ok"]
     for batch in acked:
         start = batch.committed_next_offset - batch.count
+        identity = batch.identity()
         for i in range(batch.count):
             offset, sequence = start + i, batch.first_sequence + i
+            record = (identity, sequence)
             other = claimed.get(offset)
-            if other is not None:
+            if other is not None and other[1] != record:
                 violations["duplicate"].append(
-                    f"offset {offset} is acknowledged twice: by {other.name()} and {batch.name()}"
+                    f"offset {offset} is acknowledged twice, for different records: by "
+                    f"{other[0].name()} and {batch.name()}"
                 )
-            claimed[offset] = batch
+            first = placed.get(record)
+            if first is not None and first[0] != offset:
+                violations["duplicate"].append(
+                    f"record {sequence} of {identity} is acknowledged at offset {first[0]} by "
+                    f"{first[1].name()} and again at offset {offset} by {batch.name()}"
+                )
+            claimed.setdefault(offset, (batch, record))
+            placed.setdefault(record, (offset, batch))
             seen = visible.get(offset)
             if seen is None:
                 violations["lost"].append(

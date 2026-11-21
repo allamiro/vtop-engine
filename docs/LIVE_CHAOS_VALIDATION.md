@@ -199,7 +199,7 @@ against it:
 | Check | What fails it |
 |---|---|
 | `lost` | an acknowledged record missing from its acknowledged offset, or a different record there (the #611 and #261 shapes) |
-| `duplicate` | two acknowledgements claiming one offset, or an acknowledged or unanswered record visible a second time. A record is its producer's id, epoch and sequence: a retry from a new process sends the same records again, so an unanswered attempt cannot account for a copy of what its retry was acknowledged for |
+| `duplicate` | one offset acknowledged for two different records, one record acknowledged at two offsets, or an acknowledged or unanswered record visible a second time. A record is its producer's id, epoch and sequence: a retry from a new process sends the same records again, so an unanswered attempt cannot account for a copy of what its retry was acknowledged for, and a resent batch the broker answers with its original offsets is one copy |
 | `order` | a producer acknowledged at an offset below one it was acknowledged at earlier |
 | `phantom` | a visible record that no acknowledged batch claims and no whole unanswered batch accounts for; a record of a refused (`fail`) batch, which is what a fenced leader's writes would be (the #641 shape) |
 | `rewritten` | a record an earlier read saw, below the last read's high watermark, that the last read sees differently |
