@@ -38,6 +38,10 @@ resources:
 # only here: a real deployment keeps the chart's defaults, which are sized
 # for a network, not for a CI runner sharing a core with a compiler.
 meta:
+  # A plaintext admin plane has no certificate to match, so the policy that
+  # is on by default (#732, M2) cannot apply: the lab opt-out, said by name.
+  adminAuthorization:
+    enabled: false
   timers:
     electionTimeoutMinMs: 1500
     electionTimeoutMaxMs: 3000
