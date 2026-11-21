@@ -732,6 +732,49 @@ jobs:
           echo "rendered $manifests manifests"
           test "$manifests" -ge 5
 
+      # Admin authorization is on by default (#732, M2). Asserted on the
+      # rendered configs and the install notes, not the exit code: a chart
+      # that dropped the policy would render as cleanly as one that kept it.
+      - name: Admin authorization is on by default, and the opt-out is said
+        run: |
+          set -euo pipefail
+          for values in default-values.yaml separated-values.yaml replicated-values.yaml; do
+            helm template vtop helm/vtop -f "helm/vtop/ci/$values" > /tmp/authz.yaml
+            grep -qE '^\s*operator_common_names: \["operator"\]$' /tmp/authz.yaml \
+              || { echo "::error::$values: the rendered config does not carry the admin policy with the named operator"; exit 1; }
+          done
+          # No operator at all: only when asked for by name, rendered as the
+          # strictest policy (nobody may), never as no policy.
+          helm template vtop helm/vtop -f helm/vtop/ci/default-values.yaml \
+            --set-json 'meta.adminAuthorization.operatorCommonNames=[]' \
+            --set meta.adminAuthorization.allowNoOperators=true > /tmp/authz-none.yaml
+          grep -qE '^\s*operator_common_names: \[\]$' /tmp/authz-none.yaml \
+            || { echo "::error::allowNoOperators did not render the empty (nobody may) policy"; exit 1; }
+          # The lab opt-out renders no policy, and the install notes say so.
+          helm template vtop helm/vtop -f helm/vtop/ci/plaintext-values.yaml > /tmp/authz-off.yaml
+          if grep -q 'admin_authorization:' /tmp/authz-off.yaml; then
+            echo "::error::the opt-out still rendered an admin policy"; exit 1
+          fi
+          # `helm template` does not render NOTES.txt and `helm install
+          # --dry-run` needs a cluster, so the notes are rendered as an
+          # ordinary template from a copy of the chart. They are not YAML, so
+          # helm exits non-zero after printing them under --debug.
+          rm -rf /tmp/notes-chart && cp -r helm/vtop /tmp/notes-chart
+          cp /tmp/notes-chart/templates/NOTES.txt /tmp/notes-chart/templates/notes-check.txt
+          notes() {
+            helm template vtop /tmp/notes-chart "$@" --debug \
+              --show-only templates/notes-check.txt 2>&1 || true
+          }
+          notes -f helm/vtop/ci/plaintext-values.yaml | grep -q 'WARNING: admin authorization is OFF' \
+            || { echo "::error::the co-located notes do not warn about the opt-out"; exit 1; }
+          notes -f helm/vtop/ci/separated-values.yaml --set meta.adminAuthorization.enabled=false \
+            | grep -q 'WARNING: admin authorization is OFF' \
+            || { echo "::error::the separated notes do not warn about the opt-out"; exit 1; }
+          if notes -f helm/vtop/ci/default-values.yaml | grep -q 'WARNING: admin authorization is OFF'; then
+            echo "::error::the notes warn about an opt-out that was not made"; exit 1
+          fi
+          echo "admin authorization renders on by default; the opt-out renders no policy and is warned about"
+
       # A secret file from an external manager (#733) goes in through
       # extraVolumes as a whole Secret volume at defaultMode 0400 (256), which
       # the kubelet makes 0440 under the chart's fsGroup: the form the archive
@@ -849,7 +892,11 @@ jobs:
             fi
             echo "refused because: $expected"
           }
-          refuses "any identities"
+          # The operator CN is supplied in both cases below: admin
+          # authorization is on by default (#732, M2) and refuses an empty
+          # operator list, so without it a case could be refused for that
+          # instead of for what it names.
+          refuses "any identities" --set 'meta.adminAuthorization.operatorCommonNames={operator}'
           # Every other identity supplied, so rendering REACHES the TLS check
           # instead of aborting earlier. The first version of this step set only
           # cluster.id and stopped at the nodeUuids length check — helm exits
@@ -857,6 +904,7 @@ jobs:
           # the contract it names. A regression that silently stopped refusing
           # TLS would have sailed through it.
           refuses "TLS secret names" \
+            --set 'meta.adminAuthorization.operatorCommonNames={operator}' \
             --set cluster.id=11111111-2222-3333-4444-555555555555 \
             --set 'data.nodeUuids={aaaaaaaa-0000-0000-0000-0000000000a1,aaaaaaaa-0000-0000-0000-0000000000a2,aaaaaaaa-0000-0000-0000-0000000000a3}' \
             --set data.range.topic=telemetry \
@@ -900,6 +948,14 @@ jobs:
             -f helm/vtop/ci/default-values.yaml --set transport.peer=mtls
           refuses_because "transport.admin is plaintext but meta.adminAuthorization.enabled is true" \
             -f helm/vtop/ci/plaintext-values.yaml --set meta.adminAuthorization.enabled=true
+          # Admin authorization is on by default (#732, M2): with no operator
+          # named, no certificate could bootstrap the cluster, so the chart
+          # refuses rather than rendering a policy nobody can use, on both
+          # shapes. Nothing falls back to an open admin plane.
+          refuses_because "meta.adminAuthorization.operatorCommonNames is empty" \
+            -f helm/vtop/ci/default-values.yaml --set-json 'meta.adminAuthorization.operatorCommonNames=[]'
+          refuses_because "meta.adminAuthorization.operatorCommonNames is empty" \
+            -f helm/vtop/ci/separated-values.yaml --set-json 'meta.adminAuthorization.operatorCommonNames=[]'
           # A replicated range is candidates, and the node refuses a candidate
           # on a plaintext replica plane; the chart refuses first.
           refuses_because "transport.replica is plaintext but data.topology is replicated" \

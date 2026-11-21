@@ -183,6 +183,13 @@ with an endpoint set.
   anything that can reach the port and knows that UUID may produce and
   consume); a plaintext admin plane refuses an enforcing
   `admin_authorization`, since there is no CN to match.
+- The Helm chart renders `admin_authorization` by default (#732): only the
+  certificate CNs in `meta.adminAuthorization.operatorCommonNames` may run
+  cluster-scoped admin commands, and the chart refuses to render with the
+  policy on and no operator named rather than fall back to an open admin
+  plane. `meta.adminAuthorization.enabled: false` is the lab opt-out, warned
+  about in the install notes; a hand-written node config without the block is
+  still authenticate-only and warns at startup.
 - Certificate validity alone does not grant a role. The embedding deployment
   **MUST** supply a `SessionAuthorizer` that binds the peer certificate chain,
   declared principal ID, and requested producer/consumer role. Produce requests

@@ -55,7 +55,9 @@ cluster.id is required: the cluster UUID shared by every node. The chart does no
 
 [`helm/vtop/ci/default-values.yaml`](../../helm/vtop/ci/default-values.yaml)
 is a complete example that renders; copy it and replace the identities with
-your own.
+your own. That includes `meta.adminAuthorization.operatorCommonNames`: admin
+authorization is on by default since v0.11.0, so name the Common Name of the
+certificate your `vtopctl` uses, or the chart refuses to render.
 
 ```bash
 helm lint helm/vtop -f my-values.yaml

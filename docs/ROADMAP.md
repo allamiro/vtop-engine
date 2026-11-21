@@ -1339,6 +1339,34 @@ restore drill, a pilot). Failover and crash-durability measurements against
 Apache Kafka stay open (#597, #599), as does the head-to-head throughput run
 (#596).
 
+**Upgrade note for v0.11.0: the Helm chart turns admin authorization on by
+default (#732, M2).** `meta.adminAuthorization.enabled` now defaults to
+`true`. An existing install that never set it now renders only when
+`meta.adminAuthorization.operatorCommonNames` names the Common Names of your
+operator certificates. Otherwise `helm upgrade` stops at render with a message
+naming the three ways out, and nothing is changed in the cluster. Before
+upgrading:
+
+- Find the CN of each certificate your `vtopctl` uses against the admin plane
+  (`openssl x509 -noout -subject -in operator.pem`), and add it:
+  `--set 'meta.adminAuthorization.operatorCommonNames={vtop-admin}'`.
+- Once the policy is on, other certificates the CA signed, data nodes' included,
+  can no longer run `meta init`, change membership or grant leases. A data
+  node keeps its own lease, version report and group cursors. Today a data
+  node's lease *release* at shutdown names no holder, so the policy refuses
+  it as an operator's command and the lease lapses on its deadline (15 s by
+  default): a planned handover waits that long. A release that names its
+  holder, which the policy admits from the node's own certificate, is in
+  review (#870, on metadata feature level 9 from #850); this note will say
+  how to turn it on once both are in.
+- A cluster administered out of band can set `allowNoOperators: true` (nobody
+  may run cluster-scoped commands). A lab can opt out with `enabled: false`;
+  the install notes then print a WARNING. A plaintext admin plane
+  (`transport.admin: plaintext`) needs the opt-out.
+- Turning the policy on changes no on-disk or wire format and is not a
+  one-way step: setting `enabled: false` again removes it on the next
+  rollout.
+
 ---
 
 ## Versioning

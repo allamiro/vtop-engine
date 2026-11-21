@@ -48,6 +48,14 @@ vtop {{ .Chart.AppVersion }} — SEPARATED tiers (#287): {{ $metaCount }} metada
 
    NOTE: admin authorization is ENABLED — only these certificate CNs may run
    cluster-scoped commands: {{ .Values.meta.adminAuthorization.operatorCommonNames | toJson }}
+{{- else }}
+
+   WARNING: admin authorization is OFF (meta.adminAuthorization.enabled: false).
+   Every certificate this cluster's CA signed, every data node's included,
+   may run `meta init`, change membership and grant range leases{{ if eq (toString .Values.transport.admin) "plaintext" }}, and on
+   this plaintext admin plane so may anything that reaches the port{{ end }}.
+   This opt-out is for a lab. Anywhere else, name your operators in
+   meta.adminAuthorization.operatorCommonNames and remove it.
 {{- end }}
 
 4. The data tier reaches metadata through {{ $metaSet }}-0 by default, and
@@ -133,6 +141,14 @@ vtop {{ .Chart.AppVersion }} — {{ int .Values.replicaCount }} co-located node(
 
    NOTE: admin authorization is ENABLED — only these certificate CNs may run
    cluster-scoped commands: {{ .Values.meta.adminAuthorization.operatorCommonNames | toJson }}
+{{- else }}
+
+   WARNING: admin authorization is OFF (meta.adminAuthorization.enabled: false).
+   Every certificate this cluster's CA signed, every data node's included,
+   may run `meta init`, change membership and grant range leases{{ if eq (toString .Values.transport.admin) "plaintext" }}, and on
+   this plaintext admin plane so may anything that reaches the port{{ end }}.
+   This opt-out is for a lab. Anywhere else, name your operators in
+   meta.adminAuthorization.operatorCommonNames and remove it.
 {{- end }}
 
 4. Metrics: Prometheus text on {{ if .Values.observability.tls.secretName }}https{{ else }}http{{ end }}://<pod>:{{ .Values.ports.observability }}/metrics{{ if .Values.observability.tls.secretName }} (TLS: scrape with your CA, or -k in a lab){{ end }}
