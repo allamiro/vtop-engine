@@ -2093,3 +2093,185 @@ async fn a_receipt_finding_quotes_stored_strings_bounded_and_redacted() {
         "what to do: {detail}"
     );
 }
+
+// ---- encryption at rest: every read of a manifest or receipt judges it ------
+
+/// Review of the encryption-at-rest change: an object `verify_object` judges
+/// was the only thing the scrub and recovery re-check looked at, so a batch
+/// whose object is encrypted and whose manifest is not (a re-encrypted data
+/// object, a store that dropped the header on the manifest) scrubbed clean.
+/// `check_stored_batch` is recovery's re-check too.
+#[tokio::test]
+async fn a_manifest_the_store_reports_unencrypted_is_a_finding_though_its_object_is_fine() {
+    let a = archive(2).await;
+    let report = a.scrub(&opts()).await;
+    assert!(
+        report.passed,
+        "an archive nothing asked to encrypt: {report:#?}"
+    );
+
+    a.mock.set_unencrypted_suffix(Some(".manifest.json"), false);
+    let report = a.scrub(&opts()).await;
+    assert!(!report.passed, "{report:#?}");
+    let ledger = a.ledger().await;
+    assert_eq!(
+        findings(&report),
+        ledger
+            .iter()
+            .map(|r| (r.batch_id.clone(), ScrubResult::Mismatched))
+            .collect::<Vec<_>>(),
+        "{report:#?}"
+    );
+    for f in &report.findings {
+        assert!(
+            f.detail.contains("encryption at rest missing") && f.detail.contains("manifest"),
+            "{}",
+            f.detail
+        );
+    }
+
+    // Recovery's re-check is the same function.
+    let keyring = a.engine.config.resolve_manifest_keyring().unwrap();
+    let check = scrub::check_stored_batch(a.engine.backend.as_ref(), &keyring, &ledger[0]).await;
+    assert_eq!(check.result, ScrubResult::Mismatched, "{}", check.detail);
+}
+
+/// The same bytes at the manifest's current key, stored without the
+/// encryption: the version the ledger pinned is fine, the key a reader
+/// fetches is not.
+#[tokio::test]
+async fn an_identical_manifest_at_its_current_key_stored_unencrypted_is_a_finding() {
+    let a = archive(1).await;
+    a.mock.set_unencrypted_suffix(Some(".manifest.json"), true);
+    let report = a.scrub(&opts()).await;
+    assert!(!report.passed, "{report:#?}");
+    assert_eq!(count(&report, ScrubResult::Mismatched), 1, "{report:#?}");
+    assert!(
+        report.findings[0]
+            .detail
+            .contains("the current key of manifest")
+            && report.findings[0]
+                .detail
+                .contains("encryption at rest missing"),
+        "{}",
+        report.findings[0].detail
+    );
+}
+
+/// `vtopctl verify` reports how the store keeps the manifest and the object
+/// when the backend asked for encryption, and fails on one that is not.
+#[tokio::test]
+async fn verify_says_how_the_manifest_and_object_are_kept_and_fails_on_one_unencrypted() {
+    let a = archive(1).await;
+    let keyring = a.engine.config.resolve_manifest_keyring().unwrap();
+    let muri = a.ledger().await[0].manifest_uri.clone().unwrap();
+    let run = || async {
+        vtop_cli::commands::verify_manifest_deep(
+            a.engine.store.as_ref(),
+            a.engine.backend.as_ref(),
+            &muri,
+            &keyring,
+        )
+        .await
+        .unwrap()
+    };
+    let plain = run().await;
+    assert!(
+        !plain.lines.iter().any(|l| l.starts_with("encryption")),
+        "nothing asked for, nothing said: {:?}",
+        plain.lines
+    );
+    a.mock.set_unencrypted_suffix(Some(".manifest.json"), false);
+    let verify = run().await;
+    let line = verify
+        .lines
+        .iter()
+        .find(|l| l.starts_with("encryption"))
+        .unwrap_or_else(|| panic!("{:?}", verify.lines));
+    assert!(
+        line.contains("manifest FAILED") && line.contains("object OK"),
+        "{line}"
+    );
+    assert!(
+        verify
+            .lines
+            .iter()
+            .any(|l| l.ends_with(": FAILED") && l.starts_with("verdict")),
+        "{:?}",
+        verify.lines
+    );
+}
+
+/// Review of #856: `vtopctl verify --json` printed `passed: false` with every
+/// reported check a success when encryption alone failed, because the
+/// encryption results reached only the human-readable lines. The JSON names
+/// each object, how the store keeps it, and why it failed.
+#[tokio::test]
+async fn verify_json_names_the_object_kept_unencrypted_and_why() {
+    let a = archive(1).await;
+    let keyring = a.engine.config.resolve_manifest_keyring().unwrap();
+    let muri = a.ledger().await[0].manifest_uri.clone().unwrap();
+    let run = || async {
+        vtop_cli::commands::verify_manifest_deep(
+            a.engine.store.as_ref(),
+            a.engine.backend.as_ref(),
+            &muri,
+            &keyring,
+        )
+        .await
+        .unwrap()
+    };
+    let plain = run().await;
+    assert!(plain.passed, "{:?}", plain.lines);
+    let object_uri = plain.json["object_uri"].as_str().unwrap().to_owned();
+    assert_eq!(
+        plain.json["encryption"],
+        serde_json::json!([
+            {"target": "manifest", "uri": muri, "state": "not_requested", "reason": null},
+            {"target": "object", "uri": object_uri, "state": "not_requested", "reason": null},
+        ]),
+        "{:#}",
+        plain.json
+    );
+
+    a.mock.set_unencrypted_suffix(Some(&object_uri), false);
+    let verify = run().await;
+    assert!(!verify.passed);
+    assert_eq!(verify.json["passed"], false);
+    let encryption = verify.json["encryption"].as_array().unwrap();
+    assert_eq!(encryption.len(), 2, "{:#}", verify.json);
+    assert_eq!(encryption[0]["target"], "manifest");
+    assert_eq!(encryption[0]["state"], "encrypted");
+    assert!(encryption[0]["reason"].is_null(), "{:#}", verify.json);
+    assert_eq!(encryption[1]["target"], "object");
+    assert_eq!(encryption[1]["uri"], object_uri.as_str());
+    assert_eq!(encryption[1]["state"], "violation");
+    let reason = encryption[1]["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("encryption at rest missing") && reason.contains(&object_uri),
+        "{reason}"
+    );
+}
+
+/// A receipt kept without the encryption is a receipt finding, like one that
+/// does not authenticate; the batch's own content is fine.
+#[tokio::test]
+async fn a_receipt_the_store_reports_unencrypted_is_a_receipt_finding() {
+    let a = receipted_archive(1, None).await;
+    a.mock.set_unencrypted_suffix(Some(".receipt.json"), false);
+    let report = a.scrub(&with_receipts(false)).await;
+    let ledger = a.ledger().await;
+    assert_eq!(
+        receipt_findings(&report),
+        vec![(ledger[0].batch_id.clone(), ReceiptResult::Mismatched)],
+        "{report:#?}"
+    );
+    assert!(
+        report.findings[0]
+            .detail
+            .contains("encryption at rest missing"),
+        "{}",
+        report.findings[0].detail
+    );
+    assert_eq!(count(&report, ScrubResult::Ok), 1, "content is intact");
+}
