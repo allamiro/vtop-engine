@@ -844,7 +844,12 @@ pub async fn verify(config: &ClientConfig, args: VerifyArgs) -> Result<i32, Stri
          high_watermark={high_watermark}"
     );
     if let Some(path) = args.dump.as_ref() {
-        let mut history = History::open(path, &format!("read:{}", std::process::id()))?;
+        // The pid alone can come round again in a run of days (the cluster
+        // soak, #727); the start time makes the read's name its own.
+        let mut history = History::open(
+            path,
+            &format!("read:{}:{}", std::process::id(), unix_micros()?),
+        )?;
         for run in &runs {
             history.event(fields([
                 ("op", "read".into()),

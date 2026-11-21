@@ -151,6 +151,7 @@ class Read:
 def load(lines: list[str]) -> tuple[list[Batch], list[Read]]:
     batches: dict[tuple[str, int], Batch] = {}
     reads: dict[str, Read] = {}
+    finished: list[Read] = []
     for number, line in enumerate(lines, 1):
         line = line.strip()
         if not line:
@@ -200,11 +201,14 @@ def load(lines: list[str]) -> tuple[list[Batch], list[Read]]:
                 read.high_watermark = event["high_watermark"]
                 read.end_time_us = event.get("time_us", 0)
                 read.start_offset = event.get("start_offset", 0)
+                # An `end` closes the read: a later read under the same name
+                # (a reused pid, in a run of days) is a read of its own
+                # (review of #881).
+                finished.append(reads.pop(process))
             else:
                 raise ValueError(f"line {number}: unknown read event {kind!r}")
         else:
             raise ValueError(f"line {number}: unknown op {op!r}")
-    finished = [r for r in reads.values() if r.high_watermark is not None]
     finished.sort(key=lambda r: r.end_time_us)
     return list(batches.values()), finished
 
@@ -350,9 +354,20 @@ def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) 
     # group none, where another tiling of the first would have served both
     # (review of #878). When there is none, each group is explained on its
     # own below, which is what names the groups that cannot be.
-    tasks = [
-        ([visible[o][0] for o in g], all(visible[o][1] for o in g)) for g in keyed
-    ]
+    def acked_at(offset: int):
+        holder = claimed.get(offset)
+        return holder[1] if holder is not None else None
+
+    def task_of(group: list[int]) -> Task:
+        return Task(
+            [visible[o][0] for o in group],
+            all(visible[o][1] for o in group),
+            group[0],
+            group[-1],
+            acked_at,
+        )
+
+    tasks = [task_of(g) for g in keyed]
     if _explain_all(tasks, indeterminate, used, surfaced):
         keyed_explained = True
     else:
@@ -373,7 +388,7 @@ def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) 
                 violations["unkeyed"].append(message)
             continue
         all_values_match = all(visible[o][1] for o in group)
-        if _explain(sequences, all_values_match, indeterminate, used, surfaced):
+        if _explain(task_of(group), indeterminate, used, surfaced):
             continue
         matching_refused = [b.name() for b in refused if _covers(b, sequences)]
         already_visible = [
@@ -406,27 +421,42 @@ def _covers(batch: Batch, sequences: list[int]) -> bool:
 
 
 def _tilings(
-    sequences: list[int],
-    values_match: bool,
+    task: "Task",
     indeterminate: list[Batch],
     used: set[tuple[str, int]],
     surfaced: set[tuple[str, int]],
     budget: list[int],
 ):
-    """Each way indeterminate batches tile `sequences` whole, in order, each
-    used once and none repeating a logical record already visible. Yields with
-    the tiling applied to `used` and `surfaced` (a batch is appended whole or
-    not at all) and takes it back when resumed, so a caller that stops at a
-    tiling keeps it. The search backtracks: the first batch that fits a
-    position can lead to a dead end another would not (an unanswered 0..4 and
-    an unanswered 0..9 under a visible 0..9). Batches of one producer with the
-    same sequences are interchangeable, so each position tries one of each
-    shape, the earliest. `budget` bounds the steps across every search."""
-    if not values_match:
+    """Each way indeterminate batches tile a group's sequences whole, in
+    order, each used once and none repeating a logical record already
+    visible. Yields with the tiling applied to `used` and `surfaced` (a batch
+    is appended whole or not at all) and takes it back when resumed, so a
+    caller that stops at a tiling keeps it. The search backtracks: the first
+    batch that fits a position can lead to a dead end another would not (an
+    unanswered 0..4 and an unanswered 0..9 under a visible 0..9). Batches of
+    one producer with the same sequences are interchangeable, so each
+    position tries one of each shape, the earliest. `budget` bounds the steps
+    across every search.
+
+    The first batch may begin before the group, and the last may end after
+    it, where the records outside the group are visible right beside it and
+    acknowledged there as the same logical records: a retry of part of an
+    unanswered batch is answered with the offsets the batch already holds
+    (review of #878). Those records are the acknowledgement's, not a second
+    copy."""
+    sequences = task.sequences
+    if not task.values_match:
         return
-    by_start: dict[int, list[Batch]] = defaultdict(list)
+    covering: dict[int, list[Batch]] = defaultdict(list)
     for batch in sorted(indeterminate, key=lambda b: (b.time_us, b.process, b.batch)):
-        by_start[batch.first_sequence].append(batch)
+        for sequence in range(batch.first_sequence, batch.first_sequence + batch.count):
+            covering[sequence].append(batch)
+
+    def beside(batch: Batch, offsets: range, first_sequence: int) -> bool:
+        identity = batch.identity()
+        return all(
+            task.acked_at(offset) == (identity, first_sequence + i) for i, offset in enumerate(offsets)
+        )
 
     def search(position: int):
         if position == len(sequences):
@@ -435,43 +465,62 @@ def _tilings(
         budget[0] -= 1
         if budget[0] < 0:
             return
-        shapes: set[tuple[str, int]] = set()
-        for batch in by_start.get(sequences[position], []):
-            shape = (batch.identity(), batch.count)
+        shapes: set[tuple[str, int, int]] = set()
+        sequence = sequences[position]
+        for batch in covering.get(sequence, []):
+            shape = (batch.identity(), batch.first_sequence, batch.count)
+            before = sequence - batch.first_sequence
+            inside = min(batch.count - before, len(sequences) - position)
+            after = batch.count - before - inside
             if (
                 shape in shapes
                 or (batch.process, batch.batch) in used
-                or position + batch.count > len(sequences)
-                or sequences[position + batch.count - 1] != batch.first_sequence + batch.count - 1
+                or (before and position != 0)
+                or (after and position + inside != len(sequences))
+                or sequences[position + inside - 1] != sequence + inside - 1
+                or not beside(batch, range(task.first_offset - before, task.first_offset), batch.first_sequence)
+                or not beside(batch, range(task.last_offset + 1, task.last_offset + 1 + after), sequence + inside)
             ):
                 continue
-            logical = batch.logical()
+            identity = batch.identity()
+            logical = {(identity, sequence + i) for i in range(inside)}
             if logical & surfaced:
                 continue
             shapes.add(shape)
             used.add((batch.process, batch.batch))
             surfaced.update(logical)
-            yield from search(position + batch.count)
+            yield from search(position + inside)
             surfaced.difference_update(logical)
             used.discard((batch.process, batch.batch))
 
     yield from search(0)
 
 
+@dataclass
+class Task:
+    """One visible group to explain: its sequences, whether every value is the
+    producer's, its offsets, and which logical record is acknowledged where."""
+
+    sequences: list[int]
+    values_match: bool
+    first_offset: int
+    last_offset: int
+    acked_at: "object"
+
+
 def _explain(
-    sequences: list[int],
-    values_match: bool,
+    task: Task,
     indeterminate: list[Batch],
     used: set[tuple[str, int]],
     surfaced: set[tuple[str, int]],
 ) -> bool:
     """Whether one group has a tiling; the first found is kept applied."""
-    tilings = _tilings(sequences, values_match, indeterminate, used, surfaced, [SEARCH_BUDGET])
+    tilings = _tilings(task, indeterminate, used, surfaced, [SEARCH_BUDGET])
     return next(tilings, False) is None
 
 
 def _explain_all(
-    tasks: list[tuple[list[int], bool]],
+    tasks: list[Task],
     indeterminate: list[Batch],
     used: set[tuple[str, int]],
     surfaced: set[tuple[str, int]],
@@ -483,8 +532,7 @@ def _explain_all(
     def assign(index: int) -> bool:
         if index == len(tasks):
             return True
-        sequences, values_match = tasks[index]
-        for _ in _tilings(sequences, values_match, indeterminate, used, surfaced, budget):
+        for _ in _tilings(tasks[index], indeterminate, used, surfaced, budget):
             if assign(index + 1):
                 return True
         return False

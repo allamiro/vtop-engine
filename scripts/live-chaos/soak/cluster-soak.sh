@@ -119,6 +119,9 @@ VALUE_BYTES="$(field value_bytes)"
 SAMPLE_INTERVAL="$(field sample_interval_s)"
 READ_INTERVAL="$(field read_interval_s)"
 RECOVERY_TIMEOUT="$(field recovery_timeout_s)"
+# One read of the retained range takes seconds; a read that has not finished
+# in this long is stuck, not slow.
+READ_TIMEOUT="${CHAOS_SOAK_READ_TIMEOUT_SECONDS:-300}"
 TMPFS_MIB="$(field data_tmpfs_mib)"
 RETENTION_BYTES="$(field retention_bytes)"
 export CHAOS_MAX_SEGMENT_BYTES CHAOS_MAX_GROUP_BYTES CHAOS_MAX_RECORD_BYTES
@@ -359,7 +362,11 @@ read_once() {
   start="$(metric_value "$(data_metrics_addr $((n + 10)))" vtop_broker_log_start_offset 2> /dev/null || echo 0)"
   start="${start%.*}"
   out="$WORKDIR/logs/read.log"
-  "$VTOP_NODE" verify --client-config "$(emit_client_config_at_epoch "$epoch" 1)" \
+  # Bounded (review of #881): verify has no deadline of its own, and a node
+  # that accepts a connection and never answers (a paused leader, a disk that
+  # stalls) would hold the reader, and the final read, forever. A read that
+  # runs out of time is a failed read, and the run goes on to its verdict.
+  timeout --kill-after=5 "$READ_TIMEOUT" "$VTOP_NODE" verify --client-config "$(emit_client_config_at_epoch "$epoch" 1)" \
     --addr "$(candidate_native_addr "$n")" --expect-at-least 0 --verify-content-through 0 \
     --max-offset-gaps 1000000000000 --value-bytes "$VALUE_BYTES" --from-offset "$start" \
     --dump "$READ_HISTORY" > "$out" 2>&1 || code=$?
