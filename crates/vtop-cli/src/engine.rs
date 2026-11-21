@@ -2581,7 +2581,14 @@ impl PendingBuffer {
             vtop_core::event_time::earliest(self.first_timestamp.take(), read.first_timestamp);
         self.last_timestamp =
             vtop_core::event_time::latest(self.last_timestamp.take(), read.last_timestamp);
-        self.latest_end = Some(read.progress_end);
+        // A spool marker's received-time range likewise covers every read of
+        // the window, not only the last one's lines. The times are not part
+        // of the range the adapter settles a commit by.
+        let mut end = read.progress_end;
+        if let Some(prev) = &self.latest_end {
+            end.widen_received_times(prev);
+        }
+        self.latest_end = Some(end);
         if self
             .rebuild_end
             .is_some_and(|end| self.end_position() > Some(end))
@@ -6782,6 +6789,66 @@ mod tests {
             drained.last_timestamp.as_deref(),
             Some("2026-01-01T10:30:00.000Z")
         );
+    }
+
+    /// A buffered spool window's marker carries the earliest and latest line
+    /// times of all its reads, so its manifest does not describe only the
+    /// last read's lines.
+    #[test]
+    fn a_buffered_spool_window_keeps_the_earliest_and_latest_line_time() {
+        let source = DiscoveredSource {
+            source_type: SourceType::SyslogSpool,
+            source_name: "/spool".into(),
+            format: vtop_core::types::TelemetryFormat::Syslog,
+        };
+        let mut buf = PendingBuffer::new("default", source, BatchLimits::default());
+        let marker = |start: u64, end: u64, lo: Option<&str>, hi: Option<&str>| {
+            ProgressMarker::SyslogSpool {
+                spool_id: "spool".into(),
+                path: "/spool".into(),
+                inode: Some(7),
+                start_byte: start,
+                end_byte: end,
+                received_time_start: lo.map(str::to_owned),
+                received_time_end: hi.map(str::to_owned),
+                file_size: Some(300),
+                content_fingerprint: None,
+            }
+        };
+        let read = |start: u64, end: u64, lo: Option<&str>, hi: Option<&str>| ReadResult {
+            records: vec![b"r".to_vec()],
+            progress_start: marker(start, start, None, None),
+            progress_end: marker(start, end, lo, hi),
+            first_timestamp: None,
+            last_timestamp: None,
+            verbatim: false,
+        };
+        buf.append(read(
+            0,
+            100,
+            Some("2026-11-14T10:00:00Z"),
+            Some("2026-11-14T10:30:00Z"),
+        ));
+        buf.append(read(
+            100,
+            200,
+            Some("2026-11-14T09:00:00Z"),
+            Some("2026-11-14T09:05:00Z"),
+        ));
+        buf.append(read(200, 300, None, None));
+        let drained = buf.drain().unwrap();
+        let window = window_marker(&drained);
+        assert_eq!(window.range_token(), "b0-300");
+        let ProgressMarker::SyslogSpool {
+            received_time_start,
+            received_time_end,
+            ..
+        } = window
+        else {
+            unreachable!()
+        };
+        assert_eq!(received_time_start.as_deref(), Some("2026-11-14T09:00:00Z"));
+        assert_eq!(received_time_end.as_deref(), Some("2026-11-14T10:30:00Z"));
     }
 
     /// #66: a mutating engine is single-instance per state store AND work dir;

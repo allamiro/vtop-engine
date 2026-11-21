@@ -11,6 +11,7 @@ use crate::base::{
 use crate::continuity::{self, Discontinuity, Observed};
 use crate::file_source::{CutOutcome, RefusedCut};
 use async_trait::async_trait;
+use chrono::{DateTime, SecondsFormat, Utc};
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
@@ -252,6 +253,7 @@ impl SyslogSpoolSource {
     fn apply_slice(&mut self, path: &str, slice: SpoolSlice) -> ReadResult {
         let SpoolSlice {
             records,
+            times,
             start,
             end,
             seen,
@@ -259,7 +261,7 @@ impl SyslogSpoolSource {
             cut: _,
         } = slice;
         let progress_start = Self::marker(path, &seen, start, start);
-        let progress_end = Self::marker(path, &seen, start, end);
+        let progress_end = Self::timed_marker(path, &seen, start, end, &times);
         let cursor = self.cursors.entry(path.to_string()).or_default();
         if let Some(why) = discontinuity {
             tracing::warn!(path, previous_read_byte = cursor.read_byte, "{why}");
@@ -359,14 +361,26 @@ impl SyslogSpoolSource {
     /// without which the coverage audit could not split a spool into the
     /// contents that lived at one inode.
     fn marker(path: &str, seen: &SpoolSeen, start: u64, end: u64) -> ProgressMarker {
+        Self::timed_marker(path, seen, start, end, &LineTimes::default())
+    }
+
+    /// [`Self::marker`] with the earliest and latest line times of the bytes
+    /// it names.
+    fn timed_marker(
+        path: &str,
+        seen: &SpoolSeen,
+        start: u64,
+        end: u64,
+        times: &LineTimes,
+    ) -> ProgressMarker {
         ProgressMarker::SyslogSpool {
             spool_id: Self::spool_id(path),
             path: path.to_string(),
             inode: seen.inode,
             start_byte: start,
             end_byte: end,
-            received_time_start: None,
-            received_time_end: None,
+            received_time_start: times.earliest(),
+            received_time_end: times.latest(),
             file_size: Some(seen.file_size),
             content_fingerprint: seen.content.clone(),
         }
@@ -462,6 +476,7 @@ impl SyslogSpoolSource {
         let mut reader = BufReader::with_capacity(buffer_capacity, file.take(read_limit));
 
         let mut records = Vec::new();
+        let mut times = LineTimes::default();
         let mut bytes_read: u64 = 0;
         let mut pos = start;
         let mut cut_outcome = CutOutcome::None;
@@ -504,6 +519,7 @@ impl SyslogSpoolSource {
             pos += n as u64;
             bytes_read += n as u64;
             line.pop();
+            times.add(&line);
             records.push(line);
         }
         // Fingerprint the descriptor whose bytes were actually consumed. A
@@ -519,6 +535,7 @@ impl SyslogSpoolSource {
         }
         Ok(SpoolSlice {
             records,
+            times,
             start,
             end: pos,
             seen,
@@ -547,6 +564,8 @@ impl SpoolReadError {
 /// What a completed spool read hands back.
 struct SpoolSlice {
     records: Vec<Vec<u8>>,
+    /// The earliest and latest times the records' lines start with.
+    times: LineTimes,
     /// Where the read STARTED: the cursor's position, or byte 0 after a
     /// rotation or truncation.
     start: u64,
@@ -555,6 +574,83 @@ struct SpoolSlice {
     discontinuity: Option<Discontinuity>,
     /// What became of the cut the read was given (#626).
     cut: CutOutcome,
+}
+
+/// The earliest and latest times a read's lines start with, for the spool
+/// marker's `received_time_start` and `received_time_end`.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct LineTimes {
+    range: Option<(DateTime<Utc>, DateTime<Utc>)>,
+}
+
+impl LineTimes {
+    fn add(&mut self, line: &[u8]) {
+        let Some(t) = line_time(line) else {
+            return;
+        };
+        self.range = Some(match self.range {
+            None => (t, t),
+            Some((lo, hi)) => (lo.min(t), hi.max(t)),
+        });
+    }
+
+    fn earliest(&self) -> Option<String> {
+        self.range.map(|(lo, _)| format_time(lo))
+    }
+
+    fn latest(&self) -> Option<String> {
+        self.range.map(|(_, hi)| format_time(hi))
+    }
+}
+
+/// RFC 3339 in UTC, with as many fractional digits as the instant needs
+/// (none, 3, 6 or 9).
+fn format_time(t: DateTime<Utc>) -> String {
+    t.to_rfc3339_opts(SecondsFormat::AutoSi, true)
+}
+
+/// The longest leading token read as a time: RFC 3339 with nanoseconds and
+/// an offset is 35 bytes.
+const MAX_TIME_TOKEN: usize = 64;
+
+/// The time a spool line starts with, when it starts with one that names an
+/// instant: an RFC 3339 timestamp, as rsyslog's `RSYSLOG_FileFormat` and
+/// syslog-ng's ISO date write it, after an optional `<PRI>`; or the
+/// `TIMESTAMP` of an RFC 5424 header (`<PRI>VERSION TIMESTAMP ...`).
+///
+/// An RFC 3164 timestamp (`Nov 14 11:00:00`) carries no year and no zone, so
+/// it names no instant and gives `None`, as do the RFC 5424 nil value `-`
+/// and a line that starts with anything else. A time is what the collector
+/// wrote at the start of the line: its receive time under a template that
+/// writes one (rsyslog's `%timegenerated%`), otherwise the message's own.
+fn line_time(line: &[u8]) -> Option<DateTime<Utc>> {
+    let mut rest = line;
+    if let Some(after) = rest.strip_prefix(b"<") {
+        let close = after.iter().take(4).position(|&b| b == b'>')?;
+        if close == 0 || !after[..close].iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        rest = &after[close + 1..];
+        // RFC 5424: a VERSION of one or two digits, not starting with 0,
+        // then a space and the TIMESTAMP.
+        let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+        if (1..=2).contains(&digits) && rest[0] != b'0' && rest.get(digits) == Some(&b' ') {
+            rest = &rest[digits + 1..];
+        }
+    }
+    let token = match rest
+        .iter()
+        .take(MAX_TIME_TOKEN + 1)
+        .position(|&b| b == b' ' || b == b'\t')
+    {
+        Some(len) => &rest[..len],
+        None if rest.len() <= MAX_TIME_TOKEN => rest,
+        None => return None,
+    };
+    let token = std::str::from_utf8(token).ok()?;
+    DateTime::parse_from_rfc3339(token)
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
 }
 
 /// How many spool files are read concurrently in one pass.
@@ -1251,6 +1347,119 @@ mod tests {
         assert_eq!(again[0].records, first[0].records);
         assert_eq!(again[1].records, vec![b"<13>three".to_vec()]);
         assert!(s.take_refused_cuts().is_empty());
+    }
+
+    /// The times a spool line can start with that name an instant, and the
+    /// ones that do not.
+    #[test]
+    fn a_line_time_is_read_only_where_it_names_an_instant() {
+        let t = |line: &str| line_time(line.as_bytes()).map(format_time);
+        let at = |s: &str| Some(s.to_string());
+        // rsyslog RSYSLOG_FileFormat and syslog-ng ISO dates.
+        assert_eq!(
+            t("2026-11-14T11:00:00.123456+01:00 host app[1]: m"),
+            at("2026-11-14T10:00:00.123456Z")
+        );
+        assert_eq!(t("2026-11-14T11:00:00Z host m"), at("2026-11-14T11:00:00Z"));
+        assert_eq!(
+            t("<13>2026-11-14T11:00:00Z host m"),
+            at("2026-11-14T11:00:00Z")
+        );
+        assert_eq!(t("2026-11-14T11:00:00Z"), at("2026-11-14T11:00:00Z"));
+        // RFC 5424 headers.
+        assert_eq!(
+            t("<165>1 2026-11-14T11:00:00.000000001-05:00 host app - ID47 - m"),
+            at("2026-11-14T16:00:00.000000001Z")
+        );
+        assert_eq!(t("<34>1 - host app - - - m"), None, "the nil timestamp");
+        // RFC 3164 has no year and no zone; anything else is no time.
+        assert_eq!(t("<13>Nov 14 11:00:00 host app: m"), None);
+        assert_eq!(t("Nov 14 11:00:00 host app: m"), None);
+        assert_eq!(t("<13>msg one"), None);
+        assert_eq!(t("<1x>2026-11-14T11:00:00Z m"), None);
+        assert_eq!(t("<>2026-11-14T11:00:00Z m"), None);
+        assert_eq!(t("<13>01 2026-11-14T11:00:00Z m"), None, "no such version");
+        assert_eq!(t("2026-11-14 11:00:00Z m"), None);
+        assert_eq!(t("2026-13-14T11:00:00Z m"), None);
+        assert_eq!(t(""), None);
+        assert_eq!(t(&"9".repeat(500)), None);
+        assert_eq!(line_time(b"\xff\xfe 2026"), None);
+    }
+
+    /// A read's end marker carries the earliest and latest times its lines
+    /// start with (out of order, as a collector can write them); its start
+    /// marker, a position, carries none. A spool whose lines name no instant
+    /// gives a marker without times, as before.
+    #[tokio::test]
+    async fn a_read_marks_the_earliest_and_latest_line_time() {
+        let received = |m: &ProgressMarker| match m {
+            ProgressMarker::SyslogSpool {
+                received_time_start,
+                received_time_end,
+                ..
+            } => (received_time_start.clone(), received_time_end.clone()),
+            _ => panic!("expected spool marker"),
+        };
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "<13>1 2026-11-14T11:00:05Z host app - - - two").unwrap();
+        writeln!(f, "<13>Nov 14 11:00:00 host app: untimed").unwrap();
+        writeln!(f, "2026-11-14T12:00:00+01:00 host app: one").unwrap();
+        writeln!(f, "2026-11-14T11:00:09.5Z host app: three").unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_string_lossy().into_owned();
+        let src = DiscoveredSource {
+            source_type: SourceType::SyslogSpool,
+            source_name: path.clone(),
+            format: TelemetryFormat::Syslog,
+        };
+        let mut s = SyslogSpoolSource::new(vec![path.clone()]);
+        let reads = s
+            .read_batch_candidates(&src, 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0].records.len(), 4);
+        assert_eq!(
+            received(&reads[0].progress_end),
+            (
+                Some("2026-11-14T11:00:00Z".into()),
+                Some("2026-11-14T11:00:09.500Z".into())
+            )
+        );
+        assert_eq!(received(&reads[0].progress_start), (None, None));
+        // The concurrent pass marks its reads the same way.
+        let mut s = SyslogSpoolSource::new(vec![path.clone()]);
+        let report = s
+            .read_all_batch_candidates(std::slice::from_ref(&src), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        let reads = report.outcomes[0].result.as_ref().unwrap();
+        assert_eq!(
+            received(&reads[0].progress_end),
+            (
+                Some("2026-11-14T11:00:00Z".into()),
+                Some("2026-11-14T11:00:09.500Z".into())
+            )
+        );
+
+        let mut g = tempfile::NamedTempFile::new().unwrap();
+        writeln!(g, "<13>msg one").unwrap();
+        g.flush().unwrap();
+        let path = g.path().to_string_lossy().into_owned();
+        let mut s = SyslogSpoolSource::new(vec![path.clone()]);
+        let reads = s
+            .read_batch_candidates(
+                &DiscoveredSource {
+                    source_name: path,
+                    ..src
+                },
+                100,
+                1 << 20,
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        assert_eq!(received(&reads[0].progress_end), (None, None));
     }
 
     #[tokio::test]
