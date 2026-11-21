@@ -880,6 +880,21 @@ async fn without_a_checksum_the_object_is_named_per_attempt_and_says_so() {
 struct NoAbsentAnswer {
     inner: Arc<MockBackend>,
     heads: AtomicUsize,
+    /// Objects put (manifests are not counted).
+    puts: AtomicUsize,
+    /// Reads back of an object that the store throttles (#773).
+    throttle_verifies: std::sync::atomic::AtomicBool,
+}
+
+impl NoAbsentAnswer {
+    fn over(inner: MockBackend) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::new(inner),
+            heads: AtomicUsize::new(0),
+            puts: AtomicUsize::new(0),
+            throttle_verifies: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
 }
 
 #[async_trait]
@@ -890,6 +905,7 @@ impl UploadBackend for NoAbsentAnswer {
         object_uri: &str,
         checksum: Option<ObjectChecksum<'_>>,
     ) -> Result<StoredObject, VtopError> {
+        self.puts.fetch_add(1, Ordering::SeqCst);
         self.inner
             .put_object(local_path, object_uri, checksum)
             .await
@@ -924,6 +940,10 @@ impl UploadBackend for NoAbsentAnswer {
         expected_size: u64,
         expected: Option<ObjectChecksum<'_>>,
     ) -> Result<VerificationResult, VtopError> {
+        if self.throttle_verifies.load(Ordering::SeqCst) && !object_uri.ends_with(".manifest.json")
+        {
+            return Err(VtopError::UploadThrottled("SlowDown".into()));
+        }
         self.inner
             .verify_object(object_uri, expected_size, expected)
             .await
@@ -947,10 +967,7 @@ async fn a_backend_without_an_absent_answer_is_not_probed_and_names_per_attempt(
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("app.log");
     write_lines(&input, "app", 4);
-    let backend = Arc::new(NoAbsentAnswer {
-        inner: Arc::new(MockBackend::new()),
-        heads: AtomicUsize::new(0),
-    });
+    let backend = NoAbsentAnswer::over(MockBackend::new());
     assert!(!backend.reports_absent_objects(), "the trait's default");
     let (logs, _guard) = Logs::capture();
     let mut e = Engine::new(
@@ -1803,4 +1820,344 @@ async fn a_row_without_a_seal_instant_is_not_reported_as_rebuilt() {
         "no instant, no claim"
     );
     assert!(logs.events("replay_rebuilt").is_empty());
+}
+
+// ---- #773: a backend that cannot report an absent key adopts the earlier
+// attempt's object ------------------------------------------------------------
+
+/// A command backend over the mock, the engine on it, and the first attempt:
+/// the object put lands, the manifest put is throttled, the batch fails and
+/// its range is handed back. Returns what a replay needs, the engine, the
+/// backend, the failed batch's id and the key it recorded.
+struct FailedFirstAttempt {
+    engine: Engine,
+    backend: Arc<NoAbsentAnswer>,
+    input: PathBuf,
+    first_batch: String,
+    recorded: String,
+    _dir: tempfile::TempDir,
+}
+
+async fn failed_first_attempt(tenant: &str, inner: MockBackend) -> FailedFirstAttempt {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 4);
+    let backend = NoAbsentAnswer::over(inner.with_throttled_manifest_puts(1));
+    let mut cfg = config(dir.path(), "state.db", std::slice::from_ref(&input));
+    cfg.engine.tenant = tenant.into();
+    let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+        .await
+        .unwrap();
+    engine.backend = backend.clone() as Arc<dyn UploadBackend>;
+    let first = engine.process_once(SourceType::File).await.unwrap();
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert!(
+        !first[0].committed,
+        "the throttled manifest fails the batch"
+    );
+    let row = engine
+        .store
+        .get_batch(&first[0].batch_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let recorded = row.object_uri.clone().expect("the object put was recorded");
+    assert!(
+        recorded.contains(&first[0].batch_id),
+        "a command backend writes under the attempt key: {recorded}"
+    );
+    assert!(backend.inner.contains(&recorded));
+    assert_eq!(backend.puts.load(Ordering::SeqCst), 1);
+    FailedFirstAttempt {
+        engine,
+        backend,
+        input,
+        first_batch: first[0].batch_id.clone(),
+        recorded,
+        _dir: dir,
+    }
+}
+
+/// #773, the issue's first case: the replay rebuilds the window, the ledger
+/// recorded the object the first attempt put, and a read of its stored bytes
+/// verifies against the rebuilt batch's digest. The replay adopts it: no
+/// second put, the committed row names the earlier object, and the decision
+/// is counted and logged with what happened, what the engine did and what to
+/// do. Fails on main, where the replay writes under its own key.
+#[tokio::test]
+async fn a_command_backend_adopts_the_earlier_attempts_intact_object() {
+    let tenant = "adopt-773";
+    let mut t = failed_first_attempt(tenant, MockBackend::new()).await;
+    let (logs, _guard) = Logs::capture();
+    let adopted_before = decisions(tenant, "adopted");
+    let rejected_before = decisions(tenant, "adopt_rejected");
+    let exact_before = rebuilds(tenant, "exact");
+    let fallback_before = rebuilds(tenant, "fallback");
+
+    let second = t.engine.process_once(SourceType::File).await.unwrap();
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert!(second[0].committed, "{second:?}");
+    assert_ne!(
+        second[0].batch_id, t.first_batch,
+        "each attempt has its row"
+    );
+    assert_eq!(
+        second[0].object_uri.as_deref(),
+        Some(t.recorded.as_str()),
+        "the replay adopted the object the first attempt uploaded"
+    );
+    assert_eq!(
+        t.backend.puts.load(Ordering::SeqCst),
+        1,
+        "no second object was put"
+    );
+    assert!(
+        !put_twice(&t.backend.inner, &t.recorded).await,
+        "and the recorded key was not written to"
+    );
+    assert_eq!(decisions(tenant, "adopted"), adopted_before + 1);
+    assert_eq!(decisions(tenant, "adopt_rejected"), rejected_before);
+    assert_eq!(
+        rebuilds(tenant, "exact"),
+        exact_before + 1,
+        "an adopted object is the exact rebuild's object"
+    );
+    assert_eq!(rebuilds(tenant, "fallback"), fallback_before);
+
+    let event = logs.one("object_key_adopted", &second[0].batch_id);
+    assert_eq!(text(&event, "level"), "INFO");
+    assert_eq!(text(&event, "earlier_batch_id"), t.first_batch);
+    assert_event(
+        &event,
+        &t.recorded,
+        &file_range(&t.input),
+        &[
+            &format!("by an earlier attempt (batch {})", t.first_batch),
+            "stored bytes were read back and match this batch's digest",
+            "adopted and nothing is uploaded",
+            "nothing to do",
+        ],
+    );
+    assert!(
+        logs.events("object_key_per_attempt")
+            .iter()
+            .all(|e| text(e, "batch_id") != second[0].batch_id),
+        "the replay is not also reported as per-attempt"
+    );
+
+    // The committed row scrubs clean against the adopted object (read
+    // through the mock itself: the command wrapper cannot read a pinned
+    // manifest version, as a real command backend cannot).
+    t.engine.backend = t.backend.inner.clone() as Arc<dyn UploadBackend>;
+    let rows = scrub::committed_rows(t.engine.store.list_batches().await.unwrap(), Vec::new());
+    let report = t
+        .engine
+        .scrub(rows, &ScrubOptions::default())
+        .await
+        .unwrap();
+    assert!(report.passed, "{report:#?}");
+}
+
+/// #773: the same replay after a restart reads the recorded object from the
+/// ledger row recovery claims.
+#[tokio::test]
+async fn a_command_backend_adopts_the_recorded_object_after_a_restart() {
+    let tenant = "adopt-restart-773";
+    let t = failed_first_attempt(tenant, MockBackend::new()).await;
+    let cfg = t.engine.config.clone();
+    drop(t.engine);
+    let adopted_before = decisions(tenant, "adopted");
+
+    let mut restarted = Engine::new(cfg, StreamsConfig { streams: vec![] })
+        .await
+        .unwrap();
+    restarted.backend = t.backend.clone() as Arc<dyn UploadBackend>;
+    restarted.recover().await.unwrap();
+    let out = restarted.process_once(SourceType::File).await.unwrap();
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert!(out[0].committed, "{out:?}");
+    assert_eq!(out[0].object_uri.as_deref(), Some(t.recorded.as_str()));
+    assert_eq!(t.backend.puts.load(Ordering::SeqCst), 1, "no second put");
+    assert_eq!(decisions(tenant, "adopted"), adopted_before + 1);
+}
+
+/// #773: a recorded object whose stored bytes are damaged is never adopted
+/// on the strength of its name, its size or the ledger's digest. The replay
+/// writes a fresh object under its attempt key, leaves the damaged one as it
+/// is, and says so.
+#[tokio::test]
+async fn a_damaged_recorded_object_is_not_adopted_and_is_left_alone() {
+    let tenant = "adopt-damaged-773";
+    let mut t = failed_first_attempt(tenant, MockBackend::new()).await;
+    t.backend.inner.corrupt(&t.recorded);
+    let damaged = t.backend.inner.get_object(&t.recorded).await.unwrap();
+    let (logs, _guard) = Logs::capture();
+    let rejected_before = decisions(tenant, "adopt_rejected");
+    let adopted_before = decisions(tenant, "adopted");
+
+    let second = t.engine.process_once(SourceType::File).await.unwrap();
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert!(second[0].committed, "{second:?}");
+    let written = second[0].object_uri.clone().unwrap();
+    assert_ne!(written, t.recorded, "the damaged object is not adopted");
+    assert!(written.contains(&second[0].batch_id), "{written}");
+    assert_eq!(
+        t.backend.puts.load(Ordering::SeqCst),
+        2,
+        "one fresh object was put"
+    );
+    assert_eq!(
+        t.backend.inner.get_object(&t.recorded).await.unwrap(),
+        damaged,
+        "the damaged object is untouched"
+    );
+    assert!(
+        !put_twice(&t.backend.inner, &t.recorded).await,
+        "nothing was written over {}",
+        t.recorded
+    );
+    assert_eq!(decisions(tenant, "adopt_rejected"), rejected_before + 1);
+    assert_eq!(decisions(tenant, "adopted"), adopted_before);
+
+    let event = logs.one("object_key_adopt_rejected", &second[0].batch_id);
+    assert_eq!(text(&event, "level"), "WARN");
+    assert_eq!(text(&event, "fallback_key"), written);
+    assert_event(
+        &event,
+        &t.recorded,
+        &file_range(&t.input),
+        &[
+            "its bytes do not verify against this batch",
+            &format!("writing it under {written} instead, a second object"),
+            "never written over or deleted",
+            "vtopctl scrub",
+        ],
+    );
+    // The fresh object is what the committed row names and scrubs against.
+    t.engine.backend = t.backend.inner.clone() as Arc<dyn UploadBackend>;
+    let rows = scrub::committed_rows(t.engine.store.list_batches().await.unwrap(), Vec::new());
+    let report = t
+        .engine
+        .scrub(rows, &ScrubOptions::default())
+        .await
+        .unwrap();
+    assert!(report.passed, "{report:#?}");
+}
+
+/// #773: a recorded object that is gone (deleted, or never fully stored) is
+/// not adopted either: a fresh attempt key, the missing key not written to.
+#[tokio::test]
+async fn a_missing_recorded_object_is_written_fresh_under_the_attempt_key() {
+    let tenant = "adopt-missing-773";
+    let mut t = failed_first_attempt(tenant, MockBackend::new()).await;
+    t.backend.inner.delete_object(&t.recorded).await.unwrap();
+    let (logs, _guard) = Logs::capture();
+    let rejected_before = decisions(tenant, "adopt_rejected");
+
+    let second = t.engine.process_once(SourceType::File).await.unwrap();
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert!(second[0].committed, "{second:?}");
+    let written = second[0].object_uri.clone().unwrap();
+    assert_ne!(written, t.recorded);
+    assert!(
+        !t.backend.inner.contains(&t.recorded),
+        "the missing key was not written to"
+    );
+    assert_eq!(t.backend.puts.load(Ordering::SeqCst), 2);
+    assert_eq!(decisions(tenant, "adopt_rejected"), rejected_before + 1);
+    let event = logs.one("object_key_adopt_rejected", &second[0].batch_id);
+    assert_event(
+        &event,
+        &t.recorded,
+        &file_range(&t.input),
+        &["could not be read back to verify it", "a second object"],
+    );
+}
+
+/// #773: a backend that can confirm only an object's size does not adopt it:
+/// the name and the size prove nothing about the stored bytes.
+#[tokio::test]
+async fn a_size_only_recorded_object_is_not_adopted() {
+    let tenant = "adopt-size-only-773";
+    let mut t = failed_first_attempt(tenant, MockBackend::limited()).await;
+    let (logs, _guard) = Logs::capture();
+    let rejected_before = decisions(tenant, "adopt_rejected");
+
+    let second = t.engine.process_once(SourceType::File).await.unwrap();
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert!(second[0].committed, "{second:?}");
+    assert_ne!(second[0].object_uri.as_deref(), Some(t.recorded.as_str()));
+    assert!(!put_twice(&t.backend.inner, &t.recorded).await);
+    assert_eq!(decisions(tenant, "adopt_rejected"), rejected_before + 1);
+    assert_event(
+        &logs.one("object_key_adopt_rejected", &second[0].batch_id),
+        &t.recorded,
+        &file_range(&t.input),
+        &["could confirm only its size"],
+    );
+}
+
+/// #773: a throttled read-back writes nothing: the batch fails and its range
+/// is handed back, as a throttled probe does, so an outage does not write an
+/// object per replay.
+#[tokio::test]
+async fn a_throttled_read_back_of_the_recorded_object_fails_the_batch_and_writes_nothing() {
+    let tenant = "adopt-throttled-773";
+    let mut t = failed_first_attempt(tenant, MockBackend::new()).await;
+    t.backend.throttle_verifies.store(true, Ordering::SeqCst);
+    let (logs, _guard) = Logs::capture();
+    let throttled_before = decisions(tenant, "probe_throttled");
+
+    let second = t.engine.process_once(SourceType::File).await.unwrap();
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert!(!second[0].committed, "{second:?}");
+    assert_eq!(
+        t.backend.puts.load(Ordering::SeqCst),
+        1,
+        "nothing was written"
+    );
+    assert_eq!(decisions(tenant, "probe_throttled"), throttled_before + 1);
+    assert_event(
+        &logs.one("object_key_probe_throttled", &second[0].batch_id),
+        &t.recorded,
+        &file_range(&t.input),
+        &[
+            "throttled the read-back",
+            "nothing was written",
+            "handed back for retry",
+        ],
+    );
+
+    // The store recovers: the range is read again and the object adopted.
+    t.backend.throttle_verifies.store(false, Ordering::SeqCst);
+    let third = t.engine.process_once(SourceType::File).await.unwrap();
+    assert!(third[0].committed, "{third:?}");
+    assert_eq!(third[0].object_uri.as_deref(), Some(t.recorded.as_str()));
+    assert_eq!(t.backend.puts.load(Ordering::SeqCst), 1);
+}
+
+/// #773: with no checksum there is no digest to verify against, so nothing is
+/// adopted and a replay writes another object, as documented.
+#[tokio::test]
+async fn without_a_checksum_nothing_is_adopted() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 4);
+    let backend = NoAbsentAnswer::over(MockBackend::new().with_throttled_manifest_puts(1));
+    let tenant = "adopt-none-773";
+    let mut cfg = config(dir.path(), "state.db", std::slice::from_ref(&input));
+    cfg.engine.tenant = tenant.into();
+    cfg.checksum.algorithm = vtop_core::types::ChecksumAlgorithm::None;
+    let mut e = Engine::new(cfg, StreamsConfig { streams: vec![] })
+        .await
+        .unwrap();
+    e.backend = backend.clone() as Arc<dyn UploadBackend>;
+    let first = e.process_once(SourceType::File).await.unwrap();
+    assert!(!first[0].committed, "{first:?}");
+    let second = e.process_once(SourceType::File).await.unwrap();
+    assert!(second[0].committed, "{second:?}");
+    assert_eq!(backend.puts.load(Ordering::SeqCst), 2, "a second object");
+    assert_ne!(second[0].object_uri, first[0].object_uri);
+    assert_eq!(decisions(tenant, "adopted"), 0);
+    assert_eq!(decisions(tenant, "adopt_rejected"), 0);
 }
