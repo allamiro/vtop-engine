@@ -721,3 +721,33 @@ tests:
   - eval_time: 45m
     alertname: VtopStateStoreWritesSlow
     exp_alerts: []
+- name: 'VtopEpochHistoryBroken: fires when a replica''s epoch history breaks'
+  interval: 1m
+  input_series:
+  - series: vtop_broker_epoch_history_broken{job="vtop-node",instance="data-1:9611",topic="telemetry",range="r1"}
+    values: '0 0 1x10'
+  - series: vtop_broker_epoch_history_broken{job="vtop-node",instance="data-2:9612",topic="telemetry",range="r1"}
+    values: '0x12'
+  alert_rule_test:
+  - eval_time: 5m
+    alertname: VtopEpochHistoryBroken
+    exp_alerts:
+    - exp_labels:
+        severity: page
+        job: vtop-node
+        instance: data-1:9611
+        topic: telemetry
+        range: r1
+      exp_annotations:
+        summary: Replica data-1:9611 of range r1 (telemetry) lost its epoch history
+        description: "A write to this replica's epoch journal failed (a full disk, usually), so it answers every fence and promotion probe with no history: no leader gives it a replication session and no promotion counts it, and the range runs with one replica fewer than configured until it is repaired. Its log has an ERROR line naming the failed write. Free space on its data directory, then run vtopctl node repair against a replica whose history is intact."
+        runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopepochhistorybroken
+- name: 'VtopEpochHistoryBroken: quiet while every history is intact'
+  interval: 1m
+  input_series:
+  - series: vtop_broker_epoch_history_broken{job="vtop-node",instance="data-1:9611",topic="telemetry",range="r1"}
+    values: '0x12'
+  alert_rule_test:
+  - eval_time: 10m
+    alertname: VtopEpochHistoryBroken
+    exp_alerts: []

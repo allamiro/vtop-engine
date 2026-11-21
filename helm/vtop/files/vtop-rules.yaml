@@ -297,3 +297,20 @@ groups:
           summary: "State-store writes on {{ $labels.instance }} are slow: more than 5% of batches spend over a second on them"
           description: "Over 15 minutes, more than 5% of the committed batches spent more than a second in their ledger writes, for 15 minutes on end. Every batch waits for its writes before the next stage, so archiving slows and the source falls behind. Check the state store: the disk under the SQLite ledger, or the PostgreSQL server's load, locks and network."
           runbook_url: "https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopstatestorewritesslow"
+
+      # A data node's replica whose epoch history broke (#881): a write to its
+      # epoch journal failed, a full disk above all, so it answers every fence
+      # with no history and no leader gives it a session. The range runs a
+      # replica short until an operator repairs it; it never heals itself.
+      # Set once, when the write fails, and stays set until the replica is
+      # repaired, so a minute rides out nothing but a scrape race.
+      - alert: VtopEpochHistoryBroken
+        expr: |
+          max by (job, instance, topic, range) (vtop_broker_epoch_history_broken) == 1
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "Replica {{ $labels.instance }} of range {{ $labels.range }} ({{ $labels.topic }}) lost its epoch history"
+          description: "A write to this replica's epoch journal failed (a full disk, usually), so it answers every fence and promotion probe with no history: no leader gives it a replication session and no promotion counts it, and the range runs with one replica fewer than configured until it is repaired. Its log has an ERROR line naming the failed write. Free space on its data directory, then run vtopctl node repair against a replica whose history is intact."
+          runbook_url: "https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopepochhistorybroken"

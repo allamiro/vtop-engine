@@ -236,7 +236,7 @@ pub struct InProcessFollower {
     /// [`crate::LocalBroker::epoch_starts`] for why absence and breakage are
     /// deliberately the same answer.
     fencing_epoch_journal: Mutex<Option<crate::fencing_epochs::FencingEpochJournal>>,
-    fencing_epoch_history_broken: AtomicBool,
+    fencing_epoch_history_broken: crate::fencing_epochs::EpochHistoryHealth,
     meta_fencing_epoch: MetaFencingEpoch,
     segment_format: SegmentFormat,
     cluster_committed: ClusterCommittedOffset,
@@ -398,7 +398,7 @@ impl InProcessFollower {
             range,
             held_fencing_epoch: AtomicU64::new(held_fencing_epoch),
             fencing_epoch_journal: Mutex::new(None),
-            fencing_epoch_history_broken: AtomicBool::new(false),
+            fencing_epoch_history_broken: crate::fencing_epochs::EpochHistoryHealth::new(),
             meta_fencing_epoch,
             segment_format,
             cluster_committed,
@@ -505,8 +505,14 @@ impl InProcessFollower {
                         .follow_held_leader_lineage(next_offset)
                         .and_then(|_| journal.record_adoption(epoch, next_offset));
                     if adopted.is_err() {
-                        self.fencing_epoch_history_broken
-                            .store(true, Ordering::SeqCst);
+                        self.fencing_epoch_history_broken.mark(
+                            &self.replica_name(),
+                            "recording an adopted epoch",
+                            adopted
+                                .as_ref()
+                                .err()
+                                .map(|error| error as &dyn std::fmt::Display),
+                        );
                     }
                 }
             }
@@ -536,8 +542,11 @@ impl InProcessFollower {
                 true
             }
             Err(_) => {
-                self.fencing_epoch_history_broken
-                    .store(true, Ordering::SeqCst);
+                self.fencing_epoch_history_broken.mark(
+                    &self.replica_name(),
+                    "filing records under the leader's lineage",
+                    None,
+                );
                 true
             }
         }
@@ -593,7 +602,7 @@ impl InProcessFollower {
         let Some(journal) = guard.as_mut() else {
             return;
         };
-        if self.fencing_epoch_history_broken.load(Ordering::SeqCst) {
+        if self.fencing_epoch_history_broken.is_broken() {
             return;
         }
         let outcome = if disputed {
@@ -617,8 +626,11 @@ impl InProcessFollower {
             }
             Ok(_) => {}
             Err(_) => {
-                self.fencing_epoch_history_broken
-                    .store(true, Ordering::SeqCst);
+                self.fencing_epoch_history_broken.mark(
+                    &self.replica_name(),
+                    "taking the leader's lineage at a fence",
+                    None,
+                );
             }
         }
     }
@@ -743,8 +755,11 @@ impl InProcessFollower {
         let epoch = self.held_fencing_epoch.load(Ordering::SeqCst);
         let next_offset = self.next_offset();
         if !crate::LocalBroker::attach_epoch_journal_to_log(&mut journal, next_offset) {
-            self.fencing_epoch_history_broken
-                .store(true, Ordering::SeqCst);
+            self.fencing_epoch_history_broken.mark(
+                &self.replica_name(),
+                "attaching the journal to the log",
+                None,
+            );
         }
         // Epoch 0 is the "no grant yet" sentinel, never a writing epoch.
         if journal.latest().is_none()
@@ -752,8 +767,11 @@ impl InProcessFollower {
             && epoch > 0
             && journal.record(epoch, 0).is_err()
         {
-            self.fencing_epoch_history_broken
-                .store(true, Ordering::SeqCst);
+            self.fencing_epoch_history_broken.mark(
+                &self.replica_name(),
+                "recording the first epoch",
+                None,
+            );
         }
         let reloaded = self.reload_kept_dispute(&mut journal, next_offset);
         // A lineage reloaded from its sidecar (#640) is replayed over the log
@@ -762,9 +780,11 @@ impl InProcessFollower {
         // left those records filed under the old entries.
         match journal.replay_leader_lineage_at_open(next_offset) {
             Ok(following) => self.lineage_following.store(following, Ordering::SeqCst),
-            Err(_) => self
-                .fencing_epoch_history_broken
-                .store(true, Ordering::SeqCst),
+            Err(_) => self.fencing_epoch_history_broken.mark(
+                &self.replica_name(),
+                "replaying the leader's lineage at open",
+                None,
+            ),
         }
         // A history held while its fence's dispute was pending, whose dispute
         // is no longer held (#640, with #635): a settlement a crash cut short
@@ -796,9 +816,11 @@ impl InProcessFollower {
                         self.lineage_following.store(!complete, Ordering::SeqCst);
                     }
                     Ok(_) => {}
-                    Err(_) => self
-                        .fencing_epoch_history_broken
-                        .store(true, Ordering::SeqCst),
+                    Err(_) => self.fencing_epoch_history_broken.mark(
+                        &self.replica_name(),
+                        "taking the leader's lineage at open",
+                        None,
+                    ),
                 }
             }
         }
@@ -879,8 +901,8 @@ impl InProcessFollower {
             }
             return None;
         };
-        let history_known = !self.fencing_epoch_history_broken.load(Ordering::SeqCst)
-            && !journal.entries().is_empty();
+        let history_known =
+            !self.fencing_epoch_history_broken.is_broken() && !journal.entries().is_empty();
         let stale = if next_offset <= record.from {
             Some("the log no longer reaches past its start")
         } else if record.from < self.cluster_committed.get() {
@@ -1195,8 +1217,11 @@ impl InProcessFollower {
                 }
             });
             if repaired.is_err() {
-                self.fencing_epoch_history_broken
-                    .store(true, Ordering::SeqCst);
+                self.fencing_epoch_history_broken.mark(
+                    &self.replica_name(),
+                    "truncating the history with the log",
+                    None,
+                );
             }
         }
         drop(guard);
@@ -1375,8 +1400,30 @@ impl InProcessFollower {
         crate::fencing_epochs::FencingEpochJournal::seed_attested_history_in(
             &self.fencing_epoch_journal,
             &self.fencing_epoch_history_broken,
+            &self.replica_name(),
             epoch,
         )
+    }
+
+    /// Whether this replica's epoch history is broken: a journal write
+    /// failed, so it answers every fence with no history and no leader gives
+    /// it a session until it is repaired (#881). Exported as
+    /// `vtop_broker_epoch_history_broken`. Never blocks.
+    pub fn epoch_history_broken(&self) -> bool {
+        self.fencing_epoch_history_broken.is_broken()
+    }
+
+    /// The operator message the break was reported with, if it is broken.
+    pub fn epoch_history_broken_reason(&self) -> Option<String> {
+        self.fencing_epoch_history_broken.reason()
+    }
+
+    fn replica_name(&self) -> crate::fencing_epochs::ReplicaName<'_> {
+        crate::fencing_epochs::ReplicaName {
+            node_id: self.node_id,
+            topic: &self.range.topic,
+            range_id: self.range.range_id,
+        }
     }
 
     /// This replica's epoch history; empty means "unknown", never "no changes".
@@ -1386,7 +1433,7 @@ impl InProcessFollower {
             .fencing_epoch_journal
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self.fencing_epoch_history_broken.load(Ordering::SeqCst) {
+        if self.fencing_epoch_history_broken.is_broken() {
             return Vec::new();
         }
         guard
@@ -1676,7 +1723,7 @@ impl InProcessFollower {
                 .fencing_epoch_journal
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if self.fencing_epoch_history_broken.load(Ordering::SeqCst) {
+            if self.fencing_epoch_history_broken.is_broken() {
                 crate::fencing_epochs::Lineage::Unknown
             } else {
                 guard

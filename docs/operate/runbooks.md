@@ -407,3 +407,35 @@ still keeps up with its sources (no `VtopSourceLagGrowing`, no
 `VtopNoCommits`): raise the second, or the 5%, in the rule to what that store
 does.
 
+## VtopEpochHistoryBroken
+
+**What it means.** A write to a data node replica's epoch journal failed,
+usually because its data directory filled up. The journal records which
+fencing epoch wrote each stretch of the replica's log; with a write missing,
+that record may have a hole, and a replica reconciled against a history with
+a hole could be told to keep or discard the wrong records.
+
+**What the node already did.** It marked the history broken and logged one
+ERROR line naming the replica, the range and the write that failed. From then
+on it answers every fence and promotion probe with no history, so no leader
+gives it a replication session and no promotion counts its offset. The range
+runs with one replica fewer than configured. Nothing is lost by this, but the
+next failure of another replica can leave the range without a quorum.
+Freeing space does not clear it. A restart does, but wrongly: the mark is
+held in memory, and a restarted node reopens the journal without the failed
+write and offers that history again, with nothing to say it may have a hole.
+Repair it instead of restarting it.
+
+**What to check.** The ERROR line on that node (`its epoch history could not
+be written`), its free disk space, and `vtop_broker_follower_connected` on the
+leader, which shows the replica without a session.
+
+**What to do.** Free space on the replica's data directory, or fix the storage
+fault. Then stop it and rebuild its range from a replica whose history is
+intact with `vtopctl node repair` (see the repair procedure in
+[`PRODUCTION_HA.md`](../PRODUCTION_HA.md)), and start it again. It rejoins
+through an ordinary session and catches up.
+
+**When it is safe to ignore.** Never while the range is meant to run at its
+full replication factor. Why the node does not repair itself once space is
+back is in [the design note](../EPOCH_HISTORY_AFTER_A_FAILED_WRITE.md).
