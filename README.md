@@ -276,6 +276,11 @@ Data-safety bugs were still being found as late as November 2026; each one is
 in the [data-safety register](docs/reference/data-safety-register.md). Keep the
 source data until a scrub of the archive passes.
 
+Which parts are production, preview or experimental, and why, is in the
+[component status table](docs/reference/component-status.md). The maintainer
+confirmed its labels (#740). A label states what the evidence supports, not a
+promise of support.
+
 The full table, with what is done and what is planned, is in
 [limitations.md](docs/reference/limitations.md). Per-release limits are in
 [ROADMAP.md](docs/ROADMAP.md), and the engine's HA status is in
@@ -292,6 +297,7 @@ The full table, with what is done and what is planned, is in
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | crates, the engine's runtime flow, recovery, implementation status |
 | [Archive path reference](docs/reference/archive-path.md) | sources, formats, the manifest, verification, recovery, metrics |
 | [PRODUCTION_HA.md](docs/PRODUCTION_HA.md) | engine HA: status, design and phased roadmap |
+| [Component status](docs/reference/component-status.md) | production, preview or experimental for each component, with the evidence and the criteria still open |
 | [ROADMAP.md](docs/ROADMAP.md) | engine and cluster-plane releases, per-release limitations and upgrade notes |
 | [Compatibility policy](docs/reference/compatibility.md) | what each format promises, upgrade and downgrade rules, deprecation |
 | [SUPPORT.md](docs/SUPPORT.md) | versioning, which releases get fixes, and the 1.x support window |
