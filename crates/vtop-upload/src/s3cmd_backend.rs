@@ -108,6 +108,7 @@ impl UploadBackend for S3cmdBackend {
             size_bytes: size,
             etag: None,
             checksum_sha256: None,
+            encryption: None,
         })
     }
 

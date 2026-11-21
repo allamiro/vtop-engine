@@ -28,6 +28,8 @@ vtopctl audit-coverage --config /etc/vtop/config.yaml --check-storage \
 | `--digest-dir` | Where prune digests are read from. Default: `engine.ledger_digest_dir`, else `<database file>.ledger-digests` beside a SQLite file, else `<engine.work_dir>/ledger-digests`. |
 | `--check-storage` | Also check that every committed object and manifest is present, and every object at its recorded size. |
 | `--metrics-file` | Also write the result as a Prometheus text file. |
+| `--orphans-limit` | List at most this many unreferenced objects (default 200; 0 lists none). The counts and the gauge always cover all of them. |
+| `--orphans-after` | List unreferenced objects after this key: the value the previous page printed. |
 
 For each source unit (a Kafka topic-partition under one consumer group, or a
 file or spool file at one inode), committed ranges must tile. A range that
@@ -36,6 +38,58 @@ Ranges above the last commit are pending, not holes, and overlaps are counted
 as duplicates. What it can and cannot judge, including file rotation and
 replaced files, is in
 [Production HA §6.6](../PRODUCTION_HA.md#66-ledger-retention--pruning-implemented--incremental-delete-128).
+
+### Objects no committed row names
+
+A failed attempt can leave an object in the store that no committed row names
+(#774): the attempt uploaded it and then failed, and the replay wrote another
+object (a per-attempt key, different bytes, a fallback key) instead of reusing
+it. `vtopctl scrub` reads committed rows only and `--check-storage` probes
+committed objects only, so nothing else sees it. The audit reports it from the
+ledger and the prune digests, with no listing of the bucket and no store
+request, so it needs no `s3:ListBucket`.
+
+An object is reported when a FAILED, REPLAY_REQUIRED or SUPERSEDED row
+recorded it as uploaded and no row in OBJECT_UPLOADED, MANIFEST_UPLOADED,
+VERIFIED or SOURCE_COMMITTED names the same key. A replay that reused the
+object (#626) names it, so it is not reported, and neither is a batch still on
+its way to a commit. Per source the report gives the count, the sizes the
+ledger recorded added up, the count by kind (`failed`, `replay_required`,
+`superseded`) and, up to `--orphans-limit` of them in key order, each key with
+the batches that recorded it:
+
+```text
+unreferenced objects: 2 object(s), 33 recorded byte(s), uploaded by a failed, ...
+     file app: 2 object(s), 33 byte(s) (failed 2)
+          failed s3://archive/tenant=a/.../app-20261120T0101-b0-120.raw.gz (batch-1), 11 byte(s)
+     listed 1 of 2; for the next page pass --orphans-after s3://archive/tenant=a/...
+```
+
+What it means, and what to do:
+
+- It is storage cost and never loss, so it does not change the exit status
+  that signals lost data and does not fail `audit-coverage`.
+- The command deletes nothing. Under S3 Object Lock each such object is
+  retained until its date, and under `compliance` nobody can remove it, so it
+  is budget; see [S3 Object Lock](../OBJECT_LOCK_DEPLOYMENT.md#storage-cost).
+- Decide on deletion from the objects, not from this report alone. The report
+  sees only the ledger and the digests you give it: a committed row pruned
+  without a digest (see `--digest-dir`) cannot protect its object here. Check
+  a key against the committed manifests (`vtopctl verify-manifest`, `scrub`)
+  before removing it.
+- An object whose ledger row a power loss rolled back (the in-flight tail,
+  ARCHITECTURE §12) is named by no row at all, so this report cannot find it.
+  Only a bucket listing can, and the audit does not make one.
+
+The gauges are `vtop_coverage_audit_unreferenced_objects{source_type}` and
+`vtop_coverage_audit_unreferenced_object_bytes{source_type}` in the
+`--metrics-file`, written whatever the page size. An alert on a rise, for a
+deployment whose audit runs daily:
+
+```yaml
+- alert: VtopUnreferencedObjectsGrowing
+  expr: delta(vtop_coverage_audit_unreferenced_objects[7d]) > 0
+```
 
 ## Scrub
 

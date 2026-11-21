@@ -477,6 +477,25 @@ async fn a_receipt_the_store_does_not_lock_is_a_failed_receipt_not_a_lock_check_
     );
 }
 
+/// Under upload.server_side_encryption a receipt is checked like the manifest
+/// beside it: one the store reports stored without the encryption is a failed
+/// receipt, counted and logged, and never a failed batch (D6).
+#[tokio::test]
+async fn a_receipt_stored_unencrypted_is_a_failed_receipt_and_the_batch_still_commits() {
+    let tenant = "receipts-unencrypted";
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 3);
+    let backend = Arc::new(MockBackend::new());
+    backend.set_unencrypted_suffix(Some(".receipt.json"), false);
+    let mut engine = engine(config(dir.path(), tenant, &input), &backend).await;
+    let (failed, written) = (receipts(tenant, "failed"), receipts(tenant, "written"));
+    let out = engine.process_once(SourceType::File).await.unwrap();
+    assert!(out[0].committed, "{out:?}");
+    assert_eq!(receipts(tenant, "failed"), failed + 1);
+    assert_eq!(receipts(tenant, "written"), written, "none counted written");
+}
+
 /// Review of #711: a receipt PUT the store never answers is abandoned at the
 /// receipt's own deadline (at most the request timeout, and never more than
 /// 30 s), so it cannot hold the batch's commit for the SDK's whole retry

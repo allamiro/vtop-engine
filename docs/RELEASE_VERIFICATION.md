@@ -32,10 +32,34 @@ The identity regexp matches any workflow in this repository. Pin it to
 that the image came from the release workflow at that exact tag, which is the
 stricter and better check for a deployment.
 
+The image also has a GitHub build provenance attestation (SLSA), which says
+which workflow, tag and commit built it. Check it with the GitHub CLI
+(`gh attestation`, version 2.68 or newer, the first with `--source-ref`), signed in to the registry if your
+setup needs it:
+
+```
+gh attestation verify oci://ghcr.io/allamiro/vtop-engine:VERSION \
+  --repo allamiro/vtop-engine \
+  --signer-workflow allamiro/vtop-engine/.github/workflows/release.yml \
+  --source-ref refs/tags/vVERSION \
+  --deny-self-hosted-runners
+```
+
+It exits 0 and prints the verified attestation when the image was built by
+`release.yml` at that tag on a GitHub-hosted runner, and non-zero otherwise.
+
 ## Binaries
 
 Each archive contains `vtop-node` (the node process) and `vtopctl` (the
 operator CLI), for `linux` (x86_64, aarch64) and `macOS` (arm64, x86_64).
+Linux has two archives per architecture: `TARGET` is
+`x86_64-unknown-linux-gnu` or `aarch64-unknown-linux-gnu` (glibc 2.17 or
+newer), or `x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl`
+(fully static, any Linux). On macOS it is `aarch64-apple-darwin` or
+`x86_64-apple-darwin`. Six archives in all, each with its own Sigstore
+bundle, build provenance attestation and line in `SHA256SUMS`;
+[install/binaries.md](install/binaries.md#supported-platforms) says which to
+pick.
 
 Windows is not built. librdkafka is compiled from source via cmake and the
 Windows path is not validated — an untested binary is worse than an absent one.
@@ -51,20 +75,97 @@ cosign verify-blob "$archive" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
 ```
 
+Each archive also has a GitHub build provenance attestation (SLSA). It is not a
+file in the release: it is stored with GitHub's attestations for the
+repository, and `gh attestation verify` fetches it:
+
+```
+gh attestation verify "$archive" \
+  --repo allamiro/vtop-engine \
+  --signer-workflow allamiro/vtop-engine/.github/workflows/release.yml \
+  --source-ref refs/tags/vVERSION \
+  --deny-self-hosted-runners
+```
+
+It exits 0 and prints the verified attestation when the archive was built by
+`release.yml` at that tag on a GitHub-hosted runner. The release workflow runs
+this same command on every archive and on the image before it publishes the
+release, so a release that cannot be verified is not published. A manual
+dry-run of the workflow (`workflow_dispatch`) builds but publishes nothing and
+creates no attestation.
+
 Also check the archive against `SHA256SUMS`:
 
 ```
 sha256sum --check --ignore-missing SHA256SUMS
 ```
 
-`SHA256SUMS` detects a corrupted or swapped download; the Sigstore bundle is
-what establishes it came from this project's release workflow. They answer
-different questions, so check both.
+`SHA256SUMS` detects a corrupted or swapped download; the Sigstore bundle and
+the attestation are what establish it came from this project's release
+workflow. They answer different questions, so check both.
 
 ## SBOM
 
 An SPDX SBOM (`vtop-engine-sbom.spdx.json`) is attached to every release, and
 the container image carries an SBOM attestation.
+
+## Reproducing a build
+
+Every release run (a `v*` tag, and a dry-run dispatch) also rebuilds each
+binary archive target on a second, clean runner and compares the result with
+the archive the first build made. The job is named `reproduce <target>
+(report only)`. It is report only: it never blocks or delays a release, its
+failures show as a red job inside a green run, and what it uploads
+(`repro-report-<target>`, and `repro-binaries-<target>` when a build differs)
+is kept out of the release assets.
+
+What it compares is `vtop-node` and `vtopctl`, by SHA-256, against the copies
+inside the archive. The tarball's own hash is printed but not compared, because
+`tar` and `gzip` record file times, so two correct builds of one tree give two
+archive hashes. To check an archive, use `SHA256SUMS` and the signatures above;
+to ask whether the binaries inside it come from the tagged source, run the same
+comparison yourself:
+
+```
+tar -xzf vtop-engine-VERSION-TARGET.tar.gz
+sha256sum vtop-engine-VERSION-TARGET/vtop-node vtop-engine-VERSION-TARGET/vtopctl
+```
+
+Then build the tag the way `release.yml` does (the build steps of its
+`binaries` job) and hash `target/TARGET/release/vtop-node` and `vtopctl`. The
+inputs per target:
+
+| Target | Build environment |
+|---|---|
+| `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` | The `quay.io/pypa/manylinux2014_<arch>` image named by digest in the `build_image` field of the `binaries` matrix (CentOS 7, glibc 2.17, gcc 10), with `perl-core` and `libcurl-devel` installed, run natively on that architecture |
+| `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` | The `rust:1-alpine` image named by digest in the same field, with `build-base cmake perl linux-headers curl-dev` installed, `LIBZ_SYS_STATIC=1` set, and the Rust version the workflow resolved installed with `rustup`, run natively on that architecture |
+| `aarch64-apple-darwin`, `x86_64-apple-darwin` | The `macos-15` and `macos-15-intel` runners, `cmake` from Homebrew, `MACOSX_DEPLOYMENT_TARGET=11.0` |
+
+The Rust version is the `stable` the run installed; the job's `inputs.txt`
+(in the `repro-report-<target>` artifact) and the log of the `build <target>`
+job both print it, so build with that version, not with whatever `stable` is
+today.
+
+### When a rebuild differs
+
+A difference is documented, not hidden: the job summary lists both hashes, the
+versions the rebuild used, and, for a Linux binary, the compiler version
+recorded inside each copy. Three build inputs are not pinned yet, and each can
+change a binary without any change to the source:
+
+- **The Rust toolchain.** The workflow installs `stable`, which moves every six
+  weeks. A rebuild after a new stable release uses a newer compiler.
+- **The distribution packages in the Linux build images.** The manylinux2014
+  and Alpine images are pinned by digest; the packages installed into them
+  (`perl-core` and `libcurl-devel` on CentOS 7, `build-base`, `cmake`, `perl`,
+  `linux-headers` and `curl-dev` on Alpine) are whatever the mirrors serve on
+  the day. The job prints each installed version in `inputs.txt`.
+- **The macOS runner image.** Xcode, the SDK and Homebrew's cmake change with
+  the runner image.
+
+Cargo dependencies are not on this list: `--locked` builds use the versions in
+`Cargo.lock`. If a run shows drift, the fix is to pin the input in
+`release.yml`, for both the `binaries` job and the `reproduce` job.
 
 ## Maturity
 
