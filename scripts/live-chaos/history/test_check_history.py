@@ -340,6 +340,15 @@ class Violations(unittest.TestCase):
         self.assertIn("lost", kinds(result))
         self.assertEqual(result["acknowledged_records"], 20)
 
+    def test_records_reordered_inside_an_acknowledged_batch_are_out_of_order(self):
+        # Review of #878: sequences 0 and 1 answered at offsets 1 and 0.
+        h = History()
+        h.produce("p", 1, 0, 2, "ok", 2)
+        h.lines[-1] = h.lines[-1][:-1] + ', "offsets": [1, 0]}'
+        h.read("r", [(0, 1, 1), (1, 0, 1)], 2)
+        result = h.check()
+        self.assertEqual(kinds(result), {"order"}, result)
+
     def test_the_high_watermark_never_goes_back(self):
         h = History()
         h.produce("p", 1, 0, 10, "ok", 10)

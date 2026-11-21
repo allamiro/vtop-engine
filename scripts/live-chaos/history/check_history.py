@@ -43,7 +43,8 @@ it too. The invariants:
                 a record is its producer's (id, epoch, sequence), so a retry
                 from a new process sends the same records, not new ones
   order         a producer's acknowledgements move forward: each acknowledged
-                batch sits above the one acknowledged before it
+                batch sits above the one acknowledged before it, and its
+                records in sequence order
   phantom       every visible record is an acknowledged one, or a whole
                 indeterminate batch; a refused batch (`fail`) is never visible,
                 which is what a fenced leader's records would be
@@ -251,10 +252,18 @@ def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) 
                     + f", not acknowledged record {sequence} of {batch.name()}"
                 )
 
-    # A producer's acknowledgements move forward.
+    # A producer's acknowledgements move forward, and within a batch its
+    # records sit in sequence order (review of #878).
     by_process: dict[str, list[Batch]] = defaultdict(list)
     for batch in acked:
         by_process[batch.process].append(batch)
+        for i in range(1, batch.count):
+            if batch.offset_of(i) <= batch.offset_of(i - 1):
+                violations["order"].append(
+                    f"{batch.name()} was acknowledged with record {batch.first_sequence + i} at "
+                    f"offset {batch.offset_of(i)}, not above record {batch.first_sequence + i - 1} "
+                    f"at {batch.offset_of(i - 1)}"
+                )
     for process, mine in by_process.items():
         mine.sort(key=lambda b: b.batch)
         for before, after in zip(mine, mine[1:]):
