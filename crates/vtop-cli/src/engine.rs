@@ -304,6 +304,22 @@ impl LockFallbacks {
     }
 }
 
+/// What a replay finds when it asks for the object an earlier attempt
+/// recorded, on a backend that cannot report an absent key (#773).
+#[derive(Debug)]
+enum Adoption {
+    /// Nothing to ask about: no recorded object, no digest to verify against,
+    /// or the rebuilt bytes are not the recorded ones (`bytes_differ`, which
+    /// the rebuild report already says).
+    NotApplicable,
+    /// The recorded object, read back, holds exactly this batch's bytes.
+    Adopted(String),
+    /// The recorded object cannot be used, with why. It is never written to.
+    Rejected { key: String, why: String },
+    /// The store throttled the read-back: the batch fails and is retried.
+    Throttled { key: String, error: VtopError },
+}
+
 /// What the attempt key a replay wrote earlier for the same derived key
 /// holds now (#709).
 #[derive(Debug)]
@@ -419,6 +435,73 @@ impl<'a> Pipeline<'a> {
             }
         }
         crate::object_lock::judge_reuse(read, batch_id, tenant, uri, lock)
+    }
+
+    /// Whether the object an earlier attempt uploaded for exactly this window
+    /// can be used instead of writing another (#773).
+    ///
+    /// A backend that cannot tell a missing key from a refused request never
+    /// writes to a derived key, but nothing stops it reading a key the ledger
+    /// recorded. The recorded object is adopted only when a read of its
+    /// stored bytes verifies STRONGLY against this batch's size and full
+    /// digest: the name, the ledger's digest and a size match prove nothing
+    /// about what is stored. Whatever else is found there (damaged, missing,
+    /// size-only, unreadable) is left exactly as it is and the batch goes under
+    /// its own attempt key, so nothing is ever written to the recorded key. A
+    /// key outside the configured bucket and prefix is not read at all: the
+    /// ledger may name a store this engine is no longer pointed at.
+    async fn adopt_recorded_object(
+        &self,
+        window: &RecordedWindow,
+        bucket: &str,
+        size: u64,
+        checksum: ObjectChecksum<'_>,
+        labels: [&str; 3],
+    ) -> Adoption {
+        let (Some(key), Some(recorded)) = (window.object_uri.as_deref(), window.digest.as_deref())
+        else {
+            return Adoption::NotApplicable;
+        };
+        if recorded != checksum.hex {
+            return Adoption::NotApplicable;
+        }
+        if !partitioning::is_under_prefix(key, bucket, &self.config.upload.prefix) {
+            return Adoption::Rejected {
+                key: key.to_owned(),
+                why: format!(
+                    "it is not under the configured bucket {bucket} and upload.prefix, so it \
+                     was not read"
+                ),
+            };
+        }
+        match note_store_request(
+            self.backend.verify_object(key, size, Some(checksum)).await,
+            "object_probe_verify",
+            labels,
+            &self.attempts,
+            &self.throttles,
+        ) {
+            Ok(v) if v.passed && !v.backend_limited => Adoption::Adopted(key.to_owned()),
+            Ok(v) if v.passed => Adoption::Rejected {
+                key: key.to_owned(),
+                why: format!("the backend could confirm only its size ({})", v.message),
+            },
+            Ok(v) => Adoption::Rejected {
+                key: key.to_owned(),
+                why: format!("its bytes do not verify against this batch ({})", v.message),
+            },
+            Err(error) if error.is_upload_throttle() => Adoption::Throttled {
+                key: key.to_owned(),
+                error,
+            },
+            Err(error) => Adoption::Rejected {
+                key: key.to_owned(),
+                why: format!(
+                    "it could not be read back to verify it ({})",
+                    multipart::redact_urls(&error.to_string())
+                ),
+            },
+        }
     }
 
     /// What the attempt key written earlier for this range holds now (#709):
@@ -1191,25 +1274,114 @@ impl<'a> Pipeline<'a> {
                     .inc();
             }
         };
+        // Whether the object is the one an earlier attempt recorded and this
+        // replay adopted (#773), not one the key names.
+        let mut adopted = false;
         let (object_uri, reused, key_is_derived) = match derived_object_uri {
             Err(why) => {
-                decided("per_attempt");
-                if let Some(suppressed) = self.key_notices.admit("per_attempt", source_name) {
-                    tracing::info!(
-                        event = "object_key_per_attempt",
-                        batch_id,
-                        source = source_name,
-                        range,
-                        key = %attempt_object_uri,
-                        reason = %why,
-                        suppressed,
-                        "range {range} of {source_name} is written under its per-attempt key \
-                         {attempt_object_uri}, so a replay of it will write another object \
-                         (nothing is lost): {why} ({suppressed} more like this suppressed since \
-                         the last notice)"
-                    );
+                // A backend that cannot report an absent key can still read
+                // the object an earlier attempt recorded (#773). Only with a
+                // digest (a checksum-less batch has nothing to verify
+                // against), only for a window that rebuilds the recorded
+                // range, and not under the Object Lock profile, whose
+                // retention checks a command backend cannot make.
+                let adoption = match (&rebuild, object_ck) {
+                    (Some(earlier), Some(ck))
+                        if self.config.upload.object_lock.is_none()
+                            && !self.backend.reports_absent_objects() =>
+                    {
+                        self.adopt_recorded_object(
+                            earlier,
+                            &bucket,
+                            compressed.size_bytes,
+                            ck,
+                            labels,
+                        )
+                        .await
+                    }
+                    _ => Adoption::NotApplicable,
+                };
+                let earlier_batch = rebuild
+                    .as_ref()
+                    .and_then(|w| w.batch_id.as_deref())
+                    .unwrap_or("unrecorded");
+                match adoption {
+                    Adoption::Adopted(key) => {
+                        decided("adopted");
+                        adopted = true;
+                        tracing::info!(
+                            event = "object_key_adopted",
+                            batch_id,
+                            earlier_batch_id = earlier_batch,
+                            source = source_name,
+                            range,
+                            key = %key,
+                            "range {range} of {source_name} was uploaded by an earlier attempt \
+                             (batch {earlier_batch}) as {key}; its stored bytes were read back \
+                             and match this batch's digest, so it is adopted and nothing is \
+                             uploaded (this backend cannot tell a missing key from a refused \
+                             request, so it does not name keys by content); nothing to do"
+                        );
+                        (key, true, false)
+                    }
+                    Adoption::Rejected { key, why } => {
+                        decided("adopt_rejected");
+                        tracing::warn!(
+                            event = "object_key_adopt_rejected",
+                            batch_id,
+                            earlier_batch_id = earlier_batch,
+                            source = source_name,
+                            range,
+                            key = %key,
+                            fallback_key = %attempt_object_uri,
+                            reason = %why,
+                            "range {range} of {source_name} was uploaded by an earlier attempt \
+                             (batch {earlier_batch}) as {key}, but {why}; writing it under \
+                             {attempt_object_uri} instead, a second object, and leaving {key} \
+                             as it is (never written over or deleted); nothing is lost, run \
+                             `vtopctl scrub` to see whether a committed batch names {key}"
+                        );
+                        (attempt_object_uri, false, false)
+                    }
+                    Adoption::Throttled { key, error } => {
+                        decided("probe_throttled");
+                        tracing::warn!(
+                            event = "object_key_probe_throttled",
+                            batch_id,
+                            source = source_name,
+                            range,
+                            key = %key,
+                            error = %error,
+                            "the store throttled the read-back of {key}, the object an earlier \
+                             attempt uploaded for range {range} of {source_name}; nothing was \
+                             written, the batch fails and the range is handed back for retry; \
+                             nothing to do unless it persists, then reduce upload concurrency"
+                        );
+                        fail!(format!(
+                            "read-back of recorded object {key} failed: {error}"
+                        ))
+                    }
+                    Adoption::NotApplicable => {
+                        decided("per_attempt");
+                        if let Some(suppressed) = self.key_notices.admit("per_attempt", source_name)
+                        {
+                            tracing::info!(
+                                event = "object_key_per_attempt",
+                                batch_id,
+                                source = source_name,
+                                range,
+                                key = %attempt_object_uri,
+                                reason = %why,
+                                suppressed,
+                                "range {range} of {source_name} is written under its per-attempt \
+                                 key {attempt_object_uri}, so a replay of it will write another \
+                                 object (nothing is lost): {why} ({suppressed} more like this \
+                                 suppressed since the last notice)"
+                            );
+                        }
+                        (attempt_object_uri, false, false)
+                    }
                 }
-                (attempt_object_uri, false, false)
             }
             Ok(derived) => match match (
                 probe_object_key(
@@ -1987,7 +2159,9 @@ impl<'a> Pipeline<'a> {
                 &range,
                 &object_uri,
                 object_checksum.as_deref(),
-                key_is_derived,
+                // An adopted object is the earlier attempt's own: no second
+                // object, as under a derived key (#773).
+                key_is_derived || adopted,
                 batch.record_count,
                 labels,
             );
@@ -2213,7 +2387,19 @@ impl<'a> Pipeline<'a> {
             compressed_bytes = metrics.compressed_bytes,
             compression_ratio = format!("{:.2}", metrics.compression_ratio),
             total_ms = metrics.total_ms,
+            // The same stage timings `process-once` prints and the
+            // `vtop_stage_duration_seconds` histograms observe. `run` drops
+            // its outcomes, so this line is the only place a long-running
+            // engine reports them per batch (still one line per committed
+            // batch, with no new label or span).
+            compress_ms = metrics.compress_ms,
+            checksum_ms = metrics.checksum_ms,
+            object_upload_ms = metrics.object_upload_ms,
+            manifest_upload_ms = metrics.manifest_upload_ms,
+            verify_ms = metrics.verify_ms,
+            commit_ms = metrics.commit_ms,
             state_write_ms = metrics.state_write_ms,
+            object_reused = metrics.object_reused,
             records_per_sec = format!("{:.0}", metrics.records_per_sec),
             upload_mib_per_sec = format!("{:.2}", metrics.upload_mib_per_sec),
             "batch_metrics"
@@ -2298,10 +2484,37 @@ impl PendingBuffer {
         self.batcher.is_empty()
     }
 
+    /// Whether appending `read` would take the buffered window past a size
+    /// threshold (`max_records` or `max_bytes`). If it would, the window is
+    /// sealed first and the read starts the next one, so a batch holds at
+    /// most `max_bytes` of records, as `batching.max_bytes` documents.
+    ///
+    /// Without this, `run` closed file batches at about twice `max_bytes`: a
+    /// read stops at `max_bytes` counting each line's newline, the batcher
+    /// counts records without it, so one full read stays just under the
+    /// threshold and the next full read was appended to it. A Kafka read
+    /// stops short of `max_bytes` when the next record does not fit, with the
+    /// same result. `process-once` makes one read, so it never doubled.
+    ///
+    /// A rebuilt window (#626) is never split here: it must reproduce the
+    /// recorded window, and it seals at its recorded end.
+    fn would_overflow(&self, read: &ReadResult) -> bool {
+        if self.is_empty() || self.rebuild_end.is_some() {
+            return false;
+        }
+        let limits = &self.batcher.limits;
+        let read_bytes: usize = read.records.iter().map(Vec::len).sum();
+        self.batcher.len().saturating_add(read.records.len()) > limits.max_records
+            || self.batcher.byte_len().saturating_add(read_bytes) > limits.max_bytes
+    }
+
     /// Whether a read starting at `start` picks up exactly where the buffered
     /// window ends. Byte-offset sources are continuous by construction until
     /// a rotation or truncation restarts the file at byte 0, or a different
-    /// file takes the path (#558). Kafka partitions are not judged here.
+    /// file takes the path (#558). A Kafka read continues a window unless both
+    /// name a topic id and the ids differ: two incarnations of a topic number
+    /// their offsets separately, so one window of both would carry a range no
+    /// marker can claim. Offsets are not judged.
     fn continues(&self, start: &ProgressMarker) -> bool {
         let Some(end) = self.latest_end.as_ref() else {
             return true;
@@ -2336,6 +2549,16 @@ impl PendingBuffer {
                     ..
                 },
             ) => same_file(*end_inode, *start_inode) && end_byte == start_byte,
+            (
+                ProgressMarker::Kafka {
+                    topic_id: Some(end_id),
+                    ..
+                },
+                ProgressMarker::Kafka {
+                    topic_id: Some(start_id),
+                    ..
+                },
+            ) => end_id == start_id,
             _ => true,
         }
     }
@@ -3690,6 +3913,18 @@ impl Engine {
                                 discontinued.push(done);
                             }
                         }
+                        // A read that would take the buffered window past
+                        // max_records or max_bytes starts the next window: the
+                        // buffered one is sealed first, this cycle.
+                        if self
+                            .pending
+                            .get(&key)
+                            .is_some_and(|buf| buf.would_overflow(&read))
+                        {
+                            if let Some(full) = self.pending.remove(&key) {
+                                discontinued.push(full);
+                            }
+                        }
                         let bounded_end = self.recorded.bounded_end(&read.progress_start);
                         let buf = self
                             .pending
@@ -3867,6 +4102,7 @@ impl Engine {
                         end: read.progress_end.clone(),
                         sealed_at: Some(sealed_at),
                         digest: rebuild.as_ref().and_then(|w| w.digest.clone()),
+                        object_uri: rebuild.as_ref().and_then(|w| w.object_uri.clone()),
                         batch_id: None,
                         record_count: Some(read.records.len() as u64),
                         bounded: false,
@@ -4009,6 +4245,10 @@ impl Engine {
                                     crate::rebuild::recorded_digest(row.object_sha256.as_deref())
                                 {
                                     window.digest = Some(digest);
+                                    // The key goes with its digest (#773).
+                                    window.object_uri = crate::rebuild::recorded_object_uri(
+                                        row.object_uri.as_deref(),
+                                    );
                                 }
                             }
                             Ok(None) => {}
@@ -5296,12 +5536,14 @@ impl Engine {
         {
             let committed = self.store.committed_kafka_offsets().await?;
             k.seed_committed_from_ledger(committed.iter().map(|c| {
-                (
-                    c.topic.as_str(),
-                    c.partition,
-                    c.consumer_group.as_str(),
-                    c.end_offset,
-                )
+                vtop_adapters::kafka_source::LedgerResume {
+                    topic: c.topic.as_str(),
+                    partition: c.partition,
+                    consumer_group: c.consumer_group.as_str(),
+                    topic_id: c.topic_id.as_deref(),
+                    end_offset: c.end_offset,
+                    newest_end: c.newest_end,
+                }
             }));
         }
         Ok(())
@@ -6510,6 +6752,7 @@ mod tests {
             start_offset: offset,
             end_offset: offset,
             consumer_group: "g".into(),
+            topic_id: None,
         };
         let read = |offset: i64, lo: Option<&str>, hi: Option<&str>| ReadResult {
             records: vec![b"r".to_vec()],
@@ -6635,6 +6878,7 @@ mod tests {
             start_offset: 0,
             end_offset: 0,
             consumer_group: "g".into(),
+            topic_id: None,
         };
         // Same topic, different partitions -> distinct buffer keys (no mixing).
         assert_ne!(buffer_key(&topic, &mk(0)), buffer_key(&topic, &mk(1)));
@@ -6678,6 +6922,7 @@ mod tests {
             start_offset: 0,
             end_offset: 0,
             consumer_group: "g".into(),
+            topic_id: None,
         };
         // Key names the marker's topic and partition, not the requested source.
         assert_eq!(buffer_key(&requested, &marker_for_b).1, "topic_b#p3");
@@ -6694,6 +6939,7 @@ mod tests {
             start_offset: 0,
             end_offset: 0,
             consumer_group: "g".into(),
+            topic_id: None,
         };
         assert_eq!(
             source_for_marker(&requested, &marker_for_a).source_name,
@@ -6955,6 +7201,146 @@ mod tests {
             flushed[0].committed,
             "flushed batch must commit after verify"
         );
+    }
+
+    /// The sample count of `vtop_stage_duration_seconds` for one tenant and
+    /// stage, read back from the registry as a scrape would.
+    fn stage_samples(tenant: &str, stage: &str) -> u64 {
+        let mx = telemetry::init().unwrap();
+        mx.registry
+            .gather()
+            .iter()
+            .filter(|f| f.name().ends_with("stage_duration_seconds"))
+            .flat_map(|f| f.get_metric().iter())
+            .filter(|m| {
+                let has = |name: &str, value: &str| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.name() == name && l.value() == value)
+                };
+                has("tenant", tenant) && has("stage", stage)
+            })
+            .map(|m| m.get_histogram().get_sample_count())
+            .sum()
+    }
+
+    /// `run` keeps no outcomes, so the per-stage timings of a batch it commits
+    /// reach an operator only through the `batch_metrics` line and the
+    /// `vtop_stage_duration_seconds` histograms. That line carried the total
+    /// and the ledger-write time and none of the stages, so a `run` engine's
+    /// stage timings read as absent where `process-once` printed them. The
+    /// cycle here is `run`'s own (`force_flush` false, the batch sealed by a
+    /// threshold, not by a forced flush), and the line must name every stage
+    /// with the value the batch measured.
+    #[tokio::test]
+    async fn run_cycle_logs_and_exports_the_stage_timings_of_a_committed_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let input = dir.path().join("in.log");
+        // Enough incompressible-ish text that compression, the checksum and
+        // the verify read each take well over the 1 ms the timings resolve.
+        const LINES: usize = 2_000;
+        {
+            let mut f = std::fs::File::create(&input).unwrap();
+            let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+            for _ in 0..LINES {
+                let mut line = String::with_capacity(4_096);
+                while line.len() < 4_095 {
+                    x = x
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    line.push_str(&format!("{x:016x}"));
+                }
+                writeln!(f, "{line}").unwrap();
+            }
+        }
+        let mut cfg = file_config(
+            work.to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.engine.tenant = "stage-timings-run".into();
+        cfg.batching.max_records = LINES;
+        cfg.batching.max_bytes = 104_857_600;
+        cfg.batching.max_batch_age_seconds = 3_600;
+
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let stages = [
+            "compress",
+            "checksum",
+            "object_upload",
+            "manifest_upload",
+            "verify",
+            "commit",
+            "state_write",
+        ];
+        let before: Vec<u64> = stages
+            .iter()
+            .map(|s| stage_samples("stage-timings-run", s))
+            .collect();
+
+        let (logs, _guard) = CapturedLogs::start_at(tracing::Level::INFO);
+        let outcomes = engine.run_source(SourceType::File, false).await.unwrap();
+        assert_eq!(outcomes.len(), 1, "the threshold sealed one batch");
+        let outcome = &outcomes[0];
+        assert!(outcome.committed, "the batch committed");
+        let m = outcome
+            .metrics
+            .as_ref()
+            .expect("a committed batch has metrics");
+
+        let line = logs.line("batch_metrics");
+        let field = |name: &str| -> u64 {
+            let key = format!("{name}=");
+            let at = line
+                .find(&key)
+                .unwrap_or_else(|| panic!("batch_metrics names no {name}: {line}"));
+            line[at + key.len()..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .unwrap_or_else(|_| panic!("{name} is not a number: {line}"))
+        };
+        let measured = [
+            ("compress_ms", m.compress_ms),
+            ("checksum_ms", m.checksum_ms),
+            ("object_upload_ms", m.object_upload_ms),
+            ("manifest_upload_ms", m.manifest_upload_ms),
+            ("verify_ms", m.verify_ms),
+            ("commit_ms", m.commit_ms),
+            ("state_write_ms", m.state_write_ms),
+            ("total_ms", m.total_ms),
+        ];
+        for (name, ms) in measured {
+            assert_eq!(
+                field(name),
+                ms,
+                "batch_metrics reports {name} as the batch measured it: {line}"
+            );
+        }
+        for (name, ms) in [
+            ("compress_ms", m.compress_ms),
+            ("checksum_ms", m.checksum_ms),
+            ("verify_ms", m.verify_ms),
+            ("total_ms", m.total_ms),
+        ] {
+            assert!(
+                ms > 0,
+                "{name} is 0 although the stage ran over {LINES} lines of 4 KiB: {line}"
+            );
+        }
+
+        for (stage, before) in stages.iter().zip(before) {
+            assert_eq!(
+                stage_samples("stage-timings-run", stage),
+                before + 1,
+                "one vtop_stage_duration_seconds sample for stage {stage} per committed batch"
+            );
+        }
     }
 
     /// #102: a throttle is counted apart from other upload failures, and the
@@ -9090,6 +9476,7 @@ mod tests {
             start_offset: start,
             end_offset: start + 9,
             consumer_group: "g".into(),
+            topic_id: None,
         };
         for order in [[0usize, 1, 2], [2, 1, 0], [1, 2, 0]] {
             let candidates = [
@@ -9214,6 +9601,7 @@ mod tests {
             start_offset: start,
             end_offset: end,
             consumer_group: "g".into(),
+            topic_id: None,
         };
         let mut plan = RewindPlan::default();
         plan.add(&kafka(10, 19));
@@ -9658,6 +10046,66 @@ mod tests {
         );
     }
 
+    /// `run` keeps a window buffered across passes until a threshold seals
+    /// it. A file read stops at `max_bytes` counting each line's newline and
+    /// the batcher counts records without it, so one full read stayed just
+    /// under the threshold and the next full read was appended: batches came
+    /// out at about twice `max_bytes` (73,417,507 bytes at a 16 MiB setting
+    /// were cut into batches of 33,554,257). A read that would take the window
+    /// past `max_bytes` now seals it first.
+    #[tokio::test]
+    async fn run_mode_batches_stay_within_max_bytes_across_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("app.log");
+        // 1,000 lines of 9 bytes ("line 0000" is 9 bytes, then the newline
+        // makes 10): a read at max_bytes 1000 takes 100 lines, whose records
+        // hold 900 bytes, under the threshold on their own.
+        let body: String = (0..1000).map(|i| format!("line {i:04}\n")).collect();
+        std::fs::write(&input, &body).unwrap();
+        let mut cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.max_records = 1_000_000;
+        cfg.batching.max_bytes = 1_000;
+        cfg.batching.max_batch_age_seconds = 3_600;
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+
+        for _ in 0..15 {
+            engine.run_source(SourceType::File, false).await.unwrap();
+        }
+        engine.run_source(SourceType::File, true).await.unwrap();
+
+        let committed: Vec<_> = engine
+            .store
+            .list_batches()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|b| b.state == BatchState::SourceCommitted)
+            .collect();
+        let total: i64 = committed.iter().map(|b| b.record_count.unwrap_or(0)).sum();
+        assert_eq!(total, 1000, "every line archived once: {committed:?}");
+        for b in &committed {
+            let records = b.record_count.unwrap_or(0);
+            assert!(
+                records * 9 <= 1_000,
+                "a batch of {records} records holds {} bytes of records, over max_bytes 1000",
+                records * 9
+            );
+        }
+        assert!(
+            committed.len() >= 10,
+            "1,000 lines of 9 bytes at max_bytes 1000 make at least 10 batches, not about 5: \
+             {} batches",
+            committed.len()
+        );
+    }
+
     /// Records every read the wrapped adapter hands out and every marker the
     /// engine commits through it, so a test can hold the commit to exactly
     /// what was read.
@@ -9923,6 +10371,7 @@ mod tests {
             start_offset: start,
             end_offset: end,
             consumer_group: "g".into(),
+            topic_id: None,
         };
         for (start, end) in [(100, 149), (150, 199), (200, 249)] {
             buf.append(ReadResult {
@@ -10048,6 +10497,46 @@ mod tests {
         assert!(
             !buf.continues(&file(Some(2), 10, 10)),
             "another file took the path"
+        );
+    }
+
+    /// A topic id that changes between two reads of one partition (the topic
+    /// was deleted and created again while the adapter held the old id) seals
+    /// the buffered window: one window of both incarnations would hold offsets
+    /// 0 to 9 while its marker could claim only the last read's 5 to 9. An id
+    /// unknown on either side proves no change.
+    #[test]
+    fn a_kafka_window_is_not_continued_across_a_change_of_topic_id() {
+        let kafka = |id: Option<&str>, start: i64, end: i64| ProgressMarker::Kafka {
+            topic: "t".into(),
+            partition: 0,
+            start_offset: start,
+            end_offset: end,
+            consumer_group: "g".into(),
+            topic_id: id.map(str::to_owned),
+        };
+        let src = DiscoveredSource {
+            source_type: SourceType::Kafka,
+            source_name: "t".into(),
+            format: vtop_core::types::TelemetryFormat::Raw,
+        };
+        let mut buf = PendingBuffer::new("t", src, BatchLimits::default());
+        buf.append(ReadResult {
+            records: vec![b"x".to_vec()],
+            progress_start: kafka(Some("old"), 0, 0),
+            progress_end: kafka(Some("old"), 0, 4),
+            first_timestamp: None,
+            last_timestamp: None,
+            verbatim: false,
+        });
+        assert!(buf.continues(&kafka(Some("old"), 5, 5)));
+        assert!(
+            buf.continues(&kafka(None, 5, 5)),
+            "an unknown id proves no change"
+        );
+        assert!(
+            !buf.continues(&kafka(Some("new"), 5, 5)),
+            "another incarnation of the topic"
         );
     }
 
@@ -10739,6 +11228,7 @@ mod tests {
             start_offset: start,
             end_offset: start + 9,
             consumer_group: group.into(),
+            topic_id: None,
         };
         let mut plan = RewindPlan::default();
         plan.hold(&kafka("g", 0, 10));
@@ -11353,6 +11843,7 @@ mod tests {
                 start_offset: start,
                 end_offset: end,
                 consumer_group: Self::GROUP.into(),
+                topic_id: None,
             };
             let read = ReadResult {
                 records: (self.next..end)
@@ -11616,6 +12107,7 @@ mod tests {
             start_offset: start,
             end_offset: 2,
             consumer_group: group.into(),
+            topic_id: None,
         };
         assert_eq!(
             rewinds(&kafka("g", 0, 0), &kafka("g", 0, 2)),
@@ -11856,12 +12348,17 @@ mod tests {
         /// Capture WARN and above on this thread until the guard drops (a
         /// `#[tokio::test]` runs its tasks on the one thread).
         fn start() -> (Self, tracing::subscriber::DefaultGuard) {
+            Self::start_at(tracing::Level::WARN)
+        }
+
+        /// Capture `level` and above on this thread until the guard drops.
+        fn start_at(level: tracing::Level) -> (Self, tracing::subscriber::DefaultGuard) {
             let logs = Self::default();
             let writer = logs.clone();
             let subscriber = tracing_subscriber::fmt()
                 .with_writer(move || writer.clone())
                 .with_ansi(false)
-                .with_max_level(tracing::Level::WARN)
+                .with_max_level(level)
                 .finish();
             // Whether an event's callsite is recorded at all is decided once for
             // the process, the first time any thread reaches it, and cached. With
