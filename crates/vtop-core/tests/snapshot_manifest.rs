@@ -38,6 +38,7 @@ fn kafka_builder() -> ManifestBuilder {
             start_offset: 0,
             end_offset: 99,
             consumer_group: "vtop-engine".into(),
+            topic_id: None,
         },
         object_uri: "s3://telemetry-cef/tenant=default/source=app_events/format=cef/year=2026/month=01/day=01/hour=00/vtop-20260101T000000Z-app_events-p0-0-99-deadbeef.cef.gz".into(),
         object_size: 4096,
