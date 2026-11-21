@@ -116,7 +116,11 @@ const MAX_CONFLICT_RETRIES: u32 = 5;
 /// (#614; see the SQLite predicate for why that is not the newest-created
 /// row); for a Kafka row of no topic id, a newer one of its (topic, partition,
 /// consumer group) that has none either, the rule before the id existed. A row
-/// of no id is never ranked against one of a known id. A Kafka row of either
+/// of no id is never ranked against one of a known id. "Ends higher" is two
+/// probes joined by OR (a higher end, or an equal end and a later creation),
+/// each a range or equality seek on idx_batches_kafka_max_end: one row
+/// comparison on (end, created_at, batch_id) scanned the id's rows below the
+/// candidate's end for every candidate. A Kafka row of either
 /// kind is also kept while no newer row of its (topic, partition, consumer
 /// group) exists, so the answer holding the unit's newest row, which the
 /// adapter falls back to when it cannot learn the topic's id, does not move.
@@ -131,7 +135,21 @@ macro_rules! pg_prune_predicate_sql {
         "b.updated_at < $2 AND (b.state = $4 OR (b.state = $1 \
           AND CASE \
           WHEN b.source_type = 'kafka' \
-           AND (b.progress_end_json::jsonb ->> 'topic_id') IS NOT NULL THEN EXISTS ( \
+           AND (b.progress_end_json::jsonb ->> 'topic_id') IS NOT NULL THEN ( \
+            ((b.progress_end_json::jsonb ->> 'end_offset')::bigint) < ( \
+              SELECT MAX((n.progress_end_json::jsonb ->> 'end_offset')::bigint) \
+              FROM batches n \
+              WHERE n.state = $1 \
+                AND n.source_type = 'kafka' \
+                AND (n.progress_end_json::jsonb ->> 'topic') \
+                    = (b.progress_end_json::jsonb ->> 'topic') \
+                AND (n.progress_end_json::jsonb ->> 'partition') \
+                    = (b.progress_end_json::jsonb ->> 'partition') \
+                AND (n.progress_end_json::jsonb ->> 'consumer_group') \
+                    = (b.progress_end_json::jsonb ->> 'consumer_group') \
+                AND (n.progress_end_json::jsonb ->> 'topic_id') \
+                    = (b.progress_end_json::jsonb ->> 'topic_id') \
+            ) OR EXISTS ( \
             SELECT 1 FROM batches n \
             WHERE n.state = $1 \
               AND n.source_type = 'kafka' \
@@ -143,11 +161,10 @@ macro_rules! pg_prune_predicate_sql {
                   = (b.progress_end_json::jsonb ->> 'consumer_group') \
               AND (n.progress_end_json::jsonb ->> 'topic_id') \
                   = (b.progress_end_json::jsonb ->> 'topic_id') \
-              AND ((n.progress_end_json::jsonb ->> 'end_offset')::bigint, \
-                   n.created_at, n.batch_id) \
-                > ((b.progress_end_json::jsonb ->> 'end_offset')::bigint, \
-                   b.created_at, b.batch_id) \
-          ) \
+              AND ((n.progress_end_json::jsonb ->> 'end_offset')::bigint) \
+                = ((b.progress_end_json::jsonb ->> 'end_offset')::bigint) \
+              AND (n.created_at, n.batch_id) > (b.created_at, b.batch_id) \
+          )) \
           AND EXISTS ( \
             SELECT 1 FROM batches n \
             WHERE n.state = $1 \

@@ -179,6 +179,20 @@ CREATE INDEX IF NOT EXISTS idx_batches_kafka_max_end ON batches(
     batch_id
 ) WHERE source_type = 'kafka';
 
+-- Bounds the probes for a NEWER row of a Kafka unit (the unit's newest row is
+-- kept, and rows of no topic id are ranked by creation): a range seek on
+-- (created_at, batch_id) after the unit's identity, which the index above
+-- cannot give because the topic id and end offset come before them there.
+-- The expressions must stay identical to the ones in the prune query.
+CREATE INDEX IF NOT EXISTS idx_batches_kafka_newest ON batches(
+    state,
+    (progress_end_json::jsonb ->> 'topic'),
+    (progress_end_json::jsonb ->> 'partition'),
+    (progress_end_json::jsonb ->> 'consumer_group'),
+    created_at,
+    batch_id
+) WHERE source_type = 'kafka';
+
 -- Database-level backstop for the verify-before-source-commit invariant.
 --
 -- A row is also born only as batching (#625): born verified, it could be

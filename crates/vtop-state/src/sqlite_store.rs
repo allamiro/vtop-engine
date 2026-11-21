@@ -107,6 +107,20 @@ CREATE INDEX IF NOT EXISTS idx_batches_kafka_max_end ON batches(
     created_at,
     batch_id
 ) WHERE source_type = 'kafka';
+-- Bounds the probes for a NEWER row of a Kafka unit (the unit's newest row is
+-- kept, and rows of no topic id are ranked by creation): a range seek on
+-- (created_at, batch_id) after the unit's identity, which the index above
+-- cannot give because the topic id and end offset come before them there.
+-- The expressions must stay textually identical to the ones in
+-- prune_predicate_sql.
+CREATE INDEX IF NOT EXISTS idx_batches_kafka_newest ON batches(
+    state,
+    json_extract(progress_end_json, '$.topic'),
+    json_extract(progress_end_json, '$.partition'),
+    json_extract(progress_end_json, '$.consumer_group'),
+    created_at,
+    batch_id
+) WHERE source_type = 'kafka';
 -- The audit trail (#694): one row per audit record, append only, chained
 -- (see crate::audit). A new table: an older release opening this file never
 -- reads it, so the schema version is unchanged. AUTOINCREMENT, so a deleted
@@ -163,6 +177,13 @@ CREATE INDEX IF NOT EXISTS idx_audit_events_time ON audit_events(time);
 ///   cannot learn the topic's id, and pruning a lower-ending row of that
 ///   incarnation (interleaved with rows of no id) would move it to another.
 ///
+/// A Kafka row of a known id is "better" than another when its end is higher,
+/// or equal and it is newer: two probes joined by OR, not one row-value
+/// comparison on (end, created_at, batch_id), because SQLite does not serve a
+/// row value over expression-index columns as a range, so the single probe
+/// scanned the rows of the id below the candidate's end for every candidate
+/// (quadratic in a large prune). Each probe is an equality or a range seek.
+///
 /// "Newer" is a row-value comparison on `(created_at, batch_id)`: the same
 /// order as `created_at >, or equal and batch_id >`, written so the planner
 /// can serve it as a range on the index's last two columns. With the OR form,
@@ -174,7 +195,8 @@ CREATE INDEX IF NOT EXISTS idx_audit_events_time ON audit_events(time);
 /// seek finds; they do not replace it.
 ///
 /// The probe expressions must stay textually identical to the
-/// `idx_batches_commit_newest` and `idx_batches_kafka_max_end` expressions
+/// `idx_batches_commit_newest`, `idx_batches_kafka_max_end` and
+/// `idx_batches_kafka_newest` expressions
 /// above: SQLite matches expression indexes structurally, and without the
 /// index every candidate row rescans the entire committed set (quadratic on
 /// the engine's idle-cycle pass). The Kafka literal is `'kafka'`, not a
@@ -188,7 +210,7 @@ macro_rules! prune_predicate_sql {
         "b.updated_at < ?2 AND (b.state = ?4 OR (b.state = ?1 \
               AND CASE \
               WHEN b.source_type = 'kafka' \
-               AND json_extract(b.progress_end_json, '$.topic_id') IS NOT NULL THEN EXISTS ( \
+               AND json_extract(b.progress_end_json, '$.topic_id') IS NOT NULL THEN (EXISTS ( \
                 SELECT 1 FROM batches n \
                 WHERE n.state = ?1 \
                   AND n.source_type = 'kafka' \
@@ -200,11 +222,24 @@ macro_rules! prune_predicate_sql {
                       = json_extract(b.progress_end_json, '$.consumer_group') \
                   AND json_extract(n.progress_end_json, '$.topic_id') \
                       = json_extract(b.progress_end_json, '$.topic_id') \
-                  AND (CAST(json_extract(n.progress_end_json, '$.end_offset') AS INTEGER), \
-                       n.created_at, n.batch_id) \
-                    > (CAST(json_extract(b.progress_end_json, '$.end_offset') AS INTEGER), \
-                       b.created_at, b.batch_id) \
-              ) \
+                  AND CAST(json_extract(n.progress_end_json, '$.end_offset') AS INTEGER) \
+                    > CAST(json_extract(b.progress_end_json, '$.end_offset') AS INTEGER) \
+              ) OR EXISTS ( \
+                SELECT 1 FROM batches n \
+                WHERE n.state = ?1 \
+                  AND n.source_type = 'kafka' \
+                  AND json_extract(n.progress_end_json, '$.topic') \
+                      = json_extract(b.progress_end_json, '$.topic') \
+                  AND json_extract(n.progress_end_json, '$.partition') \
+                      = json_extract(b.progress_end_json, '$.partition') \
+                  AND json_extract(n.progress_end_json, '$.consumer_group') \
+                      = json_extract(b.progress_end_json, '$.consumer_group') \
+                  AND json_extract(n.progress_end_json, '$.topic_id') \
+                      = json_extract(b.progress_end_json, '$.topic_id') \
+                  AND CAST(json_extract(n.progress_end_json, '$.end_offset') AS INTEGER) \
+                    = CAST(json_extract(b.progress_end_json, '$.end_offset') AS INTEGER) \
+                  AND (n.created_at, n.batch_id) > (b.created_at, b.batch_id) \
+              )) \
               AND EXISTS ( \
                 SELECT 1 FROM batches n \
                 WHERE n.state = ?1 \
@@ -2059,14 +2094,31 @@ mod tests {
             plan.contains("idx_batches_commit_newest"),
             "successor probe no longer uses idx_batches_commit_newest:\n{plan}"
         );
-        // Both Kafka branches' probes - for a row of a known topic id ending
-        // higher, and for a row of no id with a newer one - and each one's
-        // probe for a newer row of the unit are bounded by the partial index,
-        // for the same reason.
-        let kafka_probes = plan.matches("idx_batches_kafka_max_end").count();
+        // The probes for a row of a known topic id that ends higher - a range
+        // on the end offset, and equal with a later creation time - are
+        // bounded by the (identity, topic id, end offset, created_at) partial
+        // index; the probes for a NEWER row of the unit - the unit's newest
+        // row is kept, and rows of no id are ranked by creation - by the
+        // (identity, created_at, batch_id) one, as a range on the creation
+        // time. Naming an index is not enough: a probe whose range column
+        // comes after columns it does not constrain rescans the earlier rows
+        // for every candidate, which made a large prune quadratic.
+        let probes =
+            |index: &str| -> Vec<&str> { plan.lines().filter(|l| l.contains(index)).collect() };
+        let max_end = probes("idx_batches_kafka_max_end");
         assert!(
-            kafka_probes >= 4,
-            "{kafka_probes} of the 4 Kafka probes use idx_batches_kafka_max_end:\n{plan}"
+            max_end.iter().any(|l| l.contains("<expr>>?")),
+            "no known-id probe seeks the end offset above the candidate's:\n{plan}"
+        );
+        assert!(
+            max_end.iter().any(|l| l.contains("created_at>?")),
+            "no known-id probe seeks a later creation time at an equal end:\n{plan}"
+        );
+        let newest = probes("idx_batches_kafka_newest");
+        assert!(
+            newest.len() >= 3 && newest.iter().all(|l| l.contains("created_at>?")),
+            "the 3 newer-row probes must seek by creation time ({} found):\n{plan}",
+            newest.len()
         );
     }
 }
