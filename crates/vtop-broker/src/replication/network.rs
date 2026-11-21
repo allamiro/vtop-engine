@@ -195,6 +195,10 @@ const CATCH_UP_MAX_RECORDS: usize = 1_024;
 /// Payload bytes one catch-up read aims for, well inside one replica frame.
 const CATCH_UP_MAX_BYTES: usize = 1024 * 1024;
 
+/// The most one record read alone may take: what one replica frame carries,
+/// less room for the frame around it.
+const CATCH_UP_MAX_SINGLE_RECORD_BYTES: usize = DEFAULT_MAX_FRAME_BYTES as usize - 64 * 1024;
+
 impl LeaderLineage for crate::LocalBroker {
     fn leader_lineage(&self) -> Option<LeaderLineageSnapshot> {
         // Only an epoch this broker serves, judged as produce judges it. A
@@ -264,12 +268,26 @@ impl LeaderLineage for crate::LocalBroker {
         if from >= committed {
             return CatchUpRead::UpToDate;
         }
-        let fetched = match state.segment.fetch_through(
-            from,
-            max_bytes.max(1),
-            CATCH_UP_MAX_RECORDS,
-            committed,
-        ) {
+        // A record larger than one read's target still goes, alone (review):
+        // the produce path admits any record one replica frame can carry,
+        // and a catch-up that could not pass one would strand the follower
+        // in front of it.
+        let fetched = state
+            .segment
+            .fetch_through(from, max_bytes.max(1), CATCH_UP_MAX_RECORDS, committed)
+            .and_then(|fetched| {
+                if fetched.records.is_empty() {
+                    state.segment.fetch_through(
+                        from,
+                        CATCH_UP_MAX_SINGLE_RECORD_BYTES,
+                        1,
+                        committed,
+                    )
+                } else {
+                    Ok(fetched)
+                }
+            });
+        let fetched = match fetched {
             Ok(fetched) => fetched,
             Err(vtop_log::LogError::OffsetBelowRange { earliest, .. }) => {
                 return CatchUpRead::BelowLogStart {
@@ -296,6 +314,30 @@ impl LeaderLineage for crate::LocalBroker {
         }
         CatchUpRead::Appends(appends)
     }
+}
+
+/// The part of `appends` below `end`, where the queued stream resumes
+/// (#881, review). An append straddling `end` is cut at it, not kept whole:
+/// kept whole it would carry the follower into the middle of the queued
+/// append, which the follower then refuses for ever (its base below the
+/// follower's tip, its end not yet durable there).
+pub(crate) fn appends_below(
+    appends: Vec<ReplicaAppendRequest>,
+    end: u64,
+) -> Vec<ReplicaAppendRequest> {
+    appends
+        .into_iter()
+        .filter_map(|mut append| {
+            let room = end.checked_sub(append.expected_base_offset)?;
+            if room == 0 {
+                return None;
+            }
+            append
+                .records
+                .truncate(usize::try_from(room).unwrap_or(usize::MAX));
+            Some(append)
+        })
+        .collect()
 }
 
 /// Group records read from a leader's log into the replica appends that
@@ -2363,10 +2405,7 @@ impl FollowerDriver {
                     return Ok(());
                 }
             };
-            let appends: Vec<ReplicaAppendRequest> = appends
-                .into_iter()
-                .filter(|append| append.expected_base_offset < resume_at)
-                .collect();
+            let appends = appends_below(appends, resume_at);
             let Some(last) = appends.last() else {
                 break;
             };
@@ -3699,5 +3738,138 @@ mod tests {
             .await;
         assert_eq!(read.map(|lineage| lineage.fencing_epoch), Some(7));
         assert_eq!(leader.calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn catch_up_range() -> RangeIdentity {
+        RangeIdentity {
+            topic: "events.v1".to_owned(),
+            topic_epoch: 1,
+            range_id: Uuid::from_u128(0xC1),
+            range_generation: 0,
+        }
+    }
+
+    fn one_producer_append(base: u64, records: u64) -> ReplicaAppendRequest {
+        ReplicaAppendRequest {
+            range: catch_up_range(),
+            fencing_epoch: 4,
+            leader_node_id: Uuid::from_u128(0xA1),
+            expected_base_offset: base,
+            producer_id: Uuid::from_u128(0xB1),
+            producer_epoch: 1,
+            first_sequence: base,
+            records: (0..records)
+                .map(|index| ProduceRecord {
+                    timestamp_millis: 1,
+                    key: Vec::new(),
+                    value: format!("v{}", base + index).into_bytes(),
+                })
+                .collect(),
+        }
+    }
+
+    /// #881 review (P1): a catch-up read of 0..1024 while the queued stream
+    /// resumes at 1000 must stop at 1000. Sent whole, the append carried the
+    /// follower to 1024, into the middle of the queued append at 1000..1100,
+    /// which the follower then refused for ever.
+    #[test]
+    fn a_catch_up_append_straddling_the_queued_stream_is_cut_where_the_stream_resumes() {
+        let trimmed = appends_below(
+            vec![one_producer_append(0, 600), one_producer_append(600, 424)],
+            1_000,
+        );
+        assert_eq!(trimmed.len(), 2);
+        assert_eq!(trimmed[0].records.len(), 600);
+        assert_eq!(trimmed[1].expected_base_offset, 600);
+        assert_eq!(
+            trimmed[1].records.len(),
+            400,
+            "the append straddling the resume offset must end exactly there"
+        );
+        assert_eq!(trimmed[1].records.last().unwrap().value, b"v999");
+        // Nothing at or above the resume offset, and nothing when it is the start.
+        assert!(appends_below(vec![one_producer_append(1_000, 5)], 1_000).is_empty());
+        assert_eq!(
+            appends_below(vec![one_producer_append(0, 5)], u64::MAX)[0]
+                .records
+                .len(),
+            5
+        );
+    }
+
+    /// #881 review (P2): a record bigger than one catch-up read's target, but
+    /// one a replica frame carries, is still read and re-sent, alone. Before,
+    /// the read returned nothing for it and the follower stayed stranded in
+    /// front of it.
+    #[test]
+    fn a_record_larger_than_a_catch_up_read_is_still_caught_up_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let range = catch_up_range();
+        let mut segment = vtop_log::ActiveSegment::create_v2(
+            dir.path().join("range.active"),
+            vtop_log::SegmentDescriptorV2 {
+                segment_id: Uuid::from_u128(9),
+                topic: range.topic.clone(),
+                topic_epoch: range.topic_epoch,
+                lineage: vtop_log::RangeLineage {
+                    range_id: range.range_id,
+                    generation: range.range_generation,
+                    key_range: vtop_log::KeyRange::full(),
+                    parents: Vec::new(),
+                },
+                base_offset: 0,
+                segment_generation: 0,
+                creation_node_id: Uuid::from_u128(0xA1),
+                creation_fencing_epoch: 4,
+            },
+            vtop_log::SegmentConfigV2::default(),
+        )
+        .unwrap();
+        let big = vec![7_u8; 2 * 1024 * 1024];
+        for (sequence, value) in [b"small".to_vec(), big.clone(), b"after".to_vec()]
+            .into_iter()
+            .enumerate()
+        {
+            segment
+                .append(
+                    vtop_log::LogRecord {
+                        producer_id: Uuid::from_u128(0xB1),
+                        producer_epoch: 1,
+                        sequence: sequence as u64,
+                        timestamp_millis: 1,
+                        attributes: 0,
+                        key: Vec::new(),
+                        value,
+                    },
+                    vtop_log::Durability::Fsync,
+                )
+                .unwrap();
+        }
+        let epochs = crate::ProducerEpochJournal::open(dir.path().join("epochs")).unwrap();
+        let broker = crate::LocalBroker::new(segment, epochs, range, 4).unwrap();
+
+        let CatchUpRead::Appends(first) = broker.read_catch_up(0, CATCH_UP_MAX_BYTES) else {
+            panic!("the small record reads")
+        };
+        let end = first
+            .iter()
+            .map(|append| append.records.len() as u64)
+            .sum::<u64>();
+        assert_eq!(end, 1, "the read stops before the record it cannot fit");
+        let CatchUpRead::Appends(alone) = broker.read_catch_up(1, CATCH_UP_MAX_BYTES) else {
+            panic!("a record larger than the read's target must still be read, alone")
+        };
+        assert_eq!(alone.len(), 1);
+        assert_eq!(alone[0].expected_base_offset, 1);
+        assert_eq!(alone[0].records.len(), 1);
+        assert_eq!(alone[0].records[0].value, big);
+        assert!(matches!(
+            broker.read_catch_up(2, CATCH_UP_MAX_BYTES),
+            CatchUpRead::Appends(rest) if rest[0].expected_base_offset == 2
+        ));
+        assert_eq!(
+            broker.read_catch_up(3, CATCH_UP_MAX_BYTES),
+            CatchUpRead::UpToDate
+        );
     }
 }
