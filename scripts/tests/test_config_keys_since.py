@@ -279,6 +279,12 @@ pub struct FileRef {
         self.assertEqual([(a.path, a.note_kind) for a in added], [("store.file", "refused")])
         self.assertIn("Release-gating", added[0].note)
 
+    def test_a_field_of_a_variant_is_not_a_required_key(self):
+        # Configs that use the URL or the env form still load.
+        added = MOD.added_keys(self.BEFORE, self.AFTER, {})
+        self.assertFalse(added[0].required)
+        self.assertNotIn("Required by this build", MOD.render(added, "v1", "v2"))
+
     def test_a_field_added_to_an_existing_lenient_variant_is_only_ignored(self):
         before = self.BEFORE.replace("#[serde(deny_unknown_fields)]\npub struct EnvRef", "pub struct EnvRef")
         after = before.replace("    pub env: String,\n", "    pub env: String,\n    pub extra: String,\n")

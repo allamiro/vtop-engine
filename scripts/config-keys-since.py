@@ -283,7 +283,11 @@ def walk(
         struct = structs[struct_name]
         for item in struct.fields:
             path = f"{base}.{item.key}" if base else item.key
-            required = not (item.has_default or item.optional or struct.container_default)
+            # A field of an enum variant is required only when that variant is
+            # the one written; a config using another form still loads.
+            required = not (
+                item.has_default or item.optional or struct.container_default or via_enum
+            )
             keys[path] = Key(
                 path=path,
                 declared_in=struct_name,
