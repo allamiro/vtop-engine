@@ -8502,7 +8502,10 @@ mod tests {
                 .is_err(),
             "the flush waits on the held upload"
         );
-        assert!(Arc::strong_count(&store) > 2, "the batch task holds the store");
+        assert!(
+            Arc::strong_count(&store) > 2,
+            "the batch task holds the store"
+        );
         drop(engine);
         for _ in 0..100 {
             if Arc::strong_count(&store) == 1 {
@@ -8579,7 +8582,10 @@ mod tests {
 
         drop(live);
         assert_eq!(engine.sweep_abandoned_multipart().await, 1);
-        assert!(!path.exists(), "an abandoned session was kept once its upload ended");
+        assert!(
+            !path.exists(),
+            "an abandoned session was kept once its upload ended"
+        );
     }
 
     /// The upload slots follow the width the controller chooses (#102). A
