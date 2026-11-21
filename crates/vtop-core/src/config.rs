@@ -2587,34 +2587,51 @@ upload:
             let cfg: VtopConfig = serde_yaml::from_str(&yaml).unwrap();
             cfg.validate().map_err(|e| e.to_string())
         };
-        let cert = "    ssl_certificate_location: /etc/vtop/kafka/client.pem\n";
-        let key = "    ssl_key_location: /etc/vtop/kafka/client.key\n";
+        // Config lines, named by what they set (the case label is what a
+        // failure prints).
+        let crt_line = "    ssl_certificate_location: /etc/vtop/kafka/client.pem\n";
+        let key_line = "    ssl_key_location: /etc/vtop/kafka/client.key\n";
         let ssl = "    security_protocol: SSL\n";
-        load(&format!("{ssl}{cert}{key}")).expect("a certificate and key over SSL");
+        load(&format!("{ssl}{crt_line}{key_line}")).expect("a certificate and key over SSL");
         load(&format!(
-            "    security_protocol: SASL_SSL\n{cert}{key}    ssl_key_password_env: KAFKA_KEY_PW\n"
+            "    security_protocol: SASL_SSL\n{crt_line}{key_line}    ssl_key_password_env: KAFKA_KEY_PW\n"
         ))
         .expect("over SASL_SSL, with a key passphrase");
         load("").expect("no mutual TLS at all");
-        for (extra, says) in [
-            (format!("{ssl}{cert}"), "together or not at all"),
-            (format!("{ssl}{key}"), "together or not at all"),
-            (format!("{cert}{key}"), "not set (PLAINTEXT)"),
+        for (case, extra, says) in [
             (
-                format!("    security_protocol: SASL_PLAINTEXT\n{cert}{key}"),
+                "certificate only",
+                format!("{ssl}{crt_line}"),
+                "together or not at all",
+            ),
+            (
+                "key only",
+                format!("{ssl}{key_line}"),
+                "together or not at all",
+            ),
+            (
+                "no protocol",
+                format!("{crt_line}{key_line}"),
+                "not set (PLAINTEXT)",
+            ),
+            (
+                "SASL_PLAINTEXT",
+                format!("    security_protocol: SASL_PLAINTEXT\n{crt_line}{key_line}"),
                 "set security_protocol to SSL or SASL_SSL",
             ),
             (
+                "passphrase without a key",
                 format!("{ssl}    ssl_key_password_env: KAFKA_KEY_PW\n"),
                 "without ssl_key_location",
             ),
             (
-                format!("{ssl}{cert}    ssl_key_location: \"\"\n"),
+                "empty key path",
+                format!("{ssl}{crt_line}    ssl_key_location: \"\"\n"),
                 "ssl_key_location is set but empty",
             ),
         ] {
-            let err = load(&extra).expect_err(&extra);
-            assert!(err.contains(says), "{says:?} not in {err}");
+            let err = load(&extra).expect_err(case);
+            assert!(err.contains(says), "{case}: {says:?} not in the refusal");
         }
     }
 
