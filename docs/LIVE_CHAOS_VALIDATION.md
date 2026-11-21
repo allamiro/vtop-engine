@@ -168,12 +168,15 @@ before its private tmpfs disappears.
 The scenarios above drive the cluster plane. The archive engine (`vtopctl
 run`: a source, batches, the object store, the ledger) has its own harness,
 `scripts/live-chaos/engine/run-sweep.sh`, which sources the same `lib.sh`. It
-kills the engine with `SIGKILL` at every failpoint, against a real Kafka
-broker, the lab's MinIO and a SQLite ledger, restarts it and checks what the
-restart made of it.
+kills the engine with `SIGKILL` at every failpoint, against a real source
+(a Kafka broker, or a file), the lab's MinIO and a ledger (SQLite, or
+PostgreSQL), restarts it and checks what the restart made of it. Five legs
+run the same script with different knobs (see "The legs" below).
 
 **System model.** One crash-recovery engine process; a partially synchronous
-network; honest processes. The only fault is the `SIGKILL`.
+network; honest processes. The fault is the `SIGKILL`; two legs also hold a
+second fault (the store down, the work directory full) while the engine runs
+towards the failpoint.
 
 **How the kill lands.** A failpoint, not a timer: a build with the cargo
 feature `failpoints` reads `VTOP_FAILPOINT=<point>` (or `<point>:<n>` for the
@@ -202,21 +205,44 @@ settle pass) has them; the others are explicit calls.
 | `mid_object_put` | a multipart upload has stored a part and is not complete (the sweep sends this leg's objects as multipart) | `CHECKSUMMED` |
 | `after_object_put_before_ledger` | the object is in the store, the ledger does not say so | `CHECKSUMMED` |
 | `after_manifest_put_before_ledger` | the manifest is in the store, the ledger does not say so | `OBJECT_UPLOADED` |
-| `before_source_commit` | VERIFIED is in the ledger, the Kafka offset is not committed | `VERIFIED` |
-| `after_source_commit_before_ledger` | the Kafka offset is committed, SOURCE_COMMITTED is not written | `VERIFIED` |
+| `before_source_commit` | VERIFIED is in the ledger, the source's position is not committed | `VERIFIED` |
+| `after_source_commit_before_ledger` | the source's position is committed (the Kafka offset on the broker; a file's cursor in the engine), SOURCE_COMMITTED is not written | `VERIFIED` |
 
 `crates/vtop-cli/tests/failpoints.rs` pins this table on every build of the
 feature: each point kills a real `vtopctl process-once` (exit by signal 9),
 the ledger is in the state above, and a restart archives every record of a
 local file into a local store.
 
-**What is checked, per point.** Each point has its own consumer group,
-ledger, work directory and object prefix over one seeded topic.
+**The legs.** The issue asks for "SQLite and PostgreSQL, Kafka and file
+sources, and with a store outage and ENOSPC". Each leg is the whole script with
+`ENGINE_SWEEP_BACKEND`, `ENGINE_SWEEP_SOURCE` and `ENGINE_SWEEP_FAULT` set, so
+every leg is held to every invariant below.
+
+| Leg | Ledger | Source | Fault while the engine runs towards the point |
+|---|---|---|---|
+| `sqlite-kafka` | SQLite | Kafka | none (the baseline, and the only leg a pull request runs) |
+| `postgres-kafka` | PostgreSQL, one database per point, schema applied by `vtopctl migrate` | Kafka | none |
+| `sqlite-file` | SQLite | one file, read through the file source | none |
+| `sqlite-kafka-store-outage` | SQLite | Kafka | MinIO is stopped (`docker stop`) for up to `ENGINE_SWEEP_FAULT_SECONDS` (12), then started again; the engine is not restarted in between |
+| `sqlite-kafka-enospc` | SQLite | Kafka | the engine's work directory is a 16 KiB tmpfs with no free page, for the same time, then the filler is deleted; the engine is not restarted in between |
+
+In the two fault legs a point the engine reaches while the fault is on is
+killed there (a kill with the store down, or the disk full); a point that
+waits on the store or the disk is reached after the fault lifts, so the
+engine has to recover from the failed attempts without a restart, and then
+dies at the point. Either way the restart and every check that follows are
+the same as without a fault.
+
+**What is checked, per point.** Each point has its own ledger (a SQLite file
+or a PostgreSQL database), work directory and object prefix; a Kafka leg also
+gives each point its own consumer group over one seeded topic, and the file
+leg reads one file written once.
 
 | Invariant | Kind | How |
 |---|---|---|
-| The commit rule at the source: the group's committed offset never passes the end of the highest range the ledger records as VERIFIED | safety | read from the broker (`kafka-consumer-groups.sh`) and from the ledger (opened read-only, so the WAL the kill left is not checkpointed), at the kill and again after the restart. "No committed offset" counts only when the broker said so (the offsets table without one, or the group not found); a query that failed or timed out, which the tool reports with exit status 0, is retried three times and then fails the check |
-| The commit rule in the ledger: no SOURCE_COMMITTED row lacks what the VERIFIED write leaves (the verification class, which only `mark_verified` sets, the object and the manifest) | safety | the same read-only ledger read, at the kill and after the restart |
+| The commit rule at the source: the source's committed position never passes the end of the highest range the ledger records as VERIFIED | safety | Kafka: the group's committed offset, read from the broker (`kafka-consumer-groups.sh`), against the ledger, at the kill and again after the restart. "No committed offset" counts only when the broker said so (the offsets table without one, or the group not found); a query that failed or timed out, which the tool reports with exit status 0, is retried three times and then fails the check. File: the file's committed position is in the engine and the ledger is its durable record, so the position is the ledger's cursor (the highest SOURCE_COMMITTED end byte); that comparison cannot fail by itself, so the next two rows are what bites for a file |
+| The commit rule in the ledger: no SOURCE_COMMITTED row lacks what the VERIFIED write leaves (the verification class, which only `mark_verified` sets, the object and the manifest) | safety | the ledger read at the kill and after the restart: SQLite opened read-only, so the WAL the kill left is not checkpointed; PostgreSQL through `psql` in the server's container |
+| The order, whatever the source: at the kill the newest live ledger row is in the state the failpoint sits beside (the table above), so the engine reached the source commit only with the batch VERIFIED | safety | `KILL_STATE` in `sweep_checks.py`, a unit test holds it equal to the state table in `tests/failpoints.rs` and to the points the engine defines |
 | No hole | safety | `vtopctl audit-coverage --check-storage` passes, `vtopctl scrub` is clean, and every produced record is found in the objects the store holds, copied out with `mc` and counted by the harness, not by the engine |
 | Duplicates only where the at-least-once window is open | safety | the extra copies are counted against the table below |
 | The restart commits every record and stops cleanly | liveness | bounded poll on the group's committed offset and the ledger, then `SIGTERM` and exit 0 |
@@ -240,37 +266,84 @@ CHAOS_PROFILE=debug scripts/live-chaos/engine/run-sweep.sh
 ENGINE_SWEEP_POINTS=before_source_commit CHAOS_PROFILE=debug scripts/live-chaos/engine/run-sweep.sh
 ```
 
-Knobs (`ENGINE_SWEEP_POINTS`, `ENGINE_SWEEP_RECORDS`,
-`ENGINE_SWEEP_BATCH_RECORDS`, `ENGINE_SWEEP_POINT_TIMEOUT_SECONDS`, the Kafka
-bootstrap and container, the S3 endpoint and bucket) are documented and
-validated in the script header. `CHAOS_VTOPCTL` points at the failpoints
+The other legs add knobs to the same script:
+
+```bash
+# PostgreSQL ledger: a build with the postgres feature, and a running server
+cargo build -p vtop-cli --features failpoints,postgres --bin vtopctl
+ENGINE_SWEEP_BACKEND=postgres ENGINE_SWEEP_PG_CONTAINER=<container> CHAOS_PROFILE=debug scripts/live-chaos/engine/run-sweep.sh
+# file source
+ENGINE_SWEEP_SOURCE=file CHAOS_PROFILE=debug scripts/live-chaos/engine/run-sweep.sh
+# store outage / ENOSPC (the latter mounts a tmpfs: root or passwordless sudo)
+ENGINE_SWEEP_FAULT=store_outage CHAOS_PROFILE=debug scripts/live-chaos/engine/run-sweep.sh
+ENGINE_SWEEP_FAULT=enospc CHAOS_PROFILE=debug scripts/live-chaos/engine/run-sweep.sh
+```
+
+Knobs (`ENGINE_SWEEP_POINTS`, `ENGINE_SWEEP_BACKEND`, `ENGINE_SWEEP_SOURCE`,
+`ENGINE_SWEEP_FAULT`, `ENGINE_SWEEP_FAULT_SECONDS`, `ENGINE_SWEEP_RECORDS`,
+`ENGINE_SWEEP_BATCH_RECORDS`, `ENGINE_SWEEP_POINT_TIMEOUT_SECONDS`, the Kafka,
+PostgreSQL and MinIO containers, the S3 endpoint and bucket) are documented
+and validated in the script header. `CHAOS_VTOPCTL` points at the failpoints
 build when it is not `target/$CHAOS_PROFILE/vtopctl`.
 
 **Where it runs.** The `engine crash sweep` workflow
-(`.github/workflows/engine-crash-sweep.yml`): every point nightly at 06:37
-UTC and on dispatch (which can name points and a record count); the five
-commit-boundary points (`mid_object_put`, `after_object_put_before_ledger`,
-`after_manifest_put_before_ledger`, `before_source_commit`,
-`after_source_commit_before_ledger`) on a pull request that changes the
-engine, the ledger, the upload path, the adapters or the harness.
+(`.github/workflows/engine-crash-sweep.yml`): every point on every leg
+nightly at 06:37 UTC, and on dispatch (which can name points, a record count
+and legs); the five commit-boundary points (`mid_object_put`,
+`after_object_put_before_ledger`, `after_manifest_put_before_ledger`,
+`before_source_commit`, `after_source_commit_before_ledger`) of the
+`sqlite-kafka` leg on a pull request that changes the engine, the ledger, the
+upload path, the adapters or the harness (and every leg, with those five
+points, on a pull request that changes the workflow itself, since the nightly
+runs only from `main`). The job is a matrix over the legs;
+its check names are `engine crash sweep (real Kafka, MinIO) (<leg>)`. The
+PostgreSQL image is the one `postgres-matrix.yml` pins for major 18.
 
-**Measured.** A full local run (21 points, 50 records each, batches of 20, a
-debug build in a container capped at two CPUs, `apache/kafka:4.3.1` capped
-at one, and the lab's MinIO, all on one laptop) took 239 s, 11 to 12 s a
-point, with no duplicate at any point. The five pull-request points took
-55 s. With `mark_verified` moved behind the source commit (a deliberate
-mutation: the ledger's transitions stay legal, so only the comparison with
-the broker can see it), the five pull-request points fail at
-`after_source_commit_before_ledger`: "COMMIT RULE VIOLATED: the consumer
-group's committed offset is 20, but in the ledger no range is recorded as
-VERIFIED or SOURCE_COMMITTED, so offsets 0..19 were committed at the source
-before they were verified. Ledger states: {"MANIFEST_UPLOADED": 1}". With
-the mutation reverted they pass.
+**Measured.** Local runs, all 21 points, 50 records each, batches of 20, a
+debug build in a container capped at two CPUs, `apache/kafka:4.3.1` and the
+lab's MinIO capped at one CPU each (and PostgreSQL 18 at one for its leg), all
+on one laptop. Every leg passed, with no duplicate at any point:
 
-**Not covered yet.** PostgreSQL as the ledger, the file source, a store
-outage before the kill and ENOSPC (the second part of #725); the syslog
-source (no cursor to compare); power loss, which `kill -9` does not model
-(the page cache survives it), stays with `crates/vtop-cli/tests/ledger_power_loss.rs`.
+| Leg | Time | Per point |
+|---|---|---|
+| `sqlite-kafka` | 262 s | 12 to 13 s |
+| `postgres-kafka` | 285 s | 13 to 14 s |
+| `sqlite-file` | 98 s | 4 to 5 s |
+| `sqlite-kafka-store-outage` | 616 s | 22 s for a point reached before the store is touched, 33 to 35 s for the rest (12 s of outage, then the recovery) |
+| `sqlite-kafka-enospc` | 495 s | 12 to 13 s, then 25 to 28 s once the staging write needs space |
+
+The five pull-request points of the `sqlite-kafka` leg take about 55 s.
+
+**What a broken commit order looks like.** With `mark_verified` moved behind
+the source commit (a deliberate mutation of the engine: the ledger's
+transitions stay legal, so neither the state machine nor the database's
+trigger can see it), the commit-boundary points fail on every leg that has a
+ledger and a source to compare it with:
+
+| Leg and point | Result |
+|---|---|
+| `sqlite-kafka`, `after_source_commit_before_ledger` | "COMMIT RULE VIOLATED: the consumer group's committed position is 20, but in the ledger no range is recorded as VERIFIED or SOURCE_COMMITTED, so positions 0..19 were committed at the source before they were verified. Ledger states: {"MANIFEST_UPLOADED": 1}" |
+| `postgres-kafka`, `after_source_commit_before_ledger` | the same message, read from PostgreSQL |
+| `sqlite-kafka`, `postgres-kafka` and `sqlite-file`, `before_source_commit` | "the ledger holds a MANIFEST_UPLOADED row, but a kill at this point must find a VERIFIED row: the engine reached the point out of order" |
+| `sqlite-file`, `after_source_commit_before_ledger` | the same: a file's committed position is in the engine's memory, so the broker comparison has nothing to read, and the ledger state at the kill is what shows the commit running ahead |
+
+The three store-write points (`mid_object_put`,
+`after_object_put_before_ledger`, `after_manifest_put_before_ledger`) pass
+under the mutation on every leg, as they should: it changes nothing before the
+source commit. With the mutation reverted, all fifteen runs (those three and
+the two above, on three legs) pass. The order check at the
+kill (`KILL_STATE`) is also what fails `before_source_commit` on the
+`sqlite-kafka` leg, where the broker's offset has not moved yet and the
+offset comparison could not.
+
+**Not covered.** The syslog spool source (its reader keeps no cursor outside
+the engine and a spool has no consumer group to compare); power loss, which
+`kill -9` does not model (the page cache survives it), stays with
+`crates/vtop-cli/tests/ledger_power_loss.rs`; PostgreSQL with the file source
+(the two knobs are independent, but the nightly runs the PostgreSQL ledger
+only with Kafka); a PostgreSQL outage while the engine runs; and a kill with
+the store down or the disk full combined with the file source or PostgreSQL
+(the fault legs run the `sqlite-kafka` shape).
 
 ## Scope boundaries
 
