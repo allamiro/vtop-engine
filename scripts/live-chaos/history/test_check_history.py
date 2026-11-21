@@ -43,8 +43,9 @@ class History:
         self._event(**event)
         return self
 
-    def read(self, process, runs, high_watermark, unkeyed=()):
-        """`runs`: (offset, first_sequence, count[, values_match])."""
+    def read(self, process, runs, high_watermark, unkeyed=(), start_offset=None):
+        """`runs`: (offset, first_sequence, count[, values_match]).
+        `start_offset`: the read started there (retention, #727)."""
         for run in runs:
             offset, first, count = run[:3]
             values_match = run[3] if len(run) > 3 else True
@@ -52,8 +53,11 @@ class History:
                         first_sequence=first, count=count, values_match=values_match)
         for offset in unkeyed:
             self._event(op="read", type="unkeyed", process=process, offset=offset)
-        self._event(op="read", type="end", process=process, high_watermark=high_watermark,
-                    records=sum(r[2] for r in runs))
+        end = dict(op="read", type="end", process=process, high_watermark=high_watermark,
+                   records=sum(r[2] for r in runs))
+        if start_offset is not None:
+            end["start_offset"] = start_offset
+        self._event(**end)
         return self
 
     def check(self, allow_unkeyed=False):
@@ -263,6 +267,49 @@ class Violations(unittest.TestCase):
         h = History()
         h.produce("p", 1, 0, 10, "ok", 10)
         self.assertEqual(kinds(h.check()), {"input"})
+
+
+class Retention(unittest.TestCase):
+    """Reads of a range whose retention reclaimed a prefix (#727): each read
+    starts at the log start, and an earlier read stands for the offsets
+    below the last read's start."""
+
+    def history(self):
+        h = History()
+        h.produce("p", 1, 0, 10, "ok", 10).produce("p", 2, 10, 10, "ok", 20)
+        return h
+
+    def test_a_record_a_read_saw_before_it_was_reclaimed_is_not_lost(self):
+        h = self.history()
+        h.read("r1", [(0, 0, 20)], 20).read("r2", [(10, 10, 10)], 20, start_offset=10)
+        self.assertTrue(h.check()["valid"], h.check())
+
+    def test_a_record_reclaimed_before_any_read_saw_it_is_lost(self):
+        h = self.history()
+        h.read("r", [(10, 10, 10)], 20, start_offset=10)
+        result = h.check()
+        self.assertEqual(kinds(result), {"lost"}, result)
+        self.assertEqual(result["violations"]["lost"]["count"], 10)
+        self.assertIn("no read saw it", result["violations"]["lost"]["first"][0])
+
+    def test_a_record_rewritten_inside_a_later_reads_window_is_caught(self):
+        h = self.history()
+        h.read("r1", [(0, 0, 20)], 20)
+        h.read("r2", [(10, 10, 5), (15, 40, 5)], 20, start_offset=10)
+        self.assertIn("rewritten", kinds(h.check()))
+
+    def test_a_record_missing_inside_a_later_reads_window_is_caught(self):
+        h = self.history()
+        h.read("r1", [(0, 0, 20)], 20)
+        h.read("r2", [(10, 10, 5)], 20, start_offset=10)
+        self.assertIn("rewritten", kinds(h.check()))
+
+    def test_a_phantom_an_earlier_read_saw_is_still_a_phantom_once_reclaimed(self):
+        h = History()
+        h.produce("p", 1, 0, 10, "ok", 10)
+        h.read("r1", [(0, 0, 10), (10, 77, 3)], 13)
+        h.read("r2", [], 13, start_offset=13)
+        self.assertEqual(kinds(h.check()), {"phantom"})
 
 
 class CommandLine(unittest.TestCase):
