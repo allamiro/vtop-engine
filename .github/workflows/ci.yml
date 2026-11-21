@@ -65,7 +65,6 @@ jobs:
       mutants_gate: ${{ steps.filter.outputs.mutants_gate }}
       chaos: ${{ steps.filter.outputs.chaos }}
       upgrade: ${{ steps.filter.outputs.upgrade }}
-      manifest_compat: ${{ steps.filter.outputs.manifest_compat }}
       helm: ${{ steps.filter.outputs.helm }}
       file_source: ${{ steps.filter.outputs.file_source }}
       prometheus_rules: ${{ steps.filter.outputs.prometheus_rules }}
@@ -286,6 +285,10 @@ jobs:
               # Executable CI test code (#291), linted like the rest.
               - 'scripts/upgrade-compat.sh'
               - 'scripts/manifest-compat.sh'
+              # The compatibility matrix's release fetcher and cell runner
+              # (#743); scripts/tests/fetch-release.bats proves each check
+              # can fail.
+              - 'scripts/compat/*.sh'
               - 'scripts/ledger-compat.sh'
               # The live-chaos harness is executable shell that gates every
               # distributed-systems claim this project makes, and it was
@@ -395,19 +398,6 @@ jobs:
               - 'Cargo.lock'
               - '.cargo/**'
               - 'rust-toolchain*'
-              - '.github/workflows/ci.yml'
-            manifest_compat:
-              # Released readers over an archive HEAD writes (#671). Every
-              # crate: vtopctl depends on nearly all of them (the file
-              # adapter that archives, the ledger, the observe crate), and a
-              # hand-kept list is a gate with a hole in it (review of #711).
-              - 'crates/**'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - '.cargo/**'
-              - 'rust-toolchain*'
-              - 'scripts/manifest-compat.sh'
-              - 'scripts/ledger-compat.sh'
               - '.github/workflows/ci.yml'
   build-and-test:
     name: fmt + clippy + test + build
@@ -1269,7 +1259,7 @@ jobs:
             koalaman/shellcheck:v0.11.0 docker/*.sh scripts/release-notes.sh \
             scripts/k8s-smoke.sh scripts/k8s-forward.sh scripts/e2e-smoke.sh \
             scripts/upgrade-compat.sh \
-            scripts/manifest-compat.sh scripts/ledger-compat.sh \
+            scripts/manifest-compat.sh scripts/ledger-compat.sh scripts/compat/*.sh \
             scripts/traffic-snapshot.sh scripts/test-progress.sh \
             scripts/check-naming.sh scripts/check-egress-claims.sh \
             scripts/check-failpoints-absent.sh scripts/kafka-broker.sh
@@ -1777,116 +1767,6 @@ jobs:
           path: |
             upgrade-v*/logs
             upgrade-meta/logs
-          if-no-files-found: ignore
-          retention-days: 7
-
-  # A version 0.4 archive written by HEAD, read by RELEASED readers (#671
-  # release B). The fixtures prove HEAD reads what old writers wrote; this
-  # proves the direction an auditor or a scrub left on an older release
-  # meets: every release from v0.8.0 must verify HEAD's signed 0.4 manifest
-  # and accept its config, and v0.7.0 must report the self-hash failure,
-  # which is the documented cutoff. The released binaries are the published
-  # assets, checked against each release's SHA256SUMS, not rebuilds.
-  manifest-compat:
-    name: manifest compat (released readers verify a 0.4 archive)
-    needs: changes
-    if: needs.changes.outputs.manifest_compat == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          # The tag list below is derived from the repository's tags.
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-manifest-compat-${{ hashFiles('**/Cargo.lock') }}
-      # v0.7.0, the last release before the 0.4 reader, and the newest patch
-      # of every minor series from v0.8.0, DERIVED from the tags so a new
-      # release joins the day its assets are published. Finals only, as
-      # upgrade-compat. Only tags with a published GitHub release count: a
-      # release tag is pushed right after its bump merges, and main's CI on
-      # that merge starts while release.yml is still building the assets
-      # (about 35 minutes), so the newest patch falls back to the previous
-      # one of its series until it is published (v0.10.1 failed main with
-      # "release not found" this way).
-      - name: Select the released readers
-        id: tags
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          published="$(gh release list --limit 200 --exclude-drafts --json tagName --jq '.[].tagName')"
-          for t in $(git tag --list 'v[0-9]*'); do
-            grep -qx "$t" <<< "$published" || echo "::notice::$t has no published release yet; its series uses the previous patch"
-          done
-          tags="$(git tag --list 'v[0-9]*' --sort=version:refname \
-            | grep -Fx -f <(printf '%s\n' "$published") \
-            | awk -F. '/^v[0-9]+\.[0-9]+\.[0-9]+$/ { latest[$1 "." $2] = $0 } END { for (m in latest) print latest[m] }' \
-            | sort -V \
-            | awk -F. '{ maj = substr($1, 2) + 0; min = $2 + 0; if (maj > 0 || min >= 7) print }' \
-            | tr '\n' ' ')"
-          # The newest patch of each series: v0.8.1 replaces v0.8.0 the day it
-          # is tagged (review of #711).
-          [[ "$tags" == *v0.7.* && "$tags" == *v0.8.* ]] || { echo "expected a v0.7 and a v0.8 release among: $tags"; exit 1; }
-          echo "list=$tags" >> "$GITHUB_OUTPUT"
-          echo "replaying: $tags"
-      - name: Download the released vtopctl, checked against SHA256SUMS
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          for tag in ${{ steps.tags.outputs.list }}; do
-            v="${tag#v}"
-            asset="vtop-engine-$v-x86_64-unknown-linux-gnu.tar.gz"
-            mkdir -p "released/$tag"
-            gh release download "$tag" --dir "released/$tag" --pattern "$asset" --pattern SHA256SUMS
-            grep -q "$asset" "released/$tag/SHA256SUMS" || { echo "$asset is not in $tag's SHA256SUMS"; exit 1; }
-            (cd "released/$tag" && sha256sum --check --ignore-missing SHA256SUMS)
-            tar -xzf "released/$tag/$asset" -C "released/$tag"
-          done
-      - name: Build HEAD vtopctl
-        run: cargo build -p vtop-cli --no-default-features --bin vtopctl --locked
-      - name: Each released reader meets a 0.4 archive as documented
-        run: |
-          set -euo pipefail
-          for tag in ${{ steps.tags.outputs.list }}; do
-            v="${tag#v}"
-            # Every release before v0.8.0, the 0.4 reader, reports the
-            # self-hash failure.
-            expect=pass
-            [[ "$tag" == v0.7.* ]] && expect=hash-failure
-            MANIFEST_COMPAT_KEEP=1 MANIFEST_COMPAT_WORKDIR="$GITHUB_WORKSPACE/manifest-compat-$tag" \
-              scripts/manifest-compat.sh target/debug/vtopctl "$tag" \
-                "released/$tag/vtop-engine-$v-x86_64-unknown-linux-gnu/vtopctl" "$expect"
-          done
-      # The previous release (N-1, the only one that may share a ledger with
-      # HEAD, #743) on a SQLite ledger HEAD opened, wrote and pruned (#626):
-      # it must keep archiving and auditing. A release before v0.10.0 ignores
-      # the sealed_at column and the digests' sealed_at; one from v0.10.0 on
-      # writes it too (#755). The release binaries have no `postgres`
-      # feature, so the PostgreSQL half runs where one is built from the tag.
-      - name: The previous release keeps working on a ledger HEAD opened
-        run: |
-          set -euo pipefail
-          tag="$(printf '%s\n' ${{ steps.tags.outputs.list }} | sort -V | tail -n 1)"
-          v="${tag#v}"
-          LEDGER_COMPAT_KEEP=1 LEDGER_COMPAT_WORKDIR="$GITHUB_WORKSPACE/manifest-compat-ledger-$tag" \
-            scripts/ledger-compat.sh target/debug/vtopctl "$tag" \
-              "released/$tag/vtop-engine-$v-x86_64-unknown-linux-gnu/vtopctl"
-      - name: Upload the logs
-        if: failure()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: manifest-compat-logs
-          path: manifest-compat-*/logs
           if-no-files-found: ignore
           retention-days: 7
 
