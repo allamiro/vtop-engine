@@ -349,6 +349,14 @@ class Violations(unittest.TestCase):
         result = h.check()
         self.assertEqual(kinds(result), {"order"}, result)
 
+    def test_a_restarted_producer_acknowledged_below_its_earlier_sequences_is_out_of_order(self):
+        # Review of #878: the same producer id and epoch, two processes.
+        h = History()
+        h.produce("produce:P:1:100", 1, 0, 10, "ok", 20, first_offset=10)
+        h.produce("produce:P:1:200", 1, 10, 10, "ok", 20, first_offset=0)
+        h.read("r", [(0, 10, 10), (10, 0, 10)], 20)
+        self.assertEqual(kinds(h.check()), {"order"})
+
     def test_the_high_watermark_never_goes_back(self):
         h = History()
         h.produce("p", 1, 0, 10, "ok", 10)
