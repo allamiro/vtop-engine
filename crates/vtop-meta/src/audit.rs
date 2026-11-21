@@ -213,6 +213,7 @@ pub fn command_name(command: &MetadataCommand) -> &'static str {
         MetadataCommand::CreateTopic { .. } => "CreateTopic",
         MetadataCommand::GrantRangeLease { .. } => "GrantRangeLease",
         MetadataCommand::ReleaseRangeLease { .. } => "ReleaseRangeLease",
+        MetadataCommand::ReleaseRangeLeaseAsHolder { .. } => "ReleaseRangeLeaseAsHolder",
         MetadataCommand::AcquireRangeLease { .. } => "AcquireRangeLease",
         MetadataCommand::RenewRangeLease { .. } => "RenewRangeLease",
         MetadataCommand::ReportPromotionOutcome { .. } => "ReportPromotionOutcome",
@@ -371,6 +372,24 @@ pub fn command_audit(command: &MetadataCommand) -> Option<CommandAudit> {
             vec![
                 ("topic_uuid", topic_uuid.to_string()),
                 ("range_uuid", range_uuid.to_string()),
+                ("fencing_epoch", expected_fencing_epoch.to_string()),
+            ],
+        ),
+        // The holder's own release (#732): the same hand-back, naming who
+        // hands it back.
+        MetadataCommand::ReleaseRangeLeaseAsHolder {
+            topic_uuid,
+            range_uuid,
+            holder_node_uuid,
+            expected_fencing_epoch,
+            ..
+        } => propose(
+            "range",
+            range_target(topic_uuid, range_uuid),
+            vec![
+                ("topic_uuid", topic_uuid.to_string()),
+                ("range_uuid", range_uuid.to_string()),
+                ("node_uuid", holder_node_uuid.to_string()),
                 ("fencing_epoch", expected_fencing_epoch.to_string()),
             ],
         ),
@@ -568,7 +587,8 @@ pub fn command_audit(command: &MetadataCommand) -> Option<CommandAudit> {
 /// an audited command, asked by someone other than a machine.
 ///
 /// Machine traffic is left bare. A data node hands a range back with
-/// `ReleaseRangeLease` when it stops, and a rolling restart of a node that
+/// `ReleaseRangeLeaseAsHolder` (or, below level 9, `ReleaseRangeLease`) when
+/// it stops, and a rolling restart of a node that
 /// holds hundreds of ranges would otherwise flush the operators' commands out
 /// of the bounded tail (see [`crate::state::AUDIT_TAIL_ENTRIES`]); the edge
 /// and applied records still name it. An operator's own release is wrapped.
@@ -581,6 +601,7 @@ pub fn is_attributed_when_audited(identity: &AdminIdentity, command: &MetadataCo
         (
             AdminIdentity::Node(_),
             MetadataCommand::ReleaseRangeLease { .. }
+                | MetadataCommand::ReleaseRangeLeaseAsHolder { .. }
         )
     )
 }

@@ -114,6 +114,12 @@ const COMMAND_KIND_SET_RANGE_REPLICA_SET: u16 = 37;
 const COMMAND_KIND_REPORT_NODE_VERSION: u16 = 38;
 const COMMAND_KIND_ATTEST_UNPROVEN_PROMOTION: u16 = 39;
 pub(crate) const COMMAND_KIND_ATTRIBUTED: u16 = 40;
+// A holder's own release (#732): kind 5 with the holder it names, so the
+// admin plane can authorize it as the holder's and the state machine can
+// refuse it for anyone else's lease. A new kind rather than a new field on
+// kind 5, so kind 5's golden vectors stay byte-exact and an older voter reads
+// it as a newer format.
+const COMMAND_KIND_RELEASE_RANGE_LEASE_AS_HOLDER: u16 = 41;
 
 /// The metadata feature level of a cluster that has never recorded one: the
 /// command set of v0.6.0, the last release before levels existed (#554).
@@ -181,6 +187,16 @@ pub const PROMOTE_UNPROVEN_FEATURE_LEVEL: u32 = 8;
 /// level, and that entry is itself bare. A cluster below it writes exactly
 /// the bytes it always wrote.
 pub const ATTRIBUTED_COMMANDS_FEATURE_LEVEL: u32 = 9;
+
+/// The level at which a data node may release its own range lease under its
+/// own identity (#732): [`MetadataCommand::ReleaseRangeLeaseAsHolder`],
+/// command kind 41. Under an enforcing `admin_authorization` the holder-less
+/// [`MetadataCommand::ReleaseRangeLease`] is cluster-scoped and refused to a
+/// node, so a node's release at shutdown was refused and its lease lapsed on
+/// its deadline; this kind names the holder, so it is node-scoped. A kind an
+/// older voter cannot decode, so it is held back below this level; it rides
+/// on the same raise as [`ATTRIBUTED_COMMANDS_FEATURE_LEVEL`].
+pub const HOLDER_RELEASE_FEATURE_LEVEL: u32 = 9;
 
 /// Bound on the operator name an attestation records (#636).
 pub const MAX_ATTESTATION_OPERATOR_BYTES: usize = 128;
@@ -1067,6 +1083,23 @@ pub enum MetadataCommand {
         range_uuid: Uuid,
         expected_fencing_epoch: u64,
     },
+    /// The holder's own release of a range lease (#732), from
+    /// [`HOLDER_RELEASE_FEATURE_LEVEL`].
+    ///
+    /// [`MetadataCommand::ReleaseRangeLease`] names no holder, so the admin
+    /// plane can only treat it as cluster-scoped, and under an enforcing
+    /// policy a data node's release at shutdown was refused: its lease lapsed
+    /// on its deadline and every planned handover waited it out. This form
+    /// names the holder, so the plane admits it from that node's certificate
+    /// and from no other node's, and the state machine applies it only while
+    /// the named node holds the lease at the named epoch.
+    ReleaseRangeLeaseAsHolder {
+        env: CommandEnvelope,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        holder_node_uuid: Uuid,
+        expected_fencing_epoch: u64,
+    },
     /// Take range leadership, respecting an unexpired lease held by someone
     /// else (#223).
     ///
@@ -1625,6 +1658,8 @@ impl MetadataCommand {
             // The operator's override for a range with no provable lineage
             // (#636).
             MetadataCommand::AttestUnprovenPromotion { .. } => PROMOTE_UNPROVEN_FEATURE_LEVEL,
+            // A holder's own release (#732).
+            MetadataCommand::ReleaseRangeLeaseAsHolder { .. } => HOLDER_RELEASE_FEATURE_LEVEL,
             // The wrapper is kind 40, new at level 9; it also carries its
             // subject, which a later level may raise above it.
             MetadataCommand::Attributed { subject, .. } => {
@@ -1645,6 +1680,7 @@ impl MetadataCommand {
             | MetadataCommand::RenewRangeLease { env, .. }
             | MetadataCommand::ReportPromotionOutcome { env, .. }
             | MetadataCommand::ReleaseRangeLease { env, .. }
+            | MetadataCommand::ReleaseRangeLeaseAsHolder { env, .. }
             | MetadataCommand::SplitRange { env, .. }
             | MetadataCommand::RegisterSealedSegment { env, .. }
             | MetadataCommand::MarkSegmentVerified { env, .. }
@@ -1762,6 +1798,20 @@ impl MetadataCommand {
                 encode_envelope(&mut out, env);
                 put_uuid(&mut out, *topic_uuid);
                 put_uuid(&mut out, *range_uuid);
+                put_u64(&mut out, *expected_fencing_epoch);
+            }
+            MetadataCommand::ReleaseRangeLeaseAsHolder {
+                env,
+                topic_uuid,
+                range_uuid,
+                holder_node_uuid,
+                expected_fencing_epoch,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_RELEASE_RANGE_LEASE_AS_HOLDER);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *range_uuid);
+                put_uuid(&mut out, *holder_node_uuid);
                 put_u64(&mut out, *expected_fencing_epoch);
             }
             MetadataCommand::AcquireRangeLease {
@@ -2524,6 +2574,15 @@ impl MetadataCommand {
                 range_uuid: reader.uuid("range uuid")?,
                 expected_fencing_epoch: reader.u64("expected fencing epoch")?,
             }),
+            COMMAND_KIND_RELEASE_RANGE_LEASE_AS_HOLDER => {
+                Ok(MetadataCommand::ReleaseRangeLeaseAsHolder {
+                    env: decode_envelope(reader)?,
+                    topic_uuid: reader.uuid("topic uuid")?,
+                    range_uuid: reader.uuid("range uuid")?,
+                    holder_node_uuid: reader.uuid("holder node uuid")?,
+                    expected_fencing_epoch: reader.u64("expected fencing epoch")?,
+                })
+            }
             COMMAND_KIND_SPLIT_RANGE => Ok(MetadataCommand::SplitRange {
                 env: decode_envelope(reader)?,
                 topic_uuid: reader.uuid("topic uuid")?,
@@ -3584,6 +3643,13 @@ mod tests {
                 range_uuid: Uuid::from_u128(21),
                 expected_fencing_epoch: 1,
             },
+            MetadataCommand::ReleaseRangeLeaseAsHolder {
+                env: envelope(41),
+                topic_uuid: Uuid::from_u128(20),
+                range_uuid: Uuid::from_u128(21),
+                holder_node_uuid: Uuid::from_u128(10),
+                expected_fencing_epoch: 1,
+            },
             MetadataCommand::RegisterSealedSegment {
                 env: envelope(7),
                 topic_uuid: Uuid::from_u128(20),
@@ -4437,10 +4503,38 @@ mod tests {
         // The same wrapper with the kind a later release adds is the same
         // reading for THIS build.
         let mut later = encoded;
-        later[..2].copy_from_slice(&41u16.to_be_bytes());
+        later[..2].copy_from_slice(&(COMMAND_KIND_RELEASE_RANGE_LEASE_AS_HOLDER + 1).to_be_bytes());
         assert!(crate::storage::is_newer_format(
             &MetadataCommand::decode(&later).unwrap_err()
         ));
+    }
+
+    /// #732: a holder's own release is kind 41, which no earlier release
+    /// knows: its decoder reaches the unknown-kind arm and reports a newer
+    /// format, not corruption, and the command is gated above the previous
+    /// release's level, so it never reaches such a voter's log.
+    #[test]
+    fn an_older_voter_reads_a_holder_release_as_a_newer_format() {
+        const PREVIOUS_RELEASE_LEVEL: u32 = 8;
+        let release = MetadataCommand::ReleaseRangeLeaseAsHolder {
+            env: envelope(41),
+            topic_uuid: Uuid::from_u128(20),
+            range_uuid: Uuid::from_u128(21),
+            holder_node_uuid: Uuid::from_u128(10),
+            expected_fencing_epoch: 1,
+        };
+        let encoded = release.encode().unwrap();
+        let kind = u16::from_be_bytes([encoded[0], encoded[1]]);
+        assert_eq!(kind, COMMAND_KIND_RELEASE_RANGE_LEASE_AS_HOLDER);
+        assert_eq!(kind, COMMAND_KIND_ATTRIBUTED + 1);
+        let seen_by_an_older_release = CodecError::UnknownTag {
+            what: "command kind",
+            tag: u32::from(kind),
+        };
+        assert!(crate::storage::is_newer_format(&seen_by_an_older_release));
+        assert!(release.feature_level() > PREVIOUS_RELEASE_LEVEL);
+        assert_eq!(release.feature_level(), HOLDER_RELEASE_FEATURE_LEVEL);
+        assert_eq!(MetadataCommand::decode(&encoded).unwrap(), release);
     }
 
     /// #706: the wrapper is audited as what it carries, so an applied record
@@ -4473,7 +4567,11 @@ mod tests {
             );
             wrapped += usize::from(audited);
             // A node's: the same, except a node handing a range back.
-            let machine_traffic = matches!(command, MetadataCommand::ReleaseRangeLease { .. });
+            let machine_traffic = matches!(
+                command,
+                MetadataCommand::ReleaseRangeLease { .. }
+                    | MetadataCommand::ReleaseRangeLeaseAsHolder { .. }
+            );
             assert_eq!(
                 is_attributed_when_audited(&node, &command),
                 audited && !machine_traffic,
@@ -4602,7 +4700,7 @@ mod tests {
         let mut names: Vec<_> = commands.iter().map(command_name).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 40, "every_command() must hold every variant");
+        assert_eq!(names.len(), 41, "every_command() must hold every variant");
         // The wrapper is audited as what it carries (#706), and says so in
         // `an_attributed_command_is_audited_as_its_subject`; the list below is
         // of the bare commands.
@@ -4618,6 +4716,7 @@ mod tests {
             "CreateTopic",
             "GrantRangeLease",
             "ReleaseRangeLease",
+            "ReleaseRangeLeaseAsHolder",
             "RegisterSealedSegment",
             "MarkSegmentVerified",
             "PutKeyRecord",
