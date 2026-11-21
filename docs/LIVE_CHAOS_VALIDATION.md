@@ -200,8 +200,8 @@ against it:
 |---|---|
 | `lost` | an acknowledged record missing from its acknowledged offset, or a different record there (the #611 and #261 shapes) |
 | `duplicate` | one offset acknowledged for two different records, one record acknowledged at two offsets, or an acknowledged or unanswered record visible a second time. A record is its producer's id, epoch and sequence: a retry from a new process sends the same records again, so an unanswered attempt cannot account for a copy of what its retry was acknowledged for, and a resent batch the broker answers with its original offsets is one copy |
-| `order` | a producer's records out of sequence order: per producer id and epoch, across its processes, a higher sequence acknowledged at a lower offset |
-| `phantom` | a visible record that no acknowledged batch claims and no whole unanswered batch accounts for; a record of a refused (`fail`) batch, which is what a fenced leader's writes would be (the #641 shape) |
+| `order` | a producer's records out of sequence order: per producer id and epoch, across its processes, a higher sequence acknowledged at a lower offset (an unanswered batch is only accepted where it keeps that order) |
+| `phantom` | a visible record that no acknowledged batch claims and no whole unanswered batch accounts for; a record of a refused (`fail`) batch, which is what a fenced leader's writes would be (the #641 shape). An unanswered batch accounts only for records no read showed before it was sent |
 | `rewritten` | a record an earlier read saw, below the last read's high watermark, that the last read sees differently |
 | `missed` | a record the last read holds below an earlier read's high watermark that the earlier read did not see: a committed record is visible to every read that covers it |
 | `hwm` | a later read reporting a lower committed high watermark |
@@ -213,6 +213,22 @@ the visible records they explain is a search: it backtracks, so a phantom is
 reported only when no assignment of whole batches accounts for the records. Offsets the consumer never sees
 (a promotion's boundary marker, #240) are gaps, not records, and are not
 counted against anything; `verify --max-offset-gaps` still bounds them.
+
+Known limits of the checker:
+
+- **The search has a budget.** When matching unanswered batches to a visible
+  run takes more than `SEARCH_BUDGET` (100,000) steps, the run is reported as
+  unexplained, a `phantom`, even if some assignment would account for it.
+  Example: thousands of overlapping unanswered batches from many producers
+  under one long visible run. Live scenarios leave a handful of unanswered
+  batches.
+- **A record is first seen when its read ends.** Each record is stamped with
+  the end of the first read that showed it, not with the moment that read
+  fetched it, so an unanswered batch sent while a read was running may
+  account for records that read had already fetched. Example: a read fetches
+  sequences 0..9 at offsets 10..19, then a producer sends 0..9 under a new
+  epoch, gets no answer, and the read ends. The copy is accepted as that
+  batch.
 
 The checker's own tests (`test_check_history.py`, run in the live-chaos job
 before the scenarios) build histories by hand, clean ones and ones shaped like

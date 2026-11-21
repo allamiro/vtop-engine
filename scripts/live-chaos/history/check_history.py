@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import json
 import sys
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from dataclasses import dataclass, field
 
@@ -80,6 +81,7 @@ LISTED = 20
 # Steps the search for a tiling of one visible group may take before it gives
 # up and reports the group unexplained.
 SEARCH_BUDGET = 100_000
+INFINITY = float("inf")
 
 
 @dataclass
@@ -374,6 +376,14 @@ def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) 
         holder = claimed.get(offset)
         return holder[1] if holder is not None else None
 
+    order = Order(placed)
+    # The end of the first read that showed each visible record as it is now.
+    first_seen_us: dict[int, int] = {}
+    for read in reads:
+        for offset, record in read.records.items():
+            if offset not in first_seen_us and visible.get(offset) == record:
+                first_seen_us[offset] = read.end_time_us
+
     def task_of(group: list[int]) -> Task:
         return Task(
             [visible[o][0] for o in group],
@@ -381,6 +391,8 @@ def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) 
             group[0],
             group[-1],
             acked_at,
+            order,
+            first_seen_us,
         )
 
     tasks = [task_of(g) for g in keyed]
@@ -499,8 +511,23 @@ def _tilings(
             logical = {(identity, sequence + i) for i in range(inside)}
             if logical & surfaced:
                 continue
+            # Its records must sit in its producer's sequence order among the
+            # acknowledged ones and the other unanswered ones placed so far
+            # (review of #878).
+            run = (sequence, sequence + inside - 1, task.first_offset + position,
+                   task.first_offset + position + inside - 1)
+            if not task.order.fits(identity, run):
+                continue
+            # Records a read showed before this batch was sent are not its
+            # records (review of #881).
+            seen = min(
+                (task.first_seen_us.get(o, INFINITY) for o in range(run[2], run[3] + 1)),
+                default=INFINITY,
+            )
+            if batch.time_us >= seen:
+                continue
             shapes.add(shape)
-            yield batch, inside, logical
+            yield batch, inside, logical, (identity, run)
 
     # An explicit stack, not recursion (review of #878): a run explained by a
     # thousand unanswered batches is a thousand levels deep, past Python's
@@ -513,18 +540,20 @@ def _tilings(
     while stack:
         frame = stack[-1]
         if frame[2] is not None:
-            batch, logical = frame[2]
+            batch, logical, placement = frame[2]
             surfaced.difference_update(logical)
             used.discard(batch.uid)
+            task.order.remove(*placement)
             frame[2] = None
         chosen = next(frame[1], None)
         if chosen is None:
             stack.pop()
             continue
-        batch, inside, logical = chosen
+        batch, inside, logical, placement = chosen
         used.add(batch.uid)
         surfaced.update(logical)
-        frame[2] = (batch, logical)
+        task.order.add(*placement)
+        frame[2] = (batch, logical, placement)
         position = frame[0] + inside
         if position == len(sequences):
             yield
@@ -534,9 +563,10 @@ def _tilings(
             # Out of steps: take back every choice still applied, and give up.
             for open_frame in stack:
                 if open_frame[2] is not None:
-                    applied, applied_logical = open_frame[2]
+                    applied, applied_logical, applied_placement = open_frame[2]
                     surfaced.difference_update(applied_logical)
                     used.discard(applied.uid)
+                    task.order.remove(*applied_placement)
             return
         stack.append([position, choices(position), None])
 
@@ -551,6 +581,49 @@ class Task:
     first_offset: int
     last_offset: int
     acked_at: "object"
+    order: "Order"
+    # When a read first showed the record now at each offset: a batch invoked
+    # after that cannot be what put it there.
+    first_seen_us: dict[int, int] = field(default_factory=dict)
+
+
+class Order:
+    """Where each producer's records sit, by sequence: the acknowledged
+    placements, fixed, and the runs the search has given unanswered batches
+    so far. A run fits when every lower sequence of its producer sits below it
+    and every higher one above."""
+
+    def __init__(self, placed: dict[tuple[str, int], tuple[int, "Batch"]]):
+        by_identity: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        for (identity, sequence), (offset, _) in placed.items():
+            by_identity[identity].append((sequence, offset))
+        self.fixed: dict[str, tuple[list[int], list[int]]] = {}
+        for identity, records in by_identity.items():
+            records.sort()
+            self.fixed[identity] = ([r[0] for r in records], [r[1] for r in records])
+        self.runs: dict[str, list[tuple[int, int, int, int]]] = defaultdict(list)
+
+    def fits(self, identity: str, run: tuple[int, int, int, int]) -> bool:
+        first_sequence, last_sequence, first_offset, last_offset = run
+        sequences, offsets = self.fixed.get(identity, ([], []))
+        below = bisect_left(sequences, first_sequence)
+        if below > 0 and offsets[below - 1] >= first_offset:
+            return False
+        above = bisect_right(sequences, last_sequence)
+        if above < len(sequences) and offsets[above] <= last_offset:
+            return False
+        for s0, s1, o0, o1 in self.runs[identity]:
+            if s1 < first_sequence and o1 >= first_offset:
+                return False
+            if s0 > last_sequence and o0 <= last_offset:
+                return False
+        return True
+
+    def add(self, identity: str, run: tuple[int, int, int, int]) -> None:
+        self.runs[identity].append(run)
+
+    def remove(self, identity: str, run: tuple[int, int, int, int]) -> None:
+        self.runs[identity].remove(run)
 
 
 def _explain(

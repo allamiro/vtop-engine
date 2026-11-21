@@ -361,6 +361,31 @@ class Violations(unittest.TestCase):
         h.read("r", [(0, 10, 10), (10, 0, 10)], 20)
         self.assertEqual(kinds(h.check()), {"order"})
 
+    def test_an_unanswered_batch_visible_out_of_its_producers_order_is_not_explained(self):
+        # Review of #878: sequences 0..9 unanswered, 10..19 acknowledged at
+        # 0..9, and 0..9 visible at 10..19 — above the later sequences.
+        h = History()
+        h.produce("produce:P:1:100", 1, 0, 10, "info")
+        h.produce("produce:P:1:100", 2, 10, 10, "ok", 10, first_offset=0)
+        h.read("r", [(0, 10, 10), (10, 0, 10)], 20)
+        self.assertFalse(h.check()["valid"])
+
+    def test_two_unanswered_batches_of_one_producer_keep_its_order(self):
+        h = History()
+        h.produce("p", 1, 0, 5, "info").produce("p", 2, 5, 5, "info")
+        h.read("r", [(0, 5, 5), (5, 0, 5)], 10)
+        self.assertFalse(h.check()["valid"])
+
+    def test_a_batch_sent_after_a_read_showed_its_records_does_not_explain_them(self):
+        # Review of #881: the copy at 10..19 was visible before epoch 2's
+        # unanswered batch went out.
+        h = History()
+        h.produce("produce:P:1:100", 1, 0, 10, "ok", 10, first_offset=0)
+        h.read("r1", [(0, 0, 10), (10, 0, 10)], 20)
+        h.produce("produce:P:2:200", 1, 0, 10, "info")
+        h.read("r2", [(0, 0, 10), (10, 0, 10)], 20)
+        self.assertFalse(h.check()["valid"])
+
     def test_the_high_watermark_never_goes_back(self):
         h = History()
         h.produce("p", 1, 0, 10, "ok", 10)
