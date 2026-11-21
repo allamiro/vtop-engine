@@ -633,3 +633,61 @@ tests:
   - eval_time: 34h
     alertname: VtopMultipartSessionsPiling
     exp_alerts: []
+- name: 'VtopStateStoreWritesSlow: fires when one batch in ten spends over a second in its ledger writes'
+  interval: 1m
+  input_series:
+  # Ten batches a minute, one of them over a second.
+  - series: vtop_stage_duration_seconds_count{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="kafka",format="cef",stage="state_write"}
+    values: 0+10x60
+  - series: vtop_stage_duration_seconds_bucket{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="kafka",format="cef",stage="state_write",le="1"}
+    values: 0+9x60
+  alert_rule_test:
+  - eval_time: 10m
+    alertname: VtopStateStoreWritesSlow
+    exp_alerts: []
+  - eval_time: 30m
+    alertname: VtopStateStoreWritesSlow
+    exp_alerts:
+    - exp_labels:
+        severity: ticket
+        job: vtop-engine
+        instance: engine-1:9090
+      exp_annotations:
+        summary: "State-store writes on engine-1:9090 are slow: more than 5% of batches spend over a second on them"
+        description: "Over 15 minutes, more than 5% of the committed batches spent more than a second in their ledger writes, for 15 minutes on end. Every batch waits for its writes before the next stage, so archiving slows and the source falls behind. Check the state store: the disk under the SQLite ledger, or the PostgreSQL server's load, locks and network."
+        runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopstatestorewritesslow
+- name: 'VtopStateStoreWritesSlow: fires on the bound as Prometheus 3 stores it (le="1.0")'
+  interval: 1m
+  input_series:
+  - series: vtop_stage_duration_seconds_count{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="file",format="jsonl",stage="state_write"}
+    values: 0+10x60
+  - series: vtop_stage_duration_seconds_bucket{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="file",format="jsonl",stage="state_write",le="1.0"}
+    values: 0+8x60
+  alert_rule_test:
+  - eval_time: 30m
+    alertname: VtopStateStoreWritesSlow
+    exp_alerts:
+    - exp_labels:
+        severity: ticket
+        job: vtop-engine
+        instance: engine-1:9090
+      exp_annotations:
+        summary: "State-store writes on engine-1:9090 are slow: more than 5% of batches spend over a second on them"
+        description: "Over 15 minutes, more than 5% of the committed batches spent more than a second in their ledger writes, for 15 minutes on end. Every batch waits for its writes before the next stage, so archiving slows and the source falls behind. Check the state store: the disk under the SQLite ledger, or the PostgreSQL server's load, locks and network."
+        runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopstatestorewritesslow
+- name: 'VtopStateStoreWritesSlow: quiet when 4% of batches are slow, and on an idle engine'
+  interval: 1m
+  input_series:
+  - series: vtop_stage_duration_seconds_count{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="kafka",format="cef",stage="state_write"}
+    values: 0+100x60
+  - series: vtop_stage_duration_seconds_bucket{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="kafka",format="cef",stage="state_write",le="1"}
+    values: 0+96x60
+  # An engine that commits nothing: its histogram does not move.
+  - series: vtop_stage_duration_seconds_count{job="vtop-engine",instance="engine-2:9090",tenant="default",source_type="kafka",format="cef",stage="state_write"}
+    values: 5x60
+  - series: vtop_stage_duration_seconds_bucket{job="vtop-engine",instance="engine-2:9090",tenant="default",source_type="kafka",format="cef",stage="state_write",le="1"}
+    values: 0x60
+  alert_rule_test:
+  - eval_time: 45m
+    alertname: VtopStateStoreWritesSlow
+    exp_alerts: []
