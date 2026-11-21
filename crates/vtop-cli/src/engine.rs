@@ -2387,7 +2387,19 @@ impl<'a> Pipeline<'a> {
             compressed_bytes = metrics.compressed_bytes,
             compression_ratio = format!("{:.2}", metrics.compression_ratio),
             total_ms = metrics.total_ms,
+            // The same stage timings `process-once` prints and the
+            // `vtop_stage_duration_seconds` histograms observe. `run` drops
+            // its outcomes, so this line is the only place a long-running
+            // engine reports them per batch (still one line per committed
+            // batch, with no new label or span).
+            compress_ms = metrics.compress_ms,
+            checksum_ms = metrics.checksum_ms,
+            object_upload_ms = metrics.object_upload_ms,
+            manifest_upload_ms = metrics.manifest_upload_ms,
+            verify_ms = metrics.verify_ms,
+            commit_ms = metrics.commit_ms,
             state_write_ms = metrics.state_write_ms,
+            object_reused = metrics.object_reused,
             records_per_sec = format!("{:.0}", metrics.records_per_sec),
             upload_mib_per_sec = format!("{:.2}", metrics.upload_mib_per_sec),
             "batch_metrics"
@@ -2499,7 +2511,10 @@ impl PendingBuffer {
     /// Whether a read starting at `start` picks up exactly where the buffered
     /// window ends. Byte-offset sources are continuous by construction until
     /// a rotation or truncation restarts the file at byte 0, or a different
-    /// file takes the path (#558). Kafka partitions are not judged here.
+    /// file takes the path (#558). A Kafka read continues a window unless both
+    /// name a topic id and the ids differ: two incarnations of a topic number
+    /// their offsets separately, so one window of both would carry a range no
+    /// marker can claim. Offsets are not judged.
     fn continues(&self, start: &ProgressMarker) -> bool {
         let Some(end) = self.latest_end.as_ref() else {
             return true;
@@ -2534,6 +2549,16 @@ impl PendingBuffer {
                     ..
                 },
             ) => same_file(*end_inode, *start_inode) && end_byte == start_byte,
+            (
+                ProgressMarker::Kafka {
+                    topic_id: Some(end_id),
+                    ..
+                },
+                ProgressMarker::Kafka {
+                    topic_id: Some(start_id),
+                    ..
+                },
+            ) => end_id == start_id,
             _ => true,
         }
     }
@@ -5511,12 +5536,14 @@ impl Engine {
         {
             let committed = self.store.committed_kafka_offsets().await?;
             k.seed_committed_from_ledger(committed.iter().map(|c| {
-                (
-                    c.topic.as_str(),
-                    c.partition,
-                    c.consumer_group.as_str(),
-                    c.end_offset,
-                )
+                vtop_adapters::kafka_source::LedgerResume {
+                    topic: c.topic.as_str(),
+                    partition: c.partition,
+                    consumer_group: c.consumer_group.as_str(),
+                    topic_id: c.topic_id.as_deref(),
+                    end_offset: c.end_offset,
+                    newest_end: c.newest_end,
+                }
             }));
         }
         Ok(())
@@ -6725,6 +6752,7 @@ mod tests {
             start_offset: offset,
             end_offset: offset,
             consumer_group: "g".into(),
+            topic_id: None,
         };
         let read = |offset: i64, lo: Option<&str>, hi: Option<&str>| ReadResult {
             records: vec![b"r".to_vec()],
@@ -6850,6 +6878,7 @@ mod tests {
             start_offset: 0,
             end_offset: 0,
             consumer_group: "g".into(),
+            topic_id: None,
         };
         // Same topic, different partitions -> distinct buffer keys (no mixing).
         assert_ne!(buffer_key(&topic, &mk(0)), buffer_key(&topic, &mk(1)));
@@ -6893,6 +6922,7 @@ mod tests {
             start_offset: 0,
             end_offset: 0,
             consumer_group: "g".into(),
+            topic_id: None,
         };
         // Key names the marker's topic and partition, not the requested source.
         assert_eq!(buffer_key(&requested, &marker_for_b).1, "topic_b#p3");
@@ -6909,6 +6939,7 @@ mod tests {
             start_offset: 0,
             end_offset: 0,
             consumer_group: "g".into(),
+            topic_id: None,
         };
         assert_eq!(
             source_for_marker(&requested, &marker_for_a).source_name,
@@ -7170,6 +7201,146 @@ mod tests {
             flushed[0].committed,
             "flushed batch must commit after verify"
         );
+    }
+
+    /// The sample count of `vtop_stage_duration_seconds` for one tenant and
+    /// stage, read back from the registry as a scrape would.
+    fn stage_samples(tenant: &str, stage: &str) -> u64 {
+        let mx = telemetry::init().unwrap();
+        mx.registry
+            .gather()
+            .iter()
+            .filter(|f| f.name().ends_with("stage_duration_seconds"))
+            .flat_map(|f| f.get_metric().iter())
+            .filter(|m| {
+                let has = |name: &str, value: &str| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.name() == name && l.value() == value)
+                };
+                has("tenant", tenant) && has("stage", stage)
+            })
+            .map(|m| m.get_histogram().get_sample_count())
+            .sum()
+    }
+
+    /// `run` keeps no outcomes, so the per-stage timings of a batch it commits
+    /// reach an operator only through the `batch_metrics` line and the
+    /// `vtop_stage_duration_seconds` histograms. That line carried the total
+    /// and the ledger-write time and none of the stages, so a `run` engine's
+    /// stage timings read as absent where `process-once` printed them. The
+    /// cycle here is `run`'s own (`force_flush` false, the batch sealed by a
+    /// threshold, not by a forced flush), and the line must name every stage
+    /// with the value the batch measured.
+    #[tokio::test]
+    async fn run_cycle_logs_and_exports_the_stage_timings_of_a_committed_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let input = dir.path().join("in.log");
+        // Enough incompressible-ish text that compression, the checksum and
+        // the verify read each take well over the 1 ms the timings resolve.
+        const LINES: usize = 2_000;
+        {
+            let mut f = std::fs::File::create(&input).unwrap();
+            let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+            for _ in 0..LINES {
+                let mut line = String::with_capacity(4_096);
+                while line.len() < 4_095 {
+                    x = x
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    line.push_str(&format!("{x:016x}"));
+                }
+                writeln!(f, "{line}").unwrap();
+            }
+        }
+        let mut cfg = file_config(
+            work.to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.engine.tenant = "stage-timings-run".into();
+        cfg.batching.max_records = LINES;
+        cfg.batching.max_bytes = 104_857_600;
+        cfg.batching.max_batch_age_seconds = 3_600;
+
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let stages = [
+            "compress",
+            "checksum",
+            "object_upload",
+            "manifest_upload",
+            "verify",
+            "commit",
+            "state_write",
+        ];
+        let before: Vec<u64> = stages
+            .iter()
+            .map(|s| stage_samples("stage-timings-run", s))
+            .collect();
+
+        let (logs, _guard) = CapturedLogs::start_at(tracing::Level::INFO);
+        let outcomes = engine.run_source(SourceType::File, false).await.unwrap();
+        assert_eq!(outcomes.len(), 1, "the threshold sealed one batch");
+        let outcome = &outcomes[0];
+        assert!(outcome.committed, "the batch committed");
+        let m = outcome
+            .metrics
+            .as_ref()
+            .expect("a committed batch has metrics");
+
+        let line = logs.line("batch_metrics");
+        let field = |name: &str| -> u64 {
+            let key = format!("{name}=");
+            let at = line
+                .find(&key)
+                .unwrap_or_else(|| panic!("batch_metrics names no {name}: {line}"));
+            line[at + key.len()..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .unwrap_or_else(|_| panic!("{name} is not a number: {line}"))
+        };
+        let measured = [
+            ("compress_ms", m.compress_ms),
+            ("checksum_ms", m.checksum_ms),
+            ("object_upload_ms", m.object_upload_ms),
+            ("manifest_upload_ms", m.manifest_upload_ms),
+            ("verify_ms", m.verify_ms),
+            ("commit_ms", m.commit_ms),
+            ("state_write_ms", m.state_write_ms),
+            ("total_ms", m.total_ms),
+        ];
+        for (name, ms) in measured {
+            assert_eq!(
+                field(name),
+                ms,
+                "batch_metrics reports {name} as the batch measured it: {line}"
+            );
+        }
+        for (name, ms) in [
+            ("compress_ms", m.compress_ms),
+            ("checksum_ms", m.checksum_ms),
+            ("verify_ms", m.verify_ms),
+            ("total_ms", m.total_ms),
+        ] {
+            assert!(
+                ms > 0,
+                "{name} is 0 although the stage ran over {LINES} lines of 4 KiB: {line}"
+            );
+        }
+
+        for (stage, before) in stages.iter().zip(before) {
+            assert_eq!(
+                stage_samples("stage-timings-run", stage),
+                before + 1,
+                "one vtop_stage_duration_seconds sample for stage {stage} per committed batch"
+            );
+        }
     }
 
     /// #102: a throttle is counted apart from other upload failures, and the
@@ -9305,6 +9476,7 @@ mod tests {
             start_offset: start,
             end_offset: start + 9,
             consumer_group: "g".into(),
+            topic_id: None,
         };
         for order in [[0usize, 1, 2], [2, 1, 0], [1, 2, 0]] {
             let candidates = [
@@ -9429,6 +9601,7 @@ mod tests {
             start_offset: start,
             end_offset: end,
             consumer_group: "g".into(),
+            topic_id: None,
         };
         let mut plan = RewindPlan::default();
         plan.add(&kafka(10, 19));
@@ -10198,6 +10371,7 @@ mod tests {
             start_offset: start,
             end_offset: end,
             consumer_group: "g".into(),
+            topic_id: None,
         };
         for (start, end) in [(100, 149), (150, 199), (200, 249)] {
             buf.append(ReadResult {
@@ -10323,6 +10497,46 @@ mod tests {
         assert!(
             !buf.continues(&file(Some(2), 10, 10)),
             "another file took the path"
+        );
+    }
+
+    /// A topic id that changes between two reads of one partition (the topic
+    /// was deleted and created again while the adapter held the old id) seals
+    /// the buffered window: one window of both incarnations would hold offsets
+    /// 0 to 9 while its marker could claim only the last read's 5 to 9. An id
+    /// unknown on either side proves no change.
+    #[test]
+    fn a_kafka_window_is_not_continued_across_a_change_of_topic_id() {
+        let kafka = |id: Option<&str>, start: i64, end: i64| ProgressMarker::Kafka {
+            topic: "t".into(),
+            partition: 0,
+            start_offset: start,
+            end_offset: end,
+            consumer_group: "g".into(),
+            topic_id: id.map(str::to_owned),
+        };
+        let src = DiscoveredSource {
+            source_type: SourceType::Kafka,
+            source_name: "t".into(),
+            format: vtop_core::types::TelemetryFormat::Raw,
+        };
+        let mut buf = PendingBuffer::new("t", src, BatchLimits::default());
+        buf.append(ReadResult {
+            records: vec![b"x".to_vec()],
+            progress_start: kafka(Some("old"), 0, 0),
+            progress_end: kafka(Some("old"), 0, 4),
+            first_timestamp: None,
+            last_timestamp: None,
+            verbatim: false,
+        });
+        assert!(buf.continues(&kafka(Some("old"), 5, 5)));
+        assert!(
+            buf.continues(&kafka(None, 5, 5)),
+            "an unknown id proves no change"
+        );
+        assert!(
+            !buf.continues(&kafka(Some("new"), 5, 5)),
+            "another incarnation of the topic"
         );
     }
 
@@ -11014,6 +11228,7 @@ mod tests {
             start_offset: start,
             end_offset: start + 9,
             consumer_group: group.into(),
+            topic_id: None,
         };
         let mut plan = RewindPlan::default();
         plan.hold(&kafka("g", 0, 10));
@@ -11628,6 +11843,7 @@ mod tests {
                 start_offset: start,
                 end_offset: end,
                 consumer_group: Self::GROUP.into(),
+                topic_id: None,
             };
             let read = ReadResult {
                 records: (self.next..end)
@@ -11891,6 +12107,7 @@ mod tests {
             start_offset: start,
             end_offset: 2,
             consumer_group: group.into(),
+            topic_id: None,
         };
         assert_eq!(
             rewinds(&kafka("g", 0, 0), &kafka("g", 0, 2)),
@@ -12131,12 +12348,17 @@ mod tests {
         /// Capture WARN and above on this thread until the guard drops (a
         /// `#[tokio::test]` runs its tasks on the one thread).
         fn start() -> (Self, tracing::subscriber::DefaultGuard) {
+            Self::start_at(tracing::Level::WARN)
+        }
+
+        /// Capture `level` and above on this thread until the guard drops.
+        fn start_at(level: tracing::Level) -> (Self, tracing::subscriber::DefaultGuard) {
             let logs = Self::default();
             let writer = logs.clone();
             let subscriber = tracing_subscriber::fmt()
                 .with_writer(move || writer.clone())
                 .with_ansi(false)
-                .with_max_level(tracing::Level::WARN)
+                .with_max_level(level)
                 .finish();
             // Whether an event's callsite is recorded at all is decided once for
             // the process, the first time any thread reaches it, and cached. With

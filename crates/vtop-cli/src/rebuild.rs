@@ -726,6 +726,7 @@ mod tests {
             start_offset: start,
             end_offset: end,
             consumer_group: "g".into(),
+            topic_id: None,
         };
         let mut windows = RecordedWindows::default();
         for partition in [0, 1] {

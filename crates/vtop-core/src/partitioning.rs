@@ -107,7 +107,45 @@ pub fn resolve_template(template: &str, ctx: &PartitionContext) -> String {
             out.push(c);
         }
     }
-    normalize_prefix(&out)
+    normalize_prefix(&bound_components(&out))
+}
+
+/// The longest path component, in bytes, a partition prefix may carry: POSIX
+/// `NAME_MAX`. A directory name gets no extension or staging suffix, so 255
+/// itself is usable.
+pub const MAX_PATH_COMPONENT_BYTES: usize = 255;
+
+/// Readable prefix kept from an over-long component; the rest of the budget
+/// is `-` and 16 hex digits of the SHA-256 of the whole component.
+const COMPONENT_PREFIX_BYTES: usize = 200;
+
+/// Shorten every `/`-separated component longer than
+/// [`MAX_PATH_COMPONENT_BYTES`] to a readable prefix plus a hash of the whole
+/// component, so a source named by a long path (`source={source}` carries the
+/// full path of a file source) cannot make the object key a name the
+/// filesystem refuses. A component that fits is left byte for byte as it was,
+/// so existing archives keep their prefixes; the cut is a pure function of
+/// the component, so a replay resolves to the same prefix.
+fn bound_components(path: &str) -> String {
+    if path.split('/').all(|c| c.len() <= MAX_PATH_COMPONENT_BYTES) {
+        return path.to_string();
+    }
+    path.split('/')
+        .map(|component| {
+            if component.len() <= MAX_PATH_COMPONENT_BYTES {
+                return component.to_string();
+            }
+            let digest = crate::checksum::sha256_bytes(component.as_bytes());
+            // Cut on a char boundary: a literal template segment may be
+            // non-ASCII, a resolved value never is.
+            let mut cut = COMPONENT_PREFIX_BYTES;
+            while !component.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            format!("{}-{}", &component[..cut], &digest[..16])
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Sanitize a single resolved template value for safe use inside an object key
@@ -384,6 +422,39 @@ mod tests {
             "traversal must be neutralized: {resolved}"
         );
         assert!(resolved.starts_with("tenant=default/source="));
+    }
+
+    #[test]
+    fn a_long_source_cannot_make_a_path_component_too_long() {
+        let ts = Utc.with_ymd_and_hms(2026, 6, 18, 15, 0, 0).unwrap();
+        let long = |tail: &str| format!("/srv/{}{tail}", "customer-data-archive/".repeat(14));
+        let resolve = |source: &str| {
+            let c = PartitionContext::new("default", source, TelemetryFormat::Cef, ts);
+            resolve_template(DEFAULT_TEMPLATE, &c)
+        };
+        let a = resolve(&long("a.log"));
+        let b = resolve(&long("b.log"));
+        for part in a.split('/') {
+            assert!(part.len() <= MAX_PATH_COMPONENT_BYTES, "{part}");
+        }
+        assert_eq!(
+            a,
+            resolve(&long("a.log")),
+            "the same source, the same prefix"
+        );
+        assert_ne!(
+            a, b,
+            "sources sharing their first bytes get separate prefixes"
+        );
+        assert!(a.starts_with("tenant=default/source=_srv_customer-data-archive"));
+        // A component that fits is left exactly as it was, at the limit too.
+        let at_limit = "s".repeat(MAX_PATH_COMPONENT_BYTES - "source=".len());
+        assert_eq!(
+            resolve(&at_limit),
+            format!(
+                "tenant=default/source={at_limit}/format=cef/year=2026/month=06/day=18/hour=15"
+            )
+        );
     }
 
     #[test]

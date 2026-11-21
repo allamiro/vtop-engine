@@ -84,7 +84,7 @@ GET /readyz    readiness
 | `vtop_manifests_written_total{tenant,version}` | counter | Manifests stored, by the version written (`manifest.write_version`, #671): `0.3` or `0.4`. A `0.4` sample means every reader of the archive must run v0.8.0 or later; v0.7.0 and earlier report those manifests as tampered. The startup INFO line names the version and why |
 | `vtop_verification_receipts_total{tenant,result}` | counter | Verification receipts (#671), with `manifest.verification_receipts` on, primed at zero at startup: `written` (by the engine after a batch is VERIFIED), `failed` (it could not be built, stored or, under the Object Lock profile, read back locked; the batch commits regardless, and the WARN `verification_receipt_failed` says why), `repaired` (written by recovery for a VERIFIED batch that had none). Never a batch failure: alert on `increase(...{result="failed"}[1h]) > 0` as a warning, not a page. |
 | `vtop_records_total`, `vtop_bytes_in_total`, `vtop_bytes_out_total` | counters | Volume; rates via `rate()` |
-| `vtop_stage_duration_seconds{stage}` | histogram | Per-stage latency, p95-able |
+| `vtop_stage_duration_seconds{stage}` | histogram | Per-stage latency, p95-able. One sample per stage per committed batch, from the same measurements the `batch_metrics` log line and `process-once` report (`compress`, `checksum`, `object_upload` - skipped when the object was reused - `manifest_upload`, `verify`, `commit` for the source commit, `state_write`). Measured in whole milliseconds, so a stage under 1 ms is a 0 sample |
 | `vtop_batch_duration_seconds` | histogram | End to end |
 | `vtop_compression_ratio` | histogram | Compression effectiveness |
 | `vtop_inflight_batches` | gauge | Accumulated but not sealed |
@@ -323,6 +323,25 @@ The rules are an example, not provisioned: the lab's rules in
 `grafana/provisioning/alerting/vtop-alerts.yaml` are for metrics the lab
 produces.
 
+### Coverage audit
+
+`vtopctl audit-coverage --metrics-file` writes its own text file, by
+`source_type` and never by path or key. Besides the hole and gap gauges
+(`vtop_coverage_audit_failed_holes`, `..._unexplained_gaps`, `..._pending_ranges`,
+`..._duplicated`, `..._units`, `..._unproven_ranges`, `..._storage_findings`
+and `vtop_coverage_audit_passed`), it carries two for objects a failed attempt
+left that no committed row names (#774). They are storage cost, never loss, and
+are not part of `passed`.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `vtop_coverage_audit_unreferenced_objects{source_type}` | gauge | Objects a failed, replay-required or superseded row recorded as uploaded that no live row names, from the ledger and the prune digests. All of them, whatever `--orphans-limit` lists. A rise means failed attempts are leaving second objects; under Object Lock each is retained until its date. An object whose ledger row a power loss rolled back is not counted. |
+| `vtop_coverage_audit_unreferenced_object_bytes{source_type}` | gauge | Their recorded sizes, added up. |
+
+[Scrub and coverage audit](../docs/operate/scrub-and-audit.md#objects-no-committed-row-names)
+says what to do about them. The audit runs as a scheduled command, so these are
+not on the engine's `/metrics` and the engine's registry has no series for them.
+
 ### Design decisions worth knowing
 
 - **Labels are bounded**: `tenant`, `source_type`, `format`, `stage`, `state` —
@@ -375,7 +394,7 @@ counters, on the engine's and every node's `/metrics`:
 
 | Metric | Labels | Meaning |
 |---|---|---|
-| `vtop_audit_events_total` | `action` (`ledger.prune`, `ledger.replay`, `ledger.migrate`, `scrub.cursor`, `cluster.*`, `node.repair`, `node.reconfigure_range`, `promotion.attest`), `outcome` (`attempt`, `success`, `failure`, `refused`) | Records written. |
+| `vtop_audit_events_total` | `action` (`ledger.prune`, `ledger.replay`, `ledger.migrate`, `scrub.cursor`, `cluster.*`, `node.repair`, `node.reconfigure_range`, `promotion.attest`, `native.session`), `outcome` (`attempt`, `success`, `failure`, `refused`) | Records written. |
 | `vtop_audit_write_failures_total` | `sink` (`log`, `file`, `ledger`) | Records a sink could not take. Any increase needs a look: a destructive ledger command was refused, or a record is in fewer places than configured. |
 
 With JSON logs, the records in Loki (the lab's Alloy labels lines by

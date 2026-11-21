@@ -557,6 +557,11 @@ instances never recover the same batch. Required before fleet mode.
   per-path NEWEST committed row (by `(created_at, batch_id)`) so recovery cursor seeding
   is unchanged - the newest, not the highest end_byte, which after a
   rotation or copytruncate is the old content's row (#564);
+- for Kafka, retain per (topic, partition, consumer group, topic id) the
+  committed row with the HIGHEST end offset - what the restart resumes from
+  - and for rows recorded with no topic id the newest, never ranked against a
+  row of a known id; a topic deleted and recreated numbers its offsets from
+  zero again, so each incarnation keeps its own;
 - retain enough for audit, replay, and compliance (age window is
   configurable; archival to cold tables / object storage remains a
   possible future extension).
