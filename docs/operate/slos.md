@@ -20,6 +20,7 @@ section in [Alert runbooks](runbooks.md) says what to do.
 | Locks kept on replay | No replay finds its object without the lock configured, and no fresh object is withheld | Any hour, and a series that first appears non-zero | `vtop_object_key_decisions_total{decision}` (`fallback_unlocked`, `fallback_lock_mode`, `fallback_hold_missing`, `lock_withheld`) | [VtopObjectLockFallback](runbooks.md#vtopobjectlockfallback) (ticket) |
 | Strong verification | On for every production engine | At startup | `vtop_verification_mode{mode}` | [VtopSizeOnlyVerification](runbooks.md#vtopsizeonlyverification) (ticket) |
 | Incomplete multipart uploads | Kept sessions resumed or swept within the abandon window plus one sweep interval | a session kept 30 to 36 hours ago and nothing resumed or swept for 36 hours, held for 1 | `vtop_multipart_sessions_total{outcome}` | [VtopMultipartSessionsPiling](runbooks.md#vtopmultipartsessionspiling) (ticket) |
+| State-store write latency | At least 95% of committed batches spend under 1 s in their ledger writes | 15 minutes, held for 15 | `vtop_stage_duration_seconds{stage="state_write"}` | [VtopStateStoreWritesSlow](runbooks.md#vtopstatestorewritesslow) (ticket) |
 
 ## How to read them
 
@@ -33,6 +34,11 @@ section in [Alert runbooks](runbooks.md) says what to do.
 - **Replay rate** has both a floor and a baseline so that a stream that always
   replays a little does not page, and one that never replays does not need to
   reach a high rate before it is noticed.
+- **State-store write latency** is per batch: the time of all the ledger
+  writes one committed batch made, about eight, two of them synced. The
+  second is a default for a local disk or a nearby PostgreSQL server; a
+  store known to be slower needs its own number. An engine with no committed
+  batch in the window has no ratio, so an idle engine never raises it.
 - **Source lag** depends on kafka-exporter (the lab runs it in
   `docker-compose.observability.yml`); the engine exports no lag of its own.
   Without the exporter there is no data and the alert stays silent.

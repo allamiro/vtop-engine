@@ -41,6 +41,7 @@ async fn every_registered_transport_holds_the_evidence_rules() {
             request_timeout_seconds: 300,
             request_min_bytes_per_second: 4 * 1024,
             object_lock: None,
+            server_side_encryption: None,
         })
         .await
         .unwrap_or_else(|e| panic!("[{transport}] backend construction: {e}"));

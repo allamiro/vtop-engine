@@ -98,7 +98,7 @@ def _refuse_at_close(monkeypatch):
                         classmethod(lambda cls, sc, shape: object()))
 
     @contextlib.contextmanager
-    def contended(_spec, vtop_bytes):
+    def contended(_spec, vtop_bytes, **_diagnostics):
         yield RefusingContention()
 
     monkeypatch.setattr(run_benchmark.competitor, "contended", contended)
@@ -221,7 +221,7 @@ def test_a_contended_runs_duration_excludes_everything_closing_the_contention_to
                         classmethod(lambda cls, sc, shape: object()))
 
     @contextlib.contextmanager
-    def contended(_spec, vtop_bytes):
+    def contended(_spec, vtop_bytes, **_diagnostics):
         yield SlowToCloseContention()
 
     monkeypatch.setattr(run_benchmark.competitor, "contended", contended)

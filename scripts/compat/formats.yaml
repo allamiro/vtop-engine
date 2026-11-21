@@ -209,6 +209,7 @@ formats:
       - {file: crates/vtop-meta/src/storage/log.rs, name: CHUNK_VERSION, value: '1'}
       - {file: crates/vtop-meta/src/storage/log.rs, name: ENTRY_MAGIC, value: 'b"VTOPMLE1"'}
     fixtures: [crates/vtop-meta/tests/fixtures/meta]
+    fuzz: [meta_decode]
 
   - id: 16
     name: Metadata command set
@@ -271,6 +272,7 @@ formats:
     one_way:
       - "raising the feature level (vtopctl meta enable-features): permanent; a voter older than the level refuses a log that holds its kinds"
     fixtures: [crates/vtop-meta/tests/fixtures/meta]
+    fuzz: [meta_decode]
 
   - id: 17
     name: Metadata snapshot and state encoding
@@ -340,6 +342,7 @@ formats:
           CATEGORY_NODE_VERSION: 21
           CATEGORY_PROMOTION_ATTESTATION: 22
     fixtures: [crates/vtop-meta/tests/fixtures/meta]
+    fuzz: [meta_decode]
 
   - id: 18
     name: Metadata hard state, applied, purged, membership log id
