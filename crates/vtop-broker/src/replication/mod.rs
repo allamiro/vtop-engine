@@ -48,9 +48,9 @@ pub use fault::{
     FaultInjectingReplicaSet, FollowerNetworkFault, NetworkFaultPlan, PendingDeliveryStats,
 };
 pub use network::{
-    address_now, FlowControlConfig, LeaderLineage, LeaderLineageSnapshot, NetworkFollowerConfig,
-    NetworkedReplicaSet, ReplicaPeerHandler, ReplicaPeerServer, ReplicaStatusClient,
-    ReplicaTlsMaterial,
+    address_now, CatchUpRead, FlowControlConfig, LeaderLineage, LeaderLineageSnapshot,
+    NetworkFollowerConfig, NetworkedReplicaSet, ReplicaPeerHandler, ReplicaPeerServer,
+    ReplicaStatusClient, ReplicaTlsMaterial,
 };
 pub use transfer::{LeaderSegmentTransferHandler, SegmentTransferClient, TransferredPrefix};
 pub use version::{ClusterFeatureLevel, PeerVersion, ReplicaVersionPolicy};
@@ -2367,115 +2367,138 @@ impl InProcessFollower {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for request in requests {
-            if request.range != self.range {
-                return Err((
-                    ErrorCode::WrongRange,
-                    "replica append range identity does not match this follower".to_owned(),
-                ));
-            }
-            if let Err((code, message)) =
-                check_follower_fencing(&meta, self.held_fencing_epoch(), request.fencing_epoch)
-            {
-                return Err((code, message.to_owned()));
-            }
-            let tip = state.segment.next_offset();
-            if tip > request.expected_base_offset {
-                let batch_end = request
-                    .expected_base_offset
-                    .checked_add(request.records.len() as u64)
-                    .ok_or((
-                        ErrorCode::InvalidRequest,
-                        "replica append batch end overflows u64".to_owned(),
-                    ))?;
-                if state.segment.committed_offset() >= batch_end {
-                    continue;
+        let tip_before = state.segment.next_offset();
+        let applied = (|| {
+            for request in requests {
+                if request.range != self.range {
+                    return Err((
+                        ErrorCode::WrongRange,
+                        "replica append range identity does not match this follower".to_owned(),
+                    ));
                 }
-                return Err((
-                    ErrorCode::InvalidRequest,
-                    format!(
-                        "follower next_offset {tip} is ahead of expected_base_offset {} but not durable through {batch_end}",
-                        request.expected_base_offset
-                    ),
-                ));
-            }
-            if tip != request.expected_base_offset {
-                return Err((
-                    ErrorCode::InvalidRequest,
-                    format!(
-                        "follower next_offset {tip} does not match expected_base_offset {}",
-                        request.expected_base_offset
-                    ),
-                ));
-            }
-            if let Err(problem) = state
-                .producer_epochs
-                .accept(request.producer_id, request.producer_epoch)
-            {
-                return Err(match problem {
-                    BrokerError::ProducerFenced { .. } => (ErrorCode::Fenced, problem.to_string()),
-                    other => (ErrorCode::Storage, other.to_string()),
-                });
-            }
-            // Same refusal as the single-request path: a v1 frame cannot
-            // store the marker's reserved identity, and hiding that loss
-            // would be worse than failing the ack (#240).
-            if self.segment_format == SegmentFormat::V1
-                && request.producer_id == PROMOTION_MARKER_PRODUCER
-            {
-                return Err((
-                    ErrorCode::InvalidRequest,
-                    "a v1-format follower cannot store the promotion marker under its \
-                     recognizable identity, so it refuses the marker rather than hide the loss"
-                        .to_owned(),
-                ));
-            }
-            let (stored_id, stored_epoch) = match self.segment_format {
-                SegmentFormat::V1 => (
-                    storage_producer_id(request.producer_id, request.producer_epoch),
-                    0,
-                ),
-                SegmentFormat::V2 => (request.producer_id, request.producer_epoch),
-            };
-            let records = match records_from_wire(
-                &request.records,
-                stored_id,
-                stored_epoch,
-                request.first_sequence,
-            ) {
-                Ok(records) => records,
-                Err(message) => return Err((ErrorCode::InvalidRequest, message.to_owned())),
-            };
-            // A roll mid-batch commits the sealed tail early, which
-            // strengthens the shared durability barrier for a HEALTHY
-            // follower: nothing is acknowledged before the final commit
-            // below. Under an fsync hold that same early commit would break
-            // the injection's promise that held bytes die with a crash, so
-            // the bound refuses instead of rolling there.
-            let appended = if self.hold_fsync() {
-                state
-                    .segment
-                    .append_group_tail_only(&records, Durability::Buffered)
-            } else {
-                state
-                    .segment
-                    .append_group_minting(&records, Durability::Buffered)
-            };
-            if let Err(problem) = appended {
-                return Err((
-                    match problem {
-                        vtop_log::LogError::FirstSequence { .. }
-                        | vtop_log::LogError::SequenceGap { .. }
-                        | vtop_log::LogError::SequenceConflict { .. }
-                        | vtop_log::LogError::SequenceBelowWindow { .. } => {
-                            ErrorCode::SequenceConflict
+                if let Err((code, message)) =
+                    check_follower_fencing(&meta, self.held_fencing_epoch(), request.fencing_epoch)
+                {
+                    return Err((code, message.to_owned()));
+                }
+                let tip = state.segment.next_offset();
+                if tip > request.expected_base_offset {
+                    let batch_end = request
+                        .expected_base_offset
+                        .checked_add(request.records.len() as u64)
+                        .ok_or((
+                            ErrorCode::InvalidRequest,
+                            "replica append batch end overflows u64".to_owned(),
+                        ))?;
+                    if state.segment.committed_offset() >= batch_end {
+                        continue;
+                    }
+                    return Err((
+                        ErrorCode::InvalidRequest,
+                        format!(
+                            "follower next_offset {tip} is ahead of expected_base_offset {} but not durable through {batch_end}",
+                            request.expected_base_offset
+                        ),
+                    ));
+                }
+                if tip != request.expected_base_offset {
+                    return Err((
+                        ErrorCode::InvalidRequest,
+                        format!(
+                            "follower next_offset {tip} does not match expected_base_offset {}",
+                            request.expected_base_offset
+                        ),
+                    ));
+                }
+                if let Err(problem) = state
+                    .producer_epochs
+                    .accept(request.producer_id, request.producer_epoch)
+                {
+                    return Err(match problem {
+                        BrokerError::ProducerFenced { .. } => {
+                            (ErrorCode::Fenced, problem.to_string())
                         }
-                        vtop_log::LogError::ProducerFenced { .. } => ErrorCode::Fenced,
-                        _ => ErrorCode::Storage,
-                    },
-                    problem.to_string(),
-                ));
+                        other => (ErrorCode::Storage, other.to_string()),
+                    });
+                }
+                // Same refusal as the single-request path: a v1 frame cannot
+                // store the marker's reserved identity, and hiding that loss
+                // would be worse than failing the ack (#240).
+                if self.segment_format == SegmentFormat::V1
+                    && request.producer_id == PROMOTION_MARKER_PRODUCER
+                {
+                    return Err((
+                        ErrorCode::InvalidRequest,
+                        "a v1-format follower cannot store the promotion marker under its \
+                         recognizable identity, so it refuses the marker rather than hide the loss"
+                            .to_owned(),
+                    ));
+                }
+                let (stored_id, stored_epoch) = match self.segment_format {
+                    SegmentFormat::V1 => (
+                        storage_producer_id(request.producer_id, request.producer_epoch),
+                        0,
+                    ),
+                    SegmentFormat::V2 => (request.producer_id, request.producer_epoch),
+                };
+                let records = match records_from_wire(
+                    &request.records,
+                    stored_id,
+                    stored_epoch,
+                    request.first_sequence,
+                ) {
+                    Ok(records) => records,
+                    Err(message) => return Err((ErrorCode::InvalidRequest, message.to_owned())),
+                };
+                // A roll mid-batch commits the sealed tail early, which
+                // strengthens the shared durability barrier for a HEALTHY
+                // follower: nothing is acknowledged before the final commit
+                // below. Under an fsync hold that same early commit would break
+                // the injection's promise that held bytes die with a crash, so
+                // the bound refuses instead of rolling there.
+                let appended = if self.hold_fsync() {
+                    state
+                        .segment
+                        .append_group_tail_only(&records, Durability::Buffered)
+                } else {
+                    state
+                        .segment
+                        .append_group_minting(&records, Durability::Buffered)
+                };
+                if let Err(problem) = appended {
+                    return Err((
+                        match problem {
+                            vtop_log::LogError::FirstSequence { .. }
+                            | vtop_log::LogError::SequenceGap { .. }
+                            | vtop_log::LogError::SequenceConflict { .. }
+                            | vtop_log::LogError::SequenceBelowWindow { .. } => {
+                                ErrorCode::SequenceConflict
+                            }
+                            vtop_log::LogError::ProducerFenced { .. } => ErrorCode::Fenced,
+                            _ => ErrorCode::Storage,
+                        },
+                        problem.to_string(),
+                    ));
+                }
             }
+            Ok(())
+        })();
+        if let Err(refusal) = applied {
+            // The members before the refused one were appended, buffered,
+            // and passed every check a member gets. Left uncommitted they
+            // stranded this replica (#881 soak): its tail ran past its
+            // durable offset, and every later append at that offset was
+            // refused as "ahead but not durable". Committed, the replica is
+            // consistent again and reports where it really is; the leader
+            // resumes from there.
+            if !self.hold_fsync() && state.segment.next_offset() > tip_before {
+                if let Ok(_committed) = state.segment.commit() {
+                    let tail = state.segment.next_offset();
+                    drop(state);
+                    self.follow_leader_lineage_after_append(requests[0].fencing_epoch, tail);
+                }
+            }
+            return Err(refusal);
         }
         // Every member was checked against the held epoch above, so the
         // group is one leader's, and so is the lineage it is filed under
