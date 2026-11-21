@@ -29,6 +29,7 @@ pub fn sample_record(id: &str) -> BatchRecord {
         start_offset: 0,
         end_offset: 10,
         consumer_group: "vtop-engine".into(),
+        topic_id: None,
     };
     BatchRecord {
         batch_id: id.into(),
@@ -82,7 +83,15 @@ pub async fn run_all(store: &dyn StateStore) {
     max_committed_end_bytes_aggregates_in_store(store).await;
     committed_cursors_never_mix_the_offsets_of_two_files(store).await;
     committed_cursors_carry_the_newest_rows_content_fingerprint(store).await;
-    committed_kafka_offsets_are_the_newest_row_of_each_partition_and_group(store).await;
+    committed_kafka_offsets_of_rows_with_no_topic_id_are_the_newest_row_of_each_partition_and_group(
+        store,
+    )
+    .await;
+    a_kafka_range_committed_below_a_newer_one_never_lowers_the_resume_point(store).await;
+    a_recreated_topic_resumes_from_its_own_incarnation(store).await;
+    rows_with_no_topic_id_are_never_compared_with_rows_of_a_known_one(store).await;
+    the_newest_rows_own_end_is_carried_when_it_ends_below_an_older_row_of_its_id(store).await;
+    a_truncated_log_under_one_topic_id_falls_back_to_the_newest_row(store).await;
     claims_respect_live_leases_and_take_over_expired_ones(store).await;
     committed_cursors_by_file_answer_each_file_that_lived_at_a_path(store).await;
     the_seal_instant_is_written_with_the_row_and_read_back_by_every_read(store).await;
@@ -296,6 +305,9 @@ pub async fn run_fencing_battery(a: &dyn StateStore, b: &dyn StateStore) {
 /// by design and must keep failing it.
 pub async fn run_prune_battery(store: &dyn StateStore) {
     prune_preserves_cursor_seeds_and_bounds_deletion(store).await;
+    prune_keeps_the_max_end_row_of_each_topic_incarnation(store).await;
+    pruning_does_not_move_the_answer_that_holds_the_newest_kafka_row(store).await;
+    pruning_keeps_the_rows_that_show_a_truncation_until_the_log_has_passed_them(store).await;
     listed_prune_deletes_only_what_was_listed(store).await;
     superseded_rows_are_pruned_like_committed_history(store).await;
     prune_never_touches_the_audit_table(store).await;
@@ -1027,29 +1039,108 @@ async fn superseded_rows_are_pruned_like_committed_history(store: &dyn StateStor
     );
 }
 
+/// A committed Kafka row of `topic`/`partition` for group "g": `[start, end]`,
+/// read from incarnation `topic_id` of the topic (`None` for a row written
+/// before the id was recorded), created at `created`.
+fn kafka_row(
+    topic: &str,
+    partition: i32,
+    topic_id: Option<&str>,
+    id: &str,
+    (start, end): (i64, i64),
+    created: &str,
+) -> BatchRecord {
+    let marker = ProgressMarker::Kafka {
+        topic: topic.into(),
+        partition,
+        start_offset: start,
+        end_offset: end,
+        consumer_group: "g".into(),
+        topic_id: topic_id.map(str::to_owned),
+    };
+    let mut r = sample_record(id);
+    r.source_name = topic.into();
+    r.progress_start = marker.clone();
+    r.progress_end = marker;
+    r.created_at = created.into();
+    r
+}
+
+/// Walk `rec` to SOURCE_COMMITTED.
+async fn commit_kafka_row(store: &dyn StateStore, rec: &BatchRecord) {
+    store.save_batch_state(rec).await.unwrap();
+    for st in LEGAL_WALK {
+        store
+            .update_batch_state(&rec.batch_id, st, &BatchPatch::default())
+            .await
+            .unwrap();
+    }
+}
+
+/// The ledger's resume answers for one partition of group "g" of `topic`,
+/// sorted by topic id (no id first).
+async fn kafka_answers(
+    store: &dyn StateStore,
+    topic: &str,
+    partition: i32,
+) -> Vec<CommittedKafkaOffset> {
+    let mut answers: Vec<CommittedKafkaOffset> = store
+        .committed_kafka_offsets()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|o| o.topic == topic && o.partition == partition && o.consumer_group == "g")
+        .collect();
+    answers.sort_by(|a, b| a.topic_id.cmp(&b.topic_id));
+    answers
+}
+
+fn kafka_answer(
+    topic: &str,
+    partition: i32,
+    topic_id: Option<&str>,
+    end: i64,
+    newest_end: Option<i64>,
+) -> CommittedKafkaOffset {
+    CommittedKafkaOffset {
+        topic: topic.into(),
+        partition,
+        consumer_group: "g".into(),
+        topic_id: topic_id.map(str::to_owned),
+        end_offset: end,
+        newest_end,
+    }
+}
+
 /// #614: the Kafka adapter resumes each partition from the ledger, not from
 /// the group's committed offset, which an engine whose claim has moved on can
-/// still overwrite. The answer is per (topic, partition, consumer group), and
-/// it is the NEWEST committed row's end offset: not a row of another
-/// partition or group, not a row that is only VERIFIED, and not the highest
-/// offset - a recreated topic numbers its records from zero again.
-async fn committed_kafka_offsets_are_the_newest_row_of_each_partition_and_group(
+/// still overwrite. The answer is per (topic, partition, consumer group, topic
+/// id): not a row of another partition or group, and not a row that is only
+/// VERIFIED.
+///
+/// This test's rows carry NO topic id, as every row written before the id was
+/// recorded: they keep the rule the ledger always had, the NEWEST committed
+/// row's end, never a maximum - a topic recreated under the same name numbers
+/// its offsets from zero again, and rows with no id cannot say which
+/// incarnation they are of. The known-id rules are in
+/// [`a_kafka_range_committed_below_a_newer_one_never_lowers_the_resume_point`]
+/// and [`a_recreated_topic_resumes_from_its_own_incarnation`].
+async fn committed_kafka_offsets_of_rows_with_no_topic_id_are_the_newest_row_of_each_partition_and_group(
     store: &dyn StateStore,
 ) {
     let topic = "kafka_resume_614";
     let row = |id: &str, partition: i32, group: &str, end: i64, created: &str| {
+        let mut r = kafka_row(topic, partition, None, id, (0, end), created);
         let marker = ProgressMarker::Kafka {
             topic: topic.into(),
             partition,
             start_offset: 0,
             end_offset: end,
             consumer_group: group.into(),
+            topic_id: None,
         };
-        let mut r = sample_record(id);
-        r.source_name = topic.into();
         r.progress_start = marker.clone();
         r.progress_end = marker;
-        r.created_at = created.into();
         r
     };
     let committed = [
@@ -1062,13 +1153,7 @@ async fn committed_kafka_offsets_are_the_newest_row_of_each_partition_and_group(
         row("ko-p2-new-topic", 2, "g", 7, "2030-01-01T00:00:06Z"),
     ];
     for rec in &committed {
-        store.save_batch_state(rec).await.unwrap();
-        for st in LEGAL_WALK {
-            store
-                .update_batch_state(&rec.batch_id, st, &BatchPatch::default())
-                .await
-                .unwrap();
-        }
+        commit_kafka_row(store, rec).await;
     }
     // Newer and higher, but only VERIFIED: never a resume point.
     let verified = row("ko-p0-verified", 0, "g", 29, "2030-01-01T00:00:09Z");
@@ -1092,7 +1177,9 @@ async fn committed_kafka_offsets_are_the_newest_row_of_each_partition_and_group(
         topic: topic.into(),
         partition,
         consumer_group: group.into(),
+        topic_id: None,
         end_offset: end,
+        newest_end: Some(end),
     };
     assert_eq!(
         got,
@@ -1102,7 +1189,221 @@ async fn committed_kafka_offsets_are_the_newest_row_of_each_partition_and_group(
             want(1, "g", 4),
             want(2, "g", 7),
         ],
-        "one resume point per (topic, partition, consumer group): the newest committed row's"
+        "one resume point per (topic, partition, consumer group) for rows with no topic id: the \
+         newest committed row's"
+    );
+}
+
+/// The Kafka window ranges and rows of the sequence a state-machine model
+/// found reachable on one unit, shared by the resume and the prune checks.
+/// `r0` is offsets 0..=9, `r1` is 10..=19. Every row is of the topic
+/// incarnation `topic_id`.
+///
+/// 1. A (r0) reaches VERIFIED and its source commit fails; B (r1) reaches
+///    VERIFIED. Crash.
+/// 2. A's stored object is damaged while the engine is down.
+/// 3. Recovery's re-check of A fails: A is FAILED, then REPLAY_REQUIRED, the
+///    rewind goes to r0, and B is held.
+/// 4. r0 is re-read as a NEW row C, created after B. C verifies and commits.
+/// 5. Recovery retires A (SUPERSEDED) and commits B.
+///
+/// B (end 19) is committed with the higher end and was created earlier; C
+/// (end 9) is committed with the lower end and was created later. `base` is
+/// the day the rows are created on (`"2030-02-01"`), so a test can order two
+/// incarnations.
+async fn commit_the_a_b_c_sequence(
+    store: &dyn StateStore,
+    topic: &str,
+    partition: i32,
+    topic_id: Option<&str>,
+    base: &str,
+) {
+    let row = |id: &str, range: (i64, i64), at: &str| {
+        kafka_row(
+            topic,
+            partition,
+            topic_id,
+            id,
+            range,
+            &format!("{base}T{at}Z"),
+        )
+    };
+    let p = BatchPatch::default();
+    let a = format!("{topic}-a");
+    let b = format!("{topic}-b");
+    let c = format!("{topic}-c");
+    // 1. A and B both reach VERIFIED; A's source commit failed.
+    for (id, range, at) in [(&a, (0, 9), "00:00:01"), (&b, (10, 19), "00:00:02")] {
+        store.save_batch_state(&row(id, range, at)).await.unwrap();
+        for st in &LEGAL_WALK[..6] {
+            store.update_batch_state(id, *st, &p).await.unwrap();
+        }
+    }
+    // 3. A fails its re-check and is rewound.
+    store.mark_failed(&a, "object damaged").await.unwrap();
+    // 4. r0 is re-read as a new row, created after B, and commits.
+    store
+        .save_batch_state(&row(&c, (0, 9), "00:00:03"))
+        .await
+        .unwrap();
+    for st in LEGAL_WALK {
+        store.update_batch_state(&c, st, &p).await.unwrap();
+    }
+    // 5. Recovery retires A and commits B.
+    store
+        .update_batch_state(&a, BatchState::Superseded, &p)
+        .await
+        .unwrap();
+    store
+        .update_batch_state(&b, BatchState::SourceCommitted, &p)
+        .await
+        .unwrap();
+}
+
+/// The resume point after the A, B, C sequence is B's end, not C's, when the
+/// rows are of one topic id. Resuming from C re-archives r1, which B already
+/// committed.
+async fn a_kafka_range_committed_below_a_newer_one_never_lowers_the_resume_point(
+    store: &dyn StateStore,
+) {
+    let topic = "kafka_resume_a_b_c";
+    commit_the_a_b_c_sequence(store, topic, 0, Some("inc-1"), "2030-02-01").await;
+    assert_eq!(
+        kafka_answers(store, topic, 0).await,
+        vec![kafka_answer(topic, 0, Some("inc-1"), 19, Some(9))],
+        "B committed r1 (end 19) although C, created after it, ended at 9: the adapter resumes \
+         at end + 1, so 20 is right and 10 re-archives r1"
+    );
+}
+
+/// A topic deleted and created again under the same name numbers its offsets
+/// from zero, and the maximum over both logs would skip the new one's first
+/// records. The ledger answers once per incarnation, each its own highest
+/// end, and the adapter takes the one of the current topic id.
+async fn a_recreated_topic_resumes_from_its_own_incarnation(store: &dyn StateStore) {
+    let topic = "kafka_resume_recreated";
+    // The old topic reached offset 500; the new one, a different id, started
+    // at 0 and has archived 0..=7.
+    for rec in [
+        kafka_row(
+            topic,
+            0,
+            Some("inc-old"),
+            "rc-old-1",
+            (0, 99),
+            "2030-03-01T00:00:01Z",
+        ),
+        kafka_row(
+            topic,
+            0,
+            Some("inc-old"),
+            "rc-old-2",
+            (100, 500),
+            "2030-03-01T00:00:02Z",
+        ),
+        kafka_row(
+            topic,
+            0,
+            Some("inc-new"),
+            "rc-new-1",
+            (0, 7),
+            "2030-03-02T00:00:01Z",
+        ),
+    ] {
+        commit_kafka_row(store, &rec).await;
+    }
+    assert_eq!(
+        kafka_answers(store, topic, 0).await,
+        vec![
+            kafka_answer(topic, 0, Some("inc-new"), 7, Some(7)),
+            kafka_answer(topic, 0, Some("inc-old"), 500, None),
+        ],
+        "each incarnation keeps its own highest end, and the one holding the newest row is \
+         marked: resuming at the old topic's 501 would skip the new topic's records 8 to 500"
+    );
+}
+
+/// The adapter holds a topic's id for up to a minute, so ranges read just
+/// after a recreate can carry the OLD id: an older row ending at 500 and a
+/// newer row ending at 7 then share one id. The id's answer is 500 (its highest
+/// end), and the fallback for an adapter that cannot learn the current id is
+/// the newest row's own end, 7, as the ledger always resumed - never 500, which
+/// would skip the new log's records 8 to 500.
+async fn the_newest_rows_own_end_is_carried_when_it_ends_below_an_older_row_of_its_id(
+    store: &dyn StateStore,
+) {
+    let topic = "kafka_resume_cache_window";
+    for rec in [
+        kafka_row(
+            topic,
+            0,
+            Some("inc-old"),
+            "cw-1",
+            (100, 500),
+            "2030-06-01T00:00:01Z",
+        ),
+        kafka_row(
+            topic,
+            0,
+            Some("inc-old"),
+            "cw-2",
+            (0, 7),
+            "2030-06-02T00:00:01Z",
+        ),
+    ] {
+        commit_kafka_row(store, &rec).await;
+    }
+    assert_eq!(
+        kafka_answers(store, topic, 0).await,
+        vec![kafka_answer(topic, 0, Some("inc-old"), 500, Some(7))],
+        "the answer of the id is its highest end, and it carries the newest row's own end"
+    );
+}
+
+/// Rows with no topic id and rows with one are never ranked against each
+/// other, in either order: which incarnation an unknown row is of cannot be
+/// told.
+async fn rows_with_no_topic_id_are_never_compared_with_rows_of_a_known_one(store: &dyn StateStore) {
+    let topic = "kafka_resume_mixed";
+    // Written before the upgrade: no id, the higher end, the older row.
+    // Written after it: an id, a lower end (the topic was recreated, or the
+    // rows are simply newer - the ledger cannot tell).
+    for rec in [
+        kafka_row(
+            topic,
+            0,
+            None,
+            "mx-legacy-high",
+            (0, 300),
+            "2030-04-01T00:00:01Z",
+        ),
+        kafka_row(
+            topic,
+            0,
+            None,
+            "mx-legacy-low",
+            (301, 310),
+            "2030-04-01T00:00:02Z",
+        ),
+        kafka_row(
+            topic,
+            0,
+            Some("inc-1"),
+            "mx-known-low",
+            (0, 9),
+            "2030-04-02T00:00:01Z",
+        ),
+    ] {
+        commit_kafka_row(store, &rec).await;
+    }
+    assert_eq!(
+        kafka_answers(store, topic, 0).await,
+        vec![
+            kafka_answer(topic, 0, None, 310, None),
+            kafka_answer(topic, 0, Some("inc-1"), 9, Some(9)),
+        ],
+        "no maximum across an unknown and a known id: the unknown rows answer with their \
+         newest row's end, the known id with its own"
     );
 }
 
@@ -2014,6 +2315,7 @@ async fn prune_preserves_cursor_seeds_and_bounds_deletion(store: &dyn StateStore
         start_offset: 0,
         end_offset: 10,
         consumer_group: group.into(),
+        topic_id: None,
     };
     let record = |id: &str, source_type: SourceType, name: &str, marker: ProgressMarker| {
         let mut r = sample_record(id);
@@ -2087,10 +2389,11 @@ async fn prune_preserves_cursor_seeds_and_bounds_deletion(store: &dyn StateStore
     let kafka_offsets = || async {
         let mut offsets = store.committed_kafka_offsets().await.unwrap();
         offsets.sort_by(|a, b| {
-            (&a.topic, a.partition, &a.consumer_group).cmp(&(
+            (&a.topic, a.partition, &a.consumer_group, &a.topic_id).cmp(&(
                 &b.topic,
                 b.partition,
                 &b.consumer_group,
+                &b.topic_id,
             ))
         });
         offsets
@@ -2200,6 +2503,319 @@ async fn prune_preserves_cursor_seeds_and_bounds_deletion(store: &dyn StateStore
             "{deleted} must be pruned"
         );
     }
+}
+
+/// The answer that holds the newest-created committed row is what the adapter
+/// falls back to when it cannot learn the topic's id, so pruning must not move
+/// it: with rows of a known id and of none interleaved, a lower-ending row of
+/// the newest incarnation is not the highest of its id and not the newest of
+/// the rows with no id, and was deleted, which made another answer the newest.
+/// (Its id is also unresolved here, which keeps it, so this holds twice.)
+async fn pruning_does_not_move_the_answer_that_holds_the_newest_kafka_row(store: &dyn StateStore) {
+    let topic = "kafka_prune_newest";
+    for (id, topic_id, range, at) in [
+        ("a", Some("inc-1"), (10, 19), "00:00:01"),
+        ("b", None, (0, 5), "00:00:02"),
+        ("c", Some("inc-1"), (0, 9), "00:00:03"),
+    ] {
+        commit_kafka_row(
+            store,
+            &kafka_row(
+                topic,
+                0,
+                topic_id,
+                &format!("{topic}-{id}"),
+                range,
+                &format!("2030-05-01T{at}Z"),
+            ),
+        )
+        .await;
+    }
+    let before = vec![
+        kafka_answer(topic, 0, None, 5, None),
+        kafka_answer(topic, 0, Some("inc-1"), 19, Some(9)),
+    ];
+    assert_eq!(kafka_answers(store, topic, 0).await, before);
+    let future = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+    while store.prune_committed_history(&future, 2).await.unwrap() > 0 {}
+    assert_eq!(
+        kafka_answers(store, topic, 0).await,
+        before,
+        "the newest-created row (c) holds the fallback answer and must be kept"
+    );
+    assert!(store
+        .get_batch(&format!("{topic}-c"))
+        .await
+        .unwrap()
+        .is_some());
+}
+
+/// Pruning keeps the row the Kafka restart resumes from, for every incarnation
+/// of the topic: per topic id the row with the HIGHEST end offset, not the
+/// newest-created; for rows with no id the newest, as before the id existed.
+///
+/// After the A, B, C sequence the newest-created committed row (C, end 9) ends
+/// below B (end 19); pruning by creation order kept C and deleted B, and the
+/// next restart resumed below what was archived. The same topic recreated
+/// under a new id keeps its own highest row beside it (the old log's end is
+/// not the new log's), and the rows of no id keep their newest, never ranked
+/// against either.
+async fn prune_keeps_the_max_end_row_of_each_topic_incarnation(store: &dyn StateStore) {
+    let topic = "kafka_prune_a_b_c";
+    // Incarnation 1: the A, B, C sequence (B, end 19, is the row to keep).
+    commit_the_a_b_c_sequence(store, topic, 0, Some("inc-1"), "2030-02-01").await;
+    // Incarnation 2, the topic created again: offsets from zero, later rows.
+    for (id, range, at) in [("n1", (0, 4), "00:00:01"), ("n2", (5, 9), "00:00:02")] {
+        commit_kafka_row(
+            store,
+            &kafka_row(
+                topic,
+                0,
+                Some("inc-2"),
+                &format!("{topic}-{id}"),
+                range,
+                &format!("2030-03-01T{at}Z"),
+            ),
+        )
+        .await;
+    }
+    // Rows from before the id was recorded: the older one ends higher, and
+    // the newer one is the one the ledger resumed from.
+    for (id, range, at) in [
+        ("l-high", (0, 99), "00:00:01"),
+        ("l-low", (100, 105), "00:00:02"),
+    ] {
+        commit_kafka_row(
+            store,
+            &kafka_row(
+                topic,
+                0,
+                None,
+                &format!("{topic}-{id}"),
+                range,
+                &format!("2029-12-01T{at}Z"),
+            ),
+        )
+        .await;
+    }
+    let before = vec![
+        kafka_answer(topic, 0, None, 105, None),
+        kafka_answer(topic, 0, Some("inc-1"), 19, None),
+        kafka_answer(topic, 0, Some("inc-2"), 9, Some(9)),
+    ];
+    assert_eq!(
+        kafka_answers(store, topic, 0).await,
+        before,
+        "the resume answers before the prune"
+    );
+
+    let future = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+    let ours = |rows: Vec<BatchRecord>| -> Vec<String> {
+        let mut ids: Vec<String> = rows
+            .into_iter()
+            .map(|r| r.batch_id)
+            .filter(|id| id.starts_with(topic))
+            .collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(
+        ours(store.prune_candidates(&future, 10_000).await.unwrap()),
+        [
+            "kafka_prune_a_b_c-a",
+            "kafka_prune_a_b_c-l-high",
+            "kafka_prune_a_b_c-n1",
+        ],
+        "A (superseded), the new incarnation's first row and the older of the rows with no id \
+         are candidates; inc-1 is UNRESOLVED (its newest row, C, ends below its highest, B), so \
+         C stays with B until a later row catches up, and n2 (of inc-2) and \
+         l-low (the newest with no id) are never candidates"
+    );
+    let mut passes = 0;
+    while store.prune_committed_history(&future, 2).await.unwrap() > 0 {
+        passes += 1;
+        assert!(passes < 64, "pruning must converge");
+    }
+    assert_eq!(
+        kafka_answers(store, topic, 0).await,
+        before,
+        "every incarnation's resume point is prune-invariant"
+    );
+    for kept in ["b", "c", "n2", "l-low"] {
+        assert!(
+            store
+                .get_batch(&format!("{topic}-{kept}"))
+                .await
+                .unwrap()
+                .is_some(),
+            "{kept} must survive"
+        );
+    }
+    for gone in ["a", "n1", "l-high"] {
+        assert!(
+            store
+                .get_batch(&format!("{topic}-{gone}"))
+                .await
+                .unwrap()
+                .is_none(),
+            "{gone} must be pruned"
+        );
+    }
+
+    // A later row catches inc-1 up (end 29 is above B's 19): it is resolved,
+    // and B, C and the old row are history below it.
+    commit_kafka_row(
+        store,
+        &kafka_row(
+            topic,
+            0,
+            Some("inc-1"),
+            &format!("{topic}-d"),
+            (20, 29),
+            "2030-02-02T00:00:01Z",
+        ),
+    )
+    .await;
+    let resolved = vec![
+        kafka_answer(topic, 0, None, 105, None),
+        kafka_answer(topic, 0, Some("inc-1"), 29, None),
+        kafka_answer(topic, 0, Some("inc-2"), 9, Some(9)),
+    ];
+    assert_eq!(kafka_answers(store, topic, 0).await, resolved);
+    assert_eq!(
+        ours(store.prune_candidates(&future, 10_000).await.unwrap()),
+        ["kafka_prune_a_b_c-b", "kafka_prune_a_b_c-c"],
+        "with inc-1 resolved, B (below D) and C are candidates"
+    );
+    while store.prune_committed_history(&future, 2).await.unwrap() > 0 {}
+    assert_eq!(kafka_answers(store, topic, 0).await, resolved);
+    assert!(store
+        .get_batch(&format!("{topic}-d"))
+        .await
+        .unwrap()
+        .is_some());
+}
+
+/// An unclean leader election truncates a partition and keeps its topic id, so
+/// the replacement records reuse offsets already archived: the log's committed
+/// rows climb to 500, then a row ending at 19 overlaps the range of an earlier
+/// one. The highest end (500) would skip the replacement records 20 to 500
+/// once the log regrows past it, so the id answers with its NEWEST row's end
+/// (19), as rows with no id do - a re-read, never a skip. The A, B, C sequence
+/// has no overlap (C fills the hole below B) and keeps the maximum.
+async fn a_truncated_log_under_one_topic_id_falls_back_to_the_newest_row(store: &dyn StateStore) {
+    let topic = "kafka_resume_truncated";
+    for rec in [
+        kafka_row(
+            topic,
+            0,
+            Some("inc-1"),
+            "tr-1",
+            (0, 99),
+            "2030-07-01T00:00:01Z",
+        ),
+        kafka_row(
+            topic,
+            0,
+            Some("inc-1"),
+            "tr-2",
+            (100, 500),
+            "2030-07-01T00:00:02Z",
+        ),
+        kafka_row(
+            topic,
+            0,
+            Some("inc-1"),
+            "tr-3",
+            (10, 19),
+            "2030-07-01T00:00:03Z",
+        ),
+    ] {
+        commit_kafka_row(store, &rec).await;
+    }
+    assert_eq!(
+        kafka_answers(store, topic, 0).await,
+        vec![kafka_answer(topic, 0, Some("inc-1"), 19, Some(19))],
+        "tr-3 (10 to 19) overlaps the earlier tr-1 (0 to 99): offsets were reused, so the \
+         answer is the newest row's end, not the highest (500)"
+    );
+}
+
+/// Pruning keeps what the truncation test needs while the log's id is
+/// unresolved (its newest row ends below its highest), so the answer does not
+/// change under a prune; once the log passes its old end, the rows below are
+/// history.
+async fn pruning_keeps_the_rows_that_show_a_truncation_until_the_log_has_passed_them(
+    store: &dyn StateStore,
+) {
+    let topic = "kafka_prune_truncated";
+    for rec in [
+        kafka_row(
+            topic,
+            0,
+            Some("inc-1"),
+            "pt-1",
+            (0, 99),
+            "2030-08-01T00:00:01Z",
+        ),
+        kafka_row(
+            topic,
+            0,
+            Some("inc-1"),
+            "pt-2",
+            (100, 500),
+            "2030-08-01T00:00:02Z",
+        ),
+        kafka_row(
+            topic,
+            0,
+            Some("inc-1"),
+            "pt-3",
+            (10, 19),
+            "2030-08-01T00:00:03Z",
+        ),
+    ] {
+        commit_kafka_row(store, &rec).await;
+    }
+    let truncated = vec![kafka_answer(topic, 0, Some("inc-1"), 19, Some(19))];
+    assert_eq!(kafka_answers(store, topic, 0).await, truncated);
+    let future = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+    while store.prune_committed_history(&future, 2).await.unwrap() > 0 {}
+    assert_eq!(
+        kafka_answers(store, topic, 0).await,
+        truncated,
+        "pruning must not take the overlap away: the answer would jump back to 500"
+    );
+    for id in ["pt-1", "pt-2", "pt-3"] {
+        assert!(
+            store.get_batch(id).await.unwrap().is_some(),
+            "{id} is kept while the id is unresolved"
+        );
+    }
+    // The log regrows past its old end: resolved, the rows below are history.
+    commit_kafka_row(
+        store,
+        &kafka_row(
+            topic,
+            0,
+            Some("inc-1"),
+            "pt-4",
+            (20, 600),
+            "2030-08-01T00:00:04Z",
+        ),
+    )
+    .await;
+    let resolved = vec![kafka_answer(topic, 0, Some("inc-1"), 600, Some(600))];
+    assert_eq!(kafka_answers(store, topic, 0).await, resolved);
+    while store.prune_committed_history(&future, 2).await.unwrap() > 0 {}
+    assert_eq!(kafka_answers(store, topic, 0).await, resolved);
+    for gone in ["pt-1", "pt-2", "pt-3"] {
+        assert!(
+            store.get_batch(gone).await.unwrap().is_none(),
+            "{gone} is below the highest and the id is resolved: pruned"
+        );
+    }
+    assert!(store.get_batch("pt-4").await.unwrap().is_some());
 }
 
 /// #560: a prune that must keep an anchor lists its rows first and deletes
