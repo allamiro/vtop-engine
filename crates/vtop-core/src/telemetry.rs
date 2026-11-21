@@ -50,7 +50,16 @@ pub const STAGES: [&str; 7] = [
 /// is not usable either (a store that does not keep the lock), so nothing is
 /// written and the batch fails; outside the `fallback_` prefix on purpose,
 /// since no second object was written.
-pub const OBJECT_KEY_DECISIONS: [&str; 13] = [
+///
+/// The last two (#773) are taken only on a backend that cannot report an
+/// absent key (`awscli`, `minio`, `s3cmd`), for a window that rebuilds one an
+/// earlier attempt sealed, when the ledger recorded the object that attempt
+/// uploaded. `adopted`: that object was read back and its bytes match the
+/// batch's digest, so it is reused and nothing is uploaded. `adopt_rejected`:
+/// it did not verify (damaged, missing, unreadable, size-only) or lies outside
+/// the configured bucket and prefix, so the batch is written under its attempt
+/// key as a second object, and the recorded one is left as it is.
+pub const OBJECT_KEY_DECISIONS: [&str; 15] = [
     "derived",
     "reused",
     "fallback_differs",
@@ -64,6 +73,8 @@ pub const OBJECT_KEY_DECISIONS: [&str; 13] = [
     "fallback_lock_mode",
     "fallback_hold_missing",
     "lock_withheld",
+    "adopted",
+    "adopt_rejected",
 ];
 
 /// The values of `result` on `vtop_replay_rebuilds_total` (#626): what a
@@ -328,7 +339,10 @@ pub struct Metrics {
     /// `per_attempt` rate means replays are writing second objects. Under
     /// the Object Lock profile, `fallback_unlocked`, `fallback_lock_mode`,
     /// `fallback_hold_missing` and `lock_withheld` mean an object that should
-    /// be locked is not (#709).
+    /// be locked is not (#709). `adopted` is a replay on a backend that cannot
+    /// report an absent key reusing the object the earlier attempt recorded,
+    /// and `adopt_rejected` the same replay finding that object unusable
+    /// and writing a second one (#773).
     pub object_key_decisions_total: IntCounterVec,
     /// What each replay of a window an earlier attempt sealed came to (#626),
     /// by the bounded set [`REPLAY_REBUILD_RESULTS`]. Any result but `exact`
@@ -429,6 +443,7 @@ pub const AUDIT_ACTIONS: [&str; 14] = [
     "promotion.attest",
     "audit.gap",
     "security.override",
+    "native.session",
 ];
 
 /// The values of `outcome` on `vtop_audit_events_total`.

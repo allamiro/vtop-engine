@@ -101,6 +101,12 @@ pub enum Action {
     /// true (#733). One record per file per process; the target is the file.
     #[serde(rename = "security.override")]
     SecurityOverride,
+    /// A native produce/fetch session the node refused at its hello:
+    /// a certificate that is not the one bound to the principal it asked to
+    /// act as, a principal or role the node does not serve. Refusals only;
+    /// an admitted session is not a state change.
+    #[serde(rename = "native.session")]
+    NativeSession,
 }
 
 impl Action {
@@ -120,6 +126,7 @@ impl Action {
         Action::PromotionAttest,
         Action::AuditGap,
         Action::SecurityOverride,
+        Action::NativeSession,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -138,6 +145,7 @@ impl Action {
             Action::PromotionAttest => "promotion.attest",
             Action::AuditGap => "audit.gap",
             Action::SecurityOverride => "security.override",
+            Action::NativeSession => "native.session",
         }
     }
 
@@ -217,6 +225,9 @@ impl Action {
             // What the file holds, its mode and who besides the owner can
             // read it: never its contents.
             Action::SecurityOverride => &["file_kind", "mode", "exposed_to", "setting"],
+            // The role the client asked for and the principal this node
+            // serves: identifiers, never the certificate itself.
+            Action::NativeSession => &["role", "served_principal"],
         }
     }
 
