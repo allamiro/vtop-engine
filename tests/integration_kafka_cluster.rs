@@ -29,6 +29,12 @@
 //! cargo test -p vtop-cli --test integration_kafka_cluster -- --ignored
 //! ```
 //!
+//! The tests take one lock for the cluster ([`one_node_down_at_a_time`]), so
+//! they never stop two nodes at once whatever the test runner's thread count:
+//! two nodes down would leave the controller quorum and the two in-sync
+//! replicas `acks=all` needs without a majority, and fail the tests for a
+//! reason that is not the engine's.
+//!
 //! `integration_kafka_to_minio.rs` runs against the same cluster in the same
 //! job, so every live test also runs on three brokers.
 
@@ -41,6 +47,14 @@ use vtop_core::types::ProgressMarker;
 #[path = "kafka_broker_env.rs"]
 mod broker_env;
 use broker_env::bootstrap;
+
+/// Held for the whole of each test that stops a node (review): the cluster
+/// has three nodes and tolerates one down, not two.
+static CLUSTER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn one_node_down_at_a_time() -> tokio::sync::MutexGuard<'static, ()> {
+    CLUSTER.lock().await
+}
 
 /// Records per batch, so the topic is archived in many batches and the
 /// leader can be stopped between them.
@@ -347,6 +361,7 @@ fn assert_tiles(ranges: &[(i64, i64)], records: i64) {
 #[tokio::test]
 #[ignore = "requires a three-broker Kafka cluster (scripts/kafka-cluster.sh)"]
 async fn a_leader_stopped_and_started_mid_read_loses_nothing_and_commits_nothing_twice() {
+    let _cluster = one_node_down_at_a_time().await;
     let nodes = nodes();
     let topic = unique("leader");
     let group = format!("vtop-it-{topic}");
@@ -391,6 +406,7 @@ async fn a_leader_stopped_and_started_mid_read_loses_nothing_and_commits_nothing
 #[tokio::test]
 #[ignore = "requires a three-broker Kafka cluster (scripts/kafka-cluster.sh)"]
 async fn a_follower_stopped_mid_read_changes_nothing() {
+    let _cluster = one_node_down_at_a_time().await;
     let nodes = nodes();
     let topic = unique("follower");
     let group = format!("vtop-it-{topic}");
