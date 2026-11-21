@@ -93,6 +93,7 @@ async fn state_persists_across_reopen() {
         start_offset: 0,
         end_offset: 9,
         consumer_group: "vtop-engine".into(),
+        topic_id: None,
     };
     let now = chrono::Utc::now().to_rfc3339();
     let rec = BatchRecord {
