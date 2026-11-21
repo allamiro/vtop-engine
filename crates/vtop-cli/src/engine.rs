@@ -7830,13 +7830,13 @@ mod tests {
         );
     }
 
-    /// Two windows of one file sealed in the same pass (the buffered one by
+    /// Two windows of one unit sealed in the same pass (the buffered one by
     /// overflow, the new one by its threshold), and both fail. The read head
     /// must be handed back to the LOWER start: handing back each start in
-    /// turn leaves it at the higher one, the next pass commits past the lower
-    /// range, and the restart's rewind of it is clamped to that commit.
-    #[tokio::test]
-    async fn two_windows_of_one_file_failing_in_one_pass_rewind_to_the_lower_start() {
+    /// turn left it at the higher one, the next pass committed past the
+    /// lower range, and the restart's rewind of it was clamped to that
+    /// commit. `spool` runs it on a syslog spool, else on a file.
+    async fn two_failed_windows_of_one_unit_in_one_pass(spool: bool) {
         let _serial = THROTTLE_TESTS.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("in.log");
@@ -7847,6 +7847,16 @@ mod tests {
             vec![input.to_string_lossy().into_owned()],
             "mock",
         );
+        let source_type = if spool {
+            cfg.sources.file = None;
+            cfg.sources.syslog_spool = Some(vtop_core::config::SyslogSpoolConfig {
+                enabled: true,
+                paths: vec![input.to_string_lossy().into_owned()],
+            });
+            SourceType::SyslogSpool
+        } else {
+            SourceType::File
+        };
         cfg.batching.max_records = 2;
         cfg.batching.max_batch_age_seconds = 3_600;
         cfg.batching.idle_poll_interval_ms = 20;
@@ -7855,7 +7865,7 @@ mod tests {
             .unwrap();
         engine.backend = Arc::new(vtop_upload::MockBackend::new().with_throttled_puts(2));
         // One line, below the threshold: buffered.
-        let _ = engine.run_source(SourceType::File, false).await;
+        let _ = engine.run_source(source_type.clone(), false).await;
         {
             use std::io::Write;
             let mut f = std::fs::OpenOptions::new()
@@ -7865,12 +7875,49 @@ mod tests {
             write!(f, "line 2\nline 3\n").unwrap();
         }
         // This pass seals [0, 7) and [7, 21), and the store refuses both.
-        for _ in 0..30 {
-            let _ = engine.run_source(SourceType::File, false).await;
-            tokio::time::sleep(Duration::from_millis(5)).await;
+        let failed = engine.run_source(source_type.clone(), false).await;
+        let failed = failed.unwrap_or_default();
+        assert_eq!(
+            failed
+                .iter()
+                .filter(|o| o.final_state == BatchState::Failed)
+                .count(),
+            2,
+            "both windows of the pass failed: {failed:?}"
+        );
+        for _ in 0..10 {
+            let _ = engine.run_source(source_type.clone(), false).await;
         }
         let len = std::fs::metadata(&input).unwrap().len() as i128;
         assert_committed_without_a_gap("two failures in one pass", &engine, len).await;
+    }
+
+    #[tokio::test]
+    async fn two_windows_of_one_file_failing_in_one_pass_rewind_to_the_lower_start() {
+        two_failed_windows_of_one_unit_in_one_pass(false).await;
+    }
+
+    #[tokio::test]
+    async fn two_windows_of_one_spool_failing_in_one_pass_rewind_to_the_lower_start() {
+        two_failed_windows_of_one_unit_in_one_pass(true).await;
+    }
+
+    /// The engine's half on its own: one rewind per unit, the lowest, and the
+    /// starts it covers; units kept apart and in first-seen order.
+    #[test]
+    fn the_rewind_of_a_unit_is_its_lowest_failed_start() {
+        let k = |partition: i32, start: i64| ProgressMarker::Kafka {
+            topic: "t".into(),
+            partition,
+            start_offset: start,
+            end_offset: start + 9,
+            consumer_group: "g".into(),
+            topic_id: None,
+        };
+        let (lowest, covered) =
+            lowest_rewind_per_unit(vec![k(0, 40), k(1, 5), k(0, 30), k(0, 50)]);
+        assert_eq!(lowest, vec![k(0, 30), k(1, 5)]);
+        assert_eq!(covered, vec![k(0, 40), k(0, 50)]);
     }
 
     /// Every committed file batch as (inode, start byte, end byte, records).

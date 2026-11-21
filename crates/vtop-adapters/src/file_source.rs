@@ -5490,6 +5490,45 @@ mod tests {
         assert!(results[2].is_ok(), "and does not stop the one after it");
     }
 
+    /// Two ranges of one file handed back in one call, in either order,
+    /// resume the file at the LOWER start. Applied in caller order, the
+    /// second rewind set the read position: a higher start given last moved
+    /// it above the lower range, which was then never read again.
+    #[tokio::test]
+    async fn two_rewinds_of_one_file_in_one_call_resume_at_the_lower_start() {
+        for lower_first in [true, false] {
+            let f = write_log(&["a1", "a2"]);
+            let path = f.path().to_string_lossy().into_owned();
+            let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+            let first = fs
+                .read_batch_candidates(&src(&path), 1, 1 << 20, Duration::ZERO)
+                .await
+                .unwrap();
+            let second = fs
+                .read_batch_candidates(&src(&path), 1, 1 << 20, Duration::ZERO)
+                .await
+                .unwrap();
+            assert_eq!((lines(&first), lines(&second)), (vec!["a1".to_owned()], vec!["a2".to_owned()]));
+            let (low, high) = (
+                first[0].progress_start.clone(),
+                second[0].progress_start.clone(),
+            );
+            let markers = if lower_first { [low, high] } else { [high, low] };
+            for result in fs.replay_from_markers(&markers).await {
+                result.unwrap();
+            }
+            let again = fs
+                .read_batch_candidates(&src(&path), 10, 1 << 20, Duration::ZERO)
+                .await
+                .unwrap();
+            assert_eq!(
+                lines(&again),
+                ["a1", "a2"],
+                "handed back lower first: {lower_first}; the re-read skipped the lower range"
+            );
+        }
+    }
+
     /// #626: a re-read bounded to a recorded range stops at its end, and
     /// what follows is read on in the same pass as its own read: the window
     /// the engine rebuilds ends where the failed one did, and the bytes after

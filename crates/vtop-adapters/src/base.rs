@@ -8,6 +8,17 @@ use std::time::Duration;
 use vtop_core::errors::VtopError;
 use vtop_core::types::{ProgressMarker, SourceType, TelemetryFormat};
 
+/// Where a marker's range starts, in its unit's own position (an offset or a
+/// byte).
+fn start_of(marker: &ProgressMarker) -> i128 {
+    match marker {
+        ProgressMarker::Kafka { start_offset, .. } => i128::from(*start_offset),
+        ProgressMarker::File { start_byte, .. } | ProgressMarker::SyslogSpool { start_byte, .. } => {
+            i128::from(*start_byte)
+        }
+    }
+}
+
 /// A source the engine can read batches from.
 #[derive(Debug, Clone)]
 pub struct DiscoveredSource {
@@ -226,15 +237,26 @@ pub trait SourceAdapter: Send + Sync {
     /// and the engine's failure path rewind every affected range together, and
     /// a rewind that costs a round trip each would stall startup in proportion
     /// to the number of partitions when that system is slow or down.
+    ///
+    /// Each rewind sets its unit's read position, so when several markers
+    /// name one unit the one applied last decides where it resumes. The
+    /// default applies them from the highest start down, so every unit
+    /// resumes at the LOWEST start it was given, whatever order the caller
+    /// passed them in: in caller order, a higher start handed back after a
+    /// lower one moved the read position above the lower range, which was
+    /// then never read again. An override must keep that property.
     async fn replay_from_markers(
         &mut self,
         markers: &[ProgressMarker],
     ) -> Vec<Result<(), VtopError>> {
-        let mut results = Vec::with_capacity(markers.len());
-        for marker in markers {
-            results.push(self.replay_from_marker(marker).await);
+        let mut order: Vec<usize> = (0..markers.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(start_of(&markers[i])));
+        let mut results: Vec<Option<Result<(), VtopError>>> =
+            std::iter::repeat_with(|| None).take(markers.len()).collect();
+        for i in order {
+            results[i] = Some(self.replay_from_marker(&markers[i]).await);
         }
-        results
+        results.into_iter().flatten().collect()
     }
 
     /// Bound the re-read of ranges already handed back

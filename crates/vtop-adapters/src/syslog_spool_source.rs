@@ -1437,6 +1437,57 @@ mod tests {
         assert!(error.to_string().contains("identity changed"));
     }
 
+    /// Two ranges of one spool handed back in one call, in either order,
+    /// resume the spool at the LOWER start. Applied in caller order, the
+    /// second rewind set the read position: a higher start given last moved
+    /// it above the lower range, which was then never read again.
+    #[tokio::test]
+    async fn two_rewinds_of_one_spool_in_one_call_resume_at_the_lower_start() {
+        for lower_first in [true, false] {
+            let mut f = tempfile::NamedTempFile::new().unwrap();
+            writeln!(f, "first").unwrap();
+            writeln!(f, "second").unwrap();
+            f.flush().unwrap();
+            let path = f.path().to_string_lossy().into_owned();
+            let source = DiscoveredSource {
+                source_type: SourceType::SyslogSpool,
+                source_name: path.clone(),
+                format: TelemetryFormat::Syslog,
+            };
+            let mut spool = SyslogSpoolSource::new(vec![path.clone()]);
+            let first = spool
+                .read_batch_candidates(&source, 1, 1 << 20, Duration::ZERO)
+                .await
+                .unwrap();
+            let second = spool
+                .read_batch_candidates(&source, 1, 1 << 20, Duration::ZERO)
+                .await
+                .unwrap();
+            let (low, high) = (
+                first[0].progress_start.clone(),
+                second[0].progress_start.clone(),
+            );
+            let markers = if lower_first { [low, high] } else { [high, low] };
+            for result in spool.replay_from_markers(&markers).await {
+                result.unwrap();
+            }
+            let again = spool
+                .read_batch_candidates(&source, 10, 1 << 20, Duration::ZERO)
+                .await
+                .unwrap();
+            let got: Vec<String> = again
+                .iter()
+                .flat_map(|r| r.records.iter())
+                .map(|r| String::from_utf8_lossy(r).trim_end().to_owned())
+                .collect();
+            assert_eq!(
+                got,
+                ["first", "second"],
+                "handed back lower first: {lower_first}; the re-read skipped the lower range"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn replay_rejects_a_truncated_spool() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
