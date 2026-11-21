@@ -41,6 +41,7 @@ These carry the commit rule:
 | `vtop_verification_failures_total` | Any increase is an incident. |
 | `vtop_commits_total` vs `vtop_verified_total` | Commits must never exceed verifications. |
 | `vtop_verification_mode{mode="size_only"}` | `1` means `upload.require_strong_verification` is off: same-size corruption is accepted. |
+| `vtop_server_side_encryption_mode{mode}` | `1` on the mode `upload.server_side_encryption` set: `none`, `sse-s3` or `sse-kms`. A fleet that must encrypt can alert on `mode="none"` being `1`. |
 | `vtop_verification_backend_limited_total` | Batches committed on a size-only check. |
 | `vtop_object_lock_checks_total{result}` | With `upload.object_lock`: any result but `ok` is a batch that failed because the store did not keep the retention asked for (or its bucket has no Object Lock, `bucket_not_locked`, or the store does not implement Object Lock, `store_unsupported`). See [S3 Object Lock](../OBJECT_LOCK_DEPLOYMENT.md). |
 | `vtop_object_key_decisions_total{decision}` | With `upload.object_lock`: `fallback_unlocked`, `fallback_lock_mode`, `fallback_hold_missing` and `lock_withheld` mean an object that should be locked is not, or the store is not keeping locks (#709). `fallback_lock_elapsed` is storage cost only. |
