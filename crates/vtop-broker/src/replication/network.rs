@@ -1969,17 +1969,24 @@ impl FollowerDriver {
                     // actually re-sent, so every byte is charged exactly once
                     // while it occupies the retransmission buffer.
                     drain_retransmission_to_pending(pending, retransmission, retransmission_bytes);
-                    // What the buffer cannot cover, the log can (#881).
-                    if let Err(outcome) = self
-                        .catch_up_from_log(
-                            &mut stream,
-                            next_request_id,
-                            status.local_committed_offset,
-                            pending,
-                        )
-                        .await
-                    {
-                        return outcome;
+                    // What the buffer cannot cover, the log can (#881) -
+                    // to a follower this session fenced, and only to one:
+                    // the fence is what reconciled its log against this
+                    // leader's (#641) and gave it the history the records
+                    // are filed under (#640). An unfenced (plaintext) session
+                    // keeps the buffer-only behaviour it had.
+                    if session_fence == SessionFence::Reconciled {
+                        if let Err(outcome) = self
+                            .catch_up_from_log(
+                                &mut stream,
+                                next_request_id,
+                                status.local_committed_offset,
+                                pending,
+                            )
+                            .await
+                        {
+                            return outcome;
+                        }
                     }
                 }
                 _ => return SessionOutcome::Disconnected,
@@ -2272,9 +2279,9 @@ impl FollowerDriver {
     /// resend, for ever. Under retention it then fell below every peer's log
     /// start and the range ran a replica short.
     ///
-    /// Runs after the fence and the status probe, so the follower has
-    /// already reconciled against this leader (#641) and taken its history
-    /// (#640): the records sent here are filed under the epochs that wrote
+    /// Runs only on a session this leader fenced, after the status probe, so
+    /// the follower has already reconciled against this leader (#641) and
+    /// taken its history (#640): the records sent here are filed under the epochs that wrote
     /// them, exactly as retransmitted ones are, and a suffix it kept in
     /// dispute (#611) is settled by the first append over it. Records go out
     /// in order from the offset the follower reported, as appends at this
