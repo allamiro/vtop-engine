@@ -242,6 +242,14 @@ Known limits of the checker:
   account for the whole read. Example: an unanswered 0..9, a read showing
   only 0..4 at watermark 5, then a retry of 0..4 acknowledged at 0..4: valid.
 
+- **A read that `verify` rejects leaves nothing in the history.** `verify
+  --dump` writes a read only when it completes, so a read stopped by a content
+  mismatch, an offset going back or too many gaps is absent, and
+  `await_verified_floor` retries it and overwrites its log. A later good read
+  then passes the scenario and the checker. Example: scenario 09's read meets
+  a corrupted acknowledged record once, and the retry reads it intact. The
+  cluster soak marks such reads itself and fails on them.
+
 The checker's own tests (`test_check_history.py`, run in the live-chaos job
 before the scenarios) build histories by hand, clean ones and ones shaped like
 #611, #261 and #641, and pin the verdict on each.
