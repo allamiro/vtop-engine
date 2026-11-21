@@ -2,7 +2,8 @@
 offset on each partition must not pass the ranges the ledger records as
 VERIFIED or SOURCE_COMMITTED (read from a copy of the SQLite ledger).
 
-Usage: python3 check_commit_rule.py RUN_DIR GROUP     exit 1 on a violation
+Usage: python3 check_commit_rule.py RUN_DIR GROUP     exit 1 on a violation, 2 when the
+       group's offsets cannot be read
 """
 
 import json
@@ -24,7 +25,12 @@ def main() -> int:
     # commits between the two reads and the check reports a false violation.
     described = subprocess.run(
         ["docker", "exec", KAFKA, "/opt/kafka/bin/kafka-consumer-groups.sh", "--bootstrap-server", "localhost:9092",
-         "--describe", "--group", group], capture_output=True, text=True, check=False).stdout
+         "--describe", "--group", group], capture_output=True, text=True, check=False)
+    if described.returncode != 0:
+        # No offsets observed is not a held rule: fail, so crash.sh fails.
+        print(f"group offsets unavailable (exit {described.returncode}): {described.stderr.strip()[:300]}")
+        return 2
+    described = described.stdout
     tmp = tempfile.mkdtemp()
     for suffix in ("", "-wal", "-shm"):
         src = os.path.join(run, "state", "vtop.db" + suffix)
