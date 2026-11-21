@@ -30,6 +30,9 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# A stock librdkafka client for the failover test (#751): the test that a
+# Kafka client follows a failover is only worth anything against a real one.
+rdkafka = { workspace = true }
 vtop-log = { workspace = true }
 tokio = { version = "1", default-features = false, features = [
     "io-util",
