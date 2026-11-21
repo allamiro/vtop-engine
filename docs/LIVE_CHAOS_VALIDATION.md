@@ -250,6 +250,12 @@ Known limits of the checker:
   a corrupted acknowledged record once, and the retry reads it intact. The
   cluster soak marks such reads itself and fails on them.
 
+- **Acknowledgements are judged against the last read only.** A history
+  records when a read ended, not when it started, so a read that began after
+  an acknowledgement and did not show it is not held to it. Example:
+  sequences 0..9 acknowledged at 0..9, a read showing nothing at watermark 0,
+  then a read showing all ten at watermark 10: valid.
+
 The checker's own tests (`test_check_history.py`, run in the live-chaos job
 before the scenarios) build histories by hand, clean ones and ones shaped like
 #611, #261 and #641, and pin the verdict on each.
