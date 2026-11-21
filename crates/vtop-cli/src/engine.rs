@@ -1252,7 +1252,8 @@ impl<'a> Pipeline<'a> {
             // batch for it fails here, before its first PUT, unless it is
             // the one due to check the bucket again.
             let gate = self.versioning_pauses.gate(&bucket);
-            if let versioning::Gate::Wait { next_check_in } = gate {
+            if let versioning::Gate::Wait { next_check_in } = &gate {
+                let next_check_in = *next_check_in;
                 if let Some(mx) = telemetry::metrics() {
                     mx.bucket_versioning_paused_batches_total
                         .with_label_values(&[
@@ -1264,7 +1265,7 @@ impl<'a> Pipeline<'a> {
                 }
                 fail!(versioning::paused_batch(&bucket, next_check_in));
             }
-            let checked = gate == versioning::Gate::Open
+            let checked = matches!(gate, versioning::Gate::Open)
                 && self.versioned_buckets.lock().unwrap().contains(&bucket);
             if !checked {
                 // A literal bucket passed this at startup unless the store
@@ -1318,7 +1319,7 @@ impl<'a> Pipeline<'a> {
                         // does not implement versioning, or no answer. A
                         // paused bucket stays paused, checked on its
                         // backoff.
-                        if gate == versioning::Gate::Check {
+                        if matches!(gate, versioning::Gate::Check(_)) {
                             self.versioning_off(&bucket, &batch_id, versioning::PauseCause::Check);
                         } else {
                             tracing::error!(

@@ -230,18 +230,38 @@ struct Pause {
     /// The wait after the next check that finds versioning still off.
     wait: Duration,
     checks: u64,
+    /// A batch holds the check ([`CheckClaim`]) and has not finished it.
+    checking: bool,
 }
 
 /// What a batch may do with a bucket.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Gate {
+#[derive(Debug)]
+pub(crate) enum Gate<'a> {
     /// Not paused: upload as usual.
     Open,
-    /// Paused and not yet due for a check: write nothing.
+    /// Paused, and not yet due for a check or another batch is checking:
+    /// write nothing.
     Wait { next_check_in: Duration },
-    /// Paused and due: this batch checks the bucket's versioning. Other
-    /// batches wait meanwhile.
-    Check,
+    /// Paused and due: this batch checks the bucket's versioning, and every
+    /// other batch waits until the claim is dropped, however long the
+    /// store takes to answer (review of #883). Held for its `Drop` only.
+    Check(#[allow(dead_code)] CheckClaim<'a>),
+}
+
+/// The one check of a paused bucket in flight. Dropping it, when the check
+/// finished or the batch was cancelled, lets the next due batch check.
+#[derive(Debug)]
+pub(crate) struct CheckClaim<'a> {
+    pauses: &'a VersioningPauses,
+    bucket: String,
+}
+
+impl Drop for CheckClaim<'_> {
+    fn drop(&mut self) {
+        if let Some(pause) = self.pauses.paused.lock().unwrap().get_mut(&self.bucket) {
+            pause.checking = false;
+        }
+    }
 }
 
 /// After a check that found versioning still off.
@@ -263,20 +283,25 @@ impl Default for VersioningPauses {
 }
 
 impl VersioningPauses {
-    pub(crate) fn gate(&self, bucket: &str) -> Gate {
+    pub(crate) fn gate(&self, bucket: &str) -> Gate<'_> {
         let mut paused = self.paused.lock().unwrap();
         let Some(pause) = paused.get_mut(bucket) else {
             return Gate::Open;
         };
         let now = Instant::now();
-        if now < pause.next_check {
+        if pause.checking || now < pause.next_check {
             return Gate::Wait {
-                next_check_in: pause.next_check - now,
+                next_check_in: pause.next_check.saturating_duration_since(now),
             };
         }
-        // Claimed by this batch: the others wait for its answer.
+        // Claimed by this batch until its check finishes: the others wait
+        // for its answer, even past the backoff.
+        pause.checking = true;
         pause.next_check = now + pause.wait;
-        Gate::Check
+        Gate::Check(CheckClaim {
+            pauses: self,
+            bucket: bucket.to_owned(),
+        })
     }
 
     pub(crate) fn is_paused(&self, bucket: &str) -> bool {
@@ -298,6 +323,7 @@ impl VersioningPauses {
                 next_check: now + self.first,
                 wait: (self.first * 2).min(self.cap),
                 checks: 0,
+                checking: false,
             },
         );
         if let Some(mx) = telemetry::metrics() {
@@ -320,6 +346,7 @@ impl VersioningPauses {
                 next_check: now,
                 wait: self.first,
                 checks: 0,
+                checking: false,
             }
         });
         let wait = pause.wait;
@@ -410,4 +437,49 @@ pub(crate) fn paused_batch(bucket: &str, next_check_in: Duration) -> String {
          replayed; the bucket's versioning is checked again in {}s",
         next_check_in.as_secs().max(1)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review of #883: a check that takes longer than the backoff keeps the
+    /// claim, so a second batch due after the backoff still waits instead of
+    /// sending a second request; dropping the claim, when the check is done
+    /// or its batch is cancelled, lets the next due batch check.
+    #[test]
+    fn a_check_in_flight_keeps_every_other_batch_waiting_past_the_backoff() {
+        let pauses = VersioningPauses::default();
+        assert!(matches!(pauses.gate("b"), Gate::Open));
+        assert_eq!(pauses.pause("b"), Some(RECHECK_FIRST));
+        assert!(matches!(pauses.gate("b"), Gate::Wait { .. }));
+
+        pauses.make_due();
+        let first = pauses.gate("b");
+        assert!(matches!(first, Gate::Check(_)), "{first:?}");
+        // The store has not answered and the backoff has run out.
+        pauses.make_due();
+        assert!(
+            matches!(pauses.gate("b"), Gate::Wait { .. }),
+            "a second check while the first is in flight"
+        );
+        // Another bucket is not held up by it.
+        assert!(matches!(pauses.gate("other"), Gate::Open));
+
+        // The first batch is cancelled before its answer: the claim goes.
+        drop(first);
+        pauses.make_due();
+        let second = pauses.gate("b");
+        assert!(matches!(second, Gate::Check(_)), "{second:?}");
+        let off = pauses.still_off("b");
+        assert_eq!(off.checks, 1);
+        drop(second);
+        assert!(matches!(pauses.gate("b"), Gate::Wait { .. }), "not due yet");
+        pauses.make_due();
+        let third = pauses.gate("b");
+        assert!(matches!(third, Gate::Check(_)));
+        assert!(pauses.resume("b").is_some());
+        drop(third);
+        assert!(matches!(pauses.gate("b"), Gate::Open));
+    }
 }
