@@ -1326,6 +1326,23 @@ jobs:
         run: python -m unittest discover -s scripts/compat/tests -p 'test_format_registry.py' -v
       - name: format registry (every magic and version constant has an entry)
         run: python scripts/check-format-registry.py
+      # The list of config keys an older engine silently ignores, which a
+      # release's notes carry (#743). It reads the schema out of config.rs
+      # and the reference page, so its tests run against fixture refs and
+      # against this tree's config.rs: a change to either that the script no
+      # longer understands fails here, not on release day.
+      - name: the list of new config keys can fail (fixture refs and this tree's schema)
+        run: python -m unittest discover -s scripts/tests -p 'test_config_keys_since.py' -v
+
+      # The threat map (#732): every threat in docs/SECURITY_MODEL.md section 17
+      # names a control and a test, and each must still exist. It lives in this
+      # job, which runs on every pull request, and not in the docs workflow,
+      # because a renamed test in a crate must fail here and a docs path filter
+      # would never see it. Standard library only; it reads a few files.
+      - name: the threat map's tests can fail for each rot they exist to catch
+        run: python -m unittest discover -s scripts/tests -p 'test_check_threat_map.py' -v
+      - name: threat map (every named control and test exists)
+        run: python scripts/check-threat-map.py
 
   # Kafka was entirely untested in CI, which is how a P0 shipped: every read
   # returned zero records (a subscribe() per read forced a rebalance that
@@ -1501,6 +1518,7 @@ jobs:
             --test transport_conformance \
             --test live_s3_multipart_resume \
             --test live_s3_object_lock \
+            --test live_s3_sse \
             -- --ignored --test-threads=1
 
       # The S3 Object Lock profile end to end (#684): the engine refuses a
@@ -1508,7 +1526,9 @@ jobs:
       # object, manifest and verification receipt the store then reports
       # locked. And the verification receipt (#671): the method it names is
       # the one the real backend ran, store_checksum for a single PUT and
-      # read_back for a multipart object.
+      # read_back for a multipart object. And the anti-tamper suite (docs/
+      # reference/tamper-evidence.md): a bucket-write attacker against signed
+      # manifests, Object Lock, versioning, receipts and the coverage audit.
       - name: Run the live engine tests
         env:
           VTOP_TEST_S3_ENDPOINT: http://127.0.0.1:9000
@@ -1518,6 +1538,7 @@ jobs:
         run: |
           cargo test -p vtop-cli --locked --test live_s3_object_lock_engine \
             --test live_s3_verification_receipts \
+            --test live_s3_tamper \
             -- --ignored --test-threads=1
 
       # minio-init ran as a one-off `compose run` container, removed when it

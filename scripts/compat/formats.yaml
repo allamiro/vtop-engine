@@ -98,7 +98,7 @@ formats:
   - id: 7
     name: Progress markers (ledger, digests, manifests)
     class: B
-    marker: "none: optional fields"
+    marker: "none: optional fields (Kafka `topic_id`: ledger only, never in a manifest)"
     status: evolving; key names frozen
     at_1_0: stable
 
@@ -208,6 +208,7 @@ formats:
       - {file: crates/vtop-meta/src/storage/log.rs, name: CHUNK_MAGIC, value: 'b"VTOPMLG1"'}
       - {file: crates/vtop-meta/src/storage/log.rs, name: CHUNK_VERSION, value: '1'}
       - {file: crates/vtop-meta/src/storage/log.rs, name: ENTRY_MAGIC, value: 'b"VTOPMLE1"'}
+    fuzz: [meta_decode]
 
   - id: 16
     name: Metadata command set
@@ -269,6 +270,7 @@ formats:
           COMMAND_KIND_ATTEST_UNPROVEN_PROMOTION: 39
     one_way:
       - "raising the feature level (vtopctl meta enable-features): permanent; a voter older than the level refuses a log that holds its kinds"
+    fuzz: [meta_decode]
 
   - id: 17
     name: Metadata snapshot and state encoding
@@ -337,6 +339,7 @@ formats:
           CATEGORY_RANGE_REPLICA_SET: 20
           CATEGORY_NODE_VERSION: 21
           CATEGORY_PROMOTION_ATTESTATION: 22
+    fuzz: [meta_decode]
 
   - id: 18
     name: Metadata hard state, applied, purged, membership log id

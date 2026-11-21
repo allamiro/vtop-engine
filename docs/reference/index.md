@@ -54,6 +54,24 @@ The guides link here; these pages do not repeat the guides.
 
     [:octicons-arrow-right-24: Register](data-safety-register.md)
 
+-   **Component status**
+
+    ---
+
+    Production, preview or experimental for each component, with the
+    evidence and the criteria still open, as the maintainer confirmed them.
+
+    [:octicons-arrow-right-24: Component status](component-status.md)
+
+-   **Tamper evidence**
+
+    ---
+
+    Each anti-tamper feature, the tampering it catches, what it does not, and
+    the test that shows both.
+
+    [:octicons-arrow-right-24: Tamper evidence](tamper-evidence.md)
+
 -   **Protocol**
 
     ---
