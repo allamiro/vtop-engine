@@ -1467,7 +1467,11 @@ mod tests {
                 first[0].progress_start.clone(),
                 second[0].progress_start.clone(),
             );
-            let markers = if lower_first { [low, high] } else { [high, low] };
+            let markers = if lower_first {
+                [low, high]
+            } else {
+                [high, low]
+            };
             for result in spool.replay_from_markers(&markers).await {
                 result.unwrap();
             }

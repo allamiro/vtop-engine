@@ -13,9 +13,8 @@ use vtop_core::types::{ProgressMarker, SourceType, TelemetryFormat};
 fn start_of(marker: &ProgressMarker) -> i128 {
     match marker {
         ProgressMarker::Kafka { start_offset, .. } => i128::from(*start_offset),
-        ProgressMarker::File { start_byte, .. } | ProgressMarker::SyslogSpool { start_byte, .. } => {
-            i128::from(*start_byte)
-        }
+        ProgressMarker::File { start_byte, .. }
+        | ProgressMarker::SyslogSpool { start_byte, .. } => i128::from(*start_byte),
     }
 }
 
@@ -251,8 +250,9 @@ pub trait SourceAdapter: Send + Sync {
     ) -> Vec<Result<(), VtopError>> {
         let mut order: Vec<usize> = (0..markers.len()).collect();
         order.sort_by_key(|&i| std::cmp::Reverse(start_of(&markers[i])));
-        let mut results: Vec<Option<Result<(), VtopError>>> =
-            std::iter::repeat_with(|| None).take(markers.len()).collect();
+        let mut results: Vec<Option<Result<(), VtopError>>> = std::iter::repeat_with(|| None)
+            .take(markers.len())
+            .collect();
         for i in order {
             results[i] = Some(self.replay_from_marker(&markers[i]).await);
         }

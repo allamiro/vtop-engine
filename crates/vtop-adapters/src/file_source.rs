@@ -5508,12 +5508,19 @@ mod tests {
                 .read_batch_candidates(&src(&path), 1, 1 << 20, Duration::ZERO)
                 .await
                 .unwrap();
-            assert_eq!((lines(&first), lines(&second)), (vec!["a1".to_owned()], vec!["a2".to_owned()]));
+            assert_eq!(
+                (lines(&first), lines(&second)),
+                (vec!["a1".to_owned()], vec!["a2".to_owned()])
+            );
             let (low, high) = (
                 first[0].progress_start.clone(),
                 second[0].progress_start.clone(),
             );
-            let markers = if lower_first { [low, high] } else { [high, low] };
+            let markers = if lower_first {
+                [low, high]
+            } else {
+                [high, low]
+            };
             for result in fs.replay_from_markers(&markers).await {
                 result.unwrap();
             }

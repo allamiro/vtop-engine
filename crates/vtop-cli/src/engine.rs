@@ -7914,8 +7914,7 @@ mod tests {
             consumer_group: "g".into(),
             topic_id: None,
         };
-        let (lowest, covered) =
-            lowest_rewind_per_unit(vec![k(0, 40), k(1, 5), k(0, 30), k(0, 50)]);
+        let (lowest, covered) = lowest_rewind_per_unit(vec![k(0, 40), k(1, 5), k(0, 30), k(0, 50)]);
         assert_eq!(lowest, vec![k(0, 30), k(1, 5)]);
         assert_eq!(covered, vec![k(0, 40), k(0, 50)]);
     }
