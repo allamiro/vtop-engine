@@ -8294,10 +8294,12 @@ mod tests {
     #[tokio::test]
     async fn the_upload_slots_follow_the_width_held_permits_included() {
         let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "").unwrap();
         let mut cfg = file_config(
             dir.path().join("work").to_str().unwrap(),
             "sqlite::memory:",
-            vec![],
+            vec![input.to_string_lossy().into_owned()],
             "mock",
         );
         cfg.batching.max_concurrent_batches = 4;
@@ -8341,7 +8343,10 @@ mod tests {
             "the window waits at the gate"
         );
         let held_by_tasks = Arc::strong_count(&store);
-        assert!(held_by_tasks > 2, "the batch task holds the store: {held_by_tasks}");
+        assert!(
+            held_by_tasks > 2,
+            "the batch task holds the store: {held_by_tasks}"
+        );
         drop(engine);
         for _ in 0..100 {
             if Arc::strong_count(&store) == 1 {
