@@ -1936,10 +1936,11 @@ impl Collector for ServerCollector {
 // Listener connection caps
 // ---------------------------------------------------------------------------
 
-/// Connections a listener closed at accept because its cap was reached
-/// (#732: M6, R7), by listener.
+/// Connections a capped listener closed (#732: M6, R7), by listener and why.
 ///
-/// `plane` is a closed set: `meta_peer` and `meta_admin` on a metadata node,
+/// `reason` is `capacity` (closed at accept, the cap was reached) or
+/// `handshake_timeout` (no first request within the handshake deadline, so
+/// a silent socket cannot keep its slot). `plane` is a closed set: `meta_peer` and `meta_admin` on a metadata node,
 /// `replica` on a data node. Any increase means a peer opened more
 /// connections than the node's `max_*_connections` allows: legitimate load
 /// that needs a higher cap, or a flood.
@@ -1954,9 +1955,10 @@ impl ConnectionLimitCollector {
             limits,
             refused: CounterFamily::new(
                 "listener_connections_refused_total",
-                "Connections closed at accept because the listener already held its \
-                 max_*_connections, by listener",
-                &["plane"],
+                "Connections a capped listener closed, by listener and why: capacity (closed at \
+                 accept, the listener already held its max_*_connections) or handshake_timeout \
+                 (no first request within the handshake deadline)",
+                &["plane", "reason"],
             )?,
         })
     }
@@ -1972,11 +1974,15 @@ impl Collector for ConnectionLimitCollector {
             .limits
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        vec![self.refused.family(
-            limits
-                .iter()
-                .map(|limit| (vec![limit.label()], limit.refused_total())),
-        )]
+        vec![self.refused.family(limits.iter().flat_map(|limit| {
+            [
+                (vec![limit.label(), "capacity"], limit.refused_total()),
+                (
+                    vec![limit.label(), "handshake_timeout"],
+                    limit.handshake_timeouts_total(),
+                ),
+            ]
+        }))]
     }
 }
 
@@ -3454,15 +3460,27 @@ mod tests {
         observability.watch_connection_limit(Arc::new(ConnectionLimit::replica(1)));
         let text = scrape(&observability.registry);
         assert!(
-            text.contains(r#"vtop_listener_connections_refused_total{plane="meta_peer"} 2"#),
+            text.contains(
+                r#"vtop_listener_connections_refused_total{plane="meta_peer",reason="handshake_timeout"} 0"#
+            ),
             "{text}"
         );
         assert!(
-            text.contains(r#"vtop_listener_connections_refused_total{plane="meta_admin"} 0"#),
+            text.contains(
+                r#"vtop_listener_connections_refused_total{plane="meta_peer",reason="capacity"} 2"#
+            ),
             "{text}"
         );
         assert!(
-            text.contains(r#"vtop_listener_connections_refused_total{plane="replica"} 0"#),
+            text.contains(
+                r#"vtop_listener_connections_refused_total{plane="meta_admin",reason="capacity"} 0"#
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                r#"vtop_listener_connections_refused_total{plane="replica",reason="capacity"} 0"#
+            ),
             "{text}"
         );
     }

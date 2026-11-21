@@ -236,7 +236,21 @@ impl AdminServer {
     /// [`DEFAULT_MAX_ADMIN_CONNECTIONS`]. A connection over the cap is closed
     /// at accept and counted on [`AdminServer::connection_limit`].
     pub fn with_max_connections(mut self, max: usize) -> Self {
-        self.limit = Arc::new(ConnectionLimit::meta_admin(max));
+        self.limit = Arc::new(
+            ConnectionLimit::meta_admin(max)
+                .with_handshake_deadline(self.limit.handshake_deadline()),
+        );
+        self
+    }
+
+    /// Close a connection that has not sent its first request within
+    /// `deadline` of accept (default
+    /// [`super::limit::DEFAULT_HANDSHAKE_DEADLINE`]), so a silent socket
+    /// cannot hold a slot.
+    pub fn with_handshake_deadline(mut self, deadline: std::time::Duration) -> Self {
+        self.limit = Arc::new(
+            ConnectionLimit::meta_admin(self.limit.max()).with_handshake_deadline(deadline),
+        );
         self
     }
 
@@ -278,9 +292,11 @@ impl AdminServer {
             let acceptor = self.acceptor.clone();
             let handler = Arc::clone(&self.handler);
             let authorizer = Arc::clone(&self.authorizer);
+            let limit = Arc::clone(&self.limit);
             tokio::spawn(async move {
                 let _slot = slot;
-                let _ = serve_admin_connection(acceptor, tcp, handler, authorizer).await;
+                let _ =
+                    serve_admin_connection(acceptor, tcp, handler, authorizer, &limit, peer).await;
             });
         }
     }
@@ -291,25 +307,38 @@ async fn serve_admin_connection(
     tcp: TcpStream,
     handler: Arc<dyn AdminHandler>,
     authorizer: Arc<AdminAuthorizer>,
+    limit: &ConnectionLimit,
+    peer: SocketAddr,
 ) -> TransportResult<()> {
-    // Judged before the handshake or the first frame (#294 slice 6): a peer
-    // speaking the other transport is refused by name instead of failing as
-    // a bad magic here and a reset there.
-    if let DialectVerdict::Refused(message) =
-        judge_dialect(&tcp, "admin", "admin_transport", acceptor.is_some()).await?
-    {
-        return Err(TransportError::CrossMode(message));
-    }
-    let mut stream = match acceptor {
-        Some(acceptor) => MaybeTls::Tls(Box::new(
-            acceptor
-                .accept(tcp)
-                .await
-                .map_err(|error| TransportError::Tls(format!("admin accept: {error}")))?
-                .into(),
-        )),
-        None => MaybeTls::Plain(tcp),
+    // One deadline from accept to the first request (#732): the connection
+    // holds a slot, and one that never speaks must not hold it forever.
+    let deadline = tokio::time::Instant::now() + limit.handshake_deadline();
+    let established = tokio::time::timeout_at(deadline, async {
+        // Judged before the handshake or the first frame (#294 slice 6): a
+        // peer speaking the other transport is refused by name instead of
+        // failing as a bad magic here and a reset there.
+        if let DialectVerdict::Refused(message) =
+            judge_dialect(&tcp, "admin", "admin_transport", acceptor.is_some()).await?
+        {
+            return Err(TransportError::CrossMode(message));
+        }
+        Ok(match acceptor {
+            Some(acceptor) => MaybeTls::Tls(Box::new(
+                acceptor
+                    .accept(tcp)
+                    .await
+                    .map_err(|error| TransportError::Tls(format!("admin accept: {error}")))?
+                    .into(),
+            )),
+            None => MaybeTls::Plain(tcp),
+        })
+    })
+    .await;
+    let Ok(established) = established else {
+        limit.handshake_expired(peer);
+        return Ok(());
     };
+    let mut stream = established?;
     // Identity is established once, from the certificate the handshake already
     // verified, and is fixed for the connection's lifetime. Deriving it
     // per-frame would invite a caller to influence it through frame content;
@@ -336,8 +365,20 @@ async fn serve_admin_connection(
     // Warned once per connection (#694): the audit records of its writes
     // name no actor, and the operator should know why.
     let mut warned_anonymous = false;
+    let mut first = true;
     loop {
-        let frame = match read_frame(&mut stream).await {
+        let read = if std::mem::take(&mut first) {
+            match tokio::time::timeout_at(deadline, read_frame(&mut stream)).await {
+                Ok(read) => read,
+                Err(_) => {
+                    limit.handshake_expired(peer);
+                    return Ok(());
+                }
+            }
+        } else {
+            read_frame(&mut stream).await
+        };
+        let frame = match read {
             Ok(frame) => frame,
             Err(TransportError::Closed) => return Ok(()),
             Err(error) => return Err(error),
@@ -1986,6 +2027,28 @@ mod tests {
         task.abort();
     }
 
+    /// Review of #732: a connection that sends nothing loses its slot at
+    /// the handshake deadline, so silent sockets cannot lock the plane out.
+    #[tokio::test]
+    async fn a_silent_admin_connection_is_closed_at_the_handshake_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = AdminServer::plaintext(
+            Arc::new(CountingHandler::default()) as Arc<dyn AdminHandler>,
+            AdminAuthorizer::permissive(),
+        )
+        .expect("a permissive plaintext endpoint is allowed")
+        .with_max_connections(1)
+        .with_handshake_deadline(Duration::from_millis(200));
+        let limit = server.connection_limit();
+        let task = tokio::spawn(server.serve(listener));
+        crate::transport::limit::probe::a_silent_connection_loses_its_slot_at_the_deadline(
+            addr, &limit,
+        )
+        .await;
+        task.abort();
+    }
+
     #[derive(Default)]
     struct CountingHandler {
         proposals: AtomicUsize,
@@ -2764,6 +2827,8 @@ mod tests {
             tcp,
             Arc::clone(&handler),
             Arc::new(AdminAuthorizer::permissive()),
+            &ConnectionLimit::meta_admin(1),
+            "127.0.0.1:9".parse().unwrap(),
         )
         .await
         .unwrap_err();
@@ -2785,6 +2850,8 @@ mod tests {
             tcp,
             handler,
             Arc::new(AdminAuthorizer::permissive()),
+            &ConnectionLimit::meta_admin(1),
+            "127.0.0.1:9".parse().unwrap(),
         )
         .await
         .unwrap_err();

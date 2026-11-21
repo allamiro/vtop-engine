@@ -126,7 +126,7 @@ each add the same delta and leave the export permanently above its source.
 | Metric | Type | Meaning |
 |---|---|---|
 | `vtop_node_info{role,node_id}` | gauge | Always 1; identifies the process. |
-| `vtop_listener_connections_refused_total{plane}` | counter | Connections closed at accept because the listener already held its cap (#732): `meta_peer` (`max_peer_connections`, default 256) and `meta_admin` (`max_admin_connections`, default 1024) on a metadata node, `replica` (`max_replica_connections`, default 256) on a data node that serves the replica plane. Open connections are not touched; a rate-limited WARN names the peer and the key. |
+| `vtop_listener_connections_refused_total{plane,reason}` | counter | Connections a capped listener closed (#732). `plane`: `meta_peer` (`max_peer_connections`, default 256) and `meta_admin` (`max_admin_connections`, default 1024) on a metadata node, `replica` (`max_replica_connections`, default 256) on a data node that serves the replica plane. `reason`: `capacity`, closed at accept because the cap was reached (open connections are not touched); `handshake_timeout`, closed because it sent no first request within 10 s of accept, so a silent socket cannot keep its slot. A rate-limited WARN names the peer and the key. |
 
 ### Metadata nodes
 

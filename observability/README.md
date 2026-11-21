@@ -232,11 +232,14 @@ is exported from the first scrape at zero:
 The metadata node's peer and admin listeners, and a data node's replica
 listener, each hold at most a configured number of connections at once (#732).
 A connection over the cap is closed at accept, before its TLS handshake;
-connections already open are not touched. Each one is counted in
-`vtop_listener_connections_refused_total{plane}`, and a WARN line says which
-listener refused whom and which key raises the cap, at most once per 10
-seconds per listener with the number suppressed since. `plane` is a fixed set,
-exported at zero from the first scrape:
+connections already open are not touched. A connection that has not sent its
+first request 10 s after accept (dialect check, TLS handshake, first frame)
+is closed too, so silent sockets cannot keep the slots. Both are counted in
+`vtop_listener_connections_refused_total{plane,reason}`, with `reason`
+`capacity` or `handshake_timeout`. A WARN line says which listener closed
+whose connection, why, and which key raises the cap, at most once per 10
+seconds per listener and reason, with the number suppressed since. Both
+labels are fixed sets, exported at zero from the first scrape:
 
 | `plane` | Listener | Cap (default) |
 |---|---|---|
@@ -244,10 +247,12 @@ exported at zero from the first scrape:
 | `meta_admin` | The admin endpoint on a metadata node | `max_admin_connections` (1024) |
 | `replica` | Replication on a data node (follower, candidate, and a leader's status listener) | `max_replica_connections` (256) |
 
-Any increase means something opened more connections than the cap allows:
+Any increase of `reason="capacity"` means something opened more connections than the cap allows:
 legitimate load that needs a larger cap, or a flood from a peer holding a
 certificate the cluster's CA signed (or anything that reaches a plaintext
-plane). The WARN line names the peer's address.
+plane). An increase of `reason="handshake_timeout"` means something opens
+connections and sends nothing, or a peer too slow to finish a handshake in
+10 s. The WARN line names the peer's address.
 
 ### Archive scrub
 

@@ -209,11 +209,17 @@ with an endpoint set.
   (default 256) in the node config. A connection over the cap is closed at
   accept, before its TLS handshake, so a client holding a CA-signed
   certificate (or anything that reaches a plaintext plane) cannot open
-  connections until the node runs out of descriptors or memory. Each refusal
-  is counted in `vtop_listener_connections_refused_total{plane}` and named in
-  a rate-limited WARN. A cap bounds how many connections there are, not who
-  holds them: a flood can still take every slot and keep legitimate peers out
-  until it stops, which the counter and the WARN make visible.
+  connections until the node runs out of descriptors or memory. A connection
+  holds its slot from accept, so it has 10 s from accept to its first request
+  (dialect check, TLS handshake and first frame); one that misses that is
+  closed, and a client with no certificate cannot keep slots by opening
+  sockets and sending nothing. Each refusal is counted in
+  `vtop_listener_connections_refused_total{plane,reason}` (`capacity` or
+  `handshake_timeout`) and named in a rate-limited WARN. A cap bounds how many
+  connections there are, not who holds them: a flood can still take every
+  slot and keep legitimate peers out while it lasts, and an authenticated
+  client that sends its first request may hold its slot while it stays
+  connected. The counter and the WARN make both visible.
 - The observability endpoint (`/metrics`, `/healthz`, `/readyz`) **MAY** be
   served over TLS 1.3 (#294 slice 4): `observability.tls` in a node config, or
   `VTOP_METRICS_TLS_CERT`/`_KEY` for the engine. Server-only by default so

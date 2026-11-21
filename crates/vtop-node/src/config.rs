@@ -1085,7 +1085,7 @@ pub struct MetaNodeConfig {
     pub admin_transport: PlaneTransport,
     /// The most connections the peer listener holds open at once (#732,
     /// M6). One over is closed at accept, counted on
-    /// `vtop_listener_connections_refused_total{plane="meta_peer"}` and said
+    /// `vtop_listener_connections_refused_total{plane="meta_peer",reason="capacity"}` and said
     /// in a rate-limited warning. Must be at least 1.
     #[serde(default = "default_max_peer_connections")]
     pub max_peer_connections: usize,
@@ -1255,7 +1255,7 @@ pub struct DataNodeConfig {
     /// The most connections the replica listener holds open at once (#732,
     /// R7), as the native plane caps its sessions. One over is closed at
     /// accept, counted on
-    /// `vtop_listener_connections_refused_total{plane="replica"}` and said in
+    /// `vtop_listener_connections_refused_total{plane="replica",reason="capacity"}` and said in
     /// a rate-limited warning. Must be at least 1.
     #[serde(default = "default_max_replica_connections")]
     pub max_replica_connections: usize,
