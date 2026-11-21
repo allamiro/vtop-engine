@@ -301,11 +301,19 @@ impl LeaderLineage for crate::LocalBroker {
         // The group bound the range's appends were written under: a rebuilt
         // append may not exceed it, or the follower refuses it as the
         // oversized group no producer ever sent (#881 soak).
-        let max_group_bytes = state
-            .segment
-            .active()
-            .config_v2()
-            .map_or(u64::MAX, |config| config.max_group_bytes);
+        // And one group must fit one segment: the follower rolls once for a
+        // group that does not fit its tail, never splits it (review).
+        let (max_group_bytes, max_group_records) =
+            state
+                .segment
+                .active()
+                .config_v2()
+                .map_or((u64::MAX, u64::MAX), |config| {
+                    (
+                        config.max_group_bytes.min(config.max_segment_bytes),
+                        config.max_segment_records,
+                    )
+                });
         drop(state);
         drop(meta);
         let appends = appends_from_log(
@@ -314,7 +322,10 @@ impl LeaderLineage for crate::LocalBroker {
             self.node_id(),
             from,
             &fetched.records,
-            max_group_bytes,
+            GroupBound {
+                bytes: max_group_bytes,
+                records: max_group_records,
+            },
         );
         if appends.is_empty() {
             return CatchUpRead::Unavailable(format!(
@@ -323,6 +334,14 @@ impl LeaderLineage for crate::LocalBroker {
         }
         CatchUpRead::Appends(appends)
     }
+}
+
+/// The most one rebuilt append may carry: what one group of the range may
+/// hold and one segment can take, by encoded bytes and by records.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GroupBound {
+    pub(crate) bytes: u64,
+    pub(crate) records: u64,
 }
 
 /// The part of `appends` below `end`, where the queued stream resumes
@@ -358,16 +377,16 @@ pub(crate) fn appends_below(
 /// Stops at the first record no replica append can carry (a non-zero
 /// attribute byte: the wire record has none) or the first gap in offsets,
 /// so the result is always a contiguous run from `from`. A run is also cut
-/// where its encoded records would pass `max_group_bytes`, the bound every
-/// group in the range was appended under: consecutive produces from one
-/// producer are one run in the log but were never one group.
+/// where it would pass `bound`, the limits every group in the range was
+/// appended under: consecutive produces from one producer are one run in
+/// the log but were never one group.
 pub(crate) fn appends_from_log(
     range: &RangeIdentity,
     fencing_epoch: u64,
     leader_node_id: Uuid,
     from: u64,
     records: &[vtop_log::FetchedRecord],
-    max_group_bytes: u64,
+    bound: GroupBound,
 ) -> Vec<ReplicaAppendRequest> {
     let mut appends: Vec<ReplicaAppendRequest> = Vec::new();
     let mut group_bytes = 0_u64;
@@ -391,7 +410,10 @@ pub(crate) fn appends_from_log(
                     .first_sequence
                     .checked_add(last.records.len() as u64)
                     .is_some_and(|next| next == record.sequence)
-        }) && group_bytes.saturating_add(encoded) <= max_group_bytes;
+        }) && group_bytes.saturating_add(encoded) <= bound.bytes
+            && appends
+                .last()
+                .is_some_and(|last| (last.records.len() as u64) < bound.records);
         if extends {
             group_bytes = group_bytes.saturating_add(encoded);
             appends
@@ -2424,17 +2446,26 @@ impl FollowerDriver {
                     return Ok(());
                 }
             };
-            let appends = appends_below(appends, resume_at);
-            let Some(last) = appends.last() else {
+            let mut appends = appends_below(appends, resume_at);
+            if appends.is_empty() {
                 break;
-            };
-            let end = last.expected_base_offset + last.records.len() as u64;
-            let bytes = approx_batch_bytes(&appends);
-            if self.budget.try_charge_catch_up(bytes as u64).is_err() {
-                // The budget is shared with the retransmission buffer: the
-                // rest waits for the next session rather than overrun it.
-                return Ok(());
             }
+            // Within the catch-up budget, shared with the retransmission
+            // buffer (review): a frame that does not fit sheds its last
+            // appends until it does, so a small budget means smaller steps,
+            // not a follower that can never be caught up. Only a single
+            // append larger than the whole budget waits for the next session.
+            let mut bytes = approx_batch_bytes(&appends);
+            while self.budget.try_charge_catch_up(bytes as u64).is_err() {
+                if appends.len() <= 1 {
+                    return Ok(());
+                }
+                appends.truncate(appends.len().div_ceil(2));
+                bytes = approx_batch_bytes(&appends);
+            }
+            let end = appends.last().map_or(from, |last| {
+                last.expected_base_offset + last.records.len() as u64
+            });
             let outcome = self.send_catch_up(stream, next_request_id, appends).await;
             self.budget.release_catch_up(bytes as u64);
             let durable = outcome?;
@@ -3843,7 +3874,10 @@ mod tests {
             Uuid::from_u128(0xA1),
             0,
             &records,
-            3 * one,
+            GroupBound {
+                bytes: 3 * one,
+                records: u64::MAX,
+            },
         );
         assert_eq!(
             appends
@@ -3855,6 +3889,25 @@ mod tests {
         for append in &appends {
             assert_eq!(append.first_sequence, append.expected_base_offset);
         }
+        // Review: by records too, since one group must fit one segment.
+        let by_records = appends_from_log(
+            &catch_up_range(),
+            4,
+            Uuid::from_u128(0xA1),
+            0,
+            &records,
+            GroupBound {
+                bytes: u64::MAX,
+                records: 4,
+            },
+        );
+        assert_eq!(
+            by_records
+                .iter()
+                .map(|append| append.records.len())
+                .collect::<Vec<_>>(),
+            vec![4, 4, 2]
+        );
     }
 
     /// #881 review (P2): a record bigger than one catch-up read's target, but
