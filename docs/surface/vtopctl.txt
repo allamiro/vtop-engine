@@ -20,6 +20,8 @@ vtopctl audit-coverage --check-storage flag
 vtopctl audit-coverage --config value=<CONFIG> required
 vtopctl audit-coverage --digest-dir value=<DIGEST_DIR>
 vtopctl audit-coverage --metrics-file value=<METRICS_FILE>
+vtopctl audit-coverage --orphans-after value=<ORPHANS_AFTER>
+vtopctl audit-coverage --orphans-limit value=<ORPHANS_LIMIT> default=200
 vtopctl discover
 vtopctl discover --config value=<CONFIG> required
 vtopctl list-batches
