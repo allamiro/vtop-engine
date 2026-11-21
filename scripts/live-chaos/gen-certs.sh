@@ -38,6 +38,8 @@ mint() { # mint <basename> <common-name>
   local base="$1" cn="$2"
   [[ -f "$base.pem" ]] && return 0
   openssl ecparam -name prime256v1 -genkey -noout -out "$base-key.pem" 2>/dev/null
+  # Owner-only: a node refuses a key other users can read (#732).
+  chmod 600 "$base-key.pem"
   openssl req -new -key "$base-key.pem" -subj "/CN=$cn" -out "$base.csr" 2>/dev/null
   openssl x509 -req -in "$base.csr" -CA ca.pem -CAkey ca-key.pem -CAcreateserial \
     -days 30 -sha256 -extfile leaf.ext -out "$base.pem" 2>/dev/null
@@ -55,5 +57,7 @@ done
 mint admin "vtop-admin"
 mint client "vtop-harness-client"
 
+# Keys minted by an earlier run, before nodes checked key permissions (#732).
+chmod 600 ./*-key.pem
 rm -f leaf.ext ca.srl
 echo "certs_ready dir=$PWD meta=${#META_IDS[@]} data=${#DATA_UUIDS[@]}"

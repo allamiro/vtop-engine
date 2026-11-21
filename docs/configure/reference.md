@@ -202,7 +202,7 @@ The Kafka releases the source is tested against are listed in
 | `topic_exclude_regex` | `^__.*` | Topics to skip. |
 | `auto_offset_reset` | `earliest` | Kafka `auto.offset.reset` for a partition with no committed offset. |
 | `enable_auto_commit` | `false` | Must be `false`; `true` is refused. Offsets are committed only after verification. |
-| `security_protocol` | - | Kafka `security.protocol`. |
+| `security_protocol` | - | Kafka `security.protocol`. Unset is librdkafka's `plaintext`. Unset, `plaintext` or `sasl_plaintext` with a bootstrap server that is not a loopback address is warned about on every start and by `vtopctl validate` (#732). |
 | `sasl_mechanism` | - | Kafka `sasl.mechanism`. GSSAPI needs a build with `--features kafka-gssapi`. |
 | `sasl_username` | - | Kafka `sasl.username`. |
 | `sasl_password_env` | - | Name of the environment variable holding the SASL password. |

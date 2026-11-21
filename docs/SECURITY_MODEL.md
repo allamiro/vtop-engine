@@ -72,6 +72,14 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normat
 ### TLS for Kafka
 
 - Connections to Kafka brokers **SHOULD** use TLS.
+- When `sources.kafka.security_protocol` is unset (librdkafka's default is
+  plaintext), `plaintext` or `sasl_plaintext`, and a bootstrap server is not a
+  loopback address, the engine warns on every start and `vtopctl validate`
+  reports it (#732): the records, and any SASL exchange, cross the network
+  unencrypted and the broker is not authenticated. The engine still connects;
+  set `security_protocol: ssl` or `sasl_ssl` with `ssl_ca_location`. A
+  hostname that resolves to loopback is not recognised as loopback, so it is
+  warned about.
 - Certificate validation **SHOULD** be enabled; disabling validation **MUST** be an explicit, logged, non-default configuration.
 
 ### TLS for S3-compatible endpoints
@@ -378,7 +386,8 @@ Additional guidance:
 - On Unix, the engine **MUST** refuse, before reading it, a secret or ledger file that group or other can write: a manifest MAC key file (`manifest.mac.keys[].file`), the `engine.state_store` secret file, the SQLite ledger and its `-wal` and `-shm` files, and the `VTOP_AUDIT_LOG` file (#733). No setting accepts such a file.
 - The engine **MUST** refuse such a file that other users can read, unless the directory holding it is owned by the engine's user and closed to group and other, or (for group read only) the file is a read-only Kubernetes Secret mount: reached through the kubelet's `..data` layout, on `tmpfs`, and not writable by the engine. The audit file may be group-readable. `security.allow_loose_secret_permissions: true` accepts the readable cases only; each file accepted that way **MUST** be announced by a WARN, `vtop_secret_file_permission_overrides_total` and an audit record (§10). `vtopctl validate` reports every such file at once. Recipes for external secret managers: [Secret files and their permissions](operate/secrets.md).
 - New SQLite ledgers and audit files are created with mode `0600`; the engine never changes the mode of an existing file.
-- Not yet checked: TLS private keys, and the files `vtop-node` reads. On platforms without Unix permission bits nothing is checked.
+- `vtop-node` **MUST** refuse, before reading it, a TLS private key named in its config (`tls.key`, `replica_tls.key`, `native_tls.key`, `lease.tls.key`, `observability.tls.key`, and a scenario client's `tls.key`) by the same rule (#732). A node reads no engine config, so no setting accepts a loose key. The Helm chart mounts keys at `0440` with `fsGroup`, which the Kubernetes Secret rule accepts.
+- Not yet checked: the other files `vtop-node` reads, and the engine's `VTOP_METRICS_TLS_KEY` and `vtopctl`'s `client_key`. On platforms without Unix permission bits nothing is checked.
 - Credentials **SHOULD NOT** be passed as plaintext command-line arguments where avoidable, since arguments may be visible to other processes.
 - The engine **SHOULD** support loading credentials from external secret managers without persisting them to disk.
 - Inline SQLite paths remain valid. PostgreSQL URLs **MUST** be referenced as `engine.state_store: { env: VTOP_STATE_STORE }` or `engine.state_store: { file: /run/secrets/vtop-state-store }`; inline PostgreSQL URLs are rejected before startup.
