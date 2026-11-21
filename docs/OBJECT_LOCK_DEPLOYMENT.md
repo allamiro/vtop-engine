@@ -259,6 +259,17 @@ loss rolled back. Budget for these objects, and size them with
 ([observability/README.md](../observability/README.md)). The startup WARN
 under `compliance` says so.
 
+`vtopctl audit-coverage` lists these objects (#774): the ones a failed,
+replay-required or superseded attempt uploaded and no committed row names,
+with a count and the recorded size per source, and the gauges
+`vtop_coverage_audit_unreferenced_objects` and
+`vtop_coverage_audit_unreferenced_object_bytes{source_type}` in its metrics
+file. It reads the ledger and the prune digests, makes no store request, and
+deletes nothing, so under Object Lock the list is what the retention is paid
+on. It cannot find an object whose ledger row a power loss rolled back: no
+row names it. See [Scrub and coverage
+audit](operate/scrub-and-audit.md#objects-no-committed-row-names).
+
 A replay that finds its object unlocked, its lock ended, in the other mode
 or without the configured legal hold writes one more locked object and
 leaves the old one (#709). The old one is unlocked or elapsed, so it can be
@@ -267,6 +278,12 @@ mode: a compliance lock stays until its date. A crash between that fresh
 object's upload and its ledger write, or a restart after a fallback whose
 manifest failed, writes one more; these are counted as `fallback_*` in
 `vtop_object_key_decisions_total`.
+
+A replay on a command backend (`awscli`, `minio`, `s3cmd`) adopts the object
+an earlier attempt uploaded when it verifies (#773), but those backends cannot
+run the profile (the configuration is refused), so adoption never applies to
+a locked bucket and changes nothing in the list above: under Object Lock only
+`s3_native` writes, and a replay there names its object by content as before.
 
 Incomplete multipart uploads are not objects and are not locked. The
 abandoned-session sweep and an `AbortIncompleteMultipartUpload` lifecycle rule

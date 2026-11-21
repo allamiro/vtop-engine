@@ -142,6 +142,54 @@ fn flushed_spans(log: &str) -> Option<usize> {
     })
 }
 
+/// What the child logged, at DEBUG, about its root spans and its export queue
+/// (#798). Positions are line numbers in the child's log. The order of the
+/// lines is the order of the events; two timestamps a microsecond apart, taken
+/// on different threads, cannot promise that.
+#[derive(Default)]
+struct Timeline {
+    /// The `batch` root spans that closed: their last handle dropped.
+    closed: Vec<usize>,
+    /// The `batch` spans the export queue took in.
+    queued: Vec<usize>,
+    /// Where the final flush began.
+    flush_started: Option<usize>,
+    /// Every one of those lines with its timestamp, for the failure message.
+    rendered: String,
+}
+
+fn timeline(log: &str) -> Timeline {
+    let mut t = Timeline::default();
+    for (position, line) in log.lines().enumerate() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let message = value["fields"]["message"].as_str().unwrap_or_default();
+        let span = value["fields"]["span"].as_str().unwrap_or_default();
+        let what = match (message, span) {
+            ("root span closed", "batch") => {
+                t.closed.push(position);
+                "batch span CLOSED"
+            }
+            ("span queued for export", "batch") => {
+                t.queued.push(position);
+                "batch span queued"
+            }
+            (m, _) if m.starts_with("OpenTelemetry trace flush starting") => {
+                t.flush_started = Some(position);
+                "final flush STARTED"
+            }
+            (m, _) if m.starts_with("OpenTelemetry trace flush: flushed") => "final flush DONE",
+            _ => continue,
+        };
+        t.rendered.push_str(&format!(
+            "  line {position:>3} {} {what}\n",
+            value["timestamp"].as_str().unwrap_or("?")
+        ));
+    }
+    t
+}
+
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
@@ -268,6 +316,9 @@ async fn export_on_sends_traces_and_metrics_and_says_so() {
             ("OTEL_EXPORTER_OTLP_ENDPOINT", base.as_str()),
             ("OTEL_EXPORTER_OTLP_HEADERS", header.as_str()),
             ("VTOP_LOG_FORMAT", "json"),
+            // The lifecycle lines of #798: when each root span opened and
+            // closed, and when the final flush began.
+            ("RUST_LOG", "info,vtop_observe::otel=debug"),
         ],
     )
     .await;
@@ -329,6 +380,34 @@ async fn export_on_sends_traces_and_metrics_and_says_so() {
         2,
         "the engine did not commit two batches: {stdout}; vtopctl said: {log}"
     );
+    // The next stage, from the child's own lifecycle lines: both batch spans
+    // must have closed, and been taken in by the export queue, before the
+    // final flush began. A span that closes after it is never exported, and
+    // this says so, with the timeline, where the collector's count alone
+    // only says a span is missing (#798).
+    let timeline = timeline(&log);
+    let flush_started = timeline
+        .flush_started
+        .unwrap_or_else(|| panic!("the child never began its final flush; vtopctl said: {log}"));
+    assert_eq!(
+        timeline.closed.len(),
+        2,
+        "a batch span was still open when the child exited (its last handle was never dropped):\n\
+         {}vtopctl said: {log}",
+        timeline.rendered
+    );
+    assert!(
+        timeline.closed.iter().all(|&at| at < flush_started),
+        "a batch span closed after the final flush began, so it could not be exported:\n{}\
+         vtopctl said: {log}",
+        timeline.rendered
+    );
+    assert_eq!(
+        timeline.queued.len(),
+        2,
+        "a batch span closed but the export queue never took it in:\n{}vtopctl said: {log}",
+        timeline.rendered
+    );
     // At least, not exactly: the flush line counts only what the shutdown
     // flush sent, and a scheduled export (OTEL_BSP_SCHEDULE_DELAY, 5 s after
     // the first span) on a slow runner sends spans before it that the
@@ -349,8 +428,9 @@ async fn export_on_sends_traces_and_metrics_and_says_so() {
         traced.len(),
         2,
         "two batch spans expected: {traced:?} among {decoded} spans in {} trace requests; \
-         vtopctl said: {log}",
-        traces.len()
+         the child's timeline:\n{}vtopctl said: {log}",
+        traces.len(),
+        timeline.rendered
     );
     let mut sealed = 0;
     for line in log.lines().filter(|l| l.contains("batch_sealed")) {
