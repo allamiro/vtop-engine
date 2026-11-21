@@ -1836,6 +1836,12 @@ async fn a_partition_added_while_the_topic_is_read_is_read_from_its_start() {
 /// and skipped what was written to it since its first assign, and nothing
 /// recovered it: its new start was the new end. It must be pinned where it
 /// started first.
+///
+/// The test pauses quiet behind the adapter, as a dead fetcher looks, and the
+/// renewal must clear that pause. It used to fail now and then with quiet
+/// assigned at the right offset and paused: the adapter resumed after the
+/// assign, and librdkafka discarded the resume as older than the assign's
+/// fetch start. The adapter now resumes before it assigns.
 #[tokio::test]
 #[ignore = "requires a running Kafka broker"]
 async fn renewing_the_assignment_does_not_move_a_partition_that_started_at_the_end() {
@@ -1883,15 +1889,50 @@ async fn renewing_the_assignment_does_not_move_a_partition_that_started_at_the_e
         kafka_source(&extra),
     ];
     let started = std::time::Instant::now();
+    // The renewal: the first pass with `extra` listed assigns again. Where
+    // it assigned quiet decides between the two ways this can fail: past
+    // the three records is a skip (they are never read), at the first of
+    // them is a partition that has not delivered yet.
     let mut quiet_read = 0;
-    while quiet_read < 3 && started.elapsed() < std::time::Duration::from_secs(30) {
+    let mut renewed = false;
+    let mut assigned_at = None;
+    while !renewed && quiet_read == 0 {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "the assignment was not renewed with the new topic within 30 s"
+        );
+        quiet_read += read_pass(&mut adapter, &sources).await[1];
+        // `extra` is assigned at its beginning, so a known offset for it
+        // says this pass renewed the assignment.
+        if adapter.next_offset_expected(&extra, 0).is_some() {
+            renewed = true;
+            assigned_at = adapter.next_offset_expected(&quiet, 0);
+        }
+    }
+    if quiet_read == 0 {
+        assert_eq!(
+            assigned_at,
+            Some(0),
+            "renewing the assignment assigned quiet at {}, not at the three records written \
+             to it since it started at the end of the log (offsets 0 to 2): they would never \
+             be read",
+            assigned_at.map_or("the end of the log (no pinned offset)".to_string(), |at| {
+                format!("offset {at}")
+            })
+        );
+    }
+    // Assigned at the records, they must arrive, however slowly the broker
+    // starts the new fetcher.
+    while quiet_read < 3 && started.elapsed() < std::time::Duration::from_secs(60) {
         quiet_read += read_pass(&mut adapter, &sources).await[1];
     }
     assert_eq!(
         quiet_read,
         3,
-        "renewing the assignment skipped records written to a partition that started at \
-         the end of the log (within {:?}; stall recoveries: {})",
+        "quiet was assigned at offset 0, at the three records written to it, so nothing \
+         was skipped, but it delivered {quiet_read} of them within {:?}: its fetcher did \
+         not run after the renewal (a pause left in place, or a fetcher that never \
+         started; stall recoveries: {})",
         started.elapsed(),
         adapter.stall_recoveries()
     );
