@@ -5,9 +5,11 @@
 # replaced by a new pod with an empty work directory; see
 # docs/deploy/engine-host-loss.md for what happens then.
 #
-# The image is the release image (its vtopctl has the postgres feature from
-# the release after v0.10.2). The ConfigMap holds config.yaml; the Secret
-# holds VTOP_STATE_STORE and the S3 credentials.
+# The image must have a vtopctl built with the `postgres` feature. Release
+# images up to and including v0.10.2 do not (docs/install/container.md); set
+# VERSION to a later release, or build docker/Dockerfile from a tree that
+# enables it, and push it to your registry. The ConfigMap holds config.yaml;
+# the Secret holds VTOP_STATE_STORE and the S3 credentials.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -36,7 +38,9 @@ spec:
         fsGroup: 10001
       containers:
         - name: engine
-          image: ghcr.io/allamiro/vtop-engine:0.10.2
+          # VERSION: see the header. v0.10.2 and earlier cannot open a
+          # PostgreSQL ledger.
+          image: ghcr.io/allamiro/vtop-engine:VERSION
           args: ["run"]
           env:
             - name: VTOP_CONFIG

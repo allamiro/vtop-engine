@@ -97,6 +97,9 @@ Two examples that keep to one engine and restart it on failure:
   a Deployment with `replicas: 1` and `strategy: Recreate`, liveness and
   readiness probes on `/healthz` and `/readyz`, requests and limits, and the
   work directory as an `emptyDir`, so a replacement pod is the standby above.
+  Its image tag is a placeholder: the engine needs a `vtopctl` built with the
+  `postgres` feature, which release images up to and including v0.10.2 do
+  not have ([Container image](../install/container.md)).
 
 Neither is deployed by CI; they are documented starting points, and the
 Helm chart deploys the cluster plane, not the engine.
