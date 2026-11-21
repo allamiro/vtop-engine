@@ -58,6 +58,7 @@ async fn backend(endpoint: String) -> S3NativeBackend {
         request_timeout_seconds: 5,
         request_min_bytes_per_second: 4 * 1024,
         object_lock: None,
+        server_side_encryption: None,
         max_egress_bytes_per_second: None,
     })
     .await
