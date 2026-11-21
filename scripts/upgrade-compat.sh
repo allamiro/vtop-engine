@@ -83,7 +83,7 @@ cleanup() {
 trap cleanup EXIT
 
 CERTS="$WORKDIR/certs"
-"$SCRIPT_DIR/live-chaos/gen-certs.sh" "$CERTS" 1 -- "$NODE_UUID" "$FOLLOWER_UUID" > /dev/null
+NATIVE_CLIENT_CN="$PRINCIPAL_ID" "$SCRIPT_DIR/live-chaos/gen-certs.sh" "$CERTS" 1 -- "$NODE_UUID" "$FOLLOWER_UUID" > /dev/null
 
 DATA_DIR="$WORKDIR/data"
 FOLLOWER_DIR="$WORKDIR/data-follower"
@@ -180,7 +180,7 @@ CLIENT_CFG="$WORKDIR/client.yaml"
   echo "  range_id: $RANGE_ID"
   echo "  range_generation: 0"
   echo "server_name: \"localhost\""
-  echo "tls: { ca: $CERTS/ca.pem, cert: $CERTS/data-1.pem, key: $CERTS/data-1-key.pem }"
+  echo "tls: { ca: $CERTS/ca.pem, cert: $CERTS/client.pem, key: $CERTS/client-key.pem }"
 } > "$CLIENT_CFG"
 
 start_node() { # <binary> <config> <log-name> -> pid

@@ -343,24 +343,57 @@ pub struct CommittedCursor {
     pub observed_ctime: Option<String>,
 }
 
-/// Where the ledger says a Kafka partition resumes, for one consumer group
-/// (#614): the end offset of the NEWEST committed batch read from it.
+/// Where the ledger says a Kafka partition resumes, for one consumer group and
+/// one incarnation of the topic (#614): the highest end offset any committed
+/// batch of that incarnation reached.
 ///
 /// The group's committed offset on the broker cannot answer this. The adapter
 /// reads with `assign()`, so its commits carry no group generation, and Kafka
 /// accepts one from an engine whose claim has already moved on - backwards or
 /// forwards. The ledger's commit is fenced (#557); this is what it recorded.
+///
+/// A (topic, partition, consumer group) has one answer per incarnation the
+/// ledger holds rows of, because the end offsets of two incarnations are
+/// unrelated: a topic deleted and created again under the same name numbers
+/// its offsets from zero, and the old log's highest end, taken as the new
+/// log's, would make the restart skip the new log's first records. The
+/// incarnation is the topic id the rows' markers carry; the adapter knows the
+/// current one and picks the answer that belongs to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommittedKafkaOffset {
     pub topic: String,
     pub partition: i32,
     pub consumer_group: String,
-    /// The newest committed batch's last offset; the partition resumes at the
-    /// one after it. Newest by `(created_at, batch_id)` - the order the windows
-    /// were read, and the row pruning keeps - not the highest: a topic that
-    /// was deleted and recreated starts its offsets again, and the old topic's
-    /// highest offset would skip the new one's first records.
+    /// The topic id of the rows this answer covers, or `None` for rows written
+    /// before the id was recorded (or by a broker that has none). Rows of an
+    /// unknown id are never compared with rows of a known one: whether they
+    /// are the same incarnation cannot be told.
+    pub topic_id: Option<String>,
+    /// The partition resumes at the offset after this one.
+    ///
+    /// For a known `topic_id`: the HIGHEST last offset of any committed batch
+    /// of that id, not the newest-created row's - unless two committed batches'
+    /// ranges of the id overlap, which means offsets
+    /// were reused (a log truncated by an unclean leader election keeps its
+    /// topic id), and then the NEWEST batch's last offset, so the replacement
+    /// records are read again and never skipped. Recovery can commit a window
+    /// created earlier above one created later (a damaged range re-read as a
+    /// new row while the window above it waited), and resuming from the newer,
+    /// lower row re-archives the range between.
+    ///
+    /// For an unknown `topic_id`: the newest committed batch's last offset,
+    /// newest by `(created_at, batch_id)` - the rule before the id existed. A
+    /// maximum across rows that may be of different incarnations is not safe.
     pub end_offset: i64,
+    /// The last offset of the newest-created committed row of the (topic,
+    /// partition, consumer group), on the answer of the incarnation that holds
+    /// that row, and `None` on the others. It is not `end_offset`, which for a
+    /// known id is the highest end of the id's rows: the adapter falls back to
+    /// this, as the ledger always did, when the broker does not give the
+    /// topic's current id, and a newest row ending below an older one of the
+    /// same id (a topic recreated while the adapter still held the old id)
+    /// must not resume at the older one's end.
+    pub newest_end: Option<i64>,
 }
 
 /// A `content_fingerprint` read out of a stored marker as JSON text. Anything
