@@ -184,12 +184,24 @@ POST_COMMITS="$(sample_metric "$(data_metrics_addr 0)" vtop_broker_group_commits
 (( POST_COMMITS > 0 )) || fail "the restarted leader sealed no group while the producers finished"
 log "after the restart the leader sealed $POST_COMMITS more group(s)"
 
+# POLLED, not read once (review): a quorum acknowledgement needs only one of
+# the two followers, so the other may still be catching up when the consumer
+# finishes. Each must reach every acknowledged record within the deadline.
 PROBE_CFG="$(emit_replica_probe_config)"
 for n in 1 2; do
-  STATUS="$("$VTOP_NODE" replica-status --client-config "$PROBE_CFG" --addr "$(replica_addr "$n")")"
-  LOCAL="${STATUS#*local_committed_offset=}"
-  LOCAL="${LOCAL%% *}"
-  [[ "$LOCAL" -ge "$RECORDS" ]] || fail "follower $n committed offset $LOCAL < $RECORDS acknowledged"
+  deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS))
+  while :; do
+    LOCAL=""
+    if STATUS="$("$VTOP_NODE" replica-status --client-config "$PROBE_CFG" \
+      --addr "$(replica_addr "$n")" 2>/dev/null)"; then
+      LOCAL="${STATUS#*local_committed_offset=}"
+      LOCAL="${LOCAL%% *}"
+      [[ "$LOCAL" =~ ^[0-9]+$ && "$LOCAL" -ge "$RECORDS" ]] && break
+    fi
+    [[ $SECONDS -lt $deadline ]] \
+      || fail "follower $n committed offset ${LOCAL:-unread} < $RECORDS acknowledged after ${PROGRESS_TIMEOUT_SECONDS}s"
+    sleep 0.2
+  done
 done
 log "both followers committed every one of the $RECORDS records: each acknowledgement was a quorum's"
 
