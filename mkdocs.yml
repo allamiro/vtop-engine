@@ -203,6 +203,7 @@ nav:
       - Known limitations: reference/limitations.md
       - Compatibility and upgrade policy: reference/compatibility.md
       - Data-safety register: reference/data-safety-register.md
+      - Tamper evidence: reference/tamper-evidence.md
       - Protocol (normative draft): VTOP_PROTOCOL_DRAFT.md
       - Design documents:
           - Architecture: ARCHITECTURE.md
