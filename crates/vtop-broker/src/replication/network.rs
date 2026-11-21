@@ -153,7 +153,47 @@ pub trait LeaderLineage: Send + Sync {
     /// `None` while this leader holds no live grant at the epoch it would
     /// fence at. May block briefly; the driver calls it off the runtime.
     fn leader_lineage(&self) -> Option<LeaderLineageSnapshot>;
+
+    /// Read this leader's own log from `from`, as appends a follower can
+    /// apply, for a follower whose gap the session's retransmission buffer
+    /// does not cover (#881). At most about `max_bytes` of record payload.
+    ///
+    /// The default reads nothing, which leaves such a follower exactly where
+    /// it was before log catch-up existed. May block briefly; the driver
+    /// calls it off the runtime.
+    fn read_catch_up(&self, from: u64, max_bytes: usize) -> CatchUpRead {
+        let _ = (from, max_bytes);
+        CatchUpRead::Unavailable("this leader cannot read its log for catch-up".to_owned())
+    }
 }
+
+/// What a leader's log holds for a follower behind it (#881). See
+/// [`LeaderLineage::read_catch_up`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CatchUpRead {
+    /// The next appends, contiguous from the offset asked for, at the
+    /// leader's current epoch.
+    Appends(Vec<ReplicaAppendRequest>),
+    /// The leader holds nothing at or above the offset asked for that is
+    /// not already durable on the follower.
+    UpToDate,
+    /// Retention reclaimed the offset asked for: the log starts at
+    /// `log_start`, so no append can close the gap. The follower needs a
+    /// rebuild (`vtopctl node repair`) — the catch-up horizon is this
+    /// leader's log start.
+    BelowLogStart { log_start: u64 },
+    /// Not readable now: no live grant at the epoch this leader serves, a
+    /// v1 range, or a storage error. The session goes on as it would have
+    /// without log catch-up.
+    Unavailable(String),
+}
+
+/// The most records one catch-up read returns, well inside one replica
+/// frame's record limit.
+const CATCH_UP_MAX_RECORDS: usize = 1_024;
+
+/// Payload bytes one catch-up read aims for, well inside one replica frame.
+const CATCH_UP_MAX_BYTES: usize = 1024 * 1024;
 
 impl LeaderLineage for crate::LocalBroker {
     fn leader_lineage(&self) -> Option<LeaderLineageSnapshot> {
@@ -187,6 +227,132 @@ impl LeaderLineage for crate::LocalBroker {
             epoch_starts: self.epoch_starts(),
         })
     }
+
+    fn read_catch_up(&self, from: u64, max_bytes: usize) -> CatchUpRead {
+        // A v1 frame stores the producer identity MERGED with its epoch, and
+        // the merge is a hash: the log no longer holds the identity a
+        // replica append must carry, so its records cannot be re-sent.
+        if self.segment_format() == crate::SegmentFormat::V1 {
+            return CatchUpRead::Unavailable(
+                "a v1 range stores producer identities merged with their epochs, so its records \
+                 cannot be re-sent as appends"
+                    .to_owned(),
+            );
+        }
+        // Lock order: the lease view, then the state, as on the produce
+        // path. Held through the read, so every record goes out under an
+        // epoch this broker served it under and no grant can move between
+        // the check and the read.
+        let meta = self.meta_fencing_epoch().lock();
+        let fencing_epoch = self.held_fencing_epoch();
+        if !meta.lease_active || meta.fencing_epoch != fencing_epoch {
+            return CatchUpRead::Unavailable(format!(
+                "this leader holds no live grant at epoch {fencing_epoch}"
+            ));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let log_start = state.segment.base_offset();
+        if from < log_start {
+            return CatchUpRead::BelowLogStart { log_start };
+        }
+        // Only what this leader holds durably: a follower is never handed a
+        // record its leader could still lose to a crash.
+        let committed = state.segment.committed_offset();
+        if from >= committed {
+            return CatchUpRead::UpToDate;
+        }
+        let fetched = match state.segment.fetch_through(
+            from,
+            max_bytes.max(1),
+            CATCH_UP_MAX_RECORDS,
+            committed,
+        ) {
+            Ok(fetched) => fetched,
+            Err(vtop_log::LogError::OffsetBelowRange { earliest, .. }) => {
+                return CatchUpRead::BelowLogStart {
+                    log_start: earliest,
+                }
+            }
+            Err(problem) => {
+                return CatchUpRead::Unavailable(format!("reading the log failed: {problem}"))
+            }
+        };
+        drop(state);
+        drop(meta);
+        let appends = appends_from_log(
+            self.range(),
+            fencing_epoch,
+            self.node_id(),
+            from,
+            &fetched.records,
+        );
+        if appends.is_empty() {
+            return CatchUpRead::Unavailable(format!(
+                "the record at offset {from} cannot be re-sent as a replica append"
+            ));
+        }
+        CatchUpRead::Appends(appends)
+    }
+}
+
+/// Group records read from a leader's log into the replica appends that
+/// wrote them: one request per run of records with the same producer, the
+/// same producer epoch, and consecutive sequences — the shape a produce
+/// replicates, so the follower validates them exactly as it validated the
+/// original (#881).
+///
+/// Stops at the first record no replica append can carry (a non-zero
+/// attribute byte: the wire record has none) or the first gap in offsets,
+/// so the result is always a contiguous run from `from`.
+pub(crate) fn appends_from_log(
+    range: &RangeIdentity,
+    fencing_epoch: u64,
+    leader_node_id: Uuid,
+    from: u64,
+    records: &[vtop_log::FetchedRecord],
+) -> Vec<ReplicaAppendRequest> {
+    let mut appends: Vec<ReplicaAppendRequest> = Vec::new();
+    for (index, fetched) in records.iter().enumerate() {
+        let record = &fetched.record;
+        if Some(fetched.offset) != from.checked_add(index as u64) || record.attributes != 0 {
+            break;
+        }
+        let wire = vtop_protocol::ProduceRecord {
+            timestamp_millis: record.timestamp_millis,
+            key: record.key.clone(),
+            value: record.value.clone(),
+        };
+        let extends = appends.last().is_some_and(|last| {
+            last.producer_id == record.producer_id
+                && last.producer_epoch == record.producer_epoch
+                && last
+                    .first_sequence
+                    .checked_add(last.records.len() as u64)
+                    .is_some_and(|next| next == record.sequence)
+        });
+        if extends {
+            appends
+                .last_mut()
+                .expect("checked above")
+                .records
+                .push(wire);
+        } else {
+            appends.push(ReplicaAppendRequest {
+                range: range.clone(),
+                fencing_epoch,
+                leader_node_id,
+                expected_base_offset: fetched.offset,
+                producer_id: record.producer_id,
+                producer_epoch: record.producer_epoch,
+                first_sequence: record.sequence,
+                records: vec![wire],
+            });
+        }
+    }
+    appends
 }
 
 /// Apply surface hosted by a follower peer server.
@@ -1112,6 +1278,7 @@ impl NetworkedReplicaSet {
                 node_id: config.node_id,
                 durable_offset: AtomicU64::new(0),
                 connected: AtomicBool::new(false),
+                below_catch_up_horizon: AtomicBool::new(false),
                 protocol: AtomicU16::new(0),
                 cmd_tx,
                 hwm_tx,
@@ -1198,6 +1365,17 @@ impl NetworkedReplicaSet {
     /// The replica protocol `node_id`'s latest session negotiated (#634):
     /// [`vtop_protocol::REPLICA_PROTOCOL_LEGACY`] for a follower that
     /// predates the handshake, 0 before any session opened.
+    /// Whether this follower is behind the leader's catch-up horizon — durable
+    /// only below the leader's log start, where retention has reclaimed the
+    /// records it lacks and no append can catch it up (#881). `None` for a
+    /// node that is not one of this set's followers.
+    pub fn follower_below_catch_up_horizon(&self, node_id: Uuid) -> Option<bool> {
+        self.followers
+            .iter()
+            .find(|follower| follower.node_id == node_id)
+            .map(|follower| follower.below_catch_up_horizon.load(Ordering::SeqCst))
+    }
+
     pub fn follower_protocol(&self, node_id: Uuid) -> Option<u16> {
         self.followers
             .iter()
@@ -1305,6 +1483,10 @@ struct FollowerChannel {
     node_id: Uuid,
     durable_offset: AtomicU64,
     connected: AtomicBool,
+    /// Set when the follower is durable only below this leader's log start,
+    /// where no append can reach it (#881); cleared once a session catches
+    /// it up. Exported as `vtop_broker_follower_below_catch_up_horizon`.
+    below_catch_up_horizon: AtomicBool,
     /// The replica protocol the current session negotiated (#634); 0 before
     /// the first session.
     protocol: AtomicU16,
@@ -1787,6 +1969,18 @@ impl FollowerDriver {
                     // actually re-sent, so every byte is charged exactly once
                     // while it occupies the retransmission buffer.
                     drain_retransmission_to_pending(pending, retransmission, retransmission_bytes);
+                    // What the buffer cannot cover, the log can (#881).
+                    if let Err(outcome) = self
+                        .catch_up_from_log(
+                            &mut stream,
+                            next_request_id,
+                            status.local_committed_offset,
+                            pending,
+                        )
+                        .await
+                    {
+                        return outcome;
+                    }
                 }
                 _ => return SessionOutcome::Disconnected,
             }
@@ -2062,6 +2256,184 @@ impl FollowerDriver {
                 );
                 false
             }
+        }
+    }
+
+    /// Close the gap between where the follower is and where this session's
+    /// stream resumes, from this leader's own log (#881).
+    ///
+    /// The retransmission buffer holds only what THIS session's driver sent.
+    /// A follower missing records this leader never streamed to it — a
+    /// deposed leader that missed what its successor received while it was
+    /// itself a follower, or any follower behind a leader whose buffer was
+    /// born empty at its promotion or restart — had no way back: every
+    /// append failed the follower's base-offset check, the session
+    /// re-synchronised, and the status probe found nothing in the buffer to
+    /// resend, for ever. Under retention it then fell below every peer's log
+    /// start and the range ran a replica short.
+    ///
+    /// Runs after the fence and the status probe, so the follower has
+    /// already reconciled against this leader (#641) and taken its history
+    /// (#640): the records sent here are filed under the epochs that wrote
+    /// them, exactly as retransmitted ones are, and a suffix it kept in
+    /// dispute (#611) is settled by the first append over it. Records go out
+    /// in order from the offset the follower reported, as appends at this
+    /// leader's epoch, each awaited before the next; the follower applies
+    /// them through its ordinary append path, so every check that path makes
+    /// still holds. Bounded by the follower's catch-up budget and by where
+    /// the queued stream begins, so it never resends what the stream will.
+    ///
+    /// A follower below this leader's log start cannot be caught up by any
+    /// append; it is flagged (`below_catch_up_horizon`) and needs a rebuild.
+    async fn catch_up_from_log(
+        &self,
+        stream: &mut MaybeTls<TcpStream>,
+        next_request_id: &mut u64,
+        follower_committed: u64,
+        pending: &VecDeque<FollowerCmd>,
+    ) -> Result<(), SessionOutcome> {
+        let Some(leader) = self.lineage.leader.get().and_then(std::sync::Weak::upgrade) else {
+            return Ok(());
+        };
+        // Where the queued stream resumes; everything below it is this
+        // read's to send, and nothing at or above it.
+        let resume_at = pending
+            .iter()
+            .filter_map(|cmd| match cmd {
+                FollowerCmd::Replicate { requests, .. } => {
+                    requests.first().map(|request| request.expected_base_offset)
+                }
+                FollowerCmd::DropConnection => None,
+            })
+            .min()
+            .unwrap_or(u64::MAX);
+        let mut from = follower_committed;
+        while from < resume_at {
+            let read = {
+                let leader = Arc::clone(&leader);
+                match timeout(
+                    self.flow.ack_timeout,
+                    tokio::task::spawn_blocking(move || {
+                        leader.read_catch_up(from, CATCH_UP_MAX_BYTES)
+                    }),
+                )
+                .await
+                {
+                    Ok(Ok(read)) => read,
+                    _ => return Ok(()),
+                }
+            };
+            let appends = match read {
+                CatchUpRead::Appends(appends) => appends,
+                CatchUpRead::UpToDate => break,
+                CatchUpRead::BelowLogStart { log_start } => {
+                    self.channel
+                        .below_catch_up_horizon
+                        .store(true, Ordering::SeqCst);
+                    warn_rate_limited(
+                        "replica-catch-up",
+                        &format!(
+                            "replica {} at {}: it is durable only through offset {from}, below \
+                             this leader's log start {log_start}; retention reclaimed the \
+                             records it lacks, so no append can catch it up and it stays out \
+                             of the quorum. Rebuild it from this leader (`vtopctl node \
+                             repair`); see the replica-below-catch-up-horizon runbook (#881)",
+                            self.channel.node_id, self.config.addr
+                        ),
+                    );
+                    return Ok(());
+                }
+                CatchUpRead::Unavailable(reason) => {
+                    warn_rate_limited(
+                        "replica-catch-up",
+                        &format!(
+                            "replica {} at {}: it is durable only through offset {from} and \
+                             this leader could not read its log to catch it up ({reason}); \
+                             retrying on the next session (#881)",
+                            self.channel.node_id, self.config.addr
+                        ),
+                    );
+                    return Ok(());
+                }
+            };
+            let appends: Vec<ReplicaAppendRequest> = appends
+                .into_iter()
+                .filter(|append| append.expected_base_offset < resume_at)
+                .collect();
+            let Some(last) = appends.last() else {
+                break;
+            };
+            let end = last.expected_base_offset + last.records.len() as u64;
+            let bytes = approx_batch_bytes(&appends);
+            if self.budget.try_charge_catch_up(bytes as u64).is_err() {
+                // The budget is shared with the retransmission buffer: the
+                // rest waits for the next session rather than overrun it.
+                return Ok(());
+            }
+            let outcome = self.send_catch_up(stream, next_request_id, appends).await;
+            self.budget.release_catch_up(bytes as u64);
+            let durable = outcome?;
+            self.channel
+                .durable_offset
+                .fetch_max(durable, Ordering::SeqCst);
+            if durable < end || durable <= from {
+                // Acked short of what was sent: the follower is not taking
+                // these, and resending them would only spin.
+                return Err(SessionOutcome::Disconnected);
+            }
+            from = durable;
+        }
+        self.channel
+            .below_catch_up_horizon
+            .store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// One catch-up frame, awaited: the follower's durable offset after it.
+    async fn send_catch_up(
+        &self,
+        stream: &mut MaybeTls<TcpStream>,
+        next_request_id: &mut u64,
+        appends: Vec<ReplicaAppendRequest>,
+    ) -> Result<u64, SessionOutcome> {
+        let request_id = *next_request_id;
+        *next_request_id = next_request_id.wrapping_add(1);
+        let message = if appends.len() == 1 {
+            Message::ReplicaAppendRequest(appends.into_iter().next().expect("one append"))
+        } else {
+            Message::ReplicaAppendBatchRequest(ReplicaAppendBatchRequest { requests: appends })
+        };
+        let frame = WireFrame {
+            request_id,
+            stream_id: 0,
+            message,
+        };
+        if write_frame(stream, &frame, REPLICA_LIMITS).await.is_err() {
+            return Err(SessionOutcome::Disconnected);
+        }
+        let reply = match timeout(self.flow.ack_timeout, read_frame(stream, REPLICA_LIMITS)).await {
+            Ok(Ok(Some(reply))) => reply,
+            _ => return Err(SessionOutcome::Disconnected),
+        };
+        if reply.request_id != request_id {
+            return Err(SessionOutcome::Disconnected);
+        }
+        match reply.message {
+            Message::ReplicaAppendResponse(ReplicaAppendResponse {
+                local_committed_offset,
+            }) => Ok(local_committed_offset),
+            Message::Error(ErrorResponse { code, message, .. }) => {
+                warn_rate_limited(
+                    "replica-catch-up",
+                    &format!(
+                        "replica {} at {}: it refused a catch-up append from this leader's \
+                         log ({code:?}: {message}); the session is retried (#881)",
+                        self.channel.node_id, self.config.addr
+                    ),
+                );
+                Err(SessionOutcome::Disconnected)
+            }
+            _ => Err(SessionOutcome::Disconnected),
         }
     }
 

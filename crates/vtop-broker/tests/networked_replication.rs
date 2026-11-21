@@ -23,7 +23,10 @@ use vtop_broker::replication::{
     ReplicaTlsMaterial,
 };
 use vtop_broker::{LocalBroker, MetaFencingEpoch, ProducerEpochJournal};
-use vtop_log::{ActiveSegment, KeyRange, RangeLineage, SegmentConfig, SegmentDescriptor};
+use vtop_log::{
+    ActiveSegment, KeyRange, RangeLineage, SegmentConfig, SegmentConfigV2, SegmentDescriptor,
+    SegmentDescriptorV2,
+};
 use vtop_protocol::{
     CommittedHwmUpdate, Durability as WireDurability, ErrorCode, ErrorResponse, Message,
     ProduceRecord, ProduceRequest, ProduceResponse, RangeIdentity, ReplicaAppendRequest,
@@ -106,6 +109,33 @@ fn open_segment(dir: &TempDir, segment_id: u128, range: &RangeIdentity) -> Activ
         dir.path().join("range.active"),
         descriptor,
         SegmentConfig::default(),
+    )
+    .unwrap()
+}
+
+/// The same range in the proof-carrying v2 format a data node creates: only
+/// a v2 log keeps each record's producer identity, which re-sending it as a
+/// replica append needs (#881).
+fn open_segment_v2(dir: &TempDir, segment_id: u128, range: &RangeIdentity) -> ActiveSegment {
+    let descriptor = SegmentDescriptorV2 {
+        segment_id: Uuid::from_u128(segment_id),
+        topic: range.topic.clone(),
+        topic_epoch: range.topic_epoch,
+        lineage: RangeLineage {
+            range_id: range.range_id,
+            generation: range.range_generation,
+            key_range: KeyRange::full(),
+            parents: Vec::new(),
+        },
+        base_offset: 0,
+        segment_generation: 0,
+        creation_node_id: LEADER,
+        creation_fencing_epoch: FENCING_EPOCH,
+    };
+    ActiveSegment::create_v2(
+        dir.path().join("range.active"),
+        descriptor,
+        SegmentConfigV2::default(),
     )
     .unwrap()
 }
@@ -248,6 +278,11 @@ struct NetworkHarness {
     followers: Vec<Arc<InProcessFollower>>,
     replica_set: Arc<NetworkedReplicaSet>,
     cluster_committed: ClusterCommittedOffset,
+    /// Kept so a test can stand up another leader against the same
+    /// followers.
+    follower_configs: Vec<NetworkFollowerConfig>,
+    leader_cert: CertBundle,
+    follower_certs: Vec<CertBundle>,
 }
 
 fn spawn_follower_server(
@@ -331,6 +366,31 @@ fn harness_at(
     followers_by_name: FollowerAddressing,
     gate_follower1: Option<Arc<AtomicBool>>,
 ) -> NetworkHarness {
+    harness_in_format(
+        epoch,
+        flow,
+        group_commit,
+        slow_follower2,
+        memory,
+        followers_by_name,
+        gate_follower1,
+        false,
+    )
+}
+
+/// [`harness_at`], with every replica's log in the v2 format when `v2`.
+#[allow(clippy::too_many_arguments)]
+fn harness_in_format(
+    epoch: u64,
+    flow: FlowControlConfig,
+    group_commit: Option<GroupCommitConfig>,
+    slow_follower2: Option<(Duration, Arc<AtomicBool>)>,
+    memory: Option<Arc<MemoryBudgetPool>>,
+    followers_by_name: FollowerAddressing,
+    gate_follower1: Option<Arc<AtomicBool>>,
+    v2: bool,
+) -> NetworkHarness {
+    let open = if v2 { open_segment_v2 } else { open_segment };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -346,7 +406,7 @@ fn harness_at(
     let f2_cert = cert_for_cn(&FOLLOWER_2.to_string());
 
     let leader_dir = tempfile::tempdir().unwrap();
-    let leader_segment = open_segment(&leader_dir, 0xD1, &range);
+    let leader_segment = open(&leader_dir, 0xD1, &range);
     let leader_epochs = ProducerEpochJournal::open(leader_dir.path().join("epochs")).unwrap();
 
     let mut dirs = vec![leader_dir];
@@ -359,7 +419,7 @@ fn harness_at(
         .enumerate()
     {
         let dir = tempfile::tempdir().unwrap();
-        let segment = open_segment(&dir, 0xE1 + index as u128, &range);
+        let segment = open(&dir, 0xE1 + index as u128, &range);
         let epochs = ProducerEpochJournal::open(dir.path().join("epochs")).unwrap();
         let follower = Arc::new(
             InProcessFollower::new(
@@ -424,7 +484,7 @@ fn harness_at(
     let replica_set = Arc::new(
         NetworkedReplicaSet::start_on_handle_with_memory(
             runtime.handle().clone(),
-            follower_configs,
+            follower_configs.clone(),
             leader_tls,
             flow,
             memory,
@@ -488,6 +548,9 @@ fn harness_at(
         followers,
         replica_set,
         cluster_committed,
+        follower_configs,
+        leader_cert,
+        follower_certs: vec![f1_cert, f2_cert],
     }
 }
 
@@ -1320,5 +1383,298 @@ fn a_follower_holding_records_without_a_history_gets_no_session() {
         (blind.next_offset(), blind.cluster_committed().get()),
         before,
         "the follower without a history took a record or a mark"
+    );
+}
+
+/// #881, finding 2 of the cluster soak. A replica is down while the range's
+/// leader commits records on itself and a second follower. That leader then
+/// dies, and the follower that received those records AS A FOLLOWER is
+/// promoted. The returning replica lacks records its new leader never
+/// streamed to it, so they are in no retransmission buffer anywhere: the new
+/// leader's driver was born empty.
+///
+/// Before log catch-up, its appends all failed the returning replica's
+/// base-offset check, the session re-synchronised, the status probe found
+/// nothing buffered to resend, and the replica stayed where it was for good
+/// — in the soak, until retention put it below every peer's log start and
+/// the range ran on two replicas. With only it and the new leader up, the
+/// range could not commit at all.
+///
+/// Invariant: after the new leader's fence (#641), the returning replica is
+/// caught up from the new leader's own log, holds exactly the leader's
+/// records, files them under the epochs that wrote them (#640), and counts
+/// toward the new epoch's quorum.
+#[test]
+fn a_follower_missing_records_its_new_leader_received_as_a_follower_catches_up_from_the_log() {
+    let flow = FlowControlConfig {
+        reconnect_backoff: Duration::from_millis(20),
+        ack_timeout: Duration::from_millis(500),
+        ..FlowControlConfig::default()
+    };
+    let down = Arc::new(AtomicBool::new(false));
+    let h = harness_in_format(
+        FENCING_EPOCH,
+        flow.clone(),
+        None,
+        None,
+        None,
+        FollowerAddressing::Resolved,
+        Some(Arc::clone(&down)),
+        true,
+    );
+    // Every replica keeps its epoch history, as a data node does.
+    let journals = tempfile::tempdir().unwrap();
+    h.leader.set_fencing_epoch_journal(
+        FencingEpochJournal::open(journals.path().join("leader")).unwrap(),
+    );
+    for (index, follower) in h.followers.iter().enumerate() {
+        follower.set_fencing_epoch_journal(
+            FencingEpochJournal::open(journals.path().join(format!("follower-{index}"))).unwrap(),
+        );
+    }
+    let returning = Arc::clone(&h.followers[0]);
+    let promoted = Arc::clone(&h.followers[1]);
+
+    for sequence in 0..5 {
+        let _ = produce_ok(&h.leader, h.range.clone(), sequence);
+    }
+    assert!(
+        await_within(Duration::from_secs(5), || {
+            returning.local_committed_offset() == 5 && promoted.local_committed_offset() == 5
+        }),
+        "precondition: both followers hold the first five records"
+    );
+
+    // Follower 1 is down while the leader commits 5..10 on itself and
+    // follower 2.
+    down.store(true, Ordering::SeqCst);
+    for sequence in 5..10 {
+        produce_at(&h.leader, h.range.clone(), FENCING_EPOCH, sequence);
+    }
+    assert!(
+        await_within(Duration::from_secs(5), || promoted.local_committed_offset()
+            == 10),
+        "precondition: follower 2 received 5..10 as a follower"
+    );
+    assert_eq!(returning.local_committed_offset(), 5);
+
+    // The leader dies. Its driver and its buffer die with it.
+    let NetworkHarness {
+        _dirs,
+        _runtime: runtime,
+        _server_abort,
+        range,
+        meta,
+        leader,
+        followers: _followers,
+        replica_set,
+        cluster_committed,
+        follower_configs,
+        leader_cert,
+        follower_certs,
+    } = h;
+    drop(leader);
+    drop(replica_set);
+
+    // Follower 2 is promoted at the next epoch: its log, and the epoch
+    // history it kept as a follower, become the new leader's. It dials
+    // follower 1, and an address nothing listens on stands for the dead
+    // leader, so the new epoch's quorum needs follower 1.
+    let epoch = FENCING_EPOCH + 1;
+    meta.set(epoch);
+    let placeholder = tempfile::tempdir().unwrap();
+    let (log, producer_epochs) = promoted
+        .swap_storage(
+            open_segment_v2(&placeholder, 0xF2, &range),
+            ProducerEpochJournal::open(placeholder.path().join("epochs")).unwrap(),
+        )
+        .unwrap();
+    let new_set = Arc::new(
+        NetworkedReplicaSet::start_on_handle_with_memory(
+            runtime.handle().clone(),
+            vec![
+                follower_configs[0].clone(),
+                NetworkFollowerConfig {
+                    node_id: LEADER,
+                    addr: "127.0.0.1:1".parse().unwrap(),
+                    host: None,
+                    server_name: "localhost".to_owned(),
+                },
+            ],
+            // Follower 1's server trusts the harness's leader identity; the
+            // test lends it to the promoted replica.
+            material(&leader_cert, &[&follower_certs[0], &follower_certs[1]]),
+            flow,
+            None,
+        )
+        .unwrap(),
+    );
+    let new_leader = Arc::new(
+        LocalBroker::with_replication(
+            log,
+            producer_epochs,
+            range.clone(),
+            // The epoch it served as a follower; the grant is adopted below,
+            // once its history is attached, as a promotion does.
+            FENCING_EPOCH,
+            meta.clone(),
+            LEADER,
+            Some(cluster_committed.clone()),
+            Some(new_set.clone() as Arc<dyn ReplicaSet>),
+        )
+        .unwrap(),
+    );
+    new_leader.set_fencing_epoch_journal(
+        FencingEpochJournal::open(journals.path().join("follower-1")).unwrap(),
+    );
+    assert!(new_leader.adopt_fencing_epoch(epoch));
+    assert!(new_set.reconcile_followers_against(
+        Arc::downgrade(&new_leader) as std::sync::Weak<dyn LeaderLineage>
+    ));
+
+    // Follower 1 returns, having adopted the new grant as a watcher would.
+    returning.adopt_fencing_epoch(epoch);
+    down.store(false, Ordering::SeqCst);
+
+    produce_at(&new_leader, range.clone(), epoch, 10);
+    let expected: Vec<String> = (0..11).map(|sequence| format!("v{sequence}")).collect();
+    let caught_up = await_within(Duration::from_secs(10), || {
+        returning.local_committed_offset() == 11 && served_values(&returning, 0) == expected
+    });
+    assert!(
+        caught_up,
+        "the returning replica must be caught up from the new leader's log: it holds {} \
+         record(s) (committed {}) and serves {:?}; the leader holds {:?}",
+        returning.next_offset(),
+        returning.local_committed_offset(),
+        served_values(&returning, 0),
+        expected
+    );
+    assert_eq!(
+        returning.epoch_starts(),
+        new_leader.epoch_starts(),
+        "the caught-up records must be filed under the epochs that wrote them (#640)"
+    );
+    assert_eq!(
+        new_set.follower_below_catch_up_horizon(FOLLOWER_1),
+        Some(false)
+    );
+}
+
+/// #881, the other half: a follower durable only BELOW its leader's log
+/// start. Retention reclaimed the records it lacks, so no append can reach
+/// it, and log catch-up must say so rather than spin. The leader here stands
+/// for one whose retention moved its log start to 10 while follower 1, down,
+/// stayed at 5.
+///
+/// Invariant: the leader flags the follower as behind its catch-up horizon
+/// (`vtop_broker_follower_below_catch_up_horizon`), sends it nothing it
+/// cannot apply, and the follower's log is untouched.
+#[test]
+fn a_follower_below_the_leaders_log_start_is_flagged_behind_the_catch_up_horizon() {
+    let flow = FlowControlConfig {
+        reconnect_backoff: Duration::from_millis(20),
+        ack_timeout: Duration::from_millis(500),
+        ..FlowControlConfig::default()
+    };
+    let h = harness_in_format(
+        FENCING_EPOCH,
+        flow.clone(),
+        None,
+        None,
+        None,
+        FollowerAddressing::Resolved,
+        None,
+        true,
+    );
+    let behind = Arc::clone(&h.followers[0]);
+    for sequence in 0..5 {
+        let _ = produce_ok(&h.leader, h.range.clone(), sequence);
+    }
+    assert!(
+        await_within(Duration::from_secs(5), || behind.local_committed_offset()
+            == 5),
+        "precondition: follower 1 holds the first five records"
+    );
+    let NetworkHarness {
+        _dirs,
+        _runtime: runtime,
+        _server_abort,
+        range,
+        meta,
+        leader,
+        followers: _followers,
+        replica_set,
+        cluster_committed,
+        follower_configs,
+        leader_cert,
+        follower_certs,
+    } = h;
+    drop(leader);
+    drop(replica_set);
+
+    // A leader whose log starts at 10: everything below was reclaimed.
+    let epoch = FENCING_EPOCH + 1;
+    meta.set(epoch);
+    let dir = tempfile::tempdir().unwrap();
+    let log = ActiveSegment::create_v2(
+        dir.path().join("range.active"),
+        SegmentDescriptorV2 {
+            segment_id: Uuid::from_u128(0xF3),
+            topic: range.topic.clone(),
+            topic_epoch: range.topic_epoch,
+            lineage: RangeLineage {
+                range_id: range.range_id,
+                generation: range.range_generation,
+                key_range: KeyRange::full(),
+                parents: Vec::new(),
+            },
+            base_offset: 10,
+            segment_generation: 0,
+            creation_node_id: LEADER,
+            creation_fencing_epoch: epoch,
+        },
+        SegmentConfigV2::default(),
+    )
+    .unwrap();
+    let new_set = Arc::new(
+        NetworkedReplicaSet::start_on_handle_with_memory(
+            runtime.handle().clone(),
+            vec![follower_configs[0].clone()],
+            material(&leader_cert, &[&follower_certs[0], &follower_certs[1]]),
+            flow,
+            None,
+        )
+        .unwrap(),
+    );
+    let new_leader = Arc::new(
+        LocalBroker::with_replication(
+            log,
+            ProducerEpochJournal::open(dir.path().join("epochs")).unwrap(),
+            range.clone(),
+            epoch,
+            meta.clone(),
+            LEADER,
+            Some(cluster_committed.clone()),
+            Some(new_set.clone() as Arc<dyn ReplicaSet>),
+        )
+        .unwrap(),
+    );
+    behind.adopt_fencing_epoch(epoch);
+    assert!(new_set.reconcile_followers_against(
+        Arc::downgrade(&new_leader) as std::sync::Weak<dyn LeaderLineage>
+    ));
+
+    assert!(
+        await_within(Duration::from_secs(5), || {
+            new_set.follower_below_catch_up_horizon(FOLLOWER_1) == Some(true)
+        }),
+        "a follower durable through 5 under a leader whose log starts at 10 must be flagged \
+         behind the catch-up horizon"
+    );
+    assert_eq!(
+        (behind.next_offset(), behind.local_committed_offset()),
+        (5, 5),
+        "nothing may be appended to a follower the leader cannot catch up"
     );
 }

@@ -48,9 +48,9 @@ pub use fault::{
     FaultInjectingReplicaSet, FollowerNetworkFault, NetworkFaultPlan, PendingDeliveryStats,
 };
 pub use network::{
-    address_now, FlowControlConfig, LeaderLineage, LeaderLineageSnapshot, NetworkFollowerConfig,
-    NetworkedReplicaSet, ReplicaPeerHandler, ReplicaPeerServer, ReplicaStatusClient,
-    ReplicaTlsMaterial,
+    address_now, CatchUpRead, FlowControlConfig, LeaderLineage, LeaderLineageSnapshot,
+    NetworkFollowerConfig, NetworkedReplicaSet, ReplicaPeerHandler, ReplicaPeerServer,
+    ReplicaStatusClient, ReplicaTlsMaterial,
 };
 pub use transfer::{LeaderSegmentTransferHandler, SegmentTransferClient, TransferredPrefix};
 pub use version::{ClusterFeatureLevel, PeerVersion, ReplicaVersionPolicy};

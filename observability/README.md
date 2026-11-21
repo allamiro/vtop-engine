@@ -168,7 +168,24 @@ Rules on metrics the nodes already exported, which nothing watched:
 | Follower lag growing | `deriv(vtop_broker_follower_lag_records[10m])` stays positive | 15 min |
 | Fencing epoch churn | more than 3 `vtop_broker_meta_fencing_epoch` changes in 30 min | — |
 | Promotion boundary stuck | `vtop_broker_boundary_pending` stays 1 (fetch is refused meanwhile) | 2 min |
+| Follower below the catch-up horizon | `vtop_broker_follower_below_catch_up_horizon` is 1 | 5 min |
 | Metadata leader lost its quorum | `vtop_meta_raft_millis_since_quorum_ack` above 10 s | 1 min |
+
+A leader catches a follower up from its own log when the follower is behind
+what the replication stream still holds (#881): after the session's fence, it
+re-sends what the follower lacks, from the offset the follower reports. That
+reaches no further back than the leader's log start. A follower durable only
+below it - down while retention reclaimed the records it lacks - cannot be
+caught up by any append, and **Follower below the catch-up horizon** fires.
+The range runs one replica short until the follower is rebuilt:
+
+1. Confirm it: the leader's WARN line names the follower, its durable offset
+   and the leader's log start (`vtop_broker_log_start_offset`).
+2. Stop the follower and rebuild its range directory from the leader with
+   `vtopctl node repair` (docs/PRODUCTION_HA.md), then start it.
+   It rejoins through the ordinary session and catches up from the log.
+3. If this recurs, retention is shorter than the longest outage a follower is
+   expected to ride out: raise the range's retention bound.
 
 The follower series come from a leader's collector; a candidate deployment
 exports the range and retention gauges but not per-follower ones, so those two

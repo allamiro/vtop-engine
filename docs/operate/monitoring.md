@@ -110,6 +110,7 @@ holds the Grafana rules the optional observability stack loads:
 | Range retention failing | `vtop_broker_retention_last_pass_failed` for 10 minutes |
 | Follower disconnected | `vtop_broker_follower_connected` at 0 for 2 minutes |
 | Follower lag growing | Rising `vtop_broker_follower_lag_records` for 15 minutes |
+| Follower below the catch-up horizon | `vtop_broker_follower_below_catch_up_horizon` at 1 for 5 minutes |
 | Fencing epoch churn | A range's fencing epoch rising within 30 minutes |
 | Promotion boundary stuck | `vtop_broker_boundary_pending` for 2 minutes |
 | Metadata leader lost its quorum | `vtop_meta_raft_millis_since_quorum_ack` on the leader past its threshold, for 1 minute |
