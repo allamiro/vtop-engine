@@ -188,6 +188,15 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(len(out), 1, out)
         self.assertIn("of VTOP", out[0])
 
+    def test_a_claim_about_another_product_is_not_held_to_the_project_rule(self):
+        # Review of #826: no component named used to mean "about VTOP".
+        for text in ("Apache Kafka is production-ready.\n", "Kubernetes is battle-tested.\n"):
+            with self.subTest(text=text):
+                self.assertEqual(self.problems(**{"docs/a.md": text}), [])
+        for text in ("This project is production-ready.\n", "The VTOP engine is production grade.\n"):
+            with self.subTest(text=text):
+                self.assertEqual(len(self.problems(**{"docs/a.md": text})), 1)
+
     def test_a_claim_inside_a_code_fence_or_comment_is_ignored(self):
         text = "```\nThe Kafka gateway is production-ready.\n```\n<!-- Kafka gateway production-ready -->\n"
         self.assertEqual(self.problems(**{"docs/a.md": text}), [])

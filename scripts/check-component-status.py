@@ -107,6 +107,10 @@ def qualified(sentence: str, claim: re.Match) -> bool:
     return bool(QUALIFIER_AFTER.search(sentence[claim.end() :]))
 
 
+# A claim names no component is held to the project-wide rule only when it
+# names the project: "Apache Kafka is production-ready" is about another
+# product, not VTOP (review of #826).
+PROJECT = re.compile(r"\b(?:vtop(?:[- ]engine)?|this (?:project|engine|software|release|system)|the project)\b", re.I)
 # Pages and trees the scan skips: the status page itself, the two internal
 # drafts the site does not publish, and generated or vendored trees.
 SKIP = {
@@ -329,7 +333,7 @@ def claim_problems(root: pathlib.Path, today: dict[str, str]) -> list[str]:
                     f"{rel}:{number}: says {claim.group(0)!r} of {', '.join(over)}, which {PAGE} "
                     f"labels {today[over[0]]}: {sentence.strip()[:110]}"
                 )
-            elif not named and not project_ok:
+            elif not named and not project_ok and PROJECT.search(sentence):
                 problems.append(
                     f"{rel}:{number}: says {claim.group(0)!r} of VTOP, but {PAGE} does not label "
                     f"every component production: {sentence.strip()[:110]}"
