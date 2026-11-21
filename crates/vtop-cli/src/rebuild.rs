@@ -54,6 +54,11 @@ pub(crate) struct RecordedWindow {
     /// recorded it with OBJECT_UPLOADED; `None` when no object was recorded,
     /// or the batch was not checksummed.
     pub(crate) digest: Option<String>,
+    /// The key of the object the earlier attempt uploaded, as the ledger
+    /// recorded it with OBJECT_UPLOADED, beside `digest`; `None` when no
+    /// object was recorded. A backend that cannot report an absent key
+    /// adopts it when it verifies against the rebuilt batch (#773).
+    pub(crate) object_uri: Option<String>,
     /// The earlier attempt's batch id, for the operator; `None` when its
     /// ledger row could not be written (#627).
     pub(crate) batch_id: Option<String>,
@@ -74,6 +79,7 @@ impl RecordedWindow {
             end: rec.progress_end.clone(),
             sealed_at: rec.sealed_at.as_deref().and_then(parse_sealed_at),
             digest: recorded_digest(rec.object_sha256.as_deref()),
+            object_uri: recorded_object_uri(rec.object_uri.as_deref()),
             batch_id: Some(rec.batch_id.clone()),
             record_count: rec.record_count.and_then(|n| u64::try_from(n).ok()),
             bounded: false,
@@ -139,6 +145,12 @@ pub(crate) fn recorded_digest(stored: Option<&str>) -> Option<String> {
     stored.filter(|d| !d.is_empty()).map(str::to_owned)
 }
 
+/// An object key as the ledger stores it: absent until OBJECT_UPLOADED, and
+/// empty is no key.
+pub(crate) fn recorded_object_uri(stored: Option<&str>) -> Option<String> {
+    stored.filter(|u| !u.is_empty()).map(str::to_owned)
+}
+
 /// The windows handed back to their sources and not yet read again.
 #[derive(Debug, Default)]
 pub(crate) struct RecordedWindows {
@@ -166,7 +178,11 @@ impl RecordedWindows {
             self.total -= 1;
             if earlier.same_window(&window) {
                 if window.digest.is_none() {
+                    // The key goes with the digest it was recorded with, so
+                    // the pair is never one attempt's key and another's
+                    // digest.
                     window.digest = earlier.digest;
+                    window.object_uri = earlier.object_uri;
                 }
                 if window.sealed_at.is_none() {
                     window.sealed_at = earlier.sealed_at;
@@ -327,8 +343,9 @@ impl RecordedWindows {
 
 /// Count and report what a replay of `window` came to (#626), once its key
 /// has been decided: `digest` is this attempt's, `key` the object it names,
-/// and `key_is_derived` whether that is the derived key or the attempt key a
-/// fallback took (`object_key_fallback`, `object_key_per_attempt`). Only what
+/// and `key_is_derived` whether that is the derived key (or the earlier
+/// attempt's own object, adopted: `object_key_adopted`, #773) or the attempt
+/// key a fallback took (`object_key_fallback`, `object_key_per_attempt`). Only what
 /// happened is claimed: a fallback named another key, so it is not `exact`.
 #[expect(
     clippy::too_many_arguments,
@@ -566,6 +583,7 @@ mod tests {
             end: file(start, end, 7),
             sealed_at: parse_sealed_at("2026-01-02T03:04:05Z"),
             digest: None,
+            object_uri: None,
             batch_id: Some(format!("b{start}")),
             record_count: None,
             bounded: false,
@@ -717,6 +735,7 @@ mod tests {
                 end: kafka(partition, 0, 19),
                 sealed_at: None,
                 digest: None,
+                object_uri: None,
                 batch_id: Some(format!("p{partition}")),
                 record_count: Some(20),
                 bounded: false,

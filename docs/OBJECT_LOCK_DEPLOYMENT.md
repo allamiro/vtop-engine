@@ -279,6 +279,12 @@ object's upload and its ledger write, or a restart after a fallback whose
 manifest failed, writes one more; these are counted as `fallback_*` in
 `vtop_object_key_decisions_total`.
 
+A replay on a command backend (`awscli`, `minio`, `s3cmd`) adopts the object
+an earlier attempt uploaded when it verifies (#773), but those backends cannot
+run the profile (the configuration is refused), so adoption never applies to
+a locked bucket and changes nothing in the list above: under Object Lock only
+`s3_native` writes, and a replay there names its object by content as before.
+
 Incomplete multipart uploads are not objects and are not locked. The
 abandoned-session sweep and an `AbortIncompleteMultipartUpload` lifecycle rule
 still reclaim them.
