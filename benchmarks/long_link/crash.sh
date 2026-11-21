@@ -41,7 +41,14 @@ for i in $(seq 1 "$KILLS"); do
   # The engine image has no pkill: signal the PID the loop recorded.
   docker exec vtop-longlink-engine bash -c 'kill -9 "$(cat /r/engine.pid)"'
   sleep 1
-  echo "kill $i after ${t}s: $(python3 "$HERE/check_commit_rule.py" "$R" "g-$NAME" || echo FAILED)"
+  # A violation at any kill fails the run, even if the restarts later
+  # rebuild the coverage it found missing.
+  if verdict=$(python3 "$HERE/check_commit_rule.py" "$R" "g-$NAME"); then
+    echo "kill $i after ${t}s: $verdict"
+  else
+    echo "kill $i after ${t}s: $verdict"
+    failed=1
+  fi
 done
 touch "$R/go"
 lag=-1
