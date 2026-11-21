@@ -4,7 +4,7 @@
 # committed at the source before it was verified.
 #
 # System model: one crash-recovery engine process (`vtopctl run`), a real
-# source (a Kafka broker, or a file), a real S3 store (the lab's MinIO) and a
+# source (a Kafka broker, a file, or a syslog spool file), a real S3 store (the lab's MinIO) and a
 # ledger (SQLite, or PostgreSQL); a partially synchronous network; honest
 # processes. The fault is a SIGKILL of the engine at one line, chosen by a
 # failpoint (crates/vtop-cli/src/failpoints.rs) in a build with the
@@ -65,13 +65,18 @@
 #                             and the run fails if one was not run) or a
 #                             comma-separated subset
 #   ENGINE_SWEEP_BACKEND      `sqlite` (default) or `postgres`
-#   ENGINE_SWEEP_SOURCE       `kafka` (default) or `file`
+#   ENGINE_SWEEP_SOURCE       `kafka` (default), `file` or `syslog_spool` (a
+#                             spool file, read by the spool source)
 #   ENGINE_SWEEP_FAULT        `none` (default), `store_outage` (MinIO is
 #                             stopped while the engine runs towards the
 #                             failpoint, for ENGINE_SWEEP_FAULT_SECONDS, then
 #                             started again) or `enospc` (the engine's work
 #                             directory is a full 16 KiB tmpfs for as long,
-#                             then space is freed)
+#                             then space is freed) or `host_loss` (#739: the
+#                             kill takes the engine's host, so its work
+#                             directory is deleted and a standby with a new
+#                             one recovers; needs the PostgreSQL ledger and
+#                             the Kafka source)
 #   ENGINE_SWEEP_FAULT_SECONDS how long the fault holds (default 12; a
 #                             point reached sooner is killed with the fault
 #                             still on)
@@ -101,7 +106,7 @@
 # in docs/LIVE_CHAOS_VALIDATION.md. The workflow's per-point wait is bounded
 # by ENGINE_SWEEP_POINT_TIMEOUT_SECONDS.
 #
-# Not covered here: syslog spool sources, power loss (ledger_power_loss.rs).
+# Not covered here: power loss (ledger_power_loss.rs).
 set -euo pipefail
 umask 077
 export CHAOS_NO_CERTS=1
@@ -138,10 +143,18 @@ require_integer_in_range ENGINE_SWEEP_POINT_TIMEOUT_SECONDS "$POINT_TIMEOUT" 5 3
 require_integer_in_range ENGINE_SWEEP_FAULT_SECONDS "$FAULT_SECONDS" 3 600
 [[ "$BACKEND" == "sqlite" || "$BACKEND" == "postgres" ]] \
   || fail "ENGINE_SWEEP_BACKEND must be sqlite or postgres, got '$BACKEND'"
-[[ "$SOURCE" == "kafka" || "$SOURCE" == "file" ]] \
-  || fail "ENGINE_SWEEP_SOURCE must be kafka or file, got '$SOURCE'"
-[[ "$FAULT" == "none" || "$FAULT" == "store_outage" || "$FAULT" == "enospc" ]] \
-  || fail "ENGINE_SWEEP_FAULT must be none, store_outage or enospc, got '$FAULT'"
+[[ "$SOURCE" == "kafka" || "$SOURCE" == "file" || "$SOURCE" == "syslog_spool" ]] \
+  || fail "ENGINE_SWEEP_SOURCE must be kafka, file or syslog_spool, got '$SOURCE'"
+[[ "$FAULT" == "none" || "$FAULT" == "store_outage" || "$FAULT" == "enospc" || "$FAULT" == "host_loss" ]] \
+  || fail "ENGINE_SWEEP_FAULT must be none, store_outage, enospc or host_loss, got '$FAULT'"
+# Losing the engine's host loses everything on it: a ledger, a source or a
+# store on the host would go with it, and there would be nothing to recover
+# onto. So the host-loss leg is the topology #739 supports: the ledger in
+# PostgreSQL, the source in Kafka, the store remote.
+if [[ "$FAULT" == "host_loss" ]]; then
+  [[ "$BACKEND" == "postgres" && "$SOURCE" == "kafka" ]] \
+    || fail "ENGINE_SWEEP_FAULT=host_loss needs ENGINE_SWEEP_BACKEND=postgres and ENGINE_SWEEP_SOURCE=kafka: the ledger and the source must outlive the host"
+fi
 [[ "$PG_USER" =~ ^[a-z_][a-z0-9_]*$ && "$PG_PASSWORD" =~ ^[A-Za-z0-9_-]+$ \
   && "$PG_HOSTPORT" =~ ^[A-Za-z0-9.-]+:[0-9]+$ ]] \
   || fail "ENGINE_SWEEP_PG_USER, _PG_PASSWORD or _PG_HOSTPORT is not a plain name, password or host:port"
@@ -303,7 +316,9 @@ emit_engine_config() { # <dir> <group> <prefix> <point> <state-store>
     auto_offset_reset: earliest
     enable_auto_commit: false"
   else
-    source_block="  file:
+    # A spool file is read as a file is, a line per record, by the spool
+    # source's own adapter: its cursor, markers and replay.
+    source_block="  $SOURCE:
     enabled: true
     paths: [\"$INPUT\"]"
   fi
@@ -386,7 +401,7 @@ POINT_DB="" # the PostgreSQL database of the point being run
 ledger_json() { # <dir> <group>
   local dir="$1" group="$2" rows
   local -a src
-  if [[ "$SOURCE" == "kafka" ]]; then src=(kafka "$TOPIC" 0 "$group"); else src=(file "$INPUT"); fi
+  if [[ "$SOURCE" == "kafka" ]]; then src=(kafka "$TOPIC" 0 "$group"); else src=("$SOURCE" "$INPUT"); fi
   if [[ "$BACKEND" == "sqlite" ]]; then
     python3 "$CHECKS" ledger --sqlite "$dir/state.db" "${src[@]}"
     return
@@ -560,19 +575,35 @@ for point in "${SELECTED[@]}"; do
   #    while it runs towards the line.
   fault_on "$dir"
   engine_start "$dir/config.yaml" "$dir/kill.log" "$point"
-  if [[ "$FAULT" != "none" ]]; then
+  if [[ "$FAULT" == "store_outage" || "$FAULT" == "enospc" ]]; then
     fault_hold "$ENGINE_PID" "$dir/kill.log"
     fault_off "$dir"
   fi
   engine_wait_killed "$ENGINE_PID" "$point" "$dir/kill.log" "$POINT_TIMEOUT"
   log "killed by SIGKILL at the failpoint"
+  killed_at=$SECONDS
 
   # 2. The commit rule at the instant of the kill, before anything restarts.
   check_commit_rule "$point" "$dir" "$group" "at the kill"
 
   # 3. Restart without the failpoint and drain to the end of the source.
-  engine_start "$dir/config.yaml" "$dir/restart.log"
+  #    After a host loss the restart is a standby on another host: the old
+  #    host's work directory (its staged batches, multipart sessions and
+  #    lock) is gone, and the standby starts with an empty one. The fence is
+  #    the kill: the old engine is known dead (engine_wait_killed) before
+  #    the standby starts, as an operator powers the old host off first.
+  restart_config="$dir/config.yaml"
+  if [[ "$FAULT" == "host_loss" ]]; then
+    rm -rf "$dir/work"
+    restart_config="$dir/standby.yaml"
+    sed "s#^  work_dir: \"$dir/work\"\$#  work_dir: \"$dir/standby-work\"#" "$dir/config.yaml" > "$restart_config"
+    grep -q "^  work_dir: \"$dir/standby-work\"\$" "$restart_config" \
+      || fail "the standby's config does not name a new work directory"
+    log "host lost: its work directory is deleted; a standby starts on $dir/standby-work"
+  fi
+  engine_start "$restart_config" "$dir/restart.log"
   engine_drain "$ENGINE_PID" "$dir/restart.log" "$POINT_TIMEOUT" drained "$dir" "$group"
+  recovered_in=$((SECONDS - killed_at))
   check_commit_rule "$point" "$dir" "$group" "after the restart"
 
   # 4. No hole, by the engine's own checkers and by an independent count.
@@ -588,13 +619,13 @@ for point in "${SELECTED[@]}"; do
     || fail "$extra duplicate record copies after a kill at $point; at most $allowed are allowed there: $counts"
 
   echo "$point" >> "$RAN_FILE"
-  SUMMARY+=("$(printf '%-36s PASS  %3ss  duplicates %s (allowed %s)' "$point" "$((SECONDS - started))" "$extra" "$allowed")")
-  log "PASS in $((SECONDS - started))s: $RECORDS records archived, $extra duplicate copies (allowed $allowed)"
+  SUMMARY+=("$(printf '%-36s PASS  %3ss  duplicates %s (allowed %s)  recovered in %ss' "$point" "$((SECONDS - started))" "$extra" "$allowed" "$recovered_in")")
+  log "PASS in $((SECONDS - started))s: $RECORDS records archived, $extra duplicate copies (allowed $allowed); from the kill to every record committed: ${recovered_in}s"
   if [[ "$FAULT" == "enospc" ]]; then
     as_root umount "$dir/work" || fail "could not unmount $dir/work"
   fi
   if [[ "${CHAOS_KEEP:-0}" != "1" ]]; then
-    rm -rf "$dir/work" "$dir/readback"
+    rm -rf "$dir/work" "$dir/standby-work" "$dir/readback"
   fi
 done
 

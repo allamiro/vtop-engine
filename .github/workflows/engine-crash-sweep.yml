@@ -23,10 +23,16 @@ name: engine crash sweep
 #   postgres-kafka             the ledger is a PostgreSQL database
 #   sqlite-file                the source is a file; the commit rule is read
 #                              from the ledger's cursor
+#   sqlite-spool               the source is a syslog spool file, read by the
+#                              spool source; as sqlite-file otherwise
 #   sqlite-kafka-store-outage  MinIO is stopped while the engine runs towards
 #                              each failpoint
 #   sqlite-kafka-enospc        the engine's work directory is a full tmpfs
 #                              while it runs towards each failpoint
+#   postgres-kafka-host-loss   the kill takes the engine's host (#739): its
+#                              work directory is deleted and a standby with
+#                              a new one recovers on the same PostgreSQL
+#                              ledger, Kafka group and store
 # A scheduled workflow runs only from the default branch, so the nightly
 # itself is first proven on main; a pull request proves the same job with
 # fewer points.
@@ -50,7 +56,7 @@ on:
         required: false
         default: "50"
       legs:
-        description: "all, or comma-separated legs: sqlite-kafka, postgres-kafka, sqlite-file, sqlite-kafka-store-outage, sqlite-kafka-enospc"
+        description: "all, or comma-separated legs: sqlite-kafka, postgres-kafka, sqlite-file, sqlite-spool, sqlite-kafka-store-outage, sqlite-kafka-enospc, postgres-kafka-host-loss"
         required: false
         default: all
   pull_request:
@@ -129,8 +135,10 @@ jobs:
             {"name":"sqlite-kafka","backend":"sqlite","source":"kafka","fault":"none","features":"failpoints","primary":true},
             {"name":"postgres-kafka","backend":"postgres","source":"kafka","fault":"none","features":"failpoints,postgres","primary":false},
             {"name":"sqlite-file","backend":"sqlite","source":"file","fault":"none","features":"failpoints","primary":false},
+            {"name":"sqlite-spool","backend":"sqlite","source":"syslog_spool","fault":"none","features":"failpoints","primary":false},
             {"name":"sqlite-kafka-store-outage","backend":"sqlite","source":"kafka","fault":"store_outage","features":"failpoints","primary":false},
-            {"name":"sqlite-kafka-enospc","backend":"sqlite","source":"kafka","fault":"enospc","features":"failpoints","primary":false}
+            {"name":"sqlite-kafka-enospc","backend":"sqlite","source":"kafka","fault":"enospc","features":"failpoints","primary":false},
+            {"name":"postgres-kafka-host-loss","backend":"postgres","source":"kafka","fault":"host_loss","features":"failpoints,postgres","primary":false}
           ]'
           case "$EVENT" in
             pull_request)
