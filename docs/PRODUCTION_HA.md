@@ -112,8 +112,8 @@ it shipped with, are in [ROADMAP.md](ROADMAP.md).
   ([ARCHITECTURE.md](ARCHITECTURE.md) §13 item 3).
 - Phase 6 (observability & ops): metrics, readiness, dashboards, OTLP trace
   export and a unit-tested Prometheus alert rule set with runbooks and
-  documented SLOs exist (#720); a store write-latency SLO and its alert do
-  not.
+  documented SLOs exist (#720), including a state-store write-latency SLO
+  and its alert (`VtopStateStoreWritesSlow`).
 - Phase 8 (retention/backup/DR/security): retention shipped, and an
   attributable audit trail for every state-changing command (#694); a
   backup/restore runbook (#734), DR drills (#735), and the divergence checker
@@ -1263,15 +1263,15 @@ path needed by the distributed options is already implemented (§6.3).
   shipped as the chart's `PrometheusRule`: verification failures, no commits
   while data waits, replay-rate spike, Kafka lag growth (from kafka-exporter),
   size-only verification, failed Object Lock checks, retention loss, refused
-  replays, a state store refusing recovery's replay decisions, and piling
-  multipart sessions. Each has a promtool unit test and a
+  replays, a state store refusing recovery's replay decisions, piling
+  multipart sessions, and slow state-store writes. Each has a promtool unit test and a
   section in [Alert runbooks](operate/runbooks.md); the objectives are on
   [Service level objectives](operate/slos.md).
 
 **Still needed for production [PROPOSED]:**
-- **Alerting rules:** a store write-latency SLO breach (the engine has no
-  write-latency objective yet; `vtop_stage_duration_seconds{stage="state_write"}`
-  is the metric it would read).
+- **Alerting rules:** a state-store write-latency SLO breach is covered by
+  `VtopStateStoreWritesSlow`, which reads
+  `vtop_stage_duration_seconds{stage="state_write"}`.
 - Metric coverage review: **verification-failure rate**, **replay /
   REPLAY_REQUIRED rate**, Kafka **consumer lag**, state-store write latency,
   **duplicate-object rate** (needed until deterministic keys land).
@@ -1792,12 +1792,13 @@ deployment identity; the live battery proves the runtime role cannot run DDL,
   lab (retention loss, replication health, consumer-group eviction: #454,
   #561, #571).
 - **Done (#720):** Prometheus alert rules (verification failures, replay-rate
-  spike, lag growth, no commits in 30 minutes while data waits, and six more),
+  spike, lag growth, no commits in 30 minutes while data waits, and eight
+  more),
   each unit-tested with promtool in CI and linked to a runbook section;
   documented SLOs ([operate/slos.md](operate/slos.md)).
-- **Remaining:** a store-latency SLO and its alert; metric coverage review
-  (duplicate-object rate until Phase 4 lands, an engine-side consumer lag,
-  state-store write latency); wiring the rules to an Alertmanager is the
+- **Remaining:** metric coverage review
+  (duplicate-object rate until Phase 4 lands, an engine-side consumer lag);
+  wiring the rules to an Alertmanager is the
   deployment's.
 - **Test plan:** force a verification failure and confirm the alert; load test
   and watch lag/replay panels.
