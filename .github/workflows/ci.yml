@@ -1509,7 +1509,9 @@ jobs:
       # object, manifest and verification receipt the store then reports
       # locked. And the verification receipt (#671): the method it names is
       # the one the real backend ran, store_checksum for a single PUT and
-      # read_back for a multipart object.
+      # read_back for a multipart object. And the anti-tamper suite (docs/
+      # reference/tamper-evidence.md): a bucket-write attacker against signed
+      # manifests, Object Lock, versioning, receipts and the coverage audit.
       - name: Run the live engine tests
         env:
           VTOP_TEST_S3_ENDPOINT: http://127.0.0.1:9000
@@ -1519,6 +1521,7 @@ jobs:
         run: |
           cargo test -p vtop-cli --locked --test live_s3_object_lock_engine \
             --test live_s3_verification_receipts \
+            --test live_s3_tamper \
             -- --ignored --test-threads=1
 
       # minio-init ran as a one-off `compose run` container, removed when it
