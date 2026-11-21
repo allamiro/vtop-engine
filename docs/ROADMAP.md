@@ -1221,8 +1221,9 @@ mode_mismatch. The deployment profile is
   mixed fleet still stalls on such a range until it is upgraded.
 - **Objects from failed attempts are locked too,** and under `compliance`
   nobody can remove them before the date: storage cost, said at startup.
-- **`vtopctl tier copy` refuses the block;** locking cold-tier copies is a
-  separate decision.
+- **`vtopctl tier copy` locks cold-tier copies** under the block and reads
+  both retentions back before it proposes the evidence; it used to refuse
+  the block.
 - **Proven against MinIO only** (RELEASE.2025-09-07, the lab's build). AWS S3
   behaviour is taken from its documentation (the integrity header a locked
   write needs, the permissions a HEAD needs to return the lock headers), not
