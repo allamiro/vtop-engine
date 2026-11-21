@@ -47,6 +47,7 @@ use std::time::Duration;
 use uuid::Uuid;
 use vtop_broker::LocalBroker;
 use vtop_meta::command::CommandEnvelope;
+use vtop_meta::transport::warn_rate_limited;
 use vtop_meta::{AdminClient, MetadataCommand, MetadataResponse};
 
 /// Where the agent publishes what metadata decided.
@@ -596,11 +597,17 @@ impl ReplicaPlaneProbe {
                     // bug fencing exists to close, and a replica that has
                     // simply not yet seen the grant refuses here too —
                     // correctly, since it is not fenced until it has.
-                    tracing::debug!(
-                        follower = %follower.node_uuid,
-                        fencing_epoch,
-                        %error,
-                        "replica could not be fenced; excluded from the promotion quorum"
+                    // Rate-limited per follower, not debug (#881): a
+                    // replica that answers but refuses the fence is a reason
+                    // the promotion keeps failing, and the soak's wedge
+                    // could not be explained without it.
+                    warn_rate_limited(
+                        &format!("promotion-probe-fence-{}", follower.node_uuid),
+                        &format!(
+                            "replica {} could not be fenced at epoch {fencing_epoch} and is \
+                             excluded from the promotion quorum: {error}",
+                            follower.node_uuid
+                        ),
                     );
                     None
                 }
@@ -3611,8 +3618,24 @@ impl LeaseAgent {
         Ok(match response.response {
             MetadataResponse::LeaseGranted { fencing_epoch } => Some(fencing_epoch),
             // A rejection here is ordinary: a rival won, or the generation
-            // moved. It is not an error to log loudly.
-            _ => None,
+            // moved. It is not an error to log loudly - but it is the only
+            // trace of why a node that should win the range never does, so
+            // it is logged, at most once a window (#881).
+            other => {
+                let reason = match &other {
+                    MetadataResponse::Rejected(error) => error.to_string(),
+                    other => format!("unexpected answer {other:?}"),
+                };
+                warn_rate_limited(
+                    &format!("lease-acquire-refused-{}", self.range_uuid),
+                    &format!(
+                        "lease acquisition for range {} at range generation \
+                         {expected_range_generation} was refused: {reason}",
+                        self.range_uuid
+                    ),
+                );
+                None
+            }
         })
     }
 
@@ -3727,12 +3750,35 @@ impl LeaseAgent {
             // All this does is stop the epoch moving, which is the one thing a
             // replica that is behind needs in order to stop being behind.
             let _ = self.renew(fencing_epoch).await?;
+        } else {
+            // THE BUDGET IS SPENT, SO STEP BACK (#881). The lease now lapses,
+            // and this node must not be the one that takes it next: a whole
+            // lease lifetime has shown it cannot reach a quorum, and any
+            // replica that can is better placed to lead. Without this it
+            // re-acquired on its first poll after the lapse - its own
+            // renewal set the deadline, so it reached the lapse at the same
+            // point of its polling cycle every time, and rivals polling at
+            // the same interval lost the same race every time. The soak's
+            // lagging replica won 21 epochs running that way, while the
+            // caught-up ones never took the range.
+            //
+            // The eligibility stand-aside's window, set every round until the
+            // lapse so it is counted from the lapse. A rival taking the
+            // range clears it (the Wait arm); nobody taking it leaves this
+            // node to campaign again once it has run out, so a range only
+            // this node can lead is delayed, never abandoned. Liveness only:
+            // the epoch still fences every holder.
+            self.campaign_hold_off_rounds = self.stand_aside_rounds();
         }
         Ok(())
     }
 
+    /// The epoch is served. Whatever hold or step-back an earlier miss left
+    /// is moot, and a step-back left standing would delay this node's next
+    /// campaign after a later, unrelated loss (#881).
     fn clear_quorum_miss_hold(&mut self) {
         self.quorum_miss_hold = None;
+        self.campaign_hold_off_rounds = 0;
     }
 
     /// How many poll rounds an eligibility refusal sits out: two lease
@@ -7545,6 +7591,347 @@ mod tests {
         assert!(
             config.renew_interval * 2 < config.lease_duration,
             "two consecutive renewals must be able to fail without losing the range"
+        );
+    }
+
+    /// One real metadata node (Raft, a single voter, in this process) behind a
+    /// real admin server, with three registered data nodes and one range: the
+    /// harness for #881's lease races. Only the replica plane is a double.
+    struct LeaseRaceHarness {
+        _meta_dir: tempfile::TempDir,
+        consensus: Arc<vtop_meta::OpenraftConsensus>,
+        endpoint: std::net::SocketAddr,
+        serving: tokio::task::JoinHandle<()>,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        dirs: Vec<tempfile::TempDir>,
+    }
+
+    const RACE_A: Uuid = Uuid::from_u128(0xA1);
+    const RACE_B: Uuid = Uuid::from_u128(0xA2);
+    const RACE_C: Uuid = Uuid::from_u128(0xA3);
+
+    impl LeaseRaceHarness {
+        async fn start() -> Self {
+            use vtop_meta::AdminHandler;
+            let topic_uuid = Uuid::from_u128(0x70);
+            let range_uuid = Uuid::from_u128(0x71);
+            let meta_dir = tempfile::tempdir().unwrap();
+            let node = vtop_meta::start_meta_node(
+                &vtop_log::env::Env::real(),
+                meta_dir.path(),
+                Uuid::from_u128(0xC0),
+                1,
+                vtop_meta::PeerDirectory::new(),
+                None,
+                vtop_meta::MetaNodeTimers::default(),
+            )
+            .await
+            .unwrap();
+            let consensus = Arc::clone(&node.consensus);
+            AdminHandler::init(consensus.as_ref(), vec![1])
+                .await
+                .unwrap();
+            let harness = |listener: tokio::net::TcpListener| {
+                let server = vtop_meta::AdminServer::plaintext(
+                    Arc::clone(&consensus) as Arc<dyn vtop_meta::AdminHandler>,
+                    vtop_meta::transport::AdminAuthorizer::permissive(),
+                )
+                .unwrap();
+                tokio::spawn(async move {
+                    let _ = server.serve(listener).await;
+                })
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = listener.local_addr().unwrap();
+            let serving = harness(listener);
+            let this = Self {
+                _meta_dir: meta_dir,
+                consensus,
+                endpoint,
+                serving,
+                topic_uuid,
+                range_uuid,
+                dirs: (0..3).map(|_| tempfile::tempdir().unwrap()).collect(),
+            };
+            for (index, node_uuid) in [RACE_A, RACE_B, RACE_C].into_iter().enumerate() {
+                let registered = this
+                    .propose(MetadataCommand::RegisterNode {
+                        env: envelope(),
+                        node_uuid,
+                        addr: format!("10.0.0.{index}:9400"),
+                        expected_generation: None,
+                    })
+                    .await;
+                assert!(
+                    matches!(registered, MetadataResponse::Ack { .. }),
+                    "{registered:?}"
+                );
+            }
+            let created = this
+                .propose(MetadataCommand::CreateTopic {
+                    env: envelope(),
+                    name: "telemetry".to_owned(),
+                    topic_uuid,
+                    root_range_uuid: range_uuid,
+                })
+                .await;
+            assert!(
+                matches!(created, MetadataResponse::TopicCreated { .. }),
+                "{created:?}"
+            );
+            this
+        }
+
+        /// Propose through the leader, retrying while it is elected.
+        async fn propose(&self, command: MetadataCommand) -> MetadataResponse {
+            use vtop_meta::AdminHandler;
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                match AdminHandler::propose(self.consensus.as_ref(), command.clone()).await {
+                    Ok(answer) => return answer.response,
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    Err(error) => panic!("propose {command:?}: {error}"),
+                }
+            }
+        }
+
+        /// The range's lease as metadata holds it now.
+        async fn lease(&self) -> Option<vtop_meta::AdminLeaseView> {
+            use vtop_meta::AdminHandler;
+            AdminHandler::read_range_lease(
+                self.consensus.as_ref(),
+                vtop_meta::AdminReadRangeLeaseRequest {
+                    topic_uuid: self.topic_uuid,
+                    range_uuid: self.range_uuid,
+                },
+            )
+            .await
+            .ok()
+            .and_then(|view| view.lease)
+        }
+
+        /// Start node `index`'s lease agent, with its own broker and `probe`
+        /// standing for its replica plane.
+        fn agent(
+            &self,
+            index: usize,
+            node_uuid: Uuid,
+            config: LeaseAgentConfig,
+            probe: Arc<FixedProbe>,
+        ) -> (
+            tokio::sync::watch::Sender<bool>,
+            tokio::task::JoinHandle<()>,
+        ) {
+            let broker = Arc::new(test_broker(self.dirs[index].path(), 0));
+            broker.meta_fencing_epoch().suspend(0);
+            let admin = AdminClient::plaintext(vec![vtop_meta::AdminCandidate {
+                node_id: Some(vtop_meta::MetaNodeId(1)),
+                endpoint: self.endpoint,
+                host: None,
+                server_name: String::new(),
+                plaintext: true,
+            }])
+            .unwrap();
+            let agent = LeaseAgent::new(
+                admin,
+                config,
+                node_uuid,
+                self.topic_uuid,
+                self.range_uuid,
+                Arc::new(BrokerLeasePublisher::new(broker)),
+                Some(probe as Arc<dyn QuorumProbe>),
+            )
+            .unwrap();
+            let (release, released) = tokio::sync::watch::channel(false);
+            (release, tokio::spawn(agent.run(released)))
+        }
+    }
+
+    fn race_answer(node: Uuid, offset: Option<u64>) -> crate::promotion::ReplicaProbe {
+        crate::promotion::ReplicaProbe {
+            node_id: node,
+            local_committed_offset: offset,
+            lineage: vtop_meta::AnswerLineage::Agreed,
+        }
+    }
+
+    /// What the soak's lagging replica saw: only its own answer
+    /// (`answered=1 required=2`), every round.
+    fn lagging_probe() -> Arc<FixedProbe> {
+        fixed(
+            vec![
+                race_answer(RACE_A, Some(0)),
+                race_answer(RACE_B, None),
+                race_answer(RACE_C, None),
+            ],
+            3,
+        )
+    }
+
+    fn race_config() -> LeaseAgentConfig {
+        LeaseAgentConfig {
+            lease_duration: Duration::from_millis(2_000),
+            renew_interval: Duration::from_millis(400),
+            poll_interval: Duration::from_millis(100),
+        }
+    }
+
+    /// #881, finding 3, at its cause. A candidate that cannot reach a quorum
+    /// holds its epoch for one lease lifetime (the quorum-miss budget, #375),
+    /// then lets the lease lapse - and re-acquired it on its very next poll,
+    /// with nothing to stop it. Its own renewal had set the deadline, so it
+    /// reached the lapse at the same point of its polling cycle every time,
+    /// and its rivals, polling at the same interval, reached it at a fixed
+    /// point of theirs: whoever was first won every race. In the soak the
+    /// lagging replica won 21 epochs running and the caught-up replicas never
+    /// took the range.
+    ///
+    /// Invariant: once its budget is spent, the candidate sits out the race
+    /// for the eligibility stand-aside's window (two lease lifetimes), so any
+    /// replica that can promote gets an uncontested lapse - and it campaigns
+    /// again after that, so a range it alone can lead is not abandoned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_candidate_whose_quorum_miss_budget_is_spent_sits_out_the_next_lease_race() {
+        let h = LeaseRaceHarness::start().await;
+        let config = race_config();
+        let (release, run) = h.agent(0, RACE_A, config, lagging_probe());
+
+        // Epoch 1, held through the budget and then let go: its last deadline.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut lapsed_at = None;
+        while std::time::Instant::now() < deadline {
+            if let Some(lease) = h.lease().await {
+                if lease.fencing_epoch == 1 {
+                    let expires = lease
+                        .expires_at_ms
+                        .expect("an elected lease has a deadline");
+                    if now_ms() >= expires {
+                        lapsed_at = Some(expires);
+                        break;
+                    }
+                } else if lease.fencing_epoch > 1 {
+                    lapsed_at = Some(0);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let lapsed_at = lapsed_at.expect("A's first epoch must lapse once its budget is spent");
+
+        // For most of the stand-aside window, nobody holds a newer epoch.
+        let sit_out_until = lapsed_at + 3 * duration_ms(config.lease_duration).unwrap() as i64 / 2;
+        let mut reacquired_early = None;
+        while now_ms() < sit_out_until {
+            if let Some(lease) = h.lease().await {
+                if lease.fencing_epoch > 1 {
+                    reacquired_early = Some((lease.fencing_epoch, now_ms() - lapsed_at));
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            reacquired_early, None,
+            "a candidate that spent its quorum-miss budget re-acquired the range (epoch, ms \
+             after its lapse) before a rival could: it must sit out the next race"
+        );
+
+        // And it is not abandoned: alone, it campaigns again.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut campaigned_again = false;
+        while std::time::Instant::now() < deadline {
+            if h.lease().await.is_some_and(|lease| lease.fencing_epoch > 1) {
+                campaigned_again = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = release.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(10), run).await;
+        h.serving.abort();
+        assert!(
+            campaigned_again,
+            "after sitting out, a candidate nobody else displaced must campaign again"
+        );
+    }
+
+    /// #881, finding 3, end to end: the soak's shape with three real agents.
+    /// A, which cannot reach a quorum, takes the range first; B and C are
+    /// caught up and can promote at any epoch they win.
+    ///
+    /// Invariant (liveness, and no split-brain): a caught-up replica ends up
+    /// holding the range, and each epoch has one holder.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_candidate_that_cannot_reach_a_quorum_does_not_keep_the_range_from_caught_up_replicas(
+    ) {
+        let h = LeaseRaceHarness::start().await;
+        let config = race_config();
+        let (release_a, run_a) = h.agent(0, RACE_A, config, lagging_probe());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while h
+            .lease()
+            .await
+            .is_none_or(|lease| lease.holder_node_uuid != RACE_A)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "precondition: A takes the range"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let caught_up = |me: Uuid, other: Uuid| {
+            fixed(
+                vec![
+                    race_answer(me, Some(0)),
+                    race_answer(RACE_A, Some(0)),
+                    race_answer(other, Some(0)),
+                ],
+                3,
+            )
+        };
+        let (release_b, run_b) = h.agent(1, RACE_B, config, caught_up(RACE_B, RACE_C));
+        let (release_c, run_c) = h.agent(2, RACE_C, config, caught_up(RACE_C, RACE_B));
+
+        // Watched until a caught-up replica has held the range for two lease
+        // lifetimes (it is renewing, so it promoted), or 20 seconds.
+        let mut holders: Vec<(u64, Uuid)> = Vec::new();
+        let mut settled_since: Option<std::time::Instant> = None;
+        let watch_until = std::time::Instant::now() + Duration::from_secs(20);
+        while std::time::Instant::now() < watch_until {
+            if let Some(lease) = h.lease().await {
+                if holders.last() != Some(&(lease.fencing_epoch, lease.holder_node_uuid)) {
+                    holders.push((lease.fencing_epoch, lease.holder_node_uuid));
+                    settled_since =
+                        (lease.holder_node_uuid != RACE_A).then(std::time::Instant::now);
+                }
+                if settled_since.is_some_and(|since| since.elapsed() > 2 * config.lease_duration) {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        for release in [release_a, release_b, release_c] {
+            let _ = release.send(true);
+        }
+        for run in [run_a, run_b, run_c] {
+            let _ = tokio::time::timeout(Duration::from_secs(10), run).await;
+        }
+        h.serving.abort();
+
+        let mut by_epoch: std::collections::BTreeMap<u64, Uuid> = Default::default();
+        for (epoch, holder) in &holders {
+            let first = by_epoch.entry(*epoch).or_insert(*holder);
+            assert_eq!(first, holder, "two holders at epoch {epoch}: {holders:?}");
+        }
+        assert!(
+            holders
+                .last()
+                .is_some_and(|(_, holder)| *holder == RACE_B || *holder == RACE_C),
+            "a caught-up replica must end up holding the range; the holders seen, in order, \
+             were {holders:?} (A={RACE_A}, B={RACE_B}, C={RACE_C})"
         );
     }
 }
