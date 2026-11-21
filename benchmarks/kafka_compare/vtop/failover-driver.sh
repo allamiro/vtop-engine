@@ -93,7 +93,7 @@ producer_epoch: 1
 fencing_epoch: $1
 range: { topic: "bench", topic_epoch: 1, range_id: $RANGE_UUID, range_generation: 0 }
 server_name: "localhost"
-tls: { ca: /etc/vtop/tls/ca.pem, cert: /etc/vtop/tls/data-1.pem, key: /etc/vtop/tls/data-1-key.pem }
+tls: { ca: /etc/vtop/tls/ca.pem, cert: /etc/vtop/tls/client.pem, key: /etc/vtop/tls/client-key.pem }
 EOF
   echo "$path"
 }
