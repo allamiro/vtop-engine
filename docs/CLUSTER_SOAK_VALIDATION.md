@@ -74,6 +74,7 @@ an unplanned exit and started again, so one finding does not end the run.
 | **No acknowledged record was lost** | `check_history.py` finds the history valid: every acknowledged record seen at its offset (below the last read's log start, by the reads before it), none twice, none reordered, nothing visible that nobody wrote, nothing an earlier read saw rewritten later, the high watermark never back |
 | The producer kept acknowledging | at least half the offered records acknowledged |
 | The range was read throughout | reads at least half as often as scheduled, no gap over an hour, and the final read |
+| No read found the leader serving what the log forbids | no read stopped on a record served at or above the committed high watermark, offsets going backwards, or the watermark going back mid-read (`verify` gives up before it records such a read, so the driver marks it) |
 | **One leader per epoch** | no fencing epoch led by two data nodes (every `role=leader` the nodes logged, and every sample in which one said it leads), and no Raft term led by two metadata nodes (sampled) |
 | **Bounded memory and disk** | no growth trend in any node's memory or open files, or in a data directory, over the last 80% of the run (Theil-Sen within each process lifetime, the engine soak's fit; growth over both 5% and 32 MiB for memory, 5% and 16 files, 10% and 16 MiB for the data directory), and every data directory under 96 MiB and every node under 2 GiB |
 | **`vtopctl segment verify` clean on every replica** | every segment of all three data nodes verifies |

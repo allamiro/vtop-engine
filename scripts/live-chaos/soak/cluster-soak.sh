@@ -122,6 +122,10 @@ RECOVERY_TIMEOUT="$(field recovery_timeout_s)"
 # One read of the retained range takes seconds; a read that has not finished
 # in this long is stuck, not slow.
 READ_TIMEOUT="${CHAOS_SOAK_READ_TIMEOUT_SECONDS:-300}"
+# What `verify` says when the leader served something the log forbids
+# (crates/vtop-node/src/client.rs): a record at or above the committed high
+# watermark, offsets going backwards, the watermark going back mid-read.
+READ_INTEGRITY_ERRORS="exposed at or above committed high watermark|offset went backwards|committed high watermark regressed|passed the committed high watermark"
 TMPFS_MIB="$(field data_tmpfs_mib)"
 RETENTION_BYTES="$(field retention_bytes)"
 export CHAOS_MAX_SEGMENT_BYTES CHAOS_MAX_GROUP_BYTES CHAOS_MAX_RECORD_BYTES
@@ -374,8 +378,15 @@ read_once() {
     hwm="$(sed -n 's/.*high_watermark=\([0-9]*\).*/\1/p' "$out" | tail -1)"
     event read ok=true "node=data-$n" "epoch=$epoch" "start_offset=$start" "high_watermark=${hwm:-null}"
   else
+    # A read can fail because the cluster was busy (a refused fence, a
+    # dropped connection, the deadline above), or because what the leader
+    # served broke the log's promises; verify stops before it records the
+    # read then, so the second kind is marked here and fails the run (review
+    # of #881).
+    integrity=false
+    grep -qE "$READ_INTEGRITY_ERRORS" "$out" && integrity=true
     event read ok=false "node=data-$n" "epoch=$epoch" "start_offset=$start" \
-      "detail=$(json_string "$(tail -c 300 "$out")")"
+      "integrity=$integrity" "detail=$(json_string "$(tail -c 300 "$out")")"
   fi
   return $code
 }

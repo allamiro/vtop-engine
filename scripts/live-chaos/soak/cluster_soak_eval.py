@@ -142,6 +142,22 @@ def check_reads(profile: dict, events: list[dict]) -> Criterion:
     )
 
 
+def check_read_integrity(events: list[dict]) -> Criterion:
+    """No read was stopped by what the leader served: verify gives up before
+    it records such a read, so the history cannot judge it, and one bad read
+    among good ones is still a broken promise."""
+    bad = [e for e in events if e.get("kind") == "read" and e.get("integrity")]
+    return Criterion(
+        "read_integrity",
+        "no read found the leader serving what the log forbids",
+        not bad,
+        f"{len(bad)} read(s) stopped on a served record at or above the committed high watermark, "
+        "offsets going backwards or the watermark going back",
+        "0",
+        "; ".join(f"at {e['elapsed_s']:.0f} s from {e.get('node')}: {str(e.get('detail', ''))[-160:]}" for e in bad[:3]),
+    )
+
+
 def check_range_leaders(samples: list[dict], leaders: list[dict]) -> Criterion:
     """No fencing epoch led by two data nodes: from every `role=leader` the
     nodes logged, and from every sample in which a node said it leads."""
@@ -315,6 +331,7 @@ def evaluate(
         check_history(history),
         check_progress(profile, events, history),
         check_reads(profile, events),
+        check_read_integrity(events),
         check_range_leaders(samples, leaders),
         check_meta_leaders(samples),
         *check_trends(profile, samples),

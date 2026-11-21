@@ -237,6 +237,19 @@ class Evaluator(unittest.TestCase):
         ]
         self.assertEqual(failed(verdict(self.profile, self.run)), {"reads"})
 
+    def test_a_read_stopped_by_what_the_leader_served_fails_among_good_reads(self):
+        # Review of #881: verify stops before recording such a read, so only
+        # the driver's mark carries it.
+        self.run["events"].append({"elapsed_s": 301.0, "kind": "read", "ok": False, "integrity": True,
+                                   "node": "data-2", "detail": "record 812 was exposed at or above "
+                                   "committed high watermark 800"})
+        self.assertEqual(failed(verdict(self.profile, self.run)), {"read_integrity"})
+
+    def test_a_read_that_failed_for_want_of_a_leader_is_not_an_integrity_failure(self):
+        self.run["events"].append({"elapsed_s": 301.0, "kind": "read", "ok": False, "integrity": False,
+                                   "detail": "fetch rejected: Fenced"})
+        self.assertTrue(verdict(self.profile, self.run)["passed"])
+
     def test_a_stalled_producer_fails(self):
         self.run["history"]["acknowledged_records"] = 10
         self.assertEqual(failed(verdict(self.profile, self.run)), {"progress"})
