@@ -765,6 +765,77 @@ pub struct KafkaSourceConfig {
     pub sasl_password_env: Option<String>,
     #[serde(default)]
     pub ssl_ca_location: Option<String>,
+    /// Mutual TLS (#721): the PEM client certificate the engine presents to
+    /// the broker (librdkafka `ssl.certificate.location`). Set together with
+    /// `ssl_key_location`, and only over `SSL` or `SASL_SSL`.
+    #[serde(default)]
+    pub ssl_certificate_location: Option<String>,
+    /// The PEM private key of `ssl_certificate_location`
+    /// (`ssl.key.location`).
+    #[serde(default)]
+    pub ssl_key_location: Option<String>,
+    /// Env var *name* holding the passphrase of an encrypted
+    /// `ssl_key_location` (`ssl.key.password`; never the secret itself).
+    #[serde(default)]
+    pub ssl_key_password_env: Option<String>,
+}
+
+impl KafkaSourceConfig {
+    /// The mutual-TLS settings make sense together or not at all (#721): a
+    /// certificate without its key (or the reverse) would connect without a
+    /// client certificate, which a broker requiring one refuses with a TLS
+    /// error that does not name the setting; over a protocol without TLS the
+    /// certificate would never be sent; and a key passphrase with no key is
+    /// a typo. Each is refused at config load, naming the keys.
+    pub fn validate_mutual_tls(&self) -> Result<(), VtopError> {
+        let blank = |v: &Option<String>| v.as_deref().is_some_and(|s| s.trim().is_empty());
+        for (key, value) in [
+            ("ssl_certificate_location", &self.ssl_certificate_location),
+            ("ssl_key_location", &self.ssl_key_location),
+            ("ssl_key_password_env", &self.ssl_key_password_env),
+        ] {
+            if blank(value) {
+                return Err(VtopError::Config(format!(
+                    "sources.kafka.{key} is set but empty; give a value or remove the key"
+                )));
+            }
+        }
+        match (&self.ssl_certificate_location, &self.ssl_key_location) {
+            (None, None) => {
+                if self.ssl_key_password_env.is_some() {
+                    return Err(VtopError::Config(
+                        "sources.kafka.ssl_key_password_env is set without ssl_key_location; \
+                         the passphrase belongs to the client key mutual TLS presents"
+                            .into(),
+                    ));
+                }
+                return Ok(());
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(VtopError::Config(
+                    "sources.kafka.ssl_certificate_location and ssl_key_location are set \
+                     together or not at all: mutual TLS presents the certificate with its key"
+                        .into(),
+                ));
+            }
+            (Some(_), Some(_)) => {}
+        }
+        let tls = self
+            .security_protocol
+            .as_deref()
+            .is_some_and(|p| p.eq_ignore_ascii_case("ssl") || p.eq_ignore_ascii_case("sasl_ssl"));
+        if !tls {
+            return Err(VtopError::Config(format!(
+                "sources.kafka.ssl_certificate_location is set, but security_protocol is {}; \
+                 a client certificate is sent only over TLS: set security_protocol to SSL or \
+                 SASL_SSL",
+                self.security_protocol
+                    .as_deref()
+                    .map_or("not set (PLAINTEXT)".to_owned(), |p| format!("{p:?}"))
+            )));
+        }
+        Ok(())
+    }
 }
 
 fn default_group() -> String {
@@ -1791,6 +1862,7 @@ impl VtopConfig {
                     "kafka.bootstrap_servers must not be empty when kafka is enabled".into(),
                 ));
             }
+            k.validate_mutual_tls()?;
         }
         if self.upload.bucket.trim().is_empty() {
             return Err(VtopError::Config("upload.bucket must not be empty".into()));
@@ -2500,6 +2572,67 @@ upload:
         let cfg: VtopConfig = serde_yaml::from_str(yaml).unwrap();
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, VtopError::Config(_)));
+    }
+
+    /// #721: mutual TLS to the broker is a certificate and its key, over
+    /// TLS; anything else is refused at load, naming the keys.
+    #[test]
+    fn kafka_mutual_tls_is_a_certificate_and_its_key_over_tls() {
+        let load = |extra: &str| {
+            let yaml = format!(
+                "engine:\n  name: e\n  state_store: \"sqlite::memory:\"\n  work_dir: /tmp/w\n\
+                 batching: {{}}\ncompression: {{}}\nsources:\n  kafka:\n    enabled: true\n\
+                 \x20   bootstrap_servers: [\"kafka:9093\"]\n{extra}upload:\n  bucket: b\n"
+            );
+            let cfg: VtopConfig = serde_yaml::from_str(&yaml).unwrap();
+            cfg.validate().map_err(|e| e.to_string())
+        };
+        // Config lines, named by what they set (the case label is what a
+        // failure prints).
+        let crt_line = "    ssl_certificate_location: /etc/vtop/kafka/client.pem\n";
+        let key_line = "    ssl_key_location: /etc/vtop/kafka/client.key\n";
+        let ssl = "    security_protocol: SSL\n";
+        load(&format!("{ssl}{crt_line}{key_line}")).expect("a certificate and key over SSL");
+        load(&format!(
+            "    security_protocol: SASL_SSL\n{crt_line}{key_line}    ssl_key_password_env: KAFKA_KEY_PW\n"
+        ))
+        .expect("over SASL_SSL, with a key passphrase");
+        load("").expect("no mutual TLS at all");
+        for (case, extra, says) in [
+            (
+                "certificate only",
+                format!("{ssl}{crt_line}"),
+                "together or not at all",
+            ),
+            (
+                "key only",
+                format!("{ssl}{key_line}"),
+                "together or not at all",
+            ),
+            (
+                "no protocol",
+                format!("{crt_line}{key_line}"),
+                "not set (PLAINTEXT)",
+            ),
+            (
+                "SASL_PLAINTEXT",
+                format!("    security_protocol: SASL_PLAINTEXT\n{crt_line}{key_line}"),
+                "set security_protocol to SSL or SASL_SSL",
+            ),
+            (
+                "passphrase without a key",
+                format!("{ssl}    ssl_key_password_env: KAFKA_KEY_PW\n"),
+                "without ssl_key_location",
+            ),
+            (
+                "empty key path",
+                format!("{ssl}{crt_line}    ssl_key_location: \"\"\n"),
+                "ssl_key_location is set but empty",
+            ),
+        ] {
+            let err = load(&extra).expect_err(case);
+            assert!(err.contains(says), "{case}: {says:?} not in the refusal");
+        }
     }
 
     #[test]
