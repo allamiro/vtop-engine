@@ -124,6 +124,15 @@ pub(crate) const NEWER_FORMAT_WHATS: &[&str] = &[
     // entry from a newer leader.
     "lease presence",
     "joint marker",
+    // Inside kind 40 and the record of tag 26 (#706): the actor, the peer
+    // and the subject an attribution carries, and the outcome the tail
+    // records. A later level adds an actor kind (a declared user, say) or a
+    // subject (a membership change) by a new tag; a reader that predates it
+    // says "newer", not "corrupt".
+    "attribution actor",
+    "attribution peer",
+    "attribution subject",
+    "audit outcome",
 ];
 
 /// The `UnknownTag` `what`s this review does not classify as newer, each

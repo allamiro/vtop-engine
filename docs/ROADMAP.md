@@ -29,6 +29,37 @@ what each release does **not** yet do.
   reissue the ones that differ with `CN=<principal_id>`. The refusal is
   logged by the node and names the CN it saw.
 
+## Next minor release, v0.11.0 — the actor of a cluster command is committed in the replicated log
+
+- **[#706](https://github.com/allamiro/vtop-engine/issues/706)** — the
+  actor of an audited cluster command is committed in the replicated log,
+  from metadata feature level 9. The serving leader wraps the command in a new
+  command kind (40, `Attributed`) carrying the certificate identity it
+  verified, the address the connection came from, its own node id and its own
+  clock, so the actor and the command are one log entry on every replica. The
+  last 1024 such entries are kept in the cluster state (key category 23, value
+  tag 26) and travel in snapshots. Applying the entry does exactly what
+  applying the bare command did, and a retry never rewrites who acted. A
+  client cannot send an actor of its own: the admin endpoint refuses kind 40
+  before authorization, and audits the refusal. The wrapper is applied only to
+  commands the audit list already names, never to a node's own traffic (a data
+  node handing a range back); a certificate name over 128 bytes is refused
+  before anything is proposed. Reading the tail back, request ids for
+  bootstrap and membership, and the applied records' `requested_by` field are
+  the rest of #706.
+- **Upgrade note (#706, one-way): feature level 9.** Below level 9 nothing
+  changes: the leader proposes the bare command, byte for byte as before, and
+  logs once per term that the actor is recorded at the admin endpoint only.
+  Upgrade every metadata voter and data node, then
+  `vtopctl meta enable-features --level 9`; the raise is refused until every
+  metadata member and every counted data node supports 9, and it is permanent.
+  The raise itself is a bare entry: no kind-40 entry precedes it. A voter
+  older than this release cannot decode kind 40 and reads it as a newer
+  format, not as corruption; raising the level while one remains stalls that
+  voter (and the tier, if it is a majority) exactly as every earlier level
+  does. Level 9 adds a command kind, a key category and a record value tag,
+  none of which is written below it.
+
 ## v0.1.0 — a range that fails over
 
 Metadata leases, a lease agent on the data node, verified promotion, and the

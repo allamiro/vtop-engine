@@ -10,9 +10,10 @@ use uuid::Uuid;
 use vtop_log::env::{Env, OpenMode};
 use vtop_log::sim::SimStorage;
 use vtop_meta::{
-    AnswerLineage, CommandEnvelope, HardState, HardStateFile, MetaLog, MetaLogConfig, MetaLogEntry,
-    MetaLogPayload, MetaMembership, MetaNodeId, MetaSnapshots, MetaStateMachine, MetaStoreError,
-    MetadataCommand, PromotionOutcome, QuorumAnswer, LINEAGE_VERDICTS_FEATURE_LEVEL,
+    AnswerLineage, Attribution, CommandActor, CommandEnvelope, HardState, HardStateFile, MetaLog,
+    MetaLogConfig, MetaLogEntry, MetaLogPayload, MetaMembership, MetaNodeId, MetaSnapshots,
+    MetaStateMachine, MetaStoreError, MetadataCommand, PromotionOutcome, QuorumAnswer,
+    LINEAGE_VERDICTS_FEATURE_LEVEL,
 };
 
 const ROOT: &str = "/meta";
@@ -25,6 +26,43 @@ const GOLDEN_SET_FEATURE_LEVEL_HEX: &str = concat!(
     "00112233445566778899aabbccddee04", // request id
     "0102030405060708",                 // issued_at_ms
     "00000004",                         // feature level 4
+);
+
+/// Attributed (#706), derived by hand from the layout: kind 40, the actor
+/// (tag 1, a certificate name as a length-prefixed string), the peer (0: none),
+/// the vouching node and the leader's clock, the subject tag (1: a command),
+/// and the subject encoded as its own kind - here the SetFeatureLevel vector
+/// above.
+const GOLDEN_ATTRIBUTED_NAMED_HEX: &str = concat!(
+    "0028",                             // kind 40
+    "01",                               // actor: named
+    "0003",                             // name: 3 bytes
+    "6f7073",                           // "ops"
+    "00",                               // no peer
+    "0000000000000001",                 // vouched by meta node 1
+    "0102030405060708",                 // recorded_at_ms
+    "01",                               // subject: a command
+    "0024",                             // subject kind 36
+    "00112233445566778899aabbccddee04", // its request id
+    "0102030405060708",                 // its issued_at_ms
+    "00000004",                         // its feature level 4
+);
+
+/// The same wrapper for a data node asking from an IPv4 address: actor tag 2
+/// and the node's uuid, peer tag 4 and the four octets.
+const GOLDEN_ATTRIBUTED_NODE_V4_HEX: &str = concat!(
+    "0028",                             // kind 40
+    "02",                               // actor: a data node
+    "bbbbbbbb000000000000000000000031", // its uuid
+    "04",                               // peer: IPv4
+    "0a000001",                         // 10.0.0.1
+    "0000000000000002",                 // vouched by meta node 2
+    "0102030405060708",                 // recorded_at_ms
+    "01",                               // subject: a command
+    "0024",                             // subject kind 36
+    "00112233445566778899aabbccddee04", // its request id
+    "0102030405060708",                 // its issued_at_ms
+    "00000004",                         // its feature level 4
 );
 
 /// SetRangeReplicaSet (#553), derived by hand from the layout: kind 37, the
@@ -366,6 +404,59 @@ fn set_feature_level_command_matches_golden_vector() {
     let encoded = command.encode().unwrap();
     assert_eq!(to_hex(&encoded), GOLDEN_SET_FEATURE_LEVEL_HEX);
     assert_eq!(MetadataCommand::decode(&encoded).unwrap(), command);
+}
+
+fn set_feature_level_4() -> MetadataCommand {
+    MetadataCommand::SetFeatureLevel {
+        env: CommandEnvelope {
+            request_id: Uuid::parse_str("00112233-4455-6677-8899-aabbccddee04").unwrap(),
+            issued_at_ms: 0x0102_0304_0506_0708,
+        },
+        feature_level: 4,
+    }
+}
+
+/// #706: kind 40 is the SetFeatureLevel vector behind an actor, and nothing
+/// else about the subject moves: the subject's bytes are its own encoding.
+#[test]
+fn attributed_command_matches_golden_vectors() {
+    let named = MetadataCommand::Attributed {
+        attribution: Attribution {
+            actor: CommandActor::Named("ops".to_owned()),
+            peer: None,
+            vouched_by: 1,
+            recorded_at_ms: 0x0102_0304_0506_0708,
+        },
+        subject: Box::new(set_feature_level_4()),
+    };
+    let encoded = named.encode().unwrap();
+    assert_eq!(to_hex(&encoded), GOLDEN_ATTRIBUTED_NAMED_HEX);
+    assert_eq!(MetadataCommand::decode(&encoded).unwrap(), named);
+    assert!(
+        to_hex(&encoded).ends_with(GOLDEN_SET_FEATURE_LEVEL_HEX),
+        "the subject is carried as its own kind, byte for byte"
+    );
+    assert_eq!(
+        named.feature_level(),
+        9,
+        "gated: older voters cannot decode it"
+    );
+    assert_eq!(named.envelope(), set_feature_level_4().envelope());
+
+    let node = MetadataCommand::Attributed {
+        attribution: Attribution {
+            actor: CommandActor::Node(
+                Uuid::parse_str("bbbbbbbb-0000-0000-0000-000000000031").unwrap(),
+            ),
+            peer: Some("10.0.0.1".parse().unwrap()),
+            vouched_by: 2,
+            recorded_at_ms: 0x0102_0304_0506_0708,
+        },
+        subject: Box::new(set_feature_level_4()),
+    };
+    let encoded = node.encode().unwrap();
+    assert_eq!(to_hex(&encoded), GOLDEN_ATTRIBUTED_NODE_V4_HEX);
+    assert_eq!(MetadataCommand::decode(&encoded).unwrap(), node);
 }
 
 #[test]

@@ -14,7 +14,7 @@ use crate::raft::observation::{RaftObservation, RaftServerState};
 use crate::raft::store::MetaRaftStore;
 use crate::raft::type_config::{MetaRaftTypeConfig, NodeId};
 use crate::state::MetaValue;
-use crate::transport::admin::AdminHandler;
+use crate::transport::admin::{AdminHandler, ProposalCaller};
 use crate::transport::wire::{
     AdminGroupCursorView, AdminLeaseView, AdminRangeReplicaSetView, AdminReadGroupCursorResponse,
     AdminReadPromotionAttestationResponse, AdminReadRangeLeaseResponse,
@@ -209,6 +209,10 @@ pub struct OpenraftConsensus {
     /// it raises a level they must all implement (#706). `None` cannot ask,
     /// so such a raise is refused rather than taken on trust.
     member_probe: std::sync::RwLock<Option<std::sync::Arc<dyn MemberVersionProbe>>>,
+    /// The leader term in which an audited command was last proposed bare
+    /// because the cluster is below level 9 (#706): the operator is told
+    /// once per term, not once per command.
+    unattributed_noted_term: std::sync::atomic::AtomicU64,
 }
 
 /// Milliseconds since the Unix epoch, as the metadata leader sees them.
@@ -230,7 +234,98 @@ impl OpenraftConsensus {
             transition_mac_key: std::sync::RwLock::new(None),
             leader_clock: std::sync::RwLock::new(None),
             member_probe: std::sync::RwLock::new(None),
+            unattributed_noted_term: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// The command to replicate for `command` asked by `caller` (#706): the
+    /// command wrapped in its actor when this node is the leader, the
+    /// cluster's applied level is at least
+    /// [`crate::command::ATTRIBUTED_COMMANDS_FEATURE_LEVEL`], and the command
+    /// is one the log attributes ([`crate::audit::is_attributed_when_audited`]);
+    /// otherwise the command exactly as it was, which is every proposal below
+    /// that level.
+    ///
+    /// The applied level is a lower bound on the true level, so a leader that
+    /// lags can only leave a command bare, never wrap one early; and only a
+    /// leader wraps, because only a leader's word that it verified the
+    /// certificate counts. A follower that sees the level in force sends the
+    /// client to the leader ([`ConsensusError::NotLeader`]), which presents
+    /// its certificate there.
+    fn attribute(
+        &self,
+        command: MetadataCommand,
+        caller: &ProposalCaller,
+    ) -> ConsensusResult<MetadataCommand> {
+        use crate::command::{
+            Attribution, CommandActor, ATTRIBUTED_COMMANDS_FEATURE_LEVEL, MAX_ACTOR_NAME_BYTES,
+        };
+        use crate::transport::authz::AdminIdentity;
+        if !crate::audit::is_attributed_when_audited(&caller.identity, &command) {
+            return Ok(command);
+        }
+        let Some(store) = self.store.as_ref() else {
+            return Ok(command);
+        };
+        let metrics = self.raft.metrics().borrow().clone();
+        let enabled = store.with_storage(|storage| storage.state().feature_level());
+        // A follower that sees the level in force redirects instead of
+        // passing the command on bare. A role read before the write is a
+        // race: if this node won an election between the read and
+        // `client_write`, the bare command would commit with no actor (review
+        // of #850). The client asks the leader, which wraps it. Below the
+        // level there is nothing to wrap, so the redirect is `client_write`'s.
+        if metrics.state != ServerState::Leader {
+            if enabled >= ATTRIBUTED_COMMANDS_FEATURE_LEVEL {
+                return Err(ConsensusError::NotLeader {
+                    leader: metrics.current_leader.map(MetaNodeId),
+                });
+            }
+            return Ok(command);
+        }
+        if enabled < ATTRIBUTED_COMMANDS_FEATURE_LEVEL {
+            let term = metrics.current_term;
+            if self
+                .unattributed_noted_term
+                .swap(term, std::sync::atomic::Ordering::Relaxed)
+                != term
+            {
+                eprintln!(
+                    "audit: the cluster runs at feature level {enabled}, so the actor of an \
+                     operator command is recorded at the admin endpoint but not in the \
+                     replicated log. To record it durably, upgrade every metadata voter and \
+                     data node, then run vtopctl meta enable-features --level \
+                     {ATTRIBUTED_COMMANDS_FEATURE_LEVEL}"
+                );
+            }
+            return Ok(command);
+        }
+        let actor = match &caller.identity {
+            // Refused, not truncated: a record that names someone else is
+            // worse than none, and the command is not run unrecorded.
+            AdminIdentity::Named(name) if name.is_empty() || name.len() > MAX_ACTOR_NAME_BYTES => {
+                return Err(ConsensusError::Refused(format!(
+                    "refused: the certificate's common name is {} bytes and the replicated \
+                     audit record holds 1 to {MAX_ACTOR_NAME_BYTES}. Nothing was proposed and \
+                     the cluster is unchanged. Reissue the operator certificate with a \
+                     common name of that length",
+                    name.len()
+                )));
+            }
+            AdminIdentity::Named(name) => CommandActor::Named(name.clone()),
+            AdminIdentity::Node(node_uuid) => CommandActor::Node(*node_uuid),
+            AdminIdentity::MetaNode(id) => CommandActor::MetaNode(*id),
+            AdminIdentity::Anonymous => CommandActor::Anonymous,
+        };
+        Ok(MetadataCommand::Attributed {
+            attribution: Attribution {
+                actor,
+                peer: caller.peer,
+                vouched_by: metrics.id,
+                recorded_at_ms: self.leader_now_ms(),
+            },
+            subject: Box::new(command),
+        })
     }
 
     /// Ask the metadata members through `probe` before a raise to a level
@@ -1107,7 +1202,11 @@ impl Consensus for OpenraftConsensus {
     async fn propose(&self, command: MetadataCommand) -> ConsensusResult<CommitReceipt> {
         // A raise the metadata members must all implement is judged on
         // their own answers first (#706).
-        if let MetadataCommand::SetFeatureLevel { feature_level, .. } = &command {
+        //
+        // Looked at through the wrapper (#706): from level 9 an operator's
+        // later raise is attributed like any audited command, and must be
+        // judged on the members exactly as a bare one is.
+        if let MetadataCommand::SetFeatureLevel { feature_level, .. } = command.subject() {
             self.judge_members_for(*feature_level).await?;
         }
         // The feature gate (#554), judged before the command is replicated.
@@ -1372,6 +1471,17 @@ impl AdminHandler for OpenraftConsensus {
 
     async fn status(&self) -> TransportResult<AdminStatusResponse> {
         Consensus::status(self).await.map_err(to_transport_error)
+    }
+
+    async fn propose_as(
+        &self,
+        command: MetadataCommand,
+        caller: &ProposalCaller,
+    ) -> TransportResult<AdminProposeResponse> {
+        let command = self
+            .attribute(command, caller)
+            .map_err(to_transport_error)?;
+        AdminHandler::propose(self, command).await
     }
 
     async fn propose(&self, command: MetadataCommand) -> TransportResult<AdminProposeResponse> {

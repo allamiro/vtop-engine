@@ -41,10 +41,11 @@ pub mod versions;
 mod wire;
 
 pub use command::{
-    lease_skew_bound_ms, AnswerLineage, CommandEnvelope, MetadataCommand, MetadataError,
-    MetadataResponse, NodeState, PromotionAttestation, PromotionOutcome, PromotionRefusal,
-    QuorumAnswer, RangeAssignment, VerificationMethod, BASELINE_FEATURE_LEVEL,
-    LINEAGE_VERDICTS_FEATURE_LEVEL, MAX_ASSIGNED_RANGES, MAX_ATTESTATION_OPERATOR_BYTES,
+    lease_skew_bound_ms, AnswerLineage, Attribution, CommandActor, CommandEnvelope,
+    MetadataCommand, MetadataError, MetadataResponse, NodeState, PromotionAttestation,
+    PromotionOutcome, PromotionRefusal, QuorumAnswer, RangeAssignment, VerificationMethod,
+    ATTRIBUTED_COMMANDS_FEATURE_LEVEL, BASELINE_FEATURE_LEVEL, LINEAGE_VERDICTS_FEATURE_LEVEL,
+    MAX_ACTOR_NAME_BYTES, MAX_ASSIGNED_RANGES, MAX_ATTESTATION_OPERATOR_BYTES,
     MAX_ERROR_DETAIL_BYTES, MAX_NODE_ADDR_BYTES, MAX_RELEASE_BYTES, MAX_TIER_BACKEND_ID_BYTES,
     MAX_TIER_OBJECT_URI_BYTES, MAX_TIER_VERSION_ID_BYTES, MAX_TRANSITION_QUORUM,
     NODE_VERSION_REPORTS_FEATURE_LEVEL, PROMOTE_UNPROVEN_FEATURE_LEVEL, SUPPORTED_FEATURE_LEVEL,
@@ -64,12 +65,12 @@ pub use raft::{
     RaftPeerHandler, RaftServerState, ReadFence, TlsRaftNetworkFactory,
 };
 pub use state::{
-    ClusterConfigRecord, ConsumerGroupRecord, CursorCheckpointRecord, GrantKind,
-    GroupCursorPosition, GroupMemberRecord, GroupNameRecord, KeyRecord, KeyState, LeaseRecord,
-    MetaStateMachine, MetaValue, NodeRecord, RangeRecord, RangeReplicaSetRecord,
-    RangeTransitionRecord, RebalanceIntentRecord, ReplacementProofRecord, SegmentPlacementRecord,
-    SegmentRecord, SegmentState, TierCopyRecord, TopicNameRecord, TopicRecord,
-    TopicRetentionPolicyRecord, TransitionOutcome, DEDUP_CAPACITY,
+    AttributedOutcome, AuditEntryRecord, ClusterConfigRecord, ConsumerGroupRecord,
+    CursorCheckpointRecord, GrantKind, GroupCursorPosition, GroupMemberRecord, GroupNameRecord,
+    KeyRecord, KeyState, LeaseRecord, MetaStateMachine, MetaValue, NodeRecord, RangeRecord,
+    RangeReplicaSetRecord, RangeTransitionRecord, RebalanceIntentRecord, ReplacementProofRecord,
+    SegmentPlacementRecord, SegmentRecord, SegmentState, TierCopyRecord, TopicNameRecord,
+    TopicRecord, TopicRetentionPolicyRecord, TransitionOutcome, AUDIT_TAIL_ENTRIES, DEDUP_CAPACITY,
 };
 pub use storage::hardstate::{HardState, HardStateFile};
 pub use storage::log::{
@@ -83,8 +84,8 @@ pub use transport::{
     resolve_endpoint, AdminCandidate, AdminClient, AdminHandler, AdminLeaseView,
     AdminProposeResponse, AdminReadRangeLeaseRequest, AdminReadRangeLeaseResponse,
     AdminReadRangeTransitionsRequest, AdminReadRangeTransitionsResponse, AdminServer,
-    AdminStatusResponse, AdminTransitionView, PeerClient, PeerRpcHandler, PeerServer, TlsMaterial,
-    TransportError, TransportResult, VtpmFrame, WireLogId,
+    AdminStatusResponse, AdminTransitionView, PeerClient, PeerRpcHandler, PeerServer,
+    ProposalCaller, TlsMaterial, TransportError, TransportResult, VtpmFrame, WireLogId,
 };
 pub use versions::{
     describe_blockers, describe_member_blockers, member_blockers, ClusterVersions, FeatureBlocker,

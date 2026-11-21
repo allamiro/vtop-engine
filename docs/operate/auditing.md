@@ -93,8 +93,44 @@ ever added to version 1, and a reader ignores what it does not know.
 If an auditor needs more than a host login for a cluster change, run it
 through the admin endpoint over mTLS with one certificate per operator
 (`meta.adminAuthorization`): the edge record then names the certificate.
-The actor is recorded at the edge only; making it durable in the replicated
-log is a format change of its own, not part of this release.
+Below metadata feature level 9 the actor is recorded at the edge only: it
+lives in the serving node's log stream and audit file, not in the replicated
+log, so a node that loses its audit file leaves the applied records with no
+actor, and the leader says so once per term (`audit: the cluster runs at
+feature level 8 ...`).
+
+### The actor in the replicated log (feature level 9)
+
+From level 9 (`vtopctl meta enable-features --level 9`, after every metadata
+voter, data node and engine runs the release) the leader commits an audited
+operator command together with its actor, as one log entry. The actor is what
+the leader itself verified, never what the client declared:
+
+| Recorded | Meaning |
+|---|---|
+| The identity | The certificate's Common Name for an operator, the node uuid for a data node, the node id for a metadata node, or `anonymous` on a plaintext endpoint. A Common Name over 128 bytes is refused before anything is proposed: `refused: the certificate's common name is N bytes and the replicated audit record holds 1 to 128. Nothing was proposed and the cluster is unchanged. Reissue the operator certificate with a common name of that length.` |
+| The peer address | The address the leader saw the connection come from: no port, no host name. |
+| `vouched_by` | The metadata node that checked the certificate: the leader. |
+| The leader's clock | When it wrapped the command. Audit only: applying the entry never reads it. |
+| The command | Its request id, its kind and a digest of its bytes, so the actor stays bound to one command after the log is purged, and whether the state machine applied or rejected it. |
+
+The cluster state keeps the last 1024 such entries and a snapshot carries
+them, so a replica that restarts or installs a snapshot still knows who asked.
+A retry of a request that was already applied records nothing, so a second
+caller can never take credit for the first one's command. A client cannot send
+an actor: the admin endpoint refuses a command that arrives already attributed
+(`kind 40`), before authorization, and records the refusal.
+
+A node's own traffic is not attributed: a data node handing a range back
+(`ReleaseRangeLease` under a node certificate) is left bare, so a rolling
+restart of a node that holds hundreds of ranges cannot push operators' commands
+out of the 1024. An operator's own release is attributed. Commands committed
+before the raise to 9 have no actor in the log; their edge and applied records
+still name the request. The raise itself is committed bare.
+
+An older metadata voter cannot decode the entry: it reads kind 40 as a newer
+format ("written by a newer release ... downgrade is not supported"), not as
+corruption. Upgrade every voter before the raise.
 
 ## Where records go
 
