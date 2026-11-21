@@ -1310,6 +1310,18 @@ pub async fn cleanup_abandoned(
     backend: &dyn UploadBackend,
     cfg: &MultipartUploadConfig,
 ) -> Result<usize, VtopError> {
+    cleanup_abandoned_except(backend, cfg, &|_: &str| false).await
+}
+
+/// [`cleanup_abandoned`], leaving alone the sessions whose object key `live`
+/// says an upload in this process is still working on: a slow part, or its
+/// retries, can outlast the abandonment window, and the age of a session
+/// file says nothing about whether its upload is alive.
+pub async fn cleanup_abandoned_except(
+    backend: &dyn UploadBackend,
+    cfg: &MultipartUploadConfig,
+    live: &(dyn Fn(&str) -> bool + Sync),
+) -> Result<usize, VtopError> {
     let dir = &cfg.state_dir;
     if !dir.exists() {
         return Ok(0);
@@ -1348,7 +1360,7 @@ pub async fn cleanup_abandoned(
             }
         };
         let age = now.saturating_sub(session.updated_at_unix_secs);
-        if age < cfg.abandon_after_secs {
+        if age < cfg.abandon_after_secs || live(&session.object_uri) {
             continue;
         }
         // The session file is the ONLY record of the remote upload id

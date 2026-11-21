@@ -175,6 +175,37 @@ pub struct Pipeline<'a> {
     /// was not locked as configured (#709), owned by [`Engine`] and shared
     /// like `key_notices`.
     pub lock_fallbacks: Arc<LockFallbacks>,
+    /// Object keys a multipart upload is in progress for, in this process
+    /// (review of #895). Batches now upload while the run loop goes on, so
+    /// the abandoned-session sweep can run beside a live upload; it skips
+    /// these, whatever their session's age.
+    pub active_multipart: ActiveMultipart,
+}
+
+/// See [`Pipeline::active_multipart`].
+pub type ActiveMultipart = Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
+
+/// Marks one object key's multipart upload as live until dropped, however
+/// the upload ends.
+struct LiveMultipart {
+    keys: ActiveMultipart,
+    key: String,
+}
+
+impl LiveMultipart {
+    fn start(keys: &ActiveMultipart, key: &str) -> Self {
+        keys.lock().unwrap().insert(key.to_owned());
+        Self {
+            keys: Arc::clone(keys),
+            key: key.to_owned(),
+        }
+    }
+}
+
+impl Drop for LiveMultipart {
+    fn drop(&mut self) {
+        self.keys.lock().unwrap().remove(&self.key);
+    }
 }
 
 /// Rate limit for the object-key notices a setting repeats on every batch
@@ -1726,6 +1757,7 @@ impl<'a> Pipeline<'a> {
         let upload_result = if reused {
             None
         } else if multipart_used {
+            let _live = LiveMultipart::start(&self.active_multipart, &object_uri);
             let result = multipart::upload_resumable_with_report(
                 self.backend.as_ref(),
                 &mp_cfg,
@@ -2965,6 +2997,7 @@ pub struct Engine {
     /// Process-wide Object Lock fallback memory (#709); see
     /// [`Pipeline::lock_fallbacks`].
     lock_fallbacks: Arc<LockFallbacks>,
+    active_multipart: ActiveMultipart,
     /// Per-source accumulation buffers, keyed by `(source_type, source_name)`.
     pending: HashMap<(SourceType, String), PendingBuffer>,
     /// Set by a read cycle that returned any records; drives the adaptive
@@ -3101,6 +3134,7 @@ struct OwnedPipeline {
     key_notices: Arc<KeyNotices>,
     locked_buckets: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     lock_fallbacks: Arc<LockFallbacks>,
+    active_multipart: ActiveMultipart,
 }
 
 impl OwnedPipeline {
@@ -3117,6 +3151,7 @@ impl OwnedPipeline {
             key_notices: Arc::clone(&self.key_notices),
             locked_buckets: Arc::clone(&self.locked_buckets),
             lock_fallbacks: Arc::clone(&self.lock_fallbacks),
+            active_multipart: Arc::clone(&self.active_multipart),
         }
     }
 }
@@ -3471,6 +3506,7 @@ impl Engine {
             key_notices: Arc::default(),
             locked_buckets: Arc::default(),
             lock_fallbacks: Arc::default(),
+            active_multipart: Arc::default(),
             pending: HashMap::new(),
             cycle_had_data: false,
             cycle_had_failure: false,
@@ -3560,6 +3596,7 @@ impl Engine {
             key_notices: Arc::clone(&self.key_notices),
             locked_buckets: Arc::clone(&self.locked_buckets),
             lock_fallbacks: Arc::clone(&self.lock_fallbacks),
+            active_multipart: Arc::clone(&self.active_multipart),
         }
     }
 
@@ -3576,6 +3613,7 @@ impl Engine {
             key_notices: Arc::clone(&self.key_notices),
             locked_buckets: Arc::clone(&self.locked_buckets),
             lock_fallbacks: Arc::clone(&self.lock_fallbacks),
+            active_multipart: Arc::clone(&self.active_multipart),
         }
     }
 
@@ -4454,10 +4492,16 @@ impl Engine {
     async fn wait_for_inflight(&mut self, source_type: &SourceType, wait: Wait) {
         match wait {
             Wait::All => {
+                // Each handle stays in its entry until its task has
+                // finished (review of #895): a forced flush cancelled
+                // mid-wait (a second stop) must leave every running task
+                // where `Drop for Engine` can abort it.
                 if let Some(queue) = self.inflight.get_mut(source_type) {
                     for entry in queue.iter_mut() {
-                        if let Some(task) = entry.task.take() {
-                            entry.result = Some(joined(task.await));
+                        if let Some(task) = entry.task.as_mut() {
+                            let result = task.await;
+                            entry.task = None;
+                            entry.result = Some(joined(result));
                         }
                     }
                 }
@@ -5933,7 +5977,9 @@ impl Engine {
             &self.config.upload,
             std::path::PathBuf::from(&self.config.engine.work_dir),
         );
-        match multipart::cleanup_abandoned(self.backend.as_ref(), &mp_cfg).await {
+        let live = Arc::clone(&self.active_multipart);
+        let is_live = move |key: &str| live.lock().unwrap().contains(key);
+        match multipart::cleanup_abandoned_except(self.backend.as_ref(), &mp_cfg, &is_live).await {
             Ok(0) => 0,
             Ok(aborted) => {
                 if let Some(mx) = telemetry::metrics() {
@@ -8437,6 +8483,103 @@ mod tests {
             .unwrap_or_else(|_| panic!("round {round}: a finished batch was never seen"));
             engine.inflight.get_mut(&SourceType::File).unwrap().clear();
         }
+    }
+
+    /// Review of #895: a forced flush cancelled while it waits on a batch (a
+    /// second stop abandons the shutdown flush) leaves the batch's task in
+    /// its entry, so dropping the engine still aborts it. Taken out of the
+    /// entry before the wait, the task was detached and went on writing after
+    /// the engine was gone.
+    #[tokio::test]
+    async fn a_cancelled_flush_leaves_its_batches_for_the_engine_to_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, store, _input) = pipelined_file_engine(dir.path(), 2).await;
+        let _gate = store.gate("");
+        let flush = engine.run_source(SourceType::File, true);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), flush)
+                .await
+                .is_err(),
+            "the flush waits on the held upload"
+        );
+        assert!(Arc::strong_count(&store) > 2, "the batch task holds the store");
+        drop(engine);
+        for _ in 0..100 {
+            if Arc::strong_count(&store) == 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!(
+            "a batch task outlived its engine after the flush was cancelled: the store \
+             still has {} owners",
+            Arc::strong_count(&store)
+        );
+    }
+
+    /// Review of #895: the abandoned-multipart sweep can run while a batch
+    /// is still uploading, so a session whose upload is live in this process
+    /// is never swept, however old its file says it is.
+    #[tokio::test]
+    async fn the_multipart_sweep_skips_a_session_whose_upload_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let input = dir.path().join("idle.log");
+        std::fs::write(&input, "").unwrap();
+        let cfg = file_config(
+            work.to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        let mut engine = Engine::new(cfg.clone(), StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let backend = Arc::new(vtop_upload::MockBackend::new().with_part_fault(
+            2,
+            vtop_upload::PartFault::Reset,
+            usize::MAX,
+        ));
+        engine.backend = backend.clone();
+        let mut mp_cfg = MultipartUploadConfig::from_upload(&cfg.upload, work.clone());
+        mp_cfg.part_size_bytes = 1_000;
+        mp_cfg.part_attempts = 1;
+        let data = vec![7_u8; 3_000];
+        let file = dir.path().join("live");
+        std::fs::write(&file, &data).unwrap();
+        let digest = vtop_core::checksum::sha256_bytes(&data);
+        let fence = MultipartFence {
+            expected_segment_generation: 0,
+            fencing_epoch: 0,
+            content_digest_hex: digest.clone(),
+            content_digest_algorithm: "sha256".into(),
+            byte_length: 3_000,
+        };
+        let uri = "s3://telemetry-data/live.raw".to_owned();
+        multipart::upload_resumable(
+            backend.as_ref(),
+            &mp_cfg,
+            &file,
+            &uri,
+            Some(ObjectChecksum::new("sha256", &digest)),
+            fence.clone(),
+        )
+        .await
+        .expect_err("part 2 fails");
+        let path = work.join(multipart::session_file_name(&uri, &fence));
+        let mut session = multipart::load_session(&path).unwrap();
+        session.updated_at_unix_secs = 1;
+        multipart::save_session(&path, &session).unwrap();
+
+        // As old as a session gets, but its upload is live in this process.
+        let live = LiveMultipart::start(&engine.active_multipart, &uri);
+        assert_eq!(engine.sweep_abandoned_multipart().await, 0);
+        assert!(path.exists(), "a live upload's session was swept");
+        assert!(backend.has_pending_multipart(&session.object_uri, &session.upload_id));
+
+        drop(live);
+        assert_eq!(engine.sweep_abandoned_multipart().await, 1);
+        assert!(!path.exists(), "an abandoned session was kept once its upload ended");
     }
 
     /// The upload slots follow the width the controller chooses (#102). A
