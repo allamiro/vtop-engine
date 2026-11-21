@@ -385,6 +385,22 @@ def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) 
     first_seen_us: dict[int, int] = {
         offset: when for offset, (record, when) in shown.items() if visible.get(offset) == record
     }
+    # An acknowledgement accounts for a record only if some batch that
+    # claims it there was sent before a read first showed it (review of
+    # #878): a later write cannot explain a copy already visible.
+    sent_by: dict[int, int] = {}
+    for batch in acked:
+        for i in range(batch.count):
+            offset = batch.offset_of(i)
+            if claimed.get(offset, (None, None))[1] == (batch.identity(), batch.first_sequence + i):
+                sent_by[offset] = min(sent_by.get(offset, batch.time_us), batch.time_us)
+    for offset, sent in sorted(sent_by.items()):
+        seen = first_seen_us.get(offset)
+        if seen is not None and sent >= seen:
+            violations["phantom"].append(
+                f"offset {offset} was visible to a read before any batch acknowledged for it was "
+                f"sent ({claimed[offset][0].name()})"
+            )
 
     def task_of(group: list[int]) -> Task:
         return Task(

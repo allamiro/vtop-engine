@@ -386,6 +386,16 @@ class Violations(unittest.TestCase):
         h.read("r2", [(0, 0, 10), (10, 0, 10)], 20)
         self.assertFalse(h.check()["valid"])
 
+    def test_a_later_acknowledgement_does_not_explain_a_copy_seen_before_it_was_sent(self):
+        # Review of #878: the copy at 10..19 was visible before epoch 2 sent
+        # anything; its acknowledgement there cannot account for it.
+        h = History()
+        h.produce("produce:P:1:100", 1, 0, 10, "ok", 10, first_offset=0)
+        h.read("r1", [(0, 0, 10), (10, 0, 10)], 20)
+        h.produce("produce:P:2:200", 1, 0, 10, "ok", 20, first_offset=10)
+        h.read("r2", [(0, 0, 10), (10, 0, 10)], 20)
+        self.assertFalse(h.check()["valid"])
+
     def test_the_high_watermark_never_goes_back(self):
         h = History()
         h.produce("p", 1, 0, 10, "ok", 10)
