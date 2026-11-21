@@ -214,6 +214,22 @@ reported only when no assignment of whole batches accounts for the records. Offs
 (a promotion's boundary marker, #240) are gaps, not records, and are not
 counted against anything; `verify --max-offset-gaps` still bounds them.
 
+Known limits of the checker:
+
+- **The search has a budget.** When matching unanswered batches to a visible
+  run takes more than `SEARCH_BUDGET` (100,000) steps, the run is reported as
+  unexplained, a `phantom`, even if some assignment would account for it.
+  Example: thousands of overlapping unanswered batches from many producers
+  under one long visible run. Live scenarios leave a handful of unanswered
+  batches.
+- **A record is first seen when its read ends.** Each record is stamped with
+  the end of the first read that showed it, not with the moment that read
+  fetched it, so an unanswered batch sent while a read was running may
+  account for records that read had already fetched. Example: a read fetches
+  sequences 0..9 at offsets 10..19, then a producer sends 0..9 under a new
+  epoch, gets no answer, and the read ends. The copy is accepted as that
+  batch.
+
 The checker's own tests (`test_check_history.py`, run in the live-chaos job
 before the scenarios) build histories by hand, clean ones and ones shaped like
 #611, #261 and #641, and pin the verdict on each.
