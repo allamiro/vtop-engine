@@ -280,6 +280,25 @@ soak_sleep() {
 }
 
 # --- who leads -------------------------------------------------------------------
+# lib.sh's lease_field, bounded (review of #881): the admin client bounds its
+# connect but not the answer, so a metadata node that accepts and never
+# answers (paused, wedged) would hold the driver, which also runs the faults,
+# and keep it from trying the other two nodes.
+LEASE_READ_TIMEOUT="${CHAOS_SOAK_LEASE_READ_TIMEOUT_SECONDS:-10}"
+lease_field() { # <meta-id> <python expression over `d`>
+  local id="$1" expr="$2"
+  timeout --kill-after=2 "$LEASE_READ_TIMEOUT" \
+    "$VTOPCTL" --json meta range-lease --config "$(emit_admin_config "$id")" \
+    --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" 2> /dev/null \
+    | python3 -c "
+import json,sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+print($expr)
+" 2> /dev/null
+}
 # current_lease — "<holder-uuid> <epoch>" from whichever metadata node answers.
 current_lease() {
   local m holder epoch
