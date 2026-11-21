@@ -114,6 +114,16 @@ pub enum Command {
         /// exporter's textfile collector).
         #[arg(long)]
         metrics_file: Option<PathBuf>,
+        /// List at most this many unreferenced objects (#774: uploaded by a
+        /// failed, replay-required or superseded attempt, named by no
+        /// committed row). Counts and sizes cover all of them. 0 lists none.
+        #[arg(long, default_value_t = crate::coverage::DEFAULT_ORPHAN_LIMIT as u32,
+              value_parser = clap::value_parser!(u32).range(0..=100_000))]
+        orphans_limit: u32,
+        /// List unreferenced objects after this key: the `--orphans-after`
+        /// the previous page printed.
+        #[arg(long)]
+        orphans_after: Option<String>,
     },
     /// Read committed objects back and verify them again (#628). For each
     /// committed batch, in the ledger or in a prune digest: download the
@@ -936,6 +946,8 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             digest_dir,
             check_storage,
             metrics_file,
+            orphans_limit,
+            orphans_after,
         } => {
             let (cfg, streams) = load(config)?;
             init_tracing(
@@ -960,12 +972,20 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             } else {
                 None
             };
+            let orphans = crate::coverage::orphans(
+                &all,
+                &crate::coverage::OrphanOptions {
+                    limit: *orphans_limit as usize,
+                    after: orphans_after.clone(),
+                },
+            );
             let report = crate::coverage::AuditReport {
                 ledger_rows,
                 digest_rows,
                 digest_files,
                 units: crate::coverage::audit(all),
                 storage,
+                orphans,
             };
             if let Some(path) = metrics_file {
                 crate::coverage::write_textfile(
