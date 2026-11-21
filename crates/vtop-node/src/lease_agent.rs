@@ -3332,17 +3332,54 @@ impl LeaseAgent {
             (None, None) => return,
         };
         let was_published = recorded.is_some();
-        let proposal = self
-            .bounded(
-                "propose release",
-                self.admin.propose(MetadataCommand::ReleaseRangeLease {
+        // The release that names this node as the holder (#732): under an
+        // enforcing admin policy it is this node's to make, where the
+        // holder-less one is an operator's and was refused, leaving the
+        // lease to lapse on its deadline. A tier below its level (or one
+        // that predates it) refuses it before replicating anything, and
+        // then the holder-less release goes instead, which works wherever
+        // admin authorization is off - as it did before.
+        let budget = self.round_clock.budget(self.rpc_deadline());
+        let as_holder = tokio::time::timeout(
+            budget,
+            self.admin
+                .propose(MetadataCommand::ReleaseRangeLeaseAsHolder {
                     env: envelope(),
                     topic_uuid: self.topic_uuid,
                     range_uuid: self.range_uuid,
+                    holder_node_uuid: self.node_uuid,
                     expected_fencing_epoch: fencing_epoch,
                 }),
-            )
-            .await;
+        )
+        .await;
+        let proposal = match as_holder {
+            Ok(Err(error)) if vtop_meta::transport::refuses_holder_release(&error) => {
+                tracing::info!(
+                    range = %self.range_uuid,
+                    fencing_epoch,
+                    %error,
+                    "metadata cannot record a holder's own release yet (feature level below \
+                     {}); releasing with the holder-less form, which works where admin \
+                     authorization is off",
+                    vtop_meta::HOLDER_RELEASE_FEATURE_LEVEL
+                );
+                self.bounded(
+                    "propose release",
+                    self.admin.propose(MetadataCommand::ReleaseRangeLease {
+                        env: envelope(),
+                        topic_uuid: self.topic_uuid,
+                        range_uuid: self.range_uuid,
+                        expected_fencing_epoch: fencing_epoch,
+                    }),
+                )
+                .await
+            }
+            Ok(result) => result.map_err(|error| format!("propose release: {error}")),
+            Err(_) => Err(format!(
+                "propose release: no answer within {budget:?} (the round's budget is {:?})",
+                self.rpc_deadline()
+            )),
+        };
         match proposal {
             Ok(response) => match response.response {
                 MetadataResponse::Ack { .. } => tracing::info!(
@@ -5155,6 +5192,299 @@ mod tests {
 
     fn unused() -> vtop_meta::transport::TransportError {
         vtop_meta::transport::TransportError::Protocol("not served by this fake".into())
+    }
+
+    /// A metadata tier whose range is leased to `holder` at `epoch`. It
+    /// records every release it is asked for and refuses one above `level`
+    /// with the gate's `FeatureNotEnabled`, as a tier below that level does.
+    struct ReleasingTier {
+        level: u32,
+        holder: Uuid,
+        epoch: u64,
+        proposals: std::sync::Mutex<Vec<MetadataCommand>>,
+    }
+
+    #[async_trait::async_trait]
+    impl vtop_meta::AdminHandler for ReleasingTier {
+        async fn status(
+            &self,
+        ) -> vtop_meta::transport::TransportResult<vtop_meta::AdminStatusResponse> {
+            Ok(vtop_meta::transport::stub_status(vtop_meta::MetaNodeId(1)))
+        }
+        async fn propose(
+            &self,
+            command: MetadataCommand,
+        ) -> vtop_meta::transport::TransportResult<vtop_meta::transport::AdminProposeResponse>
+        {
+            self.proposals.lock().unwrap().push(command.clone());
+            let needed = command.feature_level();
+            if needed > self.level {
+                return Err(vtop_meta::transport::TransportError::Protocol(
+                    vtop_meta::ConsensusError::FeatureNotEnabled {
+                        needed,
+                        enabled: self.level,
+                    }
+                    .to_string(),
+                ));
+            }
+            Ok(vtop_meta::transport::AdminProposeResponse {
+                log_id: vtop_meta::transport::WireLogId { term: 1, index: 1 },
+                response: MetadataResponse::Ack { generation: 2 },
+            })
+        }
+        async fn init(
+            &self,
+            _members: Vec<u64>,
+        ) -> vtop_meta::transport::TransportResult<vtop_meta::transport::AdminMembershipResponse>
+        {
+            Err(unused())
+        }
+        async fn add_learner(
+            &self,
+            _node_id: u64,
+        ) -> vtop_meta::transport::TransportResult<vtop_meta::transport::AdminMembershipResponse>
+        {
+            Err(unused())
+        }
+        async fn change_membership(
+            &self,
+            _voters: Vec<u64>,
+            _retain: bool,
+        ) -> vtop_meta::transport::TransportResult<vtop_meta::transport::AdminMembershipResponse>
+        {
+            Err(unused())
+        }
+        async fn read_range_lease(
+            &self,
+            _request: vtop_meta::AdminReadRangeLeaseRequest,
+        ) -> vtop_meta::transport::TransportResult<AdminReadRangeLeaseResponse> {
+            Ok(AdminReadRangeLeaseResponse {
+                found: true,
+                range_generation: 1,
+                fencing_epoch: self.epoch,
+                lease: Some(AdminLeaseView {
+                    holder_node_uuid: self.holder,
+                    fencing_epoch: self.epoch,
+                    expires_at_ms: Some(i64::MAX),
+                }),
+                read_at_applied_index: 1,
+            })
+        }
+        async fn read_segment_placement(
+            &self,
+            _request: vtop_meta::transport::AdminReadSegmentPlacementRequest,
+        ) -> vtop_meta::transport::TransportResult<
+            vtop_meta::transport::AdminReadSegmentPlacementResponse,
+        > {
+            Err(unused())
+        }
+    }
+
+    /// A self-signed leaf naming `common_name`, valid for `localhost`.
+    fn leaf(
+        common_name: &str,
+    ) -> (
+        rustls::pki_types::CertificateDer<'static>,
+        rustls::pki_types::PrivatePkcs8KeyDer<'static>,
+    ) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, common_name);
+        let cert = params.self_signed(&key).unwrap();
+        (
+            cert.der().clone(),
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()),
+        )
+    }
+
+    /// An admin endpoint over mTLS in front of `tier`, under `authorizer`,
+    /// and a client for each of `clients` (certificate common names).
+    async fn tls_admin(
+        tier: Arc<ReleasingTier>,
+        authorizer: vtop_meta::transport::AdminAuthorizer,
+        clients: &[&str],
+    ) -> (Vec<AdminClient>, tokio::task::JoinHandle<()>) {
+        let server = leaf("1");
+        let clients: Vec<_> = clients.iter().map(|name| leaf(name)).collect();
+        let mut server_roots = rustls::RootCertStore::empty();
+        for (cert, _) in &clients {
+            server_roots.add(cert.clone()).unwrap();
+        }
+        let material = vtop_meta::TlsMaterial {
+            certificate_chain: vec![server.0.clone()],
+            private_key: server.1.clone_key().into(),
+            trust_roots: server_roots,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let admin = vtop_meta::AdminServer::with_authorization(
+            material,
+            tier as Arc<dyn vtop_meta::AdminHandler>,
+            authorizer,
+        )
+        .unwrap();
+        let serving = tokio::spawn(async move {
+            let _ = admin.serve(listener).await;
+        });
+        let clients = clients
+            .into_iter()
+            .map(|(cert, key)| {
+                let mut roots = rustls::RootCertStore::empty();
+                roots.add(server.0.clone()).unwrap();
+                AdminClient::with_candidates(
+                    vtop_meta::TlsMaterial {
+                        certificate_chain: vec![cert],
+                        private_key: key.into(),
+                        trust_roots: roots,
+                    },
+                    vec![vtop_meta::AdminCandidate {
+                        node_id: Some(vtop_meta::MetaNodeId(1)),
+                        endpoint,
+                        host: None,
+                        server_name: "localhost".to_owned(),
+                        plaintext: false,
+                    }],
+                )
+                .unwrap()
+            })
+            .collect();
+        (clients, serving)
+    }
+
+    /// #732: under an enforcing admin policy (no operators, so only node
+    /// certificates), a data node's shutdown hands its range back AT ONCE,
+    /// with the release that names it as the holder. Before, its only
+    /// release was the holder-less one, which the policy refused as an
+    /// operator's, and the lease lapsed on its deadline. Another node's
+    /// certificate is still refused that release, and never reaches
+    /// metadata.
+    #[tokio::test]
+    async fn under_an_enforcing_policy_a_shutdown_releases_the_nodes_own_lease_at_once() {
+        let node = Uuid::from_u128(0xa1);
+        let other = Uuid::from_u128(0xb2);
+        let tier = Arc::new(ReleasingTier {
+            level: vtop_meta::HOLDER_RELEASE_FEATURE_LEVEL,
+            holder: node,
+            epoch: 3,
+            proposals: std::sync::Mutex::new(Vec::new()),
+        });
+        let (mut clients, serving) = tls_admin(
+            Arc::clone(&tier),
+            vtop_meta::transport::AdminAuthorizer::with_operators([]),
+            &[&node.to_string(), &other.to_string()],
+        )
+        .await;
+        let intruder = clients.pop().unwrap();
+        let publisher = Arc::new(Recorder::default());
+        let mut agent = LeaseAgent::new(
+            clients.pop().unwrap(),
+            LeaseAgentConfig::default(),
+            node,
+            Uuid::from_u128(20),
+            Uuid::from_u128(21),
+            Arc::clone(&publisher) as Arc<dyn LeasePublisher>,
+            None,
+        )
+        .unwrap();
+        agent.state = LeaseState::Held { fencing_epoch: 3 };
+
+        let started = std::time::Instant::now();
+        agent.release().await;
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_secs(2),
+            "the release took {took:?}; it must not wait out anything"
+        );
+        let proposals = tier.proposals.lock().unwrap().clone();
+        assert_eq!(
+            proposals.len(),
+            1,
+            "exactly one release reached metadata past the policy: {proposals:?}"
+        );
+        assert!(
+            matches!(
+                &proposals[0],
+                MetadataCommand::ReleaseRangeLeaseAsHolder {
+                    holder_node_uuid,
+                    expected_fencing_epoch: 3,
+                    ..
+                } if *holder_node_uuid == node
+            ),
+            "{proposals:?}"
+        );
+        assert_eq!(*publisher.demoted.lock().unwrap(), vec![3]);
+
+        let refused = intruder
+            .propose(MetadataCommand::ReleaseRangeLeaseAsHolder {
+                env: envelope(),
+                topic_uuid: Uuid::from_u128(20),
+                range_uuid: Uuid::from_u128(21),
+                holder_node_uuid: node,
+                expected_fencing_epoch: 3,
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("unauthorized"), "{refused}");
+        assert_eq!(
+            tier.proposals.lock().unwrap().len(),
+            1,
+            "another node's release of this lease never reaches metadata"
+        );
+        serving.abort();
+    }
+
+    /// #732: a metadata tier below the holder release's level refuses it
+    /// before replicating anything, and the node releases with the
+    /// holder-less form instead - which works wherever admin authorization
+    /// is off, as it did before.
+    #[tokio::test]
+    async fn below_the_level_a_shutdown_releases_with_the_holder_less_form() {
+        let node = Uuid::from_u128(0xa1);
+        let tier = Arc::new(ReleasingTier {
+            level: vtop_meta::HOLDER_RELEASE_FEATURE_LEVEL - 1,
+            holder: node,
+            epoch: 3,
+            proposals: std::sync::Mutex::new(Vec::new()),
+        });
+        let (mut clients, serving) = tls_admin(
+            Arc::clone(&tier),
+            vtop_meta::transport::AdminAuthorizer::permissive(),
+            &[&node.to_string()],
+        )
+        .await;
+        let publisher = Arc::new(Recorder::default());
+        let mut agent = LeaseAgent::new(
+            clients.pop().unwrap(),
+            LeaseAgentConfig::default(),
+            node,
+            Uuid::from_u128(20),
+            Uuid::from_u128(21),
+            Arc::clone(&publisher) as Arc<dyn LeasePublisher>,
+            None,
+        )
+        .unwrap();
+        agent.state = LeaseState::Held { fencing_epoch: 3 };
+        agent.release().await;
+        let proposals = tier.proposals.lock().unwrap().clone();
+        assert!(
+            matches!(
+                proposals.as_slice(),
+                [
+                    MetadataCommand::ReleaseRangeLeaseAsHolder { .. },
+                    MetadataCommand::ReleaseRangeLease {
+                        expected_fencing_epoch: 3,
+                        ..
+                    },
+                ]
+            ),
+            "{proposals:?}"
+        );
+        assert_eq!(*publisher.demoted.lock().unwrap(), vec![3]);
+        serving.abort();
     }
 
     /// Review of #566: each page of the published-floor scan draws on the

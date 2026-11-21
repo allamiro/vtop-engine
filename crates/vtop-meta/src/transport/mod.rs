@@ -29,9 +29,9 @@ pub mod tls;
 pub mod wire;
 
 pub use admin::{
-    predates_cluster_versions_read, refuses_lineage_verdicts, refuses_promote_unproven,
-    refuses_version_report, resolve_endpoint, stub_status, AdminCandidate, AdminClient,
-    AdminHandler, AdminServer, ProposalCaller,
+    predates_cluster_versions_read, refuses_holder_release, refuses_lineage_verdicts,
+    refuses_promote_unproven, refuses_version_report, resolve_endpoint, stub_status,
+    AdminCandidate, AdminClient, AdminHandler, AdminServer, ProposalCaller,
 };
 pub use authz::{AdminAuthorizer, AdminIdentity, CommandClass, Refusal};
 pub use maybe_tls::{

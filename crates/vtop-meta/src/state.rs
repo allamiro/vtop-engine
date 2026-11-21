@@ -2245,7 +2245,19 @@ impl MetaStateMachine {
                 range_uuid,
                 expected_fencing_epoch,
                 ..
-            } => self.release_range_lease(*topic_uuid, *range_uuid, *expected_fencing_epoch),
+            } => self.release_range_lease(*topic_uuid, *range_uuid, None, *expected_fencing_epoch),
+            MetadataCommand::ReleaseRangeLeaseAsHolder {
+                topic_uuid,
+                range_uuid,
+                holder_node_uuid,
+                expected_fencing_epoch,
+                ..
+            } => self.release_range_lease(
+                *topic_uuid,
+                *range_uuid,
+                Some(*holder_node_uuid),
+                *expected_fencing_epoch,
+            ),
             MetadataCommand::SetFeatureLevel { feature_level, .. } => {
                 self.set_feature_level(*feature_level)
             }
@@ -3465,10 +3477,15 @@ impl MetaStateMachine {
         }
     }
 
+    /// Clear a range's lease. `holder` is the node a holder's own release
+    /// names (#732): it applies only while that node holds the lease, so a
+    /// node cannot release another's lease even at the right epoch. `None`
+    /// is the holder-less release, which names no one.
     fn release_range_lease(
         &mut self,
         topic_uuid: Uuid,
         range_uuid: Uuid,
+        holder: Option<Uuid>,
         expected_fencing_epoch: u64,
     ) -> MetadataResponse {
         let range_key = MetaKey::Range {
@@ -3485,10 +3502,18 @@ impl MetaStateMachine {
                 actual: range.fencing_epoch,
             });
         }
-        if range.lease.is_none() {
+        let Some(lease) = range.lease.as_ref() else {
             return reject(MetadataError::invalid_transition(
                 "range holds no lease to release",
             ));
+        };
+        if let Some(holder) = holder {
+            if lease.holder_node_uuid != holder {
+                return reject(MetadataError::invalid_transition(format!(
+                    "range lease is held by {}, not {holder}",
+                    lease.holder_node_uuid
+                )));
+            }
         }
         // Release clears the lease but never rewinds the fencing epoch.
         range.lease = None;
@@ -9319,6 +9344,77 @@ mod tests {
             MetadataResponse::Rejected(MetadataError::InvalidTransition(reason))
                 if reason.contains("lineage change")
         ));
+    }
+
+    /// #732: a holder's own release applies only while the named node holds
+    /// the lease at the named epoch. Another node naming itself, or naming
+    /// the holder at a stale epoch, changes nothing; the holder's release
+    /// clears the lease and keeps the epoch, as the holder-less release does.
+    #[test]
+    fn a_holder_release_clears_only_the_named_holders_lease() {
+        let (mut machine, node_a, topic_uuid, range_uuid) = leaseable_range(10);
+        let node_b = Uuid::from_u128(11);
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        let MetadataResponse::LeaseGranted { fencing_epoch } = acquire(
+            &mut machine,
+            3,
+            3,
+            1_000,
+            node_a,
+            topic_uuid,
+            range_uuid,
+            generation,
+            60_000,
+        ) else {
+            panic!("a lease for node a");
+        };
+        let release =
+            |index: u128, holder: Uuid, epoch: u64| MetadataCommand::ReleaseRangeLeaseAsHolder {
+                env: envelope(index),
+                topic_uuid,
+                range_uuid,
+                holder_node_uuid: holder,
+                expected_fencing_epoch: epoch,
+            };
+        assert!(
+            matches!(
+                machine.apply(4, &release(4, node_b, fencing_epoch)),
+                MetadataResponse::Rejected(MetadataError::InvalidTransition(reason))
+                    if reason == format!("range lease is held by {node_a}, not {node_b}")
+            ),
+            "another node's release"
+        );
+        assert!(
+            matches!(
+                machine.apply(5, &release(5, node_a, fencing_epoch + 1)),
+                MetadataResponse::Rejected(MetadataError::EpochMismatch { .. })
+            ),
+            "a stale or future epoch"
+        );
+        let held = range_of(&machine, topic_uuid, range_uuid);
+        assert_eq!(
+            held.lease.as_ref().map(|lease| lease.holder_node_uuid),
+            Some(node_a),
+            "nothing a refused release did may move the lease"
+        );
+        assert!(matches!(
+            machine.apply(6, &release(6, node_a, fencing_epoch)),
+            MetadataResponse::Ack { .. }
+        ));
+        let released = range_of(&machine, topic_uuid, range_uuid);
+        assert!(released.lease.is_none());
+        assert_eq!(
+            released.fencing_epoch, fencing_epoch,
+            "the epoch never rewinds"
+        );
+        assert_eq!(released.generation, held.generation + 1);
+        assert!(
+            matches!(
+                machine.apply(7, &release(7, node_a, fencing_epoch)),
+                MetadataResponse::Rejected(MetadataError::InvalidTransition(_))
+            ),
+            "nothing left to release"
+        );
     }
 
     /// The membership a gateway needs is made in one fenced step (#457 slice
