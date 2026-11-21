@@ -53,8 +53,10 @@ Shell changes are linted with the same pinned shellcheck CI uses, in two steps:
 # The same file lists CI lints — a shorter one gives a false green.
 docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.11.0 \
   docker/*.sh scripts/release-notes.sh scripts/k8s-smoke.sh \
-  scripts/e2e-smoke.sh scripts/upgrade-compat.sh scripts/traffic-snapshot.sh \
-  scripts/test-progress.sh scripts/check-naming.sh scripts/check-egress-claims.sh
+  scripts/k8s-forward.sh scripts/e2e-smoke.sh scripts/upgrade-compat.sh \
+  scripts/manifest-compat.sh scripts/ledger-compat.sh \
+  scripts/traffic-snapshot.sh scripts/test-progress.sh scripts/check-naming.sh \
+  scripts/check-egress-claims.sh scripts/kafka-broker.sh
 
 docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.11.0 \
   -x -P scripts/live-chaos/scenarios \
@@ -168,7 +170,7 @@ Do not add AI-assistant co-author trailers or "generated with" lines.
 
 ## Security
 
-Do not open a public issue for a vulnerability. Contact the maintainer
-directly, and give the version, the configuration, and what an attacker gains —
-the security model this engine holds itself to is written down in
-[docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md).
+Do not open a public issue for a vulnerability. [SECURITY.md](SECURITY.md)
+says how to report one privately, how fast you will hear back, and which
+versions receive fixes. The security model this engine holds itself to is
+written down in [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md).

@@ -3,6 +3,11 @@
 # leaves (CN = decimal Raft node id — the peer transport parses it), data-node
 # leaves (CN = broker UUID — the replica transport parses it), plus admin and
 # native-client leaves. ECDSA P-256, SAN DNS:localhost throughout.
+#
+# The native client leaf's CN is the principal it acts as: a data node admits a
+# native session only when the certificate's CN equals its `principal_id`.
+# Set NATIVE_CLIENT_CN to that principal's UUID; unset, the leaf keeps the name
+# "vtop-harness-client", which a node refuses.
 set -euo pipefail
 
 CERT_DIR="${1:?usage: gen-certs.sh <output-dir> <meta-ids...> -- <data-uuids...>}"
@@ -53,7 +58,7 @@ for uuid in "${DATA_UUIDS[@]}"; do
   index=$((index + 1))
 done
 mint admin "vtop-admin"
-mint client "vtop-harness-client"
+mint client "${NATIVE_CLIENT_CN:-vtop-harness-client}"
 
 rm -f leaf.ext ca.srl
 echo "certs_ready dir=$PWD meta=${#META_IDS[@]} data=${#DATA_UUIDS[@]}"

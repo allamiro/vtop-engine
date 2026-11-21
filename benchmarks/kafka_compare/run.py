@@ -21,10 +21,12 @@ import json
 import math
 import os
 import platform
+import plistlib
 import re
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from typing import Any
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -130,6 +132,100 @@ def volume_filesystem_command() -> list[str]:
             KAFKA_IMAGE, "-T", "/probe"]
 
 
+class HostDiskUnknown(Exception):
+    """The disk behind Docker's data could not be named; the message says what the probe saw."""
+
+
+def describe_macos_disk(path: str, info: Callable[[str], dict[str, Any]]) -> str:
+    """"<model>, SSD|HDD, <bus>, <filesystem>" of the physical disk under the volume holding `path`.
+    `info(device)` is `diskutil info -plist <device>` as a dict. Raises HostDiskUnknown, naming
+    what diskutil did or did not say, rather than record a guess."""
+    try:
+        volume = info(path)
+        stores = volume.get("APFSPhysicalStores") or []
+        device = stores[0]["APFSPhysicalStore"] if stores else volume["ParentWholeDisk"]
+        whole = info(device).get("ParentWholeDisk") or device
+        disk = info(whole)
+    except Exception as exc:
+        raise HostDiskUnknown(f"diskutil info for {path}: {exc}") from exc
+    model, solid = disk.get("MediaName"), disk.get("SolidState")
+    if not model or solid is None:
+        raise HostDiskUnknown(f"diskutil names no model or solid-state flag for {whole} (MediaName={model!r}, "
+                              f"SolidState={solid!r})")
+    return ", ".join((model, "SSD" if solid else "HDD", disk.get("BusProtocol") or "unknown bus",
+                      volume.get("FilesystemType") or "unknown filesystem"))
+
+
+def describe_linux_disk(findmnt: str, lsblk: Callable[[str], str]) -> str:
+    """The same for Linux. `findmnt` is `findmnt -no SOURCE,FSTYPE -T <Docker's data root>`; `lsblk(device)`
+    runs `lsblk -nsPo NAME,TYPE,MODEL,ROTA,TRAN <device>`, the device and every device under it, so the
+    walk reaches the disk through partitions, LVM and LUKS. The kernel's rotational flag is quoted as it
+    is (virtio and some RAID controllers report it wrongly), not turned into SSD or HDD."""
+    fields = findmnt.split()
+    if len(fields) < 2:
+        raise HostDiskUnknown(f"findmnt named no device and filesystem (it printed {findmnt.strip()!r})")
+    # btrfs prints the subvolume after the device: /dev/nvme0n1p3[/root].
+    source, fstype = re.sub(r"\[.*\]$", "", fields[0]), fields[1]
+    try:
+        listing = lsblk(source)
+    except Exception as exc:
+        raise HostDiskUnknown(f"lsblk {source}: {exc}") from exc
+    devices = [dict(re.findall(r'(\w+)="([^"]*)"', line)) for line in listing.splitlines() if line.strip()]
+    disks = [device for device in devices if device.get("TYPE") == "disk"]
+    if not disks:
+        raise HostDiskUnknown(f"lsblk shows no disk under {source} (types: {[d.get('TYPE') for d in devices]})")
+    disk = disks[0]
+    model = disk.get("MODEL", "").strip()
+    if not model:
+        raise HostDiskUnknown(f"lsblk names no model for {disk.get('NAME')} under {source}")
+    rota = {"0": "non-rotational (kernel flag)", "1": "rotational (kernel flag)"}.get(disk.get("ROTA", ""),
+                                                                                      "unknown rotation")
+    return ", ".join((model, rota, disk.get("TRAN") or "unknown bus", fstype))
+
+
+def docker_desktop_data_folder() -> str | None:
+    """Where Docker Desktop for Mac keeps its VM disk, if its settings say (the "Disk image location")."""
+    base = os.path.expanduser("~/Library/Group Containers/group.com.docker")
+    for name, key in (("settings-store.json", "DataFolder"), ("settings.json", "dataFolder")):
+        try:
+            with open(os.path.join(base, name), encoding="utf-8") as handle:
+                folder = json.load(handle).get(key)
+        except (OSError, ValueError, AttributeError):
+            continue
+        if folder:
+            return folder
+    return None
+
+
+def host_disk(docker_root: str) -> str:
+    """The disk behind Docker's data (schema 2, #600: every image's footer names it), or HostDiskUnknown."""
+    system = platform.system()
+    if system == "Darwin":
+        def info(device: str) -> dict[str, Any]:
+            return plistlib.loads(sh(["diskutil", "info", "-plist", device]).stdout.encode())
+        return describe_macos_disk(docker_desktop_data_folder() or "/", info)
+    if system == "Linux":
+        try:
+            findmnt = sh(["findmnt", "-no", "SOURCE,FSTYPE", "-T", docker_root]).stdout
+        except (RuntimeError, FileNotFoundError) as exc:
+            raise HostDiskUnknown(f"findmnt -T {docker_root}: {exc}") from exc
+        return describe_linux_disk(findmnt, lambda device: sh(["lsblk", "-nsPo", "NAME,TYPE,MODEL,ROTA,TRAN",
+                                                                device]).stdout)
+    raise HostDiskUnknown(f"no disk probe for {system}")
+
+
+def probe_host_disk() -> str:
+    """The host disk, before any image is pulled or built or any directory is made: a run whose disk
+    cannot be named would be refused by the report, so it is refused before it starts."""
+    try:
+        root = json.loads(sh(["docker", "info", "--format", "{{json .}}"]).stdout).get("DockerRootDir") or "/"
+        return host_disk(root)
+    except HostDiskUnknown as exc:
+        raise SystemExit(f"could not name the host disk behind Docker's data: {exc}. Every image's footer names "
+                         "it (environment.json schema 2), so the run is refused before it starts; fix the probe "
+                         "or the permission it needs and run again.") from exc
+
+
 def git(*args: str) -> str:
     return sh(["git", "-C", REPO, *args]).stdout.strip()
 
@@ -144,7 +240,8 @@ def dirty_build_inputs() -> list[str]:
     return [line for line in status.splitlines() if line.strip()]
 
 
-def capture_environment(run_id: str, matrix: dict[str, Any], vtop_image: str, limits: dict[str, str]) -> dict:
+def capture_environment(run_id: str, matrix: dict[str, Any], vtop_image: str, limits: dict[str, str],
+                        disk: str) -> dict:
     info = json.loads(sh(["docker", "info", "--format", "{{json .}}"]).stdout)
     version = json.loads(sh(["docker", "version", "--format", "{{json .}}"]).stdout)
     kafka_inspect = json.loads(sh(["docker", "image", "inspect", KAFKA_IMAGE]).stdout)[0]
@@ -171,6 +268,8 @@ def capture_environment(run_id: str, matrix: dict[str, Any], vtop_image: str, li
         # Device and type only: the usage columns change run to run and would
         # make every run's fingerprint different.
         "volume_filesystem": " ".join(volume_fs[-1].split()[:2]) if volume_fs else "unknown",
+        # The host's disk under Docker's data (schema 2): model, SSD or HDD, bus, filesystem.
+        "host_disk": disk,
         "node_limits": limits,
         "client_limits": {"cpus": CLIENT_CPUS, "memory": CLIENT_MEMORY, "heap": CLIENT_HEAP},
         "kafka_image": KAFKA_IMAGE,
@@ -186,6 +285,10 @@ def capture_environment(run_id: str, matrix: dict[str, Any], vtop_image: str, li
         "consumer_props": list(CONSUMER_PROPS),
     }
     return {
+        "schema_version": schema.SCHEMA_VERSION,
+        # Which generator draws it (failover.py overwrites it). Recorded from schema 2 on, so a
+        # schema-2 run never needs its kind guessed from the files in its directory.
+        "kind": "throughput",
         "run_id": run_id,
         "run_state": "running",
         "started_at": utc_now(),
@@ -689,6 +792,7 @@ def main(argv: list[str] | None = None) -> int:
         running = sh(["docker", "ps", "-q", "--filter", f"label=com.docker.compose.project=kc-{system}"]).stdout
         if running.strip():
             raise SystemExit(f"kc-{system} is already running; stop it first (one system at a time, rule 1)")
+    disk = probe_host_disk()
     sh(["docker", "pull", "-q", KAFKA_IMAGE], timeout=1800)
     vtop_image = ensure_vtop_image(args.rebuild)
 
@@ -697,7 +801,7 @@ def main(argv: list[str] | None = None) -> int:
     if os.path.exists(run_dir):
         raise SystemExit(f"{run_dir} exists; runs never overwrite each other")
     os.makedirs(run_dir)
-    env = capture_environment(run_id, matrix, vtop_image, limits)
+    env = capture_environment(run_id, matrix, vtop_image, limits, disk)
     ctx = {"run_id": run_id, "run_dir": run_dir, "csv": os.path.join(run_dir, "results.csv"), "env": env,
            "fingerprint": schema.fingerprint(env), "vtop_image": vtop_image, "reps": args.reps,
            "sat_records": sat_records, "fixed_seconds": args.fixed_seconds,

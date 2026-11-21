@@ -295,6 +295,53 @@ mod tests {
         opener.join().unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "xy");
     }
+
+    /// #619, the spike the late-open tests in `file_source` stand on. An
+    /// `O_PATH` descriptor is a path lookup that has resolved to the inode
+    /// and has not opened it: the kernel does not count it against a lease,
+    /// and an open through it later (`/proc/self/fd/N`) is an open of that
+    /// inode, wherever its name has gone since. So it is an open that
+    /// resolved the path BEFORE a rename and reaches the lease AFTER it -
+    /// the stalled open the delete's grace is for - with no timing to guess.
+    /// Run on tmpfs, ext4 and overlay by pointing `TMPDIR` at each.
+    #[test]
+    fn an_o_path_descriptor_is_not_counted_by_a_lease_and_an_open_through_it_breaks_it() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, "x").unwrap();
+        let resolved = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH)
+            .open(&path)
+            .unwrap();
+        let mine = File::open(&path).unwrap();
+        let lease =
+            leased(&mine).expect("the lease was refused: an O_PATH descriptor counted as an open");
+        let moved = dir.path().join("moved");
+        std::fs::rename(&path, &moved).unwrap();
+        let through = format!("/proc/self/fd/{}", resolved.as_raw_fd());
+        let opener = std::thread::spawn(move || {
+            let mut w = std::fs::OpenOptions::new()
+                .append(true)
+                .open(through)
+                .unwrap();
+            w.write_all(b"y").unwrap();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while lease.intact() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            !lease.intact(),
+            "an open through an O_PATH descriptor taken before the rename did not break the \
+             lease"
+        );
+        drop(lease);
+        opener.join().unwrap();
+        assert_eq!(std::fs::read_to_string(&moved).unwrap(), "xy");
+    }
 }
 
 /// Off Linux there is no lease, so a writer that holds the file open cannot

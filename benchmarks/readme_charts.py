@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The README's evidence charts, drawn from committed measurements only.
 
-    python3 -m pip install -r benchmarks/kafka_compare/requirements-report.txt
+    python3 -m pip install --require-hashes -r benchmarks/kafka_compare/requirements-report.txt
     python3 benchmarks/readme_charts.py
     git status --porcelain -- docs/assets/readme/      # what CI does next: empty means no drift
 
@@ -43,7 +43,7 @@ from typing import Any
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
 
-from kafka_compare import failover_report, failover_schema, report, schema  # noqa: E402
+from kafka_compare import colours, failover_report, failover_schema, footer, report, schema  # noqa: E402
 from kafka_compare import regenerate as kc_regenerate  # noqa: E402
 from kafka_compare.failover_stats import FAULT_LABELS  # noqa: E402
 
@@ -54,14 +54,16 @@ POLICED = "benchmarks/measurements/663-policed-uplink/runs.csv"
 THROUGHPUT_RUN = "benchmarks/kafka_compare/results/20261109T232328Z"
 FAILOVER_RUN = "benchmarks/kafka_compare/results/failover-20261111T032549Z"
 
-# Categorical slots 1 and 2 of the reference palette, light and dark steps,
-# validated (CVD and contrast) against GitHub's light #ffffff and dark #0d1117
-# page backgrounds. The images are transparent, so the page shows through.
+# The system colours come from the registry in kafka_compare/colours.py:
+# categorical slots 1 and 2, light and dark steps of the same hues, validated
+# (CVD and contrast) against GitHub's light #ffffff and dark #0d1117 page
+# backgrounds. The images are transparent, so the page shows through.
 THEMES: dict[str, dict[str, str]] = {
-    "light": {"ink": "#0b0b0b", "ink2": "#52514e", "grid": "#e1e0d9", "axis": "#c3c2b7",
-              "s1": "#2a78d6", "s2": "#eb6834", "muted": "#898781"},
-    "dark": {"ink": "#f0efec", "ink2": "#c3c2b7", "grid": "#30363d", "axis": "#484f58",
-             "s1": "#3987e5", "s2": "#d95926", "muted": "#898781"},
+    mode: {**neutrals, "s1": colours.colour("kafka", mode), "s2": colours.colour("vtop", mode)}
+    for mode, neutrals in (
+        ("light", {"ink": "#0b0b0b", "ink2": "#52514e", "grid": "#e1e0d9", "axis": "#c3c2b7", "muted": "#898781"}),
+        ("dark", {"ink": "#f0efec", "ink2": "#c3c2b7", "grid": "#30363d", "axis": "#484f58", "muted": "#898781"}),
+    )
 }
 
 FAULT_ORDER = ("kill9_leader", "stop_leader", "partition_leader")
@@ -75,7 +77,7 @@ class Refused(Exception):
 
 
 def _read_csv(rel: str, repo: str = REPO) -> list[dict[str, str]]:
-    with open(os.path.join(repo, rel), newline="") as handle:
+    with open(os.path.join(repo, rel), newline="", encoding="utf-8") as handle:
         return list(csv.DictReader(handle))
 
 
@@ -152,6 +154,7 @@ def failover(repo: str = REPO) -> dict[str, Any]:
     if len(per_cell) != 1:
         raise Refused(f"{FAILOVER_RUN}: repetitions per fault and system differ ({sorted(per_cell)})")
     return {
+        "environment": run.environment,
         "cells": cells,
         "per_fault": per_fault,
         "per_cell": per_cell.pop(),
@@ -178,7 +181,7 @@ def throughput(repo: str = REPO) -> dict[str, Any]:
             cells[(size, system, "rps")] = report.cell_summary(run.rows, system, "saturation", size,
                                                                "records_per_sec")["summary"]
     return {"sizes": sizes, "cells": cells, "cpus": run.environment["comparable"]["node_limits"]["cpus"],
-            "repetitions": run.environment["matrix"]["repetitions"]}
+            "repetitions": run.environment["matrix"]["repetitions"], "environment": run.environment}
 
 
 def facts(repo: str = REPO) -> dict[str, str]:
@@ -270,12 +273,29 @@ def _header(fig, theme, height_in: float, title: str, subtitle: str) -> None:
              linespacing=1.4)
 
 
+# Characters per footer line at 7 pt across a 9 in figure.
+FOOTER_WIDTH = 150
+FOOTER_LINE_IN = 0.125
+
+
+def _wrap(text: str) -> str:
+    return footer.wrap(text, FOOTER_WIDTH)
+
+
+def footer_height(text: str) -> float:
+    """Inches the wrapped footer takes, so each chart can make room for it."""
+    return FOOTER_LINE_IN * (_wrap(text).count("\n") + 1)
+
+
 def _footer(fig, theme, text: str) -> None:
-    fig.text(0.012, 0.015, text, fontsize=7, color=theme["ink2"], ha="left", va="bottom")
+    fig.text(0.012, 0.015, _wrap(text), fontsize=7, color=theme["ink2"], ha="left", va="bottom", linespacing=1.4)
+    fig._vtop_footer = text  # what _save writes into the image's description
 
 
 def _save(fig, path: str) -> str:
-    fig.savefig(path, format="svg", metadata={"Date": None, "Creator": None})
+    # The footer goes into the SVG's dc:description too: the glyphs are paths.
+    metadata = footer.metadata(getattr(fig, "_vtop_footer", ""), "svg")
+    fig.savefig(path, format="svg", metadata=metadata)
     return path
 
 
@@ -388,9 +408,12 @@ def policed_chart(plt, theme, data) -> Any:
 
 
 def failover_chart(plt, theme, data) -> Any:
-    width_in, height_in = 9.0, 3.9
+    text = (f"Data: {FAILOVER_RUN}/failover.csv. Dot: median; line: min-max; the two clients are different "
+            "programs.\n" + footer.footer_text(data["environment"]))
+    extra = footer_height(text)
+    width_in, height_in = 9.0, 3.75 + extra
     fig, ax = plt.subplots(figsize=(width_in, height_in))
-    fig.subplots_adjust(left=0.25, right=0.8, top=1 - 1.25 / height_in, bottom=0.8 / height_in)
+    fig.subplots_adjust(left=0.25, right=0.8, top=1 - 1.25 / height_in, bottom=(0.65 + extra) / height_in)
     _axes(ax)
     ax.grid(axis="x")
     styles = {"kafka": ("Apache Kafka (JVM client)", theme["s1"], "o"),
@@ -425,15 +448,17 @@ def failover_chart(plt, theme, data) -> Any:
     _header(fig, theme, height_in, "Failover: Kafka resumes sooner; neither lost an acknowledged record",
             f"{data['repetitions']} leader failovers under load, {data['per_cell']} per fault per system, "
             f"three nodes each, {data['acked']:,} acknowledged records read back.")
-    _footer(fig, theme, f"Data: {FAILOVER_RUN}/failover.csv (#597). Single host, Docker Desktop; "
-            "the two clients are different programs.")
+    _footer(fig, theme, text)
     return fig
 
 
 def throughput_chart(plt, theme, data) -> Any:
-    width_in, height_in = 9.0, 3.8
+    text = (f"Data: {THROUGHPUT_RUN}/results.csv. Bar: median of {data['repetitions']} repetitions; whisker: "
+            "min-max.\n" + footer.footer_text(data["environment"]))
+    extra = footer_height(text)
+    width_in, height_in = 9.0, 3.65 + extra
     fig, ax = plt.subplots(figsize=(width_in, height_in))
-    fig.subplots_adjust(left=0.075, right=0.985, top=1 - 1.25 / height_in, bottom=0.8 / height_in)
+    fig.subplots_adjust(left=0.075, right=0.985, top=1 - 1.25 / height_in, bottom=(0.65 + extra) / height_in)
     _axes(ax)
     ax.grid(axis="y")
     styles = {"kafka": ("Apache Kafka", theme["s1"]), "vtop": ("VTOP (Kafka gateway)", theme["s2"])}
@@ -465,8 +490,7 @@ def throughput_chart(plt, theme, data) -> Any:
     _header(fig, theme, height_in, "Produce throughput: Apache Kafka is an order of magnitude ahead",
             f"Same JVM producer, acks=all, three nodes each at {data['cpus']} CPUs. "
             "A VTOP ack waits for fsync on 2 of 3 replicas; Kafka's, as shipped, does not.")
-    _footer(fig, theme, f"Data: {THROUGHPUT_RUN}/results.csv (#596). Bar: median of {data['repetitions']} "
-            "repetitions; whisker: min-max. Single host, Docker Desktop.")
+    _footer(fig, theme, text)
     return fig
 
 

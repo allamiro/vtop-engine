@@ -57,9 +57,13 @@ How the chart generators stay trustworthy:
 To add a chart or a measured page:
 1. Commit the measurement files first, with their environment record (the substantiation rule: conditions beside every number).
 2. Extend the generator, never a hand-drawn image. Add its facts to `facts()` and to the test.
-3. Run `python3 -m pip install -r benchmarks/kafka_compare/requirements-report.txt`, then the generator, then `git status --porcelain -- docs/benchmarks/ docs/assets/readme/`; commit what it wrote.
+3. Run `python3 -m pip install --require-hashes -r benchmarks/kafka_compare/requirements-report.txt`, then the generator, then `git status --porcelain -- docs/benchmarks/ docs/assets/readme/`; commit what it wrote.
 4. In the README, use a `<picture>` with the light and dark SVG so both GitHub themes work; add the page to `mkdocs.yml` `nav` if it is a page.
 5. Say in the PR which command regenerates it and that CI's drift step passed on the exact head.
+
+## The threat map is hand-written and checked
+
+`docs/SECURITY_MODEL.md` section 17 maps each threat to a control and a test as `path::symbol` references. `scripts/check-threat-map.py` runs in the `claims` job of `ci.yml` (every pull request, so a test renamed in a crate fails it, not only a docs change) and fails when a named file, function or test is gone or `#[ignore]`d, when a group of rows is missing, or when the gaps table disagrees with the rows. Rename a control or a test, and you edit its row in the same PR. `--lines` prints the current `file:line` of each reference. A threat with no control or no test is a GAP in its cell and a row in the gaps table, not an issue.
 
 ## Adding a page: checklist
 

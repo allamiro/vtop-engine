@@ -58,10 +58,10 @@ pub use placement::{
     DEFAULT_PLACEMENT_WEIGHT, MAX_FAILURE_DOMAIN_BYTES, MAX_REPLICAS, MIN_PLACEMENT_WEIGHT,
 };
 pub use raft::{
-    start_meta_node, CommitReceipt, Consensus, ConsensusError, ConsensusResult, MetaNode,
-    MetaNodeTimers, MetaRaftLogStore, MetaRaftStateMachine, MetaRaftStore, MetaRaftTypeConfig,
-    OpenraftConsensus, PeerDirectory, PeerEndpoint, RaftObservation, RaftPeerHandler,
-    RaftServerState, ReadFence, TlsRaftNetworkFactory,
+    start_meta_node, CommitReceipt, Consensus, ConsensusError, ConsensusResult, MemberVersionProbe,
+    MetaNode, MetaNodeTimers, MetaRaftLogStore, MetaRaftStateMachine, MetaRaftStore,
+    MetaRaftTypeConfig, OpenraftConsensus, PeerDirectory, PeerEndpoint, RaftObservation,
+    RaftPeerHandler, RaftServerState, ReadFence, TlsRaftNetworkFactory,
 };
 pub use state::{
     ClusterConfigRecord, ConsumerGroupRecord, CursorCheckpointRecord, GrantKind,
@@ -87,6 +87,8 @@ pub use transport::{
     TransportError, TransportResult, VtpmFrame, WireLogId,
 };
 pub use versions::{
-    describe_blockers, ClusterVersions, FeatureBlocker, NodeVersionEntry, NodeVersionRecord,
+    describe_blockers, describe_member_blockers, member_blockers, ClusterVersions, FeatureBlocker,
+    MemberBlocker, MemberVersion, NodeVersionEntry, NodeVersionRecord,
+    FIRST_MEMBER_CHECKED_FEATURE_LEVEL,
 };
 pub use wire::CodecError;

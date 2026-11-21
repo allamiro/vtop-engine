@@ -177,10 +177,10 @@ impl MetaMembership {
                     }
                     Some(outgoing)
                 }
-                _ => {
-                    return Err(CodecError::InvalidValue {
+                other => {
+                    return Err(CodecError::UnknownTag {
                         what: "joint marker",
-                        reason: "expected 1",
+                        tag: u32::from(other),
                     })
                 }
             }
@@ -329,6 +329,9 @@ fn parse_frame(bytes: &[u8], position: usize) -> FrameParse {
         },
         ENTRY_KIND_MEMBERSHIP => match MetaMembership::decode(payload_bytes) {
             Ok(membership) => MetaLogPayload::Membership(membership),
+            Err(error) if super::is_newer_format(&error) => {
+                return FrameParse::Newer(format!("entry payload: {error}"))
+            }
             Err(error) => {
                 return FrameParse::Corrupt(format!("invalid membership payload: {error}"));
             }
@@ -1015,6 +1018,61 @@ mod newer_format_tests {
             matches!(parse_frame(&garbage, 0), FrameParse::Corrupt(_)),
             "a truncated payload is damage, not a newer release"
         );
+    }
+
+    /// A membership with a joint-config marker this build does not know
+    /// (only 1 exists) was written by a newer release: newer, not corrupt,
+    /// in a log frame and wherever else a membership is decoded (#743).
+    #[test]
+    fn an_unknown_joint_marker_in_a_membership_is_newer() {
+        let mut payload = MetaMembership {
+            voters: vec![MetaNodeId(1)],
+            learners: Vec::new(),
+            joint_outgoing: Some(vec![MetaNodeId(2)]),
+        }
+        .encode()
+        .unwrap();
+        let single = MetaMembership {
+            voters: vec![MetaNodeId(1)],
+            learners: Vec::new(),
+            joint_outgoing: None,
+        }
+        .encode()
+        .unwrap();
+        // The joint config appends its marker right after the single one.
+        assert_eq!(payload[single.len()], 1, "the joint marker moved");
+        payload[single.len()] = 0x7f;
+        let error = MetaMembership::decode(&payload).unwrap_err();
+        assert_eq!(
+            error,
+            CodecError::UnknownTag {
+                what: "joint marker",
+                tag: 0x7f
+            }
+        );
+        assert!(super::super::is_newer_format(&error));
+
+        let entry = MetaLogEntry {
+            term: 1,
+            index: 1,
+            payload: MetaLogPayload::Membership(MetaMembership {
+                voters: vec![MetaNodeId(1)],
+                learners: Vec::new(),
+                joint_outgoing: Some(vec![MetaNodeId(2)]),
+            }),
+        };
+        let mut frame = entry.encode_frame().unwrap();
+        let payload_at = FRAME_PREFIX_BYTES + FRAME_FIXED_BODY_BYTES - CHECKSUM_LEN;
+        frame[payload_at + single.len()] = 0x7f;
+        let checksum_at = frame.len() - CHECKSUM_LEN;
+        let checksum = *blake3::hash(&frame[..checksum_at]).as_bytes();
+        frame[checksum_at..].copy_from_slice(&checksum);
+        match parse_frame(&frame, 0) {
+            FrameParse::Newer(reason) => {
+                assert!(reason.contains("unknown joint marker tag 127"), "{reason}")
+            }
+            other => panic!("expected Newer, got {}", describe(&other)),
+        }
     }
 
     fn describe(parse: &FrameParse) -> String {

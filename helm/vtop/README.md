@@ -17,6 +17,7 @@ one fate. Default: 3 replicas — the smallest quorum that survives one failure.
 | PodDisruptionBudget | `maxUnavailable: 1` — quorum protection for voluntary disruption. |
 | NetworkPolicy (optional) | Default-deny with the topology's exact allowances. |
 | ServiceMonitor (optional) | Requires the Prometheus Operator CRDs; render fails clearly without them. |
+| PrometheusRule (optional) | The engine's alert rules from `files/vtop-rules.yaml` (a CI-checked copy of `observability/prometheus/vtop-rules.yaml`), behind `metrics.prometheusRule.enabled`; same CRD requirement. |
 
 ## Deployment mode: co-located, or separated tiers (#287)
 
@@ -190,6 +191,45 @@ kubectl create secret generic vtop-meta-tls \
 `commonName`/`dnsNames` above, keys copied/renamed into this layout), but the
 chart deliberately does not depend on it — it consumes plain Secrets from
 wherever you issue them.
+
+### Secrets from an external manager
+
+The chart mounts its TLS Secrets with `defaultMode: 0440`, and
+`podSecurityContext.fsGroup: 10001` gives the unprivileged `vtop` user group
+access to them. Secrets from a manager reach the pods the same way:
+
+- **External Secrets Operator** syncs into an ordinary Secret: name it in
+  `tls.metaSecretName` / `tls.dataSecretName`, or mount it with
+  `extraVolumes`.
+- **Any other secret file** goes in through `extraVolumes` and
+  `extraVolumeMounts`. Mount the whole volume at a directory, never with
+  `subPath`. For a Secret, set `defaultMode: 0400`: the kubelet adds the
+  group read bit because the pod sets `fsGroup`, so the file is `0440` on
+  disk, owned by root and group 10001. A Secret's own default mode is
+  `0644`, readable by every user in the container. A Secrets Store CSI
+  volume (`readOnly: true`) has no `defaultMode`; its file mode comes from
+  the provider, so set it there.
+
+[`ci/external-secret-values.yaml`](ci/external-secret-values.yaml) mounts a
+Secret this way and is rendered by the chart's CI lint:
+
+```yaml
+extraVolumes:
+  - name: external-secret
+    secret:
+      secretName: vtop-external-secret
+      defaultMode: 0400
+extraVolumeMounts:
+  - name: external-secret
+    mountPath: /etc/vtop/external
+    readOnly: true
+```
+
+This chart runs `vtop-node`. The archive engine (`vtopctl run`), which you
+deploy yourself, refuses a manifest key file or `engine.state_store` secret
+file other local users can read; the `0440` result above is the form it
+accepts. The rule and the recipes for each secret manager are in
+[docs/operate/secrets.md](../../docs/operate/secrets.md).
 
 ## Transport: TLS by default, plaintext when said twice (#294)
 

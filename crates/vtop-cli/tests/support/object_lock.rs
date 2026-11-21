@@ -110,6 +110,13 @@ impl Logs {
             .with_max_level(tracing::Level::INFO)
             .with_writer(logs.clone())
             .finish();
+        // A second dispatcher, kept for the life of the process, so a callsite
+        // another test reaches first, with no subscriber of its own, is not
+        // cached as never wanted and missed here (as `otel` does for spans,
+        // #791).
+        static ALWAYS_A_SECOND: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        ALWAYS_A_SECOND
+            .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
         (logs.clone(), tracing::subscriber::set_default(subscriber))
     }
     pub fn raw(&self) -> String {
@@ -174,4 +181,15 @@ pub fn assert_says(message: &str, parts: &[&str]) {
     for part in parts {
         assert!(message.contains(part), "{message:?} should say {part:?}");
     }
+}
+
+/// The count of `decision` on `vtop_object_key_decisions_total` for file
+/// batches of `tenant` (#626, #709). Each test uses a tenant of its own, so
+/// it can assert exact counts.
+pub fn decisions(tenant: &str, decision: &str) -> u64 {
+    vtop_core::telemetry::init()
+        .unwrap()
+        .object_key_decisions_total
+        .with_label_values(&[tenant, "file", "raw", decision])
+        .get()
 }

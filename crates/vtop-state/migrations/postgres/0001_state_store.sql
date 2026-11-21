@@ -91,6 +91,18 @@ ALTER TABLE batches ADD COLUMN IF NOT EXISTS claim_gen BIGINT NOT NULL DEFAULT 0
 -- below.
 ALTER TABLE batches ADD COLUMN IF NOT EXISTS verification_class TEXT;
 
+-- The instant the batch's contents were fixed (#626), recorded with the
+-- row's first write. A replay reads it back so its object is filed under the
+-- same hour, and named by the same key, as the attempt that failed. NULL on
+-- every row from before it: such a replay is filed under the hour it runs in,
+-- as it always was. Startup names the column (batch_columns!), so engines of
+-- this release need this migration first. Engines of the release before it
+-- (v0.9.0) name their columns and never write this one, so they keep running
+-- against a migrated database: rows they insert carry NULL, and their
+-- replays are filed as they always were. No marker bump: see the marker note
+-- below.
+ALTER TABLE batches ADD COLUMN IF NOT EXISTS sealed_at TEXT;
+
 -- SUPERSEDED (#567): the terminal state of a handed-back range its source has
 -- since committed past. A table created before it carries the CHECK above
 -- without it, and CREATE TABLE IF NOT EXISTS does not touch an existing
@@ -149,6 +161,40 @@ CREATE INDEX IF NOT EXISTS idx_batches_commit_newest ON batches(
     batch_id
 );
 
+-- Bounds the Kafka branches of the prune predicate: a Kafka row of a known
+-- topic id is deletable once a row of its (topic, partition, consumer group,
+-- topic id) ends HIGHER, and that probe seeks to the rows above this one's end
+-- offset, and a row of no id seeks the group's rows of no id. Partial, so a file
+-- or spool ledger pays nothing for it. The expressions must stay identical to
+-- the ones in the prune query. Without it (a database not yet migrated by
+-- this release) the prune is correct and slower.
+CREATE INDEX IF NOT EXISTS idx_batches_kafka_max_end ON batches(
+    state,
+    (progress_end_json::jsonb ->> 'topic'),
+    (progress_end_json::jsonb ->> 'partition'),
+    (progress_end_json::jsonb ->> 'consumer_group'),
+    (progress_end_json::jsonb ->> 'topic_id'),
+    ((progress_end_json::jsonb ->> 'end_offset')::bigint),
+    created_at,
+    batch_id
+) WHERE source_type = 'kafka';
+
+-- Bounds the lookup of an incarnation's newest row (the unresolved test in
+-- the prune query) and the probe for a newer row of no topic id: the unit's
+-- identity and the topic id, then (created_at, batch_id). Without the topic id
+-- ahead of the creation time, an old incarnation's lookup walks the newer
+-- incarnation's rows. The expressions must stay identical to the ones in the
+-- prune query.
+CREATE INDEX IF NOT EXISTS idx_batches_kafka_id_newest ON batches(
+    state,
+    (progress_end_json::jsonb ->> 'topic'),
+    (progress_end_json::jsonb ->> 'partition'),
+    (progress_end_json::jsonb ->> 'consumer_group'),
+    (progress_end_json::jsonb ->> 'topic_id'),
+    created_at,
+    batch_id
+) WHERE source_type = 'kafka';
+
 -- Database-level backstop for the verify-before-source-commit invariant.
 --
 -- A row is also born only as batching (#625): born verified, it could be
@@ -178,7 +224,8 @@ CREATE INDEX IF NOT EXISTS idx_batches_commit_newest ON batches(
 -- MIN_SCHEMA_VERSION together. A new nullable column that startup names
 -- (batch_columns!) and that older engines never name needs no bump: startup
 -- already refuses a schema without it, and an older release's migrate never
--- drops it. The verification_class column (#664) is such a change. From #664
+-- drops it. The verification_class column (#664) and the sealed_at column
+-- (#626) are such changes. From #664
 -- on, engines and migrate refuse a marker above their SCHEMA_VERSION (a newer
 -- release's); releases before it accept every marker at or above their
 -- minimum, which is why the marker is bumped only for what they would

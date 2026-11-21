@@ -13,6 +13,15 @@ Book lens: chapter 4 — formats for encoding data, schema evolution, and datafl
 - **Forward compatible:** old code can read data written by new code (ignoring what it does not understand).
 - Rolling upgrades need both on the wire; durable data needs backward at minimum, and forward if downgrade is ever supported.
 
+## The policy
+
+`docs/reference/compatibility.md` (#743) is the project's compatibility policy, and this skill applies it. In short:
+
+- Every format is in one of four classes: **A** archive artifacts (manifests, receipts, object keys, ledger digests: read forever), **B** node-local state (N and N-1, plus the bridge release before 1.0), **C** wire (N-1 and N in a rolling upgrade), **D** operator interface (config, JSON output, metrics, Helm values). Its inventory row names the marker and the status (stable, evolving, experimental).
+- **Reader first:** release R ships the reader, a later minor the opt-in writer, and the default changes no earlier than two minors after R and one after the writer, never in a patch. A patch release changes no format at all.
+- **A one-way step is always operator-gated** (a feature-level raise, `vtopctl migrate` for a PostgreSQL marker bump, a write-version setting). No binary takes one on its own on first open; an exception needs a written sign-off in the release notes. A new nullable ledger column is not a one-way step: no `user_version` or marker bump for it.
+- A change to a format edits its entry in `scripts/compat/formats.yaml` in the same PR; the page's inventory table is generated from it (`scripts/check-format-registry.py --write`), and the check in the `claims` job fails on a magic, version, schema, protocol or feature-level constant, or a metadata command kind, value tag or key category, that the registry does not name with its current value.
+
 ## What VTOP already does (preserve it)
 
 - Hand-coded, bounded, checksummed codecs; no serde in `vtop-meta` wire/storage paths. Explicit field tags and sizes make the format reviewable and fuzzable.
@@ -42,8 +51,9 @@ Book lens: chapter 4 — formats for encoding data, schema evolution, and datafl
 ## Checklist for a format change
 
 - [ ] Which version marker changes, and what do old readers do with the new data?
+- [ ] Is the change one-way? Then which operator action takes it, and where is its refusal test? Its entry in `scripts/compat/formats.yaml` (and so its row on `docs/reference/compatibility.md`) is updated in the same PR.
 - [ ] Is there an old-release fixture in `upgrade-compat.sh` coverage (add the profile if the format is new)?
 - [ ] Mixed-version behaviour stated for each of: old leader/new follower, new leader/old follower, old reader of new data?
-- [ ] Fuzz target extended (`fuzz/fuzz_targets/`: `manifest_parse`, `detect_*`; add one for new parsers)?
+- [ ] Fuzz target extended (`fuzz/fuzz_targets/`, one per decoder of untrusted bytes, listed in `fuzz/README.md`; add one for a new parser) and its seeds rewritten if the format changed?
 - [ ] Docs updated: `docs/VTOP_PROTOCOL_DRAFT.md` for protocol, `docs/ROADMAP.md` known limitations for compatibility notes?
 - [ ] CHANGELOG / release notes mention it (`scripts/release-notes.sh`, `docs/RELEASE_VERIFICATION.md`)?

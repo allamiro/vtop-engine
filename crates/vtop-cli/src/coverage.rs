@@ -33,6 +33,14 @@
 //! - **duplicates**: bytes/offsets archived more than once. Expected under
 //!   at-least-once delivery, and counted so a sudden rise is visible.
 //!
+//! - **unreferenced objects** (#774): objects a FAILED, REPLAY_REQUIRED or
+//!   SUPERSEDED row recorded as uploaded that no committed or in-flight row
+//!   names. A failed attempt that wrote its object and was then replayed
+//!   under another key leaves one; each is storage cost, never loss. Read
+//!   from the ledger and the digests only: no listing, no store request, and
+//!   never a delete. An object whose ledger row a power loss rolled back is
+//!   in no row, so this cannot find it.
+//!
 //! What it cannot see: anything before a unit's first committed range (a
 //! tail started mid-file, a group that began at a later offset, history
 //! pruned without a digest), and whether an object the ledger names still
@@ -43,6 +51,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use vtop_core::config::sqlite_database_file;
 use vtop_core::errors::VtopError;
 use vtop_core::state_machine::BatchState;
 use vtop_core::types::{ContentFingerprint, ProgressMarker, SourceType};
@@ -219,6 +228,7 @@ pub fn unit_ranges(record: &BatchRecord) -> Vec<(Unit, u64, u64)> {
                 end_offset,
                 consumer_group,
                 start_offset: last_read_start,
+                ..
             },
         ) => {
             // A Kafka window never spans partitions (one buffer each); a pair
@@ -897,7 +907,8 @@ struct DigestTrailer {
 /// never read each other's digests as their own history; only otherwise
 /// (PostgreSQL, an in-memory SQLite) under `work_dir`, which is scratch and
 /// which a PostgreSQL deployment should override.
-pub fn default_digest_dir(engine: &vtop_core::config::EngineConfig) -> PathBuf {
+pub fn default_digest_dir(config: &vtop_core::config::VtopConfig) -> PathBuf {
+    let engine = &config.engine;
     if let Some(dir) = engine
         .ledger_digest_dir
         .as_deref()
@@ -905,9 +916,8 @@ pub fn default_digest_dir(engine: &vtop_core::config::EngineConfig) -> PathBuf {
     {
         return PathBuf::from(dir);
     }
-    if let Some(database) = engine
-        .state_store
-        .resolve()
+    if let Some(database) = config
+        .resolve_state_store()
         .ok()
         .and_then(|store| sqlite_database_file(store.expose_secret()))
     {
@@ -921,30 +931,6 @@ pub fn default_digest_dir(engine: &vtop_core::config::EngineConfig) -> PathBuf {
         return beside.join(format!("{name}.ledger-digests"));
     }
     Path::new(&engine.work_dir).join("ledger-digests")
-}
-
-/// The file a SQLite connection string names, or `None` for PostgreSQL and
-/// an in-memory database.
-fn sqlite_database_file(conn: &str) -> Option<PathBuf> {
-    let conn = conn.trim();
-    let lower = conn.to_ascii_lowercase();
-    if lower.starts_with("postgres://") || lower.starts_with("postgresql://") {
-        return None;
-    }
-    let rest = conn
-        .strip_prefix("sqlite://")
-        .or_else(|| conn.strip_prefix("sqlite:"))
-        .unwrap_or(conn);
-    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
-    // The `mode=memory` QUERY PARAMETER, exactly - not those characters
-    // anywhere in the string, which a real path can contain (review).
-    let in_memory = query
-        .split('&')
-        .any(|parameter| parameter.eq_ignore_ascii_case("mode=memory"));
-    if path.is_empty() || path == ":memory:" || in_memory {
-        return None;
-    }
-    Some(PathBuf::from(path))
 }
 
 /// Write `rows` as one digest file in `dir`, durably (written, fsynced,
@@ -1081,8 +1067,15 @@ pub fn read_digests(dir: &Path) -> Result<(Vec<BatchRecord>, usize), VtopError> 
 }
 
 fn read_digest(path: &Path) -> Result<Vec<BatchRecord>, VtopError> {
-    let bad = |why: String| VtopError::Other(format!("ledger digest {}: {why}", path.display()));
     let text = std::fs::read_to_string(path)?;
+    parse_digest(&text, &path.display().to_string())
+}
+
+/// Parse a digest's text; `name` is what the errors call it (the path). Split
+/// from reading the file so the `ledger_rows` fuzz target (#729) drives the
+/// same parser on hostile text.
+pub fn parse_digest(text: &str, name: &str) -> Result<Vec<BatchRecord>, VtopError> {
+    let bad = |why: String| VtopError::Other(format!("ledger digest {name}: {why}"));
     let lines: Vec<&str> = text.lines().collect();
     if lines.len() < 2 {
         return Err(bad("no header and trailer (truncated?)".into()));
@@ -1136,6 +1129,195 @@ pub async fn prune_with_digest(
     let ids: Vec<String> = rows.into_iter().map(|row| row.batch_id).collect();
     let deleted = store.prune_listed(cutoff, &ids).await?;
     Ok((deleted, Some(digest)))
+}
+
+// ---- Unreferenced objects (#774) -------------------------------------------
+
+/// How many keys the detailed output lists by default.
+pub const DEFAULT_ORPHAN_LIMIT: usize = 200;
+
+/// Which kind of handed-back row recorded an unreferenced object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrphanKind {
+    /// A FAILED row: the attempt uploaded its object and then failed.
+    Failed,
+    /// A REPLAY_REQUIRED row: recovery handed the range back.
+    ReplayRequired,
+    /// A SUPERSEDED row (#567): the source committed past the range.
+    Superseded,
+}
+
+impl OrphanKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OrphanKind::Failed => "failed",
+            OrphanKind::ReplayRequired => "replay_required",
+            OrphanKind::Superseded => "superseded",
+        }
+    }
+
+    fn of(state: BatchState) -> Option<Self> {
+        match state {
+            BatchState::Failed => Some(OrphanKind::Failed),
+            BatchState::ReplayRequired => Some(OrphanKind::ReplayRequired),
+            BatchState::Superseded => Some(OrphanKind::Superseded),
+            _ => None,
+        }
+    }
+}
+
+/// An object a handed-back row recorded and no live row names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OrphanObject {
+    pub uri: String,
+    /// The kind of the row that recorded it; the first of [`OrphanKind`]'s
+    /// order when several attempts recorded one key.
+    pub kind: OrphanKind,
+    /// The size the ledger recorded, if it recorded one.
+    pub size_bytes: Option<u64>,
+    /// The handed-back rows that recorded it, sorted.
+    pub batch_ids: Vec<String>,
+}
+
+/// The unreferenced objects of one source.
+#[derive(Debug, Clone, Serialize)]
+pub struct OrphanSource {
+    pub source_type: SourceType,
+    pub source_name: String,
+    /// Every unreferenced object of the source, not only the page listed.
+    pub count: u64,
+    /// The sizes the ledger recorded, summed; an object with no recorded
+    /// size adds nothing.
+    pub size_bytes: u64,
+    /// `count` by kind, for the kinds that occur.
+    pub by_kind: BTreeMap<&'static str, u64>,
+    /// This page's keys, in key order.
+    pub objects: Vec<OrphanObject>,
+}
+
+/// Which page of the keys to list. Counts and sizes are never paged.
+#[derive(Debug, Clone)]
+pub struct OrphanOptions {
+    /// Most keys listed in one run.
+    pub limit: usize,
+    /// List keys after this one (the previous run's `next_after`).
+    pub after: Option<String>,
+}
+
+impl Default for OrphanOptions {
+    fn default() -> Self {
+        Self {
+            limit: DEFAULT_ORPHAN_LIMIT,
+            after: None,
+        }
+    }
+}
+
+/// The objects handed-back attempts left that nothing names. Informational:
+/// it costs storage and loses nothing, so it never changes the audit's
+/// verdict.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct OrphanReport {
+    pub count: u64,
+    pub size_bytes: u64,
+    pub sources: Vec<OrphanSource>,
+    /// Keys listed in this run.
+    pub listed: usize,
+    /// Pass as `--orphans-after` to list the next page; `None` on the last.
+    pub next_after: Option<String>,
+}
+
+/// Find the objects a FAILED, REPLAY_REQUIRED or SUPERSEDED row recorded that
+/// no row of a live state names. The rows that name an object are
+/// OBJECT_UPLOADED, MANIFEST_UPLOADED, VERIFIED and SOURCE_COMMITTED: a replay
+/// that reused the object is one of them, and so is a batch still on its way
+/// to a commit, so neither is reported (an operator may act on a report). From
+/// the ledger and the digests alone: no store request.
+pub fn orphans(records: &[BatchRecord], options: &OrphanOptions) -> OrphanReport {
+    let named: std::collections::HashSet<&str> = records
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.state,
+                BatchState::ObjectUploaded
+                    | BatchState::ManifestUploaded
+                    | BatchState::Verified
+                    | BatchState::SourceCommitted
+            )
+        })
+        .filter_map(|r| r.object_uri.as_deref())
+        .collect();
+    // By key, so a key two attempts recorded is one object and the page is
+    // stable between runs.
+    let mut found: BTreeMap<&str, (&BatchRecord, OrphanObject)> = BTreeMap::new();
+    for record in records {
+        let (Some(kind), Some(uri)) = (OrphanKind::of(record.state), record.object_uri.as_deref())
+        else {
+            continue;
+        };
+        if uri.is_empty() || named.contains(uri) {
+            continue;
+        }
+        let (_, object) = found.entry(uri).or_insert_with(|| {
+            (
+                record,
+                OrphanObject {
+                    uri: uri.to_owned(),
+                    kind,
+                    size_bytes: None,
+                    batch_ids: Vec::new(),
+                },
+            )
+        });
+        object.kind = object.kind.min(kind);
+        object.size_bytes = object.size_bytes.or_else(|| {
+            record
+                .object_size_bytes
+                .and_then(|size| u64::try_from(size).ok())
+        });
+        if !object.batch_ids.contains(&record.batch_id) {
+            object.batch_ids.push(record.batch_id.clone());
+        }
+    }
+    let mut sources: BTreeMap<(&'static str, &str), OrphanSource> = BTreeMap::new();
+    let mut report = OrphanReport::default();
+    let mut last_listed: Option<String> = None;
+    for (uri, (record, mut object)) in found {
+        object.batch_ids.sort();
+        let source = sources
+            .entry((record.source_type.as_str(), record.source_name.as_str()))
+            .or_insert_with(|| OrphanSource {
+                source_type: record.source_type.clone(),
+                source_name: record.source_name.clone(),
+                count: 0,
+                size_bytes: 0,
+                by_kind: BTreeMap::new(),
+                objects: Vec::new(),
+            });
+        let size = object.size_bytes.unwrap_or(0);
+        source.count += 1;
+        source.size_bytes += size;
+        *source.by_kind.entry(object.kind.as_str()).or_default() += 1;
+        report.count += 1;
+        report.size_bytes += size;
+        if options.after.as_deref().is_some_and(|after| uri <= after) {
+            continue;
+        }
+        if report.listed >= options.limit {
+            // Keys remain after the page: the cursor is the last one listed,
+            // or the one this run was given when it listed none.
+            if report.next_after.is_none() {
+                report.next_after = last_listed.clone().or_else(|| options.after.clone());
+            }
+            continue;
+        }
+        report.listed += 1;
+        last_listed = Some(object.uri.clone());
+        source.objects.push(object);
+    }
+    report.sources = sources.into_values().collect();
+    report
 }
 
 // ---- Storage cross-check ----------------------------------------------------
@@ -1227,6 +1409,9 @@ pub struct AuditReport {
     pub units: Vec<UnitReport>,
     /// `None` when storage was not checked.
     pub storage: Option<Vec<StorageFinding>>,
+    /// Objects failed attempts left that no committed row names (#774).
+    /// Informational: never part of [`AuditReport::passed`].
+    pub orphans: OrphanReport,
 }
 
 impl AuditReport {
@@ -1302,6 +1487,7 @@ impl AuditReport {
                 ));
             }
         }
+        self.orphan_lines(&mut out);
         match &self.storage {
             None => out.push("storage: not checked (pass --check-storage)".into()),
             Some(findings) if findings.is_empty() => {
@@ -1322,6 +1508,55 @@ impl AuditReport {
             "coverage audit FAILED".into()
         });
         out
+    }
+
+    fn orphan_lines(&self, out: &mut Vec<String>) {
+        let orphans = &self.orphans;
+        if orphans.count == 0 {
+            out.push("unreferenced objects: none".into());
+            return;
+        }
+        out.push(format!(
+            "unreferenced objects: {} object(s), {} recorded byte(s), uploaded by a failed, \
+             replay-required or superseded attempt and named by no committed row. This is \
+             storage cost, never loss, and does not change the verdict. Nothing was deleted \
+             (under Object Lock an object stays until its retention date). An object whose \
+             ledger row a power loss rolled back is in no row and is not listed",
+            orphans.count, orphans.size_bytes
+        ));
+        for source in &orphans.sources {
+            let kinds: Vec<String> = source
+                .by_kind
+                .iter()
+                .map(|(kind, count)| format!("{kind} {count}"))
+                .collect();
+            out.push(format!(
+                "     {} {}: {} object(s), {} byte(s) ({})",
+                source.source_type.as_str(),
+                source.source_name,
+                source.count,
+                source.size_bytes,
+                kinds.join(", ")
+            ));
+            for object in &source.objects {
+                out.push(format!(
+                    "          {} {} ({}){}",
+                    object.kind.as_str(),
+                    object.uri,
+                    object.batch_ids.join(", "),
+                    object
+                        .size_bytes
+                        .map_or(String::new(), |size| format!(", {size} byte(s)"))
+                ));
+            }
+        }
+        out.push(match &orphans.next_after {
+            Some(after) => format!(
+                "     listed {} of {}; for the next page pass --orphans-after {after}",
+                orphans.listed, orphans.count
+            ),
+            None => format!("     listed {} of {}", orphans.listed, orphans.count),
+        });
     }
 
     /// The audit as a Prometheus text-format file, for a node exporter's
@@ -1374,6 +1609,37 @@ impl AuditReport {
                 out.push_str(&format!(
                     "{name}{{source_type=\"{source_type}\"}} {}\n",
                     counts[index]
+                ));
+            }
+        }
+        // Unreferenced objects (#774), by source type: a source type with only
+        // such objects has no unit, so the types are the union of both.
+        let mut orphans: BTreeMap<&str, (u64, u64)> = types
+            .iter()
+            .map(|(source_type, _)| (*source_type, (0, 0)))
+            .collect();
+        for source in &self.orphans.sources {
+            let entry = orphans.entry(source.source_type.as_str()).or_default();
+            entry.0 += source.count;
+            entry.1 += source.size_bytes;
+        }
+        for (name, help, bytes) in [
+            (
+                "vtop_coverage_audit_unreferenced_objects",
+                "Objects a failed, replay-required or superseded attempt uploaded that no committed row names (storage cost, not loss)",
+                false,
+            ),
+            (
+                "vtop_coverage_audit_unreferenced_object_bytes",
+                "Recorded size of those objects (storage cost, not loss)",
+                true,
+            ),
+        ] {
+            out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} gauge\n"));
+            for (source_type, (count, size)) in &orphans {
+                out.push_str(&format!(
+                    "{name}{{source_type=\"{source_type}\"}} {}\n",
+                    if bytes { *size } else { *count }
                 ));
             }
         }
@@ -1436,6 +1702,7 @@ mod tests {
             mtime: String::new(),
             content_fingerprint: None,
             tail_fingerprint: None,
+            ctime: None,
         }
     }
 
@@ -1458,6 +1725,7 @@ mod tests {
             mtime: String::new(),
             content_fingerprint: None,
             tail_fingerprint: None,
+            ctime: None,
         };
         row(id, state, marker(start), marker(end))
     }
@@ -1469,6 +1737,7 @@ mod tests {
             start_offset: start,
             end_offset: end,
             consumer_group: "g".into(),
+            topic_id: None,
         }
     }
 
@@ -1489,6 +1758,7 @@ mod tests {
             manifest_version_id: None,
             object_size_bytes: Some(10),
             verification_class: None,
+            sealed_at: None,
             record_count: Some(1),
             error_message: None,
             owner: None,
@@ -1570,6 +1840,7 @@ mod tests {
                 mtime: String::new(),
                 content_fingerprint: None,
                 tail_fingerprint: None,
+                ctime: None,
             };
             row(id, Committed, marker(start), marker(start))
         };
@@ -1664,6 +1935,7 @@ mod tests {
             digest_rows: 0,
             digest_files: 0,
             storage: None,
+            orphans: OrphanReport::default(),
         }
         .lines();
         assert!(
@@ -1777,20 +2049,20 @@ mod tests {
             "mock",
         );
         assert_eq!(
-            default_digest_dir(&config.engine),
+            default_digest_dir(&config),
             PathBuf::from("/var/lib/vtop/state.db.ledger-digests"),
             "named for the database, so a neighbour's digests are not read as its own"
         );
         let mut configured = config.clone();
         configured.engine.ledger_digest_dir = Some("/backed-up/digests".into());
         assert_eq!(
-            default_digest_dir(&configured.engine),
+            default_digest_dir(&configured),
             PathBuf::from("/backed-up/digests")
         );
         let memory =
             crate::testkit::file_config("/tmp/scratch", "sqlite::memory:", Vec::new(), "mock");
         assert_eq!(
-            default_digest_dir(&memory.engine),
+            default_digest_dir(&memory),
             PathBuf::from("/tmp/scratch/ledger-digests")
         );
         assert_eq!(
@@ -1886,6 +2158,36 @@ mod tests {
         assert_eq!(read_digests(&dir).unwrap().0.len(), 1);
         // And again into the now-existing directory.
         write_digest(&dir, "c", &rows).unwrap();
+    }
+
+    /// #729: the digest parser is what the `ledger_rows` fuzz target drives,
+    /// on text rather than a path. It reads back what `write_digest` wrote,
+    /// and refuses every prefix of it without panicking.
+    #[test]
+    fn parse_digest_reads_a_written_digest_and_refuses_its_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = vec![bytes("a", Committed, 0, 10), bytes("b", Committed, 10, 20)];
+        let path = write_digest(dir.path(), "c", &rows).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let parsed = parse_digest(&text, "digest").unwrap();
+        assert_eq!(
+            parsed
+                .iter()
+                .map(|r| r.batch_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        for end in 0..text.len() - 1 {
+            if text.is_char_boundary(end) {
+                assert!(
+                    parse_digest(&text[..end], "digest").is_err(),
+                    "prefix {end}"
+                );
+            }
+        }
+        for odd in ["\r", "\n\r", "\r\n\r\n", "{}\r\n{}", "\n\n\n"] {
+            assert!(parse_digest(odd, "digest").is_err());
+        }
     }
 
     /// Review of #573: a one-line file is refused, not a panic.
@@ -2082,6 +2384,44 @@ mod tests {
         let unit = &units[0];
         assert!(unit.unexplained_holes.is_empty(), "{unit:?}");
         assert_eq!(unit.committed_through, 20);
+    }
+
+    /// A Kafka row written once the broker gives topic ids carries one in its
+    /// marker. The audit must count it like a row without: a marker pattern
+    /// that named `topic_id: None` dropped every such row, so an audit of
+    /// them reported no unit at all and passed over a failed range.
+    #[test]
+    fn kafka_rows_with_a_known_topic_id_are_audited() {
+        let with_id = |start: i64, end: i64| match kafka(start, end) {
+            ProgressMarker::Kafka {
+                topic,
+                partition,
+                start_offset,
+                end_offset,
+                consumer_group,
+                ..
+            } => ProgressMarker::Kafka {
+                topic,
+                partition,
+                start_offset,
+                end_offset,
+                consumer_group,
+                topic_id: Some("Zk3pXK7bTfyqY0v9mQw1ZA".into()),
+            },
+            other => other,
+        };
+        let units = audit([
+            row("a", Committed, with_id(0, 9), with_id(0, 9)),
+            row("f", Failed, with_id(10, 19), with_id(10, 19)),
+            row("c", Committed, with_id(20, 29), with_id(20, 29)),
+        ]);
+        assert_eq!(units.len(), 1, "the rows were dropped: {units:?}");
+        assert_eq!(units[0].committed_through, 30);
+        assert!(
+            units[0].has_findings() && !units[0].failed_holes.is_empty(),
+            "the failed range 10 to 19 below a committed one must be a finding: {:?}",
+            units[0]
+        );
     }
 
     /// A window of several reads starts at its FIRST read.
@@ -2281,6 +2621,7 @@ mod tests {
                 bytes("c", Committed, 20, 30),
             ]),
             storage: None,
+            orphans: OrphanReport::default(),
         };
         let text = report.prometheus_text(1_700_000_000);
         for line in [
@@ -2298,6 +2639,276 @@ mod tests {
         }
         assert!(!text.contains("/a.log"), "a path became a label: {text}");
         assert!(report.lines().last().unwrap().contains("FAILED"));
+    }
+
+    // ---- unreferenced objects (#774) ----------------------------------------
+
+    /// A handed-back or live row that names `uri` instead of its own key.
+    fn names(mut record: BatchRecord, uri: &str, size: Option<i64>) -> BatchRecord {
+        record.object_uri = Some(uri.into());
+        record.object_size_bytes = size;
+        record
+    }
+
+    fn uris(report: &OrphanReport) -> Vec<&str> {
+        report
+            .sources
+            .iter()
+            .flat_map(|s| s.objects.iter().map(|o| o.uri.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn an_object_only_a_failed_attempt_named_is_reported() {
+        let report = orphans(
+            &[
+                bytes("a", Committed, 0, 10),
+                names(bytes("b", Failed, 10, 20), "s3://b/b-attempt", Some(42)),
+                bytes("b2", Committed, 10, 20),
+            ],
+            &OrphanOptions::default(),
+        );
+        assert_eq!(uris(&report), ["s3://b/b-attempt"]);
+        assert_eq!((report.count, report.size_bytes), (1, 42));
+        let object = &report.sources[0].objects[0];
+        assert_eq!(object.kind, OrphanKind::Failed);
+        assert_eq!(object.batch_ids, ["b"]);
+        assert_eq!(report.next_after, None);
+    }
+
+    #[test]
+    fn a_committed_object_is_never_reported() {
+        // The replay reused the failed attempt's object: the committed row
+        // names the same key.
+        let shared = "s3://b/shared";
+        let reused = [
+            names(bytes("x", Failed, 0, 10), shared, Some(7)),
+            names(bytes("y", Committed, 0, 10), shared, Some(7)),
+        ];
+        assert_eq!(orphans(&reused, &OrphanOptions::default()).count, 0);
+        // Every state that names an object keeps it from the report: a
+        // batch on its way to a commit is not an orphan.
+        for state in [
+            BatchState::ObjectUploaded,
+            BatchState::ManifestUploaded,
+            Verified,
+            Committed,
+        ] {
+            let rows = [
+                names(bytes("x", Failed, 0, 10), shared, Some(7)),
+                names(bytes("y", state, 0, 10), shared, Some(7)),
+            ];
+            assert_eq!(
+                orphans(&rows, &OrphanOptions::default()).count,
+                0,
+                "{state:?} names the object"
+            );
+        }
+        // A committed row's own object is not a candidate at all.
+        assert_eq!(
+            orphans(&[bytes("c", Committed, 0, 10)], &OrphanOptions::default()).count,
+            0
+        );
+    }
+
+    #[test]
+    fn each_kind_of_handed_back_row_is_classified() {
+        let report = orphans(
+            &[
+                bytes("f", Failed, 0, 10),
+                bytes("r", ReplayRequired, 10, 20),
+                bytes("s", Superseded, 20, 30),
+                // Rows with no object recorded left nothing behind.
+                {
+                    let mut none = bytes("n", Failed, 30, 40);
+                    none.object_uri = None;
+                    none
+                },
+                // Rows that have not been handed back are not candidates.
+                bytes("w", BatchState::Sealed, 40, 50),
+            ],
+            &OrphanOptions::default(),
+        );
+        let kinds: Vec<(&str, OrphanKind)> = report.sources[0]
+            .objects
+            .iter()
+            .map(|o| (o.batch_ids[0].as_str(), o.kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("f", OrphanKind::Failed),
+                ("r", OrphanKind::ReplayRequired),
+                ("s", OrphanKind::Superseded)
+            ]
+        );
+        let source = &report.sources[0];
+        assert_eq!(source.count, 3);
+        assert_eq!(
+            source
+                .by_kind
+                .iter()
+                .map(|(k, c)| (*k, *c))
+                .collect::<Vec<_>>(),
+            [("failed", 1), ("replay_required", 1), ("superseded", 1)]
+        );
+    }
+
+    #[test]
+    fn one_key_two_attempts_recorded_is_one_object_with_both_batches() {
+        let report = orphans(
+            &[
+                names(bytes("b", Superseded, 0, 10), "s3://b/k", Some(5)),
+                names(bytes("a", Failed, 0, 10), "s3://b/k", None),
+            ],
+            &OrphanOptions::default(),
+        );
+        assert_eq!(report.count, 1);
+        let object = &report.sources[0].objects[0];
+        assert_eq!(object.kind, OrphanKind::Failed, "the first kind wins");
+        assert_eq!(object.batch_ids, ["a", "b"]);
+        assert_eq!(object.size_bytes, Some(5), "a recorded size is not lost");
+        assert_eq!(report.size_bytes, 5);
+    }
+
+    #[test]
+    fn sources_are_counted_apart_and_a_page_never_changes_the_counts() {
+        let mut other = names(bytes("k", Failed, 0, 10), "s3://b/k", Some(3));
+        other.source_name = "other".into();
+        let mut rows = vec![other];
+        for i in 0..5 {
+            rows.push(names(
+                bytes(&format!("f{i}"), Failed, 0, 10),
+                &format!("s3://b/f{i}"),
+                Some(10),
+            ));
+        }
+        let all = orphans(&rows, &OrphanOptions::default());
+        assert_eq!((all.count, all.size_bytes, all.listed), (6, 53, 6));
+        assert_eq!(all.sources.len(), 2);
+        assert_eq!(all.next_after, None);
+
+        // Walk the keys two at a time: each page is bounded, the counts stay
+        // exact, and the pages tile the whole set once.
+        let mut seen = Vec::new();
+        let mut after = None;
+        let mut pages = 0;
+        loop {
+            let page = orphans(&rows, &OrphanOptions { limit: 2, after });
+            assert!(page.listed <= 2);
+            assert_eq!((page.count, page.size_bytes), (6, 53));
+            seen.extend(uris(&page).into_iter().map(str::to_owned));
+            pages += 1;
+            after = page.next_after;
+            if after.is_none() {
+                break;
+            }
+        }
+        assert_eq!(pages, 3);
+        let mut want: Vec<String> = all
+            .sources
+            .iter()
+            .flat_map(|s| s.objects.iter().map(|o| o.uri.clone()))
+            .collect();
+        want.sort();
+        seen.sort();
+        assert_eq!(seen, want);
+
+        let none = orphans(
+            &rows,
+            &OrphanOptions {
+                limit: 0,
+                after: None,
+            },
+        );
+        assert_eq!((none.count, none.listed), (6, 0));
+        assert_eq!(none.next_after, None, "no keys listed means no cursor");
+    }
+
+    #[test]
+    fn the_report_is_informational_and_says_so() {
+        let orphaned = orphans(
+            &[names(bytes("b", Failed, 0, 10), "s3://b/k", Some(5))],
+            &OrphanOptions::default(),
+        );
+        let report = AuditReport {
+            ledger_rows: 1,
+            digest_rows: 0,
+            digest_files: 0,
+            units: Vec::new(),
+            storage: None,
+            orphans: orphaned,
+        };
+        assert!(report.passed(), "an orphan is not lost data");
+        let lines = report.lines().join("\n");
+        for part in [
+            "unreferenced objects: 1 object(s), 5 recorded byte(s)",
+            "storage cost, never loss",
+            "Nothing was deleted",
+            "power loss",
+            "failed s3://b/k (b), 5 byte(s)",
+        ] {
+            assert!(lines.contains(part), "missing {part:?} in:\n{lines}");
+        }
+        assert!(lines.ends_with("coverage audit PASSED"));
+    }
+
+    #[test]
+    fn the_metrics_file_counts_unreferenced_objects_by_source_type() {
+        let rows = [
+            bytes("a", Committed, 0, 10),
+            names(bytes("b", Failed, 10, 20), "s3://b/o1", Some(40)),
+            names(bytes("c", Superseded, 10, 20), "s3://b/o2", Some(2)),
+        ];
+        // The page limit does not change the gauge.
+        let report = AuditReport {
+            ledger_rows: 3,
+            digest_rows: 0,
+            digest_files: 0,
+            units: audit(rows.clone()),
+            storage: None,
+            orphans: orphans(
+                &rows,
+                &OrphanOptions {
+                    limit: 0,
+                    after: None,
+                },
+            ),
+        };
+        let text = report.prometheus_text(1);
+        for line in [
+            "vtop_coverage_audit_unreferenced_objects{source_type=\"file\"} 2",
+            "vtop_coverage_audit_unreferenced_object_bytes{source_type=\"file\"} 42",
+        ] {
+            assert!(
+                text.lines().any(|l| l == line),
+                "missing {line:?} in:\n{text}"
+            );
+        }
+        assert!(!text.contains("s3://"), "a key became a label: {text}");
+        // A source type with nothing but orphans still gets its series.
+        let kafka_only = orphans(
+            &[{
+                let mut r = row("k", Failed, kafka(0, 5), kafka(0, 5));
+                r.object_size_bytes = Some(9);
+                r
+            }],
+            &OrphanOptions::default(),
+        );
+        let text = AuditReport {
+            ledger_rows: 1,
+            digest_rows: 0,
+            digest_files: 0,
+            units: Vec::new(),
+            storage: None,
+            orphans: kafka_only,
+        }
+        .prometheus_text(1);
+        assert!(
+            text.lines()
+                .any(|l| l == "vtop_coverage_audit_unreferenced_objects{source_type=\"kafka\"} 1"),
+            "{text}"
+        );
     }
 
     // ---- content identity (#578) --------------------------------------------
@@ -2339,6 +2950,7 @@ mod tests {
                     mtime: String::new(),
                     content_fingerprint: content.clone(),
                     tail_fingerprint: None,
+                    ctime: None,
                 }
             }
         };
@@ -2517,5 +3129,34 @@ mod tests {
             ),
         ]);
         assert_eq!(empty.len(), 1, "{empty:#?}");
+    }
+    /// The `ledger_rows` fuzz target's seeds (#729): a prune digest as
+    /// `write_digest` writes it (rows of every state, a file, a rotated file
+    /// and a Kafka source), and its rows one per seed. The progress markers
+    /// older releases wrote are committed beside them by hand, copied from
+    /// the constants in vtop-core's types.rs tests. Run on purpose:
+    /// `cargo test -p vtop-cli --lib -- --ignored write_fuzz_seeds`.
+    #[test]
+    #[ignore = "writes fuzz/corpus/ledger_rows; run on purpose"]
+    fn write_fuzz_seeds() {
+        let out = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus/ledger_rows");
+        std::fs::create_dir_all(&out).unwrap();
+        let rows = vec![
+            bytes("a", Committed, 0, 10),
+            bytes("held", Verified, 10, 15),
+            bytes("lost", Failed, 15, 20),
+            sized("rotated", Committed, 8, 0, 4096, 4096),
+            row("k", Superseded, kafka(0, 0), kafka(0, 99)),
+            row("r", ReplayRequired, kafka(100, 100), kafka(100, 150)),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_digest(dir.path(), "2026-11-01T00:00:00+00:00", &rows).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(parse_digest(&text, "seed").unwrap().len(), rows.len());
+        std::fs::write(out.join("digest.seed"), &text).unwrap();
+        for row in &rows {
+            let line = serde_json::to_string(row).unwrap();
+            std::fs::write(out.join(format!("row-{}.seed", row.batch_id)), line + "\n").unwrap();
+        }
     }
 }

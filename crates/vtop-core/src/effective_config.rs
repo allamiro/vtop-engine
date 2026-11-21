@@ -89,6 +89,11 @@ pub struct EffectiveStream {
     pub manifest_verification_receipts: EffectiveSetting<bool>,
     #[serde(rename = "upload.require_object_versioning")]
     pub require_object_versioning: EffectiveSetting<bool>,
+    /// Global (#733): whether key, state-store, ledger and audit files other
+    /// users can read are accepted (announced and audited) instead of
+    /// refused.
+    #[serde(rename = "security.allow_loose_secret_permissions")]
+    pub allow_loose_secret_permissions: EffectiveSetting<bool>,
     #[serde(rename = "upload.backend")]
     pub upload_backend: EffectiveSetting<String>,
     #[serde(rename = "upload.prefix")]
@@ -410,6 +415,10 @@ pub fn effective_streams(config: &VtopConfig, streams: Option<&StreamsConfig>) -
             require_object_versioning: EffectiveSetting {
                 value: config.upload.require_object_versioning,
                 origin: global("upload.require_object_versioning"),
+            },
+            allow_loose_secret_permissions: EffectiveSetting {
+                value: config.security.allow_loose_secret_permissions,
+                origin: global("security.allow_loose_secret_permissions"),
             },
             upload_backend: EffectiveSetting {
                 value: config.upload.backend.clone(),

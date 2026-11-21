@@ -11,6 +11,8 @@
 
 # SQLite state files
 *.db
+# Ledger fixtures written by released binaries (#626) are test data.
+!crates/vtop-cli/tests/fixtures/**/*.db
 *.db-shm
 *.db-wal
 

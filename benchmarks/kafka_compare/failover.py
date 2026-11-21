@@ -70,6 +70,10 @@ DRAIN_DEADLINE_S = 240
 TOPIC_UUID = "aaaaaaaa-0000-0000-0000-0000000000b1"
 RANGE_UUID = "aaaaaaaa-0000-0000-0000-0000000000c1"
 NODE_UUID = {n: f"aaaaaaaa-0000-0000-0000-0000000000a{n}" for n in (1, 2, 3)}
+# The one client principal the nodes' native plane serves (`principal_id` in vtop/ha-node-*.yaml).
+# A node admits a native session only on the certificate issued to that principal, so the clients
+# present `client.pem`, minted with this as its CN, and not a node's own certificate.
+PRINCIPAL_UUID = "aaaaaaaa-0000-0000-0000-0000000000ce"
 
 SPEC = {
     "kafka": {"compose": "compose.kafka.yml", "project": "kc-kafka", "network": "kc-kafka-bench",
@@ -144,8 +148,8 @@ def ensure_vtop_image(rebuild: bool) -> str:
     return image
 
 
-def capture_environment(run_id: str, matrix: dict, vtop_image: str, limits: dict) -> dict:
-    env = phase1.capture_environment(run_id, matrix, vtop_image, limits)
+def capture_environment(run_id: str, matrix: dict, vtop_image: str, limits: dict, disk: str) -> dict:
+    env = phase1.capture_environment(run_id, matrix, vtop_image, limits, disk)
     c = env["comparable"]
     c["vtop_commit"] = engine_commit()
     c["harness_commit"] = phase1.git("rev-parse", "HEAD")
@@ -633,13 +637,13 @@ def run_vtop(ctx: dict, fault: str, raw: str, logs: str, row: dict) -> tuple[lis
         node, current_epoch = int(holder[0][-1]), holder[1]
         with open(os.path.join(raw, "verify-client.yaml"), "w") as handle:
             handle.write(f"cluster_id: 11111111-2222-3333-4444-555555555555\n"
-                         f"principal_id: aaaaaaaa-0000-0000-0000-0000000000ce\n"
-                         f"producer_id: aaaaaaaa-0000-0000-0000-0000000000ce\nproducer_epoch: 1\n"
+                         f"principal_id: {PRINCIPAL_UUID}\n"
+                         f"producer_id: {PRINCIPAL_UUID}\nproducer_epoch: 1\n"
                          f"fencing_epoch: {current_epoch}\n"
                          f'range: {{ topic: "bench", topic_epoch: 1, range_id: {RANGE_UUID}, range_generation: 0 }}\n'
                          f'server_name: "localhost"\n'
-                         f"tls: {{ ca: /etc/vtop/tls/ca.pem, cert: /etc/vtop/tls/data-1.pem, "
-                         f"key: /etc/vtop/tls/data-1-key.pem }}\n")
+                         f"tls: {{ ca: /etc/vtop/tls/ca.pem, cert: /etc/vtop/tls/client.pem, "
+                         f"key: /etc/vtop/tls/client-key.pem }}\n")
         try:
             done = vtop_tool(ctx, raw, "verify", "--client-config", "/out/verify-client.yaml", "--addr",
                              f"vtop-{node}:9400", "--expect-at-least", str(acked), "--max-offset-gaps",
@@ -779,7 +783,7 @@ def record_host_noise(env: dict, ctx: dict, sampler: host_noise.Sampler, path: s
 
 def mint_certs(directory: str) -> None:
     sh(["bash", os.path.join(REPO, "scripts", "live-chaos", "gen-certs.sh"), directory, "1", "2", "3", "--",
-        NODE_UUID[1], NODE_UUID[2], NODE_UUID[3]])
+        NODE_UUID[1], NODE_UUID[2], NODE_UUID[3]], env={"NATIVE_CLIENT_CN": PRINCIPAL_UUID})
     # The CA key signs nothing after minting; removed, no container can see it.
     os.remove(os.path.join(directory, "ca-key.pem"))
     for name in os.listdir(directory):
@@ -812,6 +816,7 @@ def main(argv: list[str] | None = None) -> int:
         running = sh(["docker", "ps", "-q", "--filter", f"label=com.docker.compose.project={SPEC[system]['project']}"])
         if running.stdout.strip():
             raise SystemExit(f"{SPEC[system]['project']} is already running; stop it first (one system at a time)")
+    disk = phase1.probe_host_disk()
     sh(["docker", "pull", "-q", KAFKA_IMAGE], timeout=1800)
     sh(["docker", "pull", "-q", PYTHON_IMAGE], timeout=1800)
     vtop_image = ensure_vtop_image(args.rebuild)
@@ -832,7 +837,7 @@ def main(argv: list[str] | None = None) -> int:
               "timeline_from_ms": TIMELINE_FROM_MS, "timeline_to_ms": TIMELINE_TO_MS,
               "drain_deadline_s": DRAIN_DEADLINE_S, "vtop_batch": args.vtop_batch,
               "vtop_value_bytes": args.vtop_value_bytes, "order": "per fault, per repetition: kafka then vtop"}
-    env = capture_environment(run_id, matrix, vtop_image, limits)
+    env = capture_environment(run_id, matrix, vtop_image, limits, disk)
     ctx = {"run_id": run_id, "run_dir": run_dir, "work": work, "certs": certs, "env": env,
            "fingerprint": schema.fingerprint(env), "vtop_image": vtop_image, "rate": args.rate, "total": total,
            "vtop_batch": args.vtop_batch, "vtop_value_bytes": args.vtop_value_bytes, "keep_raw": args.keep_raw,
