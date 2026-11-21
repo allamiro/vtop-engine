@@ -2213,7 +2213,19 @@ impl<'a> Pipeline<'a> {
             compressed_bytes = metrics.compressed_bytes,
             compression_ratio = format!("{:.2}", metrics.compression_ratio),
             total_ms = metrics.total_ms,
+            // The same stage timings `process-once` prints and the
+            // `vtop_stage_duration_seconds` histograms observe. `run` drops
+            // its outcomes, so this line is the only place a long-running
+            // engine reports them per batch (still one line per committed
+            // batch, with no new label or span).
+            compress_ms = metrics.compress_ms,
+            checksum_ms = metrics.checksum_ms,
+            object_upload_ms = metrics.object_upload_ms,
+            manifest_upload_ms = metrics.manifest_upload_ms,
+            verify_ms = metrics.verify_ms,
+            commit_ms = metrics.commit_ms,
             state_write_ms = metrics.state_write_ms,
+            object_reused = metrics.object_reused,
             records_per_sec = format!("{:.0}", metrics.records_per_sec),
             upload_mib_per_sec = format!("{:.2}", metrics.upload_mib_per_sec),
             "batch_metrics"
@@ -6991,6 +7003,146 @@ mod tests {
             flushed[0].committed,
             "flushed batch must commit after verify"
         );
+    }
+
+    /// The sample count of `vtop_stage_duration_seconds` for one tenant and
+    /// stage, read back from the registry as a scrape would.
+    fn stage_samples(tenant: &str, stage: &str) -> u64 {
+        let mx = telemetry::init().unwrap();
+        mx.registry
+            .gather()
+            .iter()
+            .filter(|f| f.name().ends_with("stage_duration_seconds"))
+            .flat_map(|f| f.get_metric().iter())
+            .filter(|m| {
+                let has = |name: &str, value: &str| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.name() == name && l.value() == value)
+                };
+                has("tenant", tenant) && has("stage", stage)
+            })
+            .map(|m| m.get_histogram().get_sample_count())
+            .sum()
+    }
+
+    /// `run` keeps no outcomes, so the per-stage timings of a batch it commits
+    /// reach an operator only through the `batch_metrics` line and the
+    /// `vtop_stage_duration_seconds` histograms. That line carried the total
+    /// and the ledger-write time and none of the stages, so a `run` engine's
+    /// stage timings read as absent where `process-once` printed them. The
+    /// cycle here is `run`'s own (`force_flush` false, the batch sealed by a
+    /// threshold, not by a forced flush), and the line must name every stage
+    /// with the value the batch measured.
+    #[tokio::test]
+    async fn run_cycle_logs_and_exports_the_stage_timings_of_a_committed_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let input = dir.path().join("in.log");
+        // Enough incompressible-ish text that compression, the checksum and
+        // the verify read each take well over the 1 ms the timings resolve.
+        const LINES: usize = 2_000;
+        {
+            let mut f = std::fs::File::create(&input).unwrap();
+            let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+            for _ in 0..LINES {
+                let mut line = String::with_capacity(4_096);
+                while line.len() < 4_095 {
+                    x = x
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    line.push_str(&format!("{x:016x}"));
+                }
+                writeln!(f, "{line}").unwrap();
+            }
+        }
+        let mut cfg = file_config(
+            work.to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.engine.tenant = "stage-timings-run".into();
+        cfg.batching.max_records = LINES;
+        cfg.batching.max_bytes = 104_857_600;
+        cfg.batching.max_batch_age_seconds = 3_600;
+
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let stages = [
+            "compress",
+            "checksum",
+            "object_upload",
+            "manifest_upload",
+            "verify",
+            "commit",
+            "state_write",
+        ];
+        let before: Vec<u64> = stages
+            .iter()
+            .map(|s| stage_samples("stage-timings-run", s))
+            .collect();
+
+        let (logs, _guard) = CapturedLogs::start_at(tracing::Level::INFO);
+        let outcomes = engine.run_source(SourceType::File, false).await.unwrap();
+        assert_eq!(outcomes.len(), 1, "the threshold sealed one batch");
+        let outcome = &outcomes[0];
+        assert!(outcome.committed, "the batch committed");
+        let m = outcome
+            .metrics
+            .as_ref()
+            .expect("a committed batch has metrics");
+
+        let line = logs.line("batch_metrics");
+        let field = |name: &str| -> u64 {
+            let key = format!("{name}=");
+            let at = line
+                .find(&key)
+                .unwrap_or_else(|| panic!("batch_metrics names no {name}: {line}"));
+            line[at + key.len()..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .unwrap_or_else(|_| panic!("{name} is not a number: {line}"))
+        };
+        let measured = [
+            ("compress_ms", m.compress_ms),
+            ("checksum_ms", m.checksum_ms),
+            ("object_upload_ms", m.object_upload_ms),
+            ("manifest_upload_ms", m.manifest_upload_ms),
+            ("verify_ms", m.verify_ms),
+            ("commit_ms", m.commit_ms),
+            ("state_write_ms", m.state_write_ms),
+            ("total_ms", m.total_ms),
+        ];
+        for (name, ms) in measured {
+            assert_eq!(
+                field(name),
+                ms,
+                "batch_metrics reports {name} as the batch measured it: {line}"
+            );
+        }
+        for (name, ms) in [
+            ("compress_ms", m.compress_ms),
+            ("checksum_ms", m.checksum_ms),
+            ("verify_ms", m.verify_ms),
+            ("total_ms", m.total_ms),
+        ] {
+            assert!(
+                ms > 0,
+                "{name} is 0 although the stage ran over {LINES} lines of 4 KiB: {line}"
+            );
+        }
+
+        for (stage, before) in stages.iter().zip(before) {
+            assert_eq!(
+                stage_samples("stage-timings-run", stage),
+                before + 1,
+                "one vtop_stage_duration_seconds sample for stage {stage} per committed batch"
+            );
+        }
     }
 
     /// #102: a throttle is counted apart from other upload failures, and the
@@ -11952,12 +12104,17 @@ mod tests {
         /// Capture WARN and above on this thread until the guard drops (a
         /// `#[tokio::test]` runs its tasks on the one thread).
         fn start() -> (Self, tracing::subscriber::DefaultGuard) {
+            Self::start_at(tracing::Level::WARN)
+        }
+
+        /// Capture `level` and above on this thread until the guard drops.
+        fn start_at(level: tracing::Level) -> (Self, tracing::subscriber::DefaultGuard) {
             let logs = Self::default();
             let writer = logs.clone();
             let subscriber = tracing_subscriber::fmt()
                 .with_writer(move || writer.clone())
                 .with_ansi(false)
-                .with_max_level(tracing::Level::WARN)
+                .with_max_level(level)
                 .finish();
             // Whether an event's callsite is recorded at all is decided once for
             // the process, the first time any thread reaches it, and cached. With
