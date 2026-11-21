@@ -4317,9 +4317,19 @@ impl Engine {
         if !rewinds.is_empty() {
             self.cycle_had_failure = true;
         }
-        for (marker, result) in rewinds
+        // One rewind per unit, to its LOWEST failed start. Two windows of one
+        // unit can fail in the same pass (the buffered one sealed by
+        // overflow, the new one by its threshold), and an adapter applies the
+        // rewinds in turn, each setting the unit's read position: the higher
+        // start, applied last, left the read head above the lower window, a
+        // later window committed past it, and the restart's rewind of it was
+        // clamped to that commit, so it was never archived. The rewind to the
+        // lowest start re-reads the higher windows too.
+        let (rewinds, covered) = lowest_rewind_per_unit(rewinds);
+        for (at, (marker, result)) in rewinds
             .iter()
             .zip(adapter.replay_from_markers(&rewinds).await)
+            .enumerate()
         {
             match result {
                 Ok(()) => {
@@ -4339,6 +4349,12 @@ impl Engine {
                     self.count_refused_replay(source_type, marker);
                     // Not re-read, so nothing will rebuild it (#626).
                     self.recorded.forget(marker);
+                    // Nor the failed windows of the unit above it, which
+                    // this rewind was to re-read.
+                    for (_, above) in covered.iter().filter(|(by, _)| *by == at) {
+                        self.count_refused_replay(source_type, above);
+                        self.recorded.forget(above);
+                    }
                     tracing::error!(
                         source_type = %source_type,
                         start = ?marker,
@@ -6545,6 +6561,55 @@ pub(crate) fn end_position(marker: &ProgressMarker) -> i128 {
 }
 
 /// Where a range begins within its unit.
+/// One rewind per unit and content generation: the lowest start among
+/// `rewinds`, with the starts it re-reads. Units and generations stay in the
+/// order they first appear, so a replacement's rewind is applied after the
+/// old content's, as recovery orders them.
+///
+/// A generation is content not proven to be another file's (see
+/// [`RewindPlan`]): a same-inode replacement whose fingerprint proves it
+/// other keeps its own rewind, so the replacement is re-read even though the
+/// old content's rewind is refused (review of #891). Between two starts that
+/// are equal, the later window's is kept: it describes the file as it is
+/// now. Each covered start comes with the index of the rewind that re-reads
+/// it.
+fn lowest_rewind_per_unit(
+    rewinds: Vec<ProgressMarker>,
+) -> (Vec<ProgressMarker>, Vec<(usize, ProgressMarker)>) {
+    let mut lowest: Vec<ProgressMarker> = Vec::new();
+    let mut contents: Vec<Vec<ContentFingerprint>> = Vec::new();
+    let mut covered = Vec::new();
+    for marker in rewinds {
+        let unit = unit_key(&marker);
+        let content = marker.content_fingerprint().cloned();
+        let generation = (0..lowest.len()).find(|&i| {
+            unit_key(&lowest[i]) == unit
+                && !contents[i]
+                    .iter()
+                    .any(|seen| proven_other(Some(seen), content.as_ref()))
+        });
+        match generation {
+            Some(i) => {
+                if let Some(content) = content {
+                    if !contents[i].contains(&content) {
+                        contents[i].push(content);
+                    }
+                }
+                if start_position(&marker) <= start_position(&lowest[i]) {
+                    covered.push((i, std::mem::replace(&mut lowest[i], marker)));
+                } else {
+                    covered.push((i, marker));
+                }
+            }
+            None => {
+                lowest.push(marker);
+                contents.push(content.into_iter().collect());
+            }
+        }
+    }
+    (lowest, covered)
+}
+
 pub(crate) fn start_position(marker: &ProgressMarker) -> i128 {
     match marker {
         ProgressMarker::Kafka { start_offset, .. } => i128::from(*start_offset),
@@ -7793,6 +7858,159 @@ mod tests {
             vec![(Some(inode), 0, 7, Some(1)), (Some(inode), 7, len, Some(1))],
             "the failed range is archived as first cut, and nothing is skipped"
         );
+    }
+
+    /// Two windows of one unit sealed in the same pass (the buffered one by
+    /// overflow, the new one by its threshold), and both fail. The read head
+    /// must be handed back to the LOWER start: handing back each start in
+    /// turn left it at the higher one, the next pass committed past the
+    /// lower range, and the restart's rewind of it was clamped to that
+    /// commit. `spool` runs it on a syslog spool, else on a file.
+    async fn two_failed_windows_of_one_unit_in_one_pass(spool: bool) {
+        let _serial = THROTTLE_TESTS.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "line 1\n").unwrap();
+        let mut cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        let source_type = if spool {
+            cfg.sources.file = None;
+            cfg.sources.syslog_spool = Some(vtop_core::config::SyslogSpoolConfig {
+                enabled: true,
+                paths: vec![input.to_string_lossy().into_owned()],
+            });
+            SourceType::SyslogSpool
+        } else {
+            SourceType::File
+        };
+        cfg.batching.max_records = 2;
+        cfg.batching.max_batch_age_seconds = 3_600;
+        cfg.batching.idle_poll_interval_ms = 20;
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        engine.backend = Arc::new(vtop_upload::MockBackend::new().with_throttled_puts(2));
+        // One line, below the threshold: buffered.
+        let _ = engine.run_source(source_type.clone(), false).await;
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&input)
+                .unwrap();
+            write!(f, "line 2\nline 3\n").unwrap();
+        }
+        // This pass seals [0, 7) and [7, 21), and the store refuses both.
+        let failed = engine.run_source(source_type.clone(), false).await;
+        let failed = failed.unwrap_or_default();
+        assert_eq!(
+            failed
+                .iter()
+                .filter(|o| o.final_state == BatchState::Failed)
+                .count(),
+            2,
+            "both windows of the pass failed: {failed:?}"
+        );
+        for _ in 0..10 {
+            let _ = engine.run_source(source_type.clone(), false).await;
+        }
+        let len = std::fs::metadata(&input).unwrap().len() as i128;
+        assert_committed_without_a_gap("two failures in one pass", &engine, len).await;
+    }
+
+    #[tokio::test]
+    async fn two_windows_of_one_file_failing_in_one_pass_rewind_to_the_lower_start() {
+        two_failed_windows_of_one_unit_in_one_pass(false).await;
+    }
+
+    #[tokio::test]
+    async fn two_windows_of_one_spool_failing_in_one_pass_rewind_to_the_lower_start() {
+        two_failed_windows_of_one_unit_in_one_pass(true).await;
+    }
+
+    /// Review of #891: the buffered window of a file and a full window of the
+    /// content that replaced it at the same inode are sealed in one pass, both
+    /// start at byte 0, and both fail. The replacement's fingerprint proves it
+    /// another file, so it keeps its own rewind: the old content's rewind is
+    /// refused (its bytes are gone), and the replacement's must still be
+    /// attempted, or the read head stays past it and a later commit skips it.
+    #[tokio::test]
+    async fn a_replacement_failing_with_the_old_content_it_replaced_is_still_read_again() {
+        let _serial = THROTTLE_TESTS.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        // Lines over a fingerprint's length, so old and new content are
+        // proven different, not merely of other lengths.
+        let line = |c: char| format!("{}\n", c.to_string().repeat(5_000));
+        std::fs::write(&input, line('a')).unwrap();
+        let mut cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.max_records = 2;
+        cfg.batching.max_batch_age_seconds = 3_600;
+        cfg.batching.idle_poll_interval_ms = 20;
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        engine.backend = Arc::new(vtop_upload::MockBackend::new().with_throttled_puts(2));
+        // The old content, below the threshold: buffered.
+        let _ = engine.run_source(SourceType::File, false).await;
+        // Rewritten in place: the same inode, other bytes, two lines.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&input)
+                .unwrap();
+            write!(f, "{}{}", line('b'), line('c')).unwrap();
+        }
+        // The old content's rewind is refused (its bytes are gone), so the
+        // pass reports an error; what matters is what the ledger holds.
+        let _ = engine.run_source(SourceType::File, false).await;
+        let failed: Vec<_> = engine
+            .store
+            .list_batches()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|b| matches!(b.state, BatchState::Failed | BatchState::ReplayRequired))
+            .collect();
+        assert_eq!(
+            failed.len(),
+            2,
+            "the old window and the replacement's both failed: {failed:?}"
+        );
+        for _ in 0..10 {
+            let _ = engine.run_source(SourceType::File, false).await;
+        }
+        let len = std::fs::metadata(&input).unwrap().len() as i128;
+        assert_committed_without_a_gap("a replacement failing with the old content", &engine, len)
+            .await;
+    }
+
+    /// The engine's half on its own: one rewind per unit, the lowest, and the
+    /// starts it covers; units kept apart and in first-seen order.
+    #[test]
+    fn the_rewind_of_a_unit_is_its_lowest_failed_start() {
+        let k = |partition: i32, start: i64| ProgressMarker::Kafka {
+            topic: "t".into(),
+            partition,
+            start_offset: start,
+            end_offset: start + 9,
+            consumer_group: "g".into(),
+            topic_id: None,
+        };
+        let (lowest, covered) = lowest_rewind_per_unit(vec![k(0, 40), k(1, 5), k(0, 30), k(0, 50)]);
+        assert_eq!(lowest, vec![k(0, 30), k(1, 5)]);
+        assert_eq!(covered, vec![(0, k(0, 40)), (0, k(0, 50))]);
     }
 
     /// Every committed file batch as (inode, start byte, end byte, records).
