@@ -68,6 +68,7 @@ fn every_variant() -> Vec<(&'static str, ProgressMarker)> {
             start_offset: 1000,
             end_offset: 1999,
             consumer_group: "vtop-archive".into(),
+            topic_id: None,
         },
     ]
     .into_iter()
