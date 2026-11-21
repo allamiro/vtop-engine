@@ -654,6 +654,38 @@ query string, fragment or user info; the writer refuses such a URI rather
 than record it. The warning for a receipt that could not be written strips
 URL query strings and user info from the store's error.
 
+### 8.5 A manifest is bound to its key (`verify-manifest`)
+
+A genuine manifest copied over another batch's manifest key is intact: its
+self-hash, its MAC, its object and its ledger row all check out. The scrub
+and recovery catch the copy through the ledger, which records which manifest
+belongs at which key (`is batch X's, not Y`). `vtopctl verify-manifest` may
+run with no ledger that knows the batch, so it binds the manifest to its key
+itself: every manifest names the key it was written to, in `manifest.uri`,
+and the check **MUST** find that name equal to the URI it read the manifest
+from, exactly. Otherwise it fails, naming both keys and the batch whose
+manifest it is (`manifest key : FAILED`, `"manifest_key_ok": false`).
+
+What is bound, by manifest version:
+
+| Version | `manifest.uri` present | Covered by the self-hash | Covered by the MAC |
+|---|---|---|---|
+| 0.1 | yes | yes | no MAC exists in 0.1; with a key configured, an unsigned manifest is refused anyway (§8) |
+| 0.2, 0.3 | yes | yes (the re-encoded fields) | yes, when the manifest is signed and a key is configured |
+| 0.4 | yes | yes (the stored document) | yes, when a key is configured |
+
+- **With a key configured**, the binding is authenticated: the MAC covers
+  `manifest.uri` and `batch_id` together, so the key and the batch a manifest
+  names are its signer's statement, and editing either fails the MAC.
+- **Without a key**, the self-hash makes the binding corruption detection
+  only, like every other field: someone who can write the bucket can rewrite
+  `manifest.uri` and recompute the hash. A copied manifest left as it is
+  fails.
+- **Not derived from other fields.** The check does not rebuild the key from
+  the batch id and the partition template: not every writer names a
+  manifest that way (`vtopctl tier` writes `<object>.manifest.json`), and
+  under the MAC the name the manifest carries is already authenticated.
+
 ## 9. Resource exhaustion controls
 
 Resource exhaustion controls are part of the security boundary:

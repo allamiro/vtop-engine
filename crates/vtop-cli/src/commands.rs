@@ -1352,6 +1352,28 @@ pub async fn verify_manifest_deep(
         parsed.fields().batch_id
     ));
 
+    // 1b. The key: is this the manifest that was written HERE? Every check
+    // below is about the manifest's own content, which another batch's
+    // genuine manifest copied over this key passes, so on its own the
+    // report would vouch for the wrong batch at this URI. A manifest names
+    // the key it was written to (`manifest.uri`, in every version from 0.1),
+    // and its self-hash covers that name, and so does its MAC, together with
+    // the batch id: with a key configured the binding is authenticated. The
+    // comparison is exact, as the scrub's binding to the ledger is.
+    let names_uri = parsed.fields().manifest.uri.as_str();
+    let key_ok = names_uri == manifest_uri;
+    failed |= !key_ok;
+    let key_status = if key_ok {
+        "OK (the manifest names the key it was read from)".to_string()
+    } else {
+        format!(
+            "FAILED (read from {manifest_uri}, but it is the manifest written to {names_uri}, \
+             batch {}'s: not the manifest written at this key)",
+            parsed.fields().batch_id
+        )
+    };
+    lines.push(format!("manifest key    : {key_status}"));
+
     // 2. Self-hash: is the manifest itself intact?
     let self_hash_ok = parsed.verify_self_hash().is_ok();
     failed |= !self_hash_ok;
@@ -1495,6 +1517,9 @@ pub async fn verify_manifest_deep(
         "manifest": manifest_uri,
         "batch_id": parsed.fields().batch_id,
         "object_uri": parsed.fields().object.uri,
+        "manifest_key_ok": key_ok,
+        "manifest_key": key_status,
+        "manifest_names_uri": names_uri,
         "self_hash_ok": self_hash_ok,
         "manifest_authentication": authentication_status,
         "manifest_authentication_required": keyring.is_configured(),

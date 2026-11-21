@@ -402,6 +402,96 @@ async fn a_manifest_with_a_bad_mac_is_reported_as_unauthenticated() {
     );
 }
 
+/// `vtopctl verify-manifest` on one URI: the report of the manifest stored
+/// there, checked against `store` as its ledger.
+async fn verify_manifest_at(
+    a: &Archive,
+    store: &dyn vtop_state::StateStore,
+    uri: &str,
+    keyring: &ManifestKeyring,
+) -> vtop_cli::commands::VerifyReport {
+    vtop_cli::commands::verify_manifest_deep(store, a.engine.backend.as_ref(), uri, keyring)
+        .await
+        .unwrap()
+}
+
+/// The external tamper evaluation of v0.10.2: another batch's genuine,
+/// validly signed manifest copied over this batch's manifest key passed
+/// `verify-manifest`, with the MAC on and off and with or without a ledger.
+/// Every check it ran was about the manifest's own content, which is intact.
+/// The manifest names the key it was written to, and its self-hash and MAC
+/// cover that name, so a manifest read from another key is not the one
+/// written there: it fails, naming both. The genuine manifest at its own key
+/// still passes.
+#[tokio::test]
+async fn verify_manifest_fails_another_batchs_genuine_manifest_copied_to_this_key() {
+    let env = format!("VTOP_TEST_VERIFY_SWAP_MAC_{}", std::process::id());
+    for mac in [false, true] {
+        if mac {
+            std::env::set_var(&env, "5a".repeat(32));
+        }
+        let a = archive_with(2, mac.then_some(env.as_str())).await;
+        let keyring = a.engine.config.resolve_manifest_keyring().unwrap();
+        std::env::remove_var(&env);
+        let no_ledger = vtop_state::connect_state_store(&format!(
+            "sqlite://{}",
+            a.dir.path().join("empty.db").display()
+        ))
+        .await
+        .unwrap();
+        let ledger = a.ledger().await;
+        let (victim, donor) = (&ledger[0], &ledger[1]);
+        let victim_uri = victim.manifest_uri.clone().unwrap();
+        let donor_uri = donor.manifest_uri.clone().unwrap();
+
+        for store in [a.engine.store.as_ref(), no_ledger.as_ref()] {
+            let before = verify_manifest_at(&a, store, &victim_uri, &keyring).await;
+            assert!(before.passed, "[mac {mac}] {:#?}", before.lines);
+            assert_eq!(before.json["manifest_key_ok"], true, "{:#?}", before.json);
+        }
+
+        let donated = a
+            .mock
+            .get_object_bounded(&donor_uri, 1 << 20)
+            .await
+            .unwrap();
+        a.overwrite(&victim_uri, &donated, true).await;
+
+        for (store, which) in [
+            (a.engine.store.as_ref(), "ledger"),
+            (no_ledger.as_ref(), "no ledger"),
+        ] {
+            let swapped = verify_manifest_at(&a, store, &victim_uri, &keyring).await;
+            assert!(!swapped.passed, "[mac {mac}, {which}] {:#?}", swapped.lines);
+            let line = swapped
+                .lines
+                .iter()
+                .find(|l| l.starts_with("manifest key"))
+                .unwrap_or_else(|| panic!("no manifest key line: {:#?}", swapped.lines));
+            assert!(
+                line.contains("FAILED")
+                    && line.contains(&victim_uri)
+                    && line.contains(&donor_uri)
+                    && line.contains(&donor.batch_id),
+                "[mac {mac}, {which}] {line}"
+            );
+            assert_eq!(
+                swapped.json["manifest_key_ok"], false,
+                "{:#?}",
+                swapped.json
+            );
+            assert_eq!(swapped.json["manifest_names_uri"], donor_uri.as_str());
+            assert_eq!(swapped.json["passed"], false);
+            // The other checks are about content, which is intact: only the
+            // key binding catches the swap.
+            assert_eq!(swapped.json["self_hash_ok"], true);
+
+            let genuine = verify_manifest_at(&a, store, &donor_uri, &keyring).await;
+            assert!(genuine.passed, "[mac {mac}, {which}] {:#?}", genuine.lines);
+        }
+    }
+}
+
 /// Rows `prune-ledger` deleted are known only by its digests; the scrub
 /// checks them from there, and says where each finding's row came from.
 #[tokio::test]
