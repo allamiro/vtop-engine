@@ -70,6 +70,12 @@ impl ColocatedNodeConfig {
         if let Some(kafka) = self.data.kafka.as_ref() {
             crate::config::kafka_partitions(kafka)?;
             crate::config::kafka_topics(kafka)?;
+            crate::config::kafka_brokers(
+                kafka,
+                self.data.role,
+                self.data.node_uuid,
+                &self.data.peers,
+            )?;
         }
         // Fail loudly rather than picking a winner. A config that names three
         // listen addresses and gets one is a config whose author has a wrong
@@ -258,6 +264,59 @@ observability:
         assert!(
             error.contains("one gateway serves one range"),
             "the co-located entry must judge the topology too: {error}"
+        );
+    }
+
+    /// A co-located candidate's `kafka.brokers` is judged before either role
+    /// binds too (#751): `run` binds the shared observability endpoint before
+    /// `serve` is polled.
+    #[test]
+    fn a_candidates_kafka_brokers_are_judged_before_either_role_binds() {
+        let yaml = |brokers: &str| {
+            format!(
+                r#"
+meta:
+  node_id: 1
+  cluster_id: 00000000-0000-0000-0000-0000000000c0
+  data_dir: /tmp/meta
+  peer_listen: "127.0.0.1:9101"
+  admin_listen: "127.0.0.1:9201"
+  tls: {{ ca: ca.pem, cert: c.pem, key: k.pem }}
+data:
+  role: candidate
+  node_uuid: 00000000-0000-0000-0000-0000000000a1
+  cluster_id: 00000000-0000-0000-0000-0000000000c0
+  data_dir: /tmp/data
+  fencing_epoch: 1
+  range: {{ topic: t, topic_epoch: 1, range_id: 00000000-0000-0000-0000-0000000000c1, range_generation: 0 }}
+  segment_id: 00000000-0000-0000-0000-0000000000d1
+  native_listen: "127.0.0.1:9400"
+  replica_listen: "127.0.0.1:9300"
+  peers:
+    - {{ node_uuid: 00000000-0000-0000-0000-0000000000a1, addr: "10.0.0.1:9300", server_name: a1 }}
+    - {{ node_uuid: 00000000-0000-0000-0000-0000000000a2, addr: "10.0.0.2:9300", server_name: a2 }}
+  replica_tls: {{ ca: ca.pem, cert: c.pem, key: k.pem }}
+  native_tls: {{ ca: ca.pem, cert: c.pem, key: k.pem }}
+  principal_id: 00000000-0000-0000-0000-0000000000e1
+  kafka:
+    listen: "127.0.0.1:9092"
+    node_id: 1
+    brokers:
+{brokers}
+observability:
+  listen: "127.0.0.1:9500"
+"#
+            )
+        };
+        let both = "      - { node_uuid: 00000000-0000-0000-0000-0000000000a1, node_id: 1, host: a1.example, port: 9092 }\n      - { node_uuid: 00000000-0000-0000-0000-0000000000a2, node_id: 2, host: a2.example, port: 9092 }";
+        let config: ColocatedNodeConfig = serde_yaml::from_str(&yaml(both)).unwrap();
+        config.validate().unwrap();
+        let other_only = "      - { node_uuid: 00000000-0000-0000-0000-0000000000a2, node_id: 2, host: a2.example, port: 9092 }";
+        let config: ColocatedNodeConfig = serde_yaml::from_str(&yaml(other_only)).unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(
+            error.contains("no entry for") && error.contains("The node did not start."),
+            "the co-located entry must judge `kafka.brokers` too: {error}"
         );
     }
 

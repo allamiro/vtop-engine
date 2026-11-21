@@ -1997,7 +1997,8 @@ impl KafkaRefusalCollector {
                 "Kafka requests this node's gateway refused, by api and reason; \
                  no_offset_store is an OffsetCommit on a node with no metadata plane, \
                  unserved_api a request (CreateTopics, DescribeConfigs, ...) the gateway \
-                 does not serve",
+                 does not serve, not_leader a produce, fetch or list-offsets this node \
+                 answered NOT_LEADER_OR_FOLLOWER because it does not hold the range",
                 &["api", "reason"],
             )?,
         })
@@ -2016,6 +2017,40 @@ impl Collector for KafkaRefusalCollector {
                 .into_iter()
                 .map(|(refusal, total)| (vec![refusal.api(), refusal.reason()], total)),
         )]
+    }
+}
+
+/// Whether this node's Kafka gateway serves its range now (#751), as
+/// `vtop_kafka_gateway_serving`: 1 while it appends and reads for the range,
+/// 0 while it only redirects (a candidate that follows, a leader whose lease
+/// is gone). Read at scrape time, so it is never a stale copy of the role.
+/// One series, no labels: a node runs at most one gateway.
+pub struct KafkaGatewayServingCollector {
+    serving: Arc<dyn Fn() -> bool + Send + Sync>,
+    gauge: IntGauge,
+}
+
+impl KafkaGatewayServingCollector {
+    pub fn new(serving: Arc<dyn Fn() -> bool + Send + Sync>) -> Result<Self, String> {
+        Ok(Self {
+            serving,
+            gauge: gauge(
+                "kafka_gateway_serving",
+                "1 while this node's Kafka gateway serves its range (produce, fetch, offsets), \
+                 0 while it only redirects clients to the node that holds the range",
+            )?,
+        })
+    }
+}
+
+impl Collector for KafkaGatewayServingCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        self.gauge.desc()
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        self.gauge.set(i64::from((self.serving)()));
+        self.gauge.collect()
     }
 }
 
@@ -2936,6 +2971,27 @@ mod tests {
     /// #596: the gateway's refusals are exported under the bounded
     /// `{api,reason}` pair, every series at zero from the first scrape, and
     /// the value is the gateway's own total.
+    /// `vtop_kafka_gateway_serving` follows the role at scrape time (#751).
+    #[test]
+    fn the_kafka_gateway_serving_gauge_reads_the_role_at_scrape_time() {
+        let serving = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let read = Arc::clone(&serving);
+        let registry = Registry::new_custom(Some("vtop".into()), None).unwrap();
+        registry
+            .register(Box::new(
+                KafkaGatewayServingCollector::new(Arc::new(move || {
+                    read.load(std::sync::atomic::Ordering::SeqCst)
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        assert!(scrape(&registry).contains("vtop_kafka_gateway_serving 0"));
+        serving.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(scrape(&registry).contains("vtop_kafka_gateway_serving 1"));
+        serving.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(scrape(&registry).contains("vtop_kafka_gateway_serving 0"));
+    }
+
     #[test]
     fn kafka_refusals_are_exported_by_api_and_reason() {
         let refusals = Arc::new(vtop_kafka::Refusals::default());
@@ -2949,13 +3005,23 @@ mod tests {
         for series in [
             r#"vtop_kafka_requests_refused_total{api="offset_commit",reason="no_offset_store"} 0"#,
             r#"vtop_kafka_requests_refused_total{api="unserved",reason="unserved_api"} 0"#,
+            r#"vtop_kafka_requests_refused_total{api="produce",reason="not_leader"} 0"#,
+            r#"vtop_kafka_requests_refused_total{api="fetch",reason="not_leader"} 0"#,
+            r#"vtop_kafka_requests_refused_total{api="list_offsets",reason="not_leader"} 0"#,
         ] {
             assert!(text.contains(series), "{series} missing: {text}");
         }
         refusals.count(vtop_kafka::Refusal::OffsetCommitWithoutStore);
         refusals.count(vtop_kafka::Refusal::OffsetCommitWithoutStore);
         refusals.count(vtop_kafka::Refusal::UnservedApi);
+        refusals.count(vtop_kafka::Refusal::FetchNotLeader);
         let text = scrape(&registry);
+        assert!(
+            text.contains(
+                r#"vtop_kafka_requests_refused_total{api="fetch",reason="not_leader"} 1"#
+            ),
+            "{text}"
+        );
         assert!(
             text.contains(
                 r#"vtop_kafka_requests_refused_total{api="offset_commit",reason="no_offset_store"} 2"#

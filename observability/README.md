@@ -226,6 +226,12 @@ is exported from the first scrape at zero:
 |---|---|---|
 | `offset_commit` | `no_offset_store` | A consumer committed offsets to a node with no metadata plane (a static leader or a standalone node). Nothing was stored; the client was answered `INVALID_REQUEST`. A consumer with auto-commit on logs it and keeps reading; an explicit commit fails. Run the node as a leased leader on a metadata plane, or set `enable.auto.commit=false` on consumers that do not need committed offsets. |
 | `unserved` | `unserved_api` | A client sent a request the gateway does not serve (CreateTopics, DescribeConfigs, ...), and the connection was closed. The log line names the api key. Topics are created on the metadata plane (`vtopctl meta create-topic`), not through the Kafka API. |
+| `produce`, `fetch`, `list_offsets` | `not_leader` | The node does not hold the range and answered `NOT_LEADER_OR_FOLLOWER` (#751). Expected on a candidate that follows, and on a node whose lease moved on: a Kafka client refreshes its metadata, which names the holder, and goes there. The log line (at powers of two, with the suppressed count) names the holder the node last read. Nothing is needed unless the count keeps climbing after a failover has settled; then check the lease with `vtopctl meta`. |
+
+`vtop_kafka_gateway_serving` (gauge, no labels) is 1 while the node's gateway
+serves its range and 0 while it only redirects clients (#751). Across the
+members of a candidate range, exactly one should read 1 once a failover has
+settled; none for longer than an election means no member holds the range.
 
 ### Archive scrub
 

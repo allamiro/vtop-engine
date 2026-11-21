@@ -54,9 +54,16 @@ The ports the Helm chart uses for each plane:
 
 ### The Kafka gateway
 
-The gateway is a `kafka:` block in a data node's config. Only a leader or a
-standalone node may serve it, and its listener stays on loopback unless the
-config sets `any_interface`. The Helm chart does not render this block. How it
+The gateway is a `kafka:` block in a data node's config. A leader, a
+standalone node or a candidate may serve it (a static follower may not), and
+its listener stays on loopback unless the config sets `any_interface`. The
+Helm chart does not render this block.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `kafka.brokers` | - | Candidates only, and required there. Every member of `peers` as a Kafka broker, `{ node_uuid, node_id, host, port }`, this node included at its own `kafka.node_id`; the same list on every member. Metadata lists them all and names whichever member holds the lease as the partition's leader, and FindCoordinator names it as the group coordinator, so a client bootstrapped from any member follows a failover with no restart. Ids are unique in 0..=255 and endpoints are distinct. A candidate does not take `kafka.partitions` or `kafka.topics`. |
+
+How it
 compares with Apache Kafka, with every condition, is in the
 [Kafka comparison](../benchmarks/kafka-comparison.md) and
 [Kafka failover](../benchmarks/kafka-failover.md) reports.

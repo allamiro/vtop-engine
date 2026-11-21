@@ -76,17 +76,144 @@ struct BrokerLeaseView(Arc<vtop_broker::LocalBroker>);
 
 impl vtop_kafka::metadata_offsets::LeaseView for BrokerLeaseView {
     fn lease(&self) -> vtop_kafka::metadata_offsets::LeaseState {
-        use vtop_kafka::metadata_offsets::LeaseState;
-        // Never waits on the broker's lock (review): a produce holds it
-        // through its fsync, and an offset commit that blocked there would
-        // park a runtime worker past its own ceiling. A view that cannot
-        // answer now says so, and the commit is retryable.
-        match self.0.meta_fencing_epoch().try_snapshot() {
-            Some((epoch, true)) => LeaseState::Held(epoch),
-            Some((_, false)) => LeaseState::Gone,
-            None => LeaseState::Unknown,
-        }
+        broker_lease(&self.0)
     }
+}
+
+/// The range's lease as `broker` holds it, for the Kafka gateway.
+pub(crate) fn broker_lease(broker: &LocalBroker) -> vtop_kafka::LeaseState {
+    use vtop_kafka::LeaseState;
+    // Never waits on the broker's lock (review): a produce holds it
+    // through its fsync, and an offset commit that blocked there would
+    // park a runtime worker past its own ceiling. A view that cannot
+    // answer now says so, and the commit is retryable.
+    match broker.meta_fencing_epoch().try_snapshot() {
+        Some((epoch, true)) => LeaseState::Held(epoch),
+        Some((_, false)) => LeaseState::Gone,
+        None => LeaseState::Unknown,
+    }
+}
+
+/// Bind the Kafka gateway's listener and judge the address it resolved to
+/// (#225): bound at startup, before the lease agent exists, so a port that
+/// cannot be bound refuses startup before this node could hold a lease it
+/// would never serve.
+async fn bind_kafka_listener(
+    kafka: &crate::config::KafkaGatewayConfig,
+) -> Result<(TcpListener, std::net::SocketAddr), String> {
+    let listener = TcpListener::bind(&kafka.listen)
+        .await
+        .map_err(|error| format!("bind kafka {}: {error}", kafka.listen))?;
+    let bound = listener.local_addr().map_err(|error| error.to_string())?;
+    // The address the bind RESOLVED to is judged too (review): a
+    // hostname in `listen` passes the literal check and can land
+    // off loopback, and a wildcard bound with nothing to advertise
+    // would publish 0.0.0.0 to every client.
+    if !kafka.any_interface && !bound.ip().is_loopback() {
+        return Err(format!(
+            "`kafka.listen: {}` resolved off loopback at {bound}: Kafka's protocol carries \
+             no vtop identity, so this listener admits any peer that can reach it. Bind it \
+             to 127.0.0.1, or spell out `kafka.any_interface: true`",
+            kafka.listen
+        ));
+    }
+    if bound.ip().is_unspecified() && !kafka.advertises_a_host(kafka.partition) {
+        return Err(format!(
+            "`kafka.listen: {}` bound every interface at {bound} and nothing says what \
+             to advertise: set `kafka.advertised_host` to what clients dial, or name \
+             this node's host in `kafka.partitions` or `kafka.brokers`",
+            kafka.listen
+        ));
+    }
+    Ok((listener, bound))
+}
+
+/// How the native bridge behind a gateway appends (#225): as the gateway's
+/// own producer, at the durability the range can honour.
+fn kafka_bridge_config(
+    topic: String,
+    producer_id: Uuid,
+    replicated: bool,
+) -> vtop_kafka::NativeBridgeConfig {
+    vtop_kafka::NativeBridgeConfig {
+        topic,
+        producer_id,
+        durability: if replicated {
+            vtop_protocol::Durability::Quorum
+        } else {
+            vtop_protocol::Durability::LocalFsync
+        },
+        fetch_max_records: MAX_RECORDS,
+        // What one append may carry (review): on a replicated range, what
+        // the replica plane frames — a follower refuses a larger frame, and
+        // from here that looks like a quorum that never arrives (#453);
+        // standalone, the node's own session limits, so a stock client's
+        // default batch is one append and all-or-nothing.
+        max_append_records: if replicated {
+            vtop_protocol::DEFAULT_MAX_RECORDS as usize
+        } else {
+            MAX_RECORDS as usize
+        },
+        max_append_bytes: if replicated {
+            (vtop_protocol::DEFAULT_MAX_FRAME_BYTES / 2) as usize
+        } else {
+            (MAX_FRAME_BYTES / 2) as usize
+        },
+    }
+}
+
+/// What the gateway tells clients and how it bounds itself (#225, #457,
+/// #751). One place decides what clients are told to dial, and the topology
+/// or a candidate's own `kafka.brokers` entry wins there (review):
+/// FindCoordinator answers from this field, and on a wildcard listener the
+/// bound address is `0.0.0.0`, which on the client's own machine is the
+/// client.
+fn kafka_gateway_config(
+    config: &DataNodeConfig,
+    kafka: &crate::config::KafkaGatewayConfig,
+    bound: std::net::SocketAddr,
+) -> vtop_kafka::GatewayConfig {
+    let (advertised_host, advertised_port) = crate::config::kafka_advertised_endpoint(kafka, bound);
+    vtop_kafka::GatewayConfig {
+        advertised_host,
+        advertised_port,
+        node_id: kafka.node_id,
+        partition: kafka.partition,
+        partitions: kafka
+            .partitions
+            .iter()
+            .map(|peer| vtop_kafka::PartitionLeader {
+                index: peer.partition,
+                node_id: peer.node_id,
+                host: peer.host.clone(),
+                port: i32::from(peer.port),
+            })
+            .collect(),
+        brokers: kafka
+            .brokers
+            .iter()
+            .map(|broker| vtop_kafka::KafkaBroker {
+                node_id: broker.node_id,
+                host: broker.host.clone(),
+                port: i32::from(broker.port),
+            })
+            .collect(),
+        cluster_id: Some(config.cluster_id.to_string()),
+        max_fetch_wait: Duration::from_millis(kafka.max_fetch_wait_ms),
+        ..vtop_kafka::GatewayConfig::default()
+    }
+}
+
+/// How long a node joins its gateway's `serve` for at shutdown: longer than
+/// every wait inside it (review). Its drain reports at `drain_timeout` and
+/// gives up only past the bridge ceilings, so the handle is never dropped
+/// while a session can still be inside a bridge call.
+fn kafka_drain_budget(gateway: &vtop_kafka::GatewayConfig) -> Duration {
+    gateway.drain_timeout
+        + gateway.max_produce_wait
+        + gateway.max_fetch_wait
+        + gateway.max_offset_wait
+        + Duration::from_secs(1)
 }
 
 fn lease_admin_client(
@@ -808,6 +935,7 @@ pub async fn run(
     if let Some(kafka) = config.kafka.as_ref() {
         crate::config::kafka_partitions(kafka)?;
         crate::config::kafka_topics(kafka)?;
+        crate::config::kafka_brokers(kafka, config.role, config.node_uuid, &config.peers)?;
     }
     let endpoint = config.observability.take().unwrap_or_default();
     let metrics_addr = observability.serve(&endpoint).await?;
@@ -857,6 +985,7 @@ pub async fn serve(
     if let Some(kafka) = config.kafka.as_ref() {
         crate::config::kafka_partitions(kafka)?;
         crate::config::kafka_topics(kafka)?;
+        crate::config::kafka_brokers(kafka, config.role, config.node_uuid, &config.peers)?;
     }
     std::fs::create_dir_all(&config.data_dir)
         .map_err(|error| format!("create {}: {error}", config.data_dir.display()))?;
@@ -1226,33 +1355,7 @@ async fn run_leader(
     // hold a lease it would never serve. The gateway itself is built once
     // the broker exists, below.
     let kafka_listener = match config.kafka.as_ref() {
-        Some(kafka) => {
-            let listener = TcpListener::bind(&kafka.listen)
-                .await
-                .map_err(|error| format!("bind kafka {}: {error}", kafka.listen))?;
-            let bound = listener.local_addr().map_err(|error| error.to_string())?;
-            // The address the bind RESOLVED to is judged too (review): a
-            // hostname in `listen` passes the literal check and can land
-            // off loopback, and a wildcard bound with nothing to advertise
-            // would publish 0.0.0.0 to every client.
-            if !kafka.any_interface && !bound.ip().is_loopback() {
-                return Err(format!(
-                    "`kafka.listen: {}` resolved off loopback at {bound}: Kafka's protocol carries \
-                     no vtop identity, so this listener admits any peer that can reach it. Bind it \
-                     to 127.0.0.1, or spell out `kafka.any_interface: true`",
-                    kafka.listen
-                ));
-            }
-            if bound.ip().is_unspecified() && !kafka.advertises_a_host(kafka.partition) {
-                return Err(format!(
-                    "`kafka.listen: {}` bound every interface at {bound} and nothing says what \
-                     to advertise: set `kafka.advertised_host` to what clients dial, or name \
-                     this node's host in `kafka.partitions`",
-                    kafka.listen
-                ));
-            }
-            Some((listener, bound))
-        }
+        Some(kafka) => Some(bind_kafka_listener(kafka).await?),
         None => None,
     };
     let principal = config
@@ -1645,69 +1748,12 @@ async fn run_leader(
             let native: Arc<dyn vtop_kafka::Bridge> = Arc::new(
                 vtop_kafka::NativeBridge::new(
                     Arc::clone(&broker),
-                    vtop_kafka::NativeBridgeConfig {
-                        topic: served_topic.clone(),
-                        producer_id: kafka_producer,
-                        durability: if replicated {
-                            vtop_protocol::Durability::Quorum
-                        } else {
-                            vtop_protocol::Durability::LocalFsync
-                        },
-                        fetch_max_records: MAX_RECORDS,
-                        // What one append may carry (review): on a replicated
-                        // range, what the replica plane frames — a follower
-                        // refuses a larger frame, and from here that looks like a
-                        // quorum that never arrives (#453); standalone, the
-                        // node's own session limits, so a stock client's default
-                        // batch is one append and all-or-nothing.
-                        max_append_records: if replicated {
-                            vtop_protocol::DEFAULT_MAX_RECORDS as usize
-                        } else {
-                            MAX_RECORDS as usize
-                        },
-                        max_append_bytes: if replicated {
-                            (vtop_protocol::DEFAULT_MAX_FRAME_BYTES / 2) as usize
-                        } else {
-                            (MAX_FRAME_BYTES / 2) as usize
-                        },
-                    },
+                    kafka_bridge_config(served_topic.clone(), kafka_producer, replicated),
                 )
                 .map_err(|error| format!("kafka gateway: {error}"))?,
             );
-            // One place decides what clients are told to dial, and the
-            // topology wins there (review): FindCoordinator answers from this
-            // field, and on a wildcard listener the bound address is
-            // `0.0.0.0`, which on the client's own machine is the client.
-            let (advertised_host, advertised_port) =
-                crate::config::kafka_advertised_endpoint(kafka, bound);
-            let gateway_config = vtop_kafka::GatewayConfig {
-                advertised_host,
-                advertised_port,
-                node_id: kafka.node_id,
-                partition: kafka.partition,
-                partitions: kafka
-                    .partitions
-                    .iter()
-                    .map(|peer| vtop_kafka::PartitionLeader {
-                        index: peer.partition,
-                        node_id: peer.node_id,
-                        host: peer.host.clone(),
-                        port: i32::from(peer.port),
-                    })
-                    .collect(),
-                cluster_id: Some(config.cluster_id.to_string()),
-                max_fetch_wait: Duration::from_millis(kafka.max_fetch_wait_ms),
-                ..vtop_kafka::GatewayConfig::default()
-            };
-            // Joined for longer than every wait inside `serve` (review): its
-            // drain reports at `drain_timeout` and gives up only past the
-            // bridge ceilings, so this handle is never dropped while a
-            // session can still be inside a bridge call.
-            kafka_drain = gateway_config.drain_timeout
-                + gateway_config.max_produce_wait
-                + gateway_config.max_fetch_wait
-                + gateway_config.max_offset_wait
-                + Duration::from_secs(1);
+            let gateway_config = kafka_gateway_config(&config, kafka, bound);
+            kafka_drain = kafka_drain_budget(&gateway_config);
             let gateway = if kafka.topics.is_empty() {
                 (vtop_kafka::Gateway::new(native, gateway_config), Vec::new())
             } else {
@@ -1816,6 +1862,16 @@ async fn run_leader(
             // repeat only at powers of two.
             observability.register(Box::new(crate::observe::KafkaRefusalCollector::new(
                 gateway.refusals(),
+            )?))?;
+            // Serving while the lease is not gone (#751): a leader whose lease
+            // moved keeps its listener and only redirects.
+            let serving_lease = config.lease.is_some().then(|| Arc::clone(&broker));
+            observability.register(Box::new(crate::observe::KafkaGatewayServingCollector::new(
+                Arc::new(move || {
+                    serving_lease.as_ref().is_none_or(|broker| {
+                        !matches!(broker_lease(broker), vtop_kafka::LeaseState::Gone)
+                    })
+                }),
             )?))?;
             let kafka_shutdown = shutdown.clone();
             // Kept, to be joined before the range is handed back (review):
@@ -2099,6 +2155,17 @@ async fn run_candidate(
         "native",
         "native_transport",
     )?;
+    // The Kafka listener (#751), bound once like the native one: the
+    // address never moves, only what serves behind it. Bound and judged
+    // here, before the lease agent exists, so a refusal is a startup error
+    // with nothing acquired.
+    let kafka_listener = match config.kafka.as_ref() {
+        Some(kafka) => Some((
+            bind_kafka_listener(kafka).await?,
+            kafka_producer_id(principal, kafka)?,
+        )),
+        None => None,
+    };
     let native_shutdown = oneshot_on_shutdown(shutdown.clone());
     let mut native_task = tokio::spawn(async move {
         native_server
@@ -2173,6 +2240,14 @@ async fn run_candidate(
         Some(Arc::new(probe) as Arc<dyn crate::lease_agent::QuorumProbe>),
     )?
     .with_refusal_counters(refusals);
+    // Who holds the range, read every poll, for the Kafka gateway to name
+    // while this node follows (#751).
+    let (holder_tx, holder_rx) = tokio::sync::watch::channel(None);
+    let agent = if kafka_listener.is_some() {
+        agent.with_holder_watch(holder_tx)
+    } else {
+        agent
+    };
     // One MORE mark before /readyz goes green, same shape as the static
     // follower: the binds' own mark plus the agent's first completed
     // metadata exchange (review: a candidate that has never reached
@@ -2189,6 +2264,88 @@ async fn run_candidate(
     let agent_drain = std::time::Duration::from_secs(5)
         .max(std::time::Duration::from_millis(lease.renew_interval_ms).saturating_mul(3));
     let mut agent_task = tokio::spawn(agent.run(release_lease_rx));
+
+    // --- the Kafka gateway, built once (#751) -------------------------------
+    // Over a bridge slot and an offset slot that are empty while this node
+    // follows, a lease view over the broker slot, and the holder the agent
+    // reads. A promotion installs this leadership's bridge and store; a
+    // demotion clears them and waits for the calls in flight.
+    let mut kafka_drain = Duration::ZERO;
+    let mut kafka_addr = None;
+    let (candidate_kafka, mut kafka_task) = match config.kafka.as_ref().zip(kafka_listener) {
+        Some((kafka, ((kafka_listener, bound), kafka_producer))) => {
+            let served_topic = kafka
+                .topic
+                .clone()
+                .unwrap_or_else(|| config.range.topic.clone());
+            let gateway_config = kafka_gateway_config(&config, kafka, bound);
+            kafka_drain = kafka_drain_budget(&gateway_config);
+            let plane = Arc::new(lease_admin_client(lease)?)
+                as Arc<dyn vtop_kafka::metadata_offsets::CursorPlane>;
+            let identity = vtop_kafka::metadata_offsets::RangeIdentity {
+                cluster_id: config.cluster_id,
+                topic: served_topic.clone(),
+                topic_uuid: lease.topic_uuid,
+                range_uuid: config.range.range_id,
+                topic_epoch: config.range.topic_epoch,
+                holder_node_uuid: config.node_uuid,
+                partition: kafka.partition,
+            };
+            // Committed offsets live on the metadata plane (#457 slice 2b),
+            // through a store bound to the leadership that holds the range:
+            // built over each promoted broker, never over a past one.
+            let store: crate::kafka_candidate::OffsetStoreFactory = Box::new(move |broker| {
+                Arc::new(vtop_kafka::metadata_offsets::MetadataOffsetStore::new(
+                    Arc::clone(&plane),
+                    Arc::new(BrokerLeaseView(Arc::clone(broker)))
+                        as Arc<dyn vtop_kafka::metadata_offsets::LeaseView>,
+                    identity.clone(),
+                )) as Arc<dyn vtop_kafka::OffsetStore>
+            });
+            let (candidate_kafka, gateway) = crate::kafka_candidate::CandidateKafka::new(
+                config.range.range_id,
+                gateway_config,
+                kafka_bridge_config(served_topic, kafka_producer, true),
+                Arc::new(crate::kafka_candidate::SlotLeaseView(Arc::clone(&slot)))
+                    as Arc<dyn vtop_kafka::LeaseView>,
+                Arc::new(crate::kafka_candidate::WatchedHolder::new(
+                    holder_rx,
+                    kafka
+                        .brokers
+                        .iter()
+                        .map(|broker| (broker.node_uuid, broker.node_id))
+                        .collect(),
+                )) as Arc<dyn vtop_kafka::HolderView>,
+                Some(store),
+            );
+            let candidate_kafka = Arc::new(candidate_kafka);
+            // What the gateway refuses is counted (#596), and whether it
+            // serves is a gauge (#751).
+            observability.register(Box::new(crate::observe::KafkaRefusalCollector::new(
+                gateway.refusals(),
+            )?))?;
+            let serving = Arc::clone(&candidate_kafka);
+            observability.register(Box::new(crate::observe::KafkaGatewayServingCollector::new(
+                Arc::new(move || serving.is_serving()),
+            )?))?;
+            eprintln!(
+                "warning: kafka gateway on {bound} speaks Kafka's protocol, which carries no vtop \
+                 identity: every peer that reaches it produces and fetches as producer \
+                 {kafka_producer} (derived from principal {principal}) while this node holds the \
+                 range, and an idempotent producer as an identity derived from the range and its \
+                 own id, the same on every member (#225, #457, #751)"
+            );
+            kafka_addr = Some(bound);
+            (
+                Some(candidate_kafka),
+                tokio::spawn(gateway.serve(kafka_listener, shutdown.clone())),
+            )
+        }
+        // No gateway: a task that never ends, so the supervisor's arm for
+        // it never fires.
+        None => (None, tokio::spawn(std::future::pending())),
+    };
+    let mut kafka_task_done = false;
 
     // --- readiness ----------------------------------------------------------
     // 0 = following, 1 = leading, 2 = transitioning. A follower is ready the
@@ -2271,10 +2428,13 @@ async fn run_candidate(
     }));
     observability.gate.mark_ready();
     println!(
-        "data_node_ready role=candidate node={} native={native_listen} replica={replica_listen}{}",
+        "data_node_ready role=candidate node={} native={native_listen} replica={replica_listen}{}{}",
         config.node_uuid,
         metrics_addr
             .map(|addr| format!(" metrics={addr}"))
+            .unwrap_or_default(),
+        kafka_addr
+            .map(|addr| format!(" kafka={addr}"))
             .unwrap_or_default()
     );
     use std::io::Write;
@@ -2386,6 +2546,25 @@ async fn run_candidate(
                     Ok(Ok(())) => "candidate native server exited early".to_owned(),
                     Ok(Err(error)) => error,
                     Err(join) => format!("candidate native server task failed: {join}"),
+                });
+                break 'supervisor;
+            }
+            // The Kafka listener is a plane like the others (#751): a
+            // leader whose advertised Kafka endpoint is gone must not stay
+            // ready, so its early exit is fail-stop too, and its orderly
+            // shutdown is the shutdown.
+            result = &mut kafka_task, if !kafka_task_done => {
+                kafka_task_done = true;
+                if *shutdown.borrow() {
+                    if let Ok(Err(error)) = &result {
+                        eprintln!("kafka gateway error during shutdown: {error}");
+                    }
+                    break;
+                }
+                fatal = Some(match result {
+                    Ok(Ok(())) => "candidate kafka gateway exited early".to_owned(),
+                    Ok(Err(error)) => format!("candidate kafka gateway exited: {error}"),
+                    Err(join) => format!("candidate kafka gateway task failed: {join}"),
                 });
                 break 'supervisor;
             }
@@ -2647,6 +2826,13 @@ async fn run_candidate(
                         switching.install(Arc::clone(&built.status));
                         view.install(Arc::clone(&built.broker) as Arc<dyn CandidateSurface>);
                         slot.install(Arc::clone(&built.broker));
+                        // The gateway serves from here (#751): after the
+                        // promotion completed and the broker is installed,
+                        // never before, so it never appends through a
+                        // broker whose promotion was abandoned.
+                        if let Some(kafka) = candidate_kafka.as_ref() {
+                            kafka.promote(&built.broker, fencing_epoch);
+                        }
                         role_flag.store(1, std::sync::atomic::Ordering::Relaxed);
                         println!(
                             "data_node_role_changed role=leader node={} epoch={fencing_epoch}",
@@ -2708,6 +2894,15 @@ async fn run_candidate(
                         probe_last.store(false, std::sync::atomic::Ordering::Relaxed);
                         view.clear();
                         publisher.set_target(None);
+                        // The gateway in the same order (#751): its bridge
+                        // and store are cleared, so it refuses and names the
+                        // holder, and its calls in flight end before the
+                        // broker is quiesced and dropped below. Nothing it
+                        // holds outlives this, so the directory has one
+                        // owner when it is reopened.
+                        if let Some(kafka) = candidate_kafka.as_ref() {
+                            kafka.demote("follower").await;
+                        }
                         let Phase::Leading { broker, .. } =
                             std::mem::replace(&mut phase, Phase::Transitioning)
                         else {
@@ -2768,6 +2963,8 @@ async fn run_candidate(
         role_flag.store(2, std::sync::atomic::Ordering::Relaxed);
         native_task.abort();
         replica_task.abort();
+        kafka_task.abort();
+        kafka_task_done = true;
         // Aborted handles must not be awaited again below.
         native_task_done = true;
     }
@@ -2809,6 +3006,28 @@ async fn run_candidate(
     // gone) and cannot reach quorum once the successor fences the
     // followers: the same exposure as a SIGKILL, which the protocol
     // already tolerates.
+    // The Kafka gateway drains on the same signal (#751, as run_leader's):
+    // its `serve` returns once every session has finished the request it
+    // was in, and a leading node's bridge is then cleared and its calls
+    // waited for, before the broker's final commit and the release.
+    if candidate_kafka.is_some()
+        && !kafka_task_done
+        && tokio::time::timeout(kafka_drain, &mut kafka_task)
+            .await
+            .is_err()
+    {
+        eprintln!(
+            "kafka gateway did not drain within {kafka_drain:?}; waiting for its calls in \
+             flight before release"
+        );
+    }
+    // Aborted either way: a gateway that drained is done, one that did not is
+    // waited for call by call below, and the stand-in for no gateway never
+    // ends on its own.
+    kafka_task.abort();
+    if let (Some(kafka), Phase::Leading { .. }) = (candidate_kafka.as_ref(), &phase) {
+        kafka.demote("shutdown").await;
+    }
     let committed = match &phase {
         Phase::Following(follower) => Some(follower.quiesce()),
         Phase::Leading { broker, .. } => Some(broker.quiesce()),
@@ -4636,6 +4855,19 @@ mod stream_wait_tests {
     /// A real follower on the replica plane: the stream to it connects the
     /// way a surviving peer's does after a failover.
     async fn live_follower(dir: &Path) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
+        let (addr, stop, _) = live_follower_with_log(dir).await;
+        (addr, stop)
+    }
+
+    /// [`live_follower`], and the follower itself, for a test that reads
+    /// what reached its log.
+    async fn live_follower_with_log(
+        dir: &Path,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::sync::oneshot::Sender<()>,
+        Arc<InProcessFollower>,
+    ) {
         let (set, _) = open_range(
             dir,
             Uuid::from_u128(0xE1),
@@ -4660,12 +4892,14 @@ mod stream_wait_tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (stop, stopped) = tokio::sync::oneshot::channel();
-        let server =
-            ReplicaPeerServer::plaintext(LIVE_PEER, follower as Arc<dyn ReplicaPeerHandler>);
+        let server = ReplicaPeerServer::plaintext(
+            LIVE_PEER,
+            Arc::clone(&follower) as Arc<dyn ReplicaPeerHandler>,
+        );
         tokio::spawn(async move {
             let _ = server.serve(listener, stopped).await;
         });
-        (addr, stop)
+        (addr, stop, follower)
     }
 
     /// Test 1 (#750): one peer up and one down is a write quorum of three,
@@ -5021,6 +5255,310 @@ mod stream_wait_tests {
             "\"waited_ms\":10020",
         ] {
             assert!(warn.contains(part), "missing {part:?} in {warn}");
+        }
+    }
+
+    /// The Kafka gateway on a candidate (#751), over the real leader build:
+    /// a broker built by `build_leader_phase`, a live follower on the replica
+    /// plane, and the gateway a candidate builds once at startup.
+    mod candidate_kafka {
+        use super::*;
+        use crate::kafka_candidate::{CandidateKafka, SlotLeaseView, WatchedHolder};
+        use crate::lease_agent::ObservedHolder;
+        use std::io::{Read, Write};
+        use vtop_kafka::{Bridge, Decoder, Encoder};
+
+        const NOT_LEADER: i16 = 6;
+        const TOPIC: &str = "events.v1";
+
+        /// One request on a fresh connection, the reply's body after its
+        /// correlation id.
+        fn call(addr: std::net::SocketAddr, key: i16, version: i16, body: &[u8]) -> Vec<u8> {
+            let mut socket = std::net::TcpStream::connect(addr).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            let mut e = Encoder::new();
+            e.i16(key);
+            e.i16(version);
+            e.i32(7);
+            e.nullable_string(Some("candidate-node-test"));
+            e.raw(body);
+            let mut framed = (e.as_slice().len() as i32).to_be_bytes().to_vec();
+            framed.extend_from_slice(e.as_slice());
+            socket.write_all(&framed).unwrap();
+            let mut len = [0_u8; 4];
+            socket.read_exact(&mut len).unwrap();
+            let mut reply = vec![0_u8; i32::from_be_bytes(len) as usize];
+            socket.read_exact(&mut reply).unwrap();
+            reply[4..].to_vec()
+        }
+
+        /// Produce v3 of one record at `acks=all`: `(error, base offset)`.
+        fn produce(addr: std::net::SocketAddr, value: &str) -> (i16, i64) {
+            let batch = vtop_kafka::RecordBatch::encode(
+                0,
+                -1,
+                -1,
+                -1,
+                &[vtop_kafka::Record {
+                    offset: 0,
+                    timestamp_millis: 1_700_000_000_000,
+                    key: None,
+                    value: Some(value.as_bytes().to_vec()),
+                    headers: Vec::new(),
+                }],
+            );
+            let mut e = Encoder::new();
+            e.nullable_string(None);
+            e.i16(-1);
+            e.i32(30_000);
+            e.array_len(1);
+            e.string(TOPIC);
+            e.array_len(1);
+            e.i32(0);
+            e.nullable_bytes(Some(&batch));
+            let reply = call(addr, 0, 3, e.as_slice());
+            let mut d = Decoder::new(&reply);
+            d.array_len("topics").unwrap();
+            d.string("topic").unwrap();
+            d.array_len("partitions").unwrap();
+            d.i32("index").unwrap();
+            (d.i16("error").unwrap(), d.i64("base").unwrap())
+        }
+
+        /// FindCoordinator v1 for a group: `(error, node id)`.
+        fn find_coordinator(addr: std::net::SocketAddr) -> (i16, i32) {
+            let mut e = Encoder::new();
+            e.string("g");
+            e.i8(0);
+            let reply = call(addr, 10, 1, e.as_slice());
+            let mut d = Decoder::new(&reply);
+            d.i32("throttle").unwrap();
+            let error = d.i16("error").unwrap();
+            d.nullable_string("message").unwrap();
+            (error, d.i32("node").unwrap())
+        }
+
+        async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+            tokio::task::spawn_blocking(work).await.unwrap()
+        }
+
+        /// A bridge whose first produce parks until released, so a test can
+        /// hold a call in flight across a demotion.
+        struct Gated {
+            inner: Arc<dyn Bridge>,
+            entered: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+            finished: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        impl Bridge for Gated {
+            fn topics(&self) -> Vec<String> {
+                self.inner.topics()
+            }
+            fn produce(
+                &self,
+                topic: &str,
+                batches: &[vtop_kafka::RecordBatch],
+                sequenced: Option<vtop_kafka::Sequenced>,
+            ) -> Result<vtop_kafka::Appended, vtop_kafka::ErrorCode> {
+                if let Some(entered) = self.entered.lock().unwrap().take() {
+                    entered.send(()).unwrap();
+                    self.release.lock().unwrap().recv().unwrap();
+                }
+                let appended = self.inner.produce(topic, batches, sequenced);
+                self.finished
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                appended
+            }
+            fn fetch(
+                &self,
+                topic: &str,
+                offset: i64,
+                max_bytes: usize,
+            ) -> Result<vtop_kafka::Fetched, vtop_kafka::ErrorCode> {
+                self.inner.fetch(topic, offset, max_bytes)
+            }
+            fn bounds(&self, topic: &str) -> Result<(i64, i64), vtop_kafka::ErrorCode> {
+                self.inner.bounds(topic)
+            }
+        }
+
+        /// A candidate that is promoted serves a Produce through its gateway
+        /// and acknowledges it at a quorum: the record is on the live
+        /// follower's disk when the client hears success. On demotion the
+        /// gateway refuses at once, a call in flight ends before the
+        /// demotion returns, the gateway names the new holder, and once the
+        /// node drops its own handles nothing owns the broker: a `Weak` to
+        /// it fails to upgrade, so the directory has one owner when the
+        /// follower reopens it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_promoted_candidate_serves_at_a_quorum_and_its_demotion_leaves_the_broker_unowned(
+        ) {
+            let leader_dir = tempfile::tempdir().unwrap();
+            let follower_dir = tempfile::tempdir().unwrap();
+            let (live, _stop, follower) = live_follower_with_log(follower_dir.path()).await;
+            let config = candidate_config(leader_dir.path());
+            let peers = vec![peer(LIVE_PEER, live), peer(DEAD_PEER, closed_port().await)];
+
+            // The gateway a candidate builds at startup, before any role.
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let broker_slot = Arc::new(vtop_broker::BrokerSlot::empty());
+            let (holder_tx, holder_rx) = tokio::sync::watch::channel(None);
+            let (kafka, gateway) = CandidateKafka::new(
+                range().range_id,
+                vtop_kafka::GatewayConfig {
+                    advertised_host: addr.ip().to_string(),
+                    advertised_port: i32::from(addr.port()),
+                    node_id: 1,
+                    brokers: vec![
+                        vtop_kafka::KafkaBroker {
+                            node_id: 1,
+                            host: addr.ip().to_string(),
+                            port: i32::from(addr.port()),
+                        },
+                        vtop_kafka::KafkaBroker {
+                            node_id: 2,
+                            host: "127.0.0.1".to_owned(),
+                            port: 1,
+                        },
+                    ],
+                    max_produce_wait: Duration::from_secs(20),
+                    drain_timeout: Duration::from_secs(1),
+                    ..vtop_kafka::GatewayConfig::default()
+                },
+                kafka_bridge_config(TOPIC.to_owned(), Uuid::from_u128(0x6A7E), true),
+                Arc::new(SlotLeaseView(Arc::clone(&broker_slot))),
+                Arc::new(WatchedHolder::new(
+                    holder_rx,
+                    vec![(SELF, 1), (LIVE_PEER, 2)],
+                )),
+                None,
+            );
+            let (stop_gateway, gateway_shutdown) = tokio::sync::watch::channel(false);
+            let served = tokio::spawn(gateway.serve(listener, gateway_shutdown));
+
+            // Following: refused by name, never an empty success.
+            assert_eq!(blocking(move || produce(addr, "early")).await.0, NOT_LEADER);
+            assert!(!kafka.is_serving());
+
+            // Promoted: the build, the install, then the gateway.
+            let built = build_leader_phase(
+                &config,
+                &range(),
+                &peers,
+                roll(),
+                &MetaFencingEpoch::new(EPOCH),
+                EPOCH,
+            )
+            .await
+            .expect("the build succeeds with a quorum of streams");
+            let witness = Arc::downgrade(&built.broker);
+            broker_slot.install(Arc::clone(&built.broker));
+            kafka.promote(&built.broker, EPOCH);
+            holder_tx.send_replace(Some(ObservedHolder {
+                node_uuid: SELF,
+                fencing_epoch: EPOCH,
+            }));
+            assert!(kafka.is_serving());
+            assert_eq!(blocking(move || produce(addr, "first")).await, (0, 0));
+            assert!(
+                follower.local_committed_offset() >= 1,
+                "acks=all is a quorum: the live follower holds the record when the client hears \
+                 success"
+            );
+            assert_eq!(blocking(move || find_coordinator(addr)).await, (0, 1));
+
+            // Demoted with nothing in flight, in the supervisor's order: the
+            // broker slot first, then the gateway. Refused at once.
+            broker_slot.clear();
+            let quiesced = kafka.demote("follower").await;
+            assert_eq!(quiesced.in_flight, 0);
+            assert!(!kafka.is_serving());
+            assert_eq!(
+                blocking(move || produce(addr, "refused")).await.0,
+                NOT_LEADER
+            );
+
+            // Promoted again, and demoted with a produce in flight. The
+            // bridge is the native one over this broker, held open at its
+            // first produce.
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let native = Arc::new(
+                vtop_kafka::NativeBridge::new(
+                    Arc::clone(&built.broker),
+                    kafka_bridge_config(TOPIC.to_owned(), Uuid::from_u128(0x6A7E), true),
+                )
+                .unwrap(),
+            );
+            broker_slot.install(Arc::clone(&built.broker));
+            kafka.install(
+                Arc::new(Gated {
+                    inner: native,
+                    entered: std::sync::Mutex::new(Some(entered_tx)),
+                    release: std::sync::Mutex::new(release_rx),
+                    finished: Arc::clone(&finished),
+                }),
+                None,
+                EPOCH,
+            );
+            let in_flight = std::thread::spawn(move || produce(addr, "in flight"));
+            blocking(move || entered_rx.recv().unwrap()).await;
+
+            let kafka = Arc::new(kafka);
+            broker_slot.clear();
+            let demotion = {
+                let kafka = Arc::clone(&kafka);
+                tokio::spawn(async move { kafka.demote("follower").await })
+            };
+            // The range moved; the demoted node names the new holder.
+            holder_tx.send_replace(Some(ObservedHolder {
+                node_uuid: LIVE_PEER,
+                fencing_epoch: EPOCH + 1,
+            }));
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                !demotion.is_finished(),
+                "the demotion waits for the call in flight"
+            );
+            assert_eq!(
+                blocking(move || produce(addr, "after")).await.0,
+                NOT_LEADER,
+                "a call that starts after the demotion began is refused while the old one runs"
+            );
+            assert_eq!(
+                blocking(move || find_coordinator(addr)).await,
+                (0, 2),
+                "the coordinator moved with the lease"
+            );
+
+            release_tx.send(()).unwrap();
+            let quiesced = demotion.await.unwrap();
+            assert!(
+                finished.load(std::sync::atomic::Ordering::SeqCst),
+                "the call in flight ended before the demotion returned"
+            );
+            assert_eq!(quiesced.in_flight, 1);
+            assert_eq!(
+                in_flight.join().unwrap(),
+                (0, 1),
+                "the call finished on the bridge it began on"
+            );
+
+            // The node's own handle goes, as the supervisor drops it, and
+            // nothing else holds the broker.
+            drop(built);
+            assert!(
+                witness.upgrade().is_none(),
+                "no Arc<LocalBroker> outlives the demotion"
+            );
+
+            stop_gateway.send(true).unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(10), served).await;
         }
     }
 }
