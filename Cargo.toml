@@ -13,6 +13,7 @@ members = [
   "crates/vtop-state",
   "crates/vtop-cli",
   "crates/vtop-kafka",
+  "crates/vtop-s3-testkit",
 ]
 
 [workspace.package]
@@ -144,6 +145,10 @@ vtop-kafka = { path = "crates/vtop-kafka", version = "0.10.2" }
 vtop-adapters = { path = "crates/vtop-adapters", version = "0.10.2", default-features = false }
 vtop-upload = { path = "crates/vtop-upload", version = "0.10.2" }
 vtop-state = { path = "crates/vtop-state", version = "0.10.2" }
+# Test support for the live S3 tests (#722), a dev-dependency only and never
+# published. The version is cargo-deny's: a path dependency without one is a
+# wildcard, which `bans` refuses.
+vtop-s3-testkit = { path = "crates/vtop-s3-testkit", version = "0.10.2" }
 
 [profile.release]
 opt-level = 3

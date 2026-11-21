@@ -4059,6 +4059,7 @@ dependencies = [
  "vtop-meta",
  "vtop-observe",
  "vtop-protocol",
+ "vtop-s3-testkit",
  "vtop-state",
  "vtop-upload",
 ]
@@ -4207,6 +4208,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "vtop-s3-testkit"
+version = "0.10.2"
+dependencies = [
+ "futures",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "vtop-state"
 version = "0.10.2"
 dependencies = [
@@ -4249,6 +4262,7 @@ dependencies = [
  "tokio",
  "tracing",
  "vtop-core",
+ "vtop-s3-testkit",
 ]
 
 [[package]]
