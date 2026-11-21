@@ -168,6 +168,16 @@ jobs:
           done
           ls -la "$out"
           test "$(find "$out" -type f | wc -l)" -eq 7
+          # The anti-tamper suite (docs/reference/tamper-evidence.md) is not
+          # a capability case: it needs the lab's MinIO, its root credentials
+          # and its Object Lock bucket, so it is kept apart from the binaries
+          # every leg runs and only the minio leg runs it.
+          lab="$RUNNER_TEMP/s3-tamper-bin"
+          mkdir -p "$lab"
+          build -p vtop-cli --test live_s3_tamper | while read -r name exe; do
+            cp "$exe" "$lab/$name"
+          done
+          test -x "$lab/live_s3_tamper"
 
       - name: Save the build cache (main only)
         if: github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true'
@@ -183,6 +193,13 @@ jobs:
         with:
           name: s3-compat-binaries
           path: ${{ runner.temp }}/s3-compat-bin
+          retention-days: 1
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: s3-tamper-binary
+          path: ${{ runner.temp }}/s3-tamper-bin
           retention-days: 1
           if-no-files-found: error
 
@@ -255,6 +272,27 @@ jobs:
           scripts/s3-lab.sh test "${{ matrix.server }}" "$RUNNER_TEMP/s3-compat-bin" \
             "${RESULTS%/*}/when_required-${{ matrix.server }}.jsonl" \
             live_s3_verification transport_conformance live_s3_object_lock live_s3_object_lock_engine
+
+      # The anti-tamper suite against the lab's MinIO (docs/reference/
+      # tamper-evidence.md): a bucket-write attacker against signed
+      # manifests, Object Lock, versioning, receipts and the coverage audit.
+      # MinIO only, and gating there: it is not judged by a capability file.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: matrix.server == 'minio'
+        with:
+          name: s3-tamper-binary
+          path: ${{ runner.temp }}/s3-tamper-bin
+
+      - name: Run the anti-tamper suite (minio only)
+        if: matrix.server == 'minio'
+        run: |
+          set -euo pipefail
+          set -a
+          . docker/s3-servers/minio/server.env
+          set +a
+          export AWS_REGION=us-east-1
+          chmod +x "$RUNNER_TEMP/s3-tamper-bin/live_s3_tamper"
+          "$RUNNER_TEMP/s3-tamper-bin/live_s3_tamper" --ignored --test-threads=1
 
       - name: Summarise the results
         if: always()

@@ -10,6 +10,11 @@
 //!   cargo test -p vtop-cli --test integration_kafka_to_minio -- --ignored
 //! ```
 //!
+//! The same suite runs through a TLS or SASL listener when the
+//! `VTOP_TEST_KAFKA_*` variables of `kafka_broker_env.rs` are set;
+//! `scripts/kafka-broker.sh` starts such a broker and prints the variables
+//! (#721, docs/install/kafka.md).
+//!
 //! Why this file matters: the Kafka path had a P0 where every read returned zero
 //! records (a `subscribe()` per read forced a rebalance that reseeked to earliest
 //! and consumed the whole poll window), so no batch ever sealed and no offset
@@ -24,6 +29,12 @@
 
 use vtop_adapters::kafka_source::build_client_config;
 use vtop_core::config::KafkaSourceConfig;
+
+// Where the broker is and how to authenticate to it: environment hooks, so the
+// same suite runs through a plaintext, TLS or SASL listener (#721).
+#[path = "kafka_broker_env.rs"]
+mod broker_env;
+use broker_env::bootstrap;
 
 /// Run `$op` (an expression ending in `.await` that yields a `Result`),
 /// waiting out a group coordinator that is not ready yet (#665): a warm-up
@@ -56,7 +67,7 @@ macro_rules! through_warm_up {
 }
 
 fn kafka_cfg(bootstrap: &str, group: &str) -> KafkaSourceConfig {
-    KafkaSourceConfig {
+    let mut cfg = KafkaSourceConfig {
         enabled: true,
         bootstrap_servers: vec![bootstrap.to_string()],
         consumer_group: group.to_string(),
@@ -69,7 +80,9 @@ fn kafka_cfg(bootstrap: &str, group: &str) -> KafkaSourceConfig {
         sasl_username: None,
         sasl_password_env: None,
         ssl_ca_location: None,
-    }
+    };
+    broker_env::apply(&mut cfg);
+    cfg
 }
 
 /// Always-on guard: the Kafka client config must never enable auto-commit,
@@ -90,10 +103,6 @@ use std::collections::HashMap;
 use vtop_adapters::base::{DiscoveredSource, SourceAdapter};
 use vtop_adapters::KafkaSource;
 use vtop_core::types::{ProgressMarker, TelemetryFormat};
-
-fn bootstrap() -> String {
-    std::env::var("VTOP_TEST_KAFKA").unwrap_or_else(|_| "kafka:9092".into())
-}
 
 /// A unique consumer group per test, so a re-run never inherits offsets from a
 /// previous run — which would silently mask a broken read.
@@ -616,6 +625,7 @@ fn kafka_marker(topic: &str, group: &str, start: i64, end: i64) -> ProgressMarke
         start_offset: start,
         end_offset: end,
         consumer_group: group.into(),
+        topic_id: None,
     }
 }
 
@@ -1826,6 +1836,12 @@ async fn a_partition_added_while_the_topic_is_read_is_read_from_its_start() {
 /// and skipped what was written to it since its first assign, and nothing
 /// recovered it: its new start was the new end. It must be pinned where it
 /// started first.
+///
+/// The test pauses quiet behind the adapter, as a dead fetcher looks, and the
+/// renewal must clear that pause. It used to fail now and then with quiet
+/// assigned at the right offset and paused: the adapter resumed after the
+/// assign, and librdkafka discarded the resume as older than the assign's
+/// fetch start. The adapter now resumes before it assigns.
 #[tokio::test]
 #[ignore = "requires a running Kafka broker"]
 async fn renewing_the_assignment_does_not_move_a_partition_that_started_at_the_end() {
@@ -1873,15 +1889,50 @@ async fn renewing_the_assignment_does_not_move_a_partition_that_started_at_the_e
         kafka_source(&extra),
     ];
     let started = std::time::Instant::now();
+    // The renewal: the first pass with `extra` listed assigns again. Where
+    // it assigned quiet decides between the two ways this can fail: past
+    // the three records is a skip (they are never read), at the first of
+    // them is a partition that has not delivered yet.
     let mut quiet_read = 0;
-    while quiet_read < 3 && started.elapsed() < std::time::Duration::from_secs(30) {
+    let mut renewed = false;
+    let mut assigned_at = None;
+    while !renewed && quiet_read == 0 {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "the assignment was not renewed with the new topic within 30 s"
+        );
+        quiet_read += read_pass(&mut adapter, &sources).await[1];
+        // `extra` is assigned at its beginning, so a known offset for it
+        // says this pass renewed the assignment.
+        if adapter.next_offset_expected(&extra, 0).is_some() {
+            renewed = true;
+            assigned_at = adapter.next_offset_expected(&quiet, 0);
+        }
+    }
+    if quiet_read == 0 {
+        assert_eq!(
+            assigned_at,
+            Some(0),
+            "renewing the assignment assigned quiet at {}, not at the three records written \
+             to it since it started at the end of the log (offsets 0 to 2): they would never \
+             be read",
+            assigned_at.map_or("the end of the log (no pinned offset)".to_string(), |at| {
+                format!("offset {at}")
+            })
+        );
+    }
+    // Assigned at the records, they must arrive, however slowly the broker
+    // starts the new fetcher.
+    while quiet_read < 3 && started.elapsed() < std::time::Duration::from_secs(60) {
         quiet_read += read_pass(&mut adapter, &sources).await[1];
     }
     assert_eq!(
         quiet_read,
         3,
-        "renewing the assignment skipped records written to a partition that started at \
-         the end of the log (within {:?}; stall recoveries: {})",
+        "quiet was assigned at offset 0, at the three records written to it, so nothing \
+         was skipped, but it delivered {quiet_read} of them within {:?}: its fetcher did \
+         not run after the renewal (a pause left in place, or a fetcher that never \
+         started; stall recoveries: {})",
         started.elapsed(),
         adapter.stall_recoveries()
     );
@@ -1938,6 +1989,82 @@ async fn deleting_a_topic_with_a_waiting_partition_does_not_stop_the_others() {
         3,
         "after {gone} was deleted, {busy} was not read again within {:?}",
         started.elapsed()
+    );
+}
+
+// ---- topic ids: which incarnation of a topic a range was read from ---------
+
+/// What one read of `topic` through a new adapter records: the topic id of the
+/// read's start and end markers (which must agree), and the end offset.
+async fn read_topic_id(topic: &str) -> (Option<String>, i64) {
+    let mut adapter = KafkaSource::new(
+        kafka_cfg(&bootstrap(), &unique_group("topic-id")),
+        TelemetryFormat::Cef,
+    )
+    .unwrap();
+    let src = kafka_source(topic);
+    let reads = through_warm_up!(
+        "read failed",
+        adapter
+            .read_batch_candidates(&src, 100, 1 << 20, std::time::Duration::from_secs(10))
+            .await
+    );
+    let read = reads
+        .iter()
+        .find(|r| !r.records.is_empty())
+        .unwrap_or_else(|| panic!("a read of {topic} returned no records"));
+    match (&read.progress_start, &read.progress_end) {
+        (
+            ProgressMarker::Kafka {
+                topic_id: start_id, ..
+            },
+            ProgressMarker::Kafka {
+                topic_id: end_id,
+                end_offset,
+                ..
+            },
+        ) => {
+            assert_eq!(start_id, end_id, "one read, one topic id");
+            (end_id.clone(), *end_offset)
+        }
+        other => panic!("expected Kafka markers, got {other:?}"),
+    }
+}
+
+/// The ledger tells a topic deleted and recreated under the same name from the
+/// old one by the topic id the markers record, because the offsets of the two
+/// logs overlap. The broker (Kafka 2.8 and later) gives each incarnation its
+/// own UUID: a read records it, it is the same for the same topic, and a topic
+/// created again under the name has another.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn a_read_records_the_topic_id_and_a_recreated_topic_has_another() {
+    let topic = fresh_topic_name("topic_id");
+    let first = create_topic(&topic).await;
+    produce(&topic, 3);
+    let (id, end) = read_topic_id(&topic).await;
+    let id = id.expect("the broker gave the topic an id, which the markers of a read record");
+    assert_eq!(id.len(), 22, "a UUID as Kafka prints it: {id}");
+    assert_eq!(end, 2, "offsets 0 to 2 were written");
+    let (again, _) = read_topic_id(&topic).await;
+    assert_eq!(
+        again.as_deref(),
+        Some(id.as_str()),
+        "the same topic has the same id on every read"
+    );
+
+    // Deleted and created again under the same name: offsets start from zero.
+    drop(first);
+    wait_for_partitions_gone(&topic);
+    let _second = create_topic(&topic).await;
+    produce(&topic, 3);
+    let (recreated, end) = read_topic_id(&topic).await;
+    assert_eq!(end, 2, "the new log numbers its offsets from zero again");
+    let recreated = recreated.expect("the recreated topic has an id");
+    assert_ne!(
+        recreated, id,
+        "a recreated topic must have another id, or its rows could not be told from the old \
+         topic's"
     );
 }
 

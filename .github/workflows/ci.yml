@@ -1345,6 +1345,16 @@ jobs:
       - name: format registry (every magic and version constant has an entry)
         run: python scripts/check-format-registry.py
 
+      # The threat map (#732): every threat in docs/SECURITY_MODEL.md section 17
+      # names a control and a test, and each must still exist. It lives in this
+      # job, which runs on every pull request, and not in the docs workflow,
+      # because a renamed test in a crate must fail here and a docs path filter
+      # would never see it. Standard library only; it reads a few files.
+      - name: the threat map's tests can fail for each rot they exist to catch
+        run: python -m unittest discover -s scripts/tests -p 'test_check_threat_map.py' -v
+      - name: threat map (every named control and test exists)
+        run: python scripts/check-threat-map.py
+
   # Kafka was entirely untested in CI, which is how a P0 shipped: every read
   # returned zero records (a subscribe() per read forced a rebalance that
   # reseeked to earliest and ate the poll window), so no batch ever sealed - and

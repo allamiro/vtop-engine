@@ -205,6 +205,7 @@ nav:
       - S3 compatibility: reference/s3-compatibility.md
       - Compatibility and upgrade policy: reference/compatibility.md
       - Data-safety register: reference/data-safety-register.md
+      - Tamper evidence: reference/tamper-evidence.md
       - Protocol (normative draft): VTOP_PROTOCOL_DRAFT.md
       - Design documents:
           - Architecture: ARCHITECTURE.md

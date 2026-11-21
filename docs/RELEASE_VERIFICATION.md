@@ -32,10 +32,34 @@ The identity regexp matches any workflow in this repository. Pin it to
 that the image came from the release workflow at that exact tag, which is the
 stricter and better check for a deployment.
 
+The image also has a GitHub build provenance attestation (SLSA), which says
+which workflow, tag and commit built it. Check it with the GitHub CLI
+(`gh attestation`, version 2.68 or newer, the first with `--source-ref`), signed in to the registry if your
+setup needs it:
+
+```
+gh attestation verify oci://ghcr.io/allamiro/vtop-engine:VERSION \
+  --repo allamiro/vtop-engine \
+  --signer-workflow allamiro/vtop-engine/.github/workflows/release.yml \
+  --source-ref refs/tags/vVERSION \
+  --deny-self-hosted-runners
+```
+
+It exits 0 and prints the verified attestation when the image was built by
+`release.yml` at that tag on a GitHub-hosted runner, and non-zero otherwise.
+
 ## Binaries
 
 Each archive contains `vtop-node` (the node process) and `vtopctl` (the
 operator CLI), for `linux` (x86_64, aarch64) and `macOS` (arm64, x86_64).
+Linux has two archives per architecture: `TARGET` is
+`x86_64-unknown-linux-gnu` or `aarch64-unknown-linux-gnu` (glibc 2.17 or
+newer), or `x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl`
+(fully static, any Linux). On macOS it is `aarch64-apple-darwin` or
+`x86_64-apple-darwin`. Six archives in all, each with its own Sigstore
+bundle, build provenance attestation and line in `SHA256SUMS`;
+[install/binaries.md](install/binaries.md#supported-platforms) says which to
+pick.
 
 Windows is not built. librdkafka is compiled from source via cmake and the
 Windows path is not validated — an untested binary is worse than an absent one.
@@ -51,15 +75,34 @@ cosign verify-blob "$archive" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
 ```
 
+Each archive also has a GitHub build provenance attestation (SLSA). It is not a
+file in the release: it is stored with GitHub's attestations for the
+repository, and `gh attestation verify` fetches it:
+
+```
+gh attestation verify "$archive" \
+  --repo allamiro/vtop-engine \
+  --signer-workflow allamiro/vtop-engine/.github/workflows/release.yml \
+  --source-ref refs/tags/vVERSION \
+  --deny-self-hosted-runners
+```
+
+It exits 0 and prints the verified attestation when the archive was built by
+`release.yml` at that tag on a GitHub-hosted runner. The release workflow runs
+this same command on every archive and on the image before it publishes the
+release, so a release that cannot be verified is not published. A manual
+dry-run of the workflow (`workflow_dispatch`) builds but publishes nothing and
+creates no attestation.
+
 Also check the archive against `SHA256SUMS`:
 
 ```
 sha256sum --check --ignore-missing SHA256SUMS
 ```
 
-`SHA256SUMS` detects a corrupted or swapped download; the Sigstore bundle is
-what establishes it came from this project's release workflow. They answer
-different questions, so check both.
+`SHA256SUMS` detects a corrupted or swapped download; the Sigstore bundle and
+the attestation are what establish it came from this project's release
+workflow. They answer different questions, so check both.
 
 ## SBOM
 
