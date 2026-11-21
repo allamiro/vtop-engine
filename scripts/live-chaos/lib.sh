@@ -344,7 +344,7 @@ init_workdir() {
     || fail "cannot create log directory under $WORKDIR; set CHAOS_WORKDIR to a writable filesystem"
   CERTS="$WORKDIR/certs"
   if [[ "${CHAOS_NO_CERTS:-0}" != "1" ]]; then
-    "$SCRIPT_DIR/gen-certs.sh" "$CERTS" 1 2 3 4 5 6 -- \
+    NATIVE_CLIENT_CN="$PRINCIPAL_ID" "$SCRIPT_DIR/gen-certs.sh" "$CERTS" 1 2 3 4 5 6 -- \
       "$LEADER_UUID" "$FOLLOWER1_UUID" "$FOLLOWER2_UUID" "$SPARE_UUID" > /dev/null
   fi
   log "workdir=$WORKDIR"
@@ -675,7 +675,7 @@ emit_client_config_at_epoch() {
     emit_range_yaml
     echo "server_name: \"localhost\""
     if ! transport_plaintext; then
-      echo "tls: { ca: $CERTS/ca.pem, cert: $CERTS/data-1.pem, key: $CERTS/data-1-key.pem }"
+      echo "tls: { ca: $CERTS/ca.pem, cert: $CERTS/client.pem, key: $CERTS/client-key.pem }"
     fi
   } | install_config "$cfg"
   echo "$cfg"
