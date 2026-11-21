@@ -111,7 +111,7 @@ pub enum Action {
 
 impl Action {
     /// Every action, for label sets and tests.
-    pub const ALL: [Action; 14] = [
+    pub const ALL: [Action; 15] = [
         Action::LedgerReplay,
         Action::LedgerPrune,
         Action::LedgerMigrate,
