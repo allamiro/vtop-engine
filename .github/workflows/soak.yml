@@ -185,6 +185,12 @@ jobs:
       # to a directory on a disk with about 180 GB free.
       DATA_DIR: ${{ vars.VTOP_SOAK_DATA_DIR || '/var/lib/vtop-soak' }}
       OUT: ${{ github.workspace }}/soak-out
+      # The lab's containers write the data directories as their own users
+      # (the engine as 10001, Kafka as its appuser, MinIO as root), which a
+      # runner user cannot delete: the data is removed from a root container,
+      # as soak_lab.py's prepare_data_dirs chowns it. The engine image's own
+      # base, pinned by the same digest as docker/Dockerfile.
+      CLEANUP_IMAGE: debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: The host meets the requirements
@@ -197,6 +203,13 @@ jobs:
           python3 --version
           mkdir -p "$DATA_DIR"
           df -h "$DATA_DIR"
+      # A run whose runner died skipped its tear-down; its data would make
+      # this run's preparation fail on directories it cannot chmod.
+      - name: Remove what an earlier run left in the data directory
+        run: |
+          set -euo pipefail
+          docker run --rm --user 0 --network none -v "$DATA_DIR:/data" --entrypoint /bin/rm \
+            "$CLEANUP_IMAGE" -rf /data/kafka /data/minio /data/engine-state /data/engine-work
       - name: Unit tests
         working-directory: benchmarks
         run: python3 -m pip install --user --disable-pip-version-check pytest pyyaml && python3 -m pytest soak/tests
@@ -233,7 +246,17 @@ jobs:
       - name: Tear the lab down and free the disk
         if: always()
         run: |
+          set -uo pipefail
           docker compose -p vtop-soak -f benchmarks/soak/docker-compose.soak.yml down --volumes --remove-orphans --timeout 60 || true
-          rm -rf "$DATA_DIR"/kafka "$DATA_DIR"/minio "$DATA_DIR"/engine-state "$DATA_DIR"/engine-work || true
+          docker run --rm --user 0 --network none -v "$DATA_DIR:/data" --entrypoint /bin/rm \
+            "$CLEANUP_IMAGE" -rf /data/kafka /data/minio /data/engine-state /data/engine-work || true
+          left=""
+          for sub in kafka minio engine-state engine-work; do
+            if [ -e "$DATA_DIR/$sub" ]; then left="$left $sub"; fi
+          done
+          if [ -n "$left" ]; then
+            echo "::error::could not remove$left under $DATA_DIR; delete them as root before the next dispatch, or it fails preparing them"
+            exit 1
+          fi
         env:
           SOAK_RUN_DIR: /nonexistent
