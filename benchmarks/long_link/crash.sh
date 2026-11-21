@@ -20,7 +20,12 @@ sed -e "s/@NAME@/$NAME/g" -e "s/@TOPIC@/$TOPIC/g" -e "s/@MAX_BYTES@/16777216/g" 
   -e "s/@CHECKSUM@/sha256/g" -e "s/@STRONG@/true/g" "$HERE/config.yaml.in" > "$R/config.yaml"
 cat > "$R/loop.sh" <<'LOOP'
 while true; do
-  if [ -f /r/go ]; then rm -f /r/go; vtopctl run --config /r/config.yaml >> /r/engine.log 2>&1; fi
+  if [ -f /r/go ]; then
+    rm -f /r/go
+    vtopctl run --config /r/config.yaml >> /r/engine.log 2>&1 &
+    echo $! > /r/engine.pid
+    wait
+  fi
   sleep 0.2
 done
 LOOP
@@ -33,7 +38,8 @@ for i in $(seq 1 "$KILLS"); do
   touch "$R/go"
   t=$(( RANDOM % ${KILL_SPAN:-10} + ${KILL_MIN:-6} ))
   sleep "$t"
-  docker exec vtop-longlink-engine pkill -9 -x vtopctl || true
+  # The engine image has no pkill: signal the PID the loop recorded.
+  docker exec vtop-longlink-engine bash -c 'kill -9 "$(cat /r/engine.pid)"'
   sleep 1
   echo "kill $i after ${t}s: $(python3 "$HERE/check_commit_rule.py" "$R" "g-$NAME" || echo FAILED)"
 done
@@ -46,7 +52,7 @@ for _ in $(seq 1 300); do
   sleep 2
 done
 echo "drained: lag $lag"
-docker exec vtop-longlink-engine pkill -TERM -x vtopctl || true
+docker exec vtop-longlink-engine bash -c 'kill -TERM "$(cat /r/engine.pid)"' || true
 sleep 3
 python3 "$HERE/check_commit_rule.py" "$R" "g-$NAME" || failed=1
 if docker exec vtop-longlink-engine vtopctl audit-coverage --check-storage --config /r/config.yaml \
