@@ -21,8 +21,8 @@ fixes is in [Versioning and support](../SUPPORT.md).
 
 v0.10.3 fixes where a Kafka partition resumes, makes the `localfs` backend
 fsync before a write is reported done, unsticks a source under a long
-directory, and binds a native client certificate to the principal it acts
-as. The full notes are in
+directory, binds a native client certificate to the principal it acts as,
+and adds encryption at rest through S3 server-side encryption. The full notes are in
 [v0.10.3](../ROADMAP.md#v0103--a-kafka-resume-that-survives-a-recreated-topic-durable-local-writes-and-client-certificates-bound-to-their-principal)
 in the roadmap.
 
@@ -50,11 +50,17 @@ in the roadmap.
   new object instead of reusing the old one: a duplicate, never a loss (#851).
 - **`localfs` writes are slower**, by an fsync of the file and its
   directories (#827).
+- **Upgrade every engine before setting `upload.server_side_encryption`
+  (#856).** A v0.10.2 engine ignores the key without a word and writes
+  objects unencrypted, so keep a bucket default encryption as the floor.
+  Objects written before the mode was set stay as they were, and `vtopctl
+  scrub` reports each as a mismatch. With `sse-kms` the identity needs
+  `kms:GenerateDataKey` and `kms:Decrypt`.
 - **Otherwise a drop-in replacement.** Replace the binaries in any order;
   v0.10.2 and v0.10.3 engines, voters and data nodes can run side by side,
   apart from the native client certificates above. No schema marker, wire
-  format or cluster feature level changes, no config key is added, and no
-  one-way step is added.
+  format or cluster feature level changes, and no one-way step is added. The
+  one new key is `upload.server_side_encryption`.
 - **Helm chart 0.6.2** (`appVersion` 0.10.3). No template or values change.
 - Downgrade is not supported.
 
