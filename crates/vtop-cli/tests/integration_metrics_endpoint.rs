@@ -140,6 +140,11 @@ fn populated() -> String {
             .with_label_values(&["default", mode])
             .set(0);
     }
+    for mode in telemetry::SERVER_SIDE_ENCRYPTION_MODES {
+        m.server_side_encryption_mode
+            .with_label_values(&["default", mode])
+            .set(0);
+    }
     for r in telemetry::RECEIPT_WRITE_RESULTS {
         m.verification_receipts_total
             .with_label_values(&["default", r])
@@ -179,6 +184,23 @@ fn the_object_lock_metrics_are_exported() {
     }
     for mode in ["off", "governance", "compliance"] {
         let series = format!(r#"vtop_object_lock_mode{{mode="{mode}",tenant="default"}}"#);
+        assert!(text.contains(&series), "missing {series}:\n{text}");
+    }
+}
+
+/// The server-side encryption mode gauge, under its name, with `mode` from
+/// its closed set: an alert on a fleet that is not writing encrypted objects
+/// reads it.
+#[test]
+fn the_server_side_encryption_mode_gauge_is_exported() {
+    let text = populated();
+    assert!(
+        text.contains("# TYPE vtop_server_side_encryption_mode gauge"),
+        "{text}"
+    );
+    for mode in ["none", "sse-s3", "sse-kms"] {
+        let series =
+            format!(r#"vtop_server_side_encryption_mode{{mode="{mode}",tenant="default"}}"#);
         assert!(text.contains(&series), "missing {series}:\n{text}");
     }
 }

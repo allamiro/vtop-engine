@@ -163,6 +163,14 @@ services:
       # container that the collector cannot read. LAB ONLY - never expose metrics
       # unauthenticated outside a lab.
       MINIO_PROMETHEUS_AUTH_TYPE: public
+      # A single static KMS key, so the lab can store objects with server-side
+      # encryption (SSE-S3, and SSE-KMS under the key name `vtop-lab-key`):
+      # the live tests of `upload.server_side_encryption` need it. It encrypts
+      # nothing by itself, since no bucket here sets default encryption. The
+      # value is `<name>:<base64 of 32 bytes>` and is a LAB-ONLY constant that
+      # protects nothing: anyone who can read this file has it. Never use a
+      # static key like this for real data.
+      MINIO_KMS_SECRET_KEY: vtop-lab-key:dnRvcC1sYWItb25seS1rbXMta2V5LTAxMjM0NTY3ODk=
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 10s
