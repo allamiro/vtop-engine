@@ -36,6 +36,10 @@
 #   multipart_cleared_window     36h      VtopMultipartSessionsPiling (no resume or sweep in this window)
 #   multipart_hold               1h       VtopMultipartSessionsPiling
 #   versioning_paused_hold       5m       VtopBucketVersioningPaused (the engine rechecks at most every 60 s)
+#   state_write_seconds          1s       VtopStateStoreWritesSlow (a bucket bound of the histogram)
+#   state_write_slow_share       0.05     VtopStateStoreWritesSlow (more than 5% of batches over it...)
+#   state_write_window           15m      VtopStateStoreWritesSlow
+#   state_write_hold             15m      VtopStateStoreWritesSlow (...held this long)
 #
 # Severity: `page` wakes someone (data is missing, at risk, or not being
 # archived); `ticket` is for working hours (degraded, or a setting to fix).
@@ -267,3 +271,29 @@ groups:
           summary: "{{ $labels.instance }} stopped writing to {{ $value }} bucket(s) that no longer keep object versions"
           description: "With upload.require_object_versioning set, a bucket's versioning was suspended or turned off, so the engine stopped writing to it: nothing in it commits, each batch for it fails before writing anything and is replayed. The bucket is named in the bucket_versioning_paused ERROR line. Re-enable versioning on that bucket (PutBucketVersioning with Status=Enabled); the engine resumes on its own within about two minutes (its next check, then the next retry)."
           runbook_url: "https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopbucketversioningpaused"
+
+      # The state store's write latency (the SLO on docs/operate/slos.md):
+      # the share of committed batches whose ledger writes took more than a
+      # second in all, from vtop_stage_duration_seconds{stage="state_write"},
+      # observed once per committed batch with the time of every ledger write
+      # it made (about eight, two of them synced). 1 s is a bucket bound of
+      # that histogram; le is matched both as the engine writes it ("1") and
+      # as Prometheus 3 stores a classic histogram's bound ("1.0"). No batch
+      # in the window is no data, not a miss: the division has no result.
+      - alert: VtopStateStoreWritesSlow
+        expr: |
+          (
+            sum by (job, instance) (rate(vtop_stage_duration_seconds_count{stage="state_write"}[15m]))
+            -
+            sum by (job, instance) (rate(vtop_stage_duration_seconds_bucket{stage="state_write", le=~"1|1.0"}[15m]))
+          )
+          /
+          sum by (job, instance) (rate(vtop_stage_duration_seconds_count{stage="state_write"}[15m]))
+          > 0.05
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "State-store writes on {{ $labels.instance }} are slow: more than 5% of batches spend over a second on them"
+          description: "Over 15 minutes, more than 5% of the committed batches spent more than a second in their ledger writes, for 15 minutes on end. Every batch waits for its writes before the next stage, so archiving slows and the source falls behind. Check the state store: the disk under the SQLite ledger, or the PostgreSQL server's load, locks and network."
+          runbook_url: "https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopstatestorewritesslow"

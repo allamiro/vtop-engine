@@ -21,6 +21,7 @@ section in [Alert runbooks](runbooks.md) says what to do.
 | Strong verification | On for every production engine | At startup | `vtop_verification_mode{mode}` | [VtopSizeOnlyVerification](runbooks.md#vtopsizeonlyverification) (ticket) |
 | Versioned buckets written to | No bucket's writes paused because it stopped keeping object versions (`upload.require_object_versioning`) | Held for 5 minutes (the engine rechecks at most every 60 s) | `vtop_bucket_versioning_paused` | [VtopBucketVersioningPaused](runbooks.md#vtopbucketversioningpaused) (page) |
 | Incomplete multipart uploads | Kept sessions resumed or swept within the abandon window plus one sweep interval | a session kept 30 to 36 hours ago and nothing resumed or swept for 36 hours, held for 1 | `vtop_multipart_sessions_total{outcome}` | [VtopMultipartSessionsPiling](runbooks.md#vtopmultipartsessionspiling) (ticket) |
+| State-store write latency | At least 95% of committed batches spend under 1 s in their ledger writes | 15 minutes, held for 15 | `vtop_stage_duration_seconds{stage="state_write"}` | [VtopStateStoreWritesSlow](runbooks.md#vtopstatestorewritesslow) (ticket) |
 
 ## How to read them
 
@@ -34,6 +35,11 @@ section in [Alert runbooks](runbooks.md) says what to do.
 - **Replay rate** has both a floor and a baseline so that a stream that always
   replays a little does not page, and one that never replays does not need to
   reach a high rate before it is noticed.
+- **State-store write latency** is per batch: the time of all the ledger
+  writes one committed batch made, about eight, two of them synced. The
+  second is a default for a local disk or a nearby PostgreSQL server; a
+  store known to be slower needs its own number. An engine with no committed
+  batch in the window has no ratio, so an idle engine never raises it.
 - **Source lag** depends on kafka-exporter (the lab runs it in
   `docker-compose.observability.yml`); the engine exports no lag of its own.
   Without the exporter there is no data and the alert stays silent.
