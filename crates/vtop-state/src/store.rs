@@ -81,8 +81,10 @@ pub async fn connect_state_store_with_deadline(
 /// Apply state-store schema migrations explicitly.
 ///
 /// SQLite retains its embedded single-node behavior and initializes when it is
-/// opened. PostgreSQL migrations are intentionally separate from runtime
-/// connection setup so the engine identity never needs DDL privileges.
+/// opened, up to what older releases cannot misread; its one-way steps are
+/// taken here only (`SqliteStateStore::migrate`). PostgreSQL migrations are
+/// intentionally separate from runtime connection setup so the engine
+/// identity never needs DDL privileges.
 pub async fn migrate_state_store(conn_str: &str) -> Result<(), VtopError> {
     let lower = conn_str.trim().to_ascii_lowercase();
     if lower.starts_with("postgres://") || lower.starts_with("postgresql://") {
@@ -99,9 +101,7 @@ pub async fn migrate_state_store(conn_str: &str) -> Result<(), VtopError> {
         }
     }
 
-    // `SqliteStateStore::connect` owns SQLite's local schema initialization.
-    SqliteStateStore::connect(conn_str).await?;
-    Ok(())
+    SqliteStateStore::migrate(conn_str).await
 }
 
 /// Normalize a caller-supplied RFC3339 instant to canonical UTC text, so the

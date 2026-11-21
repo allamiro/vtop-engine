@@ -80,6 +80,7 @@ formats:
     at_1_0: stable
     constants:
       - {file: crates/vtop-state/src/sqlite_store.rs, name: SQLITE_SCHEMA_VERSION, value: '1'}
+      - {file: crates/vtop-state/src/sqlite_store.rs, name: SQLITE_OPEN_VERSION, value: '1'}
 
   - id: 6
     name: State ledger, PostgreSQL
