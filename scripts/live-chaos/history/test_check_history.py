@@ -197,6 +197,16 @@ class CleanHistories(unittest.TestCase):
             ch.SEARCH_BUDGET = saved
         self.assertEqual(kinds(result), {"phantom"})
 
+    def test_a_retry_answered_where_an_earlier_unanswered_attempt_was_already_read(self):
+        # Review of #878: the unanswered attempt landed and was read before
+        # its same-id, same-epoch retry was answered at those offsets.
+        h = History()
+        h.produce("produce:P:1:100", 1, 0, 10, "info")
+        h.read("r1", [(0, 0, 10)], 10)
+        h.produce("produce:P:1:200", 1, 0, 10, "ok", 10, first_offset=0)
+        h.read("r2", [(0, 0, 10)], 10)
+        self.assertTrue(h.check()["valid"], h.check())
+
 class Violations(unittest.TestCase):
     def test_611_an_acknowledged_suffix_truncated_at_failover_is_lost(self):
         h = History()
