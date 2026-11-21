@@ -171,7 +171,7 @@ run`: a source, batches, the object store, the ledger) has its own harness,
 kills the engine with `SIGKILL` at every failpoint, against a real source
 (a Kafka broker, a file, or a syslog spool file), the lab's MinIO and a
 ledger (SQLite, or PostgreSQL), restarts it and checks what the restart made
-of it. Six legs
+of it. Seven legs
 run the same script with different knobs (see "The legs" below).
 
 **System model.** One crash-recovery engine process; a partially synchronous
@@ -227,6 +227,7 @@ every leg is held to every invariant below.
 | `sqlite-spool` | SQLite | one spool file, read through the syslog spool source (its own adapter: cursor, markers, replay); its commit rule is read from the ledger's cursor, as for a file | none |
 | `sqlite-kafka-store-outage` | SQLite | Kafka | MinIO is stopped (`docker stop`) for up to `ENGINE_SWEEP_FAULT_SECONDS` (12), then started again; the engine is not restarted in between |
 | `sqlite-kafka-enospc` | SQLite | Kafka | the engine's work directory is a 16 KiB tmpfs with no free page, for the same time, then the filler is deleted; the engine is not restarted in between |
+| `postgres-kafka-host-loss` | PostgreSQL | Kafka | none; the kill takes the host (#739): the dead engine's work directory is deleted and the restart is a standby with a new one, on the same ledger, group and bucket ([Losing the engine's host](deploy/engine-host-loss.md)) |
 
 In the two fault legs a point the engine reaches while the fault is on is
 killed there (a kill with the store down, or the disk full); a point that
@@ -277,6 +278,8 @@ ENGINE_SWEEP_BACKEND=postgres ENGINE_SWEEP_PG_CONTAINER=<container> CHAOS_PROFIL
 # file source, or the syslog spool source
 ENGINE_SWEEP_SOURCE=file CHAOS_PROFILE=debug scripts/live-chaos/engine/run-sweep.sh
 ENGINE_SWEEP_SOURCE=syslog_spool CHAOS_PROFILE=debug scripts/live-chaos/engine/run-sweep.sh
+# host loss (PostgreSQL ledger and Kafka source only)
+ENGINE_SWEEP_FAULT=host_loss ENGINE_SWEEP_BACKEND=postgres ENGINE_SWEEP_PG_CONTAINER=<container> CHAOS_PROFILE=debug scripts/live-chaos/engine/run-sweep.sh
 # store outage / ENOSPC (the latter mounts a tmpfs: root or passwordless sudo)
 ENGINE_SWEEP_FAULT=store_outage CHAOS_PROFILE=debug scripts/live-chaos/engine/run-sweep.sh
 ENGINE_SWEEP_FAULT=enospc CHAOS_PROFILE=debug scripts/live-chaos/engine/run-sweep.sh
@@ -313,6 +316,7 @@ on one laptop. Every leg passed, with no duplicate at any point:
 | `postgres-kafka` | 285 s | 13 to 14 s |
 | `sqlite-file` | 98 s | 4 to 5 s |
 | `sqlite-spool` | 74 s | 3 to 5 s (measured later, with the MinIO image only: no broker running) |
+| `postgres-kafka-host-loss` | 244 s | 10 to 15 s; 8 to 12 s from the kill to every record committed by the standby (measured later, Kafka, MinIO and PostgreSQL 18 at under a CPU each) |
 | `sqlite-kafka-store-outage` | 616 s | 22 s for a point reached before the store is touched, 33 to 35 s for the rest (12 s of outage, then the recovery) |
 | `sqlite-kafka-enospc` | 495 s | 12 to 13 s, then 25 to 28 s once the staging write needs space |
 
