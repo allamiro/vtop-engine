@@ -188,6 +188,16 @@ with an endpoint set.
   declared principal ID, and requested producer/consumer role. Produce requests
   additionally require `producer_id == principal_id` before the durable producer
   epoch journal can be changed.
+- The data node's authorizer binds the certificate to the principal: a session
+  over TLS is admitted only when the chain-verified leaf certificate's Common
+  Name is the node's configured `principal_id` (the same field the metadata,
+  replica and admin planes read as an identity), the declared principal is
+  that `principal_id`, and the role is producer or consumer. A certificate that
+  chains to the CA but was issued to another identity is refused and leaves a
+  `native.session` audit record naming the CN it presented. A client
+  certificate whose CN is not the principal's UUID is refused; there is no
+  setting that restores the earlier behaviour of accepting any CA-signed
+  certificate that names the UUID.
 - Native clients **MUST** validate the broker certificate against their
   configured roots and the expected server identity (no insecure or
   accept-any verifiers). TLS peer authentication is mutual: server-side client
@@ -840,7 +850,7 @@ flagged and collected below the tables.
 
 | Family | Stack | Function | Class |
 |---|---|---|---|
-| Cluster-plane TLS (admin, Raft peer, replica, native client; each plane's transport is a node config knob defaulting to TLS; plaintext is selectable per plane, loopback-only unless named, and confidentiality holds only on the planes left at `tls`, §2) | rustls 0.23, **ring pinned at every construction site**, TLS 1.3 only, mutual; CN identity via `x509-parser` after chain validation on the admin, Raft-peer and replica planes — the native-client plane never parses the subject (Q3 below) | peer authentication, confidentiality; authorization input where the CN is read (CN is a Raft **safety** input on the peer plane) — native sessions match the declared hello principal against config, not the certificate | security function |
+| Cluster-plane TLS (admin, Raft peer, replica, native client; each plane's transport is a node config knob defaulting to TLS; plaintext is selectable per plane, loopback-only unless named, and confidentiality holds only on the planes left at `tls`, §2) | rustls 0.23, **ring pinned at every construction site**, TLS 1.3 only, mutual; CN identity via `x509-parser` after chain validation on the admin, Raft-peer and replica planes — and, on the native-client plane, the leaf CN must equal the node's `principal_id` (Q3 below) | peer authentication, confidentiality; authorization input where the CN is read (CN is a Raft **safety** input on the peer plane) — a native session is admitted only for the configured principal and only on the certificate issued to it | security function |
 | Kafka source transport | librdkafka (vendored C, cmake) + **system OpenSSL** (`ssl`) + **system Cyrus SASL** (`sasl`) | broker TLS + SASL auth; plaintext unless configured (SHOULD-level, §2); missing password env is a hard startup error, never a silent downgrade | security function |
 | S3 upload transport + signing | AWS SDK: hyper 1 + hyper-rustls + rustls 0.23 with the SDK's **aws-lc-rs** provider, system roots; SigV4 HMAC-SHA-256 (SigV4a/P-256 available, never explicitly invoked) | endpoint TLS (scheme floor via `verify_tls`; cert verification not disableable) and per-request authentication | security function |
 | OpenTelemetry export (off until configured, #683) | opentelemetry-otlp (traces) and opentelemetry-proto (metrics), HTTP/protobuf over the hyper 1 + hyper-rustls client already in the tree; rustls 0.23 with **ring pinned** at its one construction site (`crates/vtop-observe/src/otel/http.rs`), system roots | collector TLS for `https://` endpoints (verification not disableable); authentication only as the operator's `OTEL_EXPORTER_OTLP_HEADERS` | security function |
@@ -887,8 +897,15 @@ today; that is the gap the later #296 checkboxes exist to close, not a
 property this inventory can document around.
 
 **Q3 — housekeeping the sweep surfaced:** the produce/fetch
-`PrincipalAuthorizer` ignores the verified certificate chain (the declared
-principal is matched against config, not bound to the cert — unlike the
-meta and replica planes, where the leaf CN *is* the identity); and only one
-CI container is digest-pinned (`actionlint`) while the shellcheck images
-are tag-pinned. Both are posture notes, not inventory rows.
+`PrincipalAuthorizer` ignored the verified certificate chain: the declared
+principal was matched against config and not bound to the cert, unlike the
+meta and replica planes, where the leaf CN *is* the identity. That is closed:
+the node now admits a native session only when the chain-verified leaf's CN is
+the configured `principal_id` (the model the Helm chart already documented as
+"= client cert CN"), refuses any other CA-signed certificate with an audited
+`native.session` record, and keeps a plaintext native plane's behaviour (the
+declaration is all there is, §2). A deployment whose client certificates carry
+another CN must reissue them; the refusal names the CN it saw. The other half
+remains: only one CI container is digest-pinned (`actionlint`) while the
+shellcheck images are tag-pinned. That is a posture note, not an inventory
+row.
