@@ -334,19 +334,15 @@ If you use VTOP Engine in research, please cite it. GitHub's **Cite this reposit
 
 ## License
 
-**[MIT](LICENSE) © 2026 Tamir Suliman** — and today that covers the entire
-engine.
+VTOP Engine is open source under the **[MIT License](LICENSE)**, © 2026 Tamir
+Suliman. All of the code in this repository is MIT.
 
-The repository is set up as **dual-licensed** so the boundary is written down
-before there is anything on the other side of it: directories named `ee/`, and
-files carrying the header `VTOP Engine Enterprise Edition`, fall under
-[LICENSE-EE](LICENSE-EE) instead, which permits evaluation, development and
-testing but requires a commercial subscription for production use. **No `ee/`
-directory exists yet**, so nothing in this repository is currently under those
-terms.
+| Edition | License | Use |
+|---|---|---|
+| **Core** (this repository) | [MIT](LICENSE) | Free for any use, including production and commercial use |
+| **Enterprise Edition** (code under `ee/`, or marked `VTOP Engine Enterprise Edition`) | [LICENSE-EE](LICENSE-EE) | Free to evaluate, develop and test; production use needs a commercial subscription |
 
-Three rules bound it, stated in [COMMERCIAL.md](COMMERCIAL.md): code that is
-MIT stays MIT, the core must build and pass CI with `ee/` deleted, and anything
-whose absence could lose or corrupt acknowledged data — durability, fencing,
-replication, failover, verification — stays in the core. Paying is for
-operating at scale, not for not losing data.
+Data safety is never part of the paid edition. Durability, fencing,
+replication, failover and verification stay in the MIT core, and the core
+builds and passes CI on its own. [COMMERCIAL.md](COMMERCIAL.md) sets out these
+rules and how to ask for commercial terms.
