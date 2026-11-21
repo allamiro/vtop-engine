@@ -72,7 +72,17 @@ pub struct NodeObservability {
     /// owner. The served source holds the same cell, so a probe installed late
     /// takes effect on the next request rather than the next restart.
     probe: Arc<std::sync::RwLock<Option<ReadinessProbe>>>,
+    /// The capped listeners of every role in this process (#732), read by
+    /// one collector registered at construction. One, not one per role:
+    /// a co-located process runs the metadata and the data role against
+    /// this one registry, and a second collector with the same family name
+    /// would be refused at registration and stop the process.
+    connection_limits: ConnectionLimits,
 }
+
+/// The listeners [`ConnectionLimitCollector`] reports, shared with the
+/// [`NodeObservability`] that roles add them through.
+type ConnectionLimits = Arc<std::sync::Mutex<Vec<Arc<vtop_meta::transport::ConnectionLimit>>>>;
 
 /// Serves this node's registry, and its readiness as `gate AND probe`.
 struct NodeSource {
@@ -141,11 +151,27 @@ impl NodeObservability {
         // The audit trail's counters (#694), at 0 from the first scrape.
         vtop_observe::audit::register_counters(&registry)
             .map_err(|error| format!("register audit counters: {error}"))?;
+        let connection_limits = ConnectionLimits::default();
+        registry
+            .register(Box::new(ConnectionLimitCollector::new(Arc::clone(
+                &connection_limits,
+            ))?))
+            .map_err(|error| format!("register listener connection limits: {error}"))?;
         Ok(Self {
             registry,
             gate: ReadinessGate::starting("node is still starting"),
             probe: Arc::new(std::sync::RwLock::new(None)),
+            connection_limits,
         })
+    }
+
+    /// Report a capped listener's refusals (#732) on this node's metrics,
+    /// under `vtop_listener_connections_refused_total{plane}`.
+    pub fn watch_connection_limit(&self, limit: Arc<vtop_meta::transport::ConnectionLimit>) {
+        self.connection_limits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(limit);
     }
 
     /// Install a live readiness condition, evaluated on every `/readyz`
@@ -1907,6 +1933,60 @@ impl Collector for ServerCollector {
 }
 
 // ---------------------------------------------------------------------------
+// Listener connection caps
+// ---------------------------------------------------------------------------
+
+/// Connections a capped listener closed (#732: M6, R7), by listener and why.
+///
+/// `reason` is `capacity` (closed at accept, the cap was reached) or
+/// `handshake_timeout` (no first request within the handshake deadline, so
+/// a silent socket cannot keep its slot). `plane` is a closed set: `meta_peer` and `meta_admin` on a metadata node,
+/// `replica` on a data node. Any increase means a peer opened more
+/// connections than the node's `max_*_connections` allows: legitimate load
+/// that needs a higher cap, or a flood.
+pub struct ConnectionLimitCollector {
+    limits: ConnectionLimits,
+    refused: CounterFamily,
+}
+
+impl ConnectionLimitCollector {
+    fn new(limits: ConnectionLimits) -> Result<Self, String> {
+        Ok(Self {
+            limits,
+            refused: CounterFamily::new(
+                "listener_connections_refused_total",
+                "Connections a capped listener closed, by listener and why: capacity (closed at \
+                 accept, the listener already held its max_*_connections) or handshake_timeout \
+                 (no first request within the handshake deadline)",
+                &["plane", "reason"],
+            )?,
+        })
+    }
+}
+
+impl Collector for ConnectionLimitCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        vec![&self.refused.desc]
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        let limits = self
+            .limits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        vec![self.refused.family(limits.iter().flat_map(|limit| {
+            [
+                (vec![limit.label(), "capacity"], limit.refused_total()),
+                (
+                    vec![limit.label(), "handshake_timeout"],
+                    limit.handshake_timeouts_total(),
+                ),
+            ]
+        }))]
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Promotion
 // ---------------------------------------------------------------------------
 
@@ -3355,6 +3435,53 @@ mod tests {
         assert!(
             unexpected.is_empty(),
             "labels {unexpected:?} are not in the bounded set {BOUNDED:?}"
+        );
+    }
+
+    /// #732: the refusals of every capped listener, from every role in the
+    /// process, are exported under one family with a bounded `plane` label,
+    /// at 0 before any refusal.
+    #[test]
+    fn listener_connection_refusals_are_exported_by_plane() {
+        use std::net::SocketAddr;
+        use vtop_meta::transport::ConnectionLimit;
+        let peer = Arc::new(ConnectionLimit::meta_peer(1));
+        let admin = Arc::new(ConnectionLimit::meta_admin(1));
+        let from: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let _held = peer.admit(from).unwrap();
+        assert!(peer.admit(from).is_none());
+        assert!(peer.admit(from).is_none());
+        // One NodeObservability, as a co-located process shares between its
+        // metadata and data roles: each role adds its listeners, and nothing
+        // registers a second collector (review: that refused the process).
+        let observability = NodeObservability::new("colocated", "1").unwrap();
+        observability.watch_connection_limit(peer);
+        observability.watch_connection_limit(admin);
+        observability.watch_connection_limit(Arc::new(ConnectionLimit::replica(1)));
+        let text = scrape(&observability.registry);
+        assert!(
+            text.contains(
+                r#"vtop_listener_connections_refused_total{plane="meta_peer",reason="handshake_timeout"} 0"#
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                r#"vtop_listener_connections_refused_total{plane="meta_peer",reason="capacity"} 2"#
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                r#"vtop_listener_connections_refused_total{plane="meta_admin",reason="capacity"} 0"#
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                r#"vtop_listener_connections_refused_total{plane="replica",reason="capacity"} 0"#
+            ),
+            "{text}"
         );
     }
 }
