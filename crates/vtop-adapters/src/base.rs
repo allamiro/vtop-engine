@@ -8,6 +8,101 @@ use std::time::Duration;
 use vtop_core::errors::VtopError;
 use vtop_core::types::{ProgressMarker, SourceType, TelemetryFormat};
 
+/// The markers of one rewind group in [`SourceAdapter::replay_from_markers`]:
+/// one unit (a Kafka partition of one group, a file or spool at one inode)
+/// and one content generation, and which of them is rewound.
+pub struct RewindGroup {
+    /// Indices into the call's markers, in caller order.
+    pub members: Vec<usize>,
+    /// The member rewound: the lowest start; of equal starts, the later one,
+    /// which describes the file as it is now.
+    pub lowest: usize,
+}
+
+/// Group `markers` by unit and content generation, ordered by each group's
+/// last member. Content proven to be another file's (fingerprints of the same
+/// length with other bytes: a same-inode replacement) is a generation of its
+/// own, so its rewind is attempted even when the old content's is refused.
+pub fn rewind_groups(markers: &[ProgressMarker]) -> Vec<RewindGroup> {
+    let mut groups: Vec<(RewindGroup, Vec<&vtop_core::types::ContentFingerprint>)> = Vec::new();
+    for (i, marker) in markers.iter().enumerate() {
+        let content = marker.content_fingerprint();
+        let found = groups.iter_mut().find(|(group, contents)| {
+            same_unit(&markers[group.lowest], marker)
+                && !contents
+                    .iter()
+                    .any(|seen| content.is_some_and(|c| seen.same_content(c) == Some(false)))
+        });
+        match found {
+            Some((group, contents)) => {
+                group.members.push(i);
+                if start_of(marker) <= start_of(&markers[group.lowest]) {
+                    group.lowest = i;
+                }
+                if let Some(c) = content {
+                    contents.push(c);
+                }
+            }
+            None => groups.push((
+                RewindGroup {
+                    members: vec![i],
+                    lowest: i,
+                },
+                content.into_iter().collect(),
+            )),
+        }
+    }
+    let mut groups: Vec<RewindGroup> = groups.into_iter().map(|(g, _)| g).collect();
+    groups.sort_by_key(|g| g.members.last().copied().unwrap_or_default());
+    groups
+}
+
+/// Whether two markers name the same unit: one Kafka partition of one
+/// consumer group, or one file or spool path at one inode.
+fn same_unit(a: &ProgressMarker, b: &ProgressMarker) -> bool {
+    match (a, b) {
+        (
+            ProgressMarker::Kafka {
+                topic: ta,
+                partition: pa,
+                consumer_group: ga,
+                ..
+            },
+            ProgressMarker::Kafka {
+                topic: tb,
+                partition: pb,
+                consumer_group: gb,
+                ..
+            },
+        ) => ta == tb && pa == pb && ga == gb,
+        (
+            ProgressMarker::File {
+                path: pa,
+                inode: ia,
+                ..
+            },
+            ProgressMarker::File {
+                path: pb,
+                inode: ib,
+                ..
+            },
+        )
+        | (
+            ProgressMarker::SyslogSpool {
+                path: pa,
+                inode: ia,
+                ..
+            },
+            ProgressMarker::SyslogSpool {
+                path: pb,
+                inode: ib,
+                ..
+            },
+        ) => pa == pb && ia == ib,
+        _ => false,
+    }
+}
+
 /// Where a marker's range starts, in its unit's own position (an offset or a
 /// byte).
 fn start_of(marker: &ProgressMarker) -> i128 {
@@ -238,25 +333,38 @@ pub trait SourceAdapter: Send + Sync {
     /// to the number of partitions when that system is slow or down.
     ///
     /// Each rewind sets its unit's read position, so when several markers
-    /// name one unit the one applied last decides where it resumes. The
-    /// default applies them from the highest start down, so every unit
-    /// resumes at the LOWEST start it was given, whatever order the caller
-    /// passed them in: in caller order, a higher start handed back after a
-    /// lower one moved the read position above the lower range, which was
-    /// then never read again. An override must keep that property.
+    /// name one unit the one applied last decides where it resumes. In
+    /// caller order, a higher start handed back after a lower one moved the
+    /// read position above the lower range, which was then never read again.
+    /// The default therefore rewinds each unit and content generation ONCE,
+    /// to the lowest start the call names for it (see [`rewind_groups`]),
+    /// and the other markers of the group share that rewind's outcome. The
+    /// groups are applied in the order of their last marker, so where the
+    /// caller orders a path's files oldest first (recovery does), the most
+    /// recent file's rewind still lands last. An override must keep the
+    /// lowest-start property.
     async fn replay_from_markers(
         &mut self,
         markers: &[ProgressMarker],
     ) -> Vec<Result<(), VtopError>> {
-        let mut order: Vec<usize> = (0..markers.len()).collect();
-        order.sort_by_key(|&i| std::cmp::Reverse(start_of(&markers[i])));
-        let mut results: Vec<Option<Result<(), VtopError>>> = std::iter::repeat_with(|| None)
+        let groups = rewind_groups(markers);
+        let mut outcome: Vec<Option<Result<(), VtopError>>> = std::iter::repeat_with(|| None)
             .take(markers.len())
             .collect();
-        for i in order {
-            results[i] = Some(self.replay_from_marker(&markers[i]).await);
+        for group in &groups {
+            outcome[group.lowest] = Some(self.replay_from_marker(&markers[group.lowest]).await);
         }
-        results.into_iter().flatten().collect()
+        for group in &groups {
+            for &member in group.members.iter().filter(|&&m| m != group.lowest) {
+                outcome[member] = Some(match &outcome[group.lowest] {
+                    Some(Ok(())) | None => Ok(()),
+                    Some(Err(e)) => Err(VtopError::Source(format!(
+                        "not rewound: the rewind of a lower range of the same unit was refused: {e}"
+                    ))),
+                });
+            }
+        }
+        outcome.into_iter().map(|o| o.unwrap_or(Ok(()))).collect()
     }
 
     /// Bound the re-read of ranges already handed back
