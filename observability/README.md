@@ -323,6 +323,25 @@ The rules are an example, not provisioned: the lab's rules in
 `grafana/provisioning/alerting/vtop-alerts.yaml` are for metrics the lab
 produces.
 
+### Coverage audit
+
+`vtopctl audit-coverage --metrics-file` writes its own text file, by
+`source_type` and never by path or key. Besides the hole and gap gauges
+(`vtop_coverage_audit_failed_holes`, `..._unexplained_gaps`, `..._pending_ranges`,
+`..._duplicated`, `..._units`, `..._unproven_ranges`, `..._storage_findings`
+and `vtop_coverage_audit_passed`), it carries two for objects a failed attempt
+left that no committed row names (#774). They are storage cost, never loss, and
+are not part of `passed`.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `vtop_coverage_audit_unreferenced_objects{source_type}` | gauge | Objects a failed, replay-required or superseded row recorded as uploaded that no live row names, from the ledger and the prune digests. All of them, whatever `--orphans-limit` lists. A rise means failed attempts are leaving second objects; under Object Lock each is retained until its date. An object whose ledger row a power loss rolled back is not counted. |
+| `vtop_coverage_audit_unreferenced_object_bytes{source_type}` | gauge | Their recorded sizes, added up. |
+
+[Scrub and coverage audit](../docs/operate/scrub-and-audit.md#objects-no-committed-row-names)
+says what to do about them. The audit runs as a scheduled command, so these are
+not on the engine's `/metrics` and the engine's registry has no series for them.
+
 ### Design decisions worth knowing
 
 - **Labels are bounded**: `tenant`, `source_type`, `format`, `stage`, `state` —
