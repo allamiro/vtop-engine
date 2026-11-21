@@ -1,0 +1,116 @@
+name: s3-compat-results
+
+# Refreshes the S3 compatibility results (#722, D6) from the newest nightly
+# matrix run on `main` (s3-compat-matrix.yml) and the newest AWS run
+# (s3-aws.yml), regenerates the page and the README block, and uploads the
+# changed files as the `s3-compat-results-refresh` artifact. Results reach
+# `main` only through a reviewed pull request the maintainer opens from that
+# artifact: this workflow holds read permissions only, so it needs no
+# repository setting and no token that can write.
+on:
+  schedule:
+    # Tuesdays 04:41 UTC: off the hour, as traffic.yml is, and after the
+    # weekly s3-pins check.
+    - cron: "41 4 * * 2"
+  workflow_dispatch:
+
+concurrency:
+  group: s3-compat-results
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    name: refresh the committed S3 compatibility results
+    if: github.repository == 'allamiro/vtop-engine'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Install the report's one dependency
+        run: pip install --disable-pip-version-check pyyaml==6.0.3
+
+      # The newest run of the nightly matrix on main that uploaded results
+      # (every server, unlike the MinIO-only call from ci.yml), and the
+      # newest run of the opt-in s3-aws workflow that uploaded any (it skips,
+      # and uploads nothing, until the maintainer configures it).
+      - name: Download the newest results from main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/results"
+          newest() {
+            local workflow=$1 dest=$2 run
+            for run in $(gh run list --workflow "$workflow" --branch main --limit 30 \
+                --json databaseId,conclusion --jq '.[] | select(.conclusion == "success" or .conclusion == "failure") | .databaseId'); do
+              if gh run download "$run" --pattern 's3-compat-results-*' --dir "$dest" 2>/dev/null; then
+                # The run's own date, so an old artifact keeps it (the report
+                # reads the nearest RUN_DATE) instead of looking newly run.
+                gh run view "$run" --json createdAt --jq '.createdAt[0:10]' > "$dest/RUN_DATE"
+                echo "$run"
+                return 0
+              fi
+            done
+            return 1
+          }
+          if run=$(newest s3-compat-matrix.yml "$RUNNER_TEMP/results/ci"); then
+            echo "RUN_ID=$run" >> "$GITHUB_ENV"
+            echo "Matrix results from run $run"
+          fi
+          if aws=$(newest s3-aws.yml "$RUNNER_TEMP/results/aws"); then
+            echo "AWS results from run $aws"
+            echo "RUN_ID=${run:-$aws}" >> "$GITHUB_ENV"
+          fi
+          if [ ! -d "$RUNNER_TEMP/results/ci" ] && [ ! -d "$RUNNER_TEMP/results/aws" ]; then
+            echo "No run on main in the last 30 of either workflow uploaded S3 compatibility results; nothing to refresh." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Regenerate from them
+        if: env.RUN_ID != ''
+        run: python3 scripts/s3_compat_report.py --ingest "$RUNNER_TEMP/results"
+
+      # Only the files that change, in the layout of the repository, so the
+      # maintainer unpacks them over a checkout of main and opens a pull
+      # request: the page and the README block are regenerated from the
+      # results, and the drift check holds them to it.
+      - name: Collect the changed files
+        if: env.RUN_ID != ''
+        run: |
+          set -euo pipefail
+          changed=$(git status --porcelain -- tests/s3-compat/results docs/reference/s3-compatibility.md README.md | awk '{print $2}')
+          if [ -z "$changed" ]; then
+            echo "The committed results already match run $RUN_ID." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          mkdir -p "$RUNNER_TEMP/refresh"
+          # shellcheck disable=SC2086
+          tar -cf - $changed | tar -xf - -C "$RUNNER_TEMP/refresh"
+          {
+            echo "### S3 compatibility results from run $RUN_ID"
+            echo
+            echo "Changed files:"
+            echo
+            printf '%s\n' "$changed" | sed 's/^/- /'
+            echo
+            echo "To commit them: download the \`s3-compat-results-refresh\` artifact, copy its files over a"
+            echo "checkout of main on a new branch, and open a pull request that says Refs #722."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "HAVE_REFRESH=true" >> "$GITHUB_ENV"
+
+      - name: Upload the refreshed files
+        if: env.HAVE_REFRESH == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: s3-compat-results-refresh
+          path: ${{ runner.temp }}/refresh
+          retention-days: 30
+          if-no-files-found: error

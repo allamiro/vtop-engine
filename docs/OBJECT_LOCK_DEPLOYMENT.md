@@ -298,9 +298,14 @@ still reclaim them.
   a downgraded engine writes unlocked objects.
 - **The cluster plane's tier copies** (`vtopctl tier copy` refuses the
   profile).
-- **Stores other than MinIO** have not been measured. The live tests run
-  against the lab's MinIO, RELEASE.2025-09-07. It accepts locked writes for
-  both checksum paths and for multipart, returns the lock headers on
-  `HeadObject`, refuses to delete a locked version, and still reports an
-  ended retention's mode and date. Behaviour on AWS S3 comes from its
-  documentation.
+- **Stores the matrix has not run.** The live tests run against the S3
+  compatibility matrix's servers (#722). On the lab's MinIO
+  (RELEASE.2025-09-07), RustFS 1.0.5, SeaweedFS 4.53, Versity S3 Gateway v1.11.0
+  and Zenko CloudServer 9.5.5 they accept locked
+  writes for both checksum paths and for multipart, return the lock headers
+  on `HeadObject`, refuse to delete a locked version, and still report an
+  ended retention's mode and date. Garage v2.5.0 implements no Object Lock
+  (`GetObjectLockConfiguration` answers 501), and the engine refuses it at
+  startup. The [S3 compatibility](reference/s3-compatibility.md) table is
+  generated from the committed results. Behaviour on AWS S3 comes from its
+  documentation until the opt-in AWS workflow has run.
