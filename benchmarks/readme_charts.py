@@ -169,6 +169,9 @@ def failover(repo: str = REPO) -> dict[str, Any]:
 
 def throughput(repo: str = REPO) -> dict[str, Any]:
     run = schema.load_run(os.path.join(repo, THROUGHPUT_RUN))
+    # The same refusal the page's report makes (#596): a run this chart
+    # would pool across profiles or codecs is refused, not drawn.
+    report.check_drawable(run.rows, run.environment)
     sizes = run.environment["matrix"]["record_sizes"]
     cells = {}
     for size in sizes:
