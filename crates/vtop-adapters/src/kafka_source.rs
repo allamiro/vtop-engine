@@ -1140,6 +1140,9 @@ pub struct KafkaSource {
     /// nothing for `STALL_PASSES` passes and `STALL_AFTER` while the broker
     /// holds records for it, whatever the other partitions do.
     liveness: PartitionLiveness,
+    /// How many times this adapter (re)assigned its partitions: each one
+    /// restarts every partition's fetcher. For tests.
+    assignments: u64,
     /// Re-assigns the stall check has made in this process, for the log.
     stall_reassigns: u64,
     /// Partition ids per topic, cached with a TTL, and what each metadata
@@ -1201,6 +1204,14 @@ pub struct KafkaSource {
 const PARTITION_CACHE_TTL: Duration = Duration::from_secs(300);
 
 impl KafkaSource {
+    /// How many times this adapter has (re)assigned its partitions, each a
+    /// restart of every partition's fetcher. For tests: a pass that fills its
+    /// budget must not cause one.
+    #[doc(hidden)]
+    pub fn assignments(&self) -> u64 {
+        self.assignments
+    }
+
     pub fn new(cfg: KafkaSourceConfig, format: TelemetryFormat) -> Result<Self, VtopError> {
         let include = Regex::new(&cfg.topic_include_regex)
             .map_err(|e| VtopError::Config(format!("bad topic_include_regex: {e}")))?;
@@ -1226,6 +1237,7 @@ impl KafkaSource {
             refused_cuts: Vec::new(),
             cut_check_cursor: 0,
             liveness: PartitionLiveness::default(),
+            assignments: 0,
             stall_reassigns: 0,
             partitions: PartitionCache::default(),
             stored_since: HashMap::new(),
@@ -3311,6 +3323,7 @@ impl SourceAdapter for KafkaSource {
                      by the stall check once records wait for it (#623)"
                 );
             }
+            self.assignments += 1;
             consumer.assign(&tpl).map_err(|e| {
                 VtopError::Source(format!("assign ({} topics): {e}", sources.len()))
             })?;
@@ -3478,7 +3491,14 @@ impl SourceAdapter for KafkaSource {
                                 acc.note_timestamp(idx, msg.partition(), ts_ms);
                             }
                         }
-                        must_reassign |= !kept;
+                        // A record left over the budget (or past a rebuilt
+                        // window's end, #626) is NOT a reason to re-assign:
+                        // the next pass seeks just that partition back to its
+                        // first unkept record (the sticky assignment below
+                        // seeks wherever the cursor and what was delivered
+                        // differ). A re-assign restarted every partition's
+                        // fetcher, and the pass after it often read nothing
+                        // while the fetch restarted.
                         // A partition whose rebuilt window is complete stops
                         // fetching for the rest of the pass (#626): what
                         // follows is the next window, read next pass.

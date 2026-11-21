@@ -6052,6 +6052,9 @@ impl Engine {
         self.recover().await?;
         let types: Vec<SourceType> = self.adapters.keys().cloned().collect();
         let idle = Duration::from_millis(self.config.batching.idle_poll_interval_ms);
+        // Whether the cycle before this one read anything: see the idle
+        // branch of the backoff below.
+        let mut previous_had_data = false;
         let cause = 'run: loop {
             // Accumulate across cycles; only threshold-tripped buffers flush.
             self.cycle_had_data = false;
@@ -6104,6 +6107,16 @@ impl Engine {
                 )
             } else if self.cycle_had_data {
                 Duration::ZERO
+            } else if previous_had_data {
+                // One empty pass right after a productive one is not idleness:
+                // a backlog's source is often between fetches then (a Kafka
+                // pass that filled its budget pauses or seeks the partition,
+                // and the next pass can come back empty while the fetch
+                // restarts). Sleeping the idle interval there cost every such
+                // pass `idle_poll_interval_ms` of nothing: with 64 MiB
+                // batches over a long link, every third pass. Read once more
+                // first; two empty passes in a row are idle.
+                Duration::ZERO
             } else {
                 // Housekeeping can spend a state-store timeout plus digest
                 // I/O; a stop that landed during the last pass must not wait
@@ -6114,6 +6127,7 @@ impl Engine {
                 self.maybe_prune_ledger().await;
                 idle
             };
+            previous_had_data = self.cycle_had_data;
             tokio::select! {
                 biased;
                 cause = shutdown.next_request() => break cause,
@@ -11342,6 +11356,40 @@ mod tests {
             }),
         );
         (engine, arrivals, permits)
+    }
+
+    /// One empty pass right after a productive one is not idleness (a Kafka
+    /// pass that filled its budget can come back empty while the fetch
+    /// restarts): the loop reads once more before sleeping the idle
+    /// interval. Before, that pass slept the full interval, which a backlog
+    /// paid on every such pass.
+    #[tokio::test]
+    async fn one_empty_pass_after_a_productive_one_does_not_sleep_the_idle_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        // An idle interval the timeout below cannot cover.
+        let (mut engine, mut arrivals, permits) =
+            gated_engine(dir.path(), &["read by the first pass"], 60_000).await;
+        let (stop, requests) = tokio::sync::mpsc::unbounded_channel();
+        let driver = async {
+            arrivals.recv().await.expect("the first pass starts");
+            permits.add_permits(1); // reads the line
+            arrivals.recv().await.expect("a productive pass is followed at once");
+            permits.add_permits(1); // reads nothing
+            arrivals
+                .recv()
+                .await
+                .expect("an empty pass after a productive one is followed at once");
+            stop.send("test-stop").unwrap();
+            permits.add_permits(1);
+            arrivals.recv().await.expect("the shutdown flush");
+            permits.add_permits(1);
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::join!(engine.run_until(ChannelShutdown(requests)), driver)
+        })
+        .await
+        .expect("the pass after the first empty one waited the 60 s idle interval");
+        assert!(result.is_ok(), "{result:?}");
     }
 
     /// REGRESSION (#526): `run` used to create a fresh `ctrl_c()` listener on
