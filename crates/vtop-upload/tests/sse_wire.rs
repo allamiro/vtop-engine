@@ -23,11 +23,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use vtop_core::config::{ServerSideEncryptionConfig, ServerSideEncryptionMode};
 use vtop_upload::s3_native::{S3NativeBackend, S3NativeConfig};
-use vtop_upload::{ObjectChecksum, UploadBackend, VerificationMethod};
+use vtop_upload::{EncryptionCheck, ObjectChecksum, UploadBackend, VerificationMethod};
 
 #[derive(Debug, Clone)]
 struct Seen {
     method: String,
+    target: String,
     headers: Vec<(String, String)>,
 }
 
@@ -101,6 +102,7 @@ impl Store {
             .collect();
         let seen = Seen {
             method: method.clone(),
+            target: target.clone(),
             headers,
         };
         let mut body = buf[head_end..].to_vec();
@@ -480,4 +482,58 @@ async fn a_matching_report_passes_and_keeps_the_stores_checksum_as_the_method() 
             "{configured:?}: {result:?}"
         );
     }
+}
+
+/// `check_encryption` is the judgement `verify_object` makes, for the reads
+/// that have no verification of their own (a manifest read by its pinned
+/// version, a receipt): it HEADs the exact version it is given and says what
+/// the store reports against what was asked.
+#[tokio::test]
+async fn check_encryption_heads_the_named_version_and_judges_the_answer() {
+    let store = Store::default();
+    let endpoint = store.start().await;
+    let b = backend(
+        endpoint.clone(),
+        sse(ServerSideEncryptionMode::SseS3, None, false),
+    )
+    .await;
+
+    store.answer_head(&[("x-amz-server-side-encryption", "AES256")]);
+    assert_eq!(
+        b.check_encryption("s3://b/a/obj.manifest.json", Some("ver-7"))
+            .await
+            .unwrap(),
+        EncryptionCheck::Encrypted
+    );
+    let seen = store.seen();
+    assert_eq!(seen.len(), 1, "{seen:#?}");
+    assert!(
+        seen[0].method == "HEAD" && seen[0].target.contains("versionId=ver-7"),
+        "the pinned version is the one asked about: {:?}",
+        seen[0]
+    );
+
+    store.answer_head(&[]);
+    match b
+        .check_encryption("s3://b/a/obj.manifest.json", None)
+        .await
+        .unwrap()
+    {
+        EncryptionCheck::Violation(why) => {
+            assert!(why.contains("encryption at rest missing"), "{why}")
+        }
+        other => panic!("an unencrypted manifest passed: {other:?}"),
+    }
+
+    // Nothing asked for: nothing checked, and no request made.
+    let before = store.seen().len();
+    let plain = backend(endpoint, None).await;
+    assert_eq!(
+        plain
+            .check_encryption("s3://b/a/obj.manifest.json", None)
+            .await
+            .unwrap(),
+        EncryptionCheck::NotRequested
+    );
+    assert_eq!(store.seen().len(), before, "no HEAD without the setting");
 }

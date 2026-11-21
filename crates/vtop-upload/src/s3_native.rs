@@ -950,6 +950,43 @@ impl S3NativeBackend {
         ))
     }
 
+    /// HEAD one object, or one version of it.
+    async fn head_version(
+        &self,
+        object_uri: &str,
+        version_id: Option<&str>,
+    ) -> Result<ObjectHead, VtopError> {
+        let (bucket, key) = parse_s3_uri(object_uri)?;
+        let out = self
+            .client
+            .head_object()
+            .bucket(&bucket)
+            .key(&key)
+            .set_version_id(version_id.map(str::to_owned))
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await
+            .map_err(|e| head_failure(object_uri, e))?;
+
+        // Only expose the checksum S3 itself computed over the stored body.
+        // x-amz-meta-vtop-checksum is written by the uploader and therefore
+        // cannot establish content integrity (#64).
+        let checksum_sha256 = out.checksum_sha256().and_then(b64_to_hex_sha256);
+
+        Ok(ObjectHead {
+            uri: object_uri.to_string(),
+            size_bytes: out.content_length().map(|v| v as u64),
+            etag: out.e_tag().map(|s| s.to_string()),
+            checksum_sha256,
+            encryption: out
+                .server_side_encryption()
+                .map(|alg| crate::base::StoredEncryption {
+                    algorithm: alg.as_str().to_owned(),
+                    kms_key_id: out.ssekms_key_id().map(str::to_owned),
+                }),
+        })
+    }
+
     /// Recompute a digest from the bytes returned by S3 without buffering the
     /// full object. Used for algorithms S3 does not compute natively.
     async fn digest_stored_body(
@@ -1396,34 +1433,25 @@ impl UploadBackend for S3NativeBackend {
     }
 
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {
-        let (bucket, key) = parse_s3_uri(object_uri)?;
-        let out = self
-            .client
-            .head_object()
-            .bucket(&bucket)
-            .key(&key)
-            .checksum_mode(ChecksumMode::Enabled)
-            .send()
-            .await
-            .map_err(|e| head_failure(object_uri, e))?;
+        self.head_version(object_uri, None).await
+    }
 
-        // Only expose the checksum S3 itself computed over the stored body.
-        // x-amz-meta-vtop-checksum is written by the uploader and therefore
-        // cannot establish content integrity (#64).
-        let checksum_sha256 = out.checksum_sha256().and_then(b64_to_hex_sha256);
-
-        Ok(ObjectHead {
-            uri: object_uri.to_string(),
-            size_bytes: out.content_length().map(|v| v as u64),
-            etag: out.e_tag().map(|s| s.to_string()),
-            checksum_sha256,
-            encryption: out
-                .server_side_encryption()
-                .map(|alg| crate::base::StoredEncryption {
-                    algorithm: alg.as_str().to_owned(),
-                    kms_key_id: out.ssekms_key_id().map(str::to_owned),
-                }),
-        })
+    async fn check_encryption(
+        &self,
+        object_uri: &str,
+        version_id: Option<&str>,
+    ) -> Result<crate::base::EncryptionCheck, VtopError> {
+        use crate::base::EncryptionCheck;
+        let Some(sse) = &self.sse else {
+            return Ok(EncryptionCheck::NotRequested);
+        };
+        let head = self.head_version(object_uri, version_id).await?;
+        Ok(
+            match crate::encryption::judge(sse, head.encryption.as_ref()) {
+                Ok(()) => EncryptionCheck::Encrypted,
+                Err(why) => EncryptionCheck::Violation(why),
+            },
+        )
     }
 
     async fn verify_object(

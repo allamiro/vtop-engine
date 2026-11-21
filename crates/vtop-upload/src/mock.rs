@@ -150,6 +150,10 @@ pub struct MockBackend {
     /// When set, `retention_error` applies only to keys ending with this
     /// suffix (#710), so a test can fail the receipts' reads alone.
     retention_error_suffix: Mutex<Option<String>>,
+    /// Keys ending with this suffix are reported stored unencrypted by
+    /// `check_encryption`, as a store that dropped the encryption on them
+    /// would. `None`, the default, reports nothing requested.
+    unencrypted_suffix: Mutex<Option<(String, bool)>>,
     /// The engine's credentials lack `s3:GetObjectRetention` and
     /// `s3:GetObjectLegalHold` (#709): a HEAD answers with no lock headers,
     /// and `confirm_lock_absent` is refused, as S3 does.
@@ -294,6 +298,15 @@ impl MockBackend {
     /// Every retention read from now on fails with `message`, or none does.
     pub fn set_retention_error(&self, message: Option<String>) {
         *self.retention_error.lock().unwrap() = message;
+    }
+
+    /// Make `check_encryption` report every key ending with `suffix` as
+    /// stored unencrypted, and every other key as encrypted as asked; `None`
+    /// goes back to reporting nothing requested. With `current_key_only`, only
+    /// a check of the key as it stands (no version named) finds it so: the
+    /// versions the ledger pinned stay as they were written.
+    pub fn set_unencrypted_suffix(&self, suffix: Option<&str>, current_key_only: bool) {
+        *self.unencrypted_suffix.lock().unwrap() = suffix.map(|s| (s.to_owned(), current_key_only));
     }
 
     /// Apply `retention_error` only to keys ending with `suffix`; `None`
@@ -492,6 +505,7 @@ impl MockBackend {
             retention_error: Mutex::new(None),
             retention_reads: Mutex::new(Vec::new()),
             retention_error_suffix: Mutex::new(None),
+            unencrypted_suffix: Mutex::new(None),
             lock_read_denied: false,
             bucket_object_lock: BucketFeature::Enabled,
             bucket_versioning: BucketFeature::Enabled,
@@ -947,6 +961,26 @@ impl UploadBackend for MockBackend {
             )));
         }
         Ok(stored.data.clone())
+    }
+
+    async fn check_encryption(
+        &self,
+        object_uri: &str,
+        version_id: Option<&str>,
+    ) -> Result<crate::base::EncryptionCheck, VtopError> {
+        use crate::base::EncryptionCheck;
+        Ok(match self.unencrypted_suffix.lock().unwrap().as_ref() {
+            None => EncryptionCheck::NotRequested,
+            Some((suffix, current_only))
+                if object_uri.ends_with(suffix.as_str())
+                    && !(*current_only && version_id.is_some()) =>
+            {
+                EncryptionCheck::Violation(format!(
+                    "encryption at rest missing: the mock reports {object_uri} unencrypted"
+                ))
+            }
+            Some(_) => EncryptionCheck::Encrypted,
+        })
     }
 
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {

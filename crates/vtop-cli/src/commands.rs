@@ -1460,6 +1460,30 @@ pub async fn verify_manifest_deep(
     };
     lines.push(format!("object content  : {checksum_status}"));
 
+    // 3b. How the store keeps the manifest and the object, when the backend
+    // was configured to ask for encryption at rest: said only then.
+    let mut encryption = Vec::new();
+    for (what, uri) in [
+        ("manifest", manifest_uri),
+        ("object", parsed.fields().object.uri.as_str()),
+    ] {
+        match backend.check_encryption(uri, None).await {
+            Ok(vtop_upload::EncryptionCheck::NotRequested) => {}
+            Ok(vtop_upload::EncryptionCheck::Encrypted) => encryption.push(format!("{what} OK")),
+            Ok(vtop_upload::EncryptionCheck::Violation(why)) => {
+                failed = true;
+                encryption.push(format!("{what} FAILED ({why})"));
+            }
+            Err(e) => {
+                failed = true;
+                encryption.push(format!("{what} FAILED (could not be checked: {e})"));
+            }
+        }
+    }
+    if !encryption.is_empty() {
+        lines.push(format!("encryption      : {}", encryption.join("; ")));
+    }
+
     // 4. Ledger reconciliation.
     let row = store.get_batch(&parsed.fields().batch_id).await?;
     let ledger_status = match &row {
