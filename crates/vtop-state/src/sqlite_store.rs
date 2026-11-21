@@ -24,21 +24,80 @@ use vtop_core::errors::VtopError;
 use vtop_core::state_machine::{transition, BatchState};
 use vtop_core::types::{ProgressMarker, SourceType, TelemetryFormat};
 
-/// The SQLite ledger's schema version, kept in the file's `PRAGMA
-/// user_version` (#664). 1 is the first: the schema with `verification_class`.
-/// Files from before it read 0 and are brought up to it on open. A higher
-/// value means a newer release has opened the file for a change this release
-/// could misread - the version is raised for nothing else - and this release
-/// refuses the file rather than run on it. Releases before #664 never read the
-/// version; this is the refusal path for the releases from here on. Raise it,
-/// and the `PRAGMA user_version = 1` in `migrate`, together
-/// (`sqlite_refuses_a_file_a_newer_release_opened` checks they agree).
+/// The highest schema version an ordinary open takes a SQLite ledger to by
+/// itself, kept in the file's `PRAGMA user_version` (#664). 1 is the first:
+/// the schema with `verification_class`. Files from before it read 0 and are
+/// brought up to it on open, as every release since #664 has done; nothing
+/// in it is a change an older release could misread. It stays 1: a version
+/// above it is a [`OneWayStep`], which only `vtopctl migrate` takes.
 ///
-/// The `sealed_at` column (#626) does not raise it: a nullable column that
-/// older releases never name is nothing they could misread (v0.9.0 names its
-/// columns and never writes this one), and raising the version would make a
-/// first open an automatic one-way step that PostgreSQL does not have.
-const SQLITE_SCHEMA_VERSION: i64 = 1;
+/// The `sealed_at` column (#626) does not raise any version: a nullable
+/// column that older releases never name is nothing they could misread
+/// (v0.9.0 names its columns and never writes this one).
+const SQLITE_OPEN_VERSION: i64 = 1;
+
+/// A one-way step of the SQLite ledger: a schema change a release before it
+/// could misread (a new ledger state or source type, a changed column), so
+/// that release must refuse the file once it is taken. The compatibility
+/// policy gates every one-way step behind an operator action, and for SQLite
+/// that action is `vtopctl migrate` ([`SqliteStateStore::migrate`]): an
+/// ordinary open of an existing ledger below the newest version refuses it
+/// and changes nothing, naming the command. A new ledger, which no older
+/// release has written, is created at the newest version.
+///
+/// A step raises `PRAGMA user_version` to its `version`; a release whose
+/// newest version is lower then refuses the file, as every release since
+/// #664 refuses a version above its own. Releases before #664 never read the
+/// version, so the first step must also change what they read (a state or
+/// source type they reject by name, say) or say in its release notes that
+/// they are not refused.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OneWayStep {
+    /// The version the step takes the file to: the previous step's, or
+    /// [`SQLITE_OPEN_VERSION`], plus one.
+    pub(crate) version: i64,
+    /// What the step changes, in the refusal and in the log line.
+    pub(crate) what: &'static str,
+    /// Its statements, run in the migration's transaction.
+    pub(crate) sql: &'static str,
+}
+
+/// The one-way steps, oldest first. None has been taken yet: a change that
+/// needs one adds it here (with its refusal test) instead of raising
+/// [`SQLITE_OPEN_VERSION`].
+const ONE_WAY_STEPS: &[OneWayStep] = &[];
+
+/// The newest version `steps` reach.
+const fn newest_version(steps: &[OneWayStep]) -> i64 {
+    let mut newest = SQLITE_OPEN_VERSION;
+    let mut i = 0;
+    while i < steps.len() {
+        if steps[i].version > newest {
+            newest = steps[i].version;
+        }
+        i += 1;
+    }
+    newest
+}
+
+/// The newest SQLite schema version this release reads. A higher value means
+/// a newer release has migrated the file for a change this release could
+/// misread - the version is raised for nothing else - and this release
+/// refuses the file rather than run on it. Releases before #664 never read
+/// the version; this is the refusal path for the releases from here on.
+/// `migrate` computes it from the steps it is given, so the tests can drive
+/// the gate with a step of their own; this is the production value.
+#[cfg(test)]
+const SQLITE_SCHEMA_VERSION: i64 = newest_version(ONE_WAY_STEPS);
+
+/// Whether a migration may take the one-way steps ([`OneWayStep`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Opening {
+    /// An ordinary open: only what [`SQLITE_OPEN_VERSION`] covers.
+    Open,
+    /// `vtopctl migrate`: every step in [`ONE_WAY_STEPS`].
+    Migrate,
+}
 
 /// How many times a write that lost a race to another writer is re-validated
 /// and retried before giving up.
@@ -246,6 +305,35 @@ impl SqliteStateStore {
     /// Open (creating if needed) a state store from a connection string such as
     /// `sqlite:///data/vtop-state.db` or `sqlite::memory:`.
     pub async fn connect(conn_str: &str) -> Result<Self, VtopError> {
+        Self::connect_with_steps(conn_str, ONE_WAY_STEPS).await
+    }
+
+    /// Migrate a ledger file, taking every one-way step this release knows
+    /// ([`OneWayStep`]), as `vtopctl migrate` does. An ordinary open
+    /// ([`Self::connect`]) applies only what older releases cannot misread,
+    /// and refuses a file a step has not been taken on.
+    pub async fn migrate(conn_str: &str) -> Result<(), VtopError> {
+        Self::migrate_with_steps(conn_str, ONE_WAY_STEPS).await
+    }
+
+    async fn migrate_with_steps(conn_str: &str, steps: &[OneWayStep]) -> Result<(), VtopError> {
+        if is_in_memory(conn_str) {
+            // A new database, created at the newest version by the open.
+            Self::connect_with_steps(conn_str, steps).await?;
+            return Ok(());
+        }
+        let opts = parse_sqlite_opts(conn_str)?;
+        if let Some(file) = vtop_core::config::sqlite_ledger_file(conn_str) {
+            create_owner_only(&file);
+        }
+        let mut conn = sqlx::ConnectOptions::connect(&opts)
+            .await
+            .map_err(map_sqlx)?;
+        migrate(&mut conn, Opening::Migrate, steps).await?;
+        sqlx::Connection::close(conn).await.map_err(map_sqlx)
+    }
+
+    async fn connect_with_steps(conn_str: &str, steps: &[OneWayStep]) -> Result<Self, VtopError> {
         let opts = parse_sqlite_opts(conn_str)?;
         let in_memory = is_in_memory(conn_str);
         if let Some(file) = vtop_core::config::sqlite_ledger_file(conn_str) {
@@ -265,7 +353,7 @@ impl SqliteStateStore {
             let mut conn = sqlx::ConnectOptions::connect(&opts)
                 .await
                 .map_err(map_sqlx)?;
-            migrate(&mut conn).await?;
+            migrate(&mut conn, Opening::Open, steps).await?;
             sqlx::Connection::close(conn).await.map_err(map_sqlx)?;
         }
         let pool = SqlitePoolOptions::new()
@@ -285,7 +373,7 @@ impl SqliteStateStore {
         };
         if in_memory {
             let mut conn = pool.acquire().await.map_err(map_sqlx)?;
-            migrate(&mut conn).await?;
+            migrate(&mut conn, Opening::Open, steps).await?;
         }
         Ok(Self {
             pool,
@@ -966,19 +1054,25 @@ fn row_to_audit(row: sqlx::sqlite::SqliteRow) -> AuditRow {
 
 /// Create the schema, or bring an older one up to date: idempotent, and run
 /// on every open. See [`SqliteStateStore::connect`] for why it runs on one
-/// connection.
+/// connection. Takes the one-way `steps` on a new file, or on any file under
+/// [`Opening::Migrate`]; an ordinary open of an existing file below them is
+/// refused, and the transaction rolled back, so it changes nothing.
 ///
 /// One `BEGIN IMMEDIATE` transaction from the version check to the version
 /// write (review of #664): it takes the write lock before reading the
 /// version, so a newer release raising the version at the same moment is
 /// either seen and refused, or waits; this release never writes its version
 /// over a newer one.
-async fn migrate(conn: &mut sqlx::SqliteConnection) -> Result<(), VtopError> {
+async fn migrate(
+    conn: &mut sqlx::SqliteConnection,
+    opening: Opening,
+    steps: &[OneWayStep],
+) -> Result<(), VtopError> {
     sqlx::raw_sql("BEGIN IMMEDIATE")
         .execute(&mut *conn)
         .await
         .map_err(map_sqlx)?;
-    let added = match migrate_in_transaction(&mut *conn).await {
+    let added = match migrate_in_transaction(&mut *conn, opening, steps).await {
         Ok(added) => added,
         Err(e) => {
             // The refusal or failure is the error reported; a failed
@@ -991,6 +1085,17 @@ async fn migrate(conn: &mut sqlx::SqliteConnection) -> Result<(), VtopError> {
         .execute(&mut *conn)
         .await
         .map_err(map_sqlx)?;
+    for step in &added.steps {
+        tracing::warn!(
+            backend = "SQLite",
+            schema_version = step.version,
+            "state store: took the one-way step to SQLite ledger schema version {} ({}). A \
+             release whose newest version is lower now refuses this file; going back means \
+             restoring a backup taken before the step",
+            step.version,
+            step.what
+        );
+    }
     if added.verification_class || added.sealed_at {
         // Counted after the commit, and best effort: the columns are there
         // either way, and a failed count must not fail the open.
@@ -1021,27 +1126,40 @@ async fn migrate(conn: &mut sqlx::SqliteConnection) -> Result<(), VtopError> {
 struct AddedColumns {
     verification_class: bool,
     sealed_at: bool,
+    /// The one-way steps taken on a file that already held a ledger.
+    steps: Vec<OneWayStep>,
 }
 
 /// [`migrate`]'s statements, in its transaction.
 async fn migrate_in_transaction(
     conn: &mut sqlx::SqliteConnection,
+    opening: Opening,
+    steps: &[OneWayStep],
 ) -> Result<AddedColumns, VtopError> {
     let mut added = AddedColumns::default();
+    let newest = newest_version(steps);
     // A file a newer release has opened is left alone (#664): see
     // SQLITE_SCHEMA_VERSION.
     let version: i64 = sqlx::query_scalar("PRAGMA user_version")
         .fetch_one(&mut *conn)
         .await
         .map_err(map_sqlx)?;
-    if version > SQLITE_SCHEMA_VERSION {
+    if version > newest {
         return Err(VtopError::State(format!(
             "SQLite state-store schema version {version} (the ledger file's PRAGMA user_version) \
-             is newer than this release supports (newest {SQLITE_SCHEMA_VERSION}): a newer \
-             release has opened this file. Nothing was started or changed. Run that release or a \
-             later one; downgrade is not supported"
+             is newer than this release supports (newest {newest}): a newer release has \
+             migrated this file. Nothing was started or changed. Run that release or a later \
+             one; downgrade is not supported"
         )));
     }
+    // A file with no ledger in it yet: no release has written it, so it is
+    // created at the newest version and no step is one-way for it.
+    let fresh: bool = sqlx::query_scalar(
+        "SELECT NOT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'batches')",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(map_sqlx)?;
     // Execute each statement in the schema script.
     for stmt in SCHEMA.split(';') {
         let stmt = stmt.trim();
@@ -1118,11 +1236,47 @@ async fn migrate_in_transaction(
             .await
             .map_err(map_sqlx)?;
     }
-    if version < SQLITE_SCHEMA_VERSION {
+    // SQLITE_OPEN_VERSION, which `the_one_way_steps_follow_the_open_version`
+    // holds at 1.
+    if version < SQLITE_OPEN_VERSION {
         sqlx::raw_sql("PRAGMA user_version = 1")
             .execute(&mut *conn)
             .await
             .map_err(map_sqlx)?;
+    }
+    let pending: Vec<&OneWayStep> = steps.iter().filter(|s| s.version > version).collect();
+    if let Some(first) = pending.first() {
+        if opening == Opening::Open && !fresh {
+            // Rolled back by the caller: the additive statements above are
+            // undone with the rest, so a refused open changes nothing.
+            return Err(VtopError::State(format!(
+                "SQLite state-store schema version {version} (the ledger file's PRAGMA \
+                 user_version) is older than this release needs ({newest}): the step to version \
+                 {} ({}) is one-way, and a release whose newest version is lower refuses the \
+                 file after it. Nothing was started or changed. Back up the ledger file, then run \
+                 `vtopctl migrate --config <path>` to take the step, or keep running the release \
+                 that wrote it",
+                first.version, first.what
+            )));
+        }
+        for step in pending {
+            sqlx::raw_sql(step.sql)
+                .execute(&mut *conn)
+                .await
+                .map_err(map_sqlx)?;
+            // An integer from this file's own step list; a PRAGMA takes no
+            // bound parameter.
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "PRAGMA user_version = {}",
+                step.version
+            )))
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx)?;
+            if !fresh {
+                added.steps.push(*step);
+            }
+        }
     }
     Ok(added)
 }
@@ -1668,6 +1822,174 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows, 1);
+    }
+
+    /// A one-way step for the tests: what a real one looks like to the
+    /// gate, a version above the open version and a schema change.
+    const PROBE_STEPS: &[OneWayStep] = &[OneWayStep {
+        version: SQLITE_OPEN_VERSION + 1,
+        what: "a probe table",
+        sql: "CREATE TABLE one_way_probe (x INTEGER)",
+    }];
+
+    async fn user_version(url: &str) -> i64 {
+        let mut conn = sqlx::ConnectOptions::connect(&parse_sqlite_opts(url).unwrap())
+            .await
+            .unwrap();
+        sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap()
+    }
+
+    async fn has_table(url: &str, table: &str) -> bool {
+        let mut conn = sqlx::ConnectOptions::connect(&parse_sqlite_opts(url).unwrap())
+            .await
+            .unwrap();
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = ?)")
+            .bind(table)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap()
+    }
+
+    /// The one-way steps start above the open version and follow each
+    /// other, and the newest of them is the version this release reads.
+    #[test]
+    fn the_one_way_steps_follow_the_open_version() {
+        let mut expected = SQLITE_OPEN_VERSION + 1;
+        for step in ONE_WAY_STEPS {
+            assert_eq!(step.version, expected, "{}", step.what);
+            expected += 1;
+        }
+        assert_eq!(SQLITE_SCHEMA_VERSION, expected - 1);
+        // The literal the open writes.
+        assert_eq!(SQLITE_OPEN_VERSION, 1);
+        assert_eq!(newest_version(PROBE_STEPS), SQLITE_OPEN_VERSION + 1);
+    }
+
+    /// The SQLite one-way step is gated by the operator, as the
+    /// compatibility policy requires of every one-way step: an ordinary open
+    /// of a ledger the step has not been taken on refuses it, names
+    /// `vtopctl migrate`, and changes nothing; `migrate` takes the step and
+    /// keeps the rows; the open then succeeds; and a release whose newest
+    /// version is below the step refuses the file after it.
+    #[tokio::test]
+    async fn sqlite_takes_a_one_way_step_only_through_migrate() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("gated.db").display());
+        // A ledger the release before the step wrote.
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        store
+            .save_batch_state(&test_battery::sample_record("kept"))
+            .await
+            .unwrap();
+        drop(store);
+        assert_eq!(user_version(&url).await, SQLITE_OPEN_VERSION);
+
+        let refused = match SqliteStateStore::connect_with_steps(&url, PROBE_STEPS).await {
+            Ok(_) => panic!("an open took a one-way step by itself"),
+            Err(e) => e.to_string(),
+        };
+        for part in [
+            "schema version 1",
+            "older than this release needs (2)",
+            "a probe table",
+            "one-way",
+            "Nothing was started or changed",
+            "vtopctl migrate",
+        ] {
+            assert!(refused.contains(part), "{part:?} missing from: {refused}");
+        }
+        assert_eq!(user_version(&url).await, SQLITE_OPEN_VERSION, "changed");
+        assert!(!has_table(&url, "one_way_probe").await, "changed");
+
+        SqliteStateStore::migrate_with_steps(&url, PROBE_STEPS)
+            .await
+            .unwrap();
+        assert_eq!(user_version(&url).await, 2);
+        assert!(has_table(&url, "one_way_probe").await);
+        // Taking it again is a no-op.
+        SqliteStateStore::migrate_with_steps(&url, PROBE_STEPS)
+            .await
+            .unwrap();
+        let store = SqliteStateStore::connect_with_steps(&url, PROBE_STEPS)
+            .await
+            .unwrap();
+        assert!(store.get_batch("kept").await.unwrap().is_some());
+        drop(store);
+
+        // The release before the step.
+        let refused = match SqliteStateStore::connect(&url).await {
+            Ok(_) => panic!("a release before the step opened the file after it"),
+            Err(e) => e.to_string(),
+        };
+        assert!(refused.contains("schema version 2"), "{refused}");
+        assert!(refused.contains("newer release"), "{refused}");
+        assert_eq!(user_version(&url).await, 2);
+    }
+
+    /// A refused open rolls back what it had already applied: a ledger from
+    /// before #664 (version 0, no `verification_class`) is not brought up to
+    /// the open version by an open that then refuses the one-way step.
+    #[tokio::test]
+    async fn a_refused_open_leaves_an_older_ledger_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("old.db").display());
+        {
+            let mut conn = sqlx::ConnectOptions::connect(&parse_sqlite_opts(&url).unwrap())
+                .await
+                .unwrap();
+            sqlx::raw_sql(
+                "CREATE TABLE batches (batch_id TEXT PRIMARY KEY, tenant TEXT NOT NULL, \
+                 source_type TEXT NOT NULL, source_name TEXT NOT NULL, format TEXT NOT NULL, \
+                 state TEXT NOT NULL, progress_start_json TEXT NOT NULL, \
+                 progress_end_json TEXT NOT NULL, created_at TEXT NOT NULL, \
+                 updated_at TEXT NOT NULL)",
+            )
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+        assert!(SqliteStateStore::connect_with_steps(&url, PROBE_STEPS)
+            .await
+            .is_err());
+        assert_eq!(user_version(&url).await, 0);
+        assert!(
+            !has_table(&url, "audit_events").await,
+            "the open's DDL stayed"
+        );
+        // `migrate` takes it from 0 through the open version to the step.
+        SqliteStateStore::migrate_with_steps(&url, PROBE_STEPS)
+            .await
+            .unwrap();
+        assert_eq!(user_version(&url).await, 2);
+        assert!(has_table(&url, "audit_events").await);
+    }
+
+    /// A new ledger has no rows an older release wrote, so it is created at
+    /// the newest version without `migrate`, on a file and in memory.
+    #[tokio::test]
+    async fn a_new_ledger_is_created_at_the_newest_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("new.db").display());
+        SqliteStateStore::connect_with_steps(&url, PROBE_STEPS)
+            .await
+            .unwrap();
+        assert_eq!(user_version(&url).await, 2);
+        assert!(has_table(&url, "one_way_probe").await);
+
+        let memory = SqliteStateStore::connect_with_steps("sqlite::memory:", PROBE_STEPS)
+            .await
+            .unwrap();
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&memory.pool)
+            .await
+            .unwrap();
+        assert_eq!(version, 2);
+        SqliteStateStore::migrate_with_steps("sqlite::memory:", PROBE_STEPS)
+            .await
+            .unwrap();
     }
 
     /// Review of #664: the version check and the version write are one
