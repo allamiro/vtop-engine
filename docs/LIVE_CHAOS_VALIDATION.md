@@ -272,8 +272,9 @@ The scenarios above drive the cluster plane. The archive engine (`vtopctl
 run`: a source, batches, the object store, the ledger) has its own harness,
 `scripts/live-chaos/engine/run-sweep.sh`, which sources the same `lib.sh`. It
 kills the engine with `SIGKILL` at every failpoint, against a real source
-(a Kafka broker, or a file), the lab's MinIO and a ledger (SQLite, or
-PostgreSQL), restarts it and checks what the restart made of it. Five legs
+(a Kafka broker, a file, or a syslog spool file), the lab's MinIO and a
+ledger (SQLite, or PostgreSQL), restarts it and checks what the restart made
+of it. Six legs
 run the same script with different knobs (see "The legs" below).
 
 **System model.** One crash-recovery engine process; a partially synchronous
@@ -326,6 +327,7 @@ every leg is held to every invariant below.
 | `sqlite-kafka` | SQLite | Kafka | none (the baseline, and the only leg a pull request runs) |
 | `postgres-kafka` | PostgreSQL, one database per point, schema applied by `vtopctl migrate` | Kafka | none |
 | `sqlite-file` | SQLite | one file, read through the file source | none |
+| `sqlite-spool` | SQLite | one spool file, read through the syslog spool source (its own adapter: cursor, markers, replay); its commit rule is read from the ledger's cursor, as for a file | none |
 | `sqlite-kafka-store-outage` | SQLite | Kafka | MinIO is stopped (`docker stop`) for up to `ENGINE_SWEEP_FAULT_SECONDS` (12), then started again; the engine is not restarted in between |
 | `sqlite-kafka-enospc` | SQLite | Kafka | the engine's work directory is a 16 KiB tmpfs with no free page, for the same time, then the filler is deleted; the engine is not restarted in between |
 
@@ -375,8 +377,9 @@ The other legs add knobs to the same script:
 # PostgreSQL ledger: a build with the postgres feature, and a running server
 cargo build -p vtop-cli --features failpoints,postgres --bin vtopctl
 ENGINE_SWEEP_BACKEND=postgres ENGINE_SWEEP_PG_CONTAINER=<container> CHAOS_PROFILE=debug scripts/live-chaos/engine/run-sweep.sh
-# file source
+# file source, or the syslog spool source
 ENGINE_SWEEP_SOURCE=file CHAOS_PROFILE=debug scripts/live-chaos/engine/run-sweep.sh
+ENGINE_SWEEP_SOURCE=syslog_spool CHAOS_PROFILE=debug scripts/live-chaos/engine/run-sweep.sh
 # store outage / ENOSPC (the latter mounts a tmpfs: root or passwordless sudo)
 ENGINE_SWEEP_FAULT=store_outage CHAOS_PROFILE=debug scripts/live-chaos/engine/run-sweep.sh
 ENGINE_SWEEP_FAULT=enospc CHAOS_PROFILE=debug scripts/live-chaos/engine/run-sweep.sh
@@ -412,6 +415,7 @@ on one laptop. Every leg passed, with no duplicate at any point:
 | `sqlite-kafka` | 262 s | 12 to 13 s |
 | `postgres-kafka` | 285 s | 13 to 14 s |
 | `sqlite-file` | 98 s | 4 to 5 s |
+| `sqlite-spool` | 74 s | 3 to 5 s (measured later, with the MinIO image only: no broker running) |
 | `sqlite-kafka-store-outage` | 616 s | 22 s for a point reached before the store is touched, 33 to 35 s for the rest (12 s of outage, then the recovery) |
 | `sqlite-kafka-enospc` | 495 s | 12 to 13 s, then 25 to 28 s once the staging write needs space |
 
@@ -429,6 +433,7 @@ ledger and a source to compare it with:
 | `postgres-kafka`, `after_source_commit_before_ledger` | the same message, read from PostgreSQL |
 | `sqlite-kafka`, `postgres-kafka` and `sqlite-file`, `before_source_commit` | "the ledger holds a MANIFEST_UPLOADED row, but a kill at this point must find a VERIFIED row: the engine reached the point out of order" |
 | `sqlite-file`, `after_source_commit_before_ledger` | the same: a file's committed position is in the engine's memory, so the broker comparison has nothing to read, and the ledger state at the kill is what shows the commit running ahead |
+| `sqlite-spool`, `before_source_commit` | "the ledger holds a MANIFEST_UPLOADED row, but a kill at this point must find a VERIFIED row: the engine reached the point out of order" (run later, on this leg alone) |
 
 The three store-write points (`mid_object_put`,
 `after_object_put_before_ledger`, `after_manifest_put_before_ledger`) pass
@@ -439,8 +444,7 @@ kill (`KILL_STATE`) is also what fails `before_source_commit` on the
 `sqlite-kafka` leg, where the broker's offset has not moved yet and the
 offset comparison could not.
 
-**Not covered.** The syslog spool source (its reader keeps no cursor outside
-the engine and a spool has no consumer group to compare); power loss, which
+**Not covered.** Power loss, which
 `kill -9` does not model (the page cache survives it), stays with
 `crates/vtop-cli/tests/ledger_power_loss.rs`; PostgreSQL with the file source
 (the two knobs are independent, but the nightly runs the PostgreSQL ledger
