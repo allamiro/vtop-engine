@@ -114,6 +114,16 @@ pub enum Command {
         /// exporter's textfile collector).
         #[arg(long)]
         metrics_file: Option<PathBuf>,
+        /// List at most this many unreferenced objects (#774: uploaded by a
+        /// failed, replay-required or superseded attempt, named by no
+        /// committed row). Counts and sizes cover all of them. 0 lists none.
+        #[arg(long, default_value_t = crate::coverage::DEFAULT_ORPHAN_LIMIT as u32,
+              value_parser = clap::value_parser!(u32).range(0..=100_000))]
+        orphans_limit: u32,
+        /// List unreferenced objects after this key: the `--orphans-after`
+        /// the previous page printed.
+        #[arg(long)]
+        orphans_after: Option<String>,
     },
     /// Read committed objects back and verify them again (#628). For each
     /// committed batch, in the ledger or in a prune digest: download the
@@ -438,6 +448,9 @@ fn print_receipts(file: &Path, json: bool) -> i32 {
 
 /// Dispatch a parsed CLI invocation. Returns a process exit code.
 pub async fn dispatch(cli: Cli) -> i32 {
+    // A secret file accepted under the override leaves an audit record
+    // (#733), whichever command read it.
+    vtop_core::secret_file::set_override_hook(crate::audit::record_secret_override);
     // Segment tools are synchronous, config-free, and use their own exit-code
     // contract (see segment_tools), so they bypass the engine dispatch path.
     if let Command::Receipt { file } = &cli.command {
@@ -447,6 +460,10 @@ pub async fn dispatch(cli: Cli) -> i32 {
         return crate::segment_tools::run(command, cli.json);
     }
     if let Command::Audit { command } = cli.command {
+        // A log stream (WARN and above unless --log-level says otherwise),
+        // so a secret file accepted under the override while the ledger is
+        // opened is announced here too (#733).
+        vtop_observe::logging::init(cli.log_level.as_deref().unwrap_or("warn"), cli.json);
         return crate::audit::run(command, cli.json).await;
     }
     // The cluster and node clients write audit records of the commands they
@@ -457,7 +474,9 @@ pub async fn dispatch(cli: Cli) -> i32 {
         Command::Meta { .. } | Command::Node { .. } | Command::Tier { .. }
     ) {
         vtop_observe::logging::init(cli.log_level.as_deref().unwrap_or("warn"), cli.json);
-        if let Err(error) = crate::audit::init_sink() {
+        // No engine config, so no override: the default rule (#733).
+        if let Err(error) = crate::audit::init_sink(&vtop_core::secret_file::SecretPolicy::strict())
+        {
             eprintln!("error: {error}");
             return 1;
         }
@@ -478,7 +497,10 @@ pub async fn dispatch(cli: Cli) -> i32 {
     if let Command::Tier { command } = cli.command {
         return crate::tier_tools::run(command, cli.json).await;
     }
-    let code = match run_command(&cli).await {
+    // Boxed: `run_command` holds every command's future, the engine's whole
+    // cycle among them, and a debug build polled it on a test thread's
+    // stack until that overflowed (#626 grew the cycle a little more).
+    let code = match Box::pin(run_command(&cli)).await {
         Ok(()) => 0,
         Err(e) => {
             // Errors are reported on stderr without leaking secrets.
@@ -508,8 +530,10 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             // logged, never fatal - telemetry must not block archiving.
             // A set but unwritable audit file stops the engine here, naming
             // the path (#694).
-            crate::audit::init_sink()?;
+            // Metrics first (#733): opening the audit file can announce an
+            // override, and its count must land in the registry.
             crate::metrics_server::maybe_start().await;
+            crate::audit::init_sink(&cfg.secret_policy())?;
             let mut engine = Engine::new_exclusive(cfg, streams).await?;
             engine.run().await
         }
@@ -520,6 +544,9 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 cli.json,
                 Some(&cfg.engine.name),
             )?;
+            // Before any key or ledger file is read, so a file accepted
+            // under the override is recorded in the audit file too (#733).
+            crate::audit::init_sink(&cfg.secret_policy())?;
             let engine = Engine::new(cfg, streams).await?;
             let sources = engine.discover().await?;
             if cli.json {
@@ -549,6 +576,9 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 cli.json,
                 Some(&cfg.engine.name),
             )?;
+            // Before any key or ledger file is read, so a file accepted
+            // under the override is recorded in the audit file too (#733).
+            crate::audit::init_sink(&cfg.secret_policy())?;
             let mut engine = Engine::new_exclusive(cfg, streams).await?;
             engine.recover().await?;
             let outcomes = engine.process_once((*source).into()).await?;
@@ -589,7 +619,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 cli.json,
                 Some(&cfg.engine.name),
             )?;
-            crate::audit::init_sink()?;
+            crate::audit::init_sink(&cfg.secret_policy())?;
             let engine_name = cfg.engine.name.clone();
             let audit = crate::audit::LedgerAudit {
                 command: "replay",
@@ -665,6 +695,9 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 cli.json,
                 Some(&cfg.engine.name),
             )?;
+            // Before any key or ledger file is read, so a file accepted
+            // under the override is recorded in the audit file too (#733).
+            crate::audit::init_sink(&cfg.secret_policy())?;
             let engine = Engine::new(cfg, streams).await?;
             let batches = engine.store.list_batches().await?;
             let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
@@ -688,6 +721,9 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 cli.json,
                 Some(&cfg.engine.name),
             )?;
+            // Before any key or ledger file is read, so a file accepted
+            // under the override is recorded in the audit file too (#733).
+            crate::audit::init_sink(&cfg.secret_policy())?;
             let engine = Engine::new(cfg, streams).await?;
             let batches = engine.store.list_batches().await?;
             if cli.json {
@@ -726,6 +762,9 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 cli.json,
                 Some(&cfg.engine.name),
             )?;
+            // Before any key or ledger file is read, so a file accepted
+            // under the override is recorded in the audit file too (#733).
+            crate::audit::init_sink(&cfg.secret_policy())?;
             let engine = Engine::new(cfg, streams).await?;
             let report = verify_manifest_deep(
                 engine.store.as_ref(),
@@ -763,7 +802,23 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             // startup fails the check here, naming the variable.
             let otel = vtop_observe::otel::settings_from_env(crate::otel::SERVICE_NAME)
                 .map_err(|e| VtopError::Config(format!("OpenTelemetry: {e}")))?;
-            let warnings = streams.warnings(&cfg);
+            // The files the engine would refuse for their permissions
+            // (#733), all of them at once: the same check, without reading
+            // any file, announcing anything or writing an audit record.
+            let mut secret_files = cfg.secret_files();
+            secret_files.extend(crate::audit::audit_file_from_env());
+            let permissions =
+                vtop_core::secret_file::inspect_all(&secret_files, &cfg.secret_policy());
+            if let Some(refused) = permissions.refusal_message() {
+                return Err(VtopError::Config(refused));
+            }
+            let mut warnings = streams.warnings(&cfg);
+            warnings.extend(
+                permissions
+                    .overrides
+                    .iter()
+                    .map(|accepted| accepted.validate_warning()),
+            );
             if *print_effective {
                 let effective =
                     vtop_core::effective_config::effective_streams(&cfg, Some(&streams));
@@ -820,8 +875,10 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 cli.json,
                 Some(&cfg.engine.name),
             )?;
-            crate::audit::init_sink()?;
-            let state_store = cfg.engine.state_store.resolve()?;
+            crate::audit::init_sink(&cfg.secret_policy())?;
+            let state_store = cfg.resolve_state_store()?;
+            // Before the migration writes to it (#733).
+            crate::engine::check_sqlite_files(&cfg, &state_store)?;
             let backend = if state_store.is_postgres() {
                 "postgresql"
             } else {
@@ -857,7 +914,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 let done = attempt.terminal(vtop_observe::audit::Outcome::Success);
                 // Both rows, now that the table exists: with the migration
                 // identity, which may write it.
-                let store = crate::engine::connect_configured_store(&cfg.engine, &state_store)
+                let store = crate::engine::connect_configured_store(&cfg, &state_store)
                     .await
                     .map_err(|e| {
                         VtopError::Other(format!(
@@ -889,6 +946,8 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             digest_dir,
             check_storage,
             metrics_file,
+            orphans_limit,
+            orphans_after,
         } => {
             let (cfg, streams) = load(config)?;
             init_tracing(
@@ -896,9 +955,12 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 cli.json,
                 Some(&cfg.engine.name),
             )?;
+            // Before any key or ledger file is read, so a file accepted
+            // under the override is recorded in the audit file too (#733).
+            crate::audit::init_sink(&cfg.secret_policy())?;
             let digest_dir = digest_dir
                 .clone()
-                .unwrap_or_else(|| crate::coverage::default_digest_dir(&cfg.engine));
+                .unwrap_or_else(|| crate::coverage::default_digest_dir(&cfg));
             // Read-only construction: an audit may run beside a live engine.
             let engine = Engine::new(cfg, streams).await?;
             let ledger = engine.store.list_batches().await?;
@@ -910,12 +972,20 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             } else {
                 None
             };
+            let orphans = crate::coverage::orphans(
+                &all,
+                &crate::coverage::OrphanOptions {
+                    limit: *orphans_limit as usize,
+                    after: orphans_after.clone(),
+                },
+            );
             let report = crate::coverage::AuditReport {
                 ledger_rows,
                 digest_rows,
                 digest_files,
                 units: crate::coverage::audit(all),
                 storage,
+                orphans,
             };
             if let Some(path) = metrics_file {
                 crate::coverage::write_textfile(
@@ -958,14 +1028,14 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 cli.json,
                 Some(&cfg.engine.name),
             )?;
-            crate::audit::init_sink()?;
+            crate::audit::init_sink(&cfg.secret_policy())?;
             let engine_name = cfg.engine.name.clone();
             // Whether this run moved the cursor: what its audit record says.
             let mut cursor_moved = false;
             let scrubbed: Result<(), VtopError> = async {
                 let digest_dir = digest_dir
                     .clone()
-                    .unwrap_or_else(|| crate::coverage::default_digest_dir(&cfg.engine));
+                    .unwrap_or_else(|| crate::coverage::default_digest_dir(&cfg));
                 let retention_days = cfg.engine.ledger_retention_days;
                 let retention_mode =
                     crate::object_lock::scrub_retention_mode(&cfg, *check_retention)?;
@@ -1139,19 +1209,19 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 cli.json,
                 Some(&cfg.engine.name),
             )?;
-            crate::audit::init_sink()?;
-            let state_store = cfg.engine.state_store.resolve()?;
+            crate::audit::init_sink(&cfg.secret_policy())?;
+            let state_store = cfg.resolve_state_store()?;
             let audit = crate::audit::LedgerAudit {
                 command: "prune-ledger",
                 keyring: crate::audit::ledger_keyring(&cfg, "prune-ledger")?,
             };
             // The configured bound, as the engine uses (review of #568).
-            let store = crate::engine::connect_configured_store(&cfg.engine, &state_store).await?;
+            let store = crate::engine::connect_configured_store(&cfg, &state_store).await?;
             let cutoff = (chrono::Utc::now() - chrono::Duration::days(i64::from(*older_than_days)))
                 .to_rfc3339();
             let digest_dir = digest_dir
                 .clone()
-                .unwrap_or_else(|| crate::coverage::default_digest_dir(&cfg.engine));
+                .unwrap_or_else(|| crate::coverage::default_digest_dir(&cfg));
             let span = tracing::info_span!("prune_ledger");
             async {
                 // Recorded before a row is deleted; the prune is refused when

@@ -1,8 +1,8 @@
 # Logs and auditing
 
 Metrics show trends; logs explain what the engine decided; audit evidence
-shows who changed state. This page covers what exists today and what is
-planned.
+shows who changed state. This page covers the log format and levels, the
+audit trail, and where the other evidence lives.
 
 ## Logs
 
@@ -18,6 +18,18 @@ Each step of a batch logs an event with its `batch_id`: `format_detected`,
 `source_committed`, then `batch_metrics` with sizes and per-stage timings. A
 failure logs with the batch id beside it, for example
 `source_commit_failed (will retry on recovery)`.
+
+`batch_metrics` is logged once per committed batch, by `vtopctl run` and
+`process-once` alike, with the same numbers `process-once` prints: `total_ms`
+and the stage timings `compress_ms`, `checksum_ms`, `object_upload_ms`,
+`manifest_upload_ms`, `verify_ms`, `commit_ms` (the source commit) and
+`state_write_ms` (all ledger writes of the batch), in whole milliseconds, so a
+stage faster than 1 ms reads `0`. `object_reused=true` means the object was
+already archived and verified, so `object_upload_ms` is `0` and nothing was
+uploaded. The same stage timings feed `vtop_stage_duration_seconds{stage}` on
+the [metrics endpoint](monitoring.md), which only `run` serves. A batch whose
+source commit failed or is held back logs no `batch_metrics`; it stays
+`VERIFIED` and logs why.
 
 How to read the levels:
 

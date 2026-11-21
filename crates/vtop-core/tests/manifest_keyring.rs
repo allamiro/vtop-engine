@@ -74,6 +74,7 @@ fn builder(batch: &str) -> ManifestBuilder {
             mtime: String::new(),
             content_fingerprint: None,
             tail_fingerprint: None,
+            ctime: None,
         },
         object_uri: format!("file:///archive/{batch}.raw"),
         object_size: 30,

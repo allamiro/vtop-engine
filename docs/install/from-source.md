@@ -65,6 +65,24 @@ On macOS, `.cargo/config.toml` sets `MACOSX_DEPLOYMENT_TARGET=11.0`, so a
 binary built on any macOS release runs on macOS 11 and later. To target a
 different minimum, export that variable yourself.
 
+On Linux there is no such setting: a binary needs at least the glibc of the
+system it was built on, because the C dependencies take the newest symbol
+versions of that system's headers. A build on Ubuntu 24.04 (glibc 2.39) does
+not start on Debian 12 or Amazon Linux 2. The release archives get their
+floors from where they are built (see
+[binaries.md](binaries.md#supported-platforms)):
+
+- the `-linux-gnu` archives inside `quay.io/pypa/manylinux2014_x86_64` or
+  `_aarch64` (CentOS 7, glibc 2.17, gcc 10 from devtoolset-10), for a
+  glibc 2.17 floor;
+- the `-linux-musl` archives inside `rust:1-alpine`, with
+  `cargo build --release --target <arch>-unknown-linux-musl` and
+  `LIBZ_SYS_STATIC=1`, for fully static binaries with no glibc floor. The
+  Alpine packages are `build-base cmake perl linux-headers curl-dev`.
+
+The exact commands and image digests are in the "Build" steps of
+[`.github/workflows/release.yml`](../../.github/workflows/release.yml).
+
 ## Optional builds
 
 - **Without the Kafka source.** `cargo build -p vtop-cli --no-default-features`
@@ -117,6 +135,9 @@ request; the workflow is [`.github/workflows/ci.yml`](../../.github/workflows/ci
 |---|---|
 | `Library not loaded: .../libsasl2.3.dylib` or `libssl.3.dylib` (macOS) | A v0.8.0 or earlier binary. Run `brew install openssl@3 cyrus-sasl`, or build from source. |
 | `error while loading shared libraries: libsasl2.so.3` or `libssl.so.3` (Linux) | A v0.8.0 or earlier binary. Install the run-time packages listed in [binaries.md](binaries.md#run-time-libraries). |
+| ``version `GLIBC_2.38' not found`` (Linux) | A release archive of v0.8.0 to v0.10.0 on a host with glibc older than 2.39. Use v0.10.2 or later (see [binaries.md](binaries.md#supported-platforms)), or the container image. |
+| ``version `GLIBC_2.28' not found`` (Linux) | A v0.10.1 archive on a host with glibc older than 2.28, such as Amazon Linux 2 or RHEL 7. Use v0.10.2 or later. |
+| `vtopctl: not found` although the file is there (Alpine) | A `-linux-gnu` archive on a musl system: the glibc loader it asks for does not exist. Take the `-linux-musl` archive (see [binaries.md](binaries.md#which-linux-archive-to-pick)). |
 | `Can't locate FindBin.pm` or `IPC/Cmd.pm` during the build | The OpenSSL build needs those Perl modules. Install `perl-core` (RHEL family, Fedora) or `perl` (Debian/Ubuntu). |
 | `failed to run custom build command for rdkafka-sys` mentioning `cmake` | Install CMake (see [Native prerequisites](#native-prerequisites)). |
 | `fatal error: curl/curl.h: No such file or directory` (Linux) | Install `libcurl4-openssl-dev` or `libcurl-devel` (header only; see above). |

@@ -115,7 +115,7 @@ checks is a gate that silently stops working.
 | `11-admin-authorization` | Admin transport authorization enforced by the running binary over real mTLS (#238) | An operator certificate retains the full surface; a data-node certificate is refused membership changes (and the refusal says so), may still read, and can still acquire its **own** range lease — so the policy does not break the failover path. |
 | `12-data-replica-replacement` | A data replica is lost permanently; a fresh node joins, is repaired from a survivor, and the dead replica is retired (#242) | The replica set committed is the one placement computed; `vtopctl node repair` populates the newcomer byte-for-byte and the artifact verifies independently; retirement is **refused before** the replacement proof commits and accepted after; every previously acknowledged record remains readable. |
 | `13-orderly-shutdown` | The range leader and a follower are stopped with SIGTERM instead of SIGKILL (#280) | The signal is handled within a deadline (an ignored SIGTERM fails the scenario); the departing leader releases its range lease so the replacement acquires it without waiting out the lease deadline; every acknowledged record is readable after the handoff; both stopping nodes write their final commit boundary; the stopped leader's sealed artifact verifies offline. |
-| `14-candidate-failover` | Three identical candidate configs; the range leader is SIGKILLed mid-hold (#284) | Exactly one candidate takes the range from ONE config shape — the winner is not scripted; quorum produce lands at the winner's own native address; after the kill a SURVIVOR takes the range with no process started, no config rewritten, and no port moved — the promotion appears in its log as a role change, not a restart; quorum produce resumes at the new epoch on the survivor's own address; every record acknowledged before the kill is intact. |
+| `14-candidate-failover` | Three identical candidate configs; the range leader is SIGKILLed mid-hold (#284) | Exactly one candidate takes the range from ONE config shape — the winner is not scripted; quorum produce lands at the winner's own native address; after the kill a SURVIVOR takes the range with no process started, no config rewritten, and no port moved — the promotion appears in its log as a role change, not a restart; quorum produce resumes at the new epoch on the survivor's own address; every record acknowledged before the kill is intact; the survivor serves within 3 s (`CHAOS_PROMOTION_SERVE_LIMIT_MS`) of the lease changing hands, at a write quorum of replica streams, and logs that it serves with 1 of 2 streams connected (#750: it used to wait its whole 10 s deadline for the killed leader's stream). |
 | `15-plaintext-lab` | The whole cluster on loopback without a certificate: every plane `transport: plaintext` (#294) | The lab boots and serves; a leased replicated leader is refused on a plaintext replica plane, naming the knob to turn (`replica_transport: tls`); a plaintext listener off loopback is refused, naming the way out; the warnings are on the log. |
 | `16-kafka-gateway` | A standalone node serves Kafka's wire protocol beside its native plane (#225), exercised with nothing but bash and `/dev/tcp` | ApiVersions v0 answers with the served keys; Metadata v1 names the range's topic behind the gateway; a version outside the served range is refused by closing the connection; the ready line names the listener and the node warns that the protocol carries no vtop identity. |
 | `17-kafka-stock-client` | librdkafka (`kcat`) against the gateway on a leader with two followers; one follower is `SIGKILL`ed while ONE paced producer is mid-stream (#225 acceptance) | 20,000 keyed records produced with `acks=all` by one process, every delivery a quorum acknowledgement; the kill lands after a watermark floor and before the stream ends (the scenario fails if the producer had already finished); the same process finishes with no failed delivery and the watermark reaches 20,000; the same client reads everything back byte-exact and in order from `-o beginning`; the surviving follower's committed offset covers every acknowledgement; the leader's and the follower's sealed segments pass `vtopctl segment verify`. |
@@ -123,8 +123,9 @@ checks is a gate that silently stops working.
 | `19-kafka-consumer-group` | librdkafka's consumer group (`kcat -G`) against the gateway on a leader with two followers (#457 slice 2): FindCoordinator, JoinGroup, SyncGroup, Heartbeat, OffsetFetch and LeaveGroup, the client-side assignor assigning the range's one partition; auto-commit on at a short interval, the durable store being the next slice | 5,000 keyed records produced; the group consumer's rebalance line names `TOPIC [0]`; it reads all 5,000 byte-exact and in order from the earliest offset and exits at the end; every commit is refused BY NAME on the leader's log (no store yet), the refusal is on the client's log, and the consumer reads everything and exits clean with no other error; the leader's sealed segment passes `vtopctl segment verify`. |
 | `20-kafka-offsets-resume` | a group's committed offset is a cursor on the metadata plane (#457 slice 2b): on a three-node data plane under a lease from a three-node metadata plane, a stock group consumer (`kcat -G`) reads the first half of the records and leaves, committing; `vtopctl meta group-cursor` reads the position back from the plane as an unpinned cursor at exactly that offset; a second consumer under the same group resumes at record N/2+1 and reads the rest byte-exact; the cursor then stands at N, and the leader's log names no refused commit. | the durable-store acceptance the issue asks for: commit, restart, resume — with the position living on the plane between the two consumers, not in the gateway |
 | `21-kafka-two-partitions` | two members of one group over two partitions, one each (#457 slice 4b): two standalone gateways, each leading one Kafka partition of the same topic and naming the other in `kafka.partitions`; a stock group (`kcat -G`, range assignor) of two members finds the one coordinator the topology elects, is assigned one partition each, and each member reads only the records produced to its partition — byte-exact, no overlap. Standalone: commits are refused by name (no metadata plane), as scenario 19; the assignment is the criterion. | the remaining in-flight acceptance of #457: two members, two partitions, one each |
-| `22-meta-rolling-upgrade` | a rolling upgrade of the metadata tier (#554): three voters start on the PREVIOUS release (`CHAOS_OLD_VTOP_NODE`) and are replaced one at a time by this build; after each replacement a write must commit within the progress deadline and every voter must reach the leader's applied index; once all are upgraded `vtopctl meta enable-features --level 4` raises the feature level, a voter restarted on the raised log reopens, and a lower level leaves 4 in force. Skips (exit 77, reported as SKIP by `run-all.sh`) without an old binary; CI's upgrade job runs it against the newest release tag. Against v0.6.0, raising the level with one voter still old leaves that voter unable to append (`applied 5, the leader 7`) - the failure this scenario catches, and the reason the leader gates new kinds. Then (#634) `vtopctl meta node-versions --level 8` lists the registered nodes and finds none a raise waits for (placeholders with no range and no report are not counted), `enable-features --level 7` raises the report level on the metadata tier alone, and a static range runs with one follower on the previous release and one on this build behind a leader on this build: the leader opens each session with a version hello, the old follower answers it as every release before the handshake does, and both followers must reach every acknowledged record, with no protocol error in the old follower's log. | the mixed-version check #554 asks for: the gate holds against a real previous release, not only a simulated one; and #634's: a new leader falls back to the old replica protocol against a real previous-release follower |
+| `22-meta-rolling-upgrade` | a rolling upgrade of the metadata tier (#554): three voters start on the PREVIOUS release (`CHAOS_OLD_VTOP_NODE`) and are replaced one at a time by this build; after each replacement a write must commit within the progress deadline and every voter must reach the leader's applied index; with two voters replaced and the third still on the previous release, a leader on this build refuses `enable-features --level 8` and the refusal names the old voter as closing the connection without answering the version question (#706; while the old voter leads it is restarted, still on the previous release, until a node on this build does); once all are upgraded `vtopctl meta enable-features --level 4` raises the feature level, a voter restarted on the raised log reopens, and a lower level leaves 4 in force. Skips (exit 77, reported as SKIP by `run-all.sh`) without an old binary; CI's upgrade job runs it against the newest release tag. Against v0.6.0, raising the level with one voter still old leaves that voter unable to append (`applied 5, the leader 7`) - the failure this scenario catches, and the reason the leader gates new kinds. Then (#634) `vtopctl meta node-versions --level 8` lists the registered nodes and finds none a raise waits for (placeholders with no range and no report are not counted), `enable-features --level 7` raises the report level on the metadata tier alone, and a static range runs with one follower on the previous release and one on this build behind a leader on this build: the leader opens each session with a version hello, the old follower answers it as every release before the handshake does, and both followers must reach every acknowledged record, with no protocol error in the old follower's log. | the mixed-version check #554 asks for: the gate holds against a real previous release, not only a simulated one; and #634's: a new leader falls back to the old replica protocol against a real previous-release follower |
 | `23-acked-suffix-failover` | The #611 shape on three candidates over TLS: one follower C is SIGKILLed after a shared prefix, so the leader L and the other follower R alone acknowledge the next records; L is SIGKILLed mid-stream; R is frozen (SIGSTOP) and C restarted so C takes the lease first; R is thawed to answer C's fence; then L restarts so R has a follower that holds its tail (a new leader does not stream a lagging follower up from its log, #341). Both followers' committed offsets must cover the shared prefix before C is killed, so what C lacks is exactly the suffix. `CHAOS_611_SEED` picks the lagging follower and how much suffix is acknowledged before L dies, in [`CHAOS_611_BATCH`, `CHAOS_611_SUFFIX_MAX`] (defaults 20 and 2000); `CHAOS_611_SHARED` (default 200) sizes the prefix. | C, which lacks acknowledged records, never logs a role change to leader, and R takes the range at an epoch newer than both L's and the one C was refused at; C's refusal by R's answer (Raft §5.4.1) is reported; quorum produce resumes on the candidate that serves; every record acknowledged before the kill reads back byte-exact from it. When L returns holding records past R's tail that nobody acknowledged, nothing fences it and no quorum forms (#641): the scenario reports it and exits 77 (SKIP), never PASS. It also exits 77 when C comes back holding every acknowledged record, since the shape was then not reached. Candidates carry `lease.admin_peers` for all three metadata nodes, so a metadata leader change mid-run does not strand the lease agents. |
+| `24-kafka-replicated-partitions` | Two Kafka partitions of one topic, each a range with a leader and two followers, the leaders on different hosts and every host a replica of both under one certificate (#596: the shape of the Kafka comparison's multi-partition cells). Each leader lists both partitions in `kafka.partitions`. ONE idempotent librdkafka producer (`enable.idempotence=true`, `acks=all`) lets its partitioner spread keyed records over both, then a `kcat -G` group consumer reads them. No metadata plane, as in the benchmark. | Both partitions are written, and their watermarks sum to the records produced. librdkafka's own debug lines show it acquired exactly one producer id from one leader and wrote every batch of BOTH partitions under it, so the other leader accepted an id it did not mint. The group reads exactly the input, each record once, each partition in produced order. A follower of each range committed every acknowledged record (`replica-status`). |
 | `25-kafka-compressed-produce` | librdkafka (`kcat -z`) produces through the gateway on a standalone node with each codec the gateway decompresses, gzip and zstd (#596), with librdkafka's message debug on | Every record reads back byte-exact and in order, and the watermark after each codec's stream equals the records produced. librdkafka's own debug lines say which batches it compressed: zstd must arrive compressed, so the gateway decompressed it and Fetch served it uncompressed. Against this gateway librdkafka 2.8.0 logs "Broker does not support compression type gzip: not compressing batch" and sends gzip, snappy and lz4 uncompressed, because its feature check wants protocol versions below the gateway's Produce v3 floor; the scenario reports that for gzip and does not count it as coverage. Batches the pinned Java producer compressed with gzip and zstd are decoded by the gateway's unit tests (`crates/vtop-kafka/tests/fixtures`). A codec the local kcat was built without is skipped by name (`kcat -V` features); with no codec compressed the scenario exits 77 (SKIP). |
 
 Scenario 07 skews a Raft **voter**. Skew on a lease **proposer** (a data node)
@@ -163,14 +164,128 @@ verify` checks the resulting sealed bundle. For the disk-full follower, the
 quiesced namespace-visible active file and commit boundary are copied out
 before its private tmpfs disappears.
 
+## Engine crash sweep (#725)
+
+The scenarios above drive the cluster plane. The archive engine (`vtopctl
+run`: a source, batches, the object store, the ledger) has its own harness,
+`scripts/live-chaos/engine/run-sweep.sh`, which sources the same `lib.sh`. It
+kills the engine with `SIGKILL` at every failpoint, against a real Kafka
+broker, the lab's MinIO and a SQLite ledger, restarts it and checks what the
+restart made of it.
+
+**System model.** One crash-recovery engine process; a partially synchronous
+network; honest processes. The only fault is the `SIGKILL`.
+
+**How the kill lands.** A failpoint, not a timer: a build with the cargo
+feature `failpoints` reads `VTOP_FAILPOINT=<point>` (or `<point>:<n>` for the
+nth hit) and, on reaching that line, sends itself `SIGKILL`: no destructor
+runs and nothing is flushed. The feature is off by default; without it the
+hook is an empty inline function and the variable is not read. No release
+archive, container image or chart enables it, and
+`scripts/check-failpoints-absent.sh` (the `failpoints absent from release
+builds` job) fails if the workspace's default features, `release.yml` or the
+Dockerfile ever would. The same script, given a built binary, looks for the
+line the failpoint prints before the kill: ci.yml's test job runs it on its
+release build of `vtopctl` (it must be absent), and the sweep runs it on its
+own build (it must be present, the positive control). An unknown point refuses to start and lists the valid
+ones; the sweep reads its point list from that refusal, so the list lives in
+one place (`crates/vtop-cli/src/failpoints.rs`) and a full run fails if it
+did not run every entry.
+
+**The points.** Ledger points are placed by a decorator around the state
+store, so every path that writes a transition (the pipeline, recovery, the
+settle pass) has them; the others are explicit calls.
+
+| Point | Where the engine is when it dies | Ledger row at the kill |
+|---|---|---|
+| `before_insert`, `after_insert` | around the row's first write | none / `BATCHING` |
+| `before_ledger_<S>`, `after_ledger_<S>` for S in `sealed`, `compressed`, `checksummed`, `object_uploaded`, `manifest_uploaded`, `verified`, `source_committed` | around the transition to S | the state before S / S |
+| `mid_object_put` | a multipart upload has stored a part and is not complete (the sweep sends this leg's objects as multipart) | `CHECKSUMMED` |
+| `after_object_put_before_ledger` | the object is in the store, the ledger does not say so | `CHECKSUMMED` |
+| `after_manifest_put_before_ledger` | the manifest is in the store, the ledger does not say so | `OBJECT_UPLOADED` |
+| `before_source_commit` | VERIFIED is in the ledger, the Kafka offset is not committed | `VERIFIED` |
+| `after_source_commit_before_ledger` | the Kafka offset is committed, SOURCE_COMMITTED is not written | `VERIFIED` |
+
+`crates/vtop-cli/tests/failpoints.rs` pins this table on every build of the
+feature: each point kills a real `vtopctl process-once` (exit by signal 9),
+the ledger is in the state above, and a restart archives every record of a
+local file into a local store.
+
+**What is checked, per point.** Each point has its own consumer group,
+ledger, work directory and object prefix over one seeded topic.
+
+| Invariant | Kind | How |
+|---|---|---|
+| The commit rule at the source: the group's committed offset never passes the end of the highest range the ledger records as VERIFIED | safety | read from the broker (`kafka-consumer-groups.sh`) and from the ledger (opened read-only, so the WAL the kill left is not checkpointed), at the kill and again after the restart. "No committed offset" counts only when the broker said so (the offsets table without one, or the group not found); a query that failed or timed out, which the tool reports with exit status 0, is retried three times and then fails the check |
+| The commit rule in the ledger: no SOURCE_COMMITTED row lacks what the VERIFIED write leaves (the verification class, which only `mark_verified` sets, the object and the manifest) | safety | the same read-only ledger read, at the kill and after the restart |
+| No hole | safety | `vtopctl audit-coverage --check-storage` passes, `vtopctl scrub` is clean, and every produced record is found in the objects the store holds, copied out with `mc` and counted by the harness, not by the engine |
+| Duplicates only where the at-least-once window is open | safety | the extra copies are counted against the table below |
+| The restart commits every record and stops cleanly | liveness | bounded poll on the group's committed offset and the ledger, then `SIGTERM` and exit 0 |
+
+| Points | Extra record copies allowed | Why |
+|---|---|---|
+| `before_insert` to `after_ledger_checksummed`, and `mid_object_put` | 0 | no object of the batch is in the store yet; the replay builds it from the source |
+| every later point | one batch (`ENGINE_SWEEP_BATCH_RECORDS`, 20) | the store holds the batch's object while its range is uncommitted; a replay that cannot rebuild the same bytes writes a second object ([ARCHITECTURE](ARCHITECTURE.md) section 13, item 3) |
+
+The sweep runs one batch at a time (`batching.max_concurrent_batches: 1`), so
+the batch the kill interrupts is the only one in flight.
+
+**Running it.**
+
+```bash
+cargo build -p vtop-cli --features failpoints --bin vtopctl
+docker compose build minio && docker compose up -d --wait minio
+# a broker that advertises an address the engine can reach, for example the
+# kafka service of the `engine crash sweep` workflow, then:
+CHAOS_PROFILE=debug scripts/live-chaos/engine/run-sweep.sh
+ENGINE_SWEEP_POINTS=before_source_commit CHAOS_PROFILE=debug scripts/live-chaos/engine/run-sweep.sh
+```
+
+Knobs (`ENGINE_SWEEP_POINTS`, `ENGINE_SWEEP_RECORDS`,
+`ENGINE_SWEEP_BATCH_RECORDS`, `ENGINE_SWEEP_POINT_TIMEOUT_SECONDS`, the Kafka
+bootstrap and container, the S3 endpoint and bucket) are documented and
+validated in the script header. `CHAOS_VTOPCTL` points at the failpoints
+build when it is not `target/$CHAOS_PROFILE/vtopctl`.
+
+**Where it runs.** The `engine crash sweep` workflow
+(`.github/workflows/engine-crash-sweep.yml`): every point nightly at 06:37
+UTC and on dispatch (which can name points and a record count); the five
+commit-boundary points (`mid_object_put`, `after_object_put_before_ledger`,
+`after_manifest_put_before_ledger`, `before_source_commit`,
+`after_source_commit_before_ledger`) on a pull request that changes the
+engine, the ledger, the upload path, the adapters or the harness.
+
+**Measured.** A full local run (21 points, 50 records each, batches of 20, a
+debug build in a container capped at two CPUs, `apache/kafka:4.3.1` capped
+at one, and the lab's MinIO, all on one laptop) took 239 s, 11 to 12 s a
+point, with no duplicate at any point. The five pull-request points took
+55 s. With `mark_verified` moved behind the source commit (a deliberate
+mutation: the ledger's transitions stay legal, so only the comparison with
+the broker can see it), the five pull-request points fail at
+`after_source_commit_before_ledger`: "COMMIT RULE VIOLATED: the consumer
+group's committed offset is 20, but in the ledger no range is recorded as
+VERIFIED or SOURCE_COMMITTED, so offsets 0..19 were committed at the source
+before they were verified. Ledger states: {"MANIFEST_UPLOADED": 1}". With
+the mutation reverted they pass.
+
+**Not covered yet.** PostgreSQL as the ledger, the file source, a store
+outage before the kill and ENOSPC (the second part of #725); the syslog
+source (no cursor to compare); power loss, which `kill -9` does not model
+(the page cache survives it), stays with `crates/vtop-cli/tests/ledger_power_loss.rs`.
+
 ## Scope boundaries
 
 This harness is an integration foundation for issue #215, not the final
 production cluster daemon.
 
-- Metadata and native data-plane processes are assembled separately. The
-  native broker does not yet consume metadata membership or lease changes
-  from the live Raft group.
+- Metadata and native data-plane processes are assembled separately, except
+  in scenario 10, which hosts both in one process. Range leadership on the
+  data plane follows metadata leases from the live Raft group: scenarios 09,
+  14 and 23 kill a range leader and assert that another node takes the range
+  under a lease (09 also asserts that the restarted old leader is refused as
+  fenced). Membership changes (scenarios 01 to 03) and data replica-set
+  changes (scenario 12) are driven by the operator; the harness does not
+  claim that a data node reacts to a membership change on its own.
 - Scenario 03 validates metadata voter replacement, and only that. The
   #180/#181 replacement-proof lifecycle for a sealed DATA replica is
   exercised end to end by scenario 12 — operator-driven, through
@@ -178,13 +293,15 @@ production cluster daemon.
   into the transferable prefix and asserts the repaired replica holds the
   full acknowledged floor (the closure #306 tracked) — so the one thing
   still unproven here is automated repair with no operator in the loop.
-- The native data plane has quorum replication but no live leader election.
-  Scenario 04 therefore proves acknowledged durability and same-directory
-  recovery, not automatic data-plane failover.
-- Durable consumer-group cursor proposals are covered by the metadata state
-  machine and deterministic Raft tests. They are not yet wired to the live
-  native fetch client, so this harness does not claim end-to-end cursor
-  continuity across membership changes.
+- Scenario 04 proves acknowledged durability and same-directory recovery;
+  it does not fail over. Lease-driven failover is scenarios 09, 14 and 23.
+- Consumer-group cursors are exercised live through the Kafka gateway:
+  scenario 20 commits a group's offset as a cursor on the metadata plane, and
+  a second consumer resumes from it (scenarios 19 and 21 run groups on nodes
+  with no metadata plane, where every commit is refused by name). The native
+  protocol's own cursor commit is covered by the metadata state machine and
+  deterministic Raft tests, not by this harness, so it claims no end-to-end
+  cursor continuity across membership changes.
 - Offline segment verification applies to scenarios that create data-plane
   artifacts. Metadata-only scenarios have no segment files to verify.
 

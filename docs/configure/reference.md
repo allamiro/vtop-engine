@@ -32,6 +32,7 @@ Default column means the key is unset unless you set it.
 | `sources` | **Required** (may be `{}`) | Kafka, file and syslog spool sources. |
 | `upload` | **Required** | Object storage target and upload limits. |
 | `partitioning` | See [partitioning](#partitioning) | Object key layout. |
+| `security` | `{}` | How files other local users can reach are treated; see [`security`](#security). |
 
 ## `engine`
 
@@ -39,12 +40,12 @@ Default column means the key is unset unless you set it.
 |---|---|---|
 | `name` | **Required** | Engine name. |
 | `tenant` | `default` | Tenant used for sources no stream maps. |
-| `state_store` | **Required** | The ledger. A SQLite URL inline (`"sqlite:///data/state/vtop-state.db"`), or for PostgreSQL a secret reference: `{ env: VTOP_STATE_STORE }` or `{ file: /run/secrets/vtop-state-store }`. An inline `postgres://` URL is refused. PostgreSQL also needs a build with `--features postgres`. |
+| `state_store` | **Required** | The ledger. A SQLite URL inline (`"sqlite:///data/state/vtop-state.db"`), or for PostgreSQL a secret reference: `{ env: VTOP_STATE_STORE }` or `{ file: /run/secrets/vtop-state-store }`. An inline `postgres://` URL is refused. PostgreSQL also needs a build with `--features postgres`. A `file:` reference, and a SQLite ledger with its `-wal` and `-shm` files, that other local users can reach is refused at startup ([Secret files](../operate/secrets.md)); a new ledger is created `0600`. |
 | `work_dir` | **Required** | Staging directory for batches in flight. Created if missing. Scratch. |
 | `work_retention_seconds` | `86400` | Staging files left by a crash and older than this are removed. Successful batches remove theirs at once. |
 | `work_max_bytes` | `10737418240` (10 GiB) | Ceiling on VTOP staging files in `work_dir`. Startup removes the oldest until the directory is under it. |
 | `log_level` | `INFO` | Log level. `--log-level` overrides it, and `RUST_LOG` overrides both. |
-| `ledger_retention_days` | - (no pruning) | Prune `SOURCE_COMMITTED` rows older than this many days, on idle cycles. The newest committed row per source path is always kept. Refused on PostgreSQL; schedule `vtopctl prune-ledger` there instead. |
+| `ledger_retention_days` | - (no pruning) | Prune `SOURCE_COMMITTED` rows older than this many days, on idle cycles. The newest committed row per source path is always kept, and for Kafka the committed row with the highest end offset per topic, partition, consumer group and topic id (the newest row for rows recorded without a topic id). Refused on PostgreSQL; schedule `vtopctl prune-ledger` there instead. |
 | `ledger_prune_batch` | `500` | Most rows deleted per prune pass. Must be at least 1. |
 | `state_store_timeout_seconds` | `30` | Limit for one state-store request. Whole-ledger scans (startup recovery, pruning) get ten times it. Must be > 0. |
 | `ledger_digest_dir` | - | Where prune digests are written and read. Unset: `<database file>.ledger-digests` beside a SQLite file, otherwise `<work_dir>/ledger-digests`, which is scratch; name a durable directory for PostgreSQL. |
@@ -143,7 +144,7 @@ manifest:
 | `keys` | required | Every key that verifies, the active one included. Each entry has `id`, one of `env` or `file`, and optionally `legacy`. |
 | `keys[].id` | required | 1 to 64 characters from `[A-Za-z0-9._-]`, unique across `keys` and `retired`. `none` and `other` are reserved (they are metric labels). The id appears in manifests, messages and the per-key metrics, so it is a label, never a secret. |
 | `keys[].env` | - | Name of the environment variable holding the key, 64 hex characters. |
-| `keys[].file` | - | Path of a file holding the key, such as a mounted secret. Read once at startup, at most 4 KiB, trimmed. Its permissions are not checked: mount it readable by the engine's user only. |
+| `keys[].file` | - | Path of a file holding the key, such as a mounted secret. Read once at startup, at most 4 KiB, trimmed. Refused before it is read when other local users can write it, or read it outside a Kubernetes Secret mount or a closed directory: see [Secret files](../operate/secrets.md). |
 | `keys[].legacy` | `false` | This key verifies manifests that name no key id: every manifest written before key ids, and any written with `manifest_mac_key_env`. At most one key. |
 | `retired` | `[]` | Tombstoned ids, for a key that was withdrawn or compromised. A manifest naming one fails authentication as "retired". No key material is configured for them. A key rotated out in the normal way is not retired: it stays in `keys` as a verify-only entry. |
 
@@ -167,12 +168,30 @@ and `validate --print-effective` show the keyring by id and source kind
 the keyring release ignore the whole section; see the rotation page for why
 every reader must be upgraded first.
 
+## `security`
+
+How the engine treats a manifest key file, the `engine.state_store` secret
+file, the SQLite ledger (with its `-wal` and `-shm` files) and the
+`VTOP_AUDIT_LOG` file that other local users can reach (#733). The rule is on
+[Secret files and their permissions](../operate/secrets.md).
+
+| Key | Default | Meaning |
+|---|---|---|
+| `allow_loose_secret_permissions` | `false` | Start even when one of those files can be read by other users (it is refused otherwise). Each such file is announced: a WARN, a count on `vtop_secret_file_permission_overrides_total` and a `security.override` audit record. A file other users can **write** is refused whatever this says. |
+
+Unknown keys inside `security` are refused, so a misspelt override fails at
+load rather than leaving the check in a state you did not mean. Engines
+before this release ignore the whole section.
+
 ## `sources`
 
 Each source is optional. A source block that is present but has
 `enabled: false` is not read.
 
 ### `sources.kafka`
+
+The Kafka releases the source is tested against are listed in
+[Supported Kafka brokers](../install/kafka.md).
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -198,7 +217,7 @@ Each source is optional. A source block that is present but has
 | `whole_file` | `false` | Read each file as one record instead of line by line. Needed for binary or already-compressed files. |
 | `delete_after_commit` | `false` | Delete a file once a committed batch covers it to its end and it has stayed unwritten for `delete_quiet_seconds`. On Linux the engine first takes a write lease, so a file any process still holds open is kept. Where no lease can be taken (macOS, NFS or FUSE, another user's file, a container without `CAP_LEASE`) the file is kept, unless `delete_without_open_check` is set. For finished files only, never a live log. |
 | `delete_quiet_seconds` | `3600` | How long a fully archived file must stay unwritten before it is deleted. |
-| `delete_without_open_check` | `false` | Where the engine can't check that no process holds a file open, delete it on `delete_quiet_seconds` alone. Risky: a writer still holding the file can lose lines if it stays silent past the quiet period and then writes again, or writes between the final check and the unlink. Where the check is possible it is always made. The engine warns at startup and in `vtopctl validate` when this is set. |
+| `delete_without_open_check` | `false` | Where the engine can't check that no process holds a file open (macOS and other non-Linux platforms, NFS and other non-local filesystems, another user's file when the engine lacks `CAP_LEASE`), delete the file on `delete_quiet_seconds` alone. **A file a writer still holds open is deleted with it**: the writer's later lines go into a file no path names and nothing archives them. That happens in two cases: the writer is silent for longer than the quiet period and then writes, or it writes between the engine's final check and the unlink. Where a check is possible it is always made, and a file some process has open is kept whatever this says. Each unchecked delete is logged and counted as `deleted_unchecked`. The engine warns at startup and in `vtopctl validate`. Prefer fixing the cause: run the engine as the files' owner, on Linux, on a local filesystem. |
 
 ### `sources.syslog_spool`
 
@@ -226,7 +245,7 @@ Each source is optional. A source block that is present but has
 | `max_concurrency_ceiling` | - | An operator maximum above the concurrency settings: `batching.max_concurrent_batches`, `batching.adaptive_width.min_width` and every `transports.*.max_concurrency` must be at or below it. |
 | `create_bucket` | `false` | `s3_native` only: create the bucket if it does not exist. Needs the CreateBucket permission. |
 | `require_strong_verification` | `true` | Commit only when verification is derived from stored content or a store-computed digest. `false` accepts same-size corruption; the engine warns at startup and in `validate`. |
-| `require_object_versioning` | `false` | Hardened profile: the bucket must have versioning enabled and every manifest upload must return a version, which recovery then reads. |
+| `require_object_versioning` | `false` | Hardened profile: the bucket must have versioning enabled and every manifest upload must return a version, which recovery then reads. A backend that cannot address object versions refuses startup, and so does a literal bucket without versioning or on a store that does not implement it; a templated bucket, or one `create_bucket` will create, is checked at its first upload instead, and refused there in the same words. |
 | `object_lock` | - | `s3_native` only (any other backend is refused at load): the S3 Object Lock profile. Write every object and manifest under a retention lock, refuse a bucket without Object Lock, and fail a batch whose stored object or manifest does not carry the retention asked for. Needs `require_object_versioning: true`; refuses `create_bucket: true`. See [below](#uploadobject_lock). |
 | `local_path` | - | `localfs` only, and required there: objects are written under `<local_path>/<bucket>/<key>`. |
 | `command_binary` | - | `awscli`, `s3cmd`, `minio`: absolute path of the client. Required for those backends; PATH is never searched. |

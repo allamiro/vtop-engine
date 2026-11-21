@@ -8,7 +8,7 @@ SBOM. Pick the form that matches where you will run them.
 
 | You want to | Use | Notes |
 |---|---|---|
-| Run on a Linux or macOS host | [Release binaries](binaries.md) | Linux x86_64 and aarch64, macOS arm64 and x86_64. Windows is not built. |
+| Run on a Linux or macOS host | [Release binaries](binaries.md) | Linux x86_64 and aarch64 (glibc 2.17 or newer, or a static musl build for any Linux), macOS 11 or newer on arm64 and x86_64. Windows is not built. |
 | Run in Docker or another container runtime | [Container image](container.md) | `ghcr.io/allamiro/vtop-engine`, `linux/amd64` and `linux/arm64`. |
 | Run the cluster plane on Kubernetes | [Helm chart](helm.md) | Deploys `vtop-node`, not the archive engine. |
 | Use PostgreSQL, Kerberos, or change the build | [Build from source](from-source.md) | The published binaries and image do not include the `postgres` feature. |
@@ -57,4 +57,5 @@ SBOM. Pick the form that matches where you will run them.
 </div>
 
 Whichever you choose, [verify the release](../RELEASE_VERIFICATION.md) before
-you run it.
+you run it. To read Kafka, check that your broker is in the
+[tested Kafka releases](kafka.md).

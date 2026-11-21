@@ -21,3 +21,14 @@ x509-parser = { workspace = true }
 [dev-dependencies]
 rcgen = { workspace = true }
 tempfile = { workspace = true }
+
+# The group-commit coordinator's model test (#752): built only with
+# `RUSTFLAGS="--cfg vtop_loom"`, which swaps the coordinator's Mutex, Condvar
+# and Arc for loom's so every interleaving of a small model is explored. A
+# custom cfg name, not `loom`, so tokio and the rest of the tree build as
+# they always do.
+[target.'cfg(vtop_loom)'.dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(vtop_loom)"] }

@@ -103,6 +103,7 @@ pub fn file_config(
             template: DEFAULT_TEMPLATE.into(),
             time_source: Default::default(),
         },
+        security: Default::default(),
     }
 }
 
@@ -173,5 +174,6 @@ pub fn pipeline<'a>(
         provisioned_buckets: std::sync::Arc::default(),
         key_notices: std::sync::Arc::default(),
         locked_buckets: std::sync::Arc::default(),
+        lock_fallbacks: std::sync::Arc::default(),
     }
 }

@@ -10,6 +10,14 @@
 # proposes nothing above the cluster's feature level, so at every mixed step
 # the tier must keep committing and every voter must converge.
 #
+# While one voter is still on the previous release, a raise to this build's
+# highest feature level - judged on the voters' own answers (#706) - is
+# refused and names it, when the previous release cannot vouch for that level:
+# it predates the version question (v0.10.1 and older close the connection),
+# or it answers with a lower level. When the previous release answers and
+# supports every level this build does (v0.10.2 against a build still at 8),
+# there is nothing to refuse, and the step says so instead of failing.
+#
 # After the last voter is replaced, the operator raises the feature level; the
 # new record must be readable by every node, including one restarted on it.
 #
@@ -37,6 +45,29 @@ init_workdir
 
 NEW_VTOP_NODE="$VTOP_NODE"
 log "rolling $("$OLD_VTOP_NODE" --version) -> $("$NEW_VTOP_NODE" --version)"
+
+# What the previous release can say about itself, read from its tag's source:
+# whether it answers the version question (#706), and the highest feature
+# level it supports. The binary reports neither, and the tag is what CI built
+# it from.
+feature_level_in() { # <source of crates/vtop-meta/src/command.rs>
+  sed -n 's/^pub const SUPPORTED_FEATURE_LEVEL: u32 = \([0-9][0-9]*\);.*/\1/p' <<< "$1"
+}
+NEW_LEVEL="$(feature_level_in "$(cat "$REPO_ROOT/crates/vtop-meta/src/command.rs")")"
+[[ -n "$NEW_LEVEL" ]] || fail "could not read this build's SUPPORTED_FEATURE_LEVEL"
+OLD_RELEASE="$("$OLD_VTOP_NODE" --version | awk '{print $NF}')"
+OLD_TAG="v${OLD_RELEASE#v}"
+OLD_COMMAND_RS="$(git -C "$REPO_ROOT" show "$OLD_TAG:crates/vtop-meta/src/command.rs" 2>/dev/null)" \
+  || fail "the previous release's tag $OLD_TAG is not in this clone (fetch tags): it decides what a raise past it must do"
+OLD_LEVEL="$(feature_level_in "$OLD_COMMAND_RS")"
+[[ -n "$OLD_LEVEL" ]] || OLD_LEVEL=0
+if git -C "$REPO_ROOT" show "$OLD_TAG:crates/vtop-meta/src/raft/network.rs" 2>/dev/null \
+    | grep -q 'PeerVersionRequest'; then
+  OLD_ANSWERS=1
+else
+  OLD_ANSWERS=0
+fi
+log "previous release $OLD_TAG: feature level $OLD_LEVEL, answers the version question: $OLD_ANSWERS; this build: level $NEW_LEVEL"
 
 # A write must COMMIT within the progress deadline. Bounded, because the
 # failure this scenario exists to catch - voters that cannot decode an entry
@@ -93,6 +124,55 @@ meta_admin 1 init --members 1,2,3 > /dev/null
 commit_write "previous release" 01
 await_converged "previous release"
 
+# A raise past a voter on the previous release is refused, naming it (#706).
+# Only a leader on this build asks the voters what they run, so while the
+# old voter leads it is restarted - still on the previous release - until a
+# node on this build does. The previous release has no answer to the
+# question and closes the connection, which is what the refusal must name.
+raise_refused_past_old_voter() { # <old voter id>
+  local old="$1" leader="" attempt out id live=()
+  if [[ "$OLD_ANSWERS" == 1 && "$OLD_LEVEL" -ge "$NEW_LEVEL" ]]; then
+    log "the previous release $OLD_TAG answers and supports level $OLD_LEVEL >= this build's $NEW_LEVEL: no raise past voter $old to refuse"
+    return 0
+  fi
+  for id in 1 2 3; do
+    [[ "$id" != "$old" ]] && live+=("$id")
+  done
+  for attempt in 1 2 3 4 5; do
+    leader="$(wait_meta_leader 1 2 3)"
+    [[ "$leader" != "$old" ]] && break
+    log "the old voter $old leads (attempt $attempt); restarting it on the previous release"
+    stop_node_now "${PID[$old]}"
+    # The old voter stays down until a node on this build has won the
+    # election: its followers name it as leader until their election
+    # timeout runs out, and a restart before then could hand it the
+    # leadership straight back (review of #758).
+    leader="$(wait_meta_leader_except "$old" "${live[@]}")"
+    log "node $leader leads with the old voter $old stopped"
+    VTOP_NODE="$OLD_VTOP_NODE"
+    case "$old" in
+      1) PID[1]=$(start_meta_node 1 2 3) ;;
+      2) PID[2]=$(start_meta_node 2 1 3) ;;
+      3) PID[3]=$(start_meta_node 3 1 2) ;;
+    esac
+    VTOP_NODE="$NEW_VTOP_NODE"
+    await_converged "old voter $old restarted"
+  done
+  [[ "$leader" != "$old" ]] || fail "the old voter $old kept the leadership through 5 restarts"
+  if out="$("$VTOPCTL" --json meta enable-features --level "$NEW_LEVEL" \
+      --config "$(emit_admin_config "$leader")" 2>&1)"; then
+    fail "a raise to $NEW_LEVEL was accepted while voter $old runs the previous release: $out"
+  fi
+  # A release without the question closes the connection; one with it names
+  # what it runs. Either way the refusal names the voter.
+  local named="$old ("
+  [[ "$OLD_ANSWERS" == 1 ]] || named="$old (closed without answering"
+  [[ "$out" == *"feature level $NEW_LEVEL not raised"* && "$out" == *"$named"* \
+    && "$out" == *"Nothing was proposed"* ]] \
+    || fail "the refused raise did not name the old voter $old: $out"
+  log "a raise to $NEW_LEVEL was refused while voter $old runs the previous release"
+}
+
 # --- replace each voter with this build ---------------------------------------
 VTOP_NODE="$NEW_VTOP_NODE"
 suffix=2
@@ -108,6 +188,9 @@ for id in 1 2 3; do
   commit_write "node $id upgraded" "$(printf '%02x' "$suffix")"
   suffix=$((suffix + 1))
   await_converged "node $id upgraded"
+  if [[ "$id" == 2 ]]; then
+    raise_refused_past_old_voter 3
+  fi
 done
 
 # --- every voter is upgraded: raise the feature level -------------------------

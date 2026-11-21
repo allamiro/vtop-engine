@@ -106,19 +106,109 @@ const MAX_CONFLICT_RETRIES: u32 = 5;
 
 /// The prune predicate over a candidate row `b`, shared by the prune, the
 /// candidate listing and the listed delete (#560) so the three cannot drift.
-/// A row is deletable only when a newer committed row - ordered by
-/// (created_at, batch_id), the order committed_cursors reads - exists for
-/// its source path, so the restart cursor's row always survives (#564) - and,
-/// for a Kafka row, of its partition and consumer group, where that
-/// partition resumes (#614; see the SQLite predicate). The
-/// successor probe's expressions must stay identical to
-/// idx_batches_commit_newest in migrations/postgres/0001_state_store.sql.
-/// A SUPERSEDED row ($4, #567) is deletable on age alone: it is never a
+/// A row is deletable only when a BETTER committed row exists for its unit, so
+/// the row the restart reads from always survives: for a file or spool row, a
+/// newer one - ordered by (created_at, batch_id), the order committed_cursors
+/// reads - for its source path (#564); for a Kafka row of a known topic id,
+/// one of its (topic, partition, consumer group, topic id) that ends HIGHER,
+/// ties broken by (created_at, batch_id), which is the row
+/// committed_kafka_offsets resumes from for that incarnation of the topic
+/// (#614; see the SQLite predicate for why that is not the newest-created
+/// row); for a Kafka row of no topic id, a newer one of its (topic, partition,
+/// consumer group) that has none either, the rule before the id existed. A row
+/// of no id is never ranked against one of a known id. A row of a known id is
+/// also kept while the id is unresolved (its highest end is above its newest
+/// row's end), because committed_kafka_offsets reads the overlap between rows
+/// to tell a truncated log from a hole filled, and needs the rows that overlap
+/// until the newest row has caught up. Together with the highest-end and
+/// newest-of-no-id rules this keeps the unit's newest row, which the adapter
+/// falls back to when it cannot learn the topic's id. "Ends higher" is the id's
+/// maximum end above the candidate's (one seek on idx_batches_kafka_max_end), or
+/// an equal end and a later creation; one row comparison on (end, created_at,
+/// batch_id) scanned the id's rows below the candidate's end for every
+/// candidate. An incarnation's newest row is read from
+/// idx_batches_kafka_id_newest (identity, topic id, creation order).
+/// The probes'
+/// expressions must stay identical to idx_batches_commit_newest and
+/// idx_batches_kafka_max_end in migrations/postgres/0001_state_store.sql. The
+/// Kafka literal is `'kafka'` so the partial index's WHERE is implied by the
+/// query. A SUPERSEDED row ($4, #567) is deletable on age alone: it is never a
 /// restart cursor.
 macro_rules! pg_prune_predicate_sql {
     () => {
         "b.updated_at < $2 AND (b.state = $4 OR (b.state = $1 \
-          AND EXISTS ( \
+          AND CASE \
+          WHEN b.source_type = 'kafka' \
+           AND (b.progress_end_json::jsonb ->> 'topic_id') IS NOT NULL THEN ( \
+            ((b.progress_end_json::jsonb ->> 'end_offset')::bigint) < ( \
+              SELECT MAX((n.progress_end_json::jsonb ->> 'end_offset')::bigint) \
+              FROM batches n \
+              WHERE n.state = $1 \
+                AND n.source_type = 'kafka' \
+                AND (n.progress_end_json::jsonb ->> 'topic') \
+                    = (b.progress_end_json::jsonb ->> 'topic') \
+                AND (n.progress_end_json::jsonb ->> 'partition') \
+                    = (b.progress_end_json::jsonb ->> 'partition') \
+                AND (n.progress_end_json::jsonb ->> 'consumer_group') \
+                    = (b.progress_end_json::jsonb ->> 'consumer_group') \
+                AND (n.progress_end_json::jsonb ->> 'topic_id') \
+                    = (b.progress_end_json::jsonb ->> 'topic_id') \
+            ) OR EXISTS ( \
+            SELECT 1 FROM batches n \
+            WHERE n.state = $1 \
+              AND n.source_type = 'kafka' \
+              AND (n.progress_end_json::jsonb ->> 'topic') \
+                  = (b.progress_end_json::jsonb ->> 'topic') \
+              AND (n.progress_end_json::jsonb ->> 'partition') \
+                  = (b.progress_end_json::jsonb ->> 'partition') \
+              AND (n.progress_end_json::jsonb ->> 'consumer_group') \
+                  = (b.progress_end_json::jsonb ->> 'consumer_group') \
+              AND (n.progress_end_json::jsonb ->> 'topic_id') \
+                  = (b.progress_end_json::jsonb ->> 'topic_id') \
+              AND ((n.progress_end_json::jsonb ->> 'end_offset')::bigint) \
+                = ((b.progress_end_json::jsonb ->> 'end_offset')::bigint) \
+              AND (n.created_at, n.batch_id) > (b.created_at, b.batch_id) \
+          )) \
+          AND (SELECT MAX((m.progress_end_json::jsonb ->> 'end_offset')::bigint) \
+               FROM batches m \
+               WHERE m.state = $1 \
+                 AND m.source_type = 'kafka' \
+                AND (m.progress_end_json::jsonb ->> 'topic') \
+                    = (b.progress_end_json::jsonb ->> 'topic') \
+                AND (m.progress_end_json::jsonb ->> 'partition') \
+                    = (b.progress_end_json::jsonb ->> 'partition') \
+                AND (m.progress_end_json::jsonb ->> 'consumer_group') \
+                    = (b.progress_end_json::jsonb ->> 'consumer_group') \
+                AND (m.progress_end_json::jsonb ->> 'topic_id') \
+                    = (b.progress_end_json::jsonb ->> 'topic_id') \
+              ) \
+            <= (SELECT (w.progress_end_json::jsonb ->> 'end_offset')::bigint \
+                FROM batches w \
+                WHERE w.state = $1 \
+                  AND w.source_type = 'kafka' \
+                AND (w.progress_end_json::jsonb ->> 'topic') \
+                    = (b.progress_end_json::jsonb ->> 'topic') \
+                AND (w.progress_end_json::jsonb ->> 'partition') \
+                    = (b.progress_end_json::jsonb ->> 'partition') \
+                AND (w.progress_end_json::jsonb ->> 'consumer_group') \
+                    = (b.progress_end_json::jsonb ->> 'consumer_group') \
+                AND (w.progress_end_json::jsonb ->> 'topic_id') \
+                    = (b.progress_end_json::jsonb ->> 'topic_id') \
+                ORDER BY w.created_at DESC, w.batch_id DESC LIMIT 1) \
+          WHEN b.source_type = 'kafka' THEN EXISTS ( \
+            SELECT 1 FROM batches n \
+            WHERE n.state = $1 \
+              AND n.source_type = 'kafka' \
+              AND (n.progress_end_json::jsonb ->> 'topic') \
+                  = (b.progress_end_json::jsonb ->> 'topic') \
+              AND (n.progress_end_json::jsonb ->> 'partition') \
+                  = (b.progress_end_json::jsonb ->> 'partition') \
+              AND (n.progress_end_json::jsonb ->> 'consumer_group') \
+                  = (b.progress_end_json::jsonb ->> 'consumer_group') \
+              AND (n.progress_end_json::jsonb ->> 'topic_id') IS NULL \
+              AND (n.created_at, n.batch_id) > (b.created_at, b.batch_id) \
+          ) \
+          ELSE EXISTS ( \
             SELECT 1 FROM batches n \
             WHERE n.state = $1 \
               AND n.source_type = b.source_type \
@@ -130,7 +220,7 @@ macro_rules! pg_prune_predicate_sql {
                   IS NOT DISTINCT FROM (b.progress_end_json::jsonb ->> 'consumer_group') \
               AND (n.created_at > b.created_at \
                    OR (n.created_at = b.created_at AND n.batch_id > b.batch_id)) \
-          )))"
+          ) END))"
     };
 }
 
@@ -159,7 +249,7 @@ fn map_sqlx(e: sqlx::Error) -> VtopError {
     VtopError::State(redact_postgres_urls(&e.to_string()))
 }
 
-/// A `(path, inode, end_byte, file_size, content, tail)` row of a cursor
+/// A `(path, inode, end_byte, file_size, content, tail, mtime, ctime)` row of a cursor
 /// query. The inode is read as text and parsed here so a u64 above i64::MAX
 /// stays exact; a malformed stored fingerprint reads as unknown (#620).
 fn committed_cursor_of(r: &sqlx::postgres::PgRow) -> Option<CommittedCursor> {
@@ -170,6 +260,7 @@ fn committed_cursor_of(r: &sqlx::postgres::PgRow) -> Option<CommittedCursor> {
     let content: Option<String> = r.get("content");
     let mtime: Option<String> = r.get("mtime");
     let tail: Option<String> = r.get("tail");
+    let ctime: Option<String> = r.get("ctime");
     Some(CommittedCursor {
         path: path?,
         inode: inode.and_then(|i| i.parse().ok()),
@@ -182,6 +273,7 @@ fn committed_cursor_of(r: &sqlx::postgres::PgRow) -> Option<CommittedCursor> {
         tail_fingerprint: tail
             .as_deref()
             .and_then(crate::models::parse_content_fingerprint),
+        observed_ctime: ctime.filter(|c| vtop_core::types::plausible_timestamp(c)),
     })
 }
 
@@ -340,35 +432,44 @@ impl PgStateStore {
         if let Some(refusal) = newer_schema_refusal(body.as_deref()) {
             return Err(refusal);
         }
-        // Whether this run adds the verification class column (#664) to a
-        // table that already holds rows: those rows keep no class, and the
-        // operator is told how many.
-        let adds_class_column: bool = sqlx::query_scalar(
-            "SELECT to_regclass('batches') IS NOT NULL AND NOT EXISTS ( \
-                SELECT 1 FROM pg_catalog.pg_attribute \
-                WHERE attrelid = to_regclass('batches') \
-                  AND attname = 'verification_class' AND NOT attisdropped)",
-        )
-        .fetch_one(&pool)
-        .await
-        .map_err(map_sqlx)?;
+        // Whether this run adds the verification class column (#664), or the
+        // seal instant (#626), to a table that already holds rows: those rows
+        // keep no value, and the operator is told how many.
+        let adds_column = |column: &'static str| {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT to_regclass('batches') IS NOT NULL AND NOT EXISTS ( \
+                    SELECT 1 FROM pg_catalog.pg_attribute \
+                    WHERE attrelid = to_regclass('batches') \
+                      AND attname = $1 AND NOT attisdropped)",
+            )
+            .bind(column)
+            .fetch_one(&pool)
+        };
+        let adds_class_column = adds_column("verification_class").await.map_err(map_sqlx)?;
+        let adds_sealed_at_column = adds_column("sealed_at").await.map_err(map_sqlx)?;
         sqlx::raw_sql(MIGRATION)
             .execute(&pool)
             .await
             .map_err(map_sqlx)?;
-        if adds_class_column {
+        if adds_class_column || adds_sealed_at_column {
             // Best effort (review of #664): the migration has committed, and
             // a failed count must not report it as failed. An exact count, as
             // the message promises a number; migrate is a one-off step.
-            match sqlx::query_scalar::<_, i64>("SELECT count(*) FROM batches")
+            let rows = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM batches")
                 .fetch_one(&pool)
                 .await
-            {
-                Ok(rows) => crate::models::log_class_column_added("PostgreSQL", rows),
-                Err(e) => crate::models::log_class_column_added_uncounted(
-                    "PostgreSQL",
-                    &redact_postgres_urls(&e.to_string()),
-                ),
+                .map_err(|e| redact_postgres_urls(&e.to_string()));
+            if adds_class_column {
+                match &rows {
+                    Ok(rows) => crate::models::log_class_column_added("PostgreSQL", *rows),
+                    Err(e) => crate::models::log_class_column_added_uncounted("PostgreSQL", e),
+                }
+            }
+            if adds_sealed_at_column {
+                match &rows {
+                    Ok(rows) => crate::models::log_sealed_at_column_added("PostgreSQL", *rows),
+                    Err(e) => crate::models::log_sealed_at_column_added_uncounted("PostgreSQL", e),
+                }
             }
         }
         Self {
@@ -511,8 +612,10 @@ impl StateStore for PgStateStore {
                    (batch_id, tenant, source_type, source_name, format, state,
                     progress_start_json, progress_end_json, object_uri, manifest_uri,
                     object_sha256, manifest_sha256, manifest_version_id, object_size_bytes,
-                    record_count, error_message, owner, lease_expires_at, created_at, updated_at)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)"#,
+                    record_count, error_message, owner, lease_expires_at, created_at, updated_at,
+                    sealed_at)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+                    $21)"#,
             )
             .bind(&rec.batch_id)
             .bind(&rec.tenant)
@@ -534,6 +637,7 @@ impl StateStore for PgStateStore {
             .bind(&rec.lease_expires_at)
             .bind(crate::store::canonical_created_at(&rec.created_at))
             .bind(&rec.updated_at)
+            .bind(&rec.sealed_at)
             .execute(&self.pool)
         })
         .await?;
@@ -775,14 +879,15 @@ impl StateStore for PgStateStore {
                         progress_end_json::jsonb ->> 'content_fingerprint' AS content, \
                         progress_end_json::jsonb ->> 'tail_fingerprint' AS tail, \
                         progress_end_json::jsonb ->> 'mtime' AS mtime, \
+                        progress_end_json::jsonb ->> 'ctime' AS ctime, \
                         created_at, batch_id \
                  FROM batches WHERE state = $1 AND source_type = $2 \
              ), latest AS ( \
-                 SELECT path, inode, end_byte, file_size, content, tail, mtime, ROW_NUMBER() OVER ( \
+                 SELECT path, inode, end_byte, file_size, content, tail, mtime, ctime, ROW_NUMBER() OVER ( \
                             PARTITION BY path ORDER BY created_at DESC, batch_id DESC) AS rn \
                  FROM committed \
              ) \
-             SELECT path, inode, end_byte, file_size, content, tail, mtime FROM latest WHERE rn = 1",
+             SELECT path, inode, end_byte, file_size, content, tail, mtime, ctime FROM latest WHERE rn = 1",
         )
         .bind(BatchState::SourceCommitted.as_str())
         .bind(source_type.as_str())
@@ -807,15 +912,16 @@ impl StateStore for PgStateStore {
                         progress_end_json::jsonb ->> 'content_fingerprint' AS content, \
                         progress_end_json::jsonb ->> 'tail_fingerprint' AS tail, \
                         progress_end_json::jsonb ->> 'mtime' AS mtime, \
+                        progress_end_json::jsonb ->> 'ctime' AS ctime, \
                         created_at, batch_id \
                  FROM batches WHERE state = $1 AND source_type = $2 \
              ), latest AS ( \
-                 SELECT path, inode, end_byte, file_size, content, tail, mtime, \
+                 SELECT path, inode, end_byte, file_size, content, tail, mtime, ctime, \
                         created_at, batch_id, ROW_NUMBER() OVER ( \
                             PARTITION BY path, inode ORDER BY created_at DESC, batch_id DESC) AS rn \
                  FROM committed \
              ) \
-             SELECT path, inode, end_byte, file_size, content, tail, mtime FROM latest \
+             SELECT path, inode, end_byte, file_size, content, tail, mtime, ctime FROM latest \
              WHERE rn = 1 ORDER BY path, created_at DESC, batch_id DESC",
         )
         .bind(BatchState::SourceCommitted.as_str())
@@ -827,23 +933,60 @@ impl StateStore for PgStateStore {
     }
 
     async fn committed_kafka_offsets(&self) -> Result<Vec<CommittedKafkaOffset>, VtopError> {
-        // See the SQLite implementation: the newest committed row per (topic,
-        // partition, consumer group), in the order pruning keeps.
+        // See the SQLite implementation: per (topic, partition, consumer
+        // group, topic id), the HIGHEST end offset any committed row of a
+        // known id reached, the NEWEST row's end for rows of no id, and the
+        // newest row's end for an id whose log was truncated (two committed rows of
+        // the id whose ranges overlap).
         let rows = sqlx::query(
             "WITH committed AS ( \
                  SELECT progress_end_json::jsonb ->> 'topic' AS topic, \
                         (progress_end_json::jsonb ->> 'partition')::bigint AS part, \
                         progress_end_json::jsonb ->> 'consumer_group' AS grp, \
+                        progress_end_json::jsonb ->> 'topic_id' AS tid, \
+                        COALESCE( \
+                            (progress_start_json::jsonb ->> 'start_offset')::bigint, \
+                            (progress_end_json::jsonb ->> 'start_offset')::bigint) \
+                            AS start_offset, \
                         (progress_end_json::jsonb ->> 'end_offset')::bigint AS end_offset, \
                         created_at, batch_id \
                  FROM batches WHERE state = $1 AND source_type = $2 \
-             ), latest AS ( \
-                 SELECT topic, part, grp, end_offset, ROW_NUMBER() OVER ( \
+             ), ordered AS ( \
+                 SELECT topic, part, grp, tid, start_offset, \
+                        MAX(end_offset) OVER ( \
+                            PARTITION BY topic, part, grp, tid \
+                            ORDER BY start_offset, end_offset, batch_id \
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prior_max \
+                 FROM committed WHERE tid IS NOT NULL \
+             ), broken AS ( \
+                 SELECT DISTINCT topic, part, grp, tid FROM ordered \
+                 WHERE prior_max >= start_offset \
+             ), ranked AS ( \
+                 SELECT topic, part, grp, tid, end_offset, \
+                        ROW_NUMBER() OVER ( \
+                            PARTITION BY topic, part, grp, tid \
+                            ORDER BY CASE WHEN tid IS NULL THEN 0 ELSE end_offset END DESC, \
+                                     created_at DESC, batch_id DESC) AS rn, \
+                        FIRST_VALUE(end_offset) OVER ( \
+                            PARTITION BY topic, part, grp, tid \
+                            ORDER BY created_at DESC, batch_id DESC) AS id_newest_end, \
+                        FIRST_VALUE(tid) OVER ( \
                             PARTITION BY topic, part, grp \
-                            ORDER BY created_at DESC, batch_id DESC) AS rn \
+                            ORDER BY created_at DESC, batch_id DESC) AS newest_tid, \
+                        FIRST_VALUE(end_offset) OVER ( \
+                            PARTITION BY topic, part, grp \
+                            ORDER BY created_at DESC, batch_id DESC) AS newest_end \
                  FROM committed \
              ) \
-             SELECT topic, part, grp, end_offset FROM latest WHERE rn = 1",
+             SELECT r.topic, r.part, r.grp, r.tid, \
+                    CASE WHEN b.tid IS NOT NULL THEN r.id_newest_end ELSE r.end_offset END \
+                        AS end_offset, \
+                    CASE WHEN r.tid IS NOT DISTINCT FROM r.newest_tid THEN r.newest_end END \
+                        AS newest_end \
+             FROM ranked r \
+             LEFT JOIN broken b ON b.topic = r.topic AND b.part = r.part AND b.grp = r.grp \
+                               AND b.tid = r.tid \
+             WHERE r.rn = 1",
         )
         .bind(BatchState::SourceCommitted.as_str())
         .bind(SourceType::Kafka.as_str())
@@ -856,12 +999,16 @@ impl StateStore for PgStateStore {
                 let topic: Option<String> = r.get("topic");
                 let partition: Option<i64> = r.get("part");
                 let group: Option<String> = r.get("grp");
+                let topic_id: Option<String> = r.get("tid");
                 let end: Option<i64> = r.get("end_offset");
+                let newest_end: Option<i64> = r.get("newest_end");
                 Some(CommittedKafkaOffset {
                     topic: topic?,
                     partition: i32::try_from(partition?).ok()?,
                     consumer_group: group?,
+                    topic_id,
                     end_offset: end?,
+                    newest_end,
                 })
             })
             .collect())
@@ -930,12 +1077,12 @@ impl StateStore for PgStateStore {
         limit: u32,
     ) -> Result<u64, VtopError> {
         // Same predicate as the SQLite store: a row is deletable only when a
-        // newer committed row — ordered by (created_at, batch_id), the order
-        // committed_cursors reads — exists for its source path, so the
-        // restart cursor's row always survives (review of #564). The
-        // successor probe's expressions must stay identical to
-        // idx_batches_commit_newest in migrations/postgres/0001_state_store.sql,
-        // which bounds it.
+        // better committed row exists for its unit - a newer one for a file
+        // or spool path (review of #564), a higher-ending one for a Kafka
+        // (topic, partition, consumer group) - so the restart cursor's row
+        // always survives. The probes' expressions must stay identical to
+        // idx_batches_commit_newest and idx_batches_kafka_max_end in
+        // migrations/postgres/0001_state_store.sql, which bound them.
         let result = with_retry(|| {
             sqlx::query(concat!(
                 "DELETE FROM batches WHERE batch_id IN ( \
@@ -1095,6 +1242,8 @@ impl StateStore for PgStateStore {
 }
 
 fn row_to_record(row: sqlx::postgres::PgRow) -> Result<BatchRecord, VtopError> {
+    let batch_id: String = row.get("batch_id");
+    let sealed_at = crate::models::sealed_at_column(row.get("sealed_at"), &batch_id);
     let source_type_s: String = row.get("source_type");
     let format_s: String = row.get("format");
     let state_s: String = row.get("state");
@@ -1102,7 +1251,7 @@ fn row_to_record(row: sqlx::postgres::PgRow) -> Result<BatchRecord, VtopError> {
     let pe: String = row.get("progress_end_json");
 
     Ok(BatchRecord {
-        batch_id: row.get("batch_id"),
+        batch_id,
         tenant: row.get("tenant"),
         source_type: SourceType::from_str(&source_type_s).map_err(VtopError::State)?,
         source_name: row.get("source_name"),
@@ -1124,6 +1273,7 @@ fn row_to_record(row: sqlx::postgres::PgRow) -> Result<BatchRecord, VtopError> {
         error_message: row.get("error_message"),
         owner: row.get("owner"),
         lease_expires_at: row.get("lease_expires_at"),
+        sealed_at,
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     })

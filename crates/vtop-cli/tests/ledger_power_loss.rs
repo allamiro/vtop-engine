@@ -244,6 +244,18 @@ impl StateStore for Recorder {
     }
 }
 
+/// Write a survivor ledger file owner-only, as the engine creates one: the
+/// engine refuses a ledger other users can read (#733), and the test's
+/// directory is open to them under the usual umask.
+fn write_owner_only(path: &Path, bytes: &[u8]) {
+    std::fs::write(path, bytes).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
 fn wal_of(db: &Path) -> PathBuf {
     let mut name = db.as_os_str().to_owned();
     name.push("-wal");
@@ -292,8 +304,8 @@ impl Crashed<'_> {
     async fn restart(&self, wal_len: u64) -> Vec<Range> {
         let (dir, inputs, tag) = (self.dir, self.inputs, wal_len);
         let db = dir.join(format!("survivor-{tag}.db"));
-        std::fs::write(&db, &self.db_bytes).unwrap();
-        std::fs::write(wal_of(&db), &self.wal_bytes[..wal_len as usize]).unwrap();
+        write_owner_only(&db, &self.db_bytes);
+        write_owner_only(&wal_of(&db), &self.wal_bytes[..wal_len as usize]);
 
         let mut b = Engine::new(
             engine_config(dir, &format!("work-{tag}"), &db, inputs),
@@ -586,8 +598,8 @@ async fn a_power_loss_replay_of_an_uploaded_range_writes_no_second_object() {
     for wal_len in lengths {
         let tag = wal_len;
         let db = dir.join(format!("survivor-{tag}.db"));
-        std::fs::write(&db, &crashed.db_bytes).unwrap();
-        std::fs::write(wal_of(&db), &crashed.wal_bytes[..wal_len as usize]).unwrap();
+        write_owner_only(&db, &crashed.db_bytes);
+        write_owner_only(&wal_of(&db), &crashed.wal_bytes[..wal_len as usize]);
         let mut b = Engine::new(
             engine_config(dir, &format!("work-{tag}"), &db, &inputs),
             StreamsConfig { streams: vec![] },

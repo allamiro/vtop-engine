@@ -1,0 +1,374 @@
+name: kafka matrix
+
+# The live-broker Kafka tests (tests/integration_kafka_to_minio.rs, the
+# stale-commit tests of #614 and the stall-recovery tests of #623 among them)
+# against every Apache Kafka release docs/install/kafka.md declares supported
+# (#721), through every listener it declares tested, and a smoke of them on
+# one broker that is not Apache Kafka. The oldest Apache release is 3.7, the
+# first the official apache/kafka image exists for and a KRaft-only setup;
+# ZooKeeper-era brokers are documented as expected to work and untested. The
+# non-Apache broker is Redpanda.
+#
+# A leg is one broker and one listener, a "variant":
+#   plain          PLAINTEXT, the whole live suite (every release)
+#   tls            SSL, the whole suite, then the TLS refusal tests
+#   sasl-ssl       SASL_SSL with SCRAM-SHA-512, the whole suite, then the SASL
+#                  and TLS refusal tests (every release)
+#   sasl-plain     SASL_PLAINTEXT with PLAIN, the same (oldest and newest
+#                  Apache release only)
+#   sasl-scram256  SASL_PLAINTEXT with SCRAM-SHA-256, the same (oldest and newest)
+#   sasl-scram512  SASL_PLAINTEXT with SCRAM-SHA-512, the same (oldest and newest)
+# The refusal tests (tests/integration_kafka_auth.rs) present a wrong password,
+# an unknown user, no credentials, no CA and another CA, and need the broker to
+# refuse each. Mutual TLS is not a variant: `sources.kafka` has no client
+# certificate or key setting.
+#
+# Who runs which legs:
+# - ci.yml calls this workflow on a pull request (and on a push to main) with
+#   the oldest release, 3.7.2, and the plain variant, when its `kafka` path
+#   filter matches. The newest line is already the kafka-integration job in
+#   ci.yml, so one leg is the per-PR cost. The authenticated legs and
+#   Redpanda never run per pull request.
+# - Nightly (03:17 UTC) and on dispatch it runs all of them, over whatever
+#   main holds, so a change outside the PR filter is still tested on every
+#   release and listener within a day.
+# - A pull request that changes this file or the broker script runs all of
+#   them on its own head: the schedule and dispatch run only from main, so
+#   this is the one way a new pin is proven before it merges. ci.yml's `kafka`
+#   filter leaves both files out, so such a pull request does not also run
+#   3.7.2 a second time through the call.
+#
+# The test binaries are built once and each leg runs them against its own
+# broker, so a leg needs no Rust toolchain and the matrix costs one build. The
+# build only restores the cache the kafka-integration job saves on main (the
+# same test binary); this workflow saves no cache of its own.
+#
+# The images are pinned once, below, so a pull request and the nightly can
+# never test different builds of the same release. A release is added here
+# first and then to docs/install/kafka.md, and dropped from both together.
+
+on:
+  workflow_call:
+    inputs:
+      brokers:
+        description: 'JSON list of brokers to test, e.g. ["3.7.2"]; each must be pinned below'
+        required: true
+        type: string
+      variants:
+        description: 'JSON list of listener variants to test, e.g. ["plain"]; each must be listed below'
+        required: false
+        type: string
+        default: '["plain"]'
+  schedule:
+    # 03:17 UTC: off the hour, and clear of the other nightlies.
+    - cron: "17 3 * * *"
+  pull_request:
+    paths:
+      - '.github/workflows/kafka-matrix.yml'
+      - 'scripts/kafka-broker.sh'
+  workflow_dispatch:
+    inputs:
+      brokers:
+        description: 'JSON list of brokers to test (3.7.2, ..., redpanda-26.3.1); empty runs all of them'
+        required: false
+        type: string
+        default: ''
+      variants:
+        description: 'JSON list of listener variants (plain, tls, sasl-ssl, sasl-plain, sasl-scram256, sasl-scram512); empty runs all of them'
+        required: false
+        type: string
+        default: ''
+
+# Two nightlies queue rather than cancel each other. A call from ci.yml or a
+# dispatch gets a group of its own: inside a called workflow `github.workflow`
+# is the caller's name, so a shared name could deadlock against ci.yml's group.
+concurrency:
+  group: kafka-matrix-${{ github.event_name == 'schedule' && 'nightly' || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  brokers:
+    name: which legs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      include: ${{ steps.pick.outputs.include }}
+    steps:
+      - name: Pick the pinned images and the listeners for the requested legs
+        id: pick
+        env:
+          REQUESTED: ${{ inputs.brokers }}
+          REQUESTED_VARIANTS: ${{ inputs.variants }}
+          # One line per broker: the name a leg and the docs know it by, the
+          # image pinned by digest, and the version `kafka-broker.sh version`
+          # must print for it. The Apache lines are the multi-arch index of
+          # the official `apache/kafka:<version>` tag (amd64 and arm64), read
+          # with `docker buildx imagetools inspect` on 2026-11-16, each the
+          # newest patch of its minor on that day; the Redpanda line is the
+          # index of `redpandadata/redpanda:v26.3.1`, read the same way on
+          # 2026-11-20. Dependabot does not read these, so they are refreshed
+          # by hand, as the lab images are (vtop-ci-supply-chain, "Workflow
+          # and image pins"): re-read the tag's digest, and change the name
+          # and the docs table together. The "oldest" and "newest" Apache
+          # release are the first and last Apache line, so keep them in order.
+          PINNED_IMAGES: |
+            3.7.2 apache/kafka:3.7.2@sha256:8bd63e1bd445e5e19427a4bdbcc3d23bf6efd774b058a41b36ba87fda7623e34 3.7.2
+            3.8.1 apache/kafka:3.8.1@sha256:22c4bea38875408e8f9fe52aca8e3a6ee67f9aa0090db59af99a2f6647558db5 3.8.1
+            3.9.2 apache/kafka:3.9.2@sha256:05b4616e0702ef2729327705d54ad6b50ea70b271c4b730fabd2320789fb7b02 3.9.2
+            4.0.2 apache/kafka:4.0.2@sha256:836cafdad9f4825880d7cf1d5a21202915ae2527bd0ef1c3600c526ed7814d1f 4.0.2
+            4.1.2 apache/kafka:4.1.2@sha256:5cc2a2fd93fa2687b44015eee04fb2c3edd9e526bd64bf8bec5ff1e268772e0e 4.1.2
+            4.2.2 apache/kafka:4.2.2@sha256:1213eb3943d551e5ed1fca7a4e109001cee35770b66a02a0c37a8964efe09b69 4.2.2
+            4.3.2 apache/kafka:4.3.2@sha256:852a0d49fc4e656b022e7f23785411802c9a088c78a7c5e39f33969de9c227a7 4.3.2
+            4.4.0 apache/kafka:4.4.0@sha256:833b867a9585a141da455dc2b57431c65cbccb27f11c91f694444cca9f777e0f 4.4.0
+            redpanda-26.3.1 redpandadata/redpanda:v26.3.1@sha256:260532f70fd840bf2159106bd4ef900f199c1f5ca2a23cb362642320513b90f5 v26.3.1
+          # One line per listener variant: its name, the broker mode
+          # (scripts/kafka-broker.sh), the SASL mechanism the client uses (`-`
+          # when there is none), and which Apache releases run it: `all`, or
+          # `edge` for the oldest and the newest only. Redpanda runs `plain`
+          # and nothing else.
+          VARIANTS: |
+            plain          plain           -              all
+            tls            tls             -              all
+            sasl-ssl       sasl-ssl        SCRAM-SHA-512  all
+            sasl-plain     sasl-plaintext  PLAIN          edge
+            sasl-scram256  sasl-plaintext  SCRAM-SHA-256  edge
+            sasl-scram512  sasl-plaintext  SCRAM-SHA-512  edge
+        run: |
+          set -euo pipefail
+          table() { printf '%s\n' "$1" | grep -Ev '^[[:space:]]*(#|$)'; }
+          pinned=$(table "$PINNED_IMAGES")
+          variants=$(table "$VARIANTS")
+          all_brokers=$(printf '%s\n' "$pinned" | awk '{print $1}' | jq -R . | jq -cs .)
+          all_variants=$(printf '%s\n' "$variants" | awk '{print $1}' | jq -R . | jq -cs .)
+          # An empty input is the nightly, a pull request that changes this
+          # file, or a dispatch that left it empty: all of them.
+          pick() {
+            if [ -z "$2" ]; then
+              printf '%s' "$3"
+            else
+              printf '%s' "$2" | jq -c 'if type == "array" then [.[] | tostring] else error("not a list") end' \
+                || { echo "::error::$1 must be a JSON list such as [\"3.7.2\",\"4.4.0\"]; got: $2" >&2; exit 1; }
+            fi
+          }
+          want_brokers=$(pick brokers "$REQUESTED" "$all_brokers")
+          want_variants=$(pick variants "$REQUESTED_VARIANTS" "$all_variants")
+          for which in brokers variants; do
+            want=want_$which have=all_$which
+            if [ "$(printf '%s' "${!want}" | jq length)" -eq 0 ]; then
+              echo "::error::$which is an empty list; name at least one"
+              exit 1
+            fi
+            # A name nobody pinned would otherwise be dropped from the matrix
+            # without a word, and its absence read as a pass.
+            unknown=$(jq -cn --argjson want "${!want}" --argjson have "${!have}" '$want - $have')
+            if [ "$unknown" != "[]" ]; then
+              echo "::error::no $which entry named $unknown; known: $(printf '%s' "${!have}" | jq -r 'join(", ")')"
+              exit 1
+            fi
+          done
+          pins_json=$(printf '%s\n' "$pinned" | jq -R 'split(" ") | map(select(. != "")) | {id: .[0], image: .[1], reported: .[2]}' | jq -cs .)
+          variants_json=$(printf '%s\n' "$variants" | jq -R 'split(" ") | map(select(. != "")) | {name: .[0], mode: .[1], mechanism: .[2], scope: .[3]}' | jq -cs .)
+          include=$(jq -cn --argjson pins "$pins_json" --argjson variants "$variants_json" \
+            --argjson wantb "$want_brokers" --argjson wantv "$want_variants" '
+            ($pins | map(select(.id | startswith("redpanda") | not))) as $apache
+            | [ $pins[] | select(.id as $i | $wantb | index($i)) | . as $p
+                | ($p.id | startswith("redpanda")) as $redpanda
+                | $variants[] | select(.name as $n | $wantv | index($n))
+                | select(if $redpanda then .name == "plain"
+                         else (.scope == "all" or $p.id == $apache[0].id or $p.id == $apache[-1].id) end)
+                | {kafka: $p.id, image: $p.image, reported: $p.reported,
+                   variant: .name, mode: .mode, mechanism: .mechanism,
+                   suite: (if $redpanda then "smoke" else "full" end)} ]')
+          if [ "$(printf '%s' "$include" | jq length)" -eq 0 ]; then
+            echo "::error::no leg matches brokers $want_brokers with variants $want_variants (Redpanda runs only the plain variant)"
+            exit 1
+          fi
+          echo "legs: $(printf '%s' "$include" | jq -r '[.[] | "\(.kafka)/\(.variant)"] | join(", ")')"
+          echo "include=$include" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build the kafka test binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      # Restore only: the kafka-integration job in ci.yml saves this key on
+      # main for the same test binary. A miss builds from scratch, which is
+      # slower and still correct.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-kafka-it-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-kafka-it-
+      - name: Install librdkafka build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang libssl-dev libsasl2-dev libcurl4-openssl-dev zlib1g-dev pkg-config
+      # cargo names the executable it built; a glob over target/debug/deps
+      # could pick up a stale one from the restored cache.
+      - name: Build the test binaries
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for test in integration_kafka_to_minio integration_kafka_auth; do
+            exe=$(cargo test -p vtop-cli --test "$test" --no-run --locked --message-format=json \
+              | jq -r --arg t "$test" 'select(.reason == "compiler-artifact" and .target.name == $t and .executable != null) | .executable')
+            if [ -z "$exe" ] || [ ! -x "$exe" ]; then
+              echo "::error::cargo reported no executable for the $test test (got '$exe')"
+              exit 1
+            fi
+            # Without its debug info the binary is about 80 MB instead of 460
+            # (measured on aarch64), which every leg downloads. A panic still
+            # names its file and line; only a backtrace loses its line numbers.
+            strip --strip-debug -o "dist/$test" "$exe"
+          done
+          ls -l dist/
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: kafka-it-test-binary
+          path: dist/
+          retention-days: 1
+          if-no-files-found: error
+
+  kafka:
+    # `kafka integration (3.7.2)` is the plain variant, the name ci.yml's
+    # comment and the branch's checks already use; the others append theirs.
+    name: kafka integration (${{ matrix.kafka }}${{ matrix.variant != 'plain' && format(', {0}', matrix.variant) || '' }})
+    needs: [brokers, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      # One leg failing must not hide the result of another.
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.brokers.outputs.include) }}
+    env:
+      KAFKA_BROKER_NAME: vtop-kafka-broker
+      KAFKA_ADVERTISED_HOST: localhost
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: kafka-it-test-binary
+          path: dist
+      - name: Start ${{ matrix.kafka }}, ${{ matrix.variant }}
+        env:
+          IMAGE: ${{ matrix.image }}
+          MODE: ${{ matrix.mode }}
+        run: bash scripts/kafka-broker.sh up "$IMAGE" "$MODE"
+      # A leg whose broker ran some other release would pass under this one's
+      # name.
+      - name: The broker runs ${{ matrix.kafka }}
+        env:
+          EXPECTED: ${{ matrix.reported }}
+        run: |
+          version="$(bash scripts/kafka-broker.sh version)"
+          echo "broker version: $version"
+          if [ "$version" != "$EXPECTED" ]; then
+            echo "::error::This leg is $EXPECTED, but its broker reports '$version'. Check the image pinned for it in .github/workflows/kafka-matrix.yml."
+            exit 1
+          fi
+      - name: Seed the it_events topic
+        run: bash scripts/kafka-broker.sh seed
+      # The settings the tests read (tests/kafka_broker_env.rs) for the
+      # listener the broker was started with: security protocol, the user and
+      # password, the CA. They come from the script that set the listener up,
+      # so the two cannot disagree.
+      - name: Point the tests at the listener
+        env:
+          MECHANISM: ${{ matrix.mechanism }}
+        run: bash scripts/kafka-broker.sh client-env "$MECHANISM" | tee -a "$GITHUB_ENV"
+      # Every ignored test in the binary is a live-broker test. The count is
+      # checked against the binary's own list, so a run that filtered out or
+      # skipped tests cannot pass as a smaller green run.
+      - name: Run the live-broker integration tests
+        if: matrix.suite == 'full'
+        run: |
+          set -euo pipefail
+          chmod +x dist/integration_kafka_to_minio
+          expected=$(dist/integration_kafka_to_minio --ignored --list | grep -c ': test$' || true)
+          if [ "$expected" -eq 0 ]; then
+            echo "::error::the test binary lists no ignored (live-broker) tests"
+            exit 1
+          fi
+          dist/integration_kafka_to_minio --ignored 2>&1 | tee "$RUNNER_TEMP/kafka-it.log"
+          if ! grep -q "^test result: ok. $expected passed; 0 failed" "$RUNNER_TEMP/kafka-it.log"; then
+            echo "::error::expected all $expected live-broker tests to pass; the summary was: $(grep '^test result:' "$RUNNER_TEMP/kafka-it.log" || echo none)"
+            exit 1
+          fi
+      # A broker that is not Apache Kafka runs the tests for what the engine
+      # relies on the group coordinator and the log for: a read, a commit that
+      # moves progress and nothing else does, the stale-commit cases of #614
+      # and the stall case of #623. SMOKE_TESTS is the list; each name is run
+      # exactly, and all of them must pass. (The whole suite also passed on
+      # this Redpanda release when it was run by hand; the smoke is the part a
+      # nightly keeps on a broker the engine does not otherwise target.)
+      - name: Run the smoke tests
+        if: matrix.suite == 'smoke'
+        env:
+          SMOKE_TESTS: |
+            read_returns_records_from_a_non_empty_topic
+            reading_alone_does_not_advance_progress
+            commit_advances_progress_for_a_new_consumer
+            a_stale_commit_behind_the_ledger_does_not_move_where_a_restart_reads
+            a_stale_commit_past_a_range_sent_back_for_replay_does_not_skip_it
+            recovering_an_older_verified_batch_does_not_move_the_group_offset_back
+            a_pass_that_reads_nothing_does_not_stop_the_consumer_reading
+            a_partition_that_stops_while_others_deliver_is_reassigned
+            a_failed_kafka_commit_is_retried_by_a_later_pass_and_never_moves_the_group_back
+        run: |
+          set -euo pipefail
+          chmod +x dist/integration_kafka_to_minio
+          tests=$(printf '%s\n' "$SMOKE_TESTS" | grep -Ev '^[[:space:]]*(#|$)')
+          expected=$(printf '%s\n' "$tests" | wc -l | tr -d ' ')
+          args=()
+          for t in $tests; do args+=("$t"); done
+          dist/integration_kafka_to_minio --ignored --exact "${args[@]}" 2>&1 | tee "$RUNNER_TEMP/kafka-it.log"
+          if ! grep -q "^test result: ok. $expected passed; 0 failed" "$RUNNER_TEMP/kafka-it.log"; then
+            echo "::error::expected the $expected smoke tests to pass; the summary was: $(grep '^test result:' "$RUNNER_TEMP/kafka-it.log" || echo none)"
+            exit 1
+          fi
+      # The other half of an authenticated leg: the broker must refuse a wrong
+      # password, an unknown user, a client with no credentials, no CA and
+      # another CA. `sasl_` tests need a SASL listener and `tls_` tests a TLS
+      # one; a listener that has both runs both. Each prefix's count is
+      # checked against the binary's own list.
+      - name: Run the refusal tests
+        if: matrix.mode != 'plain'
+        env:
+          MODE: ${{ matrix.mode }}
+        run: |
+          set -euo pipefail
+          chmod +x dist/integration_kafka_auth
+          prefixes=""
+          case "$MODE" in sasl-*) prefixes="$prefixes sasl_" ;; esac
+          case "$MODE" in tls | sasl-ssl) prefixes="$prefixes tls_" ;; esac
+          for prefix in $prefixes; do
+            expected=$(dist/integration_kafka_auth --ignored --list "$prefix" | grep -c ': test$' || true)
+            if [ "$expected" -eq 0 ]; then
+              echo "::error::the auth test binary lists no ignored test named $prefix*"
+              exit 1
+            fi
+            dist/integration_kafka_auth --ignored "$prefix" 2>&1 | tee "$RUNNER_TEMP/kafka-auth.log"
+            if ! grep -q "^test result: ok. $expected passed; 0 failed" "$RUNNER_TEMP/kafka-auth.log"; then
+              echo "::error::expected all $expected $prefix* refusal tests to pass; the summary was: $(grep '^test result:' "$RUNNER_TEMP/kafka-auth.log" || echo none)"
+              exit 1
+            fi
+          done
+      - name: Broker log
+        if: failure()
+        run: bash scripts/kafka-broker.sh logs 2>&1 | tail -n 300
+      - name: Stop the broker
+        if: always()
+        run: bash scripts/kafka-broker.sh down

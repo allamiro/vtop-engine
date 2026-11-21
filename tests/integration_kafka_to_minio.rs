@@ -10,6 +10,11 @@
 //!   cargo test -p vtop-cli --test integration_kafka_to_minio -- --ignored
 //! ```
 //!
+//! The same suite runs through a TLS or SASL listener when the
+//! `VTOP_TEST_KAFKA_*` variables of `kafka_broker_env.rs` are set;
+//! `scripts/kafka-broker.sh` starts such a broker and prints the variables
+//! (#721, docs/install/kafka.md).
+//!
 //! Why this file matters: the Kafka path had a P0 where every read returned zero
 //! records (a `subscribe()` per read forced a rebalance that reseeked to earliest
 //! and consumed the whole poll window), so no batch ever sealed and no offset
@@ -24,6 +29,12 @@
 
 use vtop_adapters::kafka_source::build_client_config;
 use vtop_core::config::KafkaSourceConfig;
+
+// Where the broker is and how to authenticate to it: environment hooks, so the
+// same suite runs through a plaintext, TLS or SASL listener (#721).
+#[path = "kafka_broker_env.rs"]
+mod broker_env;
+use broker_env::bootstrap;
 
 /// Run `$op` (an expression ending in `.await` that yields a `Result`),
 /// waiting out a group coordinator that is not ready yet (#665): a warm-up
@@ -56,7 +67,7 @@ macro_rules! through_warm_up {
 }
 
 fn kafka_cfg(bootstrap: &str, group: &str) -> KafkaSourceConfig {
-    KafkaSourceConfig {
+    let mut cfg = KafkaSourceConfig {
         enabled: true,
         bootstrap_servers: vec![bootstrap.to_string()],
         consumer_group: group.to_string(),
@@ -69,7 +80,9 @@ fn kafka_cfg(bootstrap: &str, group: &str) -> KafkaSourceConfig {
         sasl_username: None,
         sasl_password_env: None,
         ssl_ca_location: None,
-    }
+    };
+    broker_env::apply(&mut cfg);
+    cfg
 }
 
 /// Always-on guard: the Kafka client config must never enable auto-commit,
@@ -90,10 +103,6 @@ use std::collections::HashMap;
 use vtop_adapters::base::{DiscoveredSource, SourceAdapter};
 use vtop_adapters::KafkaSource;
 use vtop_core::types::{ProgressMarker, TelemetryFormat};
-
-fn bootstrap() -> String {
-    std::env::var("VTOP_TEST_KAFKA").unwrap_or_else(|_| "kafka:9092".into())
-}
 
 /// A unique consumer group per test, so a re-run never inherits offsets from a
 /// previous run — which would silently mask a broken read.
@@ -616,6 +625,7 @@ fn kafka_marker(topic: &str, group: &str, start: i64, end: i64) -> ProgressMarke
         start_offset: start,
         end_offset: end,
         consumer_group: group.into(),
+        topic_id: None,
     }
 }
 
@@ -650,6 +660,7 @@ async fn ledger_batch(
             manifest_version_id: None,
             object_size_bytes: None,
             verification_class: None,
+            sealed_at: None,
             record_count: Some(end - start + 1),
             error_message: None,
             owner: None,
@@ -1015,6 +1026,7 @@ async fn recovering_an_older_verified_batch_does_not_move_the_group_offset_back(
                 manifest_version_id: None,
                 object_size_bytes: Some(object_bytes.len() as i64),
                 verification_class: None,
+                sealed_at: None,
                 record_count: Some(10),
                 error_message: None,
                 owner: None,
@@ -1824,6 +1836,12 @@ async fn a_partition_added_while_the_topic_is_read_is_read_from_its_start() {
 /// and skipped what was written to it since its first assign, and nothing
 /// recovered it: its new start was the new end. It must be pinned where it
 /// started first.
+///
+/// The test pauses quiet behind the adapter, as a dead fetcher looks, and the
+/// renewal must clear that pause. It used to fail now and then with quiet
+/// assigned at the right offset and paused: the adapter resumed after the
+/// assign, and librdkafka discarded the resume as older than the assign's
+/// fetch start. The adapter now resumes before it assigns.
 #[tokio::test]
 #[ignore = "requires a running Kafka broker"]
 async fn renewing_the_assignment_does_not_move_a_partition_that_started_at_the_end() {
@@ -1845,6 +1863,15 @@ async fn renewing_the_assignment_does_not_move_a_partition_that_started_at_the_e
         produce(&busy, 2);
         busy_read += read_pass(&mut adapter, &sources).await[0];
     }
+    // #792: what reads quiet below must be the renewal, never the stall
+    // check. With the check's 10 s window, a broker slow to start quiet's
+    // renewed fetcher let the check re-assign it first, and the test failed
+    // on runner speed. Held off past the test's own length, the check cannot
+    // act on quiet here at all: a renewal that moved quiet to the new end
+    // leaves its records unread and fails the first assertion below, and a
+    // renewal that pinned it is read however slowly the broker starts it.
+    // Set after the warm-up, which keeps the check as before.
+    adapter.hold_off_stall_check_for(std::time::Duration::from_secs(600));
     // Quiet has delivered nothing; its fetcher stops before the records
     // arrive, so they are still waiting when the assignment is renewed.
     adapter
@@ -1862,15 +1889,50 @@ async fn renewing_the_assignment_does_not_move_a_partition_that_started_at_the_e
         kafka_source(&extra),
     ];
     let started = std::time::Instant::now();
+    // The renewal: the first pass with `extra` listed assigns again. Where
+    // it assigned quiet decides between the two ways this can fail: past
+    // the three records is a skip (they are never read), at the first of
+    // them is a partition that has not delivered yet.
     let mut quiet_read = 0;
-    while quiet_read < 3 && started.elapsed() < std::time::Duration::from_secs(30) {
+    let mut renewed = false;
+    let mut assigned_at = None;
+    while !renewed && quiet_read == 0 {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "the assignment was not renewed with the new topic within 30 s"
+        );
+        quiet_read += read_pass(&mut adapter, &sources).await[1];
+        // `extra` is assigned at its beginning, so a known offset for it
+        // says this pass renewed the assignment.
+        if adapter.next_offset_expected(&extra, 0).is_some() {
+            renewed = true;
+            assigned_at = adapter.next_offset_expected(&quiet, 0);
+        }
+    }
+    if quiet_read == 0 {
+        assert_eq!(
+            assigned_at,
+            Some(0),
+            "renewing the assignment assigned quiet at {}, not at the three records written \
+             to it since it started at the end of the log (offsets 0 to 2): they would never \
+             be read",
+            assigned_at.map_or("the end of the log (no pinned offset)".to_string(), |at| {
+                format!("offset {at}")
+            })
+        );
+    }
+    // Assigned at the records, they must arrive, however slowly the broker
+    // starts the new fetcher.
+    while quiet_read < 3 && started.elapsed() < std::time::Duration::from_secs(60) {
         quiet_read += read_pass(&mut adapter, &sources).await[1];
     }
     assert_eq!(
         quiet_read,
         3,
-        "renewing the assignment skipped records written to a partition that started at \
-         the end of the log (within {:?}; stall recoveries: {})",
+        "quiet was assigned at offset 0, at the three records written to it, so nothing \
+         was skipped, but it delivered {quiet_read} of them within {:?}: its fetcher did \
+         not run after the renewal (a pause left in place, or a fetcher that never \
+         started; stall recoveries: {})",
         started.elapsed(),
         adapter.stall_recoveries()
     );
@@ -1927,6 +1989,82 @@ async fn deleting_a_topic_with_a_waiting_partition_does_not_stop_the_others() {
         3,
         "after {gone} was deleted, {busy} was not read again within {:?}",
         started.elapsed()
+    );
+}
+
+// ---- topic ids: which incarnation of a topic a range was read from ---------
+
+/// What one read of `topic` through a new adapter records: the topic id of the
+/// read's start and end markers (which must agree), and the end offset.
+async fn read_topic_id(topic: &str) -> (Option<String>, i64) {
+    let mut adapter = KafkaSource::new(
+        kafka_cfg(&bootstrap(), &unique_group("topic-id")),
+        TelemetryFormat::Cef,
+    )
+    .unwrap();
+    let src = kafka_source(topic);
+    let reads = through_warm_up!(
+        "read failed",
+        adapter
+            .read_batch_candidates(&src, 100, 1 << 20, std::time::Duration::from_secs(10))
+            .await
+    );
+    let read = reads
+        .iter()
+        .find(|r| !r.records.is_empty())
+        .unwrap_or_else(|| panic!("a read of {topic} returned no records"));
+    match (&read.progress_start, &read.progress_end) {
+        (
+            ProgressMarker::Kafka {
+                topic_id: start_id, ..
+            },
+            ProgressMarker::Kafka {
+                topic_id: end_id,
+                end_offset,
+                ..
+            },
+        ) => {
+            assert_eq!(start_id, end_id, "one read, one topic id");
+            (end_id.clone(), *end_offset)
+        }
+        other => panic!("expected Kafka markers, got {other:?}"),
+    }
+}
+
+/// The ledger tells a topic deleted and recreated under the same name from the
+/// old one by the topic id the markers record, because the offsets of the two
+/// logs overlap. The broker (Kafka 2.8 and later) gives each incarnation its
+/// own UUID: a read records it, it is the same for the same topic, and a topic
+/// created again under the name has another.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn a_read_records_the_topic_id_and_a_recreated_topic_has_another() {
+    let topic = fresh_topic_name("topic_id");
+    let first = create_topic(&topic).await;
+    produce(&topic, 3);
+    let (id, end) = read_topic_id(&topic).await;
+    let id = id.expect("the broker gave the topic an id, which the markers of a read record");
+    assert_eq!(id.len(), 22, "a UUID as Kafka prints it: {id}");
+    assert_eq!(end, 2, "offsets 0 to 2 were written");
+    let (again, _) = read_topic_id(&topic).await;
+    assert_eq!(
+        again.as_deref(),
+        Some(id.as_str()),
+        "the same topic has the same id on every read"
+    );
+
+    // Deleted and created again under the same name: offsets start from zero.
+    drop(first);
+    wait_for_partitions_gone(&topic);
+    let _second = create_topic(&topic).await;
+    produce(&topic, 3);
+    let (recreated, end) = read_topic_id(&topic).await;
+    assert_eq!(end, 2, "the new log numbers its offsets from zero again");
+    let recreated = recreated.expect("the recreated topic has an id");
+    assert_ne!(
+        recreated, id,
+        "a recreated topic must have another id, or its rows could not be told from the old \
+         topic's"
     );
 }
 
@@ -2207,6 +2345,7 @@ async fn a_held_back_kafka_range_is_settled_without_a_restart_and_never_moves_th
                 manifest_version_id: None,
                 object_size_bytes: Some(object_bytes.len() as i64),
                 verification_class: None,
+                sealed_at: None,
                 record_count: Some(10),
                 error_message: None,
                 owner: None,
@@ -2404,5 +2543,294 @@ async fn an_engine_sharing_the_ledger_reuses_the_object_another_left_for_a_kafka
             .await
             .is_err(),
         "nothing was put twice under {a_object}"
+    );
+}
+
+// ---- #626: a Kafka replay rebuilds the window as first cut ------------------
+
+/// Append `records` more records to `topic`, at the offsets after its last.
+fn produce_more(topic: &str, records: usize) {
+    use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
+    let producer: BaseProducer = build_client_config(&kafka_cfg(&bootstrap(), "vtop-it-producer"))
+        .unwrap()
+        .create()
+        .expect("producer");
+    for i in 0..records {
+        let payload = format!("CEF:0|VTOP|IT|1.0|more{i}|Grown|3|src=10.0.1.{i}");
+        producer
+            .send(BaseRecord::<(), str>::to(topic).payload(&payload))
+            .expect("enqueue produce");
+    }
+    producer
+        .flush(std::time::Duration::from_secs(10))
+        .expect("flush produce");
+}
+
+/// The committed Kafka ranges of `engine` as `(start, end, object)`.
+async fn committed_kafka(engine: &vtop_cli::Engine) -> Vec<(i64, i64, String)> {
+    use vtop_core::state_machine::BatchState;
+    let mut out: Vec<_> = engine
+        .store
+        .list_batches()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|b| b.state == BatchState::SourceCommitted)
+        .map(|b| match (&b.progress_start, &b.progress_end) {
+            (
+                ProgressMarker::Kafka { start_offset, .. },
+                ProgressMarker::Kafka { end_offset, .. },
+            ) => (*start_offset, *end_offset, b.object_uri.clone().unwrap()),
+            other => panic!("Kafka markers: {other:?}"),
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Fail the first window of `engine` after its object lands (the manifest
+/// put is throttled); its range and its object.
+async fn fail_first_window(
+    engine: &mut vtop_cli::Engine,
+    mock: &std::sync::Arc<vtop_upload::MockBackend>,
+) -> (i64, i64, String) {
+    use vtop_core::state_machine::BatchState;
+    engine.backend = mock.clone();
+    for _ in 0..15 {
+        let out = through_warm_up!(
+            "a read pass",
+            engine
+                .process_once(vtop_core::types::SourceType::Kafka)
+                .await
+        );
+        if let Some(failed) = out.iter().find(|o| o.final_state == BatchState::Failed) {
+            let row = engine
+                .store
+                .get_batch(&failed.batch_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let (
+                ProgressMarker::Kafka { start_offset, .. },
+                ProgressMarker::Kafka { end_offset, .. },
+            ) = (&row.progress_start, &row.progress_end)
+            else {
+                panic!("Kafka markers");
+            };
+            return (*start_offset, *end_offset, row.object_uri.unwrap());
+        }
+    }
+    panic!("no window failed in 15 passes");
+}
+
+/// Run passes until the committed ranges reach `last` (inclusive).
+async fn commit_through(engine: &mut vtop_cli::Engine, last: i64) -> Vec<(i64, i64, String)> {
+    for _ in 0..20 {
+        through_warm_up!(
+            "a read pass",
+            engine
+                .process_once(vtop_core::types::SourceType::Kafka)
+                .await
+        );
+        let committed = committed_kafka(engine).await;
+        if committed.last().is_some_and(|(_, end, _)| *end >= last) {
+            return committed;
+        }
+    }
+    panic!(
+        "the engine did not commit through offset {last} in 20 passes: {:?}",
+        committed_kafka(engine).await
+    );
+}
+
+/// #626 PR 3, against a live broker: the first window `[0, 19]` fails after
+/// its object lands, and the partition grows by ten records before the
+/// replay. The re-read stops at offset 19 (the window's recorded end), so it
+/// rebuilds the bytes the failed attempt uploaded and reuses that object; the
+/// new offsets are the next batch. Before, the replay read `[0, 29]`, named
+/// another object and left the first as an orphan.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn a_replay_over_a_grown_partition_resolves_to_the_archived_object() {
+    let (topic, _cleanup) = fresh_topic("grown_replay", 20).await;
+    let dir = tempfile::tempdir().unwrap();
+    let db = format!("sqlite://{}", dir.path().join("state.db").display());
+    let group = unique_group("grown-replay");
+    let mut engine = engine_on(&db, dir.path(), &topic, &group).await;
+    let mock = std::sync::Arc::new(vtop_upload::MockBackend::new().with_throttled_manifest_puts(1));
+    let (start, end, orphan) = fail_first_window(&mut engine, &mock).await;
+    assert_eq!((start, end), (0, 19), "the first window is the whole topic");
+
+    produce_more(&topic, 10);
+    let committed = commit_through(&mut engine, 29).await;
+    assert_eq!(committed[0].0, 0, "{committed:?}");
+    assert_eq!(committed[0].1, 19, "rebuilt as first cut: {committed:?}");
+    assert_eq!(
+        committed[0].2, orphan,
+        "and resolved to the object the failed attempt left"
+    );
+    assert_eq!(mock.version_count(&orphan), 1, "which was not put again");
+    assert_eq!(
+        committed[1].0, 20,
+        "the new records are the next batch: {committed:?}"
+    );
+}
+
+/// #626 PR 3, against a live broker: the first window `[0, 19]` fails after
+/// its object lands, and the log start then moves past the range (records
+/// deleted below offset 25, as retention would). The range cannot be rebuilt:
+/// the bound is refused and counted, the re-read goes on from where the log
+/// starts, a new object is written, and the failed attempt's object is left
+/// untouched.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn a_replay_whose_range_the_log_no_longer_holds_is_refused_and_read_on() {
+    use rdkafka::admin::{AdminClient, AdminOptions};
+    use rdkafka::{Offset, TopicPartitionList};
+    let (topic, _cleanup) = fresh_topic("gone_replay", 20).await;
+    let dir = tempfile::tempdir().unwrap();
+    let db = format!("sqlite://{}", dir.path().join("state.db").display());
+    let group = unique_group("gone-replay");
+    let mut engine = engine_on(&db, dir.path(), &topic, &group).await;
+    let mock = std::sync::Arc::new(vtop_upload::MockBackend::new().with_throttled_manifest_puts(1));
+    let (_, end, orphan) = fail_first_window(&mut engine, &mock).await;
+    assert_eq!(end, 19);
+
+    produce_more(&topic, 10);
+    let admin: AdminClient<_> = build_client_config(&kafka_cfg(&bootstrap(), "vtop-it-admin"))
+        .unwrap()
+        .create()
+        .expect("admin client");
+    let mut below = TopicPartitionList::new();
+    below
+        .add_partition_offset(&topic, 0, Offset::Offset(25))
+        .unwrap();
+    admin
+        .delete_records(&below, &AdminOptions::new())
+        .await
+        .expect("delete_records");
+    let refused = || {
+        vtop_core::telemetry::init()
+            .unwrap()
+            .replay_rebuilds_total
+            .with_label_values(&["default", "kafka", "raw", "refused"])
+            .get()
+    };
+    let before = refused();
+    let committed = commit_through(&mut engine, 29).await;
+    let after_deletion: Vec<_> = committed.iter().filter(|(s, _, _)| *s >= 25).collect();
+    assert_eq!(
+        after_deletion.first().map(|(s, _, _)| *s),
+        Some(25),
+        "{committed:?}"
+    );
+    assert!(
+        committed.iter().all(|(_, _, uri)| *uri != orphan),
+        "the range was not rebuilt, so no committed batch names the orphan: {committed:?}"
+    );
+    assert_eq!(mock.version_count(&orphan), 1, "the orphan is untouched");
+    assert!(refused() > before, "the bound is counted refused");
+}
+
+/// Review of #626 PR 3, against a live broker: a rebuild that takes two
+/// passes (the limits were lowered to ten records) has read `[0, 9]` of the
+/// failed window `[0, 19]` when the log loses the rest of the range (records
+/// deleted below offset 20, as retention would), and nothing new is produced.
+/// The partition then delivers nothing, so only its low watermark can tell
+/// the window will never be complete. The bound is refused and counted, the
+/// half already read is no longer held, and it is archived on its own.
+/// Before, it was held as rebuilding for as long as the partition stayed
+/// idle.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn a_rebuild_whose_remaining_range_expires_on_an_idle_partition_is_refused() {
+    use rdkafka::admin::{AdminClient, AdminOptions};
+    use rdkafka::{Offset, TopicPartitionList};
+    let (topic, _cleanup) = fresh_topic("expired_rebuild", 20).await;
+    let dir = tempfile::tempdir().unwrap();
+    let db = format!("sqlite://{}", dir.path().join("state.db").display());
+    let group = unique_group("expired-rebuild");
+    let mut engine = engine_on(&db, dir.path(), &topic, &group).await;
+    let mock = std::sync::Arc::new(vtop_upload::MockBackend::new().with_throttled_manifest_puts(1));
+    let (_, end, orphan) = fail_first_window(&mut engine, &mock).await;
+    assert_eq!(end, 19);
+
+    engine.config.batching.max_records = 10;
+    let held = through_warm_up!(
+        "a read pass",
+        engine
+            .process_once(vtop_core::types::SourceType::Kafka)
+            .await
+    );
+    assert!(held.is_empty(), "half the window is held: {held:?}");
+
+    let admin: AdminClient<_> = build_client_config(&kafka_cfg(&bootstrap(), "vtop-it-admin"))
+        .unwrap()
+        .create()
+        .expect("admin client");
+    let mut below = TopicPartitionList::new();
+    below
+        .add_partition_offset(&topic, 0, Offset::Offset(20))
+        .unwrap();
+    admin
+        .delete_records(&below, &AdminOptions::new())
+        .await
+        .expect("delete_records");
+    let refused = || {
+        vtop_core::telemetry::init()
+            .unwrap()
+            .replay_rebuilds_total
+            .with_label_values(&["default", "kafka", "raw", "refused"])
+            .get()
+    };
+    let before = refused();
+    let committed = commit_through(&mut engine, 9).await;
+    assert_eq!(
+        committed
+            .iter()
+            .map(|(s, e, _)| (*s, *e))
+            .collect::<Vec<_>>(),
+        vec![(0, 9)],
+        "the half already read is archived on its own"
+    );
+    assert_ne!(committed[0].2, orphan, "it is not the failed window");
+    assert_eq!(mock.version_count(&orphan), 1, "the orphan is untouched");
+    assert!(refused() > before, "the bound is counted refused");
+}
+
+/// Review of #626 PR 3, against a live broker: `batching.max_bytes` is
+/// lowered after the window `[0, 19]` failed, and `max_records` is not, so
+/// the window passes the record-count cap. A Kafka row records no
+/// uncompressed size, so only the buffer can tell it is over 4x the current
+/// byte limit. Once the held buffer goes over that cap, the hold is released
+/// and counted `too_large`, and the window is sealed by the thresholds from
+/// there. Before, it was held whole whatever its size.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn a_held_kafka_rebuild_over_four_times_the_byte_limit_is_released() {
+    let (topic, _cleanup) = fresh_topic("byte_cap_rebuild", 20).await;
+    let dir = tempfile::tempdir().unwrap();
+    let db = format!("sqlite://{}", dir.path().join("state.db").display());
+    let group = unique_group("byte-cap-rebuild");
+    let mut engine = engine_on(&db, dir.path(), &topic, &group).await;
+    let mock = std::sync::Arc::new(vtop_upload::MockBackend::new().with_throttled_manifest_puts(1));
+    let (_, end, orphan) = fail_first_window(&mut engine, &mock).await;
+    assert_eq!(end, 19);
+
+    // Twenty records of about 50 bytes: the window is over 4x 100 bytes.
+    engine.config.batching.max_bytes = 100;
+    let too_large = || {
+        vtop_core::telemetry::init()
+            .unwrap()
+            .replay_rebuilds_total
+            .with_label_values(&["default", "kafka", "raw", "too_large"])
+            .get()
+    };
+    let before = too_large();
+    let committed = commit_through(&mut engine, 19).await;
+    assert!(too_large() > before, "the held window is counted too_large");
+    assert!(
+        committed[0].1 < 19 && committed[0].2 != orphan,
+        "it is released and sealed by the thresholds, not held whole: {committed:?}"
     );
 }

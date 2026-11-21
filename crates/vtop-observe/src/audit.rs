@@ -91,11 +91,22 @@ pub enum Action {
     /// `vtopctl node promote-unproven`: the operator's attestation (#636).
     #[serde(rename = "promotion.attest")]
     PromotionAttest,
+    /// A key, state-store, ledger or audit file other local users can read,
+    /// accepted only because `security.allow_loose_secret_permissions` is
+    /// true (#733). One record per file per process; the target is the file.
+    #[serde(rename = "security.override")]
+    SecurityOverride,
+    /// A native produce/fetch session the node refused at its hello:
+    /// a certificate that is not the one bound to the principal it asked to
+    /// act as, a principal or role the node does not serve. Refusals only;
+    /// an admitted session is not a state change.
+    #[serde(rename = "native.session")]
+    NativeSession,
 }
 
 impl Action {
     /// Every action, for label sets and tests.
-    pub const ALL: [Action; 12] = [
+    pub const ALL: [Action; 14] = [
         Action::LedgerReplay,
         Action::LedgerPrune,
         Action::LedgerMigrate,
@@ -108,6 +119,8 @@ impl Action {
         Action::NodeRepair,
         Action::NodeReconfigureRange,
         Action::PromotionAttest,
+        Action::SecurityOverride,
+        Action::NativeSession,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -124,6 +137,8 @@ impl Action {
             Action::NodeRepair => "node.repair",
             Action::NodeReconfigureRange => "node.reconfigure_range",
             Action::PromotionAttest => "promotion.attest",
+            Action::SecurityOverride => "security.override",
+            Action::NativeSession => "native.session",
         }
     }
 
@@ -199,6 +214,12 @@ impl Action {
                 "operator",
                 "command",
             ],
+            // What the file holds, its mode and who besides the owner can
+            // read it: never its contents.
+            Action::SecurityOverride => &["file_kind", "mode", "exposed_to", "setting"],
+            // The role the client asked for and the principal this node
+            // serves: identifiers, never the certificate itself.
+            Action::NativeSession => &["role", "served_principal"],
         }
     }
 
@@ -431,7 +452,7 @@ impl Actor {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Target {
     /// `ledger`, `batch`, `cluster`, `topic`, `range`, `node`, `cursor`,
-    /// `data_dir`.
+    /// `data_dir`, `file` (a secret file accepted under an override, #733).
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,

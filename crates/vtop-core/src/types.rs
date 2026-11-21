@@ -200,6 +200,25 @@ pub enum ProgressMarker {
         start_offset: i64,
         end_offset: i64,
         consumer_group: String,
+        /// The topic's id (the broker's UUID for it, base64url without
+        /// padding) when this range was read. A topic that is deleted and
+        /// created again under the same name numbers its offsets from zero
+        /// again and gets a new id, so the name and an offset cannot tell
+        /// the two logs apart and the id can: the ledger resumes a partition
+        /// from the highest committed end among the rows of ONE id.
+        ///
+        /// LEDGER ONLY: [`ProgressMarker::for_manifest`] clears it, so a
+        /// manifest is byte for byte what released readers verify. `None` on
+        /// a row written before the field existed, on a broker that has no
+        /// topic ids (before Kafka 2.8) or did not answer, and for a stored
+        /// value that is empty. Omitted when `None`, so such a marker
+        /// serializes as the code before it wrote it.
+        #[serde(
+            default,
+            deserialize_with = "plausible_topic_id",
+            skip_serializing_if = "Option::is_none"
+        )]
+        topic_id: Option<String>,
     },
     File {
         path: String,
@@ -237,6 +256,28 @@ pub enum ProgressMarker {
             skip_serializing_if = "Option::is_none"
         )]
         tail_fingerprint: Option<ContentFingerprint>,
+        /// The file's ctime as this read saw it (#619): from the same fstat,
+        /// after the read, as `mtime`, and written the same way (RFC 3339
+        /// in UTC, up to nanosecond precision). A rewrite of the file moves
+        /// it, and so does setting the mtime back, and no process can set
+        /// it; so a same-length rewrite confined between the first page and
+        /// the page below `end_byte`, with the mtime put back, still differs
+        /// here.
+        /// `delete_after_commit` requires the file to still have it, at the
+        /// covering commit and when a restart re-arms the delete.
+        ///
+        /// LEDGER ONLY: [`ProgressMarker::for_manifest`] clears it, so a
+        /// manifest is byte for byte what released readers verify. `None` on
+        /// a row written before the field (judged exactly as before), on a
+        /// platform without ctimes, and for a stored value that does not
+        /// parse as RFC 3339 ([`plausible_timestamp`]). Omitted when `None`,
+        /// so such a marker serializes as the code before it wrote it.
+        #[serde(
+            default,
+            deserialize_with = "plausible_ctime",
+            skip_serializing_if = "Option::is_none"
+        )]
+        ctime: Option<String>,
     },
     SyslogSpool {
         spool_id: String,
@@ -372,6 +413,51 @@ where
     })
 }
 
+/// Whether `text` is a timestamp a writer of a marker's `ctime` produces: an
+/// RFC 3339 date-time (#619). Anything else was corrupted in storage, and a
+/// ctime is then unknown, which the delete treats as a row from before the
+/// field - never as a value to compare a file against.
+pub fn plausible_timestamp(text: &str) -> bool {
+    chrono::DateTime::parse_from_rfc3339(text).is_ok()
+}
+
+/// A marker's stored ctime, or `None` when it is absent, not a string, or not
+/// a [`plausible_timestamp`] (#619), as for the fingerprints above.
+fn plausible_ctime<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Stored {
+        Text(String),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Option::<Stored>::deserialize(deserializer)? {
+        Some(Stored::Text(text)) => Some(text).filter(|t| plausible_timestamp(t)),
+        Some(Stored::Other(_)) | None => None,
+    })
+}
+
+/// A marker's stored topic id, or `None` when it is absent, not a string, or
+/// empty: an id no writer produces reads as "unknown", never as an id that
+/// could match another row's.
+fn plausible_topic_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Stored {
+        Text(String),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Option::<Stored>::deserialize(deserializer)? {
+        Some(Stored::Text(text)) => Some(text).filter(|t| !t.is_empty()),
+        Some(Stored::Other(_)) | None => None,
+    })
+}
+
 impl ProgressMarker {
     /// The [`SourceType`] this marker belongs to.
     pub fn source_type(&self) -> SourceType {
@@ -426,6 +512,12 @@ impl ProgressMarker {
             (Some(a), Some(b)) => a == b,
             _ => true,
         };
+        // Two known ids that differ are two incarnations of the topic, whose
+        // offsets are not one range; an unknown id proves no change.
+        let same_topic_id = |a: &Option<String>, b: &Option<String>| match (a, b) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        };
         let mut span = last.clone();
         match (first, &mut span) {
             (
@@ -434,6 +526,7 @@ impl ProgressMarker {
                     partition: first_partition,
                     consumer_group: first_group,
                     start_offset: first_start,
+                    topic_id: first_topic_id,
                     ..
                 },
                 ProgressMarker::Kafka {
@@ -441,11 +534,13 @@ impl ProgressMarker {
                     partition,
                     consumer_group,
                     start_offset,
+                    topic_id,
                     ..
                 },
             ) if first_topic == topic
                 && first_partition == partition
                 && first_group == consumer_group
+                && same_topic_id(first_topic_id, topic_id)
                 && first_start <= start_offset =>
             {
                 *start_offset = *first_start;
@@ -499,8 +594,8 @@ impl ProgressMarker {
         span
     }
 
-    /// This marker as a manifest carries it: without the fields #578 and
-    /// #620 added.
+    /// This marker as a manifest carries it: without the fields #578, #620
+    /// and #619 (`ctime`) added.
     ///
     /// A manifest is verified by decoding it and hashing the re-encoded
     /// struct, and serde drops fields a reader does not know. An older
@@ -511,14 +606,16 @@ impl ProgressMarker {
     pub fn for_manifest(&self) -> Self {
         let mut marker = self.clone();
         match &mut marker {
-            ProgressMarker::Kafka { .. } => {}
+            ProgressMarker::Kafka { topic_id, .. } => *topic_id = None,
             ProgressMarker::File {
                 content_fingerprint,
                 tail_fingerprint,
+                ctime,
                 ..
             } => {
                 *content_fingerprint = None;
                 *tail_fingerprint = None;
+                *ctime = None;
             }
             ProgressMarker::SyslogSpool {
                 file_size,
@@ -557,6 +654,14 @@ impl ProgressMarker {
             ProgressMarker::Kafka { .. } | ProgressMarker::SyslogSpool { .. } => None,
         }
     }
+
+    /// The ctime a file marker's read saw, if it recorded one (#619).
+    pub fn ctime(&self) -> Option<&str> {
+        match self {
+            ProgressMarker::File { ctime, .. } => ctime.as_deref(),
+            ProgressMarker::Kafka { .. } | ProgressMarker::SyslogSpool { .. } => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -584,6 +689,7 @@ mod tests {
                 mtime: "2026-01-01T00:00:30Z".into(),
                 content_fingerprint: None,
                 tail_fingerprint: None,
+                ctime: None,
             }
         );
         let spool: ProgressMarker = serde_json::from_str(OLD_SPOOL_ROW).unwrap();
@@ -722,6 +828,60 @@ mod tests {
         assert_eq!(marker.tail_fingerprint(), Some(&good));
     }
 
+    /// A file marker as the code before #619's ctime writes it: a first page
+    /// and a tail, no ctime. Captured from origin/main at 9f55a41
+    /// (`serde_json::to_string` of this marker there).
+    const PRE_CTIME_FILE_ROW: &str = r#"{"source_type":"file","path":"/var/log/app.log","inode":877,"start_byte":0,"end_byte":100,"file_size":100,"mtime":"2026-01-01T00:00:30.000000123+00:00","content_fingerprint":{"len":4,"sha256":"edeaaff3f1774ad2888673770c6d64097e391bc362d7d6fb34982ddf0efd18cb"},"tail_fingerprint":{"len":4,"sha256":"edeaaff3f1774ad2888673770c6d64097e391bc362d7d6fb34982ddf0efd18cb"}}"#;
+
+    /// #619 (C5): the ctime a file marker records is a ledger-only field,
+    /// like #578's and #620's fingerprints. A row from before it decodes
+    /// with none and re-encodes byte for byte; a marker with one round-trips;
+    /// a manifest never carries it (an older verify-manifest would drop it
+    /// and fail the self-hash); and a stored value no writer produces reads
+    /// as absent, never as a ctime to compare.
+    #[test]
+    fn the_ctime_is_ledger_only_optional_and_read_as_absent_when_implausible() {
+        let old: ProgressMarker = serde_json::from_str(PRE_CTIME_FILE_ROW).unwrap();
+        assert_eq!(old.ctime(), None);
+        assert_eq!(serde_json::to_string(&old).unwrap(), PRE_CTIME_FILE_ROW);
+
+        let mut marker = old.clone();
+        if let ProgressMarker::File { ctime, .. } = &mut marker {
+            *ctime = Some("2026-01-01T00:00:31.000000456+00:00".into());
+        }
+        let json = serde_json::to_string(&marker).unwrap();
+        assert!(
+            json.ends_with(r#","ctime":"2026-01-01T00:00:31.000000456+00:00"}"#),
+            "{json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<ProgressMarker>(&json).unwrap(),
+            marker
+        );
+        let manifest = marker.for_manifest();
+        assert_eq!(manifest.ctime(), None);
+        assert!(
+            !serde_json::to_string(&manifest).unwrap().contains("ctime"),
+            "an older verify-manifest drops what it does not know and would fail the \
+             self-hash"
+        );
+
+        for bad in [
+            r#""""#,
+            r#""yesterday""#,
+            r#""2026-01-01 00:00:31""#,
+            r#"1700000000"#,
+            r#"{"secs":1}"#,
+            r#"null"#,
+        ] {
+            let open = &PRE_CTIME_FILE_ROW[..PRE_CTIME_FILE_ROW.len() - 1];
+            let row = format!(r#"{open},"ctime":{bad}}}"#);
+            let marker: ProgressMarker = serde_json::from_str(&row)
+                .unwrap_or_else(|e| panic!("a bad ctime failed the whole row: {e}: {row}"));
+            assert_eq!(marker.ctime(), None, "{bad}");
+        }
+    }
+
     /// A tail fingerprint covers the LAST page of what it is given, and
     /// matches only those exact bytes: a shorter or a longer read does not.
     #[test]
@@ -757,6 +917,7 @@ mod tests {
             tail_fingerprint: (end > 0)
                 .then(|| ContentFingerprint::of_tail(format!("below {end}").as_bytes()))
                 .flatten(),
+            ctime: None,
         }
     }
 
@@ -767,6 +928,7 @@ mod tests {
             start_offset: start,
             end_offset: end,
             consumer_group: "g".into(),
+            topic_id: None,
         }
     }
 
@@ -812,6 +974,102 @@ mod tests {
         assert_eq!(
             ProgressMarker::spanning(&file("/a", Some(7), 12, 12), &one),
             one
+        );
+    }
+
+    /// A Kafka row as every release before the topic id writes it: the v0.3
+    /// fixture, captured from that release.
+    const PRE_TOPIC_ID_KAFKA_ROW: &str = include_str!("../tests/fixtures/markers/kafka-0.3.json");
+
+    /// A Kafka row from before the topic id decodes with none and re-encodes
+    /// byte for byte; a marker with one round-trips, an older reader (which
+    /// ignores the key) sees the same marker, and a manifest never carries it.
+    #[test]
+    fn markers_written_before_the_topic_id_decode_as_unknown_and_a_manifest_carries_none() {
+        let old: ProgressMarker = serde_json::from_str(PRE_TOPIC_ID_KAFKA_ROW).unwrap();
+        assert!(matches!(
+            &old,
+            ProgressMarker::Kafka {
+                topic_id: None,
+                partition: 3,
+                ..
+            }
+        ));
+        assert_eq!(
+            serde_json::to_string(&old).unwrap(),
+            PRE_TOPIC_ID_KAFKA_ROW.trim()
+        );
+
+        let mut marker = old.clone();
+        if let ProgressMarker::Kafka { topic_id, .. } = &mut marker {
+            *topic_id = Some("Zk3pXK7bTfyqY0v9mQw1ZA".into());
+        }
+        let json = serde_json::to_string(&marker).unwrap();
+        assert!(
+            json.contains(r#""topic_id":"Zk3pXK7bTfyqY0v9mQw1ZA""#),
+            "{json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<ProgressMarker>(&json).unwrap(),
+            marker
+        );
+        // What the code before the field does with it: serde ignores the
+        // unknown key, so the marker it reads is the old one.
+        let mut as_older: serde_json::Value = serde_json::from_str(&json).unwrap();
+        as_older.as_object_mut().unwrap().remove("topic_id");
+        assert_eq!(
+            as_older,
+            serde_json::from_str::<serde_json::Value>(PRE_TOPIC_ID_KAFKA_ROW).unwrap()
+        );
+
+        let manifest = serde_json::to_string(&marker.for_manifest()).unwrap();
+        assert_eq!(
+            manifest,
+            PRE_TOPIC_ID_KAFKA_ROW.trim(),
+            "an older verify-manifest drops what it does not know and would fail the \
+             self-hash: {manifest}"
+        );
+    }
+
+    /// A stored topic id that no writer produces (empty, not a string) reads
+    /// as unknown, never as an id another row could match.
+    #[test]
+    fn an_empty_or_malformed_stored_topic_id_reads_as_unknown() {
+        for stored in [r#""""#, "null", "7", r#"["x"]"#] {
+            let json = PRE_TOPIC_ID_KAFKA_ROW.replace(
+                r#""consumer_group":"vtop-archive""#,
+                &format!(r#""consumer_group":"vtop-archive","topic_id":{stored}"#),
+            );
+            let marker: ProgressMarker = serde_json::from_str(&json).unwrap();
+            assert!(
+                matches!(marker, ProgressMarker::Kafka { topic_id: None, .. }),
+                "{stored}"
+            );
+        }
+    }
+
+    /// Two ranges of one topic name read under different ids are two logs
+    /// whose offsets are unrelated: no span is claimed across them. An unknown
+    /// id on either side proves no change.
+    #[test]
+    fn a_span_never_joins_two_incarnations_of_a_topic() {
+        let with_id = |start: i64, end: i64, id: Option<&str>| {
+            let mut m = kafka("t", 0, start, end);
+            if let ProgressMarker::Kafka { topic_id, .. } = &mut m {
+                *topic_id = id.map(str::to_owned);
+            }
+            m
+        };
+        let first = with_id(0, 0, Some("old"));
+        let last = with_id(5, 9, Some("new"));
+        assert_eq!(ProgressMarker::spanning(&first, &last), last);
+        assert_eq!(
+            ProgressMarker::spanning(&with_id(0, 0, Some("a")), &with_id(5, 9, Some("a"))),
+            with_id(0, 9, Some("a"))
+        );
+        assert_eq!(
+            ProgressMarker::spanning(&with_id(0, 0, None), &with_id(5, 9, Some("a"))),
+            with_id(0, 9, Some("a"))
         );
     }
 

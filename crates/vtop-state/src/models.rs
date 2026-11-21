@@ -42,6 +42,26 @@ pub struct BatchRecord {
         deserialize_with = "deserialize_verification_class"
     )]
     pub verification_class: Option<VerificationClass>,
+    /// The instant the batch's contents were fixed (RFC 3339, UTC), recorded
+    /// with the row's first write (#626). Its time partition is taken from
+    /// it, so a replay of the same range that reads it back files its object
+    /// under the same hour and names the same key as the attempt that failed,
+    /// whenever it runs. `None` on a row written before #626: its replay is
+    /// filed under the hour it is replayed in, as it always was.
+    ///
+    /// Omitted from the serialized record when unknown, as
+    /// `verification_class` is, so a prune digest of a legacy row is what an
+    /// older release wrote.
+    ///
+    /// A stored value that is not an RFC 3339 instant reads as unknown, never
+    /// as an error: a prune digest is read whole or refused, and one corrupted
+    /// row must not fail the coverage audit of every row in its file.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_sealed_at"
+    )]
+    pub sealed_at: Option<String>,
     pub record_count: Option<i64>,
     pub error_message: Option<String>,
     /// Engine instance that owns this in-flight batch (#93). `None` on rows
@@ -130,6 +150,118 @@ pub(crate) fn log_class_column_added_uncounted(backend: &str, error: &str) {
     );
 }
 
+/// Tells the operator that a migration added the `sealed_at` column to a
+/// table that already held rows (#626): what happened, what it means for
+/// those rows, and that nothing needs doing. Says nothing for an empty table.
+pub(crate) fn log_sealed_at_column_added(backend: &str, existing_rows: i64) {
+    if existing_rows == 0 {
+        return;
+    }
+    tracing::info!(
+        backend,
+        existing_rows,
+        column = "sealed_at",
+        "state store: added the sealed_at column; {existing_rows} existing rows left NULL (seal \
+         instant unknown). A replay of one of them is filed under the hour it is replayed in, as \
+         before this release, so it may write a second object if that hour differs. Rows \
+         written from now on record it. Nothing to do"
+    );
+}
+
+/// [`log_sealed_at_column_added`] when the rows could not be counted.
+pub(crate) fn log_sealed_at_column_added_uncounted(backend: &str, error: &str) {
+    tracing::warn!(
+        backend,
+        column = "sealed_at",
+        error,
+        "state store: added the sealed_at column, but could not count the existing rows it left \
+         NULL (seal instant unknown). The migration is complete; a replay of one of those rows \
+         is filed under the hour it is replayed in, as before this release. Nothing to do"
+    );
+}
+
+/// Whether `text` is a seal instant a writer produces: an RFC 3339 date-time
+/// (#626).
+pub fn plausible_sealed_at(text: &str) -> bool {
+    chrono::DateTime::parse_from_rfc3339(text).is_ok()
+}
+
+/// A `sealed_at` column value as a store reads it: `None` when it is NULL,
+/// and also when it is not a [`plausible_sealed_at`] instant, which is
+/// logged. The row is read all the same, and its replay is filed as a row
+/// from before the column is. Never an error: a corrupted value must not fail
+/// the claim of every incomplete row recovery makes.
+pub(crate) fn sealed_at_column(stored: Option<String>, batch_id: &str) -> Option<String> {
+    let text = stored?;
+    if plausible_sealed_at(&text) {
+        return Some(text);
+    }
+    // Every read of the row meets it again (each claim, `status`, a list),
+    // so the notice is rate-limited, with the count it held back.
+    if let Some(suppressed) = SEALED_AT_NOTICE.admit() {
+        tracing::warn!(
+            batch_id,
+            column = "sealed_at",
+            stored_len = text.len(),
+            suppressed,
+            "state store: ledger row {batch_id} holds a sealed_at that is not an RFC 3339 \
+             instant; it is read as unknown, so a replay of the row is filed under the hour it \
+             runs in, as for a row from before the column existed (it may write a second \
+             object). Nothing to do unless this repeats; then check what else writes to the \
+             ledger ({suppressed} more like this suppressed since the last notice)"
+        );
+    }
+    None
+}
+
+/// At most one notice a minute about unreadable `sealed_at` values.
+static SEALED_AT_NOTICE: Notice = Notice::new();
+
+/// A process-wide rate limit for one notice: the first is let through, then at
+/// most one a minute, each with how many were held back since the last.
+struct Notice(std::sync::Mutex<(Option<std::time::Instant>, u64)>);
+
+impl Notice {
+    const fn new() -> Self {
+        Self(std::sync::Mutex::new((None, 0)))
+    }
+
+    fn admit(&self) -> Option<u64> {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        match state.0 {
+            Some(last) if now.duration_since(last) < std::time::Duration::from_secs(60) => {
+                state.1 += 1;
+                None
+            }
+            _ => {
+                let suppressed = state.1;
+                *state = (Some(now), 0);
+                Some(suppressed)
+            }
+        }
+    }
+}
+
+/// Reads a serialized `sealed_at` leniently (#626): absent, not a string, or
+/// not an RFC 3339 instant are all unknown, as [`sealed_at_column`] reads the
+/// column.
+fn deserialize_sealed_at<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Stored {
+        Text(String),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Option::<Stored>::deserialize(d)? {
+        Some(Stored::Text(text)) => Some(text).filter(|t| plausible_sealed_at(t)),
+        Some(Stored::Other(_)) | None => None,
+    })
+}
+
 /// Reads a serialized `verification_class` leniently: a value this build does
 /// not know is unknown (`None`), never an error. A prune digest is read whole
 /// or refused, so a strict enum would make one row from a newer release fail
@@ -200,26 +332,68 @@ pub struct CommittedCursor {
     /// byte 0, and every spool row. Read out of the stored JSON - the
     /// column already holds it, so no migration.
     pub tail_fingerprint: Option<ContentFingerprint>,
+    /// The file's ctime as the same row's batch read it (the marker's
+    /// `ctime`, #619): the file source re-arms a deferred
+    /// `delete_after_commit` after a restart only while the file still has
+    /// it, which catches a same-length rewrite between the first page and the
+    /// page below `end_byte` that also set the mtime back. `None` for a row
+    /// written before the marker recorded it (armed as before), a stored
+    /// value that is not a timestamp, and every spool row. Read out of the
+    /// stored JSON, like the fields above: no migration.
+    pub observed_ctime: Option<String>,
 }
 
-/// Where the ledger says a Kafka partition resumes, for one consumer group
-/// (#614): the end offset of the NEWEST committed batch read from it.
+/// Where the ledger says a Kafka partition resumes, for one consumer group and
+/// one incarnation of the topic (#614): the highest end offset any committed
+/// batch of that incarnation reached.
 ///
 /// The group's committed offset on the broker cannot answer this. The adapter
 /// reads with `assign()`, so its commits carry no group generation, and Kafka
 /// accepts one from an engine whose claim has already moved on - backwards or
 /// forwards. The ledger's commit is fenced (#557); this is what it recorded.
+///
+/// A (topic, partition, consumer group) has one answer per incarnation the
+/// ledger holds rows of, because the end offsets of two incarnations are
+/// unrelated: a topic deleted and created again under the same name numbers
+/// its offsets from zero, and the old log's highest end, taken as the new
+/// log's, would make the restart skip the new log's first records. The
+/// incarnation is the topic id the rows' markers carry; the adapter knows the
+/// current one and picks the answer that belongs to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommittedKafkaOffset {
     pub topic: String,
     pub partition: i32,
     pub consumer_group: String,
-    /// The newest committed batch's last offset; the partition resumes at the
-    /// one after it. Newest by `(created_at, batch_id)` - the order the windows
-    /// were read, and the row pruning keeps - not the highest: a topic that
-    /// was deleted and recreated starts its offsets again, and the old topic's
-    /// highest offset would skip the new one's first records.
+    /// The topic id of the rows this answer covers, or `None` for rows written
+    /// before the id was recorded (or by a broker that has none). Rows of an
+    /// unknown id are never compared with rows of a known one: whether they
+    /// are the same incarnation cannot be told.
+    pub topic_id: Option<String>,
+    /// The partition resumes at the offset after this one.
+    ///
+    /// For a known `topic_id`: the HIGHEST last offset of any committed batch
+    /// of that id, not the newest-created row's - unless two committed batches'
+    /// ranges of the id overlap, which means offsets
+    /// were reused (a log truncated by an unclean leader election keeps its
+    /// topic id), and then the NEWEST batch's last offset, so the replacement
+    /// records are read again and never skipped. Recovery can commit a window
+    /// created earlier above one created later (a damaged range re-read as a
+    /// new row while the window above it waited), and resuming from the newer,
+    /// lower row re-archives the range between.
+    ///
+    /// For an unknown `topic_id`: the newest committed batch's last offset,
+    /// newest by `(created_at, batch_id)` - the rule before the id existed. A
+    /// maximum across rows that may be of different incarnations is not safe.
     pub end_offset: i64,
+    /// The last offset of the newest-created committed row of the (topic,
+    /// partition, consumer group), on the answer of the incarnation that holds
+    /// that row, and `None` on the others. It is not `end_offset`, which for a
+    /// known id is the highest end of the id's rows: the adapter falls back to
+    /// this, as the ledger always did, when the broker does not give the
+    /// topic's current id, and a newest row ending below an older one of the
+    /// same id (a topic recreated while the adapter still held the old id)
+    /// must not resume at the older one's end.
+    pub newest_end: Option<i64>,
 }
 
 /// A `content_fingerprint` read out of a stored marker as JSON text. Anything
@@ -313,6 +487,42 @@ mod tests {
                 serde_json::from_value::<BatchRecord>(newer)
                     .unwrap_or_else(|e| panic!("{stored}: {e}"))
                     .verification_class,
+                None,
+                "{stored}"
+            );
+        }
+    }
+
+    /// #626: a serialized record carries `sealed_at` only when known, and one
+    /// that is not an RFC 3339 instant - or not a string - reads as unknown
+    /// instead of failing the whole digest.
+    #[test]
+    fn a_serialized_seal_instant_is_optional_and_read_leniently() {
+        let mut rec = crate::test_battery::sample_record("serde-626");
+        let legacy = serde_json::to_value(&rec).unwrap();
+        assert!(legacy.get("sealed_at").is_none(), "{legacy}");
+        rec.sealed_at = Some("2026-03-04T05:59:59.900+00:00".into());
+        let known = serde_json::to_value(&rec).unwrap();
+        assert_eq!(
+            serde_json::from_value::<BatchRecord>(known)
+                .unwrap()
+                .sealed_at
+                .as_deref(),
+            Some("2026-03-04T05:59:59.900+00:00")
+        );
+        for stored in [
+            serde_json::json!("yesterday"),
+            serde_json::json!(""),
+            serde_json::json!(42),
+            serde_json::json!({"at": 1}),
+            serde_json::Value::Null,
+        ] {
+            let mut odd = legacy.clone();
+            odd["sealed_at"] = stored.clone();
+            assert_eq!(
+                serde_json::from_value::<BatchRecord>(odd)
+                    .unwrap_or_else(|e| panic!("{stored}: {e}"))
+                    .sealed_at,
                 None,
                 "{stored}"
             );

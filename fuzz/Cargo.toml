@@ -8,11 +8,28 @@ edition = "2021"
 cargo-fuzz = true
 
 [dependencies]
+blake3 = "1"
 libfuzzer-sys = "0.4"
 serde_json = "1"
+uuid = "1"
 vtop-core = { path = "../crates/vtop-core" }
-# The Kafka gateway's batch decoder only: no broker, no metadata plane.
+# The decoders of #729. vtop-cli is built without its `kafka` feature, so
+# librdkafka is not in the fuzz build; vtop-kafka without its default
+# features, which only add the native and metadata-plane backends.
+vtop-cli = { path = "../crates/vtop-cli", default-features = false }
 vtop-kafka = { path = "../crates/vtop-kafka", default-features = false }
+vtop-log = { path = "../crates/vtop-log" }
+vtop-meta = { path = "../crates/vtop-meta" }
+vtop-observe = { path = "../crates/vtop-observe" }
+vtop-protocol = { path = "../crates/vtop-protocol" }
+vtop-state = { path = "../crates/vtop-state" }
+vtop-upload = { path = "../crates/vtop-upload" }
+
+# The harness code the targets share (checksum repair, a no-op executor).
+[lib]
+path = "src/lib.rs"
+test = false
+doc = false
 
 [[bin]]
 name = "detect_record"
@@ -38,6 +55,62 @@ bench = false
 [[bin]]
 name = "manifest_parse"
 path = "fuzz_targets/manifest_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol_frame"
+path = "fuzz_targets/protocol_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kafka_request"
+path = "fuzz_targets/kafka_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "segment_codec"
+path = "fuzz_targets/segment_codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "meta_storage_files"
+path = "fuzz_targets/meta_storage_files.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vtpm_frame"
+path = "fuzz_targets/vtpm_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ledger_rows"
+path = "fuzz_targets/ledger_rows.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_files"
+path = "fuzz_targets/session_files.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "audit_record"
+path = "fuzz_targets/audit_record.rs"
 test = false
 doc = false
 bench = false
