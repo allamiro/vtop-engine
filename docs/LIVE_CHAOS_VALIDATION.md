@@ -173,7 +173,7 @@ plane promises.
 
 Recording. `vtop-node produce --history FILE` appends one JSON line before
 each batch goes out (its producer, epoch and sequences) and one when it is
-answered: `ok` with the acknowledged offset, `fail` for a refusal made before
+answered: `ok` with the offsets the broker answered with (a resent batch it already holds is answered with its original offsets), `fail` for a refusal made before
 anything was appended (`WrongRange`, a sequence conflict), or `info` when the
 outcome is unknown: no answer, a dropped connection, or an answer that does not
 settle it. `Overloaded` ("quorum not reached") is `info`, because the leader
@@ -203,6 +203,7 @@ against it:
 | `order` | a producer acknowledged at an offset below one it was acknowledged at earlier |
 | `phantom` | a visible record that no acknowledged batch claims and no whole unanswered batch accounts for; a record of a refused (`fail`) batch, which is what a fenced leader's writes would be (the #641 shape) |
 | `rewritten` | a record an earlier read saw, below the last read's high watermark, that the last read sees differently |
+| `missed` | a record the last read holds below an earlier read's high watermark that the earlier read did not see: a committed record is visible to every read that covers it |
 | `hwm` | a later read reporting a lower committed high watermark |
 | `unkeyed` | a visible record whose key is not a producer sequence |
 

@@ -31,7 +31,7 @@ class History:
         fields.setdefault("time_us", self.clock)
         self.lines.append(json.dumps(fields))
 
-    def produce(self, process, batch, first, count, outcome, next_offset=None):
+    def produce(self, process, batch, first, count, outcome, next_offset=None, first_offset=None):
         self._event(op="produce", type="invoke", process=process, batch=batch,
                     first_sequence=first, count=count, fencing_epoch=1)
         if outcome is None:
@@ -40,6 +40,8 @@ class History:
                      first_sequence=first, count=count)
         if outcome == "ok":
             event["committed_next_offset"] = next_offset
+            if first_offset is not None:
+                event["first_offset"] = first_offset
         self._event(**event)
         return self
 
@@ -140,6 +142,24 @@ class CleanHistories(unittest.TestCase):
         h.read("r", [(0, 0, 10)], 10)
         self.assertTrue(h.check()["valid"], h.check())
 
+    def test_a_resent_batch_answered_under_a_later_watermark_sits_where_it_was(self):
+        # Review of #878: the broker answers a resent, already-acknowledged
+        # batch with its original offsets and the range's current watermark.
+        h = History()
+        h.produce("produce:P:1:100", 1, 0, 10, "ok", 10).produce("produce:P:1:100", 2, 10, 10, "ok", 20)
+        h.produce("produce:P:1:200", 1, 0, 10, "ok", 20, first_offset=0)
+        h.read("r", [(0, 0, 20)], 20)
+        self.assertTrue(h.check()["valid"], h.check())
+
+    def test_unanswered_batches_are_assigned_across_groups(self):
+        # Review of #878: B (0..4) and C (5..9) tile the first visible run, but
+        # then nothing explains the second; A (0..9) explains the first and B
+        # the second.
+        h = History()
+        h.produce("b", 1, 0, 5, "info").produce("c", 1, 5, 5, "info").produce("a", 1, 0, 10, "info")
+        h.read("r", [(0, 0, 10), (10, 0, 5)], 15)
+        self.assertTrue(h.check()["valid"], h.check())
+
 class Violations(unittest.TestCase):
     def test_611_an_acknowledged_suffix_truncated_at_failover_is_lost(self):
         h = History()
@@ -235,6 +255,22 @@ class Violations(unittest.TestCase):
         h.produce("p", 1, 0, 10, "ok", 10)
         h.read("r", [(0, 0, 9), (9, 9, 1, False)], 10)
         self.assertEqual(kinds(h.check()), {"lost"})
+
+    def test_an_earlier_read_that_missed_a_committed_record_is_caught(self):
+        # Review of #878: a read with a hole below its own high watermark,
+        # where a later read shows the record.
+        h = History()
+        h.produce("p", 1, 0, 10, "ok", 10)
+        h.read("r1", [(0, 0, 9)], 10).read("r2", [(0, 0, 10)], 10)
+        result = h.check()
+        self.assertEqual(kinds(result), {"missed"}, result)
+        self.assertIn("offset 9", result["violations"]["missed"]["first"][0])
+
+    def test_an_acknowledgement_placed_by_its_offsets_is_checked_there(self):
+        h = History()
+        h.produce("p", 1, 0, 10, "ok", 20, first_offset=5)
+        h.read("r", [(0, 0, 10)], 20)
+        self.assertIn("lost", kinds(h.check()))
 
     def test_the_high_watermark_never_goes_back(self):
         h = History()
