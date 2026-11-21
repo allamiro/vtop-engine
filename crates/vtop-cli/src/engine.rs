@@ -3011,8 +3011,6 @@ pub struct Engine {
     upload_slots: Arc<tokio::sync::Semaphore>,
     /// The width `upload_slots` currently stands for.
     upload_slots_size: usize,
-    /// Signalled by each batch task as it finishes.
-    batch_done: Arc<tokio::sync::Notify>,
     /// Requests and throttles the width controller last saw (#102).
     width_seen: (u64, u64),
     /// Permits still to be withdrawn after the width narrowed while they
@@ -3485,7 +3483,6 @@ impl Engine {
             inflight: HashMap::new(),
             upload_slots,
             upload_slots_size,
-            batch_done: Arc::default(),
             width_seen: (0, 0),
             upload_slots_debt: 0,
             _instance_locks: Vec::new(),
@@ -4317,7 +4314,6 @@ impl Engine {
                 let bytes = read.records.iter().map(Vec::len).sum();
                 let owned = owned.clone();
                 let slots = Arc::clone(&self.upload_slots);
-                let done = Arc::clone(&self.batch_done);
                 // The task carries the cycle's span and subscriber, as the
                 // future polled inside the cycle did.
                 let task = tokio::spawn(
@@ -4333,7 +4329,6 @@ impl Engine {
                                 rebuild,
                             )
                             .await;
-                        done.notify_one();
                         step
                     }
                     .in_current_span()
@@ -4468,27 +4463,31 @@ impl Engine {
                 }
             }
             Wait::Any(limit) => {
-                let deadline = limit.map(|d| tokio::time::Instant::now() + d);
-                loop {
-                    let Some(queue) = self.inflight.get(source_type) else {
-                        return;
-                    };
-                    let mut running = queue.iter().filter_map(|e| e.task.as_ref()).peekable();
-                    if running.peek().is_none() {
-                        return;
-                    }
-                    if running.any(|t| t.is_finished()) {
-                        return;
-                    }
-                    let notified = self.batch_done.notified();
-                    match deadline {
-                        Some(at) => {
-                            if tokio::time::timeout_at(at, notified).await.is_err() {
-                                return;
-                            }
-                        }
-                        None => notified.await,
-                    }
+                // On the join handles themselves (review of #895): a
+                // notification sent by the task before it returned could be
+                // taken by a waiter that then found the task not yet
+                // finished and waited again, for ever.
+                let Some(queue) = self.inflight.get_mut(source_type) else {
+                    return;
+                };
+                let (at, running): (Vec<usize>, Vec<_>) = queue
+                    .iter_mut()
+                    .enumerate()
+                    .filter_map(|(i, e)| e.task.as_mut().map(|t| (i, t)))
+                    .unzip();
+                if running.is_empty() {
+                    return;
+                }
+                let any = futures::future::select_all(running);
+                let finished = match limit {
+                    Some(limit) => tokio::time::timeout(limit, any).await.ok(),
+                    None => Some(any.await),
+                };
+                if let Some((result, which, rest)) = finished {
+                    drop(rest);
+                    let entry = &mut queue[at[which]];
+                    entry.task = None;
+                    entry.result = Some(joined(result));
                 }
             }
         }
@@ -8374,6 +8373,70 @@ mod tests {
             "a throttle answered between cycles left the width at {} (was {before})",
             engine.upload_width()
         );
+    }
+
+    /// Review of #895: a wait for any batch to finish returns when one has,
+    /// on a multi-threaded runtime too. Waiting on a notification the task
+    /// sent before it returned could miss the completion and wait for ever;
+    /// the wait is on the join handles now. Many rounds, each with tasks that
+    /// finish while the engine is already waiting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn waiting_for_any_batch_returns_once_one_has_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, _store, input) = pipelined_file_engine(dir.path(), 0).await;
+        let marker = ProgressMarker::File {
+            path: input.to_string_lossy().into_owned(),
+            inode: None,
+            start_byte: 0,
+            end_byte: 1,
+            file_size: 1,
+            mtime: String::new(),
+            content_fingerprint: None,
+            tail_fingerprint: None,
+            ctime: None,
+        };
+        for round in 0..200u64 {
+            let task = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_micros(round % 7 * 50)).await;
+                Ok(VerifyStep::Finished(BatchOutcome {
+                    batch_id: format!("b{round}"),
+                    final_state: BatchState::Discovered,
+                    committed: false,
+                    record_count: 0,
+                    object_uri: None,
+                    metrics: None,
+                }))
+            });
+            engine
+                .inflight
+                .entry(SourceType::File)
+                .or_default()
+                .push_back(InFlight {
+                    unit: unit_key(&marker),
+                    window: Box::new(RecordedWindow {
+                        start: marker.clone(),
+                        end: marker.clone(),
+                        sealed_at: None,
+                        digest: None,
+                        object_uri: None,
+                        batch_id: None,
+                        record_count: Some(0),
+                        bounded: false,
+                    }),
+                    bytes: 0,
+                    superseded: false,
+                    failure_handled: false,
+                    task: Some(task),
+                    result: None,
+                });
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                engine.wait_for_inflight(&SourceType::File, Wait::Any(None)),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: a finished batch was never seen"));
+            engine.inflight.get_mut(&SourceType::File).unwrap().clear();
+        }
     }
 
     /// The upload slots follow the width the controller chooses (#102). A
