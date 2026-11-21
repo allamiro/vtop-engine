@@ -213,7 +213,11 @@ async fn a_pass_that_fills_its_budget_reads_on_without_re_assigning() {
             else {
                 panic!("a Kafka read carries Kafka markers");
             };
-            assert!(read.records.len() <= 10, "a pass kept {} records over its budget", read.records.len());
+            assert!(
+                read.records.len() <= 10,
+                "a pass kept {} records over its budget",
+                read.records.len()
+            );
             offsets.push((*start_offset, *end_offset));
         }
         if offsets.last().is_some_and(|&(_, end)| end == 29) {
@@ -222,10 +226,16 @@ async fn a_pass_that_fills_its_budget_reads_on_without_re_assigning() {
     }
     let mut next = 0;
     for &(start, end) in &offsets {
-        assert_eq!(start, next, "a pass skipped or repeated records: {offsets:?}");
+        assert_eq!(
+            start, next,
+            "a pass skipped or repeated records: {offsets:?}"
+        );
         next = end + 1;
     }
-    assert_eq!(next, 30, "the passes did not reach the end of the topic: {offsets:?}");
+    assert_eq!(
+        next, 30,
+        "the passes did not reach the end of the topic: {offsets:?}"
+    );
     assert_eq!(
         adapter.assignments(),
         1,

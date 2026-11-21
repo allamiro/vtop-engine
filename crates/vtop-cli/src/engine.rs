@@ -11373,7 +11373,10 @@ mod tests {
         let driver = async {
             arrivals.recv().await.expect("the first pass starts");
             permits.add_permits(1); // reads the line
-            arrivals.recv().await.expect("a productive pass is followed at once");
+            arrivals
+                .recv()
+                .await
+                .expect("a productive pass is followed at once");
             permits.add_permits(1); // reads nothing
             arrivals
                 .recv()
