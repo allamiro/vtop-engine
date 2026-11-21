@@ -12929,7 +12929,9 @@ mod tests {
             object_uri: &str,
             checksum: Option<ObjectChecksum<'_>>,
         ) -> Result<vtop_upload::StoredObject, VtopError> {
-            self.inner.put_object(local_path, object_uri, checksum).await
+            self.inner
+                .put_object(local_path, object_uri, checksum)
+                .await
         }
         async fn put_manifest(
             &self,
