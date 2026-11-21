@@ -4,17 +4,17 @@ Which parts of VTOP are production, preview or experimental, why, and which
 criteria are still open. It is the component table criterion H2 of the
 production-readiness bar (#714) asks for, and the scope decision of #740.
 
-Decision status: PROPOSED
+Decision status: CONFIRMED
 
 > [!IMPORTANT]
-> **Every label on this page is PROPOSED, not decided.** The labels were
-> derived from the code, CI and issues as they stand on 2026-11-20 (`main`
-> at v0.10.1 plus what has merged since). The maintainer confirms or
-> changes each one on #740; until then no row on this page is a promise,
-> and VTOP is still a **prototype / reference implementation**, as the
+> **The maintainer confirmed every label on this page on 2026-11-21**, with
+> the proposed answer to each of D1 to D9 below. The labels were derived from
+> the code, CI and issues as they stood on 2026-11-20. A label is what the
+> evidence supports, not a promise of support: VTOP is still a **prototype /
+> reference implementation** until 1.0, as the
 > [README](https://github.com/allamiro/vtop-engine#status-and-limits) and the
-> [support policy](../SUPPORT.md) say. A proposed row becomes `CONFIRMED` in
-> the same commit that records the maintainer's answer.
+> [support policy](../SUPPORT.md) say. A label changes only in a commit that
+> records the evidence for the change.
 
 ## What the labels mean
 
@@ -35,33 +35,33 @@ is the scope the maintainer is asked to commit to. A component is only
 labelled `production` at 1.0 if the criteria in its *Open criteria* line are
 met by then.
 
-## The proposed table
+## The status table
 
 <!-- status:begin -->
 
 | Component | Today | At 1.0 | Decision |
 |---|---|---|---|
-| Archive engine core | preview | production | PROPOSED |
-| Kafka source | preview | production | PROPOSED |
-| File source | preview | production | PROPOSED |
-| Syslog spool source | preview | production | PROPOSED |
-| S3-compatible upload (`s3_native`) | preview | production | PROPOSED |
-| Local directory upload (`localfs`) | experimental | preview | PROPOSED |
-| Command-line upload backends (`awscli`, `s3cmd`, `minio`) | experimental | experimental | PROPOSED |
-| SQLite state store | preview | production | PROPOSED |
-| PostgreSQL state store | preview | production | PROPOSED |
-| Manifests 0.1 to 0.3 | preview | production | PROPOSED |
-| Manifest 0.4 and MAC key rotation | preview | production | PROPOSED |
-| Verification, scrub and coverage audit | preview | production | PROPOSED |
-| S3 Object Lock profile | experimental | preview | PROPOSED |
-| Audit trail | preview | production | PROPOSED |
-| Prometheus metrics, alert rules and dashboards | preview | production | PROPOSED |
-| OpenTelemetry export | experimental | preview | PROPOSED |
-| Metadata plane (`vtop-meta`) | preview | preview | PROPOSED |
-| Data node (`vtop-node`) | preview | preview | PROPOSED |
-| Replicated broker (`vtop-broker`) | preview | preview | PROPOSED |
-| Kafka gateway | experimental | preview | PROPOSED |
-| Helm chart | preview | preview | PROPOSED |
+| Archive engine core | preview | production | CONFIRMED |
+| Kafka source | preview | production | CONFIRMED |
+| File source | preview | production | CONFIRMED |
+| Syslog spool source | preview | production | CONFIRMED |
+| S3-compatible upload (`s3_native`) | preview | production | CONFIRMED |
+| Local directory upload (`localfs`) | experimental | preview | CONFIRMED |
+| Command-line upload backends (`awscli`, `s3cmd`, `minio`) | experimental | experimental | CONFIRMED |
+| SQLite state store | preview | production | CONFIRMED |
+| PostgreSQL state store | preview | production | CONFIRMED |
+| Manifests 0.1 to 0.3 | preview | production | CONFIRMED |
+| Manifest 0.4 and MAC key rotation | preview | production | CONFIRMED |
+| Verification, scrub and coverage audit | preview | production | CONFIRMED |
+| S3 Object Lock profile | experimental | preview | CONFIRMED |
+| Audit trail | preview | production | CONFIRMED |
+| Prometheus metrics, alert rules and dashboards | preview | production | CONFIRMED |
+| OpenTelemetry export | experimental | preview | CONFIRMED |
+| Metadata plane (`vtop-meta`) | preview | preview | CONFIRMED |
+| Data node (`vtop-node`) | preview | preview | CONFIRMED |
+| Replicated broker (`vtop-broker`) | preview | preview | CONFIRMED |
+| Kafka gateway | experimental | preview | CONFIRMED |
+| Helm chart | preview | preview | CONFIRMED |
 
 <!-- status:end -->
 
@@ -79,10 +79,10 @@ quiet period (A1), the 72-hour soak (A3, #726), the real-S3 evidence (B1,
 
 ## What the maintainer decides
 
-Each is a question on #740. The proposal answers it; the maintainer confirms
-or changes the answer.
+Each was a question on #740. The maintainer confirmed the proposed answer to
+all nine on 2026-11-21; the other answer is kept for the record.
 
-| # | Decision | Proposed answer | The other reasonable answer |
+| # | Decision | Confirmed answer | The other reasonable answer |
 |---|---|---|---|
 | D1 | What a label states | Two columns: what the evidence supports today, and the scope committed to at 1.0 | One column, the 1.0 target only, with "prototype" as the project-wide word until then |
 | D2 | The 1.0 scope | The archive engine, its sources, upload, ledger, formats and operator surface. The cluster plane and the Kafka gateway are preview at 1.0 | Add the cluster plane to 1.0, which needs #727 and #728 and the external review (#730) for it |
@@ -275,6 +275,6 @@ opened 2026-11-15, #782). The criterion IDs (A1, B1 and so on) are those of
   production-ready", "until ...", "the bar for ...") is allowed;
 - the README does not link to this page.
 
-When the maintainer confirms the labels, the rows change to `CONFIRMED`, the
-status line follows, and README and the other pages must keep saying no more
-than the table does.
+The labels are confirmed: the rows read `CONFIRMED` and the status line
+follows. The README and the other pages must keep saying no more than the
+table does.
