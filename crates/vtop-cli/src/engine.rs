@@ -3013,6 +3013,8 @@ pub struct Engine {
     upload_slots_size: usize,
     /// Signalled by each batch task as it finishes.
     batch_done: Arc<tokio::sync::Notify>,
+    /// Requests and throttles the width controller last saw (#102).
+    width_seen: (u64, u64),
     /// Permits still to be withdrawn after the width narrowed while they
     /// were in use.
     upload_slots_debt: usize,
@@ -3484,6 +3486,7 @@ impl Engine {
             upload_slots,
             upload_slots_size,
             batch_done: Arc::default(),
+            width_seen: (0, 0),
             upload_slots_debt: 0,
             _instance_locks: Vec::new(),
         })
@@ -3905,8 +3908,9 @@ impl Engine {
     ) -> Result<Vec<BatchOutcome>, VtopError> {
         // Backpressure: while the batches in flight hold the byte budget, read
         // nothing more; wait for one of them to finish and act on it.
-        if !force_flush && self.inflight_bytes(source_type) >= self.inflight_byte_budget() {
+        if !force_flush && self.inflight_is_full(source_type) {
             self.wait_for_inflight(source_type, Wait::Any(None)).await;
+            self.observe_width();
             return self.settle_inflight(adapter, source_type).await;
         }
         let sources = adapter.discover_sources().await?;
@@ -4279,11 +4283,6 @@ impl Engine {
             mx.upload_width.set(limit as i64);
         }
         self.resize_upload_slots(limit);
-        let throttles_before = self.throttles.load(Ordering::Relaxed);
-        // A cycle that ISSUED no upload probes nothing (review): idle polling
-        // after a throttle must not walk the width back up, and neither may a
-        // cycle whose batches all failed before reaching the store.
-        let attempts_before = self.attempts.load(Ordering::Relaxed);
 
         // ---- Hand the sealed windows to the pipeline -------------------
         //
@@ -4367,25 +4366,36 @@ impl Engine {
                 .await;
         }
 
-        // The cycle's verdict for the width controller (#102): any throttle
-        // in it halves the next width; none grows it by one.
-        if self.config.batching.adaptive_width.enabled
-            && self.attempts.load(Ordering::Relaxed) > attempts_before
-        {
-            let throttled = self.throttles.load(Ordering::Relaxed) > throttles_before;
-            let before = self.width.width();
-            let after = self.width.observe_cycle(throttled);
-            if after != before {
-                tracing::info!(
-                    from = before,
-                    to = after,
-                    throttled,
-                    "upload_width_adjusted"
-                );
-            }
-        }
-
+        self.observe_width();
         self.settle_inflight(adapter, source_type).await
+    }
+
+    /// The width controller's verdict (#102) on every request answered since
+    /// it last looked: any throttle halves the next width; none grows it by
+    /// one. Batch tasks answer between cycles now, so the baseline is the
+    /// last observation, not the start of this cycle: a throttle that landed
+    /// while the source was polled, or during the run loop's backoff, is
+    /// counted all the same. No request answered probes nothing (review):
+    /// idle polling after a throttle must not walk the width back up.
+    fn observe_width(&mut self) {
+        let attempts = self.attempts.load(Ordering::Relaxed);
+        let throttles = self.throttles.load(Ordering::Relaxed);
+        let (attempts_seen, throttles_seen) = self.width_seen;
+        if !self.config.batching.adaptive_width.enabled || attempts <= attempts_seen {
+            return;
+        }
+        self.width_seen = (attempts, throttles);
+        let throttled = throttles > throttles_seen;
+        let before = self.width.width();
+        let after = self.width.observe_cycle(throttled);
+        if after != before {
+            tracing::info!(
+                from = before,
+                to = after,
+                throttled,
+                "upload_width_adjusted"
+            );
+        }
     }
 
     /// Publish how many sealed batches have not settled, across source types.
@@ -4394,6 +4404,18 @@ impl Engine {
             let n: usize = self.inflight.values().map(VecDeque::len).sum();
             mx.sealed_batches_in_flight.set(n as i64);
         }
+    }
+
+    /// Whether the batches of `source_type` that have not settled hold the
+    /// in-flight budget: `width × max_bytes` uncompressed bytes, or `2 ×
+    /// width` batches. The count bounds what the bytes do not see (review):
+    /// Kafka tombstones and empty values carry no payload, but each batch
+    /// still holds its records, markers and a task, and behind a stalled
+    /// upload the bytes alone would let the whole backlog queue up.
+    fn inflight_is_full(&self, source_type: &SourceType) -> bool {
+        let batches = self.inflight.get(source_type).map_or(0, VecDeque::len);
+        batches >= self.upload_width().max(1).saturating_mul(2)
+            || self.inflight_bytes(source_type) >= self.inflight_byte_budget()
     }
 
     /// Bytes held by the batches of `source_type` that have not settled.
@@ -8306,6 +8328,66 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         panic!("batches still in flight after 500 passes: {outcomes:?}");
+    }
+
+    /// Review of #895: batches whose records carry no payload (Kafka
+    /// tombstones, empty values) add nothing to the in-flight bytes, so behind
+    /// a stalled upload the byte budget alone would let the whole backlog
+    /// queue up. The count bound stops reading at twice the width.
+    #[tokio::test]
+    async fn sealed_batches_stop_reading_at_twice_the_width_whatever_their_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, store, _input) = pipelined_file_engine(dir.path(), 9).await;
+        engine.config.batching.max_concurrent_batches = 2;
+        engine.config.batching.max_records = 1;
+        // Every object put waits: nothing settles while the passes run.
+        let gate = store.gate("");
+        // A full queue makes the next pass wait for a batch to finish, which
+        // never happens here: stop at the bound rather than wait.
+        for _ in 0..8 {
+            if engine.inflight_is_full(&SourceType::File) {
+                break;
+            }
+            engine.run_source(SourceType::File, false).await.unwrap();
+        }
+        let queued = engine
+            .inflight
+            .get(&SourceType::File)
+            .map_or(0, VecDeque::len);
+        assert_eq!(
+            queued, 4,
+            "sealed batches kept queueing behind a stalled upload: {queued} with a width of 2"
+        );
+        gate.add_permits(1_000);
+        engine.run_source(SourceType::File, true).await.unwrap();
+        for _ in 0..20 {
+            let _ = engine.run_source(SourceType::File, true).await;
+        }
+        let len = std::fs::metadata(dir.path().join("in.log")).unwrap().len() as i128;
+        assert_committed_without_a_gap("after the stall", &engine, len).await;
+    }
+
+    /// Review of #895: batch tasks answer between cycles, so a throttle can
+    /// land while the source is polled or the run loop backs off. The width
+    /// controller judges everything answered since it last looked (#102),
+    /// not only what a cycle saw between two of its own reads.
+    #[tokio::test]
+    async fn a_throttle_answered_between_cycles_still_narrows_the_width() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, _store, _input) = pipelined_file_engine(dir.path(), 0).await;
+        engine.config.batching.adaptive_width.enabled = true;
+        engine.config.batching.adaptive_width.min_width = 1;
+        let before = engine.upload_width();
+        // A batch task's request was answered with a throttle after the last
+        // cycle ended.
+        engine.attempts.fetch_add(1, Ordering::Relaxed);
+        engine.throttles.fetch_add(1, Ordering::Relaxed);
+        engine.run_source(SourceType::File, false).await.unwrap();
+        assert!(
+            engine.upload_width() < before,
+            "a throttle answered between cycles left the width at {} (was {before})",
+            engine.upload_width()
+        );
     }
 
     /// The upload slots follow the width the controller chooses (#102). A

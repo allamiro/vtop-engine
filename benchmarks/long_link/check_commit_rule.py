@@ -18,6 +18,13 @@ KAFKA = "vtop-longlink-kafka"
 
 def main() -> int:
     run, group = sys.argv[1], sys.argv[2]
+    # The group's offsets FIRST, then the ledger: the engine writes VERIFIED
+    # before it commits to Kafka, so a ledger read after the offsets is at
+    # least as new as they are. In the other order, an engine still running
+    # commits between the two reads and the check reports a false violation.
+    described = subprocess.run(
+        ["docker", "exec", KAFKA, "/opt/kafka/bin/kafka-consumer-groups.sh", "--bootstrap-server", "localhost:9092",
+         "--describe", "--group", group], capture_output=True, text=True, check=False).stdout
     tmp = tempfile.mkdtemp()
     for suffix in ("", "-wal", "-shm"):
         src = os.path.join(run, "state", "vtop.db" + suffix)
@@ -25,9 +32,6 @@ def main() -> int:
             shutil.copy(src, os.path.join(tmp, "vtop.db" + suffix))
     rows = sqlite3.connect(os.path.join(tmp, "vtop.db")).execute(
         "select state, progress_start_json, progress_end_json from batches").fetchall()
-    described = subprocess.run(
-        ["docker", "exec", KAFKA, "/opt/kafka/bin/kafka-consumer-groups.sh", "--bootstrap-server", "localhost:9092",
-         "--describe", "--group", group], capture_output=True, text=True, check=False).stdout
     committed = {}
     for line in described.splitlines():
         f = line.split()
