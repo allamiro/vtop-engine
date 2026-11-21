@@ -523,7 +523,6 @@ impl ProgressMarker {
                     path: first_path,
                     inode: first_inode,
                     start_byte: first_start,
-                    received_time_start: first_received,
                     ..
                 },
                 ProgressMarker::SyslogSpool {
@@ -531,7 +530,6 @@ impl ProgressMarker {
                     path,
                     inode,
                     start_byte,
-                    received_time_start,
                     ..
                 },
             ) if first_spool == spool_id
@@ -540,11 +538,45 @@ impl ProgressMarker {
                 && first_start <= start_byte =>
             {
                 *start_byte = *first_start;
-                *received_time_start = first_received.clone();
+                span.widen_received_times(first);
             }
             _ => {}
         }
         span
+    }
+
+    /// Widen a spool marker's received-time range to cover `other`'s: the
+    /// earlier `received_time_start` and the later `received_time_end`
+    /// ([`crate::event_time::earliest`] and [`crate::event_time::latest`]).
+    /// A window's range is the minimum and maximum of its reads' ranges,
+    /// not its first read's start and last read's end, as for a batch's
+    /// event time (#559): a collector can write lines out of time order.
+    /// Does nothing unless both are spool markers of the same spool file.
+    pub fn widen_received_times(&mut self, other: &Self) {
+        if let (
+            ProgressMarker::SyslogSpool {
+                spool_id,
+                path,
+                received_time_start,
+                received_time_end,
+                ..
+            },
+            ProgressMarker::SyslogSpool {
+                spool_id: other_spool,
+                path: other_path,
+                received_time_start: other_start,
+                received_time_end: other_end,
+                ..
+            },
+        ) = (self, other)
+        {
+            if spool_id == other_spool && path == other_path {
+                *received_time_start =
+                    crate::event_time::earliest(other_start.clone(), received_time_start.take());
+                *received_time_end =
+                    crate::event_time::latest(other_end.clone(), received_time_end.take());
+            }
+        }
     }
 
     /// This marker as a manifest carries it: without the fields #578, #620
@@ -927,6 +959,68 @@ mod tests {
             ProgressMarker::spanning(&file("/a", Some(7), 12, 12), &one),
             one
         );
+    }
+
+    /// A spool window's received-time range is the earliest and latest of its
+    /// reads' ranges, compared as instants: a collector can write a line
+    /// whose time is earlier than one before it. A read that found no time
+    /// takes nothing away from one that did, and another spool lends none.
+    #[test]
+    fn a_spool_span_received_range_is_the_earliest_and_latest_of_its_reads() {
+        let timed = |start: u64, end: u64, lo: Option<&str>, hi: Option<&str>| {
+            let mut m = spool(Some(4), start, end, lo);
+            if let ProgressMarker::SyslogSpool {
+                received_time_end, ..
+            } = &mut m
+            {
+                *received_time_end = hi.map(str::to_owned);
+            }
+            m
+        };
+        let received = |m: &ProgressMarker| match m {
+            ProgressMarker::SyslogSpool {
+                received_time_start,
+                received_time_end,
+                ..
+            } => (received_time_start.clone(), received_time_end.clone()),
+            _ => unreachable!(),
+        };
+        let first = timed(
+            0,
+            40,
+            Some("2026-11-14T11:00:00+01:00"),
+            Some("2026-11-14T10:30:00Z"),
+        );
+        let last = timed(
+            40,
+            90,
+            Some("2026-11-14T10:05:00Z"),
+            Some("2026-11-14T10:20:00Z"),
+        );
+        let span = ProgressMarker::spanning(&first, &last);
+        assert_eq!(span.range_token(), "b0-90");
+        assert_eq!(
+            received(&span),
+            (
+                // 11:00+01:00 is 10:00Z, earlier than the last read's 10:05Z.
+                Some("2026-11-14T11:00:00+01:00".into()),
+                Some("2026-11-14T10:30:00Z".into())
+            )
+        );
+
+        let untimed = timed(40, 90, None, None);
+        assert_eq!(
+            received(&ProgressMarker::spanning(&first, &untimed)),
+            received(&first)
+        );
+
+        let mut other = last.clone();
+        if let ProgressMarker::SyslogSpool { path, .. } = &mut other {
+            *path = "/other".into();
+        }
+        let mut widened = other.clone();
+        widened.widen_received_times(&first);
+        assert_eq!(widened, other, "another spool's times were lent");
     }
 
     /// #620 with #622: a span ends where the LAST read ended, so its tail
