@@ -1286,7 +1286,8 @@ jobs:
             scripts/live-chaos/run-all.sh \
             scripts/live-chaos/gen-certs.sh \
             scripts/live-chaos/scenarios/*.sh \
-            scripts/live-chaos/engine/*.sh
+            scripts/live-chaos/engine/*.sh \
+            scripts/live-chaos/soak/*.sh
 
       - name: bats
         run: |
@@ -1613,6 +1614,12 @@ jobs:
       # including ones shaped like past bugs. Pure Python; seconds.
       - name: Test the history checker
         run: python3 -m unittest discover -s scripts/live-chaos/history -p 'test_*.py'
+
+      # The cluster soak's profiles and evaluator (#727): its 7-day run is a
+      # maintainer's, on a host; the rules that judge it are pinned here
+      # against fabricated runs. Pure Python; seconds.
+      - name: Test the cluster soak's evaluator
+        run: python3 -m unittest discover -s scripts/live-chaos/soak -p 'test_*.py'
 
       # CHAOS_WORKDIR is what makes the logs survive to be uploaded. Scenarios
       # delete workdirs they generated themselves, so an artifact pointed at

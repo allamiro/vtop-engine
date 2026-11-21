@@ -546,6 +546,17 @@ emit_lease_yaml() {
   echo "  lease_duration_ms: $LEASE_DURATION_MS"
   echo "  renew_interval_ms: $LEASE_RENEW_MS"
   echo "  poll_interval_ms: $LEASE_POLL_MS"
+  # CHAOS_LEASE_ADMIN_PEERS=1 names all three metadata nodes, so the lease
+  # agent follows a redirect when the one it asks first is not the leader
+  # (#292). A run that kills or partitions the metadata leader needs it (the
+  # cluster soak, #727); scenario 23 spells the same list itself.
+  if [[ "${CHAOS_LEASE_ADMIN_PEERS:-0}" == "1" ]]; then
+    local m
+    echo "  admin_peers:"
+    for m in 1 2 3; do
+      echo "    - { node_id: $m, endpoint: \"$(meta_host "$m"):$(meta_admin_port "$m")\" }"
+    done
+  fi
 }
 
 # emit_follower_config <n: 1|2> [data_dir] [fencing_epoch] [watch-meta-id]

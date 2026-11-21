@@ -1,0 +1,42 @@
+{
+  "name": "smoke",
+  "description": "About 12 minutes: every fault kind once on a small range. It proves the harness works (bring-up, the load, each fault, the reads, retention, the final checks and the evaluator); its trend limits are loose, so it is not evidence about the cluster.",
+  "duration_s": 720,
+  "first_fault_after_s": 90,
+  "fault_interval_s": 90,
+  "quiet_tail_s": 90,
+  "fault_cycle": ["range_leader_kill", "partition", "pause", "disk_full", "clock_step", "meta_leader_kill"],
+  "fault_hold_s": {
+    "range_leader_kill": 5,
+    "meta_leader_kill": 5,
+    "partition": 20,
+    "pause": 15,
+    "disk_full": 20,
+    "clock_step": 20
+  },
+  "clock_step_seconds": [3600, -3600],
+  "recovery_timeout_s": 120,
+  "rate_records_per_s": 20,
+  "batch": 10,
+  "value_bytes": 512,
+  "sample_interval_s": 5,
+  "read_interval_s": 30,
+  "max_segment_bytes": 262144,
+  "retention_bytes": 2097152,
+  "data_tmpfs_mib": 16,
+  "criteria": {
+    "trend_window_fraction": 0.8,
+    "trend_min_pairs": 3,
+    "trend": {
+      "rss_bytes": {"max_growth_pct": 100, "min_abs_growth": 268435456},
+      "open_fds": {"max_growth_pct": 100, "min_abs_growth": 256},
+      "data_dir_bytes": {"max_growth_pct": 100, "min_abs_growth": 8388608}
+    },
+    "max_data_dir_bytes": 4194304,
+    "max_rss_bytes": 2147483648,
+    "min_samples_fraction": 0.7,
+    "max_sample_gap_s": 120,
+    "min_acked_fraction": 0.2,
+    "max_read_gap_s": 180
+  }
+}
