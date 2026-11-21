@@ -22,6 +22,10 @@ on:
       - "docs/**"
       - "mkdocs.yml"
       - "README.md"
+      # Scanned by check-component-status.py (review of #826).
+      - "helm/vtop/README.md"
+      - "observability/README.md"
+      - "benchmarks/README.md"
       - "CONTRIBUTING.md"
       - "SECURITY.md"
       - ".github/ISSUE_TEMPLATE/**"
@@ -45,6 +49,10 @@ on:
       - "docs/**"
       - "mkdocs.yml"
       - "README.md"
+      # Scanned by check-component-status.py (review of #826).
+      - "helm/vtop/README.md"
+      - "observability/README.md"
+      - "benchmarks/README.md"
       - "CONTRIBUTING.md"
       - "SECURITY.md"
       - ".github/ISSUE_TEMPLATE/**"

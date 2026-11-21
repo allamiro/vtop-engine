@@ -82,13 +82,31 @@ CLAIM = re.compile(
     r"|suitable for production|battle[- ]tested|enterprise[- ]grade|mission[- ]critical)\b",
     re.I,
 )
-# Words that make a sentence something other than an assertion.
-QUALIFIER = re.compile(
-    r"\b(?:not|no|never|nor|neither|none|isn't|aren't|cannot|can't|won't|until|unless|"
-    r"before|without|yet|if|whether|when|once|needs?|needed|requires?|bar|criteria|"
+# Words that make a sentence something other than an assertion, when they
+# come BEFORE the claim: a negation ("is not production-ready"), a modal or a
+# plan ("will be", "the bar for", "the path to"), or a condition that opens the
+# sentence ("Until the soak passes, ..."). After the claim, the same words are
+# usually part of a positive assertion ("production-ready without extra
+# configuration", "production-ready and requires no setup"), so they do not
+# count there (review of #826).
+QUALIFIER_BEFORE = re.compile(
+    r"\b(?:what|how|not|no|never|nor|neither|none|nobody|isn't|aren't|wasn't|cannot|can't|won't|"
+    r"until|unless|before|yet|if|whether|when|once|needs?|needed|requires?|bar|criteria|"
     r"criterion|checklist|will|would|planned|target|toward|towards|path|stage|ladder)\b",
     re.I,
 )
+# After the claim, only a subordinator that makes the claim conditional
+# counts: "production-ready once #727 lands", "... until 1.0", "... if TLS is on".
+QUALIFIER_AFTER = re.compile(r"^[\s,]*(?:only\s+)?(?:until|unless|once|if|when|after)\b", re.I)
+
+
+def qualified(sentence: str, claim: re.Match) -> bool:
+    """Whether a qualifier negates or conditions this claim, by its position."""
+    if QUALIFIER_BEFORE.search(sentence[: claim.start()]):
+        return True
+    return bool(QUALIFIER_AFTER.search(sentence[claim.end() :]))
+
+
 # Pages and trees the scan skips: the status page itself, the two internal
 # drafts the site does not publish, and generated or vendored trees.
 SKIP = {
@@ -241,18 +259,52 @@ def strip_comments(line: str, in_comment: bool) -> tuple[str, bool]:
     return "".join(visible), in_comment
 
 
-def sentences(text: str):
-    """(line number, sentence) for prose outside code fences and comments."""
+# A line that starts a block of its own: a heading, a list item, a table row
+# or a blockquote marker. Prose that continues on the next line is joined to
+# it, the way Markdown renders a soft line break (review of #826).
+BLOCK_START = re.compile(r"^\s*(?:#{1,6}\s|[-*+]\s|\d+[.)]\s|\||>)")
+
+
+def paragraphs(text: str):
+    """(first line number, joined text) for each prose block outside code
+    fences and HTML comments; soft-wrapped lines are joined with a space."""
     in_fence = False
     in_comment = False
+    start, parts = 0, []
     for number, raw in enumerate(text.splitlines(), 1):
         if FENCE.match(raw):
+            if parts:
+                yield start, " ".join(parts)
+                start, parts = 0, []
             in_fence = not in_fence
             continue
         if in_fence:
             continue
         line, in_comment = strip_comments(raw, in_comment)
-        for piece in SENTENCE_END.split(line):
+        if not line.strip() or BLOCK_START.match(line):
+            if parts:
+                yield start, " ".join(parts)
+                start, parts = 0, []
+            if not line.strip():
+                continue
+            line = re.sub(r"^\s*>\s?", "", line)
+        if not parts:
+            start = number
+        parts.append(line.strip())
+        # A table row and a heading are one line each: nothing joins them.
+        if re.match(r"^\s*(?:\||#{1,6}\s)", line):
+            yield start, " ".join(parts)
+            start, parts = 0, []
+    if parts:
+        yield start, " ".join(parts)
+
+
+def sentences(text: str):
+    """(line number, sentence) for prose outside code fences and comments.
+
+    The line number is the first line of the block the sentence is in."""
+    for number, block in paragraphs(text):
+        for piece in SENTENCE_END.split(block):
             if piece.strip():
                 yield number, piece
 
@@ -264,7 +316,7 @@ def claim_problems(root: pathlib.Path, today: dict[str, str]) -> list[str]:
         rel = path.relative_to(root).as_posix()
         for number, sentence in sentences(path.read_text()):
             claim = CLAIM.search(sentence)
-            if claim is None or QUALIFIER.search(sentence):
+            if claim is None or qualified(sentence, claim):
                 continue
             named = [name for name, alias in COMPONENTS.items() if re.search(alias, sentence, re.I)]
             for alias, members in GROUPS.items():

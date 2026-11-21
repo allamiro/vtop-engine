@@ -147,6 +147,42 @@ class CheckTests(unittest.TestCase):
         text = "Until the soak passes, nobody should call the cluster plane ready for production.\n"
         self.assertEqual(self.problems(**{"docs/a.md": text}), [])
 
+    def test_a_claim_wrapped_across_lines_is_read_as_one_sentence(self):
+        # Review of #826: each physical line used to be judged alone, so a
+        # wrapped denial failed and a wrapped claim passed.
+        denied = "The Kafka gateway is not\nproduction-ready.\n"
+        self.assertEqual(self.problems(**{"docs/a.md": denied}), [])
+        claimed = "The Kafka gateway is ready\nfor production.\n"
+        out = self.problems(**{"docs/a.md": claimed})
+        self.assertEqual(len(out), 1, out)
+        self.assertIn("docs/a.md:1", out[0])
+
+    def test_blocks_are_not_joined_across_list_items_headings_or_blank_lines(self):
+        text = "- The Kafka gateway is not\n- production-ready.\n"
+        blocks = [b for _, b in MOD.paragraphs(text)]
+        self.assertEqual(blocks, ["- The Kafka gateway is not", "- production-ready."])
+        text = "Not this one.\n\n# The Kafka gateway\nis production-ready.\n"
+        self.assertEqual([n for n, _ in MOD.paragraphs(text)], [1, 3, 4])
+
+    def test_a_positive_claim_with_a_qualifier_word_after_it_fails(self):
+        # Review of #826: a qualifier anywhere in the sentence used to excuse it.
+        for text in (
+            "The Kafka gateway is production-ready without additional configuration.\n",
+            "The Kafka gateway is production-ready and requires no special setup.\n",
+        ):
+            with self.subTest(text=text):
+                out = self.problems(**{"docs/a.md": text})
+                self.assertEqual(len(out), 1, out)
+
+    def test_a_claim_conditioned_after_it_passes(self):
+        for text in (
+            "The Kafka gateway becomes production-ready once #751 lands.\n",
+            "The Kafka gateway is production-ready only if TLS is on.\n",
+            "## What a production-grade Kafka gateway needs\n",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.problems(**{"docs/a.md": text}), [])
+
     def test_a_project_wide_claim_fails_while_any_row_is_below_production(self):
         out = self.problems(**{"README.md": "[s](docs/reference/component-status.md)\n\nVTOP is production-ready.\n"})
         self.assertEqual(len(out), 1, out)
