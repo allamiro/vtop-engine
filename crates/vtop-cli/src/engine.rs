@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use futures::StreamExt;
+use tracing::instrument::WithSubscriber;
 use tracing::Instrument;
 use vtop_adapters::base::{DiscoveredSource, ReadResult, SourceAdapter};
 use vtop_adapters::file_source::ArchivedEnd;
@@ -1802,6 +1803,34 @@ impl<'a> Pipeline<'a> {
         }
         trace.end();
 
+        // The object's check needs nothing from the manifest, so it is sent
+        // now and runs while the manifest is built, written and recorded:
+        // on a long link that is one round trip to the store fewer per
+        // batch. Its answer is still required, and judged exactly as before,
+        // before VERIFIED; a batch that fails first drops the check. It is
+        // sent only after OBJECT_UPLOADED is recorded, so it can never be
+        // the evidence for an upload the ledger does not know of.
+        let object_check = {
+            let backend = Arc::clone(&self.backend);
+            let uri = object_uri.clone();
+            let size = compressed.size_bytes;
+            let expected = object_checksum
+                .clone()
+                .map(|hex| (algo.as_str().to_owned(), hex));
+            AbortOnDrop(tokio::spawn(
+                async move {
+                    let expected = expected
+                        .as_ref()
+                        .map(|(algorithm, hex)| ObjectChecksum::new(algorithm, hex));
+                    let started = Instant::now();
+                    let answer = backend.verify_object(&uri, size, expected).await;
+                    (answer, started.elapsed())
+                }
+                .in_current_span()
+                .with_current_subscriber(),
+            ))
+        };
+
         // ---- Build + upload manifest ------------------------------------
         trace.begin(Stage::UploadManifest);
         // `manifest.write_version` (#671 release B): 0.3 unless opted in.
@@ -1924,10 +1953,14 @@ impl<'a> Pipeline<'a> {
         // 2) the stored object matches size + checksum,
         // A throttled verification is the store asking for less traffic too
         // (review): counted like an upload, so the cycle's verdict sees it.
+        // `verify_ms` counts the object check's whole duration once, though
+        // most of it ran beside the manifest upload, not only the part left
+        // to wait for here.
+        let waiting = Instant::now();
+        let (object_answer, object_check_took) = object_check.join().await;
+        let object_check_waited = waiting.elapsed();
         let obj_v = note_store_request(
-            self.backend
-                .verify_object(&object_uri, compressed.size_bytes, object_ck)
-                .await,
+            object_answer,
             "object_verify",
             [
                 tenant.as_str(),
@@ -2096,7 +2129,8 @@ impl<'a> Pipeline<'a> {
                 fail!("stored manifest batch binding failed".to_string());
             }
         }
-        metrics.verify_ms = t.elapsed().as_millis() as u64;
+        metrics.verify_ms = (t.elapsed().saturating_sub(object_check_waited) + object_check_took)
+            .as_millis() as u64;
         let backend_limited = obj_v.backend_limited || man_v.backend_limited;
         trace.record(
             "verification_result",
@@ -2869,11 +2903,35 @@ impl WidthController {
     }
 }
 
+/// A spawned task that is cancelled when its handle is dropped.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl AbortOnDrop<(Result<vtop_upload::VerificationResult, VtopError>, Duration)> {
+    /// The check's answer and how long it took; a task that ended abnormally
+    /// is a failed request.
+    async fn join(mut self) -> (Result<vtop_upload::VerificationResult, VtopError>, Duration) {
+        (&mut self.0).await.unwrap_or_else(|e| {
+            (
+                Err(VtopError::Upload(format!(
+                    "object check ended abnormally: {e}"
+                ))),
+                Duration::ZERO,
+            )
+        })
+    }
+}
+
 /// The full engine: config, streams, state store, upload backend, adapters.
 pub struct Engine {
     pub config: VtopConfig,
     pub streams: StreamsConfig,
-    pub store: Box<dyn StateStore>,
+    pub store: Arc<dyn StateStore>,
     pub backend: Arc<dyn UploadBackend>,
     pub adapters: HashMap<SourceType, Box<dyn SourceAdapter>>,
     /// Runtime-only manifest keys (#685), resolved from their environment
@@ -3276,7 +3334,7 @@ impl Engine {
         Ok(Self {
             config,
             streams,
-            store,
+            store: Arc::from(store),
             backend,
             adapters,
             manifest_keyring,
@@ -8209,7 +8267,7 @@ mod tests {
     /// once: the ledger of a full disk or an unreachable PostgreSQL, for one
     /// write (#627).
     struct FaultyLedger {
-        inner: Box<dyn StateStore>,
+        inner: Arc<dyn StateStore>,
         armed: std::sync::Mutex<Vec<LedgerWrite>>,
     }
 
@@ -8219,8 +8277,8 @@ mod tests {
             let stand_in = vtop_state::connect_state_store("sqlite::memory:")
                 .await
                 .unwrap();
-            let inner = std::mem::replace(&mut engine.store, stand_in);
-            engine.store = Box::new(FaultyLedger {
+            let inner = std::mem::replace(&mut engine.store, Arc::from(stand_in));
+            engine.store = Arc::new(FaultyLedger {
                 inner,
                 armed: std::sync::Mutex::new(writes.to_vec()),
             });
@@ -12851,6 +12909,113 @@ mod tests {
                 &[("tenant", tenant), ("source_type", "file")],
             ) - lowered_before,
             1
+        );
+    }
+
+    /// A mock store whose manifest writes take `delay`, and which records
+    /// when each object check started and each manifest write ended.
+    struct SlowManifests {
+        inner: Arc<vtop_upload::MockBackend>,
+        delay: Duration,
+        object_checks: std::sync::Mutex<Vec<Instant>>,
+        manifest_puts: std::sync::Mutex<Vec<Instant>>,
+    }
+
+    #[async_trait::async_trait]
+    impl UploadBackend for SlowManifests {
+        async fn put_object(
+            &self,
+            local_path: &std::path::Path,
+            object_uri: &str,
+            checksum: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::StoredObject, VtopError> {
+            self.inner.put_object(local_path, object_uri, checksum).await
+        }
+        async fn put_manifest(
+            &self,
+            local_path: &std::path::Path,
+            manifest_uri: &str,
+            checksum: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::StoredManifest, VtopError> {
+            tokio::time::sleep(self.delay).await;
+            let stored = self
+                .inner
+                .put_manifest(local_path, manifest_uri, checksum)
+                .await;
+            self.manifest_puts.lock().unwrap().push(Instant::now());
+            stored
+        }
+        async fn head_object(&self, uri: &str) -> Result<vtop_upload::ObjectHead, VtopError> {
+            self.inner.head_object(uri).await
+        }
+        async fn get_object(&self, uri: &str) -> Result<Vec<u8>, VtopError> {
+            self.inner.get_object(uri).await
+        }
+        async fn get_object_bounded(&self, uri: &str, max: usize) -> Result<Vec<u8>, VtopError> {
+            self.inner.get_object_bounded(uri, max).await
+        }
+        async fn verify_object(
+            &self,
+            uri: &str,
+            size: u64,
+            expected: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::VerificationResult, VtopError> {
+            if !uri.ends_with(".manifest.json") {
+                self.object_checks.lock().unwrap().push(Instant::now());
+            }
+            self.inner.verify_object(uri, size, expected).await
+        }
+        async fn delete_object(&self, uri: &str) -> Result<(), VtopError> {
+            self.inner.delete_object(uri).await
+        }
+        fn backend_name(&self) -> &'static str {
+            "slow-manifests"
+        }
+        fn supports_checksum_verification(&self) -> bool {
+            true
+        }
+        fn supports_multipart(&self) -> bool {
+            false
+        }
+        fn reports_absent_objects(&self) -> bool {
+            true
+        }
+    }
+
+    /// The object's check is sent beside the manifest write, not after it:
+    /// on a long link the manifest PUT and the object HEAD then cost one
+    /// round trip, not two. The batch still verifies and commits.
+    #[tokio::test]
+    async fn the_object_check_runs_while_the_manifest_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "line 1\nline 2\n").unwrap();
+        let cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let store = Arc::new(SlowManifests {
+            inner: Arc::new(vtop_upload::MockBackend::new()),
+            delay: Duration::from_millis(300),
+            object_checks: std::sync::Mutex::new(Vec::new()),
+            manifest_puts: std::sync::Mutex::new(Vec::new()),
+        });
+        engine.backend = store.clone();
+        let outcomes = engine.process_once(SourceType::File).await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].committed, "the batch committed: {outcomes:?}");
+        let checked = store.object_checks.lock().unwrap().clone();
+        let written = store.manifest_puts.lock().unwrap().clone();
+        assert_eq!(checked.len(), 1, "one object check: {checked:?}");
+        assert_eq!(written.len(), 1, "one manifest write: {written:?}");
+        assert!(
+            checked[0] < written[0],
+            "the object check was sent only after the manifest write ended"
         );
     }
 
