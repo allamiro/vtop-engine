@@ -4317,6 +4317,15 @@ impl Engine {
         if !rewinds.is_empty() {
             self.cycle_had_failure = true;
         }
+        // One rewind per unit, to its LOWEST failed start. Two windows of one
+        // unit can fail in the same pass (the buffered one sealed by
+        // overflow, the new one by its threshold), and an adapter applies the
+        // rewinds in turn, each setting the unit's read position: the higher
+        // start, applied last, left the read head above the lower window, a
+        // later window committed past it, and the restart's rewind of it was
+        // clamped to that commit, so it was never archived. The rewind to the
+        // lowest start re-reads the higher windows too.
+        let (rewinds, covered) = lowest_rewind_per_unit(rewinds);
         for (marker, result) in rewinds
             .iter()
             .zip(adapter.replay_from_markers(&rewinds).await)
@@ -4339,6 +4348,12 @@ impl Engine {
                     self.count_refused_replay(source_type, marker);
                     // Not re-read, so nothing will rebuild it (#626).
                     self.recorded.forget(marker);
+                    // Nor the failed windows of the unit above it, which
+                    // this rewind was to re-read.
+                    for above in covered.iter().filter(|m| unit_key(m) == unit_key(marker)) {
+                        self.count_refused_replay(source_type, above);
+                        self.recorded.forget(above);
+                    }
                     tracing::error!(
                         source_type = %source_type,
                         start = ?marker,
@@ -6545,6 +6560,26 @@ pub(crate) fn end_position(marker: &ProgressMarker) -> i128 {
 }
 
 /// Where a range begins within its unit.
+/// The lowest of `rewinds` per unit, in the order the units first appear,
+/// and the higher starts of the same units, which the lowest re-reads.
+fn lowest_rewind_per_unit(
+    rewinds: Vec<ProgressMarker>,
+) -> (Vec<ProgressMarker>, Vec<ProgressMarker>) {
+    let mut lowest: Vec<ProgressMarker> = Vec::new();
+    let mut covered = Vec::new();
+    for marker in rewinds {
+        let unit = unit_key(&marker);
+        match lowest.iter_mut().find(|kept| unit_key(kept) == unit) {
+            Some(kept) if start_position(&marker) < start_position(kept) => {
+                covered.push(std::mem::replace(kept, marker));
+            }
+            Some(_) => covered.push(marker),
+            None => lowest.push(marker),
+        }
+    }
+    (lowest, covered)
+}
+
 pub(crate) fn start_position(marker: &ProgressMarker) -> i128 {
     match marker {
         ProgressMarker::Kafka { start_offset, .. } => i128::from(*start_offset),
@@ -7793,6 +7828,49 @@ mod tests {
             vec![(Some(inode), 0, 7, Some(1)), (Some(inode), 7, len, Some(1))],
             "the failed range is archived as first cut, and nothing is skipped"
         );
+    }
+
+    /// Two windows of one file sealed in the same pass (the buffered one by
+    /// overflow, the new one by its threshold), and both fail. The read head
+    /// must be handed back to the LOWER start: handing back each start in
+    /// turn leaves it at the higher one, the next pass commits past the lower
+    /// range, and the restart's rewind of it is clamped to that commit.
+    #[tokio::test]
+    async fn two_windows_of_one_file_failing_in_one_pass_rewind_to_the_lower_start() {
+        let _serial = THROTTLE_TESTS.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "line 1\n").unwrap();
+        let mut cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.max_records = 2;
+        cfg.batching.max_batch_age_seconds = 3_600;
+        cfg.batching.idle_poll_interval_ms = 20;
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        engine.backend = Arc::new(vtop_upload::MockBackend::new().with_throttled_puts(2));
+        // One line, below the threshold: buffered.
+        let _ = engine.run_source(SourceType::File, false).await;
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&input)
+                .unwrap();
+            write!(f, "line 2\nline 3\n").unwrap();
+        }
+        // This pass seals [0, 7) and [7, 21), and the store refuses both.
+        for _ in 0..30 {
+            let _ = engine.run_source(SourceType::File, false).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let len = std::fs::metadata(&input).unwrap().len() as i128;
+        assert_committed_without_a_gap("two failures in one pass", &engine, len).await;
     }
 
     /// Every committed file batch as (inode, start byte, end byte, records).
