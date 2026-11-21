@@ -240,9 +240,26 @@ jobs:
               # measurements they are drawn from, the output, and the README
               # whose prose quotes the same figures.
               - 'benchmarks/readme_charts.py'
+              # The README's cards (#714): their generator, the facts module
+              # they draw from, and what it reads beyond the measurements:
+              # the compose file (Kafka and MinIO versions), the Cargo files
+              # (version, librdkafka) and the S3 matrix's results.
+              - 'benchmarks/readme_cards.py'
+              - 'benchmarks/site_facts.py'
+              - 'docker-compose.yml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'tests/s3-compat/**'
+              # The matrix workflows pin the Kafka releases and PostgreSQL
+              # majors the tested-against card names.
+              - '.github/workflows/kafka-matrix.yml'
+              - '.github/workflows/postgres-matrix.yml'
               # The tests this job runs: a change to a test alone must run
               # it (tests/test_benchmark_charts_job.py checks the list).
               - 'benchmarks/tests/test_readme_charts.py'
+              - 'benchmarks/tests/test_readme_cards.py'
+              - 'benchmarks/tests/test_site_facts.py'
+              - 'benchmarks/tests/conftest.py'
               - 'benchmarks/tests/test_kafka_compare_*.py'
               - 'benchmarks/tests/test_benchmark_charts_job.py'
               # The hand-written page that links the generated reports.
@@ -2475,7 +2492,7 @@ jobs:
         # without this line the pipe into tee would hide a failing test.
         run: |
           set -o pipefail
-          python -m pytest -rs tests/test_kafka_compare_report.py tests/test_kafka_compare_regenerate.py tests/test_kafka_compare_failover.py tests/test_kafka_compare_footer.py tests/test_kafka_compare_colours.py tests/test_readme_charts.py tests/test_benchmark_charts_job.py | tee "$RUNNER_TEMP/chart-tests.log"
+          python -m pytest -rs tests/test_kafka_compare_report.py tests/test_kafka_compare_regenerate.py tests/test_kafka_compare_failover.py tests/test_kafka_compare_footer.py tests/test_kafka_compare_colours.py tests/test_readme_charts.py tests/test_readme_cards.py tests/test_site_facts.py tests/test_benchmark_charts_job.py | tee "$RUNNER_TEMP/chart-tests.log"
           if grep -E "SKIPPED.*(matplotlib|PIL)" "$RUNNER_TEMP/chart-tests.log"; then
             echo "::error::A chart test skipped for want of matplotlib or Pillow, in the one job that installs them."
             exit 1
@@ -2498,7 +2515,7 @@ jobs:
           python3 benchmarks/readme_charts.py
           drift="$(git status --porcelain -- docs/assets/readme/)"
           if [ -n "$drift" ]; then
-            echo "::error::The README's charts differ from what the committed measurements produce. Run 'python3 -m pip install --require-hashes -r benchmarks/kafka_compare/requirements-report.txt && python3 benchmarks/readme_charts.py' and commit the result."
+            echo "::error::The README's charts or cards differ from what the committed measurements produce. Run 'python3 -m pip install --require-hashes -r benchmarks/kafka_compare/requirements-report.txt && python3 benchmarks/readme_charts.py' and commit the result."
             echo "$drift"
             exit 1
           fi

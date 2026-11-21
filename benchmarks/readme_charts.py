@@ -13,6 +13,9 @@ and none is typed here:
 - policed-uplink:     benchmarks/measurements/663-policed-uplink/runs.csv
 - kafka-failover:     benchmarks/kafka_compare/results/failover-20261111T032549Z/failover.csv
 - kafka-throughput:   benchmarks/kafka_compare/results/20261109T232328Z/results.csv
+- card-*:             the README's summary cards, drawn by readme_cards.py from
+                      site_facts.py, which reads the same files through the
+                      loaders below
 
 The Kafka runs go through kafka_compare's own loaders (which refuse a partial
 or mixed run) and its own summaries, so a number here is the number
@@ -54,16 +57,15 @@ POLICED = "benchmarks/measurements/663-policed-uplink/runs.csv"
 THROUGHPUT_RUN = "benchmarks/kafka_compare/results/20261109T232328Z"
 FAILOVER_RUN = "benchmarks/kafka_compare/results/failover-20261111T032549Z"
 
-# The system colours come from the registry in kafka_compare/colours.py:
-# categorical slots 1 and 2, light and dark steps of the same hues, validated
-# (CVD and contrast) against GitHub's light #ffffff and dark #0d1117 page
-# backgrounds. The images are transparent, so the page shows through.
+# Every colour comes from the registry in kafka_compare/colours.py: the greys
+# from NEUTRALS, and the system colours from categorical slots 1 and 2, light
+# and dark steps of the same hues, validated (CVD and contrast) against
+# GitHub's light #ffffff and dark #0d1117 page backgrounds. The charts are
+# transparent, so the page shows through. A colour means one system in every
+# image: a chart of VTOP alone draws in VTOP's colour only.
 THEMES: dict[str, dict[str, str]] = {
-    mode: {**neutrals, "s1": colours.colour("kafka", mode), "s2": colours.colour("vtop", mode)}
-    for mode, neutrals in (
-        ("light", {"ink": "#0b0b0b", "ink2": "#52514e", "grid": "#e1e0d9", "axis": "#c3c2b7", "muted": "#898781"}),
-        ("dark", {"ink": "#f0efec", "ink2": "#c3c2b7", "grid": "#30363d", "axis": "#484f58", "muted": "#898781"}),
-    )
+    mode: {**colours.NEUTRALS[mode], "s1": colours.colour("kafka", mode), "s2": colours.colour("vtop", mode)}
+    for mode in ("light", "dark")
 }
 
 FAULT_ORDER = ("kill9_leader", "stop_leader", "partition_leader")
@@ -150,6 +152,23 @@ def failover(repo: str = REPO) -> dict[str, Any]:
             "lost": sum(int(float(row["acked_lost"])) for row in mine if row["acked_lost"]),
             "duplicates": sum(int(float(row["duplicates"])) for row in mine if row["duplicates"]),
         }
+    # Each system's own tally: a figure that says "VTOP lost 0" must not rest on a total that includes Kafka.
+    per_system = {}
+    for system in ("kafka", "vtop"):
+        mine = [row for row in rows if row["system"] == system]
+        if not mine:
+            raise Refused(f"{FAILOVER_RUN}: no {system} rows")
+        paths = {row["client_path"] for row in mine}
+        if len(paths) != 1:
+            raise Refused(f"{FAILOVER_RUN}: {system} ran through more than one client path ({sorted(paths)})")
+        per_system[system] = {
+            "repetitions": len(mine),
+            "read_back": sum(row["verify"] == "passed" for row in mine),
+            "acked": sum(int(row["records_acked"]) for row in mine if row["records_acked"]),
+            "lost": sum(int(float(row["acked_lost"])) for row in mine if row["acked_lost"]),
+            "duplicates": sum(int(float(row["duplicates"])) for row in mine if row["duplicates"]),
+            "client_path": paths.pop(),
+        }
     per_cell = {len(failover_report.all_rows(rows, s, f)) for f in FAULT_ORDER for s in ("kafka", "vtop")}
     if len(per_cell) != 1:
         raise Refused(f"{FAILOVER_RUN}: repetitions per fault and system differ ({sorted(per_cell)})")
@@ -157,6 +176,7 @@ def failover(repo: str = REPO) -> dict[str, Any]:
         "environment": run.environment,
         "cells": cells,
         "per_fault": per_fault,
+        "per_system": per_system,
         "per_cell": per_cell.pop(),
         "repetitions": len(rows),
         "ok": sum(row["status"] == "ok" for row in rows),
@@ -300,16 +320,18 @@ def egress_chart(plt, theme, data) -> Any:
     width_in, height_in = 9.0, 4.3
     fig, axes = plt.subplots(1, 2, figsize=(width_in, height_in), sharey=True)
     fig.subplots_adjust(left=0.075, right=0.985, top=1 - 1.25 / height_in, bottom=0.82 / height_in, wspace=0.08)
-    styles = {"wan100": ("clean", theme["s1"], "o"), "wan100-loss1": ("1% burst loss", theme["s2"], "s")}
+    # Both lines are VTOP's, so both wear VTOP's colour; the clean link is dashed with open markers.
+    styles = {"wan100": ("clean", theme["s2"], "o", "--", "none"),
+              "wan100-loss1": ("1% burst loss", theme["s2"], "s", "-", theme["s2"])}
     for ax, pif in zip(axes, (1, 4)):
         _axes(ax)
         ax.grid(axis="y")
         ax.axhline(1.0, color=theme["ink2"], linewidth=0.8)
-        for profile, (label, color, marker) in styles.items():
+        for profile, (label, color, marker, dash, face) in styles.items():
             points = data["grid"][(profile, pif)]
             xs = [p[0] for p in points]
             ax.plot(xs, [p[1] for p in points], color=color, linewidth=2, marker=marker, markersize=5,
-                    label=label, zorder=3)
+                    linestyle=dash, markerfacecolor=face, label=label, zorder=3)
             ax.vlines(xs, [p[2] for p in points], [p[3] for p in points], color=color, linewidth=1, zorder=2)
         ax.set_xscale("log", base=2)
         ax.set_xticks([1, 2, 4, 8, 16])
@@ -323,7 +345,7 @@ def egress_chart(plt, theme, data) -> Any:
     axes[0].set_ylabel("share of the link carried")
     # Direct labels where the two lines are furthest apart.
     left = axes[0]
-    for profile, (label, _color, _m) in styles.items():
+    for profile, (label, *_style) in styles.items():
         first = data["grid"][(profile, 1)][0]
         left.annotate(label, (first[0], first[1]), xytext=(8, -3 if profile == "wan100" else 0),
                       textcoords="offset points", fontsize=8.5, color=theme["ink"], va="center")
@@ -331,17 +353,17 @@ def egress_chart(plt, theme, data) -> Any:
     right = axes[1]
     for profile, shift in (("wan100", 0.9), ("wan100-loss1", 1.11)):
         median, low, high, _runs = data["default"][profile]
-        label, color, _m = styles[profile]
+        _label, _color, _m, _dash, face = styles[profile]
         right.vlines(8 * shift, low, high, color=theme["ink"], linewidth=1, zorder=4)
-        right.plot(8 * shift, median, marker="D", markersize=7, markerfacecolor=color,
+        right.plot(8 * shift, median, marker="D", markersize=7, markerfacecolor=face,
                    markeredgecolor=theme["ink"], markeredgewidth=1.2, linestyle="none", zorder=5)
     clean, lossy = data["default"]["wan100"], data["default"]["wan100-loss1"]
     right.text(18, 0.70, f"shipped default, {clean[3]} runs each:\nclean {clean[0]:.3f}, "
                f"1% loss {lossy[0]:.3f}", ha="right", va="top", fontsize=8, color=theme["ink"],
                linespacing=1.4)
     right.text(19, 1.015, "link", ha="right", va="bottom", fontsize=7.5, color=theme["ink2"])
-    handles = [plt.Line2D([], [], color=c, marker=m, linewidth=2, markersize=5, label=lab)
-               for lab, c, m in styles.values()]
+    handles = [plt.Line2D([], [], color=c, marker=m, linewidth=2, markersize=5, linestyle=dash, markerfacecolor=face,
+                          label=lab) for lab, c, m, dash, face in styles.values()]
     handles.append(plt.Line2D([], [], color=theme["ink"], marker="D", markerfacecolor="none", linestyle="none",
                               markersize=6, label="shipped default"))
     fig.legend(handles=handles, loc="upper left", ncol=3, fontsize=8.2, bbox_to_anchor=(0.065, 1 - 0.80 / height_in),
@@ -367,7 +389,8 @@ def policed_chart(plt, theme, data) -> Any:
     fig.subplots_adjust(left=0.24, right=0.84, top=1 - 1.2 / height_in, bottom=0.8 / height_in)
     _axes(ax)
     ax.grid(axis="x")
-    colors = {"before": theme["muted"], "after": theme["s1"]}
+    # The policed runs are VTOP's alone: "after" wears VTOP's colour, "before" the non-text grey.
+    colors = {"before": theme["muted"], "after": theme["s2"]}
     labels, positions = [], []
     bar = 0.3
     for index, (link, name) in enumerate(POLICED_LINKS):
@@ -510,6 +533,10 @@ def render(repo: str = REPO) -> list[str]:
             fig = draw(plt, theme, data)
             written.append(_save(fig, os.path.join(out_dir, f"{name}-{mode}.svg")))
             plt.close(fig)
+    # Imported here: readme_cards reads this module's loaders, so a top-level import would be circular.
+    import readme_cards
+
+    written += readme_cards.render(repo)
     return written
 
 

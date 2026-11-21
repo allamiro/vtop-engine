@@ -63,7 +63,9 @@ def test_every_chart_is_embedded_in_both_themes():
 
 
 def test_the_readme_embeds_no_chart_the_script_does_not_write():
-    names = {name for name, _draw, _load in readme_charts.CHARTS}
+    import site_facts
+
+    names = {name for name, _draw, _load in readme_charts.CHARTS} | set(site_facts.CARDS)
     embedded = set(re.findall(r"docs/assets/readme/([a-z0-9-]+)-(?:light|dark)\.svg", readme_text()))
     assert embedded <= names, f"README.md embeds charts no generator writes: {sorted(embedded - names)}"
 
@@ -86,9 +88,12 @@ def test_orphans_names_committed_output_no_chart_wrote(tmp_path):
 
 def test_render_writes_a_distinct_light_and_dark_svg_per_chart(tmp_path):
     pytest.importorskip("matplotlib")
-    (tmp_path / "benchmarks").symlink_to(os.path.join(readme_charts.REPO, "benchmarks"))
+    import readme_cards
+
+    for entry in ("benchmarks", "README.md", "docker-compose.yml", "Cargo.toml", "Cargo.lock", ".github", "tests"):
+        (tmp_path / entry).symlink_to(os.path.join(readme_charts.REPO, entry))
     written = readme_charts.render(str(tmp_path))
-    assert len(written) == 2 * len(readme_charts.CHARTS)
+    assert len(written) == 2 * (len(readme_charts.CHARTS) + len(readme_cards.CARDS))
     for name, _draw, _load in readme_charts.CHARTS:
         light = (tmp_path / readme_charts.OUT / f"{name}-light.svg").read_bytes()
         dark = (tmp_path / readme_charts.OUT / f"{name}-dark.svg").read_bytes()
