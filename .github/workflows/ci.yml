@@ -503,6 +503,39 @@ jobs:
               || { echo "::error::$binary is missing from the image or will not run"; exit 1; }
           done
 
+      # The image's vtopctl opens a PostgreSQL state store (D6 of the component
+      # status page): a PostgreSQL ledger needs no source build. A build
+      # without the `postgres` feature refuses a postgres:// URL by name
+      # ("configuration error: ... lacks the `postgres` feature"), before it
+      # dials anything; this one gets as far as the state store, dialing a
+      # port nothing listens on.
+      - name: The image's vtopctl opens a PostgreSQL state store
+        run: |
+          set -euo pipefail
+          config="$RUNNER_TEMP/pg-config.yaml"
+          sed 's|^  state_store: "sqlite:///data/state/vtop-state.db"$|  state_store: { env: VTOP_STATE_STORE }|' \
+            examples/config.yaml > "$config"
+          grep -q '^  state_store: { env: VTOP_STATE_STORE }$' "$config" \
+            || { echo "::error::examples/config.yaml no longer has the state_store line this check replaces"; exit 1; }
+          chmod 644 "$config"
+          if out=$(docker run --rm -v "$config:/tmp/pg-config.yaml:ro" \
+              -e VTOP_STATE_STORE='postgresql://vtop:unused@127.0.0.1:1/vtop?sslmode=verify-full' \
+              --entrypoint vtopctl vtop-engine:ci migrate --config /tmp/pg-config.yaml 2>&1); then
+            echo "$out"
+            echo "::error::vtopctl migrate succeeded against a port nothing listens on"
+            exit 1
+          fi
+          echo "$out"
+          if grep -q -e 'lacks the .postgres. feature' -e 'requires a build with --features postgres' <<<"$out"; then
+            echo "::error::the image's vtopctl is built without the postgres feature"
+            exit 1
+          fi
+          # Seen locally: "state store error: pool timed out while waiting
+          # for an open connection", after the pool's 30 s connect timeout.
+          grep -q 'state store error' <<<"$out" \
+            || { echo "::error::vtopctl migrate failed before dialing PostgreSQL"; exit 1; }
+          echo "the image's vtopctl dials a PostgreSQL state store"
+
       # The TOOLS, not only the binaries. `vtop-node` itself went missing from
       # this image and shipped in a release (#281) because nothing asserted its
       # presence; the troubleshooting tools are one Dockerfile edit away from
