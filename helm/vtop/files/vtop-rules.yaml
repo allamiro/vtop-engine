@@ -35,6 +35,7 @@
 #   multipart_kept_window        6h       VtopMultipartSessionsPiling (sessions kept 30-36 h ago)
 #   multipart_cleared_window     36h      VtopMultipartSessionsPiling (no resume or sweep in this window)
 #   multipart_hold               1h       VtopMultipartSessionsPiling
+#   versioning_paused_hold       5m       VtopBucketVersioningPaused (the engine rechecks at most every 60 s)
 #   state_write_seconds          1s       VtopStateStoreWritesSlow (a bucket bound of the histogram)
 #   state_write_slow_share       0.05     VtopStateStoreWritesSlow (more than 5% of batches over it...)
 #   state_write_window           15m      VtopStateStoreWritesSlow
@@ -252,6 +253,24 @@ groups:
           summary: "Incomplete multipart uploads on {{ $labels.instance }} are kept and never resumed or swept"
           description: "Failed uploads kept their multipart sessions for the replay, but for over a day none was resumed and none swept, so their parts stay billed in the bucket. Check the engine's multipart_sweep_failed events and the bucket's lifecycle rule for incomplete uploads."
           runbook_url: "https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopmultipartsessionspiling"
+
+      # Writes to a bucket stopped because it no longer keeps object
+      # versions while upload.require_object_versioning is set: a PUT
+      # returned no version to pin, or the store said versioning is not
+      # enabled (suspended under a running engine). Nothing in that bucket
+      # commits until versioning is enabled again; the engine checks on its
+      # own (at most every 60 s) and resumes, so a blip clears within the
+      # hold. A gauge, set by the engine, so it fires on the value.
+      - alert: VtopBucketVersioningPaused
+        expr: |
+          vtop_bucket_versioning_paused > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.instance }} stopped writing to {{ $value }} bucket(s) that no longer keep object versions"
+          description: "With upload.require_object_versioning set, a bucket's versioning was suspended or turned off, so the engine stopped writing to it: nothing in it commits, each batch for it fails before writing anything and is replayed. The bucket is named in the bucket_versioning_paused ERROR line. Re-enable versioning on that bucket (PutBucketVersioning with Status=Enabled); the engine resumes on its own within about two minutes (its next check, then the next retry)."
+          runbook_url: "https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopbucketversioningpaused"
 
       # The state store's write latency (the SLO on docs/operate/slos.md):
       # the share of committed batches whose ledger writes took more than a
