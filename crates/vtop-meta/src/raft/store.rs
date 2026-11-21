@@ -39,6 +39,27 @@ pub(crate) struct MetaRaftInner {
 #[derive(Clone)]
 pub struct MetaRaftStore {
     pub(crate) inner: Arc<Mutex<MetaRaftInner>>,
+    /// The applied audit records' delivery cursor (#706). Taken BEFORE
+    /// `inner` wherever both are held; see [`super::audit_delivery`].
+    pub(crate) delivery: Arc<Mutex<super::audit_delivery::DeliveryState>>,
+    pub(crate) progress: Arc<super::audit_delivery::AuditProgress>,
+}
+
+/// A [`MetaRaftStore`] that does not keep it alive.
+pub(crate) struct WeakMetaRaftStore {
+    inner: std::sync::Weak<Mutex<MetaRaftInner>>,
+    delivery: std::sync::Weak<Mutex<super::audit_delivery::DeliveryState>>,
+    progress: std::sync::Weak<super::audit_delivery::AuditProgress>,
+}
+
+impl WeakMetaRaftStore {
+    pub(crate) fn upgrade(&self) -> Option<MetaRaftStore> {
+        Some(MetaRaftStore {
+            inner: self.inner.upgrade()?,
+            delivery: self.delivery.upgrade()?,
+            progress: self.progress.upgrade()?,
+        })
+    }
 }
 
 impl MetaRaftStore {
@@ -60,9 +81,25 @@ impl MetaRaftStore {
         // while discard_stale_log_tail never ran. Heal on every reopen so the
         // recovered log is appendable from last_applied + 1.
         storage.discard_stale_log_tail()?;
+        // The audit frontier (#706). A store a release before #706 wrote has
+        // none: its trail starts at the applied frontier, and nothing is
+        // replayed from before it.
+        storage.ensure_audited_frontier()?;
+        // A crash after an installed snapshot was published but before its
+        // install floor was saved leaves the floor behind; once a local
+        // snapshot is built on top, the stale branch below it would read as
+        // the committed log (review of #767). Recover the floor before Raft
+        // runs, so before any local snapshot.
+        super::audit_delivery::recover_install_floor(&mut storage)?;
+        let delivered = storage
+            .audited_frontier()
+            .unwrap_or_else(|| storage.last_applied());
+        let (delivery, progress) = super::audit_delivery::new_delivery(delivered);
         let last_membership = recover_membership(&storage)?;
         let last_purged = recover_last_purged(&storage);
         Ok(Self {
+            delivery,
+            progress,
             inner: Arc::new(Mutex::new(MetaRaftInner {
                 env: env.clone(),
                 data_dir,
@@ -100,6 +137,15 @@ impl MetaRaftStore {
                 },
             },
         )
+    }
+
+    /// A handle that does not keep the store alive.
+    pub(crate) fn downgrade(&self) -> WeakMetaRaftStore {
+        WeakMetaRaftStore {
+            inner: Arc::downgrade(&self.inner),
+            delivery: Arc::downgrade(&self.delivery),
+            progress: Arc::downgrade(&self.progress),
+        }
     }
 
     pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, MetaRaftInner> {

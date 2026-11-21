@@ -314,6 +314,13 @@ the transfers it grants or refuses to `vtopctl node repair`. They go to the
 append-only JSONL file; a set but unwritable path stops `meta`, `data` and
 `node` at startup, naming the path. `vtop_audit_events_total{action,outcome}`
 and `vtop_audit_write_failures_total{sink}` are on every node's `/metrics`.
+A metadata node also exports its applied-record delivery (#706):
+`vtop_audit_replayed_total{reason}` (records delivered again after a crash or
+a refusing sink, marked `replayed`), `vtop_audit_gaps_total{reason}`
+(`audit.gap` records: ranges it could not re-derive) and
+`vtop_audit_delivery_lag_entries` (applied entries not yet delivered; above 0
+for long means the audit sink is failing). See
+[operate/auditing.md](operate/auditing.md).
 Read a node's file with `vtopctl audit list --file`; see
 [operate/auditing.md](operate/auditing.md).
 

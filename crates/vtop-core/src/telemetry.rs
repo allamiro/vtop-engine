@@ -428,7 +428,7 @@ pub struct Metrics {
 
 /// The values of `action` on `vtop_audit_events_total` (#694); the same set
 /// as `vtop_observe::audit::Action`.
-pub const AUDIT_ACTIONS: [&str; 14] = [
+pub const AUDIT_ACTIONS: [&str; 15] = [
     "ledger.replay",
     "ledger.prune",
     "ledger.migrate",
@@ -441,6 +441,7 @@ pub const AUDIT_ACTIONS: [&str; 14] = [
     "node.repair",
     "node.reconfigure_range",
     "promotion.attest",
+    "audit.gap",
     "security.override",
     "native.session",
 ];

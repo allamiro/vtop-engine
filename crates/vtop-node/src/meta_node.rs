@@ -253,6 +253,9 @@ pub async fn serve(
     observability.register(Box::new(MetaRaftCollector::new(Arc::clone(
         &node.consensus,
     ))?))?;
+    observability.register(Box::new(crate::observe::MetaAuditCollector::new(
+        Arc::clone(&node.consensus),
+    )?))?;
     observability.register(Box::new(crate::observe::MetaGroupCursorCollector::new(
         Arc::clone(&node.consensus) as Arc<dyn crate::observe::GroupCursorSource>,
     )?))?;

@@ -1,5 +1,6 @@
 //! [`openraft::storage::RaftStateMachine`] over [`crate::MetaStorage`].
 
+use crate::raft::audit_delivery::{applied_command_record, applied_membership_record};
 use crate::raft::convert::{
     membership_to_meta, meta_to_membership, raft_log_id, sto_err_apply, sto_err_snapshot,
     to_meta_index, to_raft_index,
@@ -34,70 +35,12 @@ impl MetaRaftStateMachine {
     /// Name this replica in its applied audit records.
     pub fn with_node_id(mut self, node_id: NodeId) -> Self {
         self.node_id = Some(node_id);
+        self.store.set_audit_node_id(node_id);
         self
     }
 
     pub fn store(&self) -> &MetaRaftStore {
         &self.store
-    }
-}
-
-impl MetaRaftStateMachine {
-    /// The applied record of an audited command (#694): every replica writes
-    /// one, with the request id and the log index, so the record comes from
-    /// the applied command and not only from the client. Written after
-    /// `apply_through` has saved the applied frontier: a crash in between
-    /// loses this replica's record of the entry (the others keep theirs),
-    /// and an entry a snapshot brought gets none. Readers dedupe on the
-    /// log index.
-    fn applied_record(
-        &self,
-        entry: &Entry<MetaRaftTypeConfig>,
-        command: &crate::command::MetadataCommand,
-        response: &crate::command::MetadataResponse,
-    ) -> Option<crate::audit::AuditRecord> {
-        let audit = crate::audit::command_audit(command)?;
-        let mut record = crate::audit::AuditRecord::for_command(
-            crate::audit::AuditStage::Applied,
-            crate::audit::AuditActor::Replica(self.node_id),
-            command,
-            audit,
-            crate::audit::AuditOutcome::Success,
-        );
-        let index = to_meta_index(entry.log_id.index);
-        record.log_index = Some(index);
-        if let crate::command::MetadataResponse::Rejected(error) = response {
-            record.outcome = crate::audit::AuditOutcome::Failure;
-            record.reason = Some(format!(
-                "rejected by the state machine at index {index}: {error}"
-            ));
-        }
-        Some(record)
-    }
-
-    fn membership_record(
-        &self,
-        entry: &Entry<MetaRaftTypeConfig>,
-        membership: &crate::MetaMembership,
-    ) -> crate::audit::AuditRecord {
-        let voters = membership
-            .voters
-            .iter()
-            .map(|id| id.0.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        crate::audit::AuditRecord {
-            stage: crate::audit::AuditStage::Applied,
-            action: crate::audit::AuditAction::ClusterMembership,
-            actor: crate::audit::AuditActor::Replica(self.node_id),
-            target_kind: "cluster",
-            target_id: None,
-            params: vec![("voters", voters)],
-            outcome: crate::audit::AuditOutcome::Success,
-            reason: None,
-            request_id: None,
-            log_index: Some(to_meta_index(entry.log_id.index)),
-        }
     }
 }
 
@@ -107,6 +50,25 @@ impl RaftSnapshotBuilder<MetaRaftTypeConfig> for MetaRaftStateMachine {
     ) -> Result<Snapshot<MetaRaftTypeConfig>, StorageError<NodeId>> {
         let mut guard = self.store.lock();
         let meta = guard.storage.write_snapshot().map_err(sto_err_snapshot)?;
+        // The audit frontier is saved at every snapshot build (#706), so it
+        // never falls further behind the log the snapshot lets be purged
+        // than one interval. Read without the delivery lock: it only rises,
+        // and a value read early is merely lower.
+        let delivered = self
+            .store
+            .progress
+            .delivered()
+            .min(guard.storage.last_applied());
+        if let Err(error) = guard.storage.save_audited(delivered) {
+            crate::transport::warn_rate_limited(
+                "audit-frontier-save",
+                &format!(
+                    "could not save the audit frontier at {delivered} with the snapshot \
+                     ({error}); records above the last saved one are delivered again at \
+                     restart, marked replayed"
+                ),
+            );
+        }
         let bytes = read_snapshot_file_bytes(&guard, &meta.path)?;
         let last_log_id =
             to_raft_index(meta.last_index).map(|index| raft_log_id(meta.last_term, index));
@@ -150,7 +112,12 @@ impl RaftStateMachine<MetaRaftTypeConfig> for MetaRaftStateMachine {
         if entries.is_empty() {
             return Ok(Vec::new());
         }
+        // The delivery lock first, then the store's (#706): a delivery and
+        // the retry task must not interleave, and the order is the same
+        // everywhere.
+        let mut delivery = self.store.lock_delivery();
         let mut guard = self.store.lock();
+        let first = to_meta_index(entries[0].get_log_id().index);
         let last = entries.last().expect("non-empty");
         let through_meta = to_meta_index(last.get_log_id().index);
         let responses = guard
@@ -162,6 +129,8 @@ impl RaftStateMachine<MetaRaftTypeConfig> for MetaRaftStateMachine {
         let mut out = Vec::with_capacity(entries.len());
         let mut applied = Vec::new();
         for entry in &entries {
+            let index = to_meta_index(entry.log_id.index);
+            let term = entry.log_id.leader_id.term;
             match &entry.payload {
                 EntryPayload::Normal(command) => {
                     let response = resp_iter.next().ok_or_else(|| {
@@ -173,7 +142,9 @@ impl RaftStateMachine<MetaRaftTypeConfig> for MetaRaftStateMachine {
                     let bytes = response.encode().map_err(|error| {
                         sto_err_apply(entry.log_id, format!("encode response: {error}"))
                     })?;
-                    if let Some(record) = self.applied_record(entry, command, &response) {
+                    if let Some(record) =
+                        applied_command_record(self.node_id, index, term, command, Some(&response))
+                    {
                         applied.push(record);
                     }
                     out.push(bytes);
@@ -184,7 +155,7 @@ impl RaftStateMachine<MetaRaftTypeConfig> for MetaRaftStateMachine {
                     let meta = membership_to_meta(membership)?;
                     guard.last_membership =
                         StoredMembership::new(Some(entry.log_id), membership.clone());
-                    applied.push(self.membership_record(entry, &meta));
+                    applied.push(applied_membership_record(self.node_id, index, term, &meta));
                     out.push(Vec::new());
                 }
                 EntryPayload::Blank => out.push(Vec::new()),
@@ -198,11 +169,12 @@ impl RaftStateMachine<MetaRaftTypeConfig> for MetaRaftStateMachine {
         }
         // After the store lock is released, and only for entries this call
         // applied: a log replayed when the store opens is applied inside
-        // `MetaStorage`, never through here, so it writes no records.
+        // `MetaStorage`, never through here. The applied frontier is already
+        // durable; the audit frontier follows only once the sink accepted
+        // the records (#706), so a crash in between re-delivers them.
         drop(guard);
-        for record in &applied {
-            crate::audit::emit(record);
-        }
+        self.store
+            .deliver_applied(&mut delivery, first, through_meta, applied);
         Ok(out)
     }
 
@@ -225,6 +197,7 @@ impl RaftStateMachine<MetaRaftTypeConfig> for MetaRaftStateMachine {
         let membership_log_id = *meta.last_membership.log_id();
         let membership_meta =
             membership_log_id.map(|log_id| (log_id.leader_id.term, to_meta_index(log_id.index)));
+        let mut delivery = self.store.lock_delivery();
         let mut guard = self.store.lock();
         // Membership LogId is embedded in the published snapshot (and mirrored
         // to the sidecar) inside install_snapshot_bytes — no post-publish
@@ -249,6 +222,13 @@ impl RaftStateMachine<MetaRaftTypeConfig> for MetaRaftStateMachine {
         }
         let recovered = meta_to_membership(guard.storage.membership())?;
         guard.last_membership = StoredMembership::new(membership_log_id, recovered);
+        let installed_through = guard.storage.last_applied();
+        drop(guard);
+        // The entries the snapshot replaced were never applied here one by
+        // one, so their applied records cannot be re-derived (#706).
+        self.store
+            .snapshot_installed(&mut delivery, installed_through)
+            .map_err(sto_err_snapshot)?;
         Ok(())
     }
 
