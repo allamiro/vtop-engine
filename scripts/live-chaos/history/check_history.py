@@ -87,6 +87,9 @@ class Batch:
     offsets: list[int] | None = None
     fencing_epoch: int | None = None
     time_us: int = 0
+    # This invocation, among every batch in the history: a process name can
+    # come round again (a reused pid), so (process, batch) is not unique.
+    uid: int = 0
 
     def offset_of(self, index: int) -> int:
         """Where record `index` of an acknowledged batch sits."""
@@ -102,11 +105,12 @@ class Batch:
 
     def identity(self) -> str:
         """The producer the records belong to, across processes: `produce`
-        names its process `produce:<producer id>:<producer epoch>:<pid>`, and
+        names its process `produce:<producer id>:<producer epoch>:<pid>:<start
+        time>`, and
         a retry from a new process under the same producer id and epoch sends
         the same logical records, which the log must hold at most once."""
         parts = self.process.split(":")
-        if len(parts) == 4 and parts[0] == "produce":
+        if len(parts) >= 4 and parts[0] == "produce":
             return ":".join(parts[:3])
         return self.process
 
@@ -127,6 +131,7 @@ class Read:
 def load(lines: list[str]) -> tuple[list[Batch], list[Read]]:
     batches: dict[tuple[str, int], Batch] = {}
     reads: dict[str, Read] = {}
+    retired: list[Batch] = []
     finished: list[Read] = []
     for number, line in enumerate(lines, 1):
         line = line.strip()
@@ -140,6 +145,11 @@ def load(lines: list[str]) -> tuple[list[Batch], list[Read]]:
         if op == "produce":
             key = (process, event["batch"])
             if kind == "invoke":
+                # A repeated name is a new invocation, not the old one (review
+                # of #878): the earlier batch keeps its outcome, and what
+                # follows answers this one.
+                if key in batches:
+                    retired.append(batches[key])
                 batches[key] = Batch(
                     process=process,
                     batch=event["batch"],
@@ -147,6 +157,7 @@ def load(lines: list[str]) -> tuple[list[Batch], list[Read]]:
                     count=event["count"],
                     fencing_epoch=event.get("fencing_epoch"),
                     time_us=event.get("time_us", 0),
+                    uid=number,
                 )
             elif kind in ("ok", "fail", "info"):
                 if key not in batches:
@@ -187,7 +198,7 @@ def load(lines: list[str]) -> tuple[list[Batch], list[Read]]:
         else:
             raise ValueError(f"line {number}: unknown op {op!r}")
     finished.sort(key=lambda r: r.end_time_us)
-    return list(batches.values()), finished
+    return retired + list(batches.values()), finished
 
 
 def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) -> dict:
@@ -271,7 +282,7 @@ def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) 
             groups.append([offset])
     indeterminate = [b for b in batches if b.outcome == "info"]
     refused = [b for b in batches if b.outcome == "fail"]
-    used: set[tuple[str, int]] = set()
+    used: set[int] = set()
     # Logical records already visible: an unanswered attempt cannot explain a
     # second copy of a record its producer's retry was acknowledged for.
     surfaced: set[tuple[str, int]] = set()
@@ -323,7 +334,7 @@ def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) 
         already_visible = [
             b.name()
             for b in batches
-            if b.outcome == "ok" or (b.outcome == "info" and (b.process, b.batch) in used)
+            if b.outcome == "ok" or (b.outcome == "info" and b.uid in used)
             if _covers(b, sequences)
         ]
         if already_visible and all_values_match:
@@ -376,7 +387,7 @@ def _covers(batch: Batch, sequences: list[int]) -> bool:
 def _tilings(
     task: "Task",
     indeterminate: list[Batch],
-    used: set[tuple[str, int]],
+    used: set[int],
     surfaced: set[tuple[str, int]],
     budget: list[int],
 ):
@@ -411,13 +422,10 @@ def _tilings(
             task.acked_at(offset) == (identity, first_sequence + i) for i, offset in enumerate(offsets)
         )
 
-    def search(position: int):
-        if position == len(sequences):
-            yield
-            return
-        budget[0] -= 1
-        if budget[0] < 0:
-            return
+    def choices(position: int):
+        """The batches that may tile from `position`, each with the records
+        it puts inside the group. Checked as each is reached, against the
+        search's state at that moment."""
         shapes: set[tuple[str, int, int]] = set()
         sequence = sequences[position]
         for batch in covering.get(sequence, []):
@@ -427,7 +435,7 @@ def _tilings(
             after = batch.count - before - inside
             if (
                 shape in shapes
-                or (batch.process, batch.batch) in used
+                or batch.uid in used
                 or (before and position != 0)
                 or (after and position + inside != len(sequences))
                 or sequences[position + inside - 1] != sequence + inside - 1
@@ -440,13 +448,45 @@ def _tilings(
             if logical & surfaced:
                 continue
             shapes.add(shape)
-            used.add((batch.process, batch.batch))
-            surfaced.update(logical)
-            yield from search(position + inside)
-            surfaced.difference_update(logical)
-            used.discard((batch.process, batch.batch))
+            yield batch, inside, logical
 
-    yield from search(0)
+    # An explicit stack, not recursion (review of #878): a run explained by a
+    # thousand unanswered batches is a thousand levels deep, past Python's
+    # own limit; the budget is what bounds the search. A frame is a position,
+    # its remaining choices, and the choice it has applied.
+    if budget[0] <= 0:
+        return
+    budget[0] -= 1
+    stack: list[list] = [[0, choices(0), None]]
+    while stack:
+        frame = stack[-1]
+        if frame[2] is not None:
+            batch, logical = frame[2]
+            surfaced.difference_update(logical)
+            used.discard(batch.uid)
+            frame[2] = None
+        chosen = next(frame[1], None)
+        if chosen is None:
+            stack.pop()
+            continue
+        batch, inside, logical = chosen
+        used.add(batch.uid)
+        surfaced.update(logical)
+        frame[2] = (batch, logical)
+        position = frame[0] + inside
+        if position == len(sequences):
+            yield
+            continue
+        budget[0] -= 1
+        if budget[0] < 0:
+            # Out of steps: take back every choice still applied, and give up.
+            for open_frame in stack:
+                if open_frame[2] is not None:
+                    applied, applied_logical = open_frame[2]
+                    surfaced.difference_update(applied_logical)
+                    used.discard(applied.uid)
+            return
+        stack.append([position, choices(position), None])
 
 
 @dataclass
@@ -464,7 +504,7 @@ class Task:
 def _explain(
     task: Task,
     indeterminate: list[Batch],
-    used: set[tuple[str, int]],
+    used: set[int],
     surfaced: set[tuple[str, int]],
 ) -> bool:
     """Whether one group has a tiling; the first found is kept applied."""
@@ -475,22 +515,24 @@ def _explain(
 def _explain_all(
     tasks: list[Task],
     indeterminate: list[Batch],
-    used: set[tuple[str, int]],
+    used: set[int],
     surfaced: set[tuple[str, int]],
 ) -> bool:
     """Whether every group has a tiling at once, backtracking across groups;
     the assignment found is kept applied, and nothing is when there is none."""
     budget = [SEARCH_BUDGET]
-
-    def assign(index: int) -> bool:
-        if index == len(tasks):
-            return True
-        for _ in _tilings(tasks[index], indeterminate, used, surfaced, budget):
-            if assign(index + 1):
-                return True
-        return False
-
-    return assign(0)
+    # One suspended search per group, in order; resuming one takes its tiling
+    # back and tries the next. A stack of generators rather than recursion,
+    # for the same reason as in _tilings.
+    searches: list = []
+    while len(searches) < len(tasks):
+        index = len(searches)
+        searches.append(_tilings(tasks[index], indeterminate, used, surfaced, budget))
+        while next(searches[-1], False) is not None:
+            searches.pop()
+            if not searches:
+                return False
+    return True
 
 
 def summarize(batches, reads, violations, notes) -> dict:
