@@ -17,6 +17,38 @@ promises, and the rules for changing one, are in the
 [compatibility policy](../reference/compatibility.md); which releases get
 fixes is in [Versioning and support](../SUPPORT.md).
 
+## Upgrading from v0.10.1 to v0.10.2
+
+v0.10.2 fixes the size of the batches `vtopctl run` seals, recovers a replay
+over an Object Lock that ended, and refuses key, ledger and audit files that
+other local users can reach. The full notes are in
+[v0.10.2](../ROADMAP.md#v0102--batches-stay-within-max_bytes-and-a-linux-archive-for-every-linux)
+in the roadmap.
+
+- **Run `vtopctl validate` with the v0.10.2 binary first.** The engine now
+  refuses to start when a manifest key file, the state-store secret file, the
+  SQLite ledger (or its `-wal` and `-shm`) or the `VTOP_AUDIT_LOG` file can be
+  reached by other local users (#775). A ledger written 0644 by an earlier
+  release is refused unless its directory is owned by the engine's user and
+  closed (0700); a group- or world-writable file is always refused. `validate`
+  lists every refused file and changes nothing. Fix them with `chmod`, or
+  accept readable files with `security.allow_loose_secret_permissions: true`,
+  which is announced and audited. See
+  [Secret files and their permissions](secrets.md).
+- **Otherwise a drop-in replacement.** Replace the binaries in any order;
+  v0.10.1 and v0.10.2 engines, voters and data nodes can run side by side. No
+  schema, on-disk or wire format, or cluster feature level changes, and no
+  one-way step is added. A raise of the feature level to 8 or above now asks
+  every metadata member first, so a cluster still at level 7 needs every voter
+  on v0.10.2 before that raise.
+- **Batches are smaller in `run`.** They now hold at most `batching.max_bytes`,
+  where they held about twice that, so expect more objects for the same bytes.
+- **The Linux archives** run on glibc 2.17 or later; the new `-linux-musl`
+  archives run on any Linux. See [binaries](../install/binaries.md).
+- **Helm chart 0.6.1** (`appVersion` 0.10.2). No template or values key
+  changes; the shipped alert rules gain `VtopObjectLockFallback`.
+- Downgrade is not supported.
+
 ## Upgrading from v0.10.0 to v0.10.1
 
 v0.10.1 fixes the Linux archives: v0.10.0's did not start on a host with a

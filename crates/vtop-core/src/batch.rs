@@ -274,7 +274,53 @@ pub fn build_batch_id(source_name: &str, range: &ProgressMarker) -> String {
     let range = range.range_token();
     let suffix = Uuid::new_v4().simple().to_string();
     let short = &suffix[..8];
+    let id = format!("vtop-{stamp}-{safe_source}-{range}-{short}");
+    if id.len() <= MAX_NAME_STEM_BYTES {
+        return id;
+    }
+    // A long source path would make the manifest, the receipt and the local
+    // staging files of this batch too long a file name for the filesystem.
+    let safe_source = shorten_token(source_name, &safe_source, SHORT_TOKEN_TAIL_BYTES);
     format!("vtop-{stamp}-{safe_source}-{range}-{short}")
+}
+
+/// The longest name stem (an object name or a batch id, before its
+/// extension) the engine generates: 200 bytes.
+///
+/// POSIX `NAME_MAX` is 255 bytes for one path component, and the engine adds
+/// to a stem: up to 14 bytes of extension (`.manifest.json`) and, on the
+/// localfs backend, a staging suffix of up to 37 bytes
+/// (`.<pid>-<counter>.partial`) while it copies the file in. 200 plus those 51
+/// is 251, so a stem within this bound leaves every file name the engine
+/// derives from it inside 255 bytes. A stem that already fits is never
+/// changed: only a longer one has its source token shortened.
+pub const MAX_NAME_STEM_BYTES: usize = 200;
+
+/// The readable part (the tail) of a shortened source token, in bytes.
+const SHORT_TOKEN_TAIL_BYTES: usize = 48;
+
+/// The shorter tail used when the engine's own name also has to be
+/// shortened for a stem to fit.
+const SHORTEST_TOKEN_TAIL_BYTES: usize = 24;
+
+/// Hex digits of the SHA-256 of the full, unsanitized source a shortened token
+/// carries: 64 bits, enough that two sources sharing their last bytes do not
+/// meet, since the token only has to tell the sources of one archive apart.
+const SHORT_TOKEN_HASH_HEX: usize = 16;
+
+/// A token cut to the readable END of its sanitized form plus a stable hash
+/// of the FULL `raw` value: `<tail>-<16 hex>`. The hash covers everything
+/// the cut drops, so two long paths that share their last bytes get
+/// different tokens, and the same path always gets the same one (a replay of
+/// a range must find the object a first attempt left, #626).
+/// `safe` is `sanitize_token(raw)`, ASCII by construction.
+fn shorten_token(raw: &str, safe: &str, tail_bytes: usize) -> String {
+    let digest = crate::checksum::sha256_bytes(raw.as_bytes());
+    let hash = &digest[..SHORT_TOKEN_HASH_HEX];
+    // The tail: a path's end is the file's own name, what an operator
+    // recognizes; its head is the directory every file of a tree shares.
+    let kept = &safe[safe.len().saturating_sub(tail_bytes)..];
+    format!("{kept}-{hash}")
 }
 
 /// How many hex digits of the content digest an object name carries: 128
@@ -315,12 +361,13 @@ pub fn build_object_name(
     digest_hex: &str,
 ) -> String {
     let safe_source = sanitize_token(source_name);
-    let (host, unit) = match range {
+    let safe_engine = sanitize_token(engine_name);
+    let (has_host, unit) = match range {
         ProgressMarker::File { inode, .. } | ProgressMarker::SyslogSpool { inode, .. } => (
-            format!("{}-", sanitize_token(engine_name)),
+            true,
             inode.map(|inode| format!("-i{inode}")).unwrap_or_default(),
         ),
-        ProgressMarker::Kafka { .. } => (String::new(), String::new()),
+        ProgressMarker::Kafka { .. } => (false, String::new()),
     };
     let range = range.range_token();
     let digest: String = digest_hex
@@ -329,7 +376,35 @@ pub fn build_object_name(
         .take(OBJECT_NAME_DIGEST_HEX)
         .map(|c| c.to_ascii_lowercase())
         .collect();
-    format!("vtop-{host}{safe_source}-{range}{unit}-{digest}")
+    let name = |engine: &str, source: &str| {
+        let host = if has_host {
+            format!("{engine}-")
+        } else {
+            String::new()
+        };
+        format!("vtop-{host}{source}-{range}{unit}-{digest}")
+    };
+    // The name every archive written before this bound carries, and still
+    // carries whenever it fits: existing objects are found by it on replay.
+    let full = name(&safe_engine, &safe_source);
+    if full.len() <= MAX_NAME_STEM_BYTES {
+        return full;
+    }
+    // Too long for a file name: shorten the SOURCE token, the readable end
+    // plus a hash of the whole path, so the name stays a pure function of the
+    // source, the range and the bytes.
+    let short_source = shorten_token(source_name, &safe_source, SHORT_TOKEN_TAIL_BYTES);
+    let shortened = name(&safe_engine, &short_source);
+    if shortened.len() <= MAX_NAME_STEM_BYTES {
+        return shortened;
+    }
+    // Only an engine name of tens of bytes alongside a long source gets here;
+    // with both tokens at their shortest the name fits at any offset or inode
+    // a u64 can hold.
+    name(
+        &shorten_token(engine_name, &safe_engine, SHORTEST_TOKEN_TAIL_BYTES),
+        &shorten_token(source_name, &safe_source, SHORTEST_TOKEN_TAIL_BYTES),
+    )
 }
 
 /// Replace characters that are unsafe in object keys / file names.
@@ -353,6 +428,7 @@ mod tests {
             start_offset: start,
             end_offset: end,
             consumer_group: "vtop-engine".into(),
+            topic_id: None,
         }
     }
 
@@ -416,6 +492,249 @@ mod tests {
             build_batch_id("app.events", &range),
             build_batch_id("app.events", &range)
         );
+    }
+
+    // ---- Names are bounded (a long source path) ---------------------------
+
+    /// The two functions as they were before the bound, kept so a test can
+    /// show a name that fits did not change.
+    fn legacy_object_name(
+        engine_name: &str,
+        source_name: &str,
+        range: &ProgressMarker,
+        digest_hex: &str,
+    ) -> String {
+        let safe_source = sanitize_token(source_name);
+        let (host, unit) = match range {
+            ProgressMarker::File { inode, .. } | ProgressMarker::SyslogSpool { inode, .. } => (
+                format!("{}-", sanitize_token(engine_name)),
+                inode.map(|inode| format!("-i{inode}")).unwrap_or_default(),
+            ),
+            ProgressMarker::Kafka { .. } => (String::new(), String::new()),
+        };
+        let range = range.range_token();
+        let digest: String = digest_hex
+            .chars()
+            .filter(|c| c.is_ascii_hexdigit())
+            .take(OBJECT_NAME_DIGEST_HEX)
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        format!("vtop-{host}{safe_source}-{range}{unit}-{digest}")
+    }
+
+    fn legacy_batch_id_with(source_name: &str, range: &ProgressMarker, id: &str) -> String {
+        // `id` is a generated batch id; rebuild what the old code produced
+        // from its own stamp and suffix.
+        let parts: Vec<&str> = id.splitn(3, '-').collect();
+        let stamp = parts[1];
+        let suffix = id.rsplit('-').next().unwrap();
+        format!(
+            "vtop-{stamp}-{}-{}-{suffix}",
+            sanitize_token(source_name),
+            range.range_token()
+        )
+    }
+
+    fn file_marker(path: &str, inode: Option<u64>, start: u64, end: u64) -> ProgressMarker {
+        ProgressMarker::File {
+            path: path.into(),
+            inode,
+            start_byte: start,
+            end_byte: end,
+            file_size: end,
+            mtime: String::new(),
+            content_fingerprint: None,
+            tail_fingerprint: None,
+            ctime: None,
+        }
+    }
+
+    /// A directory of 140 characters, as in the run that never drained.
+    fn long_dir() -> String {
+        format!("/srv/{}", "customer-data-archive/".repeat(6))
+    }
+
+    /// Every file name the engine derives from a batch id or an object name,
+    /// for the longest object extension (`.syslog.zst`).
+    fn derived_names(object_name: &str, batch_id: &str) -> Vec<String> {
+        vec![
+            object_name.to_string(),
+            batch_id.to_string(),
+            crate::partitioning::object_file_name(
+                object_name,
+                TelemetryFormat::Syslog,
+                crate::types::CompressionType::Zstd,
+            ),
+            crate::partitioning::manifest_file_name(batch_id),
+            crate::partitioning::receipt_file_name(batch_id),
+        ]
+    }
+
+    #[test]
+    fn a_long_source_path_yields_names_that_fit_a_file_name() {
+        let digest = "ab".repeat(16);
+        let path = format!("{}app-service-2026-11-20.log", long_dir());
+        // The offsets of a 1.5 GB file, in the widest case a u64 allows too.
+        for (start, end) in [
+            (0, 4_194_219),
+            (4_194_219, 8_388_519),
+            (1_500_000_000, 1_504_194_219),
+            (u64::MAX - 1, u64::MAX),
+        ] {
+            let range = file_marker(&path, Some(u64::MAX), start, end);
+            let object = build_object_name("engine-1", &path, &range, &digest);
+            let id = build_batch_id(&path, &range);
+            for name in derived_names(&object, &id) {
+                assert!(
+                    name.len() <= 255,
+                    "{} bytes for range {start}-{end}: {name}",
+                    name.len()
+                );
+            }
+            // The bound leaves room for the localfs staging suffix too.
+            assert!(object.len() <= MAX_NAME_STEM_BYTES, "{object}");
+            assert!(id.len() <= MAX_NAME_STEM_BYTES, "{id}");
+            assert!(
+                object.contains("customer-data-archive_app-service-2026-11-20_log-"),
+                "the file's own name stays readable: {object}"
+            );
+        }
+        // The case from the run: this path made the first range's object name
+        // 237 bytes and the second's 261.
+        let before = legacy_object_name(
+            "engine-1",
+            &path,
+            &file_marker(&path, Some(123), 4_194_219, 8_388_519),
+            &digest,
+        );
+        assert!(
+            before.len() + ".raw.zst".len() > 255 - 20,
+            "{}",
+            before.len()
+        );
+    }
+
+    #[test]
+    fn an_over_long_engine_name_with_a_long_path_still_fits() {
+        let path = format!("{}app.log", long_dir());
+        let engine = "e".repeat(120);
+        let range = file_marker(&path, Some(u64::MAX), u64::MAX - 1, u64::MAX);
+        let object = build_object_name(&engine, &path, &range, &"cd".repeat(16));
+        assert!(object.len() <= 200, "{} bytes: {object}", object.len());
+    }
+
+    #[test]
+    fn the_same_range_of_the_same_long_path_has_the_same_name() {
+        let digest = "ab".repeat(16);
+        let path = format!("{}app.log", long_dir());
+        let range = file_marker(&path, Some(9), 4_194_219, 8_388_519);
+        let a = build_object_name("e", &path, &range, &digest);
+        let b = build_object_name("e", &path, &range, &digest);
+        assert_eq!(a, b, "a replay finds the object the first attempt left");
+        // The name is a pure function of the inputs, stated outright: a
+        // change here changes where a replay looks (#626).
+        assert_eq!(
+            a,
+            format!(
+                "vtop-e-tomer-data-archive_customer-data-archive_app_log-{}-b4194219-8388519-i9-{digest}",
+                &crate::checksum::sha256_bytes(path.as_bytes())[..16]
+            )
+        );
+    }
+
+    #[test]
+    fn two_long_paths_that_share_a_prefix_have_different_names() {
+        let digest = "ab".repeat(16);
+        // Same directory, so the same first 100 bytes, then other files.
+        let a_path = format!("{}app-a.log", long_dir());
+        let b_path = format!("{}app-b.log", long_dir());
+        let a = build_object_name("e", &a_path, &file_marker(&a_path, Some(1), 0, 10), &digest);
+        let b = build_object_name("e", &b_path, &file_marker(&b_path, Some(1), 0, 10), &digest);
+        assert_ne!(a, b);
+        // Same file name under directories that differ only at the start, so
+        // the kept tail is identical and only the hash tells them apart.
+        let x_path = format!("/srv-x{}app.log", long_dir());
+        let y_path = format!("/srv-y{}app.log", long_dir());
+        let x = build_object_name("e", &x_path, &file_marker(&x_path, Some(1), 0, 10), &digest);
+        let y = build_object_name("e", &y_path, &file_marker(&y_path, Some(1), 0, 10), &digest);
+        assert_ne!(x, y, "{x} / {y}");
+        let strip = |id: String| id[id.len() - 8..].to_string();
+        let x_id = build_batch_id(&x_path, &file_marker(&x_path, Some(1), 0, 10));
+        let y_id = build_batch_id(&y_path, &file_marker(&y_path, Some(1), 0, 10));
+        assert_ne!(
+            x_id.replace(&strip(x_id.clone()), ""),
+            y_id.replace(&strip(y_id.clone()), ""),
+            "the ids differ apart from their random suffix"
+        );
+        // Paths that sanitize to the same token still differ: the hash covers
+        // the raw path.
+        let c_path = format!("{0}{0}app a.log", long_dir());
+        let d_path = format!("{0}{0}app_a.log", long_dir());
+        assert_ne!(
+            build_object_name("e", &c_path, &file_marker(&c_path, Some(1), 0, 10), &digest),
+            build_object_name("e", &d_path, &file_marker(&d_path, Some(1), 0, 10), &digest),
+        );
+    }
+
+    #[test]
+    fn a_name_that_already_fits_is_unchanged_byte_for_byte() {
+        let digest = "AB".repeat(32);
+        let cases: Vec<(&str, String, ProgressMarker)> = vec![
+            (
+                "eng-1",
+                "/var/log/app.log".into(),
+                file_marker("/var/log/app.log", Some(7), 0, 10),
+            ),
+            (
+                "eng-1",
+                "/var/log/app.log".into(),
+                file_marker("/var/log/app.log", None, 4_194_219, 8_388_519),
+            ),
+            ("e", "app.events".into(), kafka_marker(100, 249)),
+            (
+                "host-a",
+                "x".repeat(100),
+                file_marker(&"x".repeat(100), Some(12345), 1_500_000_000, 1_504_194_219),
+            ),
+            // The longest source that still fits at these offsets: 200 bytes
+            // is the bound, not the source's own length.
+            (
+                "e",
+                "s".repeat(MAX_NAME_STEM_BYTES - 71),
+                file_marker(&"s".repeat(MAX_NAME_STEM_BYTES - 71), Some(1), 0, 10),
+            ),
+        ];
+        for (engine, source, range) in cases {
+            let now = build_object_name(engine, &source, &range, &digest);
+            assert_eq!(now, legacy_object_name(engine, &source, &range, &digest));
+            assert!(now.len() <= MAX_NAME_STEM_BYTES, "{}", now.len());
+            let id = build_batch_id(&source, &range);
+            assert_eq!(id, legacy_batch_id_with(&source, &range, &id));
+        }
+        assert_eq!(
+            build_object_name(
+                "eng-1",
+                "/var/log/app.log",
+                &file_marker("/var/log/app.log", Some(7), 0, 10),
+                &digest
+            ),
+            format!("vtop-eng-1-_var_log_app_log-b0-10-i7-{}", "ab".repeat(16)),
+            "a literal, so the expected name is not computed by the code under test"
+        );
+    }
+
+    #[test]
+    fn a_name_one_byte_over_the_bound_is_shortened_and_one_at_it_is_not() {
+        let digest = "ab".repeat(16);
+        let fixed = legacy_object_name("e", "", &file_marker("", Some(1), 0, 10), &digest).len();
+        let at = "s".repeat(MAX_NAME_STEM_BYTES - fixed);
+        let over = format!("{at}s");
+        let at_name = build_object_name("e", &at, &file_marker(&at, Some(1), 0, 10), &digest);
+        let over_name = build_object_name("e", &over, &file_marker(&over, Some(1), 0, 10), &digest);
+        assert_eq!(at_name.len(), MAX_NAME_STEM_BYTES);
+        assert!(at_name.contains(&at), "unchanged at the bound");
+        assert!(!over_name.contains(&over), "shortened one byte over");
+        assert!(over_name.len() < MAX_NAME_STEM_BYTES);
     }
 
     #[test]
