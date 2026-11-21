@@ -55,6 +55,25 @@ class Releases(unittest.TestCase):
         self.assertEqual(select.releases(["v0.9.0", "v0.10.0", "v1.0.0"]), ["v0.9.0", "v0.10.0", "v1.0.0"])
 
 
+class PublishedReleases(unittest.TestCase):
+    def test_drafts_and_prereleases_are_not_selected(self):
+        listed = [
+            {"tagName": "v0.11.0", "isDraft": False, "isPrerelease": True},
+            {"tagName": "v0.10.3", "isDraft": True, "isPrerelease": False},
+            {"tagName": "v0.10.2", "isDraft": False, "isPrerelease": False},
+            {"tagName": "v0.9.0", "isDraft": False, "isPrerelease": False},
+        ]
+        self.assertEqual(select.published_tags(listed), ["v0.10.2", "v0.9.0"])
+
+    def test_a_final_looking_prerelease_is_not_the_newest_minor(self):
+        listed = [
+            {"tagName": tag, "isDraft": False, "isPrerelease": False} for tag in TAGS
+        ] + [{"tagName": "v0.11.0", "isDraft": False, "isPrerelease": True}]
+        tags = select.published_tags(listed)
+        self.assertNotIn("v0.11.0", tags)
+        self.assertEqual(select.releases(tags)[-1], "v0.9.0")
+
+
 class Matrix(unittest.TestCase):
     def test_the_full_matrix_runs_every_release_since_each_cell_applies(self):
         self.assertEqual(
