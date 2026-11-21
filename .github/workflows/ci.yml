@@ -333,6 +333,8 @@ jobs:
               # broker with. Its own workflow runs on a change to it; this
               # entry is the lint.
               - 'scripts/kafka-broker.sh'
+              # The three-broker cluster helper (kafka-cluster.yml), the same.
+              - 'scripts/kafka-cluster.sh'
               # The release-notes generator only ever runs during a tag build,
               # where a failure means a published release with a broken body and
               # no second chance to get it right before people see it. Lint it
@@ -1262,7 +1264,8 @@ jobs:
             scripts/manifest-compat.sh scripts/ledger-compat.sh scripts/compat/*.sh \
             scripts/traffic-snapshot.sh scripts/test-progress.sh \
             scripts/check-naming.sh scripts/check-egress-claims.sh \
-            scripts/check-failpoints-absent.sh scripts/kafka-broker.sh
+            scripts/check-failpoints-absent.sh scripts/kafka-broker.sh \
+            scripts/kafka-cluster.sh
 
       # `-P scripts/live-chaos/scenarios` resolves the scenarios' dynamic
       # `source "$(dirname …)/../lib.sh"`. Without it every scenario reports
