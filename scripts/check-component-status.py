@@ -20,7 +20,8 @@ has not made. This check reads the table and fails when:
     "production grade", "battle-tested" and the like) and the table's
     Today label for it is lower, or says it of VTOP as a whole while any
     component is not production. A sentence that denies, conditions or plans
-    the claim ("not production-ready", "until", "the bar for") is allowed;
+    the claim ("not production-ready", "until", "the bar for") is allowed,
+    and each claim in a sentence is judged on its own;
   - the README does not link to the status page.
 
 Usage: scripts/check-component-status.py [REPO_ROOT]
@@ -100,11 +101,43 @@ QUALIFIER_BEFORE = re.compile(
 QUALIFIER_AFTER = re.compile(r"^[\s,]*(?:only\s+)?(?:until|unless|once|if|when|after)\b", re.I)
 
 
-def qualified(sentence: str, claim: re.Match) -> bool:
-    """Whether a qualifier negates or conditions this claim, by its position."""
-    if QUALIFIER_BEFORE.search(sentence[: claim.start()]):
+# Claims joined only by "and", "or", "nor" or a comma ("not production-ready
+# or battle-tested") are one assertion: a qualifier before the first covers
+# them all.
+COORDINATED = re.compile(r"^[\s,]*(?:and|or|nor)?[\s,]*$", re.I)
+
+
+def assertions(sentence: str):
+    """(claim, before, after, about) for each readiness assertion in a sentence.
+
+    A sentence can hold several ("The engine is not production-ready, but the
+    Kafka gateway is production-ready"), and each is judged on its own text
+    (review of #826): `before` runs from the end of the previous assertion to
+    this claim, `after` from this claim to the next assertion or the end, and
+    `about` is the text that names what the claim is about - `before` and the
+    claim, plus `after` for the last assertion only (the text between two
+    claims belongs to the second: "..., but the gateway is production-ready").
+    """
+    groups: list[list[re.Match]] = []
+    for claim in CLAIM.finditer(sentence):
+        if groups and COORDINATED.match(sentence[groups[-1][-1].end() : claim.start()]):
+            groups[-1].append(claim)
+        else:
+            groups.append([claim])
+    for i, group in enumerate(groups):
+        first, last = group[0], group[-1]
+        begin = groups[i - 1][-1].end() if i else 0
+        end = groups[i + 1][0].start() if i + 1 < len(groups) else len(sentence)
+        before, after = sentence[begin : first.start()], sentence[last.end() : end]
+        about = sentence[begin : last.end()] + (after if i + 1 == len(groups) else "")
+        yield first, before, after, about
+
+
+def qualified(before: str, after: str) -> bool:
+    """Whether a qualifier negates or conditions a claim, by its position."""
+    if QUALIFIER_BEFORE.search(before):
         return True
-    return bool(QUALIFIER_AFTER.search(sentence[claim.end() :]))
+    return bool(QUALIFIER_AFTER.search(after))
 
 
 # A claim names no component is held to the project-wide rule only when it
@@ -319,25 +352,25 @@ def claim_problems(root: pathlib.Path, today: dict[str, str]) -> list[str]:
     for path in scan_targets(root):
         rel = path.relative_to(root).as_posix()
         for number, sentence in sentences(path.read_text()):
-            claim = CLAIM.search(sentence)
-            if claim is None or qualified(sentence, claim):
-                continue
-            named = [name for name, alias in COMPONENTS.items() if re.search(alias, sentence, re.I)]
-            for alias, members in GROUPS.items():
-                if re.search(alias, sentence, re.I):
-                    named += [m for m in members if m not in named]
-            named = [n for n in named if n in today]
-            over = [n for n in named if today[n] != "production"]
-            if over:
-                problems.append(
-                    f"{rel}:{number}: says {claim.group(0)!r} of {', '.join(over)}, which {PAGE} "
-                    f"labels {today[over[0]]}: {sentence.strip()[:110]}"
-                )
-            elif not named and not project_ok and PROJECT.search(sentence):
-                problems.append(
-                    f"{rel}:{number}: says {claim.group(0)!r} of VTOP, but {PAGE} does not label "
-                    f"every component production: {sentence.strip()[:110]}"
-                )
+            for claim, before, after, about in assertions(sentence):
+                if qualified(before, after):
+                    continue
+                named = [name for name, alias in COMPONENTS.items() if re.search(alias, about, re.I)]
+                for alias, members in GROUPS.items():
+                    if re.search(alias, about, re.I):
+                        named += [m for m in members if m not in named]
+                named = [n for n in named if n in today]
+                over = [n for n in named if today[n] != "production"]
+                if over:
+                    problems.append(
+                        f"{rel}:{number}: says {claim.group(0)!r} of {', '.join(over)}, which {PAGE} "
+                        f"labels {today[over[0]]}: {sentence.strip()[:110]}"
+                    )
+                elif not named and not project_ok and PROJECT.search(about):
+                    problems.append(
+                        f"{rel}:{number}: says {claim.group(0)!r} of VTOP, but {PAGE} does not label "
+                        f"every component production: {sentence.strip()[:110]}"
+                    )
     return problems
 
 

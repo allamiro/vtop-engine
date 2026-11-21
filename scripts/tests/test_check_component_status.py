@@ -183,6 +183,33 @@ class CheckTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(self.problems(**{"docs/a.md": text}), [])
 
+    def test_each_claim_in_a_sentence_is_judged_on_its_own(self):
+        # Review of #826: only the first claim of a sentence was read, so a
+        # denied claim hid an unsupported one after it.
+        text = "The archive engine is not production-ready, but the Kafka gateway is production-ready.\n"
+        out = self.problems(**{"docs/a.md": text})
+        self.assertEqual(len(out), 1, out)
+        self.assertIn(GATEWAY, out[0])
+        self.assertNotIn(ENGINE, out[0])
+        text = "The Kafka gateway is production-ready, but the archive engine is not production-ready.\n"
+        out = self.problems(**{"docs/a.md": text})
+        self.assertEqual(len(out), 1, out)
+        self.assertIn(GATEWAY, out[0])
+        self.assertNotIn(ENGINE, out[0])
+        text = "The archive engine is not production-ready, but VTOP is production-ready.\n"
+        out = self.problems(**{"docs/a.md": text})
+        self.assertEqual(len(out), 1, out)
+        self.assertIn("of VTOP", out[0])
+
+    def test_one_denial_covers_claims_joined_to_it(self):
+        for text in (
+            "The Kafka gateway is not production-ready or battle-tested.\n",
+            "The Kafka gateway is neither production-ready nor battle-tested.\n",
+            "The Kafka gateway is not production-ready, battle-tested, or enterprise-grade.\n",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.problems(**{"docs/a.md": text}), [])
+
     def test_a_project_wide_claim_fails_while_any_row_is_below_production(self):
         out = self.problems(**{"README.md": "[s](docs/reference/component-status.md)\n\nVTOP is production-ready.\n"})
         self.assertEqual(len(out), 1, out)
