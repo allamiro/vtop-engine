@@ -682,15 +682,9 @@ fn replica_server(
 }
 
 /// The replica listener's refusals over its cap, on the node's metrics
-/// (#732). Registered once per process, beside whichever replica server this
-/// role built.
-fn register_replica_limit(
-    observability: &NodeObservability,
-    server: &ReplicaPeerServer,
-) -> Result<(), String> {
-    observability.register(Box::new(crate::observe::ConnectionLimitCollector::new(
-        vec![server.connection_limit()],
-    )?))
+/// (#732), beside whichever replica server this role built.
+fn register_replica_limit(observability: &NodeObservability, server: &ReplicaPeerServer) {
+    observability.watch_connection_limit(server.connection_limit());
 }
 
 /// A replica-status client dialing the replica plane the way this node
@@ -1143,7 +1137,7 @@ async fn run_follower(
         Arc::clone(&follower) as Arc<dyn ReplicaPeerHandler>,
     )
     .map_err(|error| error.to_string())?;
-    register_replica_limit(observability, &server)?;
+    register_replica_limit(observability, &server);
     let listener = TcpListener::bind(listen)
         .await
         .map_err(|error| format!("bind {listen}: {error}"))?;
@@ -1391,7 +1385,7 @@ async fn run_leader(
         None => None,
     };
     if let Some((_, server)) = &status_server {
-        register_replica_limit(observability, server)?;
+        register_replica_limit(observability, server);
     }
     // Same epoch history a follower keeps (#240). A leader needs its own: the
     // range's history is the union of what each replica recorded, and a leader
@@ -2082,7 +2076,7 @@ async fn run_candidate(
         Arc::clone(&switching) as Arc<dyn ReplicaPeerHandler>,
     )
     .map_err(|error| error.to_string())?;
-    register_replica_limit(observability, &replica_server)?;
+    register_replica_limit(observability, &replica_server);
     let replica_listener = TcpListener::bind(replica_listen)
         .await
         .map_err(|error| format!("bind {replica_listen}: {error}"))?;
