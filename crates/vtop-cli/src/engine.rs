@@ -2325,7 +2325,10 @@ impl PendingBuffer {
     /// Whether a read starting at `start` picks up exactly where the buffered
     /// window ends. Byte-offset sources are continuous by construction until
     /// a rotation or truncation restarts the file at byte 0, or a different
-    /// file takes the path (#558). Kafka partitions are not judged here.
+    /// file takes the path (#558). A Kafka read continues a window unless both
+    /// name a topic id and the ids differ: two incarnations of a topic number
+    /// their offsets separately, so one window of both would carry a range no
+    /// marker can claim. Offsets are not judged.
     fn continues(&self, start: &ProgressMarker) -> bool {
         let Some(end) = self.latest_end.as_ref() else {
             return true;
@@ -2360,6 +2363,16 @@ impl PendingBuffer {
                     ..
                 },
             ) => same_file(*end_inode, *start_inode) && end_byte == start_byte,
+            (
+                ProgressMarker::Kafka {
+                    topic_id: Some(end_id),
+                    ..
+                },
+                ProgressMarker::Kafka {
+                    topic_id: Some(start_id),
+                    ..
+                },
+            ) => end_id == start_id,
             _ => true,
         }
     }
@@ -10153,6 +10166,46 @@ mod tests {
         assert!(
             !buf.continues(&file(Some(2), 10, 10)),
             "another file took the path"
+        );
+    }
+
+    /// A topic id that changes between two reads of one partition (the topic
+    /// was deleted and created again while the adapter held the old id) seals
+    /// the buffered window: one window of both incarnations would hold offsets
+    /// 0 to 9 while its marker could claim only the last read's 5 to 9. An id
+    /// unknown on either side proves no change.
+    #[test]
+    fn a_kafka_window_is_not_continued_across_a_change_of_topic_id() {
+        let kafka = |id: Option<&str>, start: i64, end: i64| ProgressMarker::Kafka {
+            topic: "t".into(),
+            partition: 0,
+            start_offset: start,
+            end_offset: end,
+            consumer_group: "g".into(),
+            topic_id: id.map(str::to_owned),
+        };
+        let src = DiscoveredSource {
+            source_type: SourceType::Kafka,
+            source_name: "t".into(),
+            format: vtop_core::types::TelemetryFormat::Raw,
+        };
+        let mut buf = PendingBuffer::new("t", src, BatchLimits::default());
+        buf.append(ReadResult {
+            records: vec![b"x".to_vec()],
+            progress_start: kafka(Some("old"), 0, 0),
+            progress_end: kafka(Some("old"), 0, 4),
+            first_timestamp: None,
+            last_timestamp: None,
+            verbatim: false,
+        });
+        assert!(buf.continues(&kafka(Some("old"), 5, 5)));
+        assert!(
+            buf.continues(&kafka(None, 5, 5)),
+            "an unknown id proves no change"
+        );
+        assert!(
+            !buf.continues(&kafka(Some("new"), 5, 5)),
+            "another incarnation of the topic"
         );
     }
 
