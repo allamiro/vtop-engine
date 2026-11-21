@@ -63,6 +63,15 @@ The guides link here; these pages do not repeat the guides.
 
     [:octicons-arrow-right-24: Component status](component-status.md)
 
+-   **Tamper evidence**
+
+    ---
+
+    Each anti-tamper feature, the tampering it catches, what it does not, and
+    the test that shows both.
+
+    [:octicons-arrow-right-24: Tamper evidence](tamper-evidence.md)
+
 -   **Protocol**
 
     ---
