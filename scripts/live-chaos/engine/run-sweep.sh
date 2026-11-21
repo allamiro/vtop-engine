@@ -4,7 +4,7 @@
 # committed at the source before it was verified.
 #
 # System model: one crash-recovery engine process (`vtopctl run`), a real
-# source (a Kafka broker, or a file), a real S3 store (the lab's MinIO) and a
+# source (a Kafka broker, a file, or a syslog spool file), a real S3 store (the lab's MinIO) and a
 # ledger (SQLite, or PostgreSQL); a partially synchronous network; honest
 # processes. The fault is a SIGKILL of the engine at one line, chosen by a
 # failpoint (crates/vtop-cli/src/failpoints.rs) in a build with the
@@ -65,7 +65,8 @@
 #                             and the run fails if one was not run) or a
 #                             comma-separated subset
 #   ENGINE_SWEEP_BACKEND      `sqlite` (default) or `postgres`
-#   ENGINE_SWEEP_SOURCE       `kafka` (default) or `file`
+#   ENGINE_SWEEP_SOURCE       `kafka` (default), `file` or `syslog_spool` (a
+#                             spool file, read by the spool source)
 #   ENGINE_SWEEP_FAULT        `none` (default), `store_outage` (MinIO is
 #                             stopped while the engine runs towards the
 #                             failpoint, for ENGINE_SWEEP_FAULT_SECONDS, then
@@ -101,7 +102,7 @@
 # in docs/LIVE_CHAOS_VALIDATION.md. The workflow's per-point wait is bounded
 # by ENGINE_SWEEP_POINT_TIMEOUT_SECONDS.
 #
-# Not covered here: syslog spool sources, power loss (ledger_power_loss.rs).
+# Not covered here: power loss (ledger_power_loss.rs).
 set -euo pipefail
 umask 077
 export CHAOS_NO_CERTS=1
@@ -138,8 +139,8 @@ require_integer_in_range ENGINE_SWEEP_POINT_TIMEOUT_SECONDS "$POINT_TIMEOUT" 5 3
 require_integer_in_range ENGINE_SWEEP_FAULT_SECONDS "$FAULT_SECONDS" 3 600
 [[ "$BACKEND" == "sqlite" || "$BACKEND" == "postgres" ]] \
   || fail "ENGINE_SWEEP_BACKEND must be sqlite or postgres, got '$BACKEND'"
-[[ "$SOURCE" == "kafka" || "$SOURCE" == "file" ]] \
-  || fail "ENGINE_SWEEP_SOURCE must be kafka or file, got '$SOURCE'"
+[[ "$SOURCE" == "kafka" || "$SOURCE" == "file" || "$SOURCE" == "syslog_spool" ]] \
+  || fail "ENGINE_SWEEP_SOURCE must be kafka, file or syslog_spool, got '$SOURCE'"
 [[ "$FAULT" == "none" || "$FAULT" == "store_outage" || "$FAULT" == "enospc" ]] \
   || fail "ENGINE_SWEEP_FAULT must be none, store_outage or enospc, got '$FAULT'"
 [[ "$PG_USER" =~ ^[a-z_][a-z0-9_]*$ && "$PG_PASSWORD" =~ ^[A-Za-z0-9_-]+$ \
@@ -303,7 +304,9 @@ emit_engine_config() { # <dir> <group> <prefix> <point> <state-store>
     auto_offset_reset: earliest
     enable_auto_commit: false"
   else
-    source_block="  file:
+    # A spool file is read as a file is, a line per record, by the spool
+    # source's own adapter: its cursor, markers and replay.
+    source_block="  $SOURCE:
     enabled: true
     paths: [\"$INPUT\"]"
   fi
@@ -386,7 +389,7 @@ POINT_DB="" # the PostgreSQL database of the point being run
 ledger_json() { # <dir> <group>
   local dir="$1" group="$2" rows
   local -a src
-  if [[ "$SOURCE" == "kafka" ]]; then src=(kafka "$TOPIC" 0 "$group"); else src=(file "$INPUT"); fi
+  if [[ "$SOURCE" == "kafka" ]]; then src=(kafka "$TOPIC" 0 "$group"); else src=("$SOURCE" "$INPUT"); fi
   if [[ "$BACKEND" == "sqlite" ]]; then
     python3 "$CHECKS" ledger --sqlite "$dir/state.db" "${src[@]}"
     return
