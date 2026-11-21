@@ -12,6 +12,9 @@ name: kafka matrix
 # A leg is one broker and one listener, a "variant":
 #   plain          PLAINTEXT, the whole live suite (every release)
 #   tls            SSL, the whole suite, then the TLS refusal tests
+#   mtls           SSL with a required client certificate (mutual TLS), the
+#                  whole suite presenting one, then the TLS refusal tests and
+#                  the client-certificate refusal tests (oldest and newest)
 #   sasl-ssl       SASL_SSL with SCRAM-SHA-512, the whole suite, then the SASL
 #                  and TLS refusal tests (every release)
 #   sasl-plain     SASL_PLAINTEXT with PLAIN, the same (oldest and newest
@@ -19,9 +22,8 @@ name: kafka matrix
 #   sasl-scram256  SASL_PLAINTEXT with SCRAM-SHA-256, the same (oldest and newest)
 #   sasl-scram512  SASL_PLAINTEXT with SCRAM-SHA-512, the same (oldest and newest)
 # The refusal tests (tests/integration_kafka_auth.rs) present a wrong password,
-# an unknown user, no credentials, no CA and another CA, and need the broker to
-# refuse each. Mutual TLS is not a variant: `sources.kafka` has no client
-# certificate or key setting.
+# an unknown user, no credentials, no CA and another CA, no client certificate
+# and one another CA signed, and need the broker to refuse each.
 #
 # Who runs which legs:
 # - ci.yml calls this workflow on a pull request (and on a push to main) with
@@ -74,7 +76,7 @@ on:
         type: string
         default: ''
       variants:
-        description: 'JSON list of listener variants (plain, tls, sasl-ssl, sasl-plain, sasl-scram256, sasl-scram512); empty runs all of them'
+        description: 'JSON list of listener variants (plain, tls, mtls, sasl-ssl, sasl-plain, sasl-scram256, sasl-scram512); empty runs all of them'
         required: false
         type: string
         default: ''
@@ -132,6 +134,7 @@ jobs:
           VARIANTS: |
             plain          plain           -              all
             tls            tls             -              all
+            mtls           mtls            -              edge
             sasl-ssl       sasl-ssl        SCRAM-SHA-512  all
             sasl-plain     sasl-plaintext  PLAIN          edge
             sasl-scram256  sasl-plaintext  SCRAM-SHA-256  edge
@@ -340,10 +343,12 @@ jobs:
             exit 1
           fi
       # The other half of an authenticated leg: the broker must refuse a wrong
-      # password, an unknown user, a client with no credentials, no CA and
-      # another CA. `sasl_` tests need a SASL listener and `tls_` tests a TLS
-      # one; a listener that has both runs both. Each prefix's count is
-      # checked against the binary's own list.
+      # password, an unknown user, a client with no credentials, no CA,
+      # another CA, no client certificate and one another CA signed. `sasl_`
+      # tests need a SASL listener, `tls_` tests a TLS one and `client_cert_`
+      # tests one that requires a client certificate; a listener runs every
+      # prefix it has. Each prefix's count is checked against the binary's
+      # own list.
       - name: Run the refusal tests
         if: matrix.mode != 'plain'
         env:
@@ -353,7 +358,8 @@ jobs:
           chmod +x dist/integration_kafka_auth
           prefixes=""
           case "$MODE" in sasl-*) prefixes="$prefixes sasl_" ;; esac
-          case "$MODE" in tls | sasl-ssl) prefixes="$prefixes tls_" ;; esac
+          case "$MODE" in tls | mtls | sasl-ssl) prefixes="$prefixes tls_" ;; esac
+          case "$MODE" in mtls) prefixes="$prefixes client_cert_" ;; esac
           for prefix in $prefixes; do
             expected=$(dist/integration_kafka_auth --ignored --list "$prefix" | grep -c ': test$' || true)
             if [ "$expected" -eq 0 ]; then
