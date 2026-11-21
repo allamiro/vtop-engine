@@ -290,6 +290,20 @@ pub fn manifest_uri(bucket: &str, prefix: &str, resolved_prefix: &str, batch_id:
     format!("s3://{bucket}/{key}")
 }
 
+/// Whether `uri` names a key under `bucket` and the configured `prefix`: the
+/// place [`object_uri`] writes to, whatever the partition below it. A string
+/// prefix test on whole path segments, so `a` does not cover `ab/`; nothing
+/// parses the key (#688).
+pub fn is_under_prefix(uri: &str, bucket: &str, prefix: &str) -> bool {
+    let base = join_key(&[prefix]);
+    let root = if base.is_empty() {
+        format!("s3://{bucket}/")
+    } else {
+        format!("s3://{bucket}/{base}/")
+    };
+    uri.len() > root.len() && uri.starts_with(&root)
+}
+
 fn join_key(parts: &[&str]) -> String {
     parts
         .iter()
@@ -303,6 +317,17 @@ fn join_key(parts: &[&str]) -> String {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn a_key_is_under_a_prefix_only_on_whole_segments() {
+        assert!(is_under_prefix("s3://b/a/x.raw", "b", "a"));
+        assert!(is_under_prefix("s3://b/a/x.raw", "b", "/a/"));
+        assert!(is_under_prefix("s3://b/x.raw", "b", ""));
+        assert!(!is_under_prefix("s3://b/ab/x.raw", "b", "a"));
+        assert!(!is_under_prefix("s3://other/a/x.raw", "b", "a"));
+        assert!(!is_under_prefix("s3://bb/a/x.raw", "b", "a"));
+        assert!(!is_under_prefix("s3://b/", "b", ""));
+    }
 
     fn ctx() -> PartitionContext {
         let ts = Utc.with_ymd_and_hms(2026, 6, 18, 15, 0, 0).unwrap();
