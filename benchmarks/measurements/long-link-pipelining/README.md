@@ -65,3 +65,18 @@ counts the object check's whole duration, which now overlaps
 Comparisons between these rows, on this rig. Not what any real link does:
 the link is emulated on one shared host and was not calibrated against a real
 one.
+
+## Crash runs
+
+`crash.sh` against the pipelined build (8a8104dc), 16 MiB batches. Each run
+killed the engine with SIGKILL 8 times, 6 to 15 s after each start, and the
+kills landed with batches CHECKSUMMED, OBJECT_UPLOADED, MANIFEST_UPLOADED and
+VERIFIED in flight. At every kill the group's offsets stayed within the
+ranges the ledger held as VERIFIED or SOURCE_COMMITTED. Each run then drained
+to lag 0, `audit-coverage --check-storage` found no hole, and `scrub` read
+every committed object back clean:
+
+| Run | Topic | Kills | Commit rule at every kill | Lag after | audit-coverage | scrub |
+|---|---|---|---|---|---|---|
+| crash2-p4 | p4 | 8 | held | 0 | no hole | clean |
+| crash2-p1 | p1 | 8 | held | 0 | no hole | clean |

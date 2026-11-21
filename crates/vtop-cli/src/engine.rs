@@ -8336,7 +8336,10 @@ mod tests {
             }
             engine.run_source(SourceType::File, false).await.unwrap();
         }
-        let queued = engine.inflight.get(&SourceType::File).map_or(0, VecDeque::len);
+        let queued = engine
+            .inflight
+            .get(&SourceType::File)
+            .map_or(0, VecDeque::len);
         assert_eq!(
             queued, 4,
             "sealed batches kept queueing behind a stalled upload: {queued} with a width of 2"
