@@ -298,6 +298,14 @@ impl LeaderLineage for crate::LocalBroker {
                 return CatchUpRead::Unavailable(format!("reading the log failed: {problem}"))
             }
         };
+        // The group bound the range's appends were written under: a rebuilt
+        // append may not exceed it, or the follower refuses it as the
+        // oversized group no producer ever sent (#881 soak).
+        let max_group_bytes = state
+            .segment
+            .active()
+            .config_v2()
+            .map_or(u64::MAX, |config| config.max_group_bytes);
         drop(state);
         drop(meta);
         let appends = appends_from_log(
@@ -306,6 +314,7 @@ impl LeaderLineage for crate::LocalBroker {
             self.node_id(),
             from,
             &fetched.records,
+            max_group_bytes,
         );
         if appends.is_empty() {
             return CatchUpRead::Unavailable(format!(
@@ -348,15 +357,20 @@ pub(crate) fn appends_below(
 ///
 /// Stops at the first record no replica append can carry (a non-zero
 /// attribute byte: the wire record has none) or the first gap in offsets,
-/// so the result is always a contiguous run from `from`.
+/// so the result is always a contiguous run from `from`. A run is also cut
+/// where its encoded records would pass `max_group_bytes`, the bound every
+/// group in the range was appended under: consecutive produces from one
+/// producer are one run in the log but were never one group.
 pub(crate) fn appends_from_log(
     range: &RangeIdentity,
     fencing_epoch: u64,
     leader_node_id: Uuid,
     from: u64,
     records: &[vtop_log::FetchedRecord],
+    max_group_bytes: u64,
 ) -> Vec<ReplicaAppendRequest> {
     let mut appends: Vec<ReplicaAppendRequest> = Vec::new();
+    let mut group_bytes = 0_u64;
     for (index, fetched) in records.iter().enumerate() {
         let record = &fetched.record;
         if Some(fetched.offset) != from.checked_add(index as u64) || record.attributes != 0 {
@@ -367,6 +381,9 @@ pub(crate) fn appends_from_log(
             key: record.key.clone(),
             value: record.value.clone(),
         };
+        let encoded = vtop_log::RECORD_FRAME_OVERHEAD_BYTES_V2
+            .saturating_add(record.key.len() as u64)
+            .saturating_add(record.value.len() as u64);
         let extends = appends.last().is_some_and(|last| {
             last.producer_id == record.producer_id
                 && last.producer_epoch == record.producer_epoch
@@ -374,14 +391,16 @@ pub(crate) fn appends_from_log(
                     .first_sequence
                     .checked_add(last.records.len() as u64)
                     .is_some_and(|next| next == record.sequence)
-        });
+        }) && group_bytes.saturating_add(encoded) <= max_group_bytes;
         if extends {
+            group_bytes = group_bytes.saturating_add(encoded);
             appends
                 .last_mut()
                 .expect("checked above")
                 .records
                 .push(wire);
         } else {
+            group_bytes = encoded;
             appends.push(ReplicaAppendRequest {
                 range: range.clone(),
                 fencing_epoch,
@@ -3795,6 +3814,47 @@ mod tests {
                 .len(),
             5
         );
+    }
+
+    /// #881 soak: consecutive produces from one producer are one run in the
+    /// log but were separate groups, each within the range's group bound.
+    /// Rebuilt as one append, the run passed the follower's bound and every
+    /// catch-up was refused; it is cut where the bound would be passed.
+    #[test]
+    fn a_rebuilt_append_never_exceeds_the_ranges_group_bound() {
+        let records: Vec<vtop_log::FetchedRecord> = (0..10_u64)
+            .map(|offset| vtop_log::FetchedRecord {
+                offset,
+                record: vtop_log::LogRecord {
+                    producer_id: Uuid::from_u128(0xB1),
+                    producer_epoch: 1,
+                    sequence: offset,
+                    timestamp_millis: 1,
+                    attributes: 0,
+                    key: Vec::new(),
+                    value: vec![0; 100],
+                },
+            })
+            .collect();
+        let one = vtop_log::RECORD_FRAME_OVERHEAD_BYTES_V2 + 100;
+        let appends = appends_from_log(
+            &catch_up_range(),
+            4,
+            Uuid::from_u128(0xA1),
+            0,
+            &records,
+            3 * one,
+        );
+        assert_eq!(
+            appends
+                .iter()
+                .map(|append| append.records.len())
+                .collect::<Vec<_>>(),
+            vec![3, 3, 3, 1]
+        );
+        for append in &appends {
+            assert_eq!(append.first_sequence, append.expected_base_offset);
+        }
     }
 
     /// #881 review (P2): a record bigger than one catch-up read's target, but

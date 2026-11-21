@@ -1678,3 +1678,44 @@ fn a_follower_below_the_leaders_log_start_is_flagged_behind_the_catch_up_horizon
         "nothing may be appended to a follower the leader cannot catch up"
     );
 }
+
+/// #881 soak: a follower refused one member of a replica append batch after
+/// appending the members before it, and returned the refusal without
+/// committing them. Its tail then ran past its durable offset, and every
+/// later append at that offset was refused as "ahead but not durable": the
+/// replica was stranded for the rest of the run.
+///
+/// Invariant: a refused batch leaves the follower consistent - what it
+/// appended is durable, and it reports exactly where its log ends.
+#[test]
+fn a_batch_refused_part_way_leaves_the_follower_durable_through_its_tail() {
+    let h = harness();
+    let follower = Arc::clone(&h.followers[0]);
+    let append = |base: u64, first_sequence: u64| ReplicaAppendRequest {
+        range: h.range.clone(),
+        fencing_epoch: FENCING_EPOCH,
+        leader_node_id: LEADER,
+        expected_base_offset: base,
+        producer_id: Uuid::from_u128(0xB7),
+        producer_epoch: 1,
+        first_sequence,
+        records: vec![ProduceRecord {
+            timestamp_millis: 1_000,
+            key: b"k".to_vec(),
+            value: format!("r{base}").into_bytes(),
+        }],
+    };
+    // The second member skips a sequence, so the follower refuses it after
+    // appending the first.
+    let refused = follower.apply_append_batch(&[append(0, 0), append(1, 5)]);
+    assert!(refused.is_err(), "the gapped member must be refused");
+    assert_eq!(
+        (follower.next_offset(), follower.local_committed_offset()),
+        (1, 1),
+        "the member appended before the refusal must be durable, not left past the durable \
+         offset"
+    );
+    // And the replica takes the next record where it really ends.
+    follower.apply_append(&append(1, 1)).unwrap();
+    assert_eq!(follower.local_committed_offset(), 2);
+}
