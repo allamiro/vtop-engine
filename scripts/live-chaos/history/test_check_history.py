@@ -160,6 +160,15 @@ class CleanHistories(unittest.TestCase):
         h.read("r", [(0, 0, 10), (10, 0, 5)], 15)
         self.assertTrue(h.check()["valid"], h.check())
 
+    def test_a_retry_of_part_of_an_unanswered_batch_is_one_copy(self):
+        # Review of #878: the unanswered 0..9 landed whole; a retry of 0..4
+        # under the same producer id and epoch is answered at 0..4.
+        h = History()
+        h.produce("produce:P:1:100", 1, 0, 10, "info")
+        h.produce("produce:P:1:200", 1, 0, 5, "ok", 10, first_offset=0)
+        h.read("r", [(0, 0, 10)], 10)
+        self.assertTrue(h.check()["valid"], h.check())
+
 class Violations(unittest.TestCase):
     def test_611_an_acknowledged_suffix_truncated_at_failover_is_lost(self):
         h = History()
@@ -271,6 +280,25 @@ class Violations(unittest.TestCase):
         h.produce("p", 1, 0, 10, "ok", 20, first_offset=5)
         h.read("r", [(0, 0, 10)], 20)
         self.assertIn("lost", kinds(h.check()))
+
+    def test_a_retry_of_part_of_an_unanswered_batch_does_not_excuse_a_second_copy(self):
+        h = History()
+        h.produce("produce:P:1:100", 1, 0, 10, "info")
+        h.produce("produce:P:1:200", 1, 0, 5, "ok", 5, first_offset=0)
+        h.read("r", [(0, 0, 5), (5, 0, 10)], 15)
+        # The unanswered batch cannot account for 0..4 a second time, so
+        # offsets 5..14 have no explanation.
+        self.assertFalse(h.check()["valid"])
+
+    def test_two_reads_under_one_name_are_two_reads(self):
+        # Review of #881: a pid reused days later names a second read the
+        # same; its `end` closes the first, so a rewrite between them shows.
+        h = History()
+        h.produce("p", 1, 0, 10, "ok", 10)
+        h.read("read:7", [(0, 0, 5), (5, 40, 5)], 10).read("read:7", [(0, 0, 10)], 10)
+        result = h.check()
+        self.assertEqual(result["reads"], 2)
+        self.assertIn("rewritten", kinds(result))
 
     def test_the_high_watermark_never_goes_back(self):
         h = History()
