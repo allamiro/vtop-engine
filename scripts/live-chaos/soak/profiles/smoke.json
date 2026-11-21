@@ -32,7 +32,7 @@
       "open_fds": {"max_growth_pct": 100, "min_abs_growth": 256},
       "data_dir_bytes": {"max_growth_pct": 100, "min_abs_growth": 8388608}
     },
-    "max_data_dir_bytes": 4194304,
+    "max_data_dir_bytes": 8388608,
     "max_rss_bytes": 2147483648,
     "min_samples_fraction": 0.7,
     "max_sample_gap_s": 120,

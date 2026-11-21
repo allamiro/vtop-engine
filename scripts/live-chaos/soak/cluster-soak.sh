@@ -75,6 +75,11 @@ if [[ "${VTOP_SOAK_INNER:-0}" != "1" ]]; then
   code=0
   unshare -Urnm env VTOP_SOAK_INNER=1 bash "$0" "$PROFILE_ARG" "$RUN_DIR" || code=$?
   log "the soak's driver exited with status $code; judging what it recorded"
+  # From the logs, which outlive the run's namespace, so a run that ended
+  # early is judged on the leaderships it did log.
+  if [[ -d "$RUN_DIR/work/logs" ]]; then
+    "${SOAK_PY[@]}" leaders "$RUN_DIR/work/logs" > "$RUN_DIR/leaders.jsonl" || true
+  fi
   histories=("$RUN_DIR"/history/*.jsonl)
   if [[ -e "${histories[0]}" ]]; then
     python3 "$SCRIPT_DIR/history/check_history.py" "${histories[@]}" \
@@ -520,6 +525,15 @@ for id in 1 2 3; do start_soak_meta "$id"; done
 ADMIN_LOG="$WORKDIR/logs/admin.log"
 meta_admin 1 init --members 1,2,3 > /dev/null 2>> "$ADMIN_LOG"
 META_LEADER="$(wait_meta_leader 1 2 3 2>> "$ADMIN_LOG")"
+# A new cluster starts at the base feature level; an operator raises it to
+# what the build supports, and the soak runs what production would. Below
+# level 6 a promotion records no lineage verdicts, and below 7 a node cannot
+# report its release (#634).
+FEATURE_LEVEL="$(sed -n 's/^pub const SUPPORTED_FEATURE_LEVEL: u32 = \([0-9][0-9]*\);.*/\1/p' \
+  "$REPO_ROOT/crates/vtop-meta/src/command.rs")"
+[[ -n "$FEATURE_LEVEL" ]] || fail "could not read this build's SUPPORTED_FEATURE_LEVEL"
+meta_admin "$META_LEADER" enable-features --level "$FEATURE_LEVEL" > /dev/null 2>> "$ADMIN_LOG" \
+  || fail "could not raise the metadata feature level to $FEATURE_LEVEL (see $ADMIN_LOG)"
 meta_admin "$META_LEADER" create-topic \
   --name "$TOPIC" --topic-uuid "$TOPIC_UUID" --root-range-uuid "$RANGE_ID" > /dev/null 2>> "$ADMIN_LOG" \
   || fail "could not create the topic in metadata (see $ADMIN_LOG)"
@@ -589,8 +603,8 @@ event final_read "ok=$final_ok"
 leader="$(range_leader 2> /dev/null || echo)"
 if [[ -n "$leader" ]]; then
   target="$(metric_value "$(data_metrics_addr $((leader + 10)))" vtop_broker_cluster_committed_offset || echo 0)"
+  deadline=$((SECONDS + 120))
   for n in 1 2 3; do
-    deadline=$((SECONDS + 120))
     while (( SECONDS < deadline )); do
       have="$(metric_value "$(data_metrics_addr $((n + 10)))" vtop_broker_local_committed_offset || echo -1)"
       (( ${have%.*} >= ${target%.*} )) && break
@@ -630,6 +644,5 @@ finals["replicas"][node] = {"segments": int(segments), "active_tails": int(activ
 json.dump(finals, open(path, "w"), indent=2, sort_keys=True)
 EOF
 done
-"${SOAK_PY[@]}" leaders "$WORKDIR/logs" > "$RUN_DIR/leaders.jsonl"
 event run_end
 log "run complete"
