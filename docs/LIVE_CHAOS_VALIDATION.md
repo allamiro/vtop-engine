@@ -230,6 +230,18 @@ Known limits of the checker:
   epoch, gets no answer, and the read ends. The copy is accepted as that
   batch.
 
+- **Whole batches are judged against the last read only.** An unanswered
+  batch must surface whole in the last read; an earlier read that showed
+  part of it is not held to that. Example: sequences 0..9 acknowledged, an
+  unanswered 10..19, a read showing 0..14 at watermark 15, then a read showing
+  0..19 at watermark 20: valid.
+- **An unanswered attempt's time is borrowed without placing it whole.** A
+  record an acknowledged retry was answered for is accepted as earlier than
+  the first read that showed it when any unanswered attempt of the same
+  producer and epoch covers its sequence, whether or not that attempt could
+  account for the whole read. Example: an unanswered 0..9, a read showing
+  only 0..4 at watermark 5, then a retry of 0..4 acknowledged at 0..4: valid.
+
 The checker's own tests (`test_check_history.py`, run in the live-chaos job
 before the scenarios) build histories by hand, clean ones and ones shaped like
 #611, #261 and #641, and pin the verdict on each.
