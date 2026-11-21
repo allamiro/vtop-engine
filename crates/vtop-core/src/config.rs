@@ -1645,6 +1645,71 @@ pub const DELETE_WITHOUT_OPEN_CHECK_WARNING: &str =
      a fully archived file on delete_quiet_seconds alone, and a writer that still holds it \
      open loses every line it writes after. Set it to false to keep such files instead";
 
+/// Whether a `bootstrap.servers` entry names a loopback host: `localhost`,
+/// or a loopback IP literal, with an optional `scheme://` and `:port`. A
+/// hostname that merely resolves to loopback is not recognised, so a link to
+/// it is warned about: the warning errs towards being said.
+fn is_loopback_bootstrap(server: &str) -> bool {
+    let server = server.trim();
+    let server = server.split_once("://").map_or(server, |(_, rest)| rest);
+    let host = if let Some(rest) = server.strip_prefix('[') {
+        rest.split_once(']').map_or(rest, |(host, _)| host)
+    } else if server.matches(':').count() > 1 {
+        // A bare IPv6 literal: its colons are not a port separator.
+        server
+    } else {
+        server.split_once(':').map_or(server, |(host, _)| host)
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// The warning for a Kafka source link that crosses the network unencrypted
+/// (#732, A2): `security_protocol` unset (librdkafka's default is plaintext),
+/// `plaintext` or `sasl_plaintext`, with a bootstrap server off loopback. A
+/// link on loopback alone stays quiet: nothing crosses a network.
+pub fn kafka_plaintext_warning(kafka: &KafkaSourceConfig) -> Option<String> {
+    if !kafka.enabled {
+        return None;
+    }
+    let protocol = kafka
+        .security_protocol
+        .as_deref()
+        .map(|protocol| protocol.trim().to_ascii_lowercase());
+    let (named, sasl) = match protocol.as_deref() {
+        None => ("unset, so librdkafka's default `plaintext`", false),
+        Some("plaintext") => ("`plaintext`", false),
+        Some("sasl_plaintext") => ("`sasl_plaintext`", true),
+        // `ssl`, `sasl_ssl`, and anything librdkafka will refuse itself.
+        Some(_) => return None,
+    };
+    let remote: Vec<&str> = kafka
+        .bootstrap_servers
+        .iter()
+        .map(String::as_str)
+        .filter(|server| !is_loopback_bootstrap(server))
+        .collect();
+    if remote.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "sources.kafka.security_protocol is {named}, and bootstrap server(s) {servers} are not \
+         on loopback: the records the engine reads{sasl} cross the network unencrypted, and \
+         the broker is not authenticated. The engine connects anyway. Set \
+         sources.kafka.security_protocol to {fix} and ssl_ca_location to the CA that signed \
+         the brokers' certificates",
+        servers = remote.join(", "),
+        sasl = if sasl { ", and the SASL exchange," } else { "" },
+        fix = if sasl {
+            "`sasl_ssl`"
+        } else {
+            "`ssl` (`sasl_ssl` with SASL)"
+        },
+    ))
+}
+
 impl VtopConfig {
     /// Settings that are valid but unsafe enough to say so on every start
     /// and in `vtopctl validate` (#629). Never a reason to refuse: each one
@@ -1666,6 +1731,14 @@ impl VtopConfig {
             file.enabled && file.delete_after_commit && file.delete_without_open_check
         }) {
             warnings.push(DELETE_WITHOUT_OPEN_CHECK_WARNING.to_string());
+        }
+        if let Some(warning) = self
+            .sources
+            .kafka
+            .as_ref()
+            .and_then(kafka_plaintext_warning)
+        {
+            warnings.push(warning);
         }
         warnings
     }
@@ -4141,5 +4214,96 @@ streams:
         let m = s.lookup("app_events").unwrap();
         assert_eq!(m.source_type, SourceType::Kafka);
         assert_eq!(m.s3_source_name.as_deref(), Some("app"));
+    }
+
+    /// #732 (A2): a Kafka source link that crosses the network unencrypted
+    /// is said on every start and in `vtopctl validate`; TLS, a link on
+    /// loopback alone, or a disabled source stays quiet.
+    #[test]
+    fn a_plaintext_kafka_source_off_loopback_is_warned_about() {
+        fn kafka(protocol: Option<&str>, servers: &[&str]) -> KafkaSourceConfig {
+            KafkaSourceConfig {
+                enabled: true,
+                bootstrap_servers: servers.iter().map(|s| (*s).to_owned()).collect(),
+                consumer_group: default_group(),
+                topic_include_regex: default_include(),
+                topic_exclude_regex: default_exclude(),
+                auto_offset_reset: default_offset_reset(),
+                enable_auto_commit: false,
+                security_protocol: protocol.map(str::to_owned),
+                sasl_mechanism: None,
+                sasl_username: None,
+                sasl_password_env: None,
+                ssl_ca_location: None,
+            }
+        }
+        let unset = kafka_plaintext_warning(&kafka(None, &["kafka-1:9092", "localhost:9092"]))
+            .expect("unset is librdkafka's plaintext");
+        assert!(
+            unset.contains("unset, so librdkafka's default `plaintext`")
+                && unset.contains("kafka-1:9092")
+                && !unset.contains("localhost:9092")
+                && unset.contains("unencrypted")
+                && unset.contains("The engine connects anyway")
+                && unset.contains("`ssl`"),
+            "{unset}"
+        );
+        let sasl = kafka_plaintext_warning(&kafka(Some("SASL_PLAINTEXT"), &["10.0.0.5:9092"]))
+            .expect("SASL over plaintext");
+        assert!(
+            sasl.contains("`sasl_plaintext`")
+                && sasl.contains("the SASL exchange")
+                && sasl.contains("`sasl_ssl`"),
+            "{sasl}"
+        );
+        assert!(kafka_plaintext_warning(&kafka(Some("plaintext"), &["broker:9092"])).is_some());
+
+        for quiet in [
+            kafka(Some("ssl"), &["kafka-1:9093"]),
+            kafka(Some("SASL_SSL"), &["kafka-1:9093"]),
+            kafka(
+                None,
+                &[
+                    "localhost:9092",
+                    "127.0.0.1:9092",
+                    "[::1]:9092",
+                    "::1",
+                    "PLAINTEXT://127.0.0.2:9092",
+                ],
+            ),
+            KafkaSourceConfig {
+                enabled: false,
+                ..kafka(None, &["kafka-1:9092"])
+            },
+        ] {
+            assert_eq!(kafka_plaintext_warning(&quiet), None, "{quiet:?}");
+        }
+
+        let mut cfg: VtopConfig = serde_yaml::from_str(
+            r#"
+engine:
+  name: vtop-engine
+  state_store: "sqlite::memory:"
+  work_dir: /tmp/work
+batching: {}
+compression: {}
+sources:
+  kafka:
+    enabled: true
+    bootstrap_servers: ["kafka:9092"]
+upload:
+  bucket: telemetry-data
+"#,
+        )
+        .unwrap();
+        assert!(
+            cfg.warnings()
+                .iter()
+                .any(|w| w.starts_with("sources.kafka.security_protocol is unset")),
+            "{:?}",
+            cfg.warnings()
+        );
+        cfg.sources.kafka.as_mut().unwrap().security_protocol = Some("ssl".to_owned());
+        assert!(cfg.warnings().is_empty(), "{:?}", cfg.warnings());
     }
 }
