@@ -641,6 +641,11 @@ fn warn_due(key: &str) -> bool {
     }
 }
 
+/// Acquire-arm rounds a candidate sits out after its quorum-miss budget is
+/// spent (#881): each waits a poll interval, so every rival polling at the
+/// same interval reaches the lapse before it campaigns again.
+const QUORUM_MISS_STEP_BACK_ROUNDS: u32 = 3;
+
 /// How often [`warn_due`] lets one key's warning through.
 const WARN_EVERY: Duration = Duration::from_secs(30);
 
@@ -3772,23 +3777,25 @@ impl LeaseAgent {
             let _ = self.renew(fencing_epoch).await?;
         } else {
             // THE BUDGET IS SPENT, SO STEP BACK (#881). The lease now lapses,
-            // and this node must not be the one that takes it next: a whole
-            // lease lifetime has shown it cannot reach a quorum, and any
-            // replica that can is better placed to lead. Without this it
-            // re-acquired on its first poll after the lapse - its own
-            // renewal set the deadline, so it reached the lapse at the same
-            // point of its polling cycle every time, and rivals polling at
-            // the same interval lost the same race every time. The soak's
-            // lagging replica won 21 epochs running that way, while the
-            // caught-up ones never took the range.
+            // and this node must not be first to take it again: a whole lease
+            // lifetime has shown it cannot reach a quorum, and any replica
+            // that can is better placed to lead. Without this it re-acquired
+            // on its first poll after the lapse - its own renewal set the
+            // deadline, so it reached the lapse at the same point of its
+            // polling cycle every time, and rivals polling at the same
+            // interval lost the same race every time. The soak's lagging
+            // replica won 21 epochs running that way, while the caught-up
+            // ones never took the range.
             //
-            // The eligibility stand-aside's window, set every round until the
-            // lapse so it is counted from the lapse. A rival taking the
-            // range clears it (the Wait arm); nobody taking it leaves this
-            // node to campaign again once it has run out, so a range only
-            // this node can lead is delayed, never abandoned. Liveness only:
-            // the epoch still fences every holder.
-            self.campaign_hold_off_rounds = self.stand_aside_rounds();
+            // A few rounds, not the eligibility stand-aside's two lease
+            // lifetimes: enough that every rival polling at this interval
+            // sees the lapse and campaigns first, while a node that is the
+            // range's only candidate (a static set of followers, say) loses
+            // a second or so, not a failover's worth. Set every round until
+            // the lapse, so it is counted from the lapse; a rival taking the
+            // range clears it (the Wait arm). Liveness only: the epoch still
+            // fences every holder.
+            self.campaign_hold_off_rounds = QUORUM_MISS_STEP_BACK_ROUNDS;
         }
         Ok(())
     }
@@ -7809,10 +7816,10 @@ mod tests {
     /// lagging replica won 21 epochs running and the caught-up replicas never
     /// took the range.
     ///
-    /// Invariant: once its budget is spent, the candidate sits out the race
-    /// for the eligibility stand-aside's window (two lease lifetimes), so any
-    /// replica that can promote gets an uncontested lapse - and it campaigns
-    /// again after that, so a range it alone can lead is not abandoned.
+    /// Invariant: once its budget is spent, the candidate sits out the next
+    /// few polls after the lapse, so any replica that can promote reaches the
+    /// lapse first - and it campaigns again after that, so a range it alone
+    /// can lead is delayed by a second or so, never abandoned.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_candidate_whose_quorum_miss_budget_is_spent_sits_out_the_next_lease_race() {
         let h = LeaseRaceHarness::start().await;
@@ -7841,8 +7848,10 @@ mod tests {
         }
         let lapsed_at = lapsed_at.expect("A's first epoch must lapse once its budget is spent");
 
-        // For most of the stand-aside window, nobody holds a newer epoch.
-        let sit_out_until = lapsed_at + 3 * duration_ms(config.lease_duration).unwrap() as i64 / 2;
+        // For the step-back window - two of its three polls - nobody holds a
+        // newer epoch. Without the step-back it re-acquired 30-50 ms after
+        // the lapse, on its first poll.
+        let sit_out_until = lapsed_at + 2 * duration_ms(config.poll_interval).unwrap() as i64;
         let mut reacquired_early = None;
         while now_ms() < sit_out_until {
             if let Some(lease) = h.lease().await {
