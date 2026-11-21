@@ -177,6 +177,11 @@ impl SpanProcessor for ExportQueue {
             return;
         }
         s.queue_length.inc();
+        tracing::debug!(
+            target: super::LIFECYCLE_TARGET,
+            span = %span.name,
+            "span queued for export"
+        );
         if !self.send(Msg::Span(span)) {
             self.shared.pending.fetch_sub(1, Ordering::SeqCst);
             s.queue_length.dec();
@@ -198,6 +203,10 @@ impl SpanProcessor for ExportQueue {
             return Err(OTelSdkError::AlreadyShutdown);
         }
         let started = Instant::now();
+        tracing::debug!(
+            target: super::LIFECYCLE_TARGET,
+            "OpenTelemetry trace flush starting: spans that close after this line are not exported"
+        );
         match self.flush(timeout, true) {
             Ok(report) if report.failed == 0 => {
                 tracing::info!(
