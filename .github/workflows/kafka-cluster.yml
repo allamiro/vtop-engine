@@ -1,0 +1,125 @@
+name: kafka cluster
+
+# The Kafka source against a three-broker Apache Kafka cluster (#721, B2 of
+# the production bar), not the single broker every leg of kafka-matrix.yml
+# runs: the whole live suite (tests/integration_kafka_to_minio.rs) with the
+# three nodes as its bootstrap, then tests/integration_kafka_cluster.rs, which
+# stops and starts the partition leader, and a follower, while the engine
+# reads, and requires every record committed once, in order, with the group's
+# offset at the end of the partition. scripts/kafka-cluster.sh starts the
+# cluster: three KRaft nodes, each broker and controller, topics at
+# replication 3 with min.insync.replicas 2.
+#
+# Who runs it:
+# - Nightly (04:47 UTC) and on dispatch, over whatever main holds.
+# - A pull request that changes this file, the cluster script or the cluster
+#   test runs it on its own head (the schedule runs only from main, so this
+#   is the one way a change to it is proven before it merges). An ordinary
+#   pull request does not: a cluster takes three brokers' start-up and the
+#   whole suite.
+#
+# The build only restores the cache the kafka-integration job in ci.yml saves
+# on main (the same test binaries); this workflow saves no cache of its own.
+
+on:
+  schedule:
+    # 04:47 UTC: off the hour, after the kafka matrix (03:17).
+    - cron: "47 4 * * *"
+  pull_request:
+    paths:
+      - '.github/workflows/kafka-cluster.yml'
+      - 'scripts/kafka-cluster.sh'
+      - 'tests/integration_kafka_cluster.rs'
+  workflow_dispatch:
+
+concurrency:
+  group: kafka-cluster-${{ github.event_name == 'schedule' && 'nightly' || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  cluster:
+    name: kafka cluster (three brokers, a leader restart)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # The newest line the kafka matrix pins, by the same digest.
+      KAFKA_IMAGE: apache/kafka:4.4.0@sha256:833b867a9585a141da455dc2b57431c65cbccb27f11c91f694444cca9f777e0f
+      KAFKA_CLUSTER_NAME: vtop-kafka-cluster
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      # Restore only, the key the kafka-integration job saves on main. A miss
+      # builds from scratch, which is slower and still correct.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-kafka-it-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-kafka-it-
+      - name: Install librdkafka build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang libssl-dev libsasl2-dev libcurl4-openssl-dev zlib1g-dev pkg-config
+      - name: Build the test binaries
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for test in integration_kafka_to_minio integration_kafka_cluster; do
+            exe=$(cargo test -p vtop-cli --test "$test" --no-run --locked --message-format=json \
+              | jq -r --arg t "$test" 'select(.reason == "compiler-artifact" and .target.name == $t and .executable != null) | .executable')
+            if [ -z "$exe" ] || [ ! -x "$exe" ]; then
+              echo "::error::cargo reported no executable for the $test test (got '$exe')"
+              exit 1
+            fi
+            cp "$exe" "dist/$test"
+          done
+      - name: Start the three-node cluster
+        run: bash scripts/kafka-cluster.sh up "$KAFKA_IMAGE"
+      - name: Seed the it_events topic
+        run: bash scripts/kafka-cluster.sh seed
+      - name: Point the tests at the cluster
+        run: bash scripts/kafka-cluster.sh client-env | tee -a "$GITHUB_ENV"
+      # Each count is checked against the binary's own list, so a run that
+      # filtered out or skipped tests cannot pass as a smaller green run.
+      - name: Run the live suite against three brokers
+        run: |
+          set -euo pipefail
+          expected=$(dist/integration_kafka_to_minio --ignored --list | grep -c ': test$' || true)
+          if [ "$expected" -eq 0 ]; then
+            echo "::error::the test binary lists no ignored (live-broker) tests"
+            exit 1
+          fi
+          dist/integration_kafka_to_minio --ignored 2>&1 | tee "$RUNNER_TEMP/kafka-it.log"
+          if ! grep -q "^test result: ok. $expected passed; 0 failed" "$RUNNER_TEMP/kafka-it.log"; then
+            echo "::error::expected all $expected live-broker tests to pass; the summary was: $(grep '^test result:' "$RUNNER_TEMP/kafka-it.log" || echo none)"
+            exit 1
+          fi
+      # One at a time: each test stops a node, and two at once would leave one.
+      - name: Stop and start a leader and a follower while the engine reads
+        run: |
+          set -euo pipefail
+          expected=$(dist/integration_kafka_cluster --ignored --list | grep -c ': test$' || true)
+          if [ "$expected" -eq 0 ]; then
+            echo "::error::the cluster test binary lists no ignored tests"
+            exit 1
+          fi
+          dist/integration_kafka_cluster --ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/kafka-cluster.log"
+          if ! grep -q "^test result: ok. $expected passed; 0 failed" "$RUNNER_TEMP/kafka-cluster.log"; then
+            echo "::error::expected all $expected cluster tests to pass; the summary was: $(grep '^test result:' "$RUNNER_TEMP/kafka-cluster.log" || echo none)"
+            exit 1
+          fi
+      - name: Cluster logs
+        if: failure()
+        run: bash scripts/kafka-cluster.sh logs 2>&1 | tail -n 400
+      - name: Stop the cluster
+        if: always()
+        run: bash scripts/kafka-cluster.sh down
