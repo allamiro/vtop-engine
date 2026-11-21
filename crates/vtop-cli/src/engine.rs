@@ -1817,13 +1817,29 @@ impl<'a> Pipeline<'a> {
             let expected = object_checksum
                 .clone()
                 .map(|hex| (algo.as_str().to_owned(), hex));
+            // The answer is counted here, as it arrives, not where the batch
+            // joins the task: a batch that fails first (its manifest upload,
+            // say) never joins it, and a throttle the store answered the
+            // check with must still reach the width controller (#102).
+            let (attempts, throttles) = (Arc::clone(&self.attempts), Arc::clone(&self.throttles));
+            let labels = (
+                tenant.clone(),
+                source.source_type.as_str().to_owned(),
+                format.extension().to_owned(),
+            );
             AbortOnDrop(tokio::spawn(
                 async move {
                     let expected = expected
                         .as_ref()
                         .map(|(algorithm, hex)| ObjectChecksum::new(algorithm, hex));
                     let started = Instant::now();
-                    let answer = backend.verify_object(&uri, size, expected).await;
+                    let answer = note_store_request(
+                        backend.verify_object(&uri, size, expected).await,
+                        "object_verify",
+                        [labels.0.as_str(), labels.1.as_str(), labels.2.as_str()],
+                        &attempts,
+                        &throttles,
+                    );
                     (answer, started.elapsed())
                 }
                 .in_current_span()
@@ -1959,17 +1975,8 @@ impl<'a> Pipeline<'a> {
         let waiting = Instant::now();
         let (object_answer, object_check_took) = object_check.join().await;
         let object_check_waited = waiting.elapsed();
-        let obj_v = note_store_request(
-            object_answer,
-            "object_verify",
-            [
-                tenant.as_str(),
-                source.source_type.as_str(),
-                format.extension(),
-            ],
-            &self.attempts,
-            &self.throttles,
-        )?;
+        // Counted by the task (attempt and throttle) when it answered.
+        let obj_v = object_answer?;
         if !obj_v.passed {
             if let Some(mx) = telemetry::metrics() {
                 mx.verification_failures_total
@@ -12917,6 +12924,8 @@ mod tests {
     struct SlowManifests {
         inner: Arc<vtop_upload::MockBackend>,
         delay: Duration,
+        /// Answer the object check with a throttle, and refuse the manifest.
+        throttle_check_refuse_manifest: bool,
         object_checks: std::sync::Mutex<Vec<Instant>>,
         manifest_puts: std::sync::Mutex<Vec<Instant>>,
     }
@@ -12940,6 +12949,9 @@ mod tests {
             checksum: Option<ObjectChecksum<'_>>,
         ) -> Result<vtop_upload::StoredManifest, VtopError> {
             tokio::time::sleep(self.delay).await;
+            if self.throttle_check_refuse_manifest {
+                return Err(VtopError::Upload(format!("test: {manifest_uri} refused")));
+            }
             let stored = self
                 .inner
                 .put_manifest(local_path, manifest_uri, checksum)
@@ -12964,6 +12976,9 @@ mod tests {
         ) -> Result<vtop_upload::VerificationResult, VtopError> {
             if !uri.ends_with(".manifest.json") {
                 self.object_checks.lock().unwrap().push(Instant::now());
+                if self.throttle_check_refuse_manifest {
+                    return Err(VtopError::UploadThrottled(format!("test: {uri} throttled")));
+                }
             }
             self.inner.verify_object(uri, size, expected).await
         }
@@ -13004,6 +13019,7 @@ mod tests {
         let store = Arc::new(SlowManifests {
             inner: Arc::new(vtop_upload::MockBackend::new()),
             delay: Duration::from_millis(300),
+            throttle_check_refuse_manifest: false,
             object_checks: std::sync::Mutex::new(Vec::new()),
             manifest_puts: std::sync::Mutex::new(Vec::new()),
         });
@@ -13018,6 +13034,41 @@ mod tests {
         assert!(
             checked[0] < written[0],
             "the object check was sent only after the manifest write ended"
+        );
+    }
+
+    /// Review of #892: a throttle the store answered the object check with
+    /// is counted for the width controller (#102) even when the batch fails
+    /// first, at its manifest upload, and never joins the check's task.
+    #[tokio::test]
+    async fn a_throttled_object_check_counts_though_the_manifest_upload_failed_first() {
+        let _serial = THROTTLE_TESTS.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "line 1\n").unwrap();
+        let cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        engine.backend = Arc::new(SlowManifests {
+            inner: Arc::new(vtop_upload::MockBackend::new()),
+            delay: Duration::from_millis(100),
+            throttle_check_refuse_manifest: true,
+            object_checks: std::sync::Mutex::new(Vec::new()),
+            manifest_puts: std::sync::Mutex::new(Vec::new()),
+        });
+        let before = engine.throttles.load(Ordering::Relaxed);
+        let outcomes = engine.process_once(SourceType::File).await.unwrap();
+        assert_eq!(outcomes[0].final_state, BatchState::Failed, "{outcomes:?}");
+        assert_eq!(
+            engine.throttles.load(Ordering::Relaxed) - before,
+            1,
+            "the object check's throttle was dropped with its task"
         );
     }
 
