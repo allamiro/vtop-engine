@@ -1907,6 +1907,50 @@ impl Collector for ServerCollector {
 }
 
 // ---------------------------------------------------------------------------
+// Listener connection caps
+// ---------------------------------------------------------------------------
+
+/// Connections a listener closed at accept because its cap was reached
+/// (#732: M6, R7), by listener.
+///
+/// `plane` is a closed set: `meta_peer` and `meta_admin` on a metadata node,
+/// `replica` on a data node. Any increase means a peer opened more
+/// connections than the node's `max_*_connections` allows: legitimate load
+/// that needs a higher cap, or a flood.
+pub struct ConnectionLimitCollector {
+    limits: Vec<Arc<vtop_meta::transport::ConnectionLimit>>,
+    refused: CounterFamily,
+}
+
+impl ConnectionLimitCollector {
+    pub fn new(limits: Vec<Arc<vtop_meta::transport::ConnectionLimit>>) -> Result<Self, String> {
+        Ok(Self {
+            limits,
+            refused: CounterFamily::new(
+                "listener_connections_refused_total",
+                "Connections closed at accept because the listener already held its \
+                 max_*_connections, by listener",
+                &["plane"],
+            )?,
+        })
+    }
+}
+
+impl Collector for ConnectionLimitCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        vec![&self.refused.desc]
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        vec![self.refused.family(
+            self.limits
+                .iter()
+                .map(|limit| (vec![limit.label()], limit.refused_total())),
+        )]
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Promotion
 // ---------------------------------------------------------------------------
 
@@ -3355,6 +3399,35 @@ mod tests {
         assert!(
             unexpected.is_empty(),
             "labels {unexpected:?} are not in the bounded set {BOUNDED:?}"
+        );
+    }
+
+    /// #732: the refusals of every capped listener are exported under one
+    /// family with a bounded `plane` label, at 0 before any refusal.
+    #[test]
+    fn listener_connection_refusals_are_exported_by_plane() {
+        use std::net::SocketAddr;
+        use vtop_meta::transport::ConnectionLimit;
+        let peer = Arc::new(ConnectionLimit::meta_peer(1));
+        let admin = Arc::new(ConnectionLimit::meta_admin(1));
+        let from: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let _held = peer.admit(from).unwrap();
+        assert!(peer.admit(from).is_none());
+        assert!(peer.admit(from).is_none());
+        let registry = Registry::new_custom(Some("vtop".into()), None).unwrap();
+        registry
+            .register(Box::new(
+                ConnectionLimitCollector::new(vec![peer, admin]).unwrap(),
+            ))
+            .unwrap();
+        let text = scrape(&registry);
+        assert!(
+            text.contains(r#"vtop_listener_connections_refused_total{plane="meta_peer"} 2"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"vtop_listener_connections_refused_total{plane="meta_admin"} 0"#),
+            "{text}"
         );
     }
 }

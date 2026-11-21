@@ -4,6 +4,7 @@
 //! pairs. The [`crate::raft::network`] adapter opens a short-lived
 //! connection per RPC in this slice (no connection pool yet).
 
+use super::limit::{ConnectionLimit, DEFAULT_MAX_PEER_CONNECTIONS};
 use super::maybe_tls::{judge_dialect, tls_handshake_hint, DialectVerdict, MaybeTls};
 use super::tls::{assert_peer_identity, server_name, TlsMaterial};
 use super::wire::{
@@ -60,6 +61,8 @@ pub struct PeerServer {
     local_id: MetaNodeId,
     handler: Arc<dyn PeerRpcHandler>,
     exposure: PlaintextExposure,
+    /// How many connections are served at once (#732, M6).
+    limit: Arc<ConnectionLimit>,
 }
 
 impl PeerServer {
@@ -73,6 +76,7 @@ impl PeerServer {
             local_id,
             handler,
             exposure: PlaintextExposure::LoopbackOnly,
+            limit: Arc::new(ConnectionLimit::meta_peer(DEFAULT_MAX_PEER_CONNECTIONS)),
         })
     }
 
@@ -104,6 +108,7 @@ impl PeerServer {
             local_id,
             handler,
             exposure: PlaintextExposure::LoopbackOnly,
+            limit: Arc::new(ConnectionLimit::meta_peer(DEFAULT_MAX_PEER_CONNECTIONS)),
         }
     }
 
@@ -129,8 +134,22 @@ impl PeerServer {
         server
     }
 
+    /// Serve at most `max` connections at once (#732, M6); the default is
+    /// [`DEFAULT_MAX_PEER_CONNECTIONS`]. A connection over the cap is closed
+    /// at accept and counted on [`PeerServer::connection_limit`].
+    pub fn with_max_connections(mut self, max: usize) -> Self {
+        self.limit = Arc::new(ConnectionLimit::meta_peer(max));
+        self
+    }
+
+    /// The cap and its refusal count, for the node's metrics.
+    pub fn connection_limit(&self) -> Arc<ConnectionLimit> {
+        Arc::clone(&self.limit)
+    }
+
     /// Serve until the listener is closed. Spawns one task per accepted
-    /// connection. Not deterministic under wall-clock scheduling.
+    /// connection, up to the connection cap. Not deterministic under
+    /// wall-clock scheduling.
     pub async fn serve(self, listener: TcpListener) -> TransportResult<()> {
         // CHECKED AT BIND TIME, not per connection: the question is about the
         // address this endpoint is reachable on, and answering it once means a
@@ -160,10 +179,16 @@ impl PeerServer {
         }
         loop {
             let (tcp, peer_addr) = listener.accept().await?;
+            // Over the cap: closed now, before the handshake, and counted.
+            let Some(slot) = self.limit.admit(peer_addr) else {
+                drop(tcp);
+                continue;
+            };
             let acceptor = self.acceptor.clone();
             let handler = Arc::clone(&self.handler);
             let local_id = self.local_id;
             tokio::spawn(async move {
+                let _slot = slot;
                 if let Err(error) = serve_connection(acceptor, tcp, handler, local_id).await {
                     tracing_peer_error(peer_addr, error);
                 }
@@ -613,6 +638,21 @@ mod tests {
         )));
         assert!(!from_newer_release(&TransportError::BadVersion(0)));
         assert!(!from_newer_release(&TransportError::ChecksumMismatch));
+    }
+
+    /// #732 (M6): the peer plane serves at most `max_peer_connections`; the
+    /// connection over the cap is closed at accept and counted.
+    #[tokio::test]
+    async fn a_peer_connection_over_the_cap_is_closed_and_counted() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server =
+            PeerServer::plaintext(MetaNodeId(1), Arc::new(EchoHandler)).with_max_connections(1);
+        let limit = server.connection_limit();
+        assert_eq!(limit.label(), "meta_peer");
+        let task = tokio::spawn(server.serve(listener));
+        crate::transport::limit::probe::the_second_of_a_cap_of_one_is_closed(addr, &limit).await;
+        task.abort();
     }
 
     #[async_trait]

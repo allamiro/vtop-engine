@@ -5,6 +5,7 @@
 //! façade. Openraft types never cross this boundary.
 
 use super::authz::{AdminAuthorizer, AdminIdentity, Refusal};
+use super::limit::{ConnectionLimit, DEFAULT_MAX_ADMIN_CONNECTIONS};
 use super::maybe_tls::{judge_dialect, tls_handshake_hint, DialectVerdict, MaybeTls};
 use super::tls::{server_name, TlsMaterial};
 use super::wire::{
@@ -132,6 +133,8 @@ pub struct AdminServer {
     /// Only consulted when `acceptor` is `None`; TLS endpoints carry identity
     /// and are bound wherever the operator chooses.
     exposure: PlaintextExposure,
+    /// How many connections are served at once (#732, M6).
+    limit: Arc<ConnectionLimit>,
 }
 
 /// How far a PLAINTEXT admin endpoint may be reachable.
@@ -164,6 +167,7 @@ impl AdminServer {
             authorizer: Arc::new(authorizer),
             // Unused for a TLS endpoint, which carries caller identity.
             exposure: PlaintextExposure::LoopbackOnly,
+            limit: Arc::new(ConnectionLimit::meta_admin(DEFAULT_MAX_ADMIN_CONNECTIONS)),
         })
     }
 
@@ -201,6 +205,7 @@ impl AdminServer {
             handler,
             authorizer: Arc::new(authorizer),
             exposure: PlaintextExposure::LoopbackOnly,
+            limit: Arc::new(ConnectionLimit::meta_admin(DEFAULT_MAX_ADMIN_CONNECTIONS)),
         })
     }
 
@@ -227,6 +232,19 @@ impl AdminServer {
         Ok(server)
     }
 
+    /// Serve at most `max` connections at once (#732, M6); the default is
+    /// [`DEFAULT_MAX_ADMIN_CONNECTIONS`]. A connection over the cap is closed
+    /// at accept and counted on [`AdminServer::connection_limit`].
+    pub fn with_max_connections(mut self, max: usize) -> Self {
+        self.limit = Arc::new(ConnectionLimit::meta_admin(max));
+        self
+    }
+
+    /// The cap and its refusal count, for the node's metrics.
+    pub fn connection_limit(&self) -> Arc<ConnectionLimit> {
+        Arc::clone(&self.limit)
+    }
+
     pub async fn serve(self, listener: TcpListener) -> TransportResult<()> {
         // CHECKED AT BIND TIME, not per connection: the question is about the
         // address this endpoint is reachable on, and answering it once means a
@@ -251,11 +269,17 @@ impl AdminServer {
             );
         }
         loop {
-            let (tcp, _) = listener.accept().await?;
+            let (tcp, peer) = listener.accept().await?;
+            // Over the cap: closed now, before the handshake, and counted.
+            let Some(slot) = self.limit.admit(peer) else {
+                drop(tcp);
+                continue;
+            };
             let acceptor = self.acceptor.clone();
             let handler = Arc::clone(&self.handler);
             let authorizer = Arc::clone(&self.authorizer);
             tokio::spawn(async move {
+                let _slot = slot;
                 let _ = serve_admin_connection(acceptor, tcp, handler, authorizer).await;
             });
         }
@@ -1941,6 +1965,25 @@ mod tests {
             "unexpected response kind 27".to_owned()
         )));
         assert_eq!(predates_replica_set_read(), "unexpected response kind 27");
+    }
+
+    /// #732 (M6): the admin plane serves at most `max_admin_connections`;
+    /// the connection over the cap is closed at accept and counted.
+    #[tokio::test]
+    async fn an_admin_connection_over_the_cap_is_closed_and_counted() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = AdminServer::plaintext(
+            Arc::new(CountingHandler::default()) as Arc<dyn AdminHandler>,
+            AdminAuthorizer::permissive(),
+        )
+        .expect("a permissive plaintext endpoint is allowed")
+        .with_max_connections(1);
+        let limit = server.connection_limit();
+        assert_eq!(limit.label(), "meta_admin");
+        let task = tokio::spawn(server.serve(listener));
+        crate::transport::limit::probe::the_second_of_a_cap_of_one_is_closed(addr, &limit).await;
+        task.abort();
     }
 
     #[derive(Default)]

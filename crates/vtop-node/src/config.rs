@@ -1083,6 +1083,15 @@ pub struct MetaNodeConfig {
     /// an enforcing `admin_authorization`: there is no CN to match.
     #[serde(default)]
     pub admin_transport: PlaneTransport,
+    /// The most connections the peer listener holds open at once (#732,
+    /// M6). One over is closed at accept, counted on
+    /// `vtop_listener_connections_refused_total{plane="meta_peer"}` and said
+    /// in a rate-limited warning. Must be at least 1.
+    #[serde(default = "default_max_peer_connections")]
+    pub max_peer_connections: usize,
+    /// The same for the admin listener (`plane="meta_admin"`).
+    #[serde(default = "default_max_admin_connections")]
+    pub max_admin_connections: usize,
     /// Required while any plane is `tls`; may be omitted only when both
     /// planes are plaintext.
     #[serde(default)]
@@ -1243,6 +1252,13 @@ pub struct DataNodeConfig {
     /// every member of the range must agree.
     #[serde(default)]
     pub replica_transport: PlaneTransport,
+    /// The most connections the replica listener holds open at once (#732,
+    /// R7), as the native plane caps its sessions. One over is closed at
+    /// accept, counted on
+    /// `vtop_listener_connections_refused_total{plane="replica"}` and said in
+    /// a rate-limited warning. Must be at least 1.
+    #[serde(default = "default_max_replica_connections")]
+    pub max_replica_connections: usize,
     /// Transport of the native produce/fetch plane (#294). Under plaintext a
     /// session is admitted on the declared principal alone — anything that
     /// can reach the port and knows `principal_id` may produce and consume.
@@ -1530,6 +1546,28 @@ fn default_renew_interval_ms() -> u64 {
 }
 fn default_poll_interval_ms() -> u64 {
     2_000
+}
+
+fn default_max_peer_connections() -> usize {
+    vtop_meta::transport::DEFAULT_MAX_PEER_CONNECTIONS
+}
+fn default_max_admin_connections() -> usize {
+    vtop_meta::transport::DEFAULT_MAX_ADMIN_CONNECTIONS
+}
+fn default_max_replica_connections() -> usize {
+    vtop_meta::transport::DEFAULT_MAX_REPLICA_CONNECTIONS
+}
+
+/// A listener's connection cap (#732) must admit something: zero would be a
+/// node that refuses every peer, and nothing about that is worth starting.
+pub fn check_connection_cap(key: &str, value: usize) -> Result<(), String> {
+    if value == 0 {
+        return Err(format!(
+            "`{key}: 0` would refuse every connection to that listener; set it to at least 1, or \
+             remove it for the default"
+        ));
+    }
+    Ok(())
 }
 
 pub fn load<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
@@ -2625,6 +2663,55 @@ mod transport_tests {
             ClientTransport::Tls,
             &[peer(Some(ClientTransport::Plaintext))]
         ));
+    }
+
+    /// #732 (M6, R7): every capped listener has a default, the keys are
+    /// read, and a cap of zero is refused by name.
+    #[test]
+    fn listener_connection_caps_default_parse_and_refuse_zero() {
+        let meta = |extra: &str| -> MetaNodeConfig {
+            serde_yaml::from_str(&format!(
+                "node_id: 1\n\
+                 cluster_id: 11111111-2222-3333-4444-555555555555\n\
+                 data_dir: /tmp/x\n\
+                 peer_listen: 127.0.0.1:9100\n\
+                 admin_listen: 127.0.0.1:9200\n\
+                 tls: {{ ca: ca.pem, cert: c.pem, key: k.pem }}\n{extra}"
+            ))
+            .unwrap()
+        };
+        let defaults = meta("");
+        assert_eq!(defaults.max_peer_connections, 256);
+        assert_eq!(defaults.max_admin_connections, 1024);
+        let set = meta("max_peer_connections: 8\nmax_admin_connections: 16\n");
+        assert_eq!(set.max_peer_connections, 8);
+        assert_eq!(set.max_admin_connections, 16);
+
+        let data = |extra: &str| -> DataNodeConfig {
+            serde_yaml::from_str(&format!(
+                "role: follower\n\
+                 node_uuid: aaaaaaaa-0000-0000-0000-0000000000a1\n\
+                 cluster_id: aaaaaaaa-0000-0000-0000-0000000000c0\n\
+                 data_dir: /tmp/x\n\
+                 fencing_epoch: 1\n\
+                 range: {{ topic: events.v1, topic_epoch: 1, \
+                 range_id: aaaaaaaa-0000-0000-0000-0000000000d0, range_generation: 0 }}\n\
+                 segment_id: aaaaaaaa-0000-0000-0000-0000000000e0\n{extra}"
+            ))
+            .unwrap()
+        };
+        assert_eq!(data("").max_replica_connections, 256);
+        assert_eq!(
+            data("max_replica_connections: 3\n").max_replica_connections,
+            3
+        );
+
+        assert!(check_connection_cap("max_peer_connections", 1).is_ok());
+        let refused = check_connection_cap("max_replica_connections", 0).unwrap_err();
+        assert!(
+            refused.contains("`max_replica_connections: 0`") && refused.contains("at least 1"),
+            "{refused}"
+        );
     }
 
     /// The default is TLS on every plane, spelled or not; the knobs take

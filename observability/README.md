@@ -227,6 +227,28 @@ is exported from the first scrape at zero:
 | `offset_commit` | `no_offset_store` | A consumer committed offsets to a node with no metadata plane (a static leader or a standalone node). Nothing was stored; the client was answered `INVALID_REQUEST`. A consumer with auto-commit on logs it and keeps reading; an explicit commit fails. Run the node as a leased leader on a metadata plane, or set `enable.auto.commit=false` on consumers that do not need committed offsets. |
 | `unserved` | `unserved_api` | A client sent a request the gateway does not serve (CreateTopics, DescribeConfigs, ...), and the connection was closed. The log line names the api key. Topics are created on the metadata plane (`vtopctl meta create-topic`), not through the Kafka API. |
 
+### Listener connection caps
+
+The metadata node's peer and admin listeners, and a data node's replica
+listener, each hold at most a configured number of connections at once (#732).
+A connection over the cap is closed at accept, before its TLS handshake;
+connections already open are not touched. Each one is counted in
+`vtop_listener_connections_refused_total{plane}`, and a WARN line says which
+listener refused whom and which key raises the cap, at most once per 10
+seconds per listener with the number suppressed since. `plane` is a fixed set,
+exported at zero from the first scrape:
+
+| `plane` | Listener | Cap (default) |
+|---|---|---|
+| `meta_peer` | Raft peer RPCs on a metadata node | `max_peer_connections` (256) |
+| `meta_admin` | The admin endpoint on a metadata node | `max_admin_connections` (1024) |
+| `replica` | Replication on a data node (follower, candidate, and a leader's status listener) | `max_replica_connections` (256) |
+
+Any increase means something opened more connections than the cap allows:
+legitimate load that needs a larger cap, or a flood from a peer holding a
+certificate the cluster's CA signed (or anything that reaches a plaintext
+plane). The WARN line names the peer's address.
+
 ### Archive scrub
 
 `vtopctl scrub` (#628) reads committed objects back and verifies them again:

@@ -662,6 +662,7 @@ fn replica_server(
     config: &DataNodeConfig,
     handler: Arc<dyn ReplicaPeerHandler>,
 ) -> Result<ReplicaPeerServer, String> {
+    crate::config::check_connection_cap("max_replica_connections", config.max_replica_connections)?;
     Ok(match config.replica_transport {
         PlaneTransport::Tls => ReplicaPeerServer::new(
             tls::replica_material(config.replica_tls_paths()?)?,
@@ -675,7 +676,21 @@ fn replica_server(
         }
     }
     // Dialers are held to the level this node read (#634).
-    .with_cluster_level(crate::version_report::cluster_level_for(config.node_uuid)))
+    .with_cluster_level(crate::version_report::cluster_level_for(config.node_uuid))
+    // At most this many connections at once (#732, R7).
+    .with_max_connections(config.max_replica_connections))
+}
+
+/// The replica listener's refusals over its cap, on the node's metrics
+/// (#732). Registered once per process, beside whichever replica server this
+/// role built.
+fn register_replica_limit(
+    observability: &NodeObservability,
+    server: &ReplicaPeerServer,
+) -> Result<(), String> {
+    observability.register(Box::new(crate::observe::ConnectionLimitCollector::new(
+        vec![server.connection_limit()],
+    )?))
 }
 
 /// A replica-status client dialing the replica plane the way this node
@@ -1128,6 +1143,7 @@ async fn run_follower(
         Arc::clone(&follower) as Arc<dyn ReplicaPeerHandler>,
     )
     .map_err(|error| error.to_string())?;
+    register_replica_limit(observability, &server)?;
     let listener = TcpListener::bind(listen)
         .await
         .map_err(|error| format!("bind {listen}: {error}"))?;
@@ -1374,6 +1390,9 @@ async fn run_leader(
         )),
         None => None,
     };
+    if let Some((_, server)) = &status_server {
+        register_replica_limit(observability, server)?;
+    }
     // Same epoch history a follower keeps (#240). A leader needs its own: the
     // range's history is the union of what each replica recorded, and a leader
     // that could not say which epoch wrote its tail is exactly the replica a
@@ -2063,6 +2082,7 @@ async fn run_candidate(
         Arc::clone(&switching) as Arc<dyn ReplicaPeerHandler>,
     )
     .map_err(|error| error.to_string())?;
+    register_replica_limit(observability, &replica_server)?;
     let replica_listener = TcpListener::bind(replica_listen)
         .await
         .map_err(|error| format!("bind {replica_listen}: {error}"))?;
