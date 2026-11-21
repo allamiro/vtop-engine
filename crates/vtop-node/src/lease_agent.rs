@@ -47,7 +47,6 @@ use std::time::Duration;
 use uuid::Uuid;
 use vtop_broker::LocalBroker;
 use vtop_meta::command::CommandEnvelope;
-use vtop_meta::transport::warn_rate_limited;
 use vtop_meta::{AdminClient, MetadataCommand, MetadataResponse};
 
 /// Where the agent publishes what metadata decided.
@@ -601,14 +600,14 @@ impl ReplicaPlaneProbe {
                     // replica that answers but refuses the fence is a reason
                     // the promotion keeps failing, and the soak's wedge
                     // could not be explained without it.
-                    warn_rate_limited(
-                        &format!("promotion-probe-fence-{}", follower.node_uuid),
-                        &format!(
-                            "replica {} could not be fenced at epoch {fencing_epoch} and is \
-                             excluded from the promotion quorum: {error}",
-                            follower.node_uuid
-                        ),
-                    );
+                    if warn_due(&format!("promotion-probe-fence-{}", follower.node_uuid)) {
+                        tracing::warn!(
+                            follower = %follower.node_uuid,
+                            fencing_epoch,
+                            %error,
+                            "replica could not be fenced; excluded from the promotion quorum"
+                        );
+                    }
                     None
                 }
             };
@@ -623,6 +622,27 @@ impl ReplicaPlaneProbe {
         probes
     }
 }
+
+/// Whether a warning keyed `key` is due: at most one per key every
+/// [`WARN_EVERY`], so a refusal repeated every round is reported, not
+/// repeated (#881).
+fn warn_due(key: &str) -> bool {
+    static LAST: std::sync::Mutex<Option<std::collections::HashMap<String, std::time::Instant>>> =
+        std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let last = last.get_or_insert_with(std::collections::HashMap::new);
+    let now = std::time::Instant::now();
+    match last.get(key) {
+        Some(at) if now.saturating_duration_since(*at) < WARN_EVERY => false,
+        _ => {
+            last.insert(key.to_owned(), now);
+            true
+        }
+    }
+}
+
+/// How often [`warn_due`] lets one key's warning through.
+const WARN_EVERY: Duration = Duration::from_secs(30);
 
 /// What one successful marker publication proved: the epoch whose marker
 /// is now quorum-acked, and the high-water mark it published (review).
@@ -3626,14 +3646,14 @@ impl LeaseAgent {
                     MetadataResponse::Rejected(error) => error.to_string(),
                     other => format!("unexpected answer {other:?}"),
                 };
-                warn_rate_limited(
-                    &format!("lease-acquire-refused-{}", self.range_uuid),
-                    &format!(
-                        "lease acquisition for range {} at range generation \
-                         {expected_range_generation} was refused: {reason}",
-                        self.range_uuid
-                    ),
-                );
+                if warn_due(&format!("lease-acquire-refused-{}", self.range_uuid)) {
+                    tracing::warn!(
+                        range = %self.range_uuid,
+                        expected_range_generation,
+                        %reason,
+                        "lease acquisition refused"
+                    );
+                }
                 None
             }
         })
