@@ -220,7 +220,7 @@ pub fn unit_ranges(record: &BatchRecord) -> Vec<(Unit, u64, u64)> {
                 end_offset,
                 consumer_group,
                 start_offset: last_read_start,
-                topic_id: None,
+                ..
             },
         ) => {
             // A Kafka window never spans partitions (one buffer each); a pair
@@ -2102,6 +2102,44 @@ mod tests {
         let unit = &units[0];
         assert!(unit.unexplained_holes.is_empty(), "{unit:?}");
         assert_eq!(unit.committed_through, 20);
+    }
+
+    /// A Kafka row written once the broker gives topic ids carries one in its
+    /// marker. The audit must count it like a row without: a marker pattern
+    /// that named `topic_id: None` dropped every such row, so an audit of
+    /// them reported no unit at all and passed over a failed range.
+    #[test]
+    fn kafka_rows_with_a_known_topic_id_are_audited() {
+        let with_id = |start: i64, end: i64| match kafka(start, end) {
+            ProgressMarker::Kafka {
+                topic,
+                partition,
+                start_offset,
+                end_offset,
+                consumer_group,
+                ..
+            } => ProgressMarker::Kafka {
+                topic,
+                partition,
+                start_offset,
+                end_offset,
+                consumer_group,
+                topic_id: Some("Zk3pXK7bTfyqY0v9mQw1ZA".into()),
+            },
+            other => other,
+        };
+        let units = audit([
+            row("a", Committed, with_id(0, 9), with_id(0, 9)),
+            row("f", Failed, with_id(10, 19), with_id(10, 19)),
+            row("c", Committed, with_id(20, 29), with_id(20, 29)),
+        ]);
+        assert_eq!(units.len(), 1, "the rows were dropped: {units:?}");
+        assert_eq!(units[0].committed_through, 30);
+        assert!(
+            units[0].has_findings() && !units[0].failed_holes.is_empty(),
+            "the failed range 10 to 19 below a committed one must be a finding: {:?}",
+            units[0]
+        );
     }
 
     /// A window of several reads starts at its FIRST read.

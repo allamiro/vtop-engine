@@ -107,17 +107,20 @@ CREATE INDEX IF NOT EXISTS idx_batches_kafka_max_end ON batches(
     created_at,
     batch_id
 ) WHERE source_type = 'kafka';
--- Bounds the probes for a NEWER row of a Kafka unit (the unit's newest row is
--- kept, and rows of no topic id are ranked by creation): a range seek on
--- (created_at, batch_id) after the unit's identity, which the index above
--- cannot give because the topic id and end offset come before them there.
--- The expressions must stay textually identical to the ones in
--- prune_predicate_sql.
-CREATE INDEX IF NOT EXISTS idx_batches_kafka_newest ON batches(
+-- Bounds the lookup of an incarnation's newest row (the unresolved test in
+-- the prune predicate) and the probe for a newer row of no topic id (a NULL
+-- id is one more incarnation here): the
+-- unit's identity and the topic id, then (created_at, batch_id), so the
+-- newest row is the last entry of one index range. Without the topic id
+-- ahead of the creation time, an old incarnation's lookup walks the newer
+-- incarnation's rows. The expressions must stay textually identical to the
+-- ones in prune_predicate_sql.
+CREATE INDEX IF NOT EXISTS idx_batches_kafka_id_newest ON batches(
     state,
     json_extract(progress_end_json, '$.topic'),
     json_extract(progress_end_json, '$.partition'),
     json_extract(progress_end_json, '$.consumer_group'),
+    json_extract(progress_end_json, '$.topic_id'),
     created_at,
     batch_id
 ) WHERE source_type = 'kafka';
@@ -178,11 +181,11 @@ CREATE INDEX IF NOT EXISTS idx_audit_events_time ON audit_events(time);
 ///   the overlap between rows to tell the two apart, and so needs the rows
 ///   that overlap kept until the newest row has caught up with the highest.
 ///
-///   Either kind of Kafka row is also kept while no NEWER row of its (topic,
-///   partition, consumer group) exists, whatever the id: the answer that holds
-///   the unit's newest-created row is what the adapter falls back to when it
-///   cannot learn the topic's id, and pruning a lower-ending row of that
-///   incarnation (interleaved with rows of no id) would move it to another.
+///   Together these keep the unit's newest-created row, which the adapter
+///   falls back to when it cannot learn the topic's id: if its id is
+///   unresolved every row of it stays, and if it is resolved the newest row
+///   ends at the id's highest end and is the row kept for the id (a row of no
+///   id: the newest of those).
 ///
 /// A Kafka row of a known id is "better" than another when its end is higher,
 /// or equal and it is newer: two probes joined by OR, not one row-value
@@ -203,12 +206,17 @@ CREATE INDEX IF NOT EXISTS idx_audit_events_time ON audit_events(time);
 ///
 /// The probe expressions must stay textually identical to the
 /// `idx_batches_commit_newest`, `idx_batches_kafka_max_end` and
-/// `idx_batches_kafka_newest` expressions
+/// `idx_batches_kafka_id_newest` expressions
 /// above: SQLite matches expression indexes structurally, and without the
 /// index every candidate row rescans the entire committed set (quadratic on
 /// the engine's idle-cycle pass). The Kafka literal is `'kafka'`, not a
 /// parameter, because a partial index is used only when the query's own text
 /// implies its WHERE clause.
+///
+/// The lookup of an incarnation's newest row names its index (`INDEXED BY`),
+/// so no plan can walk a newer incarnation's rows for an old one's lookup
+/// (quadratic in the history). Every connection creates the index, so it
+/// exists.
 ///
 /// A SUPERSEDED row (?4, #567) is deletable on age alone: it is never the
 /// row a restart cursor is read from, so nothing has to survive it.
@@ -261,7 +269,7 @@ macro_rules! prune_predicate_sql {
                        = json_extract(b.progress_end_json, '$.topic_id') \
                   ) \
                 <= (SELECT CAST(json_extract(w.progress_end_json, '$.end_offset') AS INTEGER) \
-                    FROM batches w \
+                    FROM batches w INDEXED BY idx_batches_kafka_id_newest \
                     WHERE w.state = ?1 \
                       AND w.source_type = 'kafka' \
                       AND json_extract(w.progress_end_json, '$.topic') \
@@ -273,18 +281,6 @@ macro_rules! prune_predicate_sql {
                       AND json_extract(w.progress_end_json, '$.topic_id') \
                         = json_extract(b.progress_end_json, '$.topic_id') \
                     ORDER BY w.created_at DESC, w.batch_id DESC LIMIT 1) \
-              AND EXISTS ( \
-                SELECT 1 FROM batches n \
-                WHERE n.state = ?1 \
-                  AND n.source_type = 'kafka' \
-                  AND json_extract(n.progress_end_json, '$.topic') \
-                      = json_extract(b.progress_end_json, '$.topic') \
-                  AND json_extract(n.progress_end_json, '$.partition') \
-                      = json_extract(b.progress_end_json, '$.partition') \
-                  AND json_extract(n.progress_end_json, '$.consumer_group') \
-                      = json_extract(b.progress_end_json, '$.consumer_group') \
-                  AND (n.created_at, n.batch_id) > (b.created_at, b.batch_id) \
-              ) \
               WHEN b.source_type = 'kafka' THEN EXISTS ( \
                 SELECT 1 FROM batches n \
                 WHERE n.state = ?1 \
@@ -296,18 +292,6 @@ macro_rules! prune_predicate_sql {
                   AND json_extract(n.progress_end_json, '$.consumer_group') \
                       = json_extract(b.progress_end_json, '$.consumer_group') \
                   AND json_extract(n.progress_end_json, '$.topic_id') IS NULL \
-                  AND (n.created_at, n.batch_id) > (b.created_at, b.batch_id) \
-              ) \
-              AND EXISTS ( \
-                SELECT 1 FROM batches n \
-                WHERE n.state = ?1 \
-                  AND n.source_type = 'kafka' \
-                  AND json_extract(n.progress_end_json, '$.topic') \
-                      = json_extract(b.progress_end_json, '$.topic') \
-                  AND json_extract(n.progress_end_json, '$.partition') \
-                      = json_extract(b.progress_end_json, '$.partition') \
-                  AND json_extract(n.progress_end_json, '$.consumer_group') \
-                      = json_extract(b.progress_end_json, '$.consumer_group') \
                   AND (n.created_at, n.batch_id) > (b.created_at, b.batch_id) \
               ) \
               ELSE EXISTS ( \
@@ -2168,10 +2152,7 @@ mod tests {
         // The probes for a row of a known topic id that ends higher - a range
         // on the end offset, and equal with a later creation time - are
         // bounded by the (identity, topic id, end offset, created_at) partial
-        // index; the probes for a NEWER row of the unit - the unit's newest
-        // row is kept, and rows of no id are ranked by creation - by the
-        // (identity, created_at, batch_id) one, as a range on the creation
-        // time. Naming an index is not enough: a probe whose range column
+        // index. Naming an index is not enough: a probe whose range column
         // comes after columns it does not constrain rescans the earlier rows
         // for every candidate, which made a large prune quadratic.
         let probes =
@@ -2185,32 +2166,37 @@ mod tests {
             max_end.iter().any(|l| l.contains("created_at>?")),
             "no known-id probe seeks a later creation time at an equal end:\n{plan}"
         );
-        let newest = probes("idx_batches_kafka_newest");
+        // The unresolved test reads an incarnation's newest row from the
+        // index that puts the topic id ahead of the creation time, so an old
+        // incarnation's lookup does not walk a newer one's rows (it did, with
+        // two incarnations of 4,000 rows each taking 22 s).
+        let id_newest = probes("idx_batches_kafka_id_newest");
         assert!(
-            newest.iter().filter(|l| l.contains("created_at>?")).count() >= 3,
-            "the 3 newer-row probes must seek by creation time:\n{plan}"
+            id_newest.iter().any(|l| l.contains("<expr>=?")),
+            "the newest-row-of-an-id lookup no longer uses idx_batches_kafka_id_newest:\n{plan}"
         );
-        // The unresolved test reads the id's newest row by walking the same
-        // index backwards (one row), and its highest end by one seek.
+        // The probe for a newer row of no topic id seeks by creation time in
+        // the same index.
         assert!(
-            newest.iter().any(|l| !l.contains("created_at>?")),
-            "the newest-row-of-an-id lookup no longer walks idx_batches_kafka_newest:\n{plan}"
+            id_newest.iter().any(|l| l.contains("created_at>?")),
+            "the rows-of-no-id probe no longer seeks by creation time:\n{plan}"
         );
     }
 
-    /// The overlap test reads the retained history in one sweep, not pairwise:
-    /// many overlapping ranges (replacement records archived after a
-    /// truncation, here every range twice) must not make the resume query
-    /// quadratic. Quadratic, 6,000 rows took tens of seconds; the bound is
-    /// generous so a slow machine does not fail it.
+    /// An old incarnation's rows find their incarnation's newest row (the
+    /// unresolved test of the prune predicate) in one index range. Through an
+    /// index that did not put the topic id ahead of the creation time, each
+    /// old row walked the replacement's rows backwards: two incarnations of
+    /// 4,000 rows took 22 s. The bound is generous so a slow machine does not
+    /// fail it.
     #[tokio::test]
-    async fn the_resume_query_stays_linear_over_overlapping_history() {
+    async fn the_prune_predicate_stays_linear_across_two_incarnations() {
         let store = SqliteStateStore::connect("sqlite::memory:").await.unwrap();
         let n = 3000u32;
         for i in 0..2 * n {
-            let k = i % n;
+            let (id, k) = if i < n { ("old", i) } else { ("new", i - n) };
             let m = format!(
-                r#"{{"source_type":"kafka","topic":"t","partition":0,"start_offset":{},"end_offset":{},"consumer_group":"g","topic_id":"inc"}}"#,
+                r#"{{"source_type":"kafka","topic":"t","partition":0,"start_offset":{},"end_offset":{},"consumer_group":"g","topic_id":"{id}"}}"#,
                 k * 10,
                 k * 10 + 9
             );
@@ -2224,11 +2210,10 @@ mod tests {
             .bind(&m)
             .bind(&m)
             .bind(format!(
-                "2030-01-01T{:02}:{:02}:{:02}.{:03}Z",
+                "2030-01-01T{:02}:{:02}:{:02}.000Z",
                 (i / 3600) % 24,
                 (i / 60) % 60,
-                i % 60,
-                0
+                i % 60
             ))
             .execute(&store.pool)
             .await
@@ -2239,18 +2224,23 @@ mod tests {
             .await
             .unwrap();
         let started = std::time::Instant::now();
-        let answers = store.committed_kafka_offsets().await.unwrap();
+        let rows = sqlx::query(concat!(
+            "SELECT b.batch_id FROM batches b WHERE ",
+            prune_predicate_sql!()
+        ))
+        .bind(BatchState::SourceCommitted.as_str())
+        .bind("2031-01-01T00:00:00Z")
+        .bind(0)
+        .bind(BatchState::Superseded.as_str())
+        .fetch_all(&store.pool)
+        .await
+        .unwrap();
         let elapsed = started.elapsed();
-        assert_eq!(answers.len(), 1);
-        assert_eq!(
-            answers[0].end_offset,
-            i64::from(n) * 10 - 1,
-            "every range was archived twice, so the id is broken and answers with the newest \
-             row's end, which is the last copy's"
-        );
+        // Each incarnation keeps its highest row: all but two are candidates.
+        assert_eq!(rows.len(), 2 * n as usize - 2);
         assert!(
             elapsed < std::time::Duration::from_secs(5),
-            "{} overlapping rows took {elapsed:?}: the overlap test is not linear",
+            "{} rows over two incarnations took {elapsed:?}: the prune predicate is not linear",
             2 * n
         );
     }

@@ -120,14 +120,14 @@ const MAX_CONFLICT_RETRIES: u32 = 5;
 /// also kept while the id is unresolved (its highest end is above its newest
 /// row's end), because committed_kafka_offsets reads the overlap between rows
 /// to tell a truncated log from a hole filled, and needs the rows that overlap
-/// until the newest row has caught up. "Ends higher" is two
-/// probes joined by OR (a higher end, or an equal end and a later creation),
-/// each a range or equality seek on idx_batches_kafka_max_end: one row
-/// comparison on (end, created_at, batch_id) scanned the id's rows below the
-/// candidate's end for every candidate. A Kafka row of either
-/// kind is also kept while no newer row of its (topic, partition, consumer
-/// group) exists, so the answer holding the unit's newest row, which the
-/// adapter falls back to when it cannot learn the topic's id, does not move.
+/// until the newest row has caught up. Together with the highest-end and
+/// newest-of-no-id rules this keeps the unit's newest row, which the adapter
+/// falls back to when it cannot learn the topic's id. "Ends higher" is the id's
+/// maximum end above the candidate's (one seek on idx_batches_kafka_max_end), or
+/// an equal end and a later creation; one row comparison on (end, created_at,
+/// batch_id) scanned the id's rows below the candidate's end for every
+/// candidate. An incarnation's newest row is read from
+/// idx_batches_kafka_id_newest (identity, topic id, creation order).
 /// The probes'
 /// expressions must stay identical to idx_batches_commit_newest and
 /// idx_batches_kafka_max_end in migrations/postgres/0001_state_store.sql. The
@@ -195,18 +195,6 @@ macro_rules! pg_prune_predicate_sql {
                 AND (w.progress_end_json::jsonb ->> 'topic_id') \
                     = (b.progress_end_json::jsonb ->> 'topic_id') \
                 ORDER BY w.created_at DESC, w.batch_id DESC LIMIT 1) \
-          AND EXISTS ( \
-            SELECT 1 FROM batches n \
-            WHERE n.state = $1 \
-              AND n.source_type = 'kafka' \
-              AND (n.progress_end_json::jsonb ->> 'topic') \
-                  = (b.progress_end_json::jsonb ->> 'topic') \
-              AND (n.progress_end_json::jsonb ->> 'partition') \
-                  = (b.progress_end_json::jsonb ->> 'partition') \
-              AND (n.progress_end_json::jsonb ->> 'consumer_group') \
-                  = (b.progress_end_json::jsonb ->> 'consumer_group') \
-              AND (n.created_at, n.batch_id) > (b.created_at, b.batch_id) \
-          ) \
           WHEN b.source_type = 'kafka' THEN EXISTS ( \
             SELECT 1 FROM batches n \
             WHERE n.state = $1 \
@@ -218,18 +206,6 @@ macro_rules! pg_prune_predicate_sql {
               AND (n.progress_end_json::jsonb ->> 'consumer_group') \
                   = (b.progress_end_json::jsonb ->> 'consumer_group') \
               AND (n.progress_end_json::jsonb ->> 'topic_id') IS NULL \
-              AND (n.created_at, n.batch_id) > (b.created_at, b.batch_id) \
-          ) \
-          AND EXISTS ( \
-            SELECT 1 FROM batches n \
-            WHERE n.state = $1 \
-              AND n.source_type = 'kafka' \
-              AND (n.progress_end_json::jsonb ->> 'topic') \
-                  = (b.progress_end_json::jsonb ->> 'topic') \
-              AND (n.progress_end_json::jsonb ->> 'partition') \
-                  = (b.progress_end_json::jsonb ->> 'partition') \
-              AND (n.progress_end_json::jsonb ->> 'consumer_group') \
-                  = (b.progress_end_json::jsonb ->> 'consumer_group') \
               AND (n.created_at, n.batch_id) > (b.created_at, b.batch_id) \
           ) \
           ELSE EXISTS ( \
