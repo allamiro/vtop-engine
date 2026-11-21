@@ -39,6 +39,8 @@ What counts as narrowed, and which row covers it:
 |---|---|---|
 | A command removed or renamed, or one of its aliases dropped | `command` | `vtopctl old-name` (covers its flags and subcommands too) |
 | A flag removed or renamed, a short or alias dropped, a flag that took no value now takes one (or the reverse), a flag made required, or a positional moved | `flag` | `vtopctl scrub --old-flag` |
+| A new required argument on a command that already existed | `flag` (or the `command`), named after the new argument | `vtopctl scrub --tenant` |
+| An option that took any value now accepts only a listed set | `flag` | `vtopctl scrub --mode` |
 | A value no longer accepted | `value` (or the `flag`) | `vtopctl process-once --source syslog` |
 | A metric removed, renamed, or changed type | `metric` | `vtop_old_total` (covers its labels too) |
 | A label removed or renamed | `label` (or the `metric`) | `vtop_old_total{reason}` |

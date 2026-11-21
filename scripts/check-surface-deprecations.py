@@ -17,9 +17,11 @@ What needs an entry:
   command that is gone, or lost an alias, needs a `command` entry. An
   argument that is gone, lost a spelling, changed between a flag and an
   option, became required, lost its repeatability or moved, needs a `flag`
-  entry. A value that is no longer
-  accepted needs a `value` entry (`vtopctl x --source syslog`) or one for the
-  flag. A `command` entry also covers everything under that command.
+  entry, as does a new required argument on a command that already existed
+  and an argument that took any value and now accepts only a listed set. A
+  value that is no longer accepted needs a `value` entry (`vtopctl x
+  --source syslog`) or one for the flag. A `command` entry also covers
+  everything under that command.
 
 A changed default, value name, help text or hidden marker needs no entry:
 every invocation that worked before still parses.
@@ -67,7 +69,8 @@ class Need:
 class Arg:
     spellings: set[str] = field(default_factory=set)
     takes: str = ""  # flag, count or value
-    values: set[str] = field(default_factory=set)
+    # None when the snapshot lists no `values=`: any value is accepted.
+    values: set[str] | None = None
     attrs: dict[str, str] = field(default_factory=dict)
     words: set[str] = field(default_factory=set)
 
@@ -189,10 +192,20 @@ def command_needs(file: str, base: str, head: str) -> list[Need]:
             reasons.append("it is no longer global")
         if "position" in arg.attrs and arg.attrs["position"] != new.attrs.get("position"):
             reasons.append(f"it moved from position {arg.attrs['position']}")
+        if arg.values is None and new.values is not None:
+            reasons.append("it took any value and now accepts only " + ",".join(sorted(new.values)))
         for reason in reasons:
             needs.append(Need(file, "flag", key, reason))
-        for value in sorted(arg.values - new.values):
-            needs.append(Need(file, "value", f"{key} {value}", "the value is no longer accepted"))
+        # Dropping a restriction (values= gone) widens what parses: no entry.
+        if arg.values is not None and new.values is not None:
+            for value in sorted(arg.values - new.values):
+                needs.append(Need(file, "value", f"{key} {value}", "the value is no longer accepted"))
+    # An invocation of a command that already existed fails without a new
+    # required argument; one on a new command breaks nothing.
+    for key, new in sorted(after_args.items()):
+        command = key.rsplit(" ", 1)[0]
+        if key not in before_args and command in before_commands and "required" in new.words:
+            needs.append(Need(file, "flag", key, "a command that existed gained it as a required argument"))
     return needs
 
 

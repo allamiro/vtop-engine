@@ -167,6 +167,30 @@ class Commands(unittest.TestCase):
         ):
             self.assertEqual(run(head_cli=head, entries=[row])[1], [])
 
+    def test_a_new_required_argument_on_an_existing_command_needs_an_entry(self):
+        head = BASE_CLI + "vtopctl scrub --tenant value=<TENANT> required\n"
+        _, missing = run(head_cli=head)
+        self.assertEqual(missing, [("flag", "vtopctl scrub --tenant")])
+        row = "| flag | `vtopctl scrub --tenant` | v0.11.0 | not scheduled | | every scrub now names a tenant |"
+        self.assertEqual(run(head_cli=head, entries=[row])[1], [])
+
+    def test_a_required_argument_of_a_new_command_or_an_optional_one_needs_no_entry(self):
+        head = (
+            BASE_CLI
+            + "vtopctl audit\nvtopctl audit --since value=<SINCE> required\n"
+            + "vtopctl scrub --tenant value=<TENANT>\n"
+        )
+        self.assertEqual(run(head_cli=head), ([], []))
+
+    def test_an_option_that_took_any_value_and_now_takes_a_list_needs_an_entry(self):
+        head = BASE_CLI.replace("--limit value=<LIMIT>", "--limit value=<LIMIT> values=10,100")
+        _, missing = run(head_cli=head)
+        self.assertEqual(missing, [("flag", "vtopctl scrub --limit")])
+
+    def test_an_option_that_drops_its_list_of_values_needs_no_entry(self):
+        head = BASE_CLI.replace(" values=kafka,file,syslog", "")
+        self.assertEqual(run(head_cli=head), ([], []))
+
     def test_a_removed_command_is_covered_by_one_command_entry(self):
         head = "\n".join(l for l in BASE_CLI.splitlines() if not l.startswith("vtopctl meta")) + "\n"
         _, missing = run(head_cli=head)
