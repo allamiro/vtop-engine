@@ -41,7 +41,8 @@ release it is named for.
 
 Other patch releases of these lines are expected to behave the same and are
 not run. A pull request that changes the workflow or `scripts/kafka-broker.sh`
-runs every release in the table before it merges.
+runs every release in the table (plaintext) before it merges, and the oldest
+and newest releases through every listener below.
 
 ## Authentication and encryption
 
