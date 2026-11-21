@@ -388,7 +388,9 @@ formats:
       - {file: crates/vtop-protocol/src/lib.rs, name: MAGIC, value: 'b"VTPW"'}
       - {file: crates/vtop-protocol/src/lib.rs, name: PROTOCOL_MAJOR, value: '1'}
       - {file: crates/vtop-protocol/src/lib.rs, name: PROTOCOL_MINOR, value: '0'}
+    fixtures: [fuzz/corpus/protocol_frame]
     fuzz: [protocol_frame]
+    cells: [wire]
 
   - id: 20
     name: Replica protocol negotiation

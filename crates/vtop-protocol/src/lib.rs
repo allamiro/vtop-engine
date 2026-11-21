@@ -3187,6 +3187,88 @@ mod tests {
         }
     }
 
+    /// #743: the byte lock. The committed frames are what the encoder writes
+    /// today, byte for byte, so a change to a frame's bytes (a field, an
+    /// order, a width, a version in the header) fails here and has to be a
+    /// decision: `cargo test -p vtop-protocol -- --ignored write_fuzz_seeds`
+    /// rewrites them, in the same change that records the wire change
+    /// (`docs/reference/compatibility.md`, "Config, JSON output and the wire,
+    /// before 1.0"). And what a peer sent as those bytes decodes to the same
+    /// message: the committed bytes are the stand-in for a frame a release
+    /// wrote, and `decode_frame` reads them back to the family it started
+    /// from.
+    #[test]
+    fn the_committed_frames_are_the_bytes_the_encoder_writes_and_decode_to_their_messages() {
+        let family = every_message_family();
+        // A kind with several samples in the family is committed as its last
+        // one, which is what `write_fuzz_seeds` leaves under that name.
+        let mut last: std::collections::BTreeMap<String, (usize, Vec<u8>)> = Default::default();
+        for (index, (name, bytes)) in fuzz_seeds().into_iter().enumerate() {
+            last.insert(name, (index, bytes));
+        }
+        assert_eq!(last.len(), 30, "one committed frame per kind");
+        for (name, (index, bytes)) in last {
+            let committed = std::fs::read(fuzz_seed_dir().join(format!("{name}.seed")))
+                .unwrap_or_else(|error| panic!("{name}: no committed frame: {error}"));
+            assert_eq!(
+                committed, bytes,
+                "{name}: the encoder no longer writes the committed bytes. A change to a native \
+                 frame is a wire change: decide it, record it, then run \
+                 `cargo test -p vtop-protocol -- --ignored write_fuzz_seeds`"
+            );
+            let frame = decode_frame(&committed, ProtocolLimits::default())
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(frame.message, family[index], "{name}");
+            assert_eq!(frame.stream_id, 1, "{name}");
+        }
+    }
+
+    /// #743: the decoder accepts exactly the kinds that have a committed
+    /// frame, plus the one legacy alias. Every other kind is `UnknownKind`,
+    /// which is what an older peer answers to a kind added under the same
+    /// minor, by dropping the connection (`docs/reference/compatibility.md`):
+    /// so adding a kind to the decoder without a frame in the family fails
+    /// here, where it is seen, and not as an N-1 peer's dropped connection.
+    #[test]
+    fn the_decoder_accepts_exactly_the_kinds_that_have_a_committed_frame() {
+        /// Kind 70 is the form of `CommitCursorRequest` from before it carried
+        /// an operation identity; it still decodes (see
+        /// `legacy_kind_70_cursor_commit_decodes_with_no_operation_authority`)
+        /// and is never encoded, so it has no frame in the family.
+        const LEGACY_ALIASES: &[u16] = &[70];
+        let template = encode_frame(
+            &WireFrame {
+                request_id: 0,
+                stream_id: 0,
+                message: Message::Ping,
+            },
+            ProtocolLimits::default(),
+        )
+        .unwrap();
+        let mut accepted = std::collections::BTreeSet::new();
+        for kind in 0..=u16::MAX {
+            let mut header = template[..HEADER_LEN].to_vec();
+            header[8..10].copy_from_slice(&kind.to_be_bytes());
+            if decode_header(&header, ProtocolLimits::default()).is_ok() {
+                accepted.insert(kind);
+            }
+        }
+        let mut with_frame: std::collections::BTreeSet<u16> =
+            every_message_family().iter().map(Message::kind).collect();
+        assert_eq!(
+            with_frame.len(),
+            30,
+            "the native protocol has 30 kinds today"
+        );
+        with_frame.extend(LEGACY_ALIASES);
+        assert_eq!(
+            accepted, with_frame,
+            "a kind the decoder accepts has no frame in every_message_family (and is not a \
+             legacy alias), or a family kind is not accepted: add the message, run \
+             write_fuzz_seeds, and record the new kind as a wire change"
+        );
+    }
+
     /// #729: every committed seed is a frame this build decodes, so the
     /// fuzzer starts from inputs that reach each message decoder, and a
     /// format change that strands the seeds fails here, not silently in

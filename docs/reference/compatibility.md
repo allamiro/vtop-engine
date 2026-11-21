@@ -133,6 +133,19 @@ What is tested today:
   fencing-epoch journals read as what the release recorded) open on every
   build. The retention and truncate intents are not among them: a clean run
   never leaves one, so no released binary's intent is captured yet.
+- **The native protocol, in the compatibility matrix** (the `wire` cell). For
+  the newest patch of each minor since v0.2 the release's published
+  `vtop-node` serves a leader and a follower on quorum durability while this
+  build's `produce` and `verify` are the client (a client upgraded before its
+  brokers), and the reverse: this build's nodes and the release's client (a
+  broker upgraded before its clients, the order a rolling upgrade serves
+  clients in). 2000 records are produced and read back. The frames themselves
+  are locked: the 30 kinds each have a committed frame
+  (`fuzz/corpus/protocol_frame/`, also the fuzzer's seeds), and `vtop-protocol`
+  fails if the encoder stops writing those bytes, if they stop decoding to
+  their messages, or if the decoder accepts a kind that has no frame. The
+  Kafka gateway's advertised APIs and version ranges are pinned the same way:
+  a range may widen, and narrowing one, or withdrawing an API, fails a test.
 - The metadata tier rolls from the newest release to the current build, one
   voter at a time (live-chaos scenario 22).
 - The released `vtopctl` of v0.7.0 and later is run over a manifest archive
