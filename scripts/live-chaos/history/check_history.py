@@ -74,6 +74,7 @@ LISTED = 20
 # Steps the search for a tiling of one visible group may take before it gives
 # up and reports the group unexplained.
 SEARCH_BUDGET = 100_000
+INFINITY = float("inf")
 
 
 @dataclass
@@ -305,6 +306,12 @@ def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) 
         return holder[1] if holder is not None else None
 
     order = Order(placed)
+    # The end of the first read that showed each visible record as it is now.
+    first_seen_us: dict[int, int] = {}
+    for read in reads:
+        for offset, record in read.records.items():
+            if offset not in first_seen_us and visible.get(offset) == record:
+                first_seen_us[offset] = read.end_time_us
 
     def task_of(group: list[int]) -> Task:
         return Task(
@@ -314,6 +321,7 @@ def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) 
             group[-1],
             acked_at,
             order,
+            first_seen_us,
         )
 
     tasks = [task_of(g) for g in keyed]
@@ -463,6 +471,14 @@ def _tilings(
                    task.first_offset + position + inside - 1)
             if not task.order.fits(identity, run):
                 continue
+            # Records a read showed before this batch was sent are not its
+            # records (review of #881).
+            seen = min(
+                (task.first_seen_us.get(o, INFINITY) for o in range(run[2], run[3] + 1)),
+                default=INFINITY,
+            )
+            if batch.time_us >= seen:
+                continue
             shapes.add(shape)
             yield batch, inside, logical, (identity, run)
 
@@ -519,6 +535,9 @@ class Task:
     last_offset: int
     acked_at: "object"
     order: "Order"
+    # When a read first showed the record now at each offset: a batch invoked
+    # after that cannot be what put it there.
+    first_seen_us: dict[int, int] = field(default_factory=dict)
 
 
 class Order:

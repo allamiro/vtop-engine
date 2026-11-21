@@ -372,6 +372,16 @@ class Violations(unittest.TestCase):
         h.read("r", [(0, 5, 5), (5, 0, 5)], 10)
         self.assertFalse(h.check()["valid"])
 
+    def test_a_batch_sent_after_a_read_showed_its_records_does_not_explain_them(self):
+        # Review of #881: the copy at 10..19 was visible before epoch 2's
+        # unanswered batch went out.
+        h = History()
+        h.produce("produce:P:1:100", 1, 0, 10, "ok", 10, first_offset=0)
+        h.read("r1", [(0, 0, 10), (10, 0, 10)], 20)
+        h.produce("produce:P:2:200", 1, 0, 10, "info")
+        h.read("r2", [(0, 0, 10), (10, 0, 10)], 20)
+        self.assertFalse(h.check()["valid"])
+
     def test_the_high_watermark_never_goes_back(self):
         h = History()
         h.produce("p", 1, 0, 10, "ok", 10)
