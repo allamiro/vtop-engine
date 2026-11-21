@@ -74,6 +74,21 @@ def releases(tags: list[str]) -> list[str]:
     return sorted(newest.values(), key=version)
 
 
+def published_tags(listed: list[dict]) -> list[str]:
+    """The tags of releases that are published, not drafts and not prereleases.
+
+    ``listed`` is ``gh release list --json tagName,isDraft,isPrerelease``. A
+    draft has no assets yet. A release marked prerelease is refused by
+    fetch-release.sh even when its tag looks final (v0.11.0), so selecting it
+    would fail every cell instead of running the newest stable release.
+    """
+    return [
+        row["tagName"]
+        for row in listed
+        if not row.get("isDraft") and not row.get("isPrerelease")
+    ]
+
+
 def load(path: pathlib.Path) -> dict:
     import yaml  # PyYAML, pinned in scripts/compat/requirements.txt
 
@@ -207,18 +222,19 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--expected", type=pathlib.Path, default=DEFAULT_EXPECTED)
     parser.add_argument("--tags-from-git", action="store_true")
     parser.add_argument("--tags-from-releases", action="store_true",
-                        help="the tags of published, non-draft GitHub releases (needs gh)")
+                        help="the tags of published GitHub releases, no drafts or prereleases (needs gh)")
     parser.add_argument("tags", nargs="*")
     args = parser.parse_args(argv)
     tags = list(args.tags)
     if args.tags_from_releases:
-        # Only tags with a published, non-draft release: a tag whose release
-        # is still being built, or failed, has no assets to run (review).
-        tags += subprocess.run(
-            ["gh", "release", "list", "--limit", "1000", "--json", "tagName,isDraft",
-             "--jq", ".[] | select(.isDraft | not) | .tagName"],
+        # Only tags with a published, non-draft, non-prerelease release: a
+        # tag whose release is still being built, or failed, has no assets to
+        # run, and fetch-release.sh refuses a prerelease (review).
+        tags += published_tags(json.loads(subprocess.run(
+            ["gh", "release", "list", "--limit", "1000",
+             "--json", "tagName,isDraft,isPrerelease"],
             check=True, capture_output=True, text=True,
-        ).stdout.split()
+        ).stdout))
     if args.tags_from_git:
         tags += subprocess.run(
             ["git", "tag", "--list", "v[0-9]*"], check=True, capture_output=True, text=True
