@@ -113,8 +113,22 @@ class Read:
     # The offset the read started at: below it, retention had reclaimed the
     # records, and the read says nothing about them.
     start_offset: int = 0
-    # offset -> (sequence or None for unkeyed, values_match)
-    records: dict[int, tuple[int | None, bool]] = field(default_factory=dict)
+    # As recorded: runs of (offset, first sequence, count, values_match), and
+    # the offsets of unkeyed records. A week-long history holds hundreds of
+    # reads (the cluster soak, #727), so a read is expanded to one entry per
+    # offset only while it is being checked.
+    runs: list[tuple[int, int, int, bool]] = field(default_factory=list)
+    unkeyed: list[int] = field(default_factory=list)
+
+    def records(self) -> dict[int, tuple[int | None, bool]]:
+        """offset -> (sequence, or None for an unkeyed record; values_match)"""
+        out: dict[int, tuple[int | None, bool]] = {}
+        for offset, first, count, values_match in self.runs:
+            for i in range(count):
+                out[offset + i] = (first + i, values_match)
+        for offset in self.unkeyed:
+            out[offset] = (None, False)
+        return out
 
 
 def load(lines: list[str]) -> tuple[list[Batch], list[Read]]:
@@ -151,13 +165,11 @@ def load(lines: list[str]) -> tuple[list[Batch], list[Read]]:
         elif op == "read":
             read = reads.setdefault(process, Read(process=process))
             if kind == "records":
-                for i in range(event["count"]):
-                    read.records[event["offset"] + i] = (
-                        event["first_sequence"] + i,
-                        bool(event["values_match"]),
-                    )
+                read.runs.append(
+                    (event["offset"], event["first_sequence"], event["count"], bool(event["values_match"]))
+                )
             elif kind == "unkeyed":
-                read.records[event["offset"]] = (None, False)
+                read.unkeyed.append(event["offset"])
             elif kind == "end":
                 read.high_watermark = event["high_watermark"]
                 read.end_time_us = event.get("time_us", 0)
@@ -188,23 +200,25 @@ def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) 
                 f"the committed high watermark went back from {before.high_watermark} "
                 f"({before.process}) to {after.high_watermark} ({after.process})"
             )
+    records: dict[int, tuple[int | None, bool]] = {}
     for read in reads:
+        records = read.records()
         if latest:
             for offset in range(read.start_offset, read.high_watermark):
                 seen = latest.get(offset)
                 if seen is None:
                     continue
-                now = read.records.get(offset)
+                now = records.get(offset)
                 if now != seen[0]:
                     violations["rewritten"].append(
                         f"offset {offset} held {seen[0]} in {seen[1].process} and holds {now} "
                         f"in {read.process}"
                     )
-        for offset, record in read.records.items():
+        for offset, record in records.items():
             latest[offset] = (record, read)
     # What the history shows at each offset: the last read, and below its start
     # offset whatever the newest earlier read saw there.
-    visible = dict(last.records)
+    visible = records
     if last.start_offset > 0:
         for offset, (record, _) in latest.items():
             if offset < last.start_offset:
@@ -404,7 +418,7 @@ def summarize(batches, reads, violations, notes) -> dict:
         "acknowledged_records": sum(b.count for b in batches if b.outcome == "ok"),
         "reads": len(reads),
         "high_watermark": reads[-1].high_watermark if reads else None,
-        "visible_records": len(reads[-1].records) if reads else 0,
+        "visible_records": len(reads[-1].records()) if reads else 0,
         "violations": {
             kind: {"count": len(items), "first": items[:LISTED]}
             for kind, items in sorted(violations.items())
