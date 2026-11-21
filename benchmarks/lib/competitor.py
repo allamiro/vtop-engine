@@ -59,13 +59,14 @@ capability.
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from . import netem
@@ -160,6 +161,27 @@ STREAM_SYNC_TOLERANCE_SECONDS = 0.25
 # iperf 3.17 (the netshoot:v0.13 build reports itself as "3.16+" and carries it;
 # netshoot:v0.16 is iperf 3.21).
 JSON_STREAM_FLAG = "--json-stream"
+
+# The receiver's own report, carried back to the client after the test (#610).
+# It changes nothing the harness measures: the server's JSON travels in the
+# end-of-test exchange that iperf3 already runs, after every interval and both
+# summaries are fixed, and no number below reads it. It is asked for so a
+# refused window leaves BOTH sides' raw reports behind (see
+# `Contention.keep_raw_reports`). Without it the receiver's side of a coverage
+# refusal is only the one `sum_received.seconds` figure, and a refusal that
+# turns on how the two sides' clocks differ cannot be explained from one of them.
+SERVER_OUTPUT_FLAG = "--get-server-output"
+
+# What a refused window leaves in the run's results directory (#610), per phase:
+# the client's --json-stream exactly as parsed (the SENDER's per-interval view,
+# with the receiver's summary in its `end` event), the server's own report from
+# that end event (the RECEIVER's per-interval view), and the source stamp of
+# each stream line. Diagnostics only: nothing reads them back.
+RAW_REPORT_FILES = {
+    "sender": "competitor-iperf3-{phase}-sender.jsonl",
+    "receiver": "competitor-iperf3-{phase}-receiver.json",
+    "stamps": "competitor-iperf3-{phase}-line-stamps.json",
+}
 
 # The stamper that runs BESIDE iperf3, inside the probe container (review). The
 # host used to stamp each line when it READ it, which dates the line late by its
@@ -442,7 +464,17 @@ class CompetitorSample:
 
     `seconds` is what the report says it measured, not what the spec asked for:
     the two differ when a flow is cut short, and only the first is a fact about
-    this run.
+    this run. It is the RECEIVER's (`end.sum_received.seconds`), and it is what
+    the goodput is a rate over.
+
+    `sender_seconds` is the SENDER's measured window (`end.sum_sent.seconds`),
+    and it is the window the interval stream covers and is laid out on (#610).
+    The two are not the same length: the receiver's clock runs on until the
+    flow's tail has drained the bottleneck's queue and crossed the one-way delay
+    (0.14-0.19 s longer on the lab's 10 Mbit/s, 100 ms, one-BDP link, measured).
+    The competitor sends nothing during that drain, so it is not contended time,
+    and laying the sender's stream out on the receiver's longer window left its
+    opening uncovered.
 
     `intervals` is the same window cut into seconds. It is carried rather than
     discarded because the flow's average over the whole window is NOT the
@@ -453,10 +485,16 @@ class CompetitorSample:
 
     mbps: float
     seconds: float
+    sender_seconds: float
     bytes: int
     retransmits: int | None
     congestion: str
     intervals: tuple[CompetitorInterval, ...]
+    # The report as parsed, and the source stamp of each of its lines, kept so
+    # a refusal can leave them behind (#610). Never read by any measurement, and
+    # out of equality and repr so a sample compares and prints as before.
+    raw: str = field(default="", repr=False, compare=False)
+    stamps: tuple[float, ...] | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         # The invariant every reader downstream leans on, made unforgeable
@@ -472,6 +510,10 @@ class CompetitorSample:
 
     def describe(self) -> dict[str, Any]:
         return {"goodput_mbps": self.mbps, "measured_seconds": self.seconds,
+                # The window the interval stream covers and the contended window
+                # is placed by (#610): the sender's, shorter than the receiver's
+                # by the queue's drain.
+                "sender_seconds": self.sender_seconds,
                 "bytes": self.bytes, "retransmits": self.retransmits,
                 "congestion_control": self.congestion,
                 # How finely the window can be cut. A reader comparing the
@@ -560,10 +602,13 @@ class CompetitorSpec:
         reading it, instead of inferring where a window of the right length
         might have sat. No `-b`: a `bulk` competitor is congestion-controlled,
         because a paced flow cannot lose a share it never asked for and its
-        goodput would say nothing about fairness.
+        goodput would say nothing about fairness. `--get-server-output` only
+        carries the receiver's own report back for a refusal to keep (#610); see
+        SERVER_OUTPUT_FLAG.
         """
         return ["iperf3", "-c", self.server, "-p", str(self.port),
-                "-t", str(self.seconds), "-O", str(self.omit), JSON_STREAM_FLAG]
+                "-t", str(self.seconds), "-O", str(self.omit), JSON_STREAM_FLAG,
+                SERVER_OUTPUT_FLAG]
 
     def command_timeout(self) -> float:
         return self.seconds + self.omit + COMMAND_SLACK_SECONDS
@@ -653,7 +698,7 @@ def _require_the_engine_outlasts_the_window(spec: CompetitorSpec, scenario) -> N
 
 
 def _measured_intervals(report: Any, out: str, spec: CompetitorSpec, phase: str,
-                        measured_seconds: float,
+                        sender_seconds: float,
                         arrivals: list[float | None] | None = None,
                         ) -> tuple[CompetitorInterval, ...]:
     """The report's per-second stream, ramp excluded, on the window's own clock.
@@ -677,7 +722,11 @@ def _measured_intervals(report: Any, out: str, spec: CompetitorSpec, phase: str,
         entries begin at zero again. Trusting `start` would therefore be off by
         the whole ramp against an iperf3 that did NOT restart it, so the origin
         is DERIVED: the last measured entry ends where the window ends, and the
-        receiver's summary says how long the window was.
+        SENDER's summary says how long the window was. Not the receiver's
+        (#610): the stream is the sender's, and the receiver's clock runs past
+        it by the queue's drain, so a stream laid out on the receiver's window
+        leaves the window's opening uncovered. On iperf 3.21 the last measured
+        entry ends exactly at `sum_sent.seconds`, so the origin is zero.
       * the first measured entry straddles that restart. Its `seconds` reaches
         back across the ramp while its `bytes` are the post-restart ones only,
         so iperf3's own `bits_per_second` for it reads at half the flow's actual
@@ -694,7 +743,7 @@ def _measured_intervals(report: Any, out: str, spec: CompetitorSpec, phase: str,
         raise ShapingError(
             f"the {phase} competitor's iperf3 report carries no interval stream "
             f"(`intervals`): {out[:400]}. Without it the competing flow has only a "
-            f"whole-window average over {measured_seconds}s, and VTOP's share is a rate "
+            f"whole-window average over {sender_seconds}s, and VTOP's share is a rate "
             "over the engine cycles inside that window — a fairness index assembled from "
             "the two would be comparing rates over two different spans. Run the lab's own "
             "iperf3 (the netshoot middlebox), not a build or a wrapper that strips the "
@@ -736,10 +785,11 @@ def _measured_intervals(report: Any, out: str, spec: CompetitorSpec, phase: str,
             "share of the window cannot be compared against a flow the report will not "
             "resolve past its own ramp")
     # The origin the whole mapping hangs on. The stream's last measured entry
-    # ends where the window ends, and the receiver's summary gives the window's
-    # length, so the difference is where the stream's clock puts the window's
-    # start — zero on an iperf3 that restarts it, the ramp on one that does not.
-    origin = max(entry[0] for entry in reported) - measured_seconds
+    # ends where the window ends, and the SENDER's summary gives the window's
+    # length (#610), so the difference is where the stream's clock puts the
+    # window's start — zero on an iperf3 that restarts it, the ramp on one that
+    # does not.
+    origin = max(entry[0] for entry in reported) - sender_seconds
     stream = []
     for end, seconds, count, arrived, live in reported:
         finish = end - origin
@@ -844,13 +894,15 @@ def competitor_bytes_over(sample: CompetitorSample, opened_at: float,
             "while it was reporting; this is a report with a hole in it, not a scenario knob")
     # THE DENOMINATOR NEEDS THE WHOLE WINDOW TOO (review). The receiver's total
     # is spread in proportion to the stream's bytes, so `total` must be the
-    # stream's bytes over the SAME window the receiver's total covers. A hole
+    # stream's bytes over the SAME window the receiver's total covers. That is
+    # the sender's window (#610): the receiver's total is the bytes the sender
+    # put on the link during it, arriving up to one queue's drain later. A hole
     # anywhere — even one wholly outside the span above, which the coverage check
     # there cannot see — drops that second's bytes from `total` and scales the
     # span's share of the receiver's total UP by exactly that much: the competing
     # flow recorded as having received more during VTOP's span than it did, and
     # the index skewed by a second nobody measured. Checked across the whole
-    # measured window, 0 to the report's own `seconds`.
+    # measured window, 0 to the sender's own `sender_seconds`.
     reached = 0.0
     window_hole: tuple[float, float] | None = None
     for slot in sorted(sample.intervals, key=lambda entry: entry.start):
@@ -858,12 +910,12 @@ def competitor_bytes_over(sample: CompetitorSample, opened_at: float,
             window_hole = (reached, slot.start)
             break
         reached = max(reached, slot.end)
-    if window_hole is None and reached < sample.seconds - STREAM_JOIN_TOLERANCE_SECONDS:
-        window_hole = (reached, sample.seconds)
+    if window_hole is None and reached < sample.sender_seconds - STREAM_JOIN_TOLERANCE_SECONDS:
+        window_hole = (reached, sample.sender_seconds)
     if window_hole is not None:
         raise ShapingError(
             f"the competing flow's stream says nothing about {window_hole[0]:.3f}-"
-            f"{window_hole[1]:.3f}s of its {sample.seconds:g}s measured window. The receiver's "
+            f"{window_hole[1]:.3f}s of its {sample.sender_seconds:g}s measured window. The receiver's "
             "total is spread across the span VTOP was measured over in proportion to the "
             "stream's bytes, so every second of the window has to be in the stream: a missing "
             "one leaves its bytes out of the proportion and hands them to the seconds that "
@@ -984,10 +1036,29 @@ def parse_report(out: str, spec: CompetitorSpec, phase: str,
     # operator after the wrong fault. Read on EVERY phase rather than only the
     # contended one, so an iperf3 whose report this module cannot use is found
     # by the first solo window instead of after three of them have run.
-    intervals = _measured_intervals(report, out, spec, phase, seconds, interval_arrivals)
+    # THE SENDER'S WINDOW, which the stream is laid out on (#610). Only the
+    # sender's summary says how long it was, so a report without one is refused
+    # rather than laid out on the receiver's clock, which is longer by the
+    # queue's drain and leaves the window's opening uncovered.
     sent = end.get("sum_sent") or {}
+    try:
+        sender_seconds = round(float(sent["seconds"]), 3)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ShapingError(
+            f"the {phase} competitor's iperf3 report carries no sender summary "
+            f"(end.sum_sent.seconds): {out[:400]}. The interval stream is the sender's, so "
+            "only the sender's summary says how long the window it describes was; the "
+            "receiver's runs on past it by the bottleneck queue's drain, and laying the "
+            "stream out on that longer window leaves its opening uncovered"
+        ) from exc
+    if sender_seconds <= 0:
+        raise ShapingError(
+            f"the {phase} competitor's iperf3 report says its sender measured "
+            f"{sender_seconds}s, so its interval stream describes no window to lay out")
+    intervals = _measured_intervals(report, out, spec, phase, sender_seconds,
+                                    interval_arrivals)
     return CompetitorSample(
-        mbps=mbps, seconds=seconds, bytes=transferred,
+        mbps=mbps, seconds=seconds, sender_seconds=sender_seconds, bytes=transferred,
         # Linux iperf3 reports the sender's retransmissions; other platforms
         # and other modes do not, and None records "not reported" rather than
         # a zero that reads as "none happened".
@@ -996,7 +1067,7 @@ def parse_report(out: str, spec: CompetitorSpec, phase: str,
         # share depends on it, so a recorded fairness number that did not name
         # it could not be reproduced.
         congestion=str(end.get("sender_tcp_congestion", "") or ""),
-        intervals=intervals)
+        intervals=intervals, raw=out, stamps=arrivals)
 
 
 def measure(spec: CompetitorSpec, run: Runner, phase: str) -> CompetitorSample:
@@ -1008,6 +1079,18 @@ def measure(spec: CompetitorSpec, run: Runner, phase: str) -> CompetitorSample:
     of its refusals preventing.
     """
     code, out, arrivals = run(spec.argv())
+    try:
+        return _judge_the_flow(spec, phase, code, out, arrivals)
+    except ShapingError as refused:
+        # A report that never became a sample — refused by the parser, or by a
+        # nonzero exit after the flow had already written part of its stream —
+        # rides on the refusal, for `Contention.keep_raw_reports` (#610).
+        refused.competitor_report = (phase, out, arrivals)
+        raise
+
+
+def _judge_the_flow(spec: CompetitorSpec, phase: str, code: int, out: str,
+                    arrivals: tuple[float, ...] | None) -> CompetitorSample:
     if code != 0 and "unrecognized option" in out and JSON_STREAM_FLAG.lstrip("-") in out:
         # Its own sentence rather than the generic one below: "start the netem
         # stack" is the wrong advice for a stack that is up and running an
@@ -1028,6 +1111,58 @@ def measure(spec: CompetitorSpec, run: Runner, phase: str) -> CompetitorSample:
             "stack — docker compose -f benchmarks/docker-compose.benchmark.yml "
             "--profile netem up -d — and check the middlebox's iperf3 server is up")
     return parse_report(out, spec, phase, arrivals)
+
+
+def _phase_slug(phase: str) -> str:
+    return "-".join(phase.lower().split())
+
+
+def write_raw_report(directory: str, phase: str, out: str,
+                     stamps: tuple[float, ...] | None) -> list[str]:
+    """Leave one phase's raw iperf3 reports in `directory` (#610).
+
+    The sender's file is the client's --json-stream exactly as the parser saw
+    it (on a nonzero exit, the output with stderr joined). The receiver's is the
+    server's own report, which `--get-server-output` makes the stream carry as a
+    `server_output_json` event of its own; when there is none, the file says so
+    rather than being left out, so a missing receiver view is a recorded fact
+    and not an absent file. Returns the paths written.
+    """
+    slug = _phase_slug(phase)
+    paths = {kind: os.path.join(directory, name.format(phase=slug))
+             for kind, name in RAW_REPORT_FILES.items()}
+    receiver: Any = {"absent": "the stream carried no server_output_json or "
+                               "server_output_text event"}
+    for line in out.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        # Under --json-stream, iperf 3.21 writes the server's report as an event
+        # of its OWN, just before `end` (iperf_json_finish: JSONStream_Output(test,
+        # "server_output_json", ...)), not as a field inside `end`. A server that
+        # answered in text arrives as `server_output_text` and is kept as it came,
+        # because it is still the receiver's own interval lines.
+        kind, data = event.get("event"), event.get("data")
+        if kind == "server_output_json":
+            receiver = data
+        elif kind == "server_output_text":
+            receiver = {"server_output_text": data}
+    os.makedirs(directory, exist_ok=True)
+    with open(paths["sender"], "w") as f:
+        f.write(out + ("\n" if out and not out.endswith("\n") else ""))
+    with open(paths["receiver"], "w") as f:
+        json.dump(receiver, f, indent=1)
+        f.write("\n")
+    with open(paths["stamps"], "w") as f:
+        json.dump({"phase": phase,
+                   "clock": "time.monotonic() beside iperf3 in the probe container, one per "
+                            "non-blank line of the sender file, in order",
+                   "stamps": None if stamps is None else list(stamps)}, f, indent=1)
+        f.write("\n")
+    return list(paths.values())
 
 
 def solo_agreement(before: float, after: float) -> float:
@@ -1092,8 +1227,12 @@ class Contention:
 
     def __init__(self, spec: CompetitorSpec, run: Runner,
                  vtop_bytes: Callable[[], int],
-                 log: Callable[[str], None] = print) -> None:
+                 log: Callable[[str], None] = print,
+                 diagnostics_dir: str | None = None) -> None:
         self.spec = spec
+        # Where a refused window leaves its raw iperf3 reports (#610); None
+        # keeps nothing. See `keep_raw_reports`.
+        self.diagnostics_dir = diagnostics_dir
         self._run = run
         self._vtop_bytes = vtop_bytes
         self._log = log
@@ -1185,7 +1324,43 @@ class Contention:
     def open_alone(self) -> None:
         """The first bracket, on the way into the block: the empty link, on
         the shape the contended window will run on."""
-        self.before = self.measure_alone("alone before")
+        try:
+            self.before = self.measure_alone("alone before")
+        except ShapingError as refused:
+            self.keep_raw_reports(refused)
+            raise
+
+    def keep_raw_reports(self, refused: BaseException | None = None) -> list[str]:
+        """Leave every phase's raw iperf3 reports in the run's results directory
+        (#610): each sample this run holds, and the report a refusal carried
+        when the parser refused it before it became one.
+
+        Called on the way out of a refusal, before it propagates. It changes no
+        measurement and no verdict: the refusal is re-raised exactly as it was,
+        and a failure to write is logged, never raised, so a full disk cannot
+        replace the reason the run stopped with one about a diagnostic file.
+        """
+        if not self.diagnostics_dir:
+            return []
+        reports: list[tuple[str, str, tuple[float, ...] | None]] = []
+        for phase, sample in (("alone before", self.before), ("with VTOP", self.contended),
+                              ("alone after", self.after)):
+            if sample is not None and sample.raw:
+                reports.append((phase, sample.raw, sample.stamps))
+        carried = getattr(refused, "competitor_report", None)
+        if carried is not None:
+            reports.append(carried)
+        written: list[str] = []
+        for phase, out, stamps in reports:
+            try:
+                written += write_raw_report(self.diagnostics_dir, phase, out, stamps)
+            except OSError as exc:
+                self._log(f"[bench] WARNING: could not keep the {phase} competitor's raw "
+                          f"iperf3 report: {exc}")
+        if written:
+            self._log("[bench] kept the competitor's raw iperf3 reports for this refusal: "
+                      + ", ".join(os.path.basename(path) for path in written))
+        return written
 
     # ------------------------------------------------------------ phase two
 
@@ -1326,6 +1501,18 @@ class Contention:
     def close(self) -> None:
         """Collect the contended window, measure the link alone again, judge.
 
+        A refusal leaves every phase's raw iperf3 reports behind before it
+        propagates (#610); see `keep_raw_reports` and `_close`.
+        """
+        try:
+            self._close()
+        except ShapingError as refused:
+            self.keep_raw_reports(refused)
+            raise
+
+    def _close(self) -> None:
+        """Collect the contended window, measure the link alone again, judge.
+
         Called by the block, as its last act inside the shaped region — not by
         the context manager's exit, which cannot tell a block that finished
         from one that gave up.
@@ -1377,7 +1564,13 @@ class Contention:
                 "charged to a span nobody located. This is a runner bug")
         launched_at = self._launched_at
         collected_at, closing_bytes = self._collected
-        measured = self.contended.seconds
+        # THE CONTENDED WINDOW IS THE SENDER'S (#610). Every line of the stream
+        # is written as one of the SENDER's intervals ends, so the window those
+        # lines place is the sender's, and its length is `sender_seconds`. The
+        # receiver's `seconds` runs on past it by the queue's drain, during
+        # which the competitor sends nothing: not contended time, and not part
+        # of the window VTOP has to outlast. It stays the goodput's denominator.
+        measured = self.contended.sender_seconds
 
         # WHERE THE MEASURED WINDOW SAT ON THIS RUN'S CLOCK (review, twice).
         #
@@ -1787,7 +1980,8 @@ class Contention:
 @contextmanager
 def contended(spec: CompetitorSpec | None, vtop_bytes: Callable[[], int],
               run: Runner | None = None,
-              log: Callable[[str], None] = print) -> Iterator[Contention | None]:
+              log: Callable[[str], None] = print,
+              diagnostics_dir: str | None = None) -> Iterator[Contention | None]:
     """Bracket the block with the competitor's three phases.
 
     Entered INSIDE the shaped block, so all three windows cross one
@@ -1810,7 +2004,7 @@ def contended(spec: CompetitorSpec | None, vtop_bytes: Callable[[], int],
         yield None
         return
     handle = Contention(spec, run or docker_exec(spec.container, spec.command_timeout()),
-                        vtop_bytes, log)
+                        vtop_bytes, log, diagnostics_dir=diagnostics_dir)
     handle.open_alone()
     try:
         yield handle

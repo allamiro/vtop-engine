@@ -332,3 +332,42 @@ abandon window, as a backstop.
 
 **When it is safe to ignore.** When the bucket's lifecycle rule is known to
 clean up incomplete uploads and the cost of a day's parts is acceptable.
+
+## VtopStateStoreWritesSlow
+
+**What it means.** For 15 minutes on end, more than 5% of the batches the
+engine committed in the last 15 minutes spent more than a second in their
+ledger writes (`vtop_stage_duration_seconds{stage="state_write"}`, the time of
+every state-store write a batch made, about eight, two of them synced to
+disk). Each batch waits for its writes before its next stage, so the engine
+archives more slowly than its sources write, and the backlog grows. No data is
+at risk: a write that is slow is still a write, and a write that fails fails
+the batch, which is replayed.
+
+**What the engine already did.** Nothing different: it waits for each write,
+up to `engine.state_store_timeout_seconds` (default 30), and a write that
+takes longer fails its batch. The per-batch total is in each committed
+batch's `batch_metrics` log line (`state_write_ms`).
+
+**What to check.**
+
+- For a SQLite ledger: the disk that holds it. Its latency, how full it is,
+  and whether something else on it is syncing heavily (a backup, another
+  database).
+- For PostgreSQL: the server's load, lock waits on `batches`, replication
+  waits if the server waits for a synchronous standby, and the network
+  round trip from the engine.
+- The engine dashboard's "Per-stage p95" panel (the `state_write` line),
+  against the batch rate: a rise that follows the batch rate is load; one
+  that does not is the store.
+
+**What to do.** Fix what slows the store: move the SQLite ledger to a faster
+local disk, or relieve the PostgreSQL server. Larger batches (`batching.
+max_records`, `batching.max_bytes`) make fewer ledger writes for the same
+data. Pruning the ledger (`vtopctl prune-ledger`) keeps its indexes small.
+
+**When it is safe to ignore.** On a store known to be slow, when the engine
+still keeps up with its sources (no `VtopSourceLagGrowing`, no
+`VtopNoCommits`): raise the second, or the 5%, in the rule to what that store
+does.
+
