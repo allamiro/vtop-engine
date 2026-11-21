@@ -510,16 +510,37 @@ def collect_logs(lab: soak_lab.Lab, run_dir: Path) -> None:
             handle.write(result.out + result.err)
 
 
+# The engine container's control state, not evidence: the shim's marker and
+# the entrypoint's vtopctl wrapper. The engine's user makes them, the marker
+# with mode 0600, so a host user who is not that user cannot read them; a run
+# interrupted during a clock step leaves both behind (review of #838).
+TRANSIENT_CONTROL = ("ctl/skew-loaded", "ctl/bin")
+
+
+def _transient(relative: Path) -> bool:
+    text = relative.as_posix()
+    return any(text == entry or text.startswith(entry + "/") for entry in TRANSIENT_CONTROL)
+
+
 def write_evidence(run_dir: Path, out: Path) -> Path:
     """The evidence tarball: everything the verdict rests on, with a SHA256SUMS
     of every file in it, so a maintainer can attach it to the release and a
-    reader can re-run soak_eval over it."""
+    reader can re-run soak_eval over it. The engine's transient control files
+    are left out of both."""
     sums = []
     for path in sorted(p for p in run_dir.rglob("*") if p.is_file() and p.name != "SHA256SUMS"):
-        sums.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(run_dir)}")
+        relative = path.relative_to(run_dir)
+        if _transient(relative):
+            continue
+        sums.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {relative}")
     (run_dir / "SHA256SUMS").write_text("\n".join(sums) + "\n")
+
+    def keep(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
+        inside = Path(info.name).relative_to(run_dir.name) if info.name != run_dir.name else Path(".")
+        return None if _transient(inside) else info
+
     with tarfile.open(out, "w:gz") as tar:
-        tar.add(run_dir, arcname=run_dir.name)
+        tar.add(run_dir, arcname=run_dir.name, filter=keep)
     return out
 
 
