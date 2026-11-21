@@ -142,7 +142,9 @@ def _nightly(path: str, repo: str) -> str:
 
 def kafka_matrix(repo: str = REPO) -> dict[str, str]:
     """The Apache Kafka releases the live-broker suite runs against, from the workflow that pins them."""
-    pin = r"^\s+(\d+(?:\.\d+)+) apache/kafka:\1@sha256:[0-9a-f]{64}\s*$"
+    # A line may end with the version `kafka-broker.sh version` must print (#834), which for an Apache
+    # release is the release itself; any other trailing word means the line is not one of these.
+    pin = r"^\s+(\d+(?:\.\d+)+) apache/kafka:\1@sha256:[0-9a-f]{64}(?:\s+\1)?\s*$"
     releases = _pins(KAFKA_MATRIX, pin, "Kafka release", repo)
     low, high = _span(releases, lambda v: tuple(int(n) for n in v.split(".")))
     return {"name": "Apache Kafka", "version": f"{low} to {high}",
