@@ -24,8 +24,11 @@
 # 9292, 9392) and on 9N93 for the controller quorum, all advertised as
 # localhost. Stopping a node therefore never takes the others' network with
 # it, and no Docker network has to be created (a host whose address pools are
-# used up cannot create one). New topics default to replication 3 with
-# min.insync.replicas 2, as a production cluster would run.
+# used up cannot create one). New topics default to replication 3. The
+# broker's min.insync.replicas stays at Kafka's default (1): the live suite
+# creates its own topics at replication 1, which a cluster-wide minimum of 2
+# would refuse produces to, and the restart tests set min.insync.replicas 2
+# on the topics they create.
 #
 # Environment:
 #   KAFKA_CLUSTER_NAME    prefix of the container names (default vtop-kafka-cluster);
@@ -127,7 +130,6 @@ cmd_up() {
       -e "KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=3"
       -e "KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=2"
       -e "KAFKA_DEFAULT_REPLICATION_FACTOR=3"
-      -e "KAFKA_MIN_INSYNC_REPLICAS=2"
       -e "KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0"
     )
     docker run "${args[@]}" "$image" >/dev/null

@@ -84,8 +84,9 @@ listener that does not require them, with SASL for the client's identity.
 
 The [kafka cluster](https://github.com/allamiro/vtop-engine/blob/main/.github/workflows/kafka-cluster.yml)
 workflow starts three Apache Kafka 4.4.0 nodes in KRaft, each broker and
-controller, with topics at replication 3 and `min.insync.replicas` 2
-(`scripts/kafka-cluster.sh`). It runs the whole live suite with the three
+controller (`scripts/kafka-cluster.sh`). The restart tests' topics are at
+replication 3 with `min.insync.replicas` 2; the live suite's own topics keep
+the replication 1 it creates them with. It runs the whole live suite with the three
 nodes as `bootstrap_servers`, and then `tests/integration_kafka_cluster.rs`:
 
 - the leader of the partition the engine is reading is stopped between two

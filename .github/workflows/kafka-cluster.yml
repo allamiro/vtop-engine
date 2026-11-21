@@ -7,8 +7,8 @@ name: kafka cluster
 # stops and starts the partition leader, and a follower, while the engine
 # reads, and requires every record committed once, in order, with the group's
 # offset at the end of the partition. scripts/kafka-cluster.sh starts the
-# cluster: three KRaft nodes, each broker and controller, topics at
-# replication 3 with min.insync.replicas 2.
+# cluster: three KRaft nodes, each broker and controller; the restart tests'
+# topics are at replication 3 with min.insync.replicas 2.
 #
 # Who runs it:
 # - Nightly (04:47 UTC) and on dispatch, over whatever main holds.
