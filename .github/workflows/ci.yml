@@ -289,6 +289,7 @@ jobs:
               # (#743); scripts/tests/fetch-release.bats proves each check
               # can fail.
               - 'scripts/compat/*.sh'
+              - 'scripts/compat/cells/*.sh'
               - 'scripts/ledger-compat.sh'
               # The live-chaos harness is executable shell that gates every
               # distributed-systems claim this project makes, and it was
@@ -1259,7 +1260,7 @@ jobs:
             koalaman/shellcheck:v0.11.0 docker/*.sh scripts/release-notes.sh \
             scripts/k8s-smoke.sh scripts/k8s-forward.sh scripts/e2e-smoke.sh \
             scripts/upgrade-compat.sh \
-            scripts/manifest-compat.sh scripts/ledger-compat.sh scripts/compat/*.sh \
+            scripts/manifest-compat.sh scripts/ledger-compat.sh scripts/compat/*.sh scripts/compat/cells/*.sh \
             scripts/traffic-snapshot.sh scripts/test-progress.sh \
             scripts/check-naming.sh scripts/check-egress-claims.sh \
             scripts/check-failpoints-absent.sh scripts/kafka-broker.sh

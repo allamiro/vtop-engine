@@ -1375,10 +1375,12 @@ changing one, the deprecation notice and the path to 1.0 are in the
 tested** (#291): CI proves a data directory written by the newest patch of
 each released minor series (v0.2+) opens under the current build, serves
 byte-exactly, and still serves after a restart; newly published tags join that
-matrix automatically. **Downgrades are not supported** — a newer release's
-directory may hold artifacts an older release cannot interpret, and nothing
-tests that path; going back means a fresh directory or a verified backup
-taken before the upgrade.
+matrix automatically. **Downgrades are not supported**, except for what the
+[compatibility matrix](reference/compatibility.md#downgrade) records for the
+previous release (the state ledger, its prune digests and the audit trail): a
+newer release's directory may hold artifacts an older release cannot
+interpret, and nothing else tests that path; going back means a fresh
+directory or a verified backup taken before the upgrade.
 
 Which releases get fixes, what a 0.x minor may break, and what 1.x will
 commit to are in [Versioning and support](SUPPORT.md).
