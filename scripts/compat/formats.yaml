@@ -463,12 +463,12 @@ formats:
     status: evolving
     at_1_0: classified at the freeze
 
-# Constants whose names look like format markers but are not.
 # Fuzz targets that are not a persisted or wire format's decoder, and why.
 fuzz_other:
   detect_record: source-side format detection of a log line (what a source hands the engine), not a persisted format
   detect_batch: source-side format detection of a batch, not a persisted format
 
+# Constants whose names look like format markers but are not.
 not_formats:
   - {file: crates/vtop-state/src/sqlite_store.rs, name: SCHEMA, why: "the SQLite DDL; the ledger's version marker is SQLITE_SCHEMA_VERSION (format 5)"}
   - {file: crates/vtop-meta/src/command.rs, name: MAX_TIER_VERSION_ID_BYTES, why: "a length bound on an object version id"}
