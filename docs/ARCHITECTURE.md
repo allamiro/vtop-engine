@@ -259,11 +259,18 @@ is a real and silent condition.
   A topic id names an incarnation of the topic, not the lineage of a partition's
   log. A partition truncated by an unclean leader election
   (`unclean.leader.election.enable`, off by default) keeps the topic id and
-  reuses offsets it had already handed out, so a restart that finds the log
-  regrown past the old highest end resumes above the replacement records
-  between. The adapter reports the truncation when it sees one
-  (`recreated_or_truncated`); the resume rule does not fence it, which would
-  take the partition's leader epoch, and the marker does not record one.
+  reuses offsets it had already handed out, so taking the highest end would
+  resume above the replacement records once the log regrows past it. The
+  ledger sees the reuse: a committed row that OVERLAPS the range of an
+  earlier-created committed row of the same id archived offsets a second time
+  (the A, B, C sequence does not, because C fills the hole below B). Such an id
+  resumes from its newest committed row, as rows with no id do: a re-read of
+  the replacement records, never a skip. Retention keeps every row of an id
+  while the id is unresolved (its highest end is above its newest row's end),
+  so the overlap is still there to be seen; once the newest row has caught up
+  with the highest the rows below are history. A truncation to an offset below
+  the oldest row retention kept is not seen. The adapter also reports a
+  truncation it sees (`recreated_or_truncated`).
 - **From `Offset::Stored`** — every other partition: a fresh store, no
   committed batch yet, a group with no committed offset for the partition
   (deleting a topic deletes its group offsets, and a batch recorded without a

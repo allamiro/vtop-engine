@@ -171,6 +171,13 @@ CREATE INDEX IF NOT EXISTS idx_audit_events_time ON audit_events(time);
 ///   A row whose end offset or identity is missing compares as NULL and has
 ///   no better row, so it is kept.
 ///
+///   A row of a known id is also kept while the id is UNRESOLVED: its
+///   highest end is above its newest row's end (a window committed above a
+///   later one, or a log truncated by an unclean leader election, whose
+///   replacement rows overlap earlier ones). `committed_kafka_offsets` reads
+///   the overlap between rows to tell the two apart, and so needs the rows
+///   that overlap kept until the newest row has caught up with the highest.
+///
 ///   Either kind of Kafka row is also kept while no NEWER row of its (topic,
 ///   partition, consumer group) exists, whatever the id: the answer that holds
 ///   the unit's newest-created row is what the adapter falls back to when it
@@ -240,6 +247,32 @@ macro_rules! prune_predicate_sql {
                     = CAST(json_extract(b.progress_end_json, '$.end_offset') AS INTEGER) \
                   AND (n.created_at, n.batch_id) > (b.created_at, b.batch_id) \
               )) \
+              AND (SELECT MAX(CAST(json_extract(m.progress_end_json, '$.end_offset') AS INTEGER)) \
+                   FROM batches m \
+                   WHERE m.state = ?1 \
+                     AND m.source_type = 'kafka' \
+                     AND json_extract(m.progress_end_json, '$.topic') \
+                       = json_extract(b.progress_end_json, '$.topic') \
+                     AND json_extract(m.progress_end_json, '$.partition') \
+                       = json_extract(b.progress_end_json, '$.partition') \
+                     AND json_extract(m.progress_end_json, '$.consumer_group') \
+                       = json_extract(b.progress_end_json, '$.consumer_group') \
+                     AND json_extract(m.progress_end_json, '$.topic_id') \
+                       = json_extract(b.progress_end_json, '$.topic_id') \
+                  ) \
+                <= (SELECT CAST(json_extract(w.progress_end_json, '$.end_offset') AS INTEGER) \
+                    FROM batches w \
+                    WHERE w.state = ?1 \
+                      AND w.source_type = 'kafka' \
+                      AND json_extract(w.progress_end_json, '$.topic') \
+                        = json_extract(b.progress_end_json, '$.topic') \
+                      AND json_extract(w.progress_end_json, '$.partition') \
+                        = json_extract(b.progress_end_json, '$.partition') \
+                      AND json_extract(w.progress_end_json, '$.consumer_group') \
+                        = json_extract(b.progress_end_json, '$.consumer_group') \
+                      AND json_extract(w.progress_end_json, '$.topic_id') \
+                        = json_extract(b.progress_end_json, '$.topic_id') \
+                    ORDER BY w.created_at DESC, w.batch_id DESC LIMIT 1) \
               AND EXISTS ( \
                 SELECT 1 FROM batches n \
                 WHERE n.state = ?1 \
@@ -506,6 +539,62 @@ impl SqliteStateStore {
     }
 }
 
+/// The resume answers of `committed_kafka_offsets`; see the method.
+const COMMITTED_KAFKA_OFFSETS_SQL: &str =
+    "WITH committed AS ( \
+                 SELECT json_extract(progress_end_json, '$.topic') AS topic, \
+                        CAST(json_extract(progress_end_json, '$.partition') AS INTEGER) AS part, \
+                        json_extract(progress_end_json, '$.consumer_group') AS grp, \
+                        json_extract(progress_end_json, '$.topic_id') AS tid, \
+                        COALESCE( \
+                            CAST(json_extract(progress_start_json, '$.start_offset') AS INTEGER), \
+                            CAST(json_extract(progress_end_json, '$.start_offset') AS INTEGER)) \
+                            AS start_offset, \
+                        CAST(json_extract(progress_end_json, '$.end_offset') AS INTEGER) AS end_offset, \
+                        created_at, batch_id \
+                 FROM batches WHERE state = ? AND source_type = ? \
+             ), descending AS ( \
+                 SELECT topic, part, grp, tid, start_offset, end_offset, created_at, batch_id, \
+                        MAX(end_offset) OVER ( \
+                            PARTITION BY topic, part, grp, tid \
+                            ORDER BY created_at, batch_id \
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prior_max \
+                 FROM committed WHERE tid IS NOT NULL \
+             ), broken AS ( \
+                 SELECT DISTINCT c.topic, c.part, c.grp, c.tid FROM descending c \
+                 WHERE c.prior_max >= c.start_offset \
+                   AND EXISTS ( \
+                       SELECT 1 FROM committed x \
+                       WHERE x.topic = c.topic AND x.part = c.part AND x.grp = c.grp \
+                         AND x.tid = c.tid \
+                         AND (x.created_at, x.batch_id) < (c.created_at, c.batch_id) \
+                         AND x.start_offset <= c.end_offset AND x.end_offset >= c.start_offset) \
+             ), ranked AS ( \
+                 SELECT topic, part, grp, tid, end_offset, \
+                        ROW_NUMBER() OVER ( \
+                            PARTITION BY topic, part, grp, tid \
+                            ORDER BY CASE WHEN tid IS NULL THEN 0 ELSE end_offset END DESC, \
+                                     created_at DESC, batch_id DESC) AS rn, \
+                        FIRST_VALUE(end_offset) OVER ( \
+                            PARTITION BY topic, part, grp, tid \
+                            ORDER BY created_at DESC, batch_id DESC) AS id_newest_end, \
+                        FIRST_VALUE(tid) OVER ( \
+                            PARTITION BY topic, part, grp \
+                            ORDER BY created_at DESC, batch_id DESC) AS newest_tid, \
+                        FIRST_VALUE(end_offset) OVER ( \
+                            PARTITION BY topic, part, grp \
+                            ORDER BY created_at DESC, batch_id DESC) AS newest_end \
+                 FROM committed \
+             ) \
+             SELECT r.topic, r.part, r.grp, r.tid, \
+                    CASE WHEN b.tid IS NOT NULL THEN r.id_newest_end ELSE r.end_offset END \
+                        AS end_offset, \
+                    CASE WHEN r.tid IS r.newest_tid THEN r.newest_end END AS newest_end \
+             FROM ranked r \
+             LEFT JOIN broken b ON b.topic = r.topic AND b.part = r.part AND b.grp = r.grp \
+                               AND b.tid = r.tid \
+             WHERE r.rn = 1";
+
 #[async_trait]
 impl StateStore for SqliteStateStore {
     /// Insert a new batch. Plain INSERT (not INSERT OR REPLACE): a `batch_id` is
@@ -663,43 +752,29 @@ impl StateStore for SqliteStateStore {
         // is the NEWEST row's end, the rule before the id existed: such rows
         // may be of different incarnations of the topic, whose offsets are
         // unrelated, so no maximum is taken across them - and none across an
-        // unknown and a known id, which are separate answers. `newest_end` is
-        // the newest-created row's own end, on the answer of the id that holds
-        // that row, for an adapter that cannot learn the current id. Pruning keeps the rows this reads
-        // (`prune_predicate_sql`), so every answer is the same before and
-        // after any prune.
-        let rows = sqlx::query(
-            "WITH committed AS ( \
-                 SELECT json_extract(progress_end_json, '$.topic') AS topic, \
-                        CAST(json_extract(progress_end_json, '$.partition') AS INTEGER) AS part, \
-                        json_extract(progress_end_json, '$.consumer_group') AS grp, \
-                        json_extract(progress_end_json, '$.topic_id') AS tid, \
-                        CAST(json_extract(progress_end_json, '$.end_offset') AS INTEGER) AS end_offset, \
-                        created_at, batch_id \
-                 FROM batches WHERE state = ? AND source_type = ? \
-             ), ranked AS ( \
-                 SELECT topic, part, grp, tid, end_offset, \
-                        ROW_NUMBER() OVER ( \
-                            PARTITION BY topic, part, grp, tid \
-                            ORDER BY CASE WHEN tid IS NULL THEN 0 ELSE end_offset END DESC, \
-                                     created_at DESC, batch_id DESC) AS rn, \
-                        FIRST_VALUE(tid) OVER ( \
-                            PARTITION BY topic, part, grp \
-                            ORDER BY created_at DESC, batch_id DESC) AS newest_tid, \
-                        FIRST_VALUE(end_offset) OVER ( \
-                            PARTITION BY topic, part, grp \
-                            ORDER BY created_at DESC, batch_id DESC) AS newest_end \
-                 FROM committed \
-             ) \
-             SELECT topic, part, grp, tid, end_offset, \
-                    CASE WHEN tid IS newest_tid THEN newest_end END AS newest_end \
-             FROM ranked WHERE rn = 1",
-        )
-        .bind(BatchState::SourceCommitted.as_str())
-        .bind(SourceType::Kafka.as_str())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(map_sqlx)?;
+        // unknown and a known id, which are separate answers.
+        //
+        // A known id's maximum is also not taken when its log was truncated:
+        // an unclean leader election keeps the topic id and reuses offsets, so
+        // a committed row that OVERLAPS the range of an earlier-created
+        // committed row of the same id archived offsets a second time. Such an
+        // id (`broken`) answers with its NEWEST row's end, as rows of no id
+        // do: a re-read of the replacement records, never a skip of them. The
+        // A, B, C sequence does not overlap (C fills the hole below B), so it
+        // keeps the maximum. Only a row that starts at or below the end of
+        // everything created before it (`prior_max`) can overlap, so the
+        // pairwise check runs for those rows alone. Pruning keeps what this
+        // reads (`prune_predicate_sql`).
+        //
+        // `newest_end` is the newest-created row's own end, on the answer of
+        // the id that holds that row, for an adapter that cannot learn the
+        // current id.
+        let rows = sqlx::query(COMMITTED_KAFKA_OFFSETS_SQL)
+            .bind(BatchState::SourceCommitted.as_str())
+            .bind(SourceType::Kafka.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
         Ok(rows
             .into_iter()
             .filter_map(|r| {
@@ -2116,9 +2191,14 @@ mod tests {
         );
         let newest = probes("idx_batches_kafka_newest");
         assert!(
-            newest.len() >= 3 && newest.iter().all(|l| l.contains("created_at>?")),
-            "the 3 newer-row probes must seek by creation time ({} found):\n{plan}",
-            newest.len()
+            newest.iter().filter(|l| l.contains("created_at>?")).count() >= 3,
+            "the 3 newer-row probes must seek by creation time:\n{plan}"
+        );
+        // The unresolved test reads the id's newest row by walking the same
+        // index backwards (one row), and its highest end by one seek.
+        assert!(
+            newest.iter().any(|l| !l.contains("created_at>?")),
+            "the newest-row-of-an-id lookup no longer walks idx_batches_kafka_newest:\n{plan}"
         );
     }
 }

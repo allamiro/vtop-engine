@@ -116,7 +116,11 @@ const MAX_CONFLICT_RETRIES: u32 = 5;
 /// (#614; see the SQLite predicate for why that is not the newest-created
 /// row); for a Kafka row of no topic id, a newer one of its (topic, partition,
 /// consumer group) that has none either, the rule before the id existed. A row
-/// of no id is never ranked against one of a known id. "Ends higher" is two
+/// of no id is never ranked against one of a known id. A row of a known id is
+/// also kept while the id is unresolved (its highest end is above its newest
+/// row's end), because committed_kafka_offsets reads the overlap between rows
+/// to tell a truncated log from a hole filled, and needs the rows that overlap
+/// until the newest row has caught up. "Ends higher" is two
 /// probes joined by OR (a higher end, or an equal end and a later creation),
 /// each a range or equality seek on idx_batches_kafka_max_end: one row
 /// comparison on (end, created_at, batch_id) scanned the id's rows below the
@@ -165,6 +169,32 @@ macro_rules! pg_prune_predicate_sql {
                 = ((b.progress_end_json::jsonb ->> 'end_offset')::bigint) \
               AND (n.created_at, n.batch_id) > (b.created_at, b.batch_id) \
           )) \
+          AND (SELECT MAX((m.progress_end_json::jsonb ->> 'end_offset')::bigint) \
+               FROM batches m \
+               WHERE m.state = $1 \
+                 AND m.source_type = 'kafka' \
+                AND (m.progress_end_json::jsonb ->> 'topic') \
+                    = (b.progress_end_json::jsonb ->> 'topic') \
+                AND (m.progress_end_json::jsonb ->> 'partition') \
+                    = (b.progress_end_json::jsonb ->> 'partition') \
+                AND (m.progress_end_json::jsonb ->> 'consumer_group') \
+                    = (b.progress_end_json::jsonb ->> 'consumer_group') \
+                AND (m.progress_end_json::jsonb ->> 'topic_id') \
+                    = (b.progress_end_json::jsonb ->> 'topic_id') \
+              ) \
+            <= (SELECT (w.progress_end_json::jsonb ->> 'end_offset')::bigint \
+                FROM batches w \
+                WHERE w.state = $1 \
+                  AND w.source_type = 'kafka' \
+                AND (w.progress_end_json::jsonb ->> 'topic') \
+                    = (b.progress_end_json::jsonb ->> 'topic') \
+                AND (w.progress_end_json::jsonb ->> 'partition') \
+                    = (b.progress_end_json::jsonb ->> 'partition') \
+                AND (w.progress_end_json::jsonb ->> 'consumer_group') \
+                    = (b.progress_end_json::jsonb ->> 'consumer_group') \
+                AND (w.progress_end_json::jsonb ->> 'topic_id') \
+                    = (b.progress_end_json::jsonb ->> 'topic_id') \
+                ORDER BY w.created_at DESC, w.batch_id DESC LIMIT 1) \
           AND EXISTS ( \
             SELECT 1 FROM batches n \
             WHERE n.state = $1 \
@@ -929,22 +959,47 @@ impl StateStore for PgStateStore {
     async fn committed_kafka_offsets(&self) -> Result<Vec<CommittedKafkaOffset>, VtopError> {
         // See the SQLite implementation: per (topic, partition, consumer
         // group, topic id), the HIGHEST end offset any committed row of a
-        // known id reached, and the NEWEST row's end for rows of no id.
+        // known id reached, the NEWEST row's end for rows of no id, and the
+        // newest row's end for an id whose log was truncated (a committed row
+        // overlapping the range of an earlier-created one of the same id).
         let rows = sqlx::query(
             "WITH committed AS ( \
                  SELECT progress_end_json::jsonb ->> 'topic' AS topic, \
                         (progress_end_json::jsonb ->> 'partition')::bigint AS part, \
                         progress_end_json::jsonb ->> 'consumer_group' AS grp, \
                         progress_end_json::jsonb ->> 'topic_id' AS tid, \
+                        COALESCE( \
+                            (progress_start_json::jsonb ->> 'start_offset')::bigint, \
+                            (progress_end_json::jsonb ->> 'start_offset')::bigint) \
+                            AS start_offset, \
                         (progress_end_json::jsonb ->> 'end_offset')::bigint AS end_offset, \
                         created_at, batch_id \
                  FROM batches WHERE state = $1 AND source_type = $2 \
+             ), descending AS ( \
+                 SELECT topic, part, grp, tid, start_offset, end_offset, created_at, batch_id, \
+                        MAX(end_offset) OVER ( \
+                            PARTITION BY topic, part, grp, tid \
+                            ORDER BY created_at, batch_id \
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prior_max \
+                 FROM committed WHERE tid IS NOT NULL \
+             ), broken AS ( \
+                 SELECT DISTINCT c.topic, c.part, c.grp, c.tid FROM descending c \
+                 WHERE c.prior_max >= c.start_offset \
+                   AND EXISTS ( \
+                       SELECT 1 FROM committed x \
+                       WHERE x.topic = c.topic AND x.part = c.part AND x.grp = c.grp \
+                         AND x.tid = c.tid \
+                         AND (x.created_at, x.batch_id) < (c.created_at, c.batch_id) \
+                         AND x.start_offset <= c.end_offset AND x.end_offset >= c.start_offset) \
              ), ranked AS ( \
                  SELECT topic, part, grp, tid, end_offset, \
                         ROW_NUMBER() OVER ( \
                             PARTITION BY topic, part, grp, tid \
                             ORDER BY CASE WHEN tid IS NULL THEN 0 ELSE end_offset END DESC, \
                                      created_at DESC, batch_id DESC) AS rn, \
+                        FIRST_VALUE(end_offset) OVER ( \
+                            PARTITION BY topic, part, grp, tid \
+                            ORDER BY created_at DESC, batch_id DESC) AS id_newest_end, \
                         FIRST_VALUE(tid) OVER ( \
                             PARTITION BY topic, part, grp \
                             ORDER BY created_at DESC, batch_id DESC) AS newest_tid, \
@@ -953,10 +1008,15 @@ impl StateStore for PgStateStore {
                             ORDER BY created_at DESC, batch_id DESC) AS newest_end \
                  FROM committed \
              ) \
-             SELECT topic, part, grp, tid, end_offset, \
-                    CASE WHEN tid IS NOT DISTINCT FROM newest_tid THEN newest_end END \
+             SELECT r.topic, r.part, r.grp, r.tid, \
+                    CASE WHEN b.tid IS NOT NULL THEN r.id_newest_end ELSE r.end_offset END \
+                        AS end_offset, \
+                    CASE WHEN r.tid IS NOT DISTINCT FROM r.newest_tid THEN r.newest_end END \
                         AS newest_end \
-             FROM ranked WHERE rn = 1",
+             FROM ranked r \
+             LEFT JOIN broken b ON b.topic = r.topic AND b.part = r.part AND b.grp = r.grp \
+                               AND b.tid = r.tid \
+             WHERE r.rn = 1",
         )
         .bind(BatchState::SourceCommitted.as_str())
         .bind(SourceType::Kafka.as_str())

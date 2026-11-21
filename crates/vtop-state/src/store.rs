@@ -275,7 +275,12 @@ pub trait StateStore: Send + Sync {
     /// the range between (a duplicate, never a loss). A maximum is safe only
     /// within one incarnation: a recreated topic numbers its offsets from
     /// zero, and the old log's highest end would skip the new log's first
-    /// records.
+    /// records. Nor is it safe across a truncation: a log cut short by an
+    /// unclean leader election keeps its id and reuses offsets, which shows as
+    /// a committed row overlapping the range of an earlier-created one of the
+    /// id (the A, B, C sequence does not overlap: C fills the hole below B). An
+    /// id so marked answers with its NEWEST row's end, as rows of no id do, so
+    /// the replacement records are read again and never skipped.
     ///
     /// Rows with no id (written before it was recorded) are one more answer,
     /// the newest committed row's end, as the ledger always resumed. They are
@@ -361,7 +366,9 @@ pub trait StateStore: Send + Sync {
     /// and for a Kafka row, for every (topic, partition, consumer group,
     /// topic id), the row with the HIGHEST end offset (ties by `created_at`,
     /// then `batch_id`) is always retained - for rows with no topic id, the
-    /// NEWEST - so [`StateStore::committed_cursors`] and
+    /// NEWEST - and, while an id is unresolved (its highest end is above its
+    /// newest row's end), every committed row of it, since the overlap that
+    /// marks a truncation is read from those rows - so [`StateStore::committed_cursors`] and
     /// [`StateStore::committed_kafka_offsets`] return identical answers
     /// before and after any prune. [`StateStore::max_committed_end_bytes`]
     /// is not prune-invariant: the highest end byte can belong to an older
