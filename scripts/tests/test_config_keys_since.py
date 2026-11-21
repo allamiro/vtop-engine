@@ -240,6 +240,62 @@ pub struct ExtraConfig {
         self.assertEqual([(a.path, a.note_kind) for a in added], [("extra.more", "refused")])
 
 
+class RequiredKeys(unittest.TestCase):
+    """A required key is a config change only where its block is written."""
+
+    BEFORE = """
+pub struct VtopConfig {
+    pub engine: EngineConfig,
+    #[serde(default)]
+    pub transports: BTreeMap<String, Tuning>,
+    pub streams_like: Vec<Row>,
+    #[serde(default)]
+    pub extras: Extras,
+}
+
+pub struct EngineConfig {
+    pub name: String,
+}
+
+pub struct Tuning {
+    pub window: u32,
+}
+
+pub struct Row {
+    pub id: u32,
+}
+
+pub struct Extras {
+    pub a: u32,
+}
+"""
+
+    def added(self, field: str, struct: str):
+        marker = f"pub struct {struct} {{\n"
+        after = self.BEFORE.replace(marker, marker + f"    pub {field}: u32,\n")
+        return {a.path: a for a in MOD.added_keys(self.BEFORE, after, {})}
+
+    def test_a_new_required_key_of_a_section_that_is_always_there_is_required_outright(self):
+        item = self.added("region", "EngineConfig")["engine.region"]
+        self.assertTrue(item.required)
+        self.assertIsNone(item.required_when)
+        self.assertIn(" Required by this build: ", MOD.render([item], "v1", "v2"))
+
+    def test_a_new_required_key_in_a_defaulted_map_is_required_where_an_entry_is_written(self):
+        item = self.added("burst", "Tuning")["transports.<name>.burst"]
+        self.assertTrue(item.required)
+        self.assertEqual(item.required_when, "transports.<name>")
+        text = MOD.render([item], "v1", "v2")
+        self.assertIn("wherever `transports.<name>` is set", text)
+        self.assertNotIn("before it loads", text)
+
+    def test_a_new_required_key_in_a_list_or_a_defaulted_section_is_conditional_too(self):
+        row = self.added("name", "Row")["streams_like[].name"]
+        self.assertEqual(row.required_when, "streams_like[]")
+        extra = self.added("b", "Extras")["extras.b"]
+        self.assertEqual(extra.required_when, "extras")
+
+
 class UntaggedEnums(unittest.TestCase):
     """A key written through an untagged enum's variant is a key."""
 

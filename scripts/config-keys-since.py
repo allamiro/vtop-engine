@@ -81,6 +81,9 @@ class Key:
     required: bool
     file: str  # config.yaml or streams.yaml
     via_enum: bool = False  # declared in the struct of an untagged enum's variant
+    # The outermost optional, defaulted or repeated block above the key: a
+    # required key there is required only where that block is written.
+    required_when: str | None = None
 
 
 file_of_root = {root: file for file, root, _page, _prefix in ROOTS}
@@ -278,7 +281,11 @@ def walk(
     keys: dict[str, Key] = {}
 
     def visit(
-        struct_name: str, base: str, active: tuple[str, ...], via_enum: bool = False
+        struct_name: str,
+        base: str,
+        active: tuple[str, ...],
+        via_enum: bool = False,
+        guard: str | None = None,
     ) -> None:
         struct = structs[struct_name]
         for item in struct.fields:
@@ -294,10 +301,15 @@ def walk(
                 required=required,
                 file=file_of_root[root],
                 via_enum=via_enum,
+                required_when=guard,
             )
             inner, suffix = _unwrap(item.type_text)
+            optional_here = bool(
+                item.has_default or item.optional or struct.container_default or suffix
+            )
+            inner_guard = guard or (path + suffix if optional_here else None)
             if inner in structs and inner not in active:
-                visit(inner, path + suffix, active + (struct_name,))
+                visit(inner, path + suffix, active + (struct_name,), False, inner_guard)
             elif inner in enums and enums[inner].variant_types:
                 if not enums[inner].untagged:
                     raise ValueError(
@@ -313,6 +325,7 @@ def walk(
                             path + suffix + held_suffix,
                             active + (struct_name,),
                             via_enum=True,
+                            guard=inner_guard,
                         )
 
     visit(root, "", ())
@@ -461,6 +474,7 @@ class Added:
     note: str
     required: bool
     inside: list[str]  # the new keys under this one (a new block)
+    required_when: str | None = None  # required only where this block is written
 
 
 def added_keys(
@@ -546,7 +560,7 @@ def added_keys(
                 "ignored by an older engine. Unset by default, and the reference "
                 "does not say what an older engine loses; decide before release.",
             )
-        out.append(Added(top, kind, note, key.required, inside))
+        out.append(Added(top, kind, note, key.required, inside, key.required_when))
     return out
 
 
@@ -582,7 +596,12 @@ def render(added: list[Added], previous: str, current: str) -> str:
         if item.inside:
             names = ", ".join(f"`{p.removeprefix(item.path + '.')}`" for p in item.inside)
             line += f" New block; keys inside: {names}."
-        if item.required:
+        if item.required and item.required_when:
+            line += (
+                f" Required by this build wherever `{item.required_when}` is set: "
+                "a config written for the older engine that sets it must add it."
+            )
+        elif item.required:
             line += (
                 " Required by this build: a config written for the older engine "
                 "must add it before it loads."
@@ -624,6 +643,7 @@ def main(argv: list[str] | None = None) -> int:
                         "kind": a.note_kind,
                         "note": a.note,
                         "required": a.required,
+                        "required_when": a.required_when,
                         "inside": a.inside,
                     }
                     for a in added
