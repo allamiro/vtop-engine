@@ -784,6 +784,7 @@ pub struct BrokerCollector {
     follower_durable_offset: IntGaugeVec,
     follower_lag_records: IntGaugeVec,
     follower_connected: IntGaugeVec,
+    follower_below_catch_up_horizon: IntGaugeVec,
     retention: RetentionGauges,
     /// Refresh and read-out under one lock, as in `CandidateCollector`: an
     /// overlapping scrape that read no retention snapshot must not reset the
@@ -870,6 +871,13 @@ impl BrokerCollector {
             follower_connected: gauge_vec(
                 "broker_follower_connected",
                 "1 while the leader holds a live replication stream to the follower",
+                &["follower"],
+            )?,
+            follower_below_catch_up_horizon: gauge_vec(
+                "broker_follower_below_catch_up_horizon",
+                "1 while the follower is durable only below this leader's log start: retention \
+                 reclaimed the records it lacks, so no append can catch it up and it needs a \
+                 rebuild (#881)",
                 &["follower"],
             )?,
             retention: RetentionGauges::new()?,
@@ -967,6 +975,7 @@ impl BrokerCollector {
             &self.follower_durable_offset,
             &self.follower_lag_records,
             &self.follower_connected,
+            &self.follower_below_catch_up_horizon,
             &self.group_commit_last_batch_records,
             &self.group_commit_last_batch_bytes,
             &self.group_commit_enabled,
@@ -1055,6 +1064,13 @@ impl BrokerCollector {
                     .with_label_values(&[&label])
                     .set(i64::from(
                         replicas.follower_connected(*node).unwrap_or(false),
+                    ));
+                self.follower_below_catch_up_horizon
+                    .with_label_values(&[&label])
+                    .set(i64::from(
+                        replicas
+                            .follower_below_catch_up_horizon(*node)
+                            .unwrap_or(false),
                     ));
             }
         }
