@@ -146,6 +146,10 @@ pub struct Pipeline<'a> {
     /// (#135). Owned by [`Engine`] and shared into every pipeline so the
     /// check runs once per bucket per process, not per batch.
     pub versioned_buckets: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Buckets whose writes are paused because they stopped keeping object
+    /// versions under the hardened profile. Owned by [`Engine`] and shared
+    /// like `versioned_buckets`.
+    pub versioning_pauses: Arc<crate::bucket_versioning::VersioningPauses>,
     /// Throttles the store answered with, counted across the process (#102):
     /// the engine reads it before and after a cycle to learn whether the
     /// cycle was throttled, which is what the width controller consumes.
@@ -375,6 +379,50 @@ impl EarlierFallback {
 }
 
 impl<'a> Pipeline<'a> {
+    /// `bucket` no longer keeps object versions under the hardened profile:
+    /// stop writing to it (see [`crate::bucket_versioning::VersioningPauses`]),
+    /// and say so. A newly paused bucket is an ERROR every time; a check
+    /// that finds it still off is an ERROR at most once a minute per bucket,
+    /// with the count suppressed in between. A PUT that finds a bucket
+    /// another batch paused already says nothing more: that batch did.
+    fn versioning_off(
+        &self,
+        bucket: &str,
+        batch_id: &str,
+        cause: crate::bucket_versioning::PauseCause,
+    ) {
+        use crate::bucket_versioning::{self as versioning, PauseCause};
+        self.versioned_buckets.lock().unwrap().remove(bucket);
+        if let Some(first) = self.versioning_pauses.pause(bucket) {
+            // Stamped, so a check right after it does not log again.
+            let _ = self.key_notices.admit("bucket_versioning_paused", bucket);
+            tracing::error!(
+                event = "bucket_versioning_paused",
+                batch_id,
+                bucket = %bucket,
+                cause = ?cause,
+                "{}",
+                versioning::paused_message(bucket, cause, first)
+            );
+            return;
+        }
+        if cause != PauseCause::Check {
+            return;
+        }
+        let off = self.versioning_pauses.still_off(bucket);
+        if let Some(suppressed) = self.key_notices.admit("bucket_versioning_paused", bucket) {
+            tracing::error!(
+                event = "bucket_versioning_paused",
+                batch_id,
+                bucket = %bucket,
+                checks = off.checks,
+                suppressed,
+                "{}",
+                versioning::still_off_message(bucket, off, suppressed)
+            );
+        }
+    }
+
     /// Read the retention of an object the batch would reuse and judge it
     /// against the profile (#709).
     async fn judge_reuse(
@@ -1199,12 +1247,32 @@ impl<'a> Pipeline<'a> {
                     versioning::Refuser::BATCH,
                 ));
             }
-            let checked = self.versioned_buckets.lock().unwrap().contains(&bucket);
+            // A bucket that stopped keeping versions under a running engine
+            // is not written to until its versioning is enabled again: a
+            // batch for it fails here, before its first PUT, unless it is
+            // the one due to check the bucket again.
+            let gate = self.versioning_pauses.gate(&bucket);
+            if let versioning::Gate::Wait { next_check_in } = &gate {
+                let next_check_in = *next_check_in;
+                if let Some(mx) = telemetry::metrics() {
+                    mx.bucket_versioning_paused_batches_total
+                        .with_label_values(&[
+                            tenant.as_str(),
+                            source.source_type.as_str(),
+                            format.extension(),
+                        ])
+                        .inc();
+                }
+                fail!(versioning::paused_batch(&bucket, next_check_in));
+            }
+            let checked = matches!(gate, versioning::Gate::Open)
+                && self.versioned_buckets.lock().unwrap().contains(&bucket);
             if !checked {
                 // A literal bucket passed this at startup unless the store
                 // could not answer then (#722); a templated one is checked
-                // here, at the first upload to each bucket it names.
-                let refusal = match note_store_request(
+                // here, at the first upload to each bucket it names; and a
+                // paused one is checked here when it is due.
+                let answer = note_store_request(
                     self.backend.bucket_versioning(&bucket).await,
                     "bucket_versioning",
                     [
@@ -1214,27 +1282,56 @@ impl<'a> Pipeline<'a> {
                     ],
                     &self.attempts,
                     &self.throttles,
-                ) {
-                    Ok(answer) => versioning::refusal(answer, &bucket, versioning::Refuser::BATCH),
+                );
+                let refusal = match &answer {
+                    Ok(answer) => versioning::refusal(*answer, &bucket, versioning::Refuser::BATCH),
                     Err(e) => Some(versioning::unreadable(
                         &bucket,
                         versioning::Refuser::BATCH,
-                        &e,
+                        e,
                     )),
                 };
-                if let Some(m) = refusal {
-                    tracing::error!(
-                        event = "bucket_versioning_refused",
-                        batch_id,
-                        bucket = %bucket,
-                        "{m}"
-                    );
-                    fail!(m);
+                match (&answer, refusal) {
+                    (_, None) => {
+                        self.versioned_buckets
+                            .lock()
+                            .unwrap()
+                            .insert(bucket.clone());
+                        if let Some(paused_for) = self.versioning_pauses.resume(&bucket) {
+                            tracing::info!(
+                                event = "bucket_versioning_resumed",
+                                batch_id,
+                                bucket = %bucket,
+                                paused_for_seconds = paused_for.as_secs(),
+                                "bucket {bucket} has versioning enabled again; the engine \
+                                 resumed writing to it after {}s paused, and the batches that \
+                                 failed meanwhile are replayed; nothing to do",
+                                paused_for.as_secs()
+                            );
+                        }
+                    }
+                    (Ok(vtop_upload::BucketFeature::NotEnabled), Some(m)) => {
+                        self.versioning_off(&bucket, &batch_id, versioning::PauseCause::Check);
+                        fail!(m);
+                    }
+                    (_, Some(m)) => {
+                        // Not a definite "versioning is off": a store that
+                        // does not implement versioning, or no answer. A
+                        // paused bucket stays paused, checked on its
+                        // backoff.
+                        if matches!(gate, versioning::Gate::Check(_)) {
+                            self.versioning_off(&bucket, &batch_id, versioning::PauseCause::Check);
+                        } else {
+                            tracing::error!(
+                                event = "bucket_versioning_refused",
+                                batch_id,
+                                bucket = %bucket,
+                                "{m}"
+                            );
+                        }
+                        fail!(m);
+                    }
                 }
-                self.versioned_buckets
-                    .lock()
-                    .unwrap()
-                    .insert(bucket.clone());
             }
         }
 
@@ -1777,6 +1874,40 @@ impl<'a> Pipeline<'a> {
             }
             fail!(format!("object upload failed: {e}"));
         }
+        // The hardened profile: an object PUT that returned no version is
+        // the first sign of a bucket whose versioning was suspended under
+        // the running engine. A multipart upload recovered after its
+        // completion reports none either, so the store is asked before
+        // anything else is written: when versioning is off, the manifest
+        // is not put, and nothing more goes to the bucket (see
+        // `VersioningPauses`).
+        if self.config.upload.require_object_versioning
+            && written.as_ref().is_some_and(|w| w.version_id.is_none())
+        {
+            let off = self.versioning_pauses.is_paused(&bucket)
+                || matches!(
+                    note_store_request(
+                        self.backend.bucket_versioning(&bucket).await,
+                        "bucket_versioning",
+                        labels,
+                        &self.attempts,
+                        &self.throttles,
+                    ),
+                    Ok(vtop_upload::BucketFeature::NotEnabled)
+                );
+            if off {
+                self.versioning_off(
+                    &bucket,
+                    &batch_id,
+                    crate::bucket_versioning::PauseCause::ObjectPut,
+                );
+                fail!(format!(
+                    "object upload to {object_uri} returned no object version and bucket \
+                     {bucket} does not have versioning enabled \
+                     (require_object_versioning is set); the manifest was not written"
+                ));
+            }
+        }
         metrics.object_upload_ms = t.elapsed().as_millis() as u64;
         if multipart_used {
             tracing::info!(batch_id, uri = %object_uri, "object_uploaded via multipart");
@@ -1860,6 +1991,16 @@ impl<'a> Pipeline<'a> {
         let manifest_size = std::fs::metadata(&manifest_path)?.len();
 
         // ---- OBJECT_UPLOADED -> MANIFEST_UPLOADED -----------------------
+        // Another batch may have found the bucket's versioning off while
+        // this one uploaded its object: its manifest could not be pinned.
+        if self.config.upload.require_object_versioning && self.versioning_pauses.is_paused(&bucket)
+        {
+            fail!(format!(
+                "bucket {bucket} stopped keeping object versions while this batch uploaded its \
+                 object (another batch found its versioning off); the manifest was not written \
+                 and the batch will be replayed"
+            ));
+        }
         let t = Instant::now();
         let stored_manifest = match note_store_request(
             self.backend
@@ -1883,6 +2024,14 @@ impl<'a> Pipeline<'a> {
         // an upload the store did not version cannot be pinned, so it cannot
         // advance (#135).
         if self.config.upload.require_object_versioning && stored_manifest.version_id.is_none() {
+            // The bucket's state, not a transient failure: a retry would put
+            // another manifest it cannot pin. Writes to it stop until its
+            // versioning is enabled again.
+            self.versioning_off(
+                &bucket,
+                &batch_id,
+                crate::bucket_versioning::PauseCause::ManifestPut,
+            );
             fail!("manifest upload returned no object version to pin \
                    (require_object_versioning is set)"
                 .to_string());
@@ -2882,6 +3031,9 @@ pub struct Engine {
     /// Process-wide hardened-profile preflight cache (#135); see
     /// [`Pipeline::versioned_buckets`].
     versioned_buckets: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Process-wide record of buckets whose writes are paused; see
+    /// [`Pipeline::versioning_pauses`].
+    versioning_pauses: Arc<crate::bucket_versioning::VersioningPauses>,
     /// Throttles counted across the process, shared into every pipeline (#102).
     throttles: Arc<AtomicU64>,
     /// Uploads issued across every pipeline, see `Pipeline::attempts`.
@@ -3281,6 +3433,7 @@ impl Engine {
             adapters,
             manifest_keyring,
             versioned_buckets: Arc::default(),
+            versioning_pauses: Arc::default(),
             throttles: Arc::default(),
             attempts: Arc::default(),
             width,
@@ -3366,6 +3519,7 @@ impl Engine {
             config: &self.config,
             manifest_keyring: Arc::clone(&self.manifest_keyring),
             versioned_buckets: Arc::clone(&self.versioned_buckets),
+            versioning_pauses: Arc::clone(&self.versioning_pauses),
             throttles: Arc::clone(&self.throttles),
             attempts: Arc::clone(&self.attempts),
             provisioned_buckets: Arc::clone(&self.provisioned_buckets),
@@ -12852,6 +13006,247 @@ mod tests {
             ) - lowered_before,
             1
         );
+    }
+
+    /// A versioned store whose bucket versioning can be suspended under a
+    /// running engine. Suspended, it still stores what is put (S3 keeps a
+    /// `null` version) but returns no version id, and GetBucketVersioning
+    /// answers that versioning is not enabled. `suspend_at_manifest` suspends
+    /// it at the next manifest PUT: the object went in versioned, the
+    /// manifest does not. Every PUT and versioning check is counted.
+    #[derive(Default)]
+    struct SuspendableVersioning {
+        inner: Arc<vtop_upload::MockBackend>,
+        suspended: std::sync::atomic::AtomicBool,
+        suspend_at_manifest: std::sync::atomic::AtomicBool,
+        object_puts: std::sync::atomic::AtomicUsize,
+        manifest_puts: std::sync::atomic::AtomicUsize,
+        versioning_checks: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SuspendableVersioning {
+        fn set_suspended(&self, on: bool) {
+            self.suspended.store(on, Ordering::SeqCst);
+        }
+        fn suspended(&self) -> bool {
+            self.suspended.load(Ordering::SeqCst)
+        }
+        /// (objects put, manifests put, versioning checks).
+        fn counts(&self) -> (usize, usize, usize) {
+            (
+                self.object_puts.load(Ordering::SeqCst),
+                self.manifest_puts.load(Ordering::SeqCst),
+                self.versioning_checks.load(Ordering::SeqCst),
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl UploadBackend for SuspendableVersioning {
+        async fn put_object(
+            &self,
+            local_path: &std::path::Path,
+            object_uri: &str,
+            checksum: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::StoredObject, VtopError> {
+            self.object_puts.fetch_add(1, Ordering::SeqCst);
+            let mut stored = self
+                .inner
+                .put_object(local_path, object_uri, checksum)
+                .await?;
+            if self.suspended() {
+                stored.version_id = None;
+            }
+            Ok(stored)
+        }
+        async fn put_manifest(
+            &self,
+            local_path: &std::path::Path,
+            manifest_uri: &str,
+            checksum: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::StoredManifest, VtopError> {
+            self.manifest_puts.fetch_add(1, Ordering::SeqCst);
+            if self.suspend_at_manifest.swap(false, Ordering::SeqCst) {
+                self.set_suspended(true);
+            }
+            let mut stored = self
+                .inner
+                .put_manifest(local_path, manifest_uri, checksum)
+                .await?;
+            if self.suspended() {
+                stored.version_id = None;
+            }
+            Ok(stored)
+        }
+        async fn get_manifest_pinned(
+            &self,
+            manifest_uri: &str,
+            version_id: &str,
+            max_bytes: usize,
+        ) -> Result<Vec<u8>, VtopError> {
+            self.inner
+                .get_manifest_pinned(manifest_uri, version_id, max_bytes)
+                .await
+        }
+        fn supports_object_versions(&self) -> bool {
+            true
+        }
+        async fn bucket_versioning(
+            &self,
+            _bucket: &str,
+        ) -> Result<vtop_upload::BucketFeature, VtopError> {
+            self.versioning_checks.fetch_add(1, Ordering::SeqCst);
+            Ok(if self.suspended() {
+                vtop_upload::BucketFeature::NotEnabled
+            } else {
+                vtop_upload::BucketFeature::Enabled
+            })
+        }
+        async fn head_object(&self, uri: &str) -> Result<vtop_upload::ObjectHead, VtopError> {
+            self.inner.head_object(uri).await
+        }
+        async fn get_object(&self, uri: &str) -> Result<Vec<u8>, VtopError> {
+            self.inner.get_object(uri).await
+        }
+        async fn get_object_bounded(&self, uri: &str, max: usize) -> Result<Vec<u8>, VtopError> {
+            self.inner.get_object_bounded(uri, max).await
+        }
+        async fn verify_object(
+            &self,
+            uri: &str,
+            size: u64,
+            expected: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::VerificationResult, VtopError> {
+            self.inner.verify_object(uri, size, expected).await
+        }
+        async fn delete_object(&self, uri: &str) -> Result<(), VtopError> {
+            self.inner.delete_object(uri).await
+        }
+        fn backend_name(&self) -> &'static str {
+            "mock"
+        }
+        fn supports_checksum_verification(&self) -> bool {
+            true
+        }
+        fn supports_multipart(&self) -> bool {
+            false
+        }
+        fn reports_absent_objects(&self) -> bool {
+            true
+        }
+    }
+
+    /// The external tamper evaluation of v0.10.2: with
+    /// `upload.require_object_versioning` set, versioning suspended under a
+    /// running engine (which had checked the bucket at startup) made every
+    /// retry put another manifest, each failing "manifest upload returned no
+    /// object version to pin": 10 objects in 25 s, nothing committed. A PUT
+    /// with no version is the bucket's state, not a transient failure: the
+    /// engine stops writing to the bucket, checks its versioning on a bounded
+    /// backoff, and resumes once it is enabled. Here the suspension is seen
+    /// at the object PUT (`at_manifest` false) or, when it lands between the
+    /// two PUTs, at the manifest PUT: either way the store gets that one
+    /// write and nothing more, however many times the range is retried.
+    #[tokio::test]
+    async fn suspended_versioning_under_a_running_engine_stops_writes_until_it_is_enabled() {
+        for at_manifest in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let input = dir.path().join("in.log");
+            std::fs::write(&input, "line 1\n").unwrap();
+            let cfg = file_config(
+                dir.path().join("work").to_str().unwrap(),
+                &format!("sqlite://{}", dir.path().join("state.db").display()),
+                vec![input.to_string_lossy().into_owned()],
+                "mock",
+            );
+            let backend = Arc::new(SuspendableVersioning::default());
+            let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+                .await
+                .unwrap();
+            engine.config.upload.require_object_versioning = true;
+            engine.backend = backend.clone();
+            // A running engine: the bucket passed the startup check.
+            engine.preflight_buckets().await.unwrap();
+            let out = engine.process_once(SourceType::File).await.unwrap();
+            assert!(out.iter().all(|o| o.committed), "{out:?}");
+
+            let (logs, guard) = CapturedLogs::start();
+            if at_manifest {
+                backend.suspend_at_manifest.store(true, Ordering::SeqCst);
+            } else {
+                backend.set_suspended(true);
+            }
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&input)
+                .unwrap();
+            writeln!(f, "line 2").unwrap();
+            drop(f);
+            let before = backend.counts();
+            for retry in 0..10 {
+                let out = engine.process_once(SourceType::File).await.unwrap();
+                assert!(
+                    out.iter().all(|o| !o.committed),
+                    "[at_manifest {at_manifest}] retry {retry}: nothing commits while \
+                     versioning is off: {out:?}"
+                );
+            }
+            let after = backend.counts();
+            let (objects, manifests, checks) =
+                (after.0 - before.0, after.1 - before.1, after.2 - before.2);
+            if at_manifest {
+                assert_eq!(
+                    (objects, manifests),
+                    (1, 1),
+                    "the one batch in flight wrote its object and its manifest, then nothing"
+                );
+                assert_eq!(checks, 0, "the manifest's missing version is enough");
+            } else {
+                assert_eq!(
+                    (objects, manifests),
+                    (1, 0),
+                    "the one batch in flight wrote its object, no manifest, then nothing"
+                );
+                assert_eq!(
+                    checks, 1,
+                    "one check confirmed the object's missing version"
+                );
+            }
+            let paused = logs.line("bucket_versioning_paused");
+            assert!(
+                paused.contains("ERROR")
+                    && paused.contains("returned no object version")
+                    && paused.contains("stopped writing to the bucket")
+                    && paused.contains("re-enable versioning on bucket"),
+                "{paused}"
+            );
+            assert_eq!(engine.versioning_pauses.paused(), 1);
+
+            // The next check, still suspended: no write, the pause holds.
+            engine.versioning_pauses.make_due();
+            let before = backend.counts();
+            let out = engine.process_once(SourceType::File).await.unwrap();
+            assert!(out.iter().all(|o| !o.committed), "{out:?}");
+            let after = backend.counts();
+            assert_eq!(
+                (after.0 - before.0, after.1 - before.1, after.2 - before.2),
+                (0, 0, 1),
+                "a due check asks the store and writes nothing"
+            );
+            assert_eq!(engine.versioning_pauses.paused(), 1);
+            drop(guard);
+
+            // Versioning enabled again: the next due check resumes, the
+            // range commits.
+            backend.set_suspended(false);
+            engine.versioning_pauses.make_due();
+            let out = engine.process_once(SourceType::File).await.unwrap();
+            assert!(
+                !out.is_empty() && out.iter().all(|o| o.committed),
+                "[at_manifest {at_manifest}] {out:?}"
+            );
+            assert_eq!(engine.versioning_pauses.paused(), 0);
+        }
     }
 
     /// A store whose objects exist but cannot be read back to verify.
