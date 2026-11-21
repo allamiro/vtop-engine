@@ -272,9 +272,18 @@ pub struct FileRef {
         self.assertEqual(sorted(MOD.schema(self.BEFORE)), ["store", "store.env"])
         self.assertEqual(sorted(MOD.schema(self.AFTER)), ["store", "store.env", "store.file"])
 
-    def test_a_new_variant_is_a_new_key(self):
+    def test_a_new_variant_is_a_new_key_an_older_engine_refuses(self):
+        # The older enum accepts a string or {env: ...}; {file: ...} matches
+        # neither, so the config does not load.
         added = MOD.added_keys(self.BEFORE, self.AFTER, {})
-        self.assertEqual([a.path for a in added], ["store.file"])
+        self.assertEqual([(a.path, a.note_kind) for a in added], [("store.file", "refused")])
+        self.assertIn("Release-gating", added[0].note)
+
+    def test_a_field_added_to_an_existing_lenient_variant_is_only_ignored(self):
+        before = self.BEFORE.replace("#[serde(deny_unknown_fields)]\npub struct EnvRef", "pub struct EnvRef")
+        after = before.replace("    pub env: String,\n", "    pub env: String,\n    pub extra: String,\n")
+        added = MOD.added_keys(before, after, {})
+        self.assertEqual([(a.path, a.note_kind) for a in added], [("store.extra", "undecided")])
 
     def test_a_field_added_to_a_strict_variant_is_refused(self):
         newer = self.BEFORE.replace(

@@ -80,6 +80,7 @@ class Key:
     declared_in: str  # the struct that holds the field
     required: bool
     file: str  # config.yaml or streams.yaml
+    via_enum: bool = False  # declared in the struct of an untagged enum's variant
 
 
 file_of_root = {root: file for file, root, _page, _prefix in ROOTS}
@@ -276,7 +277,9 @@ def walk(
     """
     keys: dict[str, Key] = {}
 
-    def visit(struct_name: str, base: str, active: tuple[str, ...]) -> None:
+    def visit(
+        struct_name: str, base: str, active: tuple[str, ...], via_enum: bool = False
+    ) -> None:
         struct = structs[struct_name]
         for item in struct.fields:
             path = f"{base}.{item.key}" if base else item.key
@@ -286,6 +289,7 @@ def walk(
                 declared_in=struct_name,
                 required=required,
                 file=file_of_root[root],
+                via_enum=via_enum,
             )
             inner, suffix = _unwrap(item.type_text)
             if inner in structs and inner not in active:
@@ -300,7 +304,12 @@ def walk(
                 for variant in enums[inner].variant_types:
                     held, held_suffix = _unwrap(variant)
                     if held in structs and held not in active:
-                        visit(held, path + suffix + held_suffix, active + (struct_name,))
+                        visit(
+                            held,
+                            path + suffix + held_suffix,
+                            active + (struct_name,),
+                            via_enum=True,
+                        )
 
     visit(root, "", ())
     return keys
@@ -455,7 +464,8 @@ def added_keys(
 ) -> list[Added]:
     old_keys = schema(old_source)
     new_keys = schema(new_source)
-    old_strict = strict_sections(old_source)
+    old_structs = parse_structs(old_source)
+    old_strict = {name for name, struct in old_structs.items() if struct.strict}
     fresh = sorted(set(new_keys) - set(old_keys))
     fresh_set = set(fresh)
 
@@ -500,9 +510,19 @@ def added_keys(
         # Does the struct that holds the key reject unknown keys at the older
         # ref? Then an older engine refuses the config instead of ignoring it.
         refused = key.declared_in in old_strict
+        # A new variant of an untagged enum is a new shape of the value: the
+        # older enum has no variant that accepts it, so the config fails to
+        # load, whatever the variant's own fields say.
+        new_shape = key.via_enum and key.declared_in not in old_structs
         sentence = older_engine_sentence(top, row, prose)
         inside = [p for p in grouped[top] if p != top]
-        if refused:
+        if new_shape:
+            kind, note = (
+                "refused",
+                "refused by an older engine: its value at this path has no form that "
+                "accepts this key, so it will not start with it set. Release-gating.",
+            )
+        elif refused:
             kind, note = (
                 "refused",
                 "refused by an older engine: the section rejects unknown keys, so "
