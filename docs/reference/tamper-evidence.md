@@ -107,7 +107,7 @@ claim otherwise:
 
 The live cases are `#[ignore]` tests that need an S3 endpoint with Object Lock
 and the lab's buckets, the same as the other live MinIO tests, and run in the
-`minio-integration` CI job:
+`s3 compat (minio)` leg of the S3 compatibility matrix (`s3-compat-matrix.yml`):
 
 ```bash
 docker compose build minio && docker compose up -d minio

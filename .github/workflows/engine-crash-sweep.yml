@@ -196,7 +196,7 @@ jobs:
             --bootstrap-server localhost:9092 --topic sweep_warmup \
             --group sweep-warmup --from-beginning --max-messages 1 --timeout-ms 30000
 
-      # As the minio-integration job in ci.yml: built from source, started
+      # As the s3-compat-matrix.yml MinIO leg: built from source, started
       # from docker-compose.yml. The engine creates its own bucket.
       - name: Build and start the lab's MinIO
         run: |

@@ -37,7 +37,7 @@
 //!  --test live_s3_tamper -- --ignored --test-threads=1`
 //! Every object a test writes is deleted at its end (governance retention
 //! bypassed with the lab's root credentials). CI runs it in the
-//! `minio-integration` job.
+//! `s3 compat (minio)` leg of `s3-compat-matrix.yml`.
 #![cfg(unix)]
 
 use std::io::Write;
