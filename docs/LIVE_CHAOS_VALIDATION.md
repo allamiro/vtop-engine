@@ -104,12 +104,12 @@ checks is a gate that silently stops working.
 | `01-meta-membership-grow` | Metadata membership grows 3 → 5 during committed metadata proposals and a concurrent 100,000-record native producer | No proposal is lost; all five voters converge and catch up; native produce/fetch remains byte-exact; all native replicas independently verify. |
 | `02-meta-membership-shrink-fenced-leader` | Metadata membership shrinks 5 → 3 with the current leader removed | A survivor takes leadership and commits; the removed voter leaves membership and refuses direct proposals. |
 | `03-meta-voter-replacement` | A fresh metadata learner catches up and replaces one voter | Replacement catches up before promotion; the retired voter can be killed without losing metadata availability. |
-| `04-leader-kill9-durability` | Native leader receives `SIGKILL` during quorum production | Every acknowledged record survives recovery; fetch stays below the reported committed HWM; both followers contain the acknowledged floor; all recovered artifacts independently verify. |
+| `04-leader-kill9-durability` | Native leader receives `SIGKILL` during quorum production | Every acknowledged record survives recovery; fetch stays below the reported committed HWM; both followers contain the acknowledged floor; all recovered artifacts independently verify; the producer's and the recovery read's [operation history](#operation-histories-728) passes the checker. |
 | `05-follower-diskfull` | One follower writes into an 8 MiB tmpfs until `ENOSPC` | Leader plus healthy follower continue quorum commits; the full follower stays alive and reports only its durable prefix; its recovered prefix and both healthy artifacts verify. |
 | `05b-follower-fsync-failure` | One follower's live `fsync`/`fdatasync` calls return `EIO` | The failing follower remains fail-closed at its durable prefix while the healthy quorum commits; all recovered artifacts verify. |
 | `06-partition-meta-leader` | Per-node network namespaces plus `iptables` isolate the metadata leader's peer traffic | Survivors elect and commit in a higher term; the isolated leader cannot commit; after healing it steps down, converges, and refuses direct proposals. |
 | `07-clock-skew` | `CLOCK_REALTIME` on one metadata node is shifted +1 hour while monotonic time stays honest | The shim proves the applied clock offset; exactly one leader is observed; proposals commit and the skewed member converges. |
-| `09-range-leader-failover` | A range leader is `SIGKILL`ed mid-flight under sustained quorum produce, and the follower holding the acknowledged floor is restarted as a lease-driven leader over the data it already replicated (#223) | The follower acquires the lease within the TTL at a strictly higher fencing epoch; every acknowledged record is still readable byte-exactly once the new quorum settles; the restarted old leader (on its own ports) never reports ready and is refused with a `Fenced` error under its stale epoch; every surviving replica artifact verifies offline. |
+| `09-range-leader-failover` | A range leader is `SIGKILL`ed mid-flight under sustained quorum produce, and the follower holding the acknowledged floor is restarted as a lease-driven leader over the data it already replicated (#223) | The follower acquires the lease within the TTL at a strictly higher fencing epoch; every acknowledged record is still readable byte-exactly once the new quorum settles; the restarted old leader (on its own ports) never reports ready and is refused with a `Fenced` error under its stale epoch; every surviving replica artifact verifies offline; the [operation history](#operation-histories-728) of both producers, the fenced probe and every read passes the checker. |
 | `10-colocated-node` | `vtop-node node` hosts a metadata voter and a data replica in ONE process (#215), which is then `SIGKILL`ed and restarted | One `/metrics` scrape carries both planes; `/readyz` opens only as the conjunction of both roles and both then serve (admin RPCs, produce); every acknowledged record survives the shared-fate restart byte-exactly and the sealed artifact verifies offline. |
 | `08-operational-surface` | Every node's `/metrics`, `/healthz`, and `/readyz` under a live cluster (#224) | The metric names the dashboards query are published on every role; exactly one node claims Raft leadership over `/metrics`; the committed offset agrees between `/metrics` and `vtopctl node status`; the endpoint answers `GET` only; a killed node stops answering its health gate while survivors stay ready. |
 | `11-admin-authorization` | Admin transport authorization enforced by the running binary over real mTLS (#238) | An operator certificate retains the full surface; a data-node certificate is refused membership changes (and the refusal says so), may still read, and can still acquire its **own** range lease — so the policy does not break the failover path. |
@@ -162,6 +162,60 @@ truncates any tail beyond the durable commit boundary, then `vtopctl segment
 verify` checks the resulting sealed bundle. For the disk-full follower, the
 quiesced namespace-visible active file and commit boundary are copied out
 before its private tmpfs disappears.
+
+## Operation histories (#728)
+
+The assertions above each check one outcome a scenario chose in advance. A
+history checks the run as a whole: the clients record what they did and what
+they were told, and a checker decides afterwards whether any single log could
+have produced that. It is the Jepsen approach, scaled to what the native data
+plane promises.
+
+Recording. `vtop-node produce --history FILE` appends one JSON line before
+each batch goes out (its producer, epoch and sequences) and one when it is
+answered: `ok` with the acknowledged offset, `fail` for a refusal made before
+anything was appended (`Fenced`, `WrongRange`, a sequence conflict), or `info`
+when the outcome is unknown: no answer, a dropped connection, or an answer
+that does not settle it. `Overloaded` ("quorum not reached") is `info`, because
+the leader appended the batch before its quorum wait expired, so the records
+may still surface. `vtop-node verify --dump FILE` records what one read found
+up to the committed high watermark, compressed into runs of consecutive
+offsets and sequences. `lib.sh` puts each client's file under
+`$WORKDIR/history/` (`history_file NAME`); `CHAOS_READ_HISTORY` makes
+`await_verified_floor` record every attempt; `assert_fenced_produce` records
+its probe when given a history file, at a producer sequence (2^40) no stream
+reaches, so the probe's record could not pass for one of the stream's own.
+
+Checking. `check_history` runs
+`scripts/live-chaos/history/check_history.py` over every file and fails the
+scenario on any violation, keeping the JSON summary in
+`logs/history-check.json`. Against the last read, and every earlier read
+against it:
+
+| Check | What fails it |
+|---|---|
+| `lost` | an acknowledged record missing from its acknowledged offset, or a different record there (the #611 and #261 shapes) |
+| `duplicate` | two acknowledgements claiming one offset, or an acknowledged or unanswered record visible a second time |
+| `order` | a producer acknowledged at an offset below one it was acknowledged at earlier |
+| `phantom` | a visible record that no acknowledged batch claims and no whole unanswered batch accounts for; a record of a refused (`fail`) batch, which is what a fenced leader's writes would be (the #641 shape) |
+| `rewritten` | a record an earlier read saw, below the last read's high watermark, that the last read sees differently |
+| `hwm` | a later read reporting a lower committed high watermark |
+| `unkeyed` | a visible record whose key is not a producer sequence |
+
+An unanswered batch may surface once, whole, or not at all; the checker
+does not count either outcome as a violation. Offsets the consumer never sees
+(a promotion's boundary marker, #240) are gaps, not records, and are not
+counted against anything; `verify --max-offset-gaps` still bounds them.
+
+The checker's own tests (`test_check_history.py`, run in the live-chaos job
+before the scenarios) build histories by hand, clean ones and ones shaped like
+#611, #261 and #641, and pin the verdict on each.
+
+Scenarios 04 and 09 record and check histories. What this does not cover yet,
+and #728 still asks for: metadata and lease operations (one leader per epoch,
+linearizable lease grants), a nemesis campaign of many hours, and showing the
+checker fail on a live run with each of #611, #640, #641 and #261
+re-introduced into the code rather than into a hand-built history.
 
 ## Engine crash sweep (#725)
 

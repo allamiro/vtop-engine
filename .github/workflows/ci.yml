@@ -1608,6 +1608,12 @@ jobs:
           cargo build -p vtop-node --bin vtop-node
           cargo build -p vtop-cli --no-default-features --bin vtopctl
 
+      # The history checker's own tests (#728): the scenarios trust its
+      # verdict, so its rules are pinned against hand-built histories first,
+      # including ones shaped like past bugs. Pure Python; seconds.
+      - name: Test the history checker
+        run: python3 -m unittest discover -s scripts/live-chaos/history -p 'test_*.py'
+
       # CHAOS_WORKDIR is what makes the logs survive to be uploaded. Scenarios
       # delete workdirs they generated themselves, so an artifact pointed at
       # the default `/tmp/vtop-chaos.*` collects nothing and the upload passes
@@ -1632,7 +1638,9 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: live-chaos-logs
-          path: ${{ runner.temp }}/chaos/**/logs/
+          path: |
+            ${{ runner.temp }}/chaos/**/logs/
+            ${{ runner.temp }}/chaos/**/history/
           if-no-files-found: error
           retention-days: 7
 
