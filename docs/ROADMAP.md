@@ -9,6 +9,24 @@ what each release does **not** yet do.
 
 ---
 
+## Next release — the ledger's backup and restore are drilled
+
+- **[#734](https://github.com/allamiro/vtop-engine/issues/734)** — the
+  ledger's backup and restore are written down and drilled. `operate/backup-and-recovery.md`
+  has the commands for SQLite (the online backup, while the engine runs) and
+  PostgreSQL (`pg_dump`; a base backup with WAL archiving, restored to the end
+  of the archive or to a time), the RPO and RTO each procedure is held to, and
+  the numbers the drill measured. `scripts/restore-drill.sh` backs the ledger
+  up under a live engine, kills the engine, destroys the ledger, restores it
+  and starts the engine again, and fails unless `audit-coverage
+  --check-storage` shows no hole, `scrub --sample` is clean, every source
+  record is in a committed object and RPO and RTO are inside the documented
+  bounds. SQLite runs on a pull request that touches the state store;
+  PostgreSQL runs nightly on every supported major, from the images
+  `postgres-matrix.yml` pins. The drill reads a file source; Kafka offsets,
+  a source that deletes after commit, a ledger of production size and the
+  metadata tier are not covered.
+
 ## v0.1.0 — a range that fails over
 
 Metadata leases, a lease agent on the data node, verified promotion, and the
