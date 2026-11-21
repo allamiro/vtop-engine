@@ -12,9 +12,10 @@ the store holds.
   points STDERR_FILE
       The failpoint list a `failpoints` build printed when refusing an
       unknown point: one name per line, indented two spaces.
-  ledger (--sqlite DB | --rows-json) (kafka TOPIC PARTITION GROUP | file PATH)
+  ledger (--sqlite DB | --rows-json) (kafka TOPIC PARTITION GROUP | file PATH |
+          syslog_spool PATH)
       The ledger's rows for one source: a Kafka partition and consumer group,
-      or one file path. The rows come from a SQLite ledger opened read-only
+      or one file or spool file path. The rows come from a SQLite ledger opened read-only
       (--sqlite), or from JSON on stdin (--rows-json), which is how the
       PostgreSQL ledger is read: the harness asks `psql` for the batches as
       a JSON array and this reads what it printed. Prints the state counts,
@@ -41,13 +42,13 @@ the store holds.
       coordinator error, no output) exits 1 naming what was printed: the
       tool exits 0 even when the query failed, and an unread offset is not
       an absent one.
-  commit-rule COMMITTED LEDGER_JSON POINT WHEN [kafka|file]
+  commit-rule COMMITTED LEDGER_JSON POINT WHEN [kafka|file|syslog_spool]
       The commit rule at one instant, from both sides. At the source: for
       Kafka, the group's committed offset on the broker (`-` for none, as
       group-offset established it) never passes the end of the highest
       VERIFIED range, i.e. committed <= verified_end + 1 (Kafka commits the
-      NEXT offset to read). For a file, whose committed position lives in
-      the engine and is recorded only by the ledger, COMMITTED is the
+      NEXT offset to read). For a file or a spool file, whose committed
+      position lives in the engine and is recorded only by the ledger, COMMITTED is the
       ledger's cursor (the end byte of the highest SOURCE_COMMITTED row, `-`
       for none) and may not pass the highest VERIFIED end byte. In the
       ledger: no SOURCE_COMMITTED row lacks the VERIFIED write's evidence.
@@ -141,12 +142,13 @@ class Source:
         if kind == "kafka" and len(fields) == 3:
             self.topic, self.partition, self.group = fields[0], int(fields[1]), fields[2]
             self.end_key = "end_offset"
-        elif kind == "file" and len(fields) == 1:
+        elif kind in ("file", "syslog_spool") and len(fields) == 1:
             self.path = fields[0]
             self.end_key = "end_byte"
         else:
             raise ValueError(
-                f"a source is `kafka TOPIC PARTITION GROUP` or `file PATH`, got {kind} {fields}"
+                "a source is `kafka TOPIC PARTITION GROUP`, `file PATH` or "
+                f"`syslog_spool PATH`, got {kind} {fields}"
             )
         self.kind = kind
 
@@ -330,7 +332,10 @@ def commit_rule(
             f"SOURCE_COMMITTED without the VERIFIED write's evidence: "
             f"{json.dumps(unverified)}. Ledger states: {json.dumps(ledger['states'])}"
         )
-    holder = "the consumer group" if kind == "kafka" else "the file source's ledger cursor"
+    holder = {
+        "kafka": "the consumer group",
+        "syslog_spool": "the spool source's ledger cursor",
+    }.get(kind, "the file source's ledger cursor")
     if committed == "-":
         return True, f"{point} ({when}): {holder} has no committed position"
     if not OFFSET.match(committed):
