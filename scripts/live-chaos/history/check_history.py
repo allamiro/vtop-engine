@@ -248,6 +248,8 @@ def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) 
     # record there shows the earlier one missed a committed record. Promotion
     # markers are holes in every read, and never filled.
     holes: dict[int, Read] = {}
+    # The record each offset holds and when a read first showed it so.
+    shown: dict[int, tuple[tuple[int | None, bool], int]] = {}
     records: dict[int, tuple[int | None, bool]] = {}
     for read in reads:
         records = read.records()
@@ -268,6 +270,8 @@ def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) 
                     f"offset {offset} holds {record} in {read.process} but {hole.process} did not "
                     f"see it below its high watermark {hole.high_watermark}"
                 )
+            if offset not in shown or shown[offset][0] != record:
+                shown[offset] = (record, read.end_time_us)
             latest[offset] = (record, read)
     # What the history shows at each offset: the last read, and below its start
     # offset whatever the newest earlier read saw there.
@@ -378,11 +382,9 @@ def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) 
 
     order = Order(placed)
     # The end of the first read that showed each visible record as it is now.
-    first_seen_us: dict[int, int] = {}
-    for read in reads:
-        for offset, record in read.records.items():
-            if offset not in first_seen_us and visible.get(offset) == record:
-                first_seen_us[offset] = read.end_time_us
+    first_seen_us: dict[int, int] = {
+        offset: when for offset, (record, when) in shown.items() if visible.get(offset) == record
+    }
 
     def task_of(group: list[int]) -> Task:
         return Task(
