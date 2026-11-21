@@ -5164,7 +5164,7 @@ mod group_commit_wiring_tests {
         durability: WireDurability,
     ) -> vtop_protocol::WireFrame {
         broker.handle(
-            Role::Producer,
+            vtop_protocol::Role::Producer,
             vtop_protocol::WireFrame {
                 request_id: producer as u64,
                 stream_id: producer as u64,
