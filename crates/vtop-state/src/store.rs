@@ -279,8 +279,9 @@ pub trait StateStore: Send + Sync {
     ///
     /// Rows with no id (written before it was recorded) are one more answer,
     /// the newest committed row's end, as the ledger always resumed. They are
-    /// never compared with rows of a known id. [`CommittedKafkaOffset::newest`]
-    /// marks the answer that holds the newest-created row of the unit.
+    /// never compared with rows of a known id. [`CommittedKafkaOffset::newest_end`]
+    /// carries the end of the unit's newest-created row on the answer that
+    /// holds it.
     ///
     /// The Kafka adapter resumes from this rather than from the group's
     /// committed offset on the broker, which any engine can move, fenced or

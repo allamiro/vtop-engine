@@ -930,11 +930,15 @@ impl StateStore for PgStateStore {
                                      created_at DESC, batch_id DESC) AS rn, \
                         FIRST_VALUE(tid) OVER ( \
                             PARTITION BY topic, part, grp \
-                            ORDER BY created_at DESC, batch_id DESC) AS newest_tid \
+                            ORDER BY created_at DESC, batch_id DESC) AS newest_tid, \
+                        FIRST_VALUE(end_offset) OVER ( \
+                            PARTITION BY topic, part, grp \
+                            ORDER BY created_at DESC, batch_id DESC) AS newest_end \
                  FROM committed \
              ) \
              SELECT topic, part, grp, tid, end_offset, \
-                    (tid IS NOT DISTINCT FROM newest_tid) AS newest \
+                    CASE WHEN tid IS NOT DISTINCT FROM newest_tid THEN newest_end END \
+                        AS newest_end \
              FROM ranked WHERE rn = 1",
         )
         .bind(BatchState::SourceCommitted.as_str())
@@ -950,14 +954,14 @@ impl StateStore for PgStateStore {
                 let group: Option<String> = r.get("grp");
                 let topic_id: Option<String> = r.get("tid");
                 let end: Option<i64> = r.get("end_offset");
-                let newest: bool = r.get("newest");
+                let newest_end: Option<i64> = r.get("newest_end");
                 Some(CommittedKafkaOffset {
                     topic: topic?,
                     partition: i32::try_from(partition?).ok()?,
                     consumer_group: group?,
                     topic_id,
                     end_offset: end?,
-                    newest,
+                    newest_end,
                 })
             })
             .collect())

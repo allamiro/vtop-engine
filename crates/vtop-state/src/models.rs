@@ -381,11 +381,15 @@ pub struct CommittedKafkaOffset {
     /// newest by `(created_at, batch_id)` - the rule before the id existed. A
     /// maximum across rows that may be of different incarnations is not safe.
     pub end_offset: i64,
-    /// Whether this incarnation holds the newest-created committed row of the
-    /// (topic, partition, consumer group). The adapter falls back to that
-    /// answer, as the ledger always did, when the broker does not give the
-    /// topic's current id.
-    pub newest: bool,
+    /// The last offset of the newest-created committed row of the (topic,
+    /// partition, consumer group), on the answer of the incarnation that holds
+    /// that row, and `None` on the others. It is not `end_offset`, which for a
+    /// known id is the highest end of the id's rows: the adapter falls back to
+    /// this, as the ledger always did, when the broker does not give the
+    /// topic's current id, and a newest row ending below an older one of the
+    /// same id (a topic recreated while the adapter still held the old id)
+    /// must not resume at the older one's end.
+    pub newest_end: Option<i64>,
 }
 
 /// A `content_fingerprint` read out of a stored marker as JSON text. Anything

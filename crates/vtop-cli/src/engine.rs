@@ -5338,7 +5338,7 @@ impl Engine {
                     consumer_group: c.consumer_group.as_str(),
                     topic_id: c.topic_id.as_deref(),
                     end_offset: c.end_offset,
-                    newest: c.newest,
+                    newest_end: c.newest_end,
                 }
             }));
         }

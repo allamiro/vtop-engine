@@ -954,9 +954,9 @@ pub struct LedgerResume<'a> {
     /// For a known id the highest committed end of its rows; for no id the
     /// newest row's end.
     pub end_offset: i64,
-    /// Whether these rows include the newest-created committed row of the
-    /// partition.
-    pub newest: bool,
+    /// The end of the newest-created committed row of the partition, on the
+    /// answer whose rows include it, and `None` on the others.
+    pub newest_end: Option<i64>,
 }
 
 /// The last committed offset to resume a partition after, among the ledger's
@@ -972,8 +972,10 @@ pub struct LedgerResume<'a> {
 ///   never used then either: they predate the rows of the known ids, so they
 ///   are older still.
 /// - The id is unknown (a broker with no topic ids, or one that did not
-///   answer): the ledger's rule before ids, the answer that holds the newest
-///   committed row. Never a maximum across answers.
+///   answer): the ledger's rule before ids, the end of the newest committed
+///   row itself - not the highest end of the id that holds it, which a
+///   topic recreated while this process still held the old id can put above
+///   it. Never a maximum across answers.
 ///
 /// A maximum across an unknown and a known id is never taken, and nor is one
 /// across two known ids: their offsets are of different logs.
@@ -991,7 +993,7 @@ pub(crate) fn resume_end(answers: &[LedgerResume<'_>], current: Option<&str>) ->
                 .find(|a| a.topic_id.is_none())
                 .map(|a| a.end_offset)
         }
-        None => answers.iter().find(|a| a.newest).map(|a| a.end_offset),
+        None => answers.iter().find_map(|a| a.newest_end),
     }
 }
 
@@ -4600,7 +4602,7 @@ mod tests {
     #[test]
     fn another_groups_ledger_rows_never_seed_this_groups_position() {
         let mut src = KafkaSource::new(cfg(), TelemetryFormat::Cef).unwrap();
-        src.seed_committed_from_ledger([answer("t", 0, "vtop-engine-old", None, 700, true)]);
+        src.seed_committed_from_ledger([answer("t", 0, "vtop-engine-old", None, 700, Some(700))]);
         assert!(src.known_committed.is_empty());
         assert!(src.cursors.is_empty());
         assert!(
@@ -4617,7 +4619,7 @@ mod tests {
     #[test]
     fn a_ledger_position_is_not_trusted_when_the_group_offset_cannot_be_read() {
         let mut src = KafkaSource::new(cfg(), TelemetryFormat::Cef).unwrap();
-        src.seed_committed_from_ledger([answer("t", 0, "vtop-engine", None, 19, true)]);
+        src.seed_committed_from_ledger([answer("t", 0, "vtop-engine", None, 19, Some(19))]);
         assert!(src.known_committed.is_empty());
         assert_eq!(
             src.cursors
@@ -4633,7 +4635,7 @@ mod tests {
         group: &'a str,
         topic_id: Option<&'a str>,
         end_offset: i64,
-        newest: bool,
+        newest_end: Option<i64>,
     ) -> LedgerResume<'a> {
         LedgerResume {
             topic,
@@ -4641,14 +4643,14 @@ mod tests {
             consumer_group: group,
             topic_id,
             end_offset,
-            newest,
+            newest_end,
         }
     }
 
     /// The ledger's answers of one partition, as the store gives them.
-    fn rows<'a>(rows: &[(Option<&'a str>, i64, bool)]) -> Vec<LedgerResume<'a>> {
+    fn rows<'a>(rows: &[(Option<&'a str>, i64, Option<i64>)]) -> Vec<LedgerResume<'a>> {
         rows.iter()
-            .map(|&(id, end, newest)| answer("t", 0, "g", id, end, newest))
+            .map(|&(id, end, newest_end)| answer("t", 0, "g", id, end, newest_end))
             .collect()
     }
 
@@ -4657,10 +4659,12 @@ mod tests {
     /// the highest end of the id, and the partition resumes after it.
     #[test]
     fn a_partition_resumes_after_the_highest_end_of_the_current_topic_id() {
-        let ledger = rows(&[(Some("inc-1"), 19, true)]);
+        // B (end 19) was created before C (end 9): the newest row's end is 9.
+        let ledger = rows(&[(Some("inc-1"), 19, Some(9))]);
         assert_eq!(resume_end(&ledger, Some("inc-1")), Some(19));
-        // The id is not known to the adapter: the answer with the newest row.
-        assert_eq!(resume_end(&ledger, None), Some(19));
+        // The id cannot be learned: the ledger's rule before ids, the newest
+        // row's own end (the duplicate this change removes where it can).
+        assert_eq!(resume_end(&ledger, None), Some(9));
     }
 
     /// A topic deleted and created again: the old log's rows end high, the
@@ -4669,7 +4673,7 @@ mod tests {
     /// records 8 to 500.
     #[test]
     fn a_recreated_topic_resumes_from_the_new_log_and_skips_nothing() {
-        let ledger = rows(&[(Some("inc-old"), 500, false), (Some("inc-new"), 7, true)]);
+        let ledger = rows(&[(Some("inc-old"), 500, None), (Some("inc-new"), 7, Some(7))]);
         assert_eq!(resume_end(&ledger, Some("inc-new")), Some(7));
         // The old incarnation is still the current one, as long as its id is.
         assert_eq!(resume_end(&ledger, Some("inc-old")), Some(500));
@@ -4681,10 +4685,10 @@ mod tests {
     /// like a partition the ledger does not know.
     #[test]
     fn a_topic_with_a_new_id_and_no_rows_of_its_own_is_not_resumed_at_the_old_end() {
-        let ledger = rows(&[(Some("inc-old"), 500, true)]);
+        let ledger = rows(&[(Some("inc-old"), 500, Some(500))]);
         assert_eq!(resume_end(&ledger, Some("inc-new")), None);
         // Rows of no id predate every row of a known id: older still.
-        let mixed = rows(&[(None, 900, false), (Some("inc-old"), 500, true)]);
+        let mixed = rows(&[(None, 900, None), (Some("inc-old"), 500, Some(500))]);
         assert_eq!(resume_end(&mixed, Some("inc-new")), None);
     }
 
@@ -4693,16 +4697,28 @@ mod tests {
     /// a maximum across them and a known id.
     #[test]
     fn rows_with_no_topic_id_keep_the_old_rule() {
-        let legacy = rows(&[(None, 310, true)]);
+        let legacy = rows(&[(None, 310, Some(310))]);
         assert_eq!(resume_end(&legacy, Some("inc-1")), Some(310));
         assert_eq!(resume_end(&legacy, None), Some(310));
         // Upgraded, with rows of both kinds: the current id's own answer, not
         // the larger end of the rows of no id (nor the other way round).
-        let mixed = rows(&[(None, 310, false), (Some("inc-1"), 9, true)]);
+        let mixed = rows(&[(None, 310, None), (Some("inc-1"), 9, Some(9))]);
         assert_eq!(resume_end(&mixed, Some("inc-1")), Some(9));
         // The id cannot be learned: the answer holding the newest row.
         assert_eq!(resume_end(&mixed, None), Some(9));
         assert_eq!(resume_end(&[], Some("inc-1")), None);
+    }
+
+    /// The topic id is cached for up to a minute, so ranges read just after a
+    /// recreate can carry the OLD id: an older row ending at 500 and a newer
+    /// one ending at 7 share it. When the id then cannot be learned at a
+    /// restart, the partition resumes after the NEWEST row's end (7), as the
+    /// ledger always did - not after the id's highest end (500), which would
+    /// skip the new log's records 8 to 500.
+    #[test]
+    fn without_an_id_a_newest_row_below_an_older_one_of_its_id_resumes_at_the_newest() {
+        let ledger = rows(&[(Some("inc-old"), 500, Some(7))]);
+        assert_eq!(resume_end(&ledger, None), Some(7));
     }
 
     /// An id is asked for when a topic has none held, or when the held ids

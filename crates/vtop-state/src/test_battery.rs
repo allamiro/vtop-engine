@@ -90,6 +90,7 @@ pub async fn run_all(store: &dyn StateStore) {
     a_kafka_range_committed_below_a_newer_one_never_lowers_the_resume_point(store).await;
     a_recreated_topic_resumes_from_its_own_incarnation(store).await;
     rows_with_no_topic_id_are_never_compared_with_rows_of_a_known_one(store).await;
+    the_newest_rows_own_end_is_carried_when_it_ends_below_an_older_row_of_its_id(store).await;
     claims_respect_live_leases_and_take_over_expired_ones(store).await;
     committed_cursors_by_file_answer_each_file_that_lived_at_a_path(store).await;
     the_seal_instant_is_written_with_the_row_and_read_back_by_every_read(store).await;
@@ -1097,7 +1098,7 @@ fn kafka_answer(
     partition: i32,
     topic_id: Option<&str>,
     end: i64,
-    newest: bool,
+    newest_end: Option<i64>,
 ) -> CommittedKafkaOffset {
     CommittedKafkaOffset {
         topic: topic.into(),
@@ -1105,7 +1106,7 @@ fn kafka_answer(
         consumer_group: "g".into(),
         topic_id: topic_id.map(str::to_owned),
         end_offset: end,
-        newest,
+        newest_end,
     }
 }
 
@@ -1176,7 +1177,7 @@ async fn committed_kafka_offsets_of_rows_with_no_topic_id_are_the_newest_row_of_
         consumer_group: group.into(),
         topic_id: None,
         end_offset: end,
-        newest: true,
+        newest_end: Some(end),
     };
     assert_eq!(
         got,
@@ -1267,7 +1268,7 @@ async fn a_kafka_range_committed_below_a_newer_one_never_lowers_the_resume_point
     commit_the_a_b_c_sequence(store, topic, 0, Some("inc-1"), "2030-02-01").await;
     assert_eq!(
         kafka_answers(store, topic, 0).await,
-        vec![kafka_answer(topic, 0, Some("inc-1"), 19, true)],
+        vec![kafka_answer(topic, 0, Some("inc-1"), 19, Some(9))],
         "B committed r1 (end 19) although C, created after it, ended at 9: the adapter resumes \
          at end + 1, so 20 is right and 10 re-archives r1"
     );
@@ -1312,11 +1313,48 @@ async fn a_recreated_topic_resumes_from_its_own_incarnation(store: &dyn StateSto
     assert_eq!(
         kafka_answers(store, topic, 0).await,
         vec![
-            kafka_answer(topic, 0, Some("inc-new"), 7, true),
-            kafka_answer(topic, 0, Some("inc-old"), 500, false),
+            kafka_answer(topic, 0, Some("inc-new"), 7, Some(7)),
+            kafka_answer(topic, 0, Some("inc-old"), 500, None),
         ],
         "each incarnation keeps its own highest end, and the one holding the newest row is \
          marked: resuming at the old topic's 501 would skip the new topic's records 8 to 500"
+    );
+}
+
+/// The adapter holds a topic's id for up to a minute, so ranges read just
+/// after a recreate can carry the OLD id: an older row ending at 500 and a
+/// newer row ending at 7 then share one id. The id's answer is 500 (its highest
+/// end), and the fallback for an adapter that cannot learn the current id is
+/// the newest row's own end, 7, as the ledger always resumed - never 500, which
+/// would skip the new log's records 8 to 500.
+async fn the_newest_rows_own_end_is_carried_when_it_ends_below_an_older_row_of_its_id(
+    store: &dyn StateStore,
+) {
+    let topic = "kafka_resume_cache_window";
+    for rec in [
+        kafka_row(
+            topic,
+            0,
+            Some("inc-old"),
+            "cw-1",
+            (0, 500),
+            "2030-06-01T00:00:01Z",
+        ),
+        kafka_row(
+            topic,
+            0,
+            Some("inc-old"),
+            "cw-2",
+            (0, 7),
+            "2030-06-02T00:00:01Z",
+        ),
+    ] {
+        commit_kafka_row(store, &rec).await;
+    }
+    assert_eq!(
+        kafka_answers(store, topic, 0).await,
+        vec![kafka_answer(topic, 0, Some("inc-old"), 500, Some(7))],
+        "the answer of the id is its highest end, and it carries the newest row's own end"
     );
 }
 
@@ -1359,8 +1397,8 @@ async fn rows_with_no_topic_id_are_never_compared_with_rows_of_a_known_one(store
     assert_eq!(
         kafka_answers(store, topic, 0).await,
         vec![
-            kafka_answer(topic, 0, None, 310, false),
-            kafka_answer(topic, 0, Some("inc-1"), 9, true),
+            kafka_answer(topic, 0, None, 310, None),
+            kafka_answer(topic, 0, Some("inc-1"), 9, Some(9)),
         ],
         "no maximum across an unknown and a known id: the unknown rows answer with their \
          newest row's end, the known id with its own"
@@ -2491,8 +2529,8 @@ async fn pruning_does_not_move_the_answer_that_holds_the_newest_kafka_row(store:
         .await;
     }
     let before = vec![
-        kafka_answer(topic, 0, None, 5, false),
-        kafka_answer(topic, 0, Some("inc-1"), 19, true),
+        kafka_answer(topic, 0, None, 5, None),
+        kafka_answer(topic, 0, Some("inc-1"), 19, Some(9)),
     ];
     assert_eq!(kafka_answers(store, topic, 0).await, before);
     let future = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
@@ -2571,9 +2609,9 @@ async fn prune_keeps_the_max_end_row_of_each_topic_incarnation(store: &dyn State
         .await;
     }
     let before = vec![
-        kafka_answer(topic, 0, None, 105, false),
-        kafka_answer(topic, 0, Some("inc-1"), 19, false),
-        kafka_answer(topic, 0, Some("inc-2"), 9, true),
+        kafka_answer(topic, 0, None, 105, None),
+        kafka_answer(topic, 0, Some("inc-1"), 19, None),
+        kafka_answer(topic, 0, Some("inc-2"), 9, Some(9)),
     ];
     assert_eq!(
         kafka_answers(store, topic, 0).await,
