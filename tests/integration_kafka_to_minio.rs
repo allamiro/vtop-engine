@@ -181,8 +181,11 @@ async fn read_returns_records_from_a_non_empty_topic() {
     }
 }
 
-/// A pass that fills its budget leaves the next record unkept; the next pass
-/// reads on from it WITHOUT re-assigning the partition. A re-assign restarts
+/// A pass that fills its BYTE budget leaves the record that did not fit
+/// unkept; the next pass reads on from it WITHOUT re-assigning the partition.
+/// (A record budget, or bytes landing exactly on the budget, stop the pass
+/// before the next record is polled: 475 bytes is not a multiple of these
+/// 46-to-48-byte records.) A re-assign restarts
 /// every partition's fetcher, and on a 64 MiB budget the pass after it often
 /// read nothing while the fetch restarted. Nothing is skipped or read twice.
 #[tokio::test]
@@ -202,7 +205,7 @@ async fn a_pass_that_fills_its_budget_reads_on_without_re_assigning() {
         let reads = through_warm_up!(
             "a budgeted pass",
             adapter
-                .read_batch_candidates(&src, 10, 1 << 20, std::time::Duration::from_secs(5))
+                .read_batch_candidates(&src, 1_000, 475, std::time::Duration::from_secs(5))
                 .await
         );
         for read in &reads {
@@ -213,10 +216,10 @@ async fn a_pass_that_fills_its_budget_reads_on_without_re_assigning() {
             else {
                 panic!("a Kafka read carries Kafka markers");
             };
+            let bytes: usize = read.records.iter().map(Vec::len).sum();
             assert!(
-                read.records.len() <= 10,
-                "a pass kept {} records over its budget",
-                read.records.len()
+                bytes <= 475,
+                "a pass kept {bytes} bytes over its 475-byte budget"
             );
             offsets.push((*start_offset, *end_offset));
         }
