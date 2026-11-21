@@ -961,17 +961,20 @@ ${reads_ok} reads answered, ${reads_failed} failed; holders observed:${observed:
 # a fencing proof.
 #
 # The optional 4th argument records the attempt in the scenario's history
-# (#728) as a batch the checker must never find visible. The record carries a
-# producer sequence no other producer in a scenario reaches
-# (FENCED_PROBE_SEQUENCE), so if it ever surfaced it could not pass for one
-# of the stream's own records. The sequence cannot change the answer: the
-# broker checks the range's fencing epoch before it looks at sequences.
+# (#728) as a batch the checker must never find visible (`--fenced-probe`:
+# a `Fenced` answer on its own does not say whether the batch was appended
+# first, so the client records it as unknown unless told the target is
+# fenced). The record carries a producer sequence no other producer in a
+# scenario reaches (FENCED_PROBE_SEQUENCE), so if it ever surfaced it could
+# not pass for one of the stream's own records. The sequence cannot change
+# the answer: the broker checks the range's fencing epoch before it looks at
+# sequences.
 FENCED_PROBE_SEQUENCE=1099511627776 # 2^40
 assert_fenced_produce() {
   local addr="$1" epoch="$2" message="$3" history="${4:-}"
   local record=()
   [[ -n "$history" ]] \
-    && record=(--history "$history" --first-sequence "$FENCED_PROBE_SEQUENCE")
+    && record=(--history "$history" --fenced-probe --first-sequence "$FENCED_PROBE_SEQUENCE")
   if "$VTOP_NODE" produce --client-config "$(emit_client_config_at_epoch "$epoch")" \
     --addr "$addr" --records 1 --batch 1 --durability quorum \
     ${record[@]+"${record[@]}"} \

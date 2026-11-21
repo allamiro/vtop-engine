@@ -174,17 +174,21 @@ plane promises.
 Recording. `vtop-node produce --history FILE` appends one JSON line before
 each batch goes out (its producer, epoch and sequences) and one when it is
 answered: `ok` with the acknowledged offset, `fail` for a refusal made before
-anything was appended (`Fenced`, `WrongRange`, a sequence conflict), or `info`
-when the outcome is unknown: no answer, a dropped connection, or an answer
-that does not settle it. `Overloaded` ("quorum not reached") is `info`, because
-the leader appended the batch before its quorum wait expired, so the records
-may still surface. `vtop-node verify --dump FILE` records what one read found
+anything was appended (`WrongRange`, a sequence conflict), or `info` when the
+outcome is unknown: no answer, a dropped connection, or an answer that does not
+settle it. `Overloaded` ("quorum not reached") is `info`, because the leader
+appended the batch before its quorum wait expired, so the records may still
+surface; so is `Fenced`, because the broker checks the lease again after
+appending and replicating, before it publishes the commit, and answers the
+same way. `--fenced-probe` records every refusal as `fail`: the caller says
+the target is a leader it fenced, whose records must never surface. `vtop-node verify --dump FILE` records what one read found
 up to the committed high watermark, compressed into runs of consecutive
 offsets and sequences. `lib.sh` puts each client's file under
 `$WORKDIR/history/` (`history_file NAME`); `CHAOS_READ_HISTORY` makes
 `await_verified_floor` record every attempt; `assert_fenced_produce` records
-its probe when given a history file, at a producer sequence (2^40) no stream
-reaches, so the probe's record could not pass for one of the stream's own.
+its probe (`--fenced-probe`) when given a history file, at a producer sequence
+(2^40) no stream reaches, so the probe's record could not pass for one of the
+stream's own.
 
 Checking. `check_history` runs
 `scripts/live-chaos/history/check_history.py` over every file and fails the
@@ -195,7 +199,7 @@ against it:
 | Check | What fails it |
 |---|---|
 | `lost` | an acknowledged record missing from its acknowledged offset, or a different record there (the #611 and #261 shapes) |
-| `duplicate` | two acknowledgements claiming one offset, or an acknowledged or unanswered record visible a second time |
+| `duplicate` | two acknowledgements claiming one offset, or an acknowledged or unanswered record visible a second time. A record is its producer's id, epoch and sequence: a retry from a new process sends the same records again, so an unanswered attempt cannot account for a copy of what its retry was acknowledged for |
 | `order` | a producer acknowledged at an offset below one it was acknowledged at earlier |
 | `phantom` | a visible record that no acknowledged batch claims and no whole unanswered batch accounts for; a record of a refused (`fail`) batch, which is what a fenced leader's writes would be (the #641 shape) |
 | `rewritten` | a record an earlier read saw, below the last read's high watermark, that the last read sees differently |
@@ -203,7 +207,9 @@ against it:
 | `unkeyed` | a visible record whose key is not a producer sequence |
 
 An unanswered batch may surface once, whole, or not at all; the checker
-does not count either outcome as a violation. Offsets the consumer never sees
+does not count either outcome as a violation. Matching unanswered batches to
+the visible records they explain is a search: it backtracks, so a phantom is
+reported only when no assignment of whole batches accounts for the records. Offsets the consumer never sees
 (a promotion's boundary marker, #240) are gaps, not records, and are not
 counted against anything; `verify --max-offset-gaps` still bounds them.
 

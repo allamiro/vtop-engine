@@ -111,6 +111,12 @@ enum Command {
         /// for the history checker (#728).
         #[arg(long)]
         history: Option<PathBuf>,
+        /// The target is a leader the caller has fenced: record any answer
+        /// short of an acknowledgement as a refusal whose records must never
+        /// become visible, whatever the error code (`Fenced` alone cannot say
+        /// whether the batch was appended first).
+        #[arg(long)]
+        fenced_probe: bool,
     },
     /// Fetch from offset 0 and byte-verify everything below the committed HWM.
     Verify {
@@ -302,6 +308,7 @@ async fn run(cli: Cli) -> Result<i32, String> {
             ack_log,
             request_timeout_ms,
             history,
+            fenced_probe,
         } => {
             let config = client::ClientConfig::load(&client_config)?;
             client::produce(
@@ -319,6 +326,7 @@ async fn run(cli: Cli) -> Result<i32, String> {
                     ack_log,
                     request_timeout_ms,
                     history,
+                    fenced_probe,
                 },
             )
             .await

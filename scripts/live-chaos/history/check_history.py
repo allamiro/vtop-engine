@@ -9,13 +9,15 @@ A scenario records what its clients did and saw, as JSON lines that
            ok      acknowledged: the batch's records sit at
                    [committed_next_offset - count, committed_next_offset)
            fail    refused by the broker before anything was appended (a
-                   fenced leader, a wrong range, a sequence conflict): the
+                   wrong range, a sequence conflict), or any refusal from a
+                   leader the scenario fenced (`produce --fenced-probe`): the
                    records must never be visible
            info    no answer (the leader died, the connection closed), or an
                    answer that does not settle it ("quorum not reached" comes
                    after the leader's own append, a storage error can come part
-                   way through one): the batch is indeterminate, visible once
-                   or not at all
+                   way through one, and `Fenced` can come from the lease check
+                   the broker repeats after replicating): the batch is
+                   indeterminate, visible once or not at all
            (an invoke with no outcome, from a process killed mid-batch, is
            indeterminate too)
   read     records a run of visible records: `count` records at consecutive
@@ -32,7 +34,9 @@ it too. The invariants:
   lost          every acknowledged record is visible at its acknowledged
                 offset, with its own key and value
   duplicate     no two acknowledged batches claim one offset, and no
-                acknowledged or indeterminate record is visible a second time
+                acknowledged or indeterminate record is visible a second time:
+                a record is its producer's (id, epoch, sequence), so a retry
+                from a new process sends the same records, not new ones
   order         a producer's acknowledgements move forward: each acknowledged
                 batch sits above the one acknowledged before it
   phantom       every visible record is an acknowledged one, or a whole
@@ -57,6 +61,9 @@ from dataclasses import dataclass, field
 
 # How many violations of one kind the summary lists in full.
 LISTED = 20
+# Steps the search for a tiling of one visible group may take before it gives
+# up and reports the group unexplained.
+SEARCH_BUDGET = 100_000
 
 
 @dataclass
@@ -75,6 +82,20 @@ class Batch:
             f"{self.process} batch {self.batch} (sequences {self.first_sequence}.."
             f"{self.first_sequence + self.count - 1})"
         )
+
+    def identity(self) -> str:
+        """The producer the records belong to, across processes: `produce`
+        names its process `produce:<producer id>:<producer epoch>:<pid>`, and
+        a retry from a new process under the same producer id and epoch sends
+        the same logical records, which the log must hold at most once."""
+        parts = self.process.split(":")
+        if len(parts) == 4 and parts[0] == "produce":
+            return ":".join(parts[:3])
+        return self.process
+
+    def logical(self) -> set[tuple[str, int]]:
+        identity = self.identity()
+        return {(identity, self.first_sequence + i) for i in range(self.count)}
 
 
 @dataclass
@@ -208,6 +229,11 @@ def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) 
     indeterminate = [b for b in batches if b.outcome == "info"]
     refused = [b for b in batches if b.outcome == "fail"]
     used: set[tuple[str, int]] = set()
+    # Logical records already visible: an unanswered attempt cannot explain a
+    # second copy of a record its producer's retry was acknowledged for.
+    surfaced: set[tuple[str, int]] = set()
+    for batch in acked:
+        surfaced |= batch.logical()
     for group in groups:
         sequences = [visible[o][0] for o in group]
         if sequences[0] is None:
@@ -218,7 +244,7 @@ def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) 
                 violations["unkeyed"].append(message)
             continue
         all_values_match = all(visible[o][1] for o in group)
-        explained = _explain(sequences, all_values_match, indeterminate, used)
+        explained = _explain(sequences, all_values_match, indeterminate, used, surfaced)
         if explained is not None:
             continue
         matching_refused = [b.name() for b in refused if _covers(b, sequences)]
@@ -274,30 +300,54 @@ def _explain(
     values_match: bool,
     indeterminate: list[Batch],
     used: set[tuple[str, int]],
+    surfaced: set[tuple[str, int]],
 ) -> list[Batch] | None:
     """Indeterminate batches that tile `sequences` whole, in order, each used
-    once; `None` when none do. A batch is appended whole or not at all."""
+    once and none repeating a logical record already visible; `None` when no
+    tiling exists. A batch is appended whole or not at all. The search
+    backtracks: the first batch that fits a position can lead to a dead end
+    another would not (an unanswered 0..4 and an unanswered 0..9 under a
+    visible 0..9). Batches of one producer with the same sequences are
+    interchangeable, so each position tries one of each shape, the earliest."""
     if not values_match:
         return None
-    position, chosen = 0, []
-    while position < len(sequences):
-        candidates = [
-            b
-            for b in indeterminate
-            if (b.process, b.batch) not in used
-            and b.first_sequence == sequences[position]
-            and position + b.count <= len(sequences)
-        ]
-        if not candidates:
-            for b in chosen:
-                used.discard((b.process, b.batch))
-            return None
-        batch = min(candidates, key=lambda b: (b.time_us, b.process, b.batch))
-        used.add((batch.process, batch.batch))
-        chosen.append(batch)
-        position += batch.count
-    return chosen
+    by_start: dict[int, list[Batch]] = defaultdict(list)
+    for batch in sorted(indeterminate, key=lambda b: (b.time_us, b.process, b.batch)):
+        by_start[batch.first_sequence].append(batch)
+    chosen: list[Batch] = []
+    budget = [SEARCH_BUDGET]
 
+    def search(position: int) -> bool:
+        if position == len(sequences):
+            return True
+        budget[0] -= 1
+        if budget[0] < 0:
+            return False
+        shapes: set[tuple[str, int]] = set()
+        for batch in by_start.get(sequences[position], []):
+            shape = (batch.identity(), batch.count)
+            if (
+                shape in shapes
+                or (batch.process, batch.batch) in used
+                or position + batch.count > len(sequences)
+                or sequences[position + batch.count - 1] != batch.first_sequence + batch.count - 1
+            ):
+                continue
+            logical = batch.logical()
+            if logical & surfaced:
+                continue
+            shapes.add(shape)
+            used.add((batch.process, batch.batch))
+            surfaced.update(logical)
+            chosen.append(batch)
+            if search(position + batch.count):
+                return True
+            chosen.pop()
+            surfaced.difference_update(logical)
+            used.discard((batch.process, batch.batch))
+        return False
+
+    return list(chosen) if search(0) else None
 
 def summarize(batches, reads, violations, notes) -> dict:
     counts = defaultdict(int)

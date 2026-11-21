@@ -274,6 +274,10 @@ pub struct ProduceArgs {
     pub request_timeout_ms: u64,
     /// Record every batch's invocation and outcome here (#728).
     pub history: Option<PathBuf>,
+    /// The produce targets a leader the caller has fenced: whatever it
+    /// answers short of an acknowledgement, its records must never become
+    /// visible, so the history records them as refused (`fail`).
+    pub fenced_probe: bool,
 }
 
 /// When record number `index` of the schedule is due, at `rate` records per
@@ -344,7 +348,10 @@ enum ProduceBatchError {
 /// appended, so its records can never become visible (a history's `fail`).
 /// Anything else is indeterminate (`info`): `Overloaded` is how a leader
 /// reports a quorum wait that expired after it appended and fsynced the batch
-/// itself, and `Storage` can fail part way through an append.
+/// itself, `Storage` can fail part way through an append, and `Fenced` comes
+/// both from the lease check at admission and from the one the broker repeats
+/// after appending and replicating, before it publishes the commit, with the
+/// same message either way.
 fn refusal_is_definite(code: ErrorCode) -> bool {
     matches!(
         code,
@@ -353,7 +360,6 @@ fn refusal_is_definite(code: ErrorCode) -> bool {
             | ErrorCode::Unauthorized
             | ErrorCode::WrongCluster
             | ErrorCode::WrongRange
-            | ErrorCode::Fenced
             | ErrorCode::SequenceConflict
             | ErrorCode::ProtocolViolation
             | ErrorCode::WrongLineage
@@ -508,7 +514,7 @@ pub async fn produce(config: &ClientConfig, args: ProduceArgs) -> Result<i32, St
             }
         };
         if let Some(history) = history.as_mut() {
-            let (kind, offset, error) = match &outcome {
+            let (mut kind, offset, error) = match &outcome {
                 Ok(next) => ("ok", Some(*next), None),
                 Err(ProduceBatchError::AckedOutOfPlace {
                     committed_next_offset,
@@ -528,6 +534,9 @@ pub async fn produce(config: &ClientConfig, args: ProduceArgs) -> Result<i32, St
                 Err(ProduceBatchError::Failed(error)) => ("info", None, Some(error.clone())),
                 Err(ProduceBatchError::Interrupted(error)) => ("info", None, Some(error.clone())),
             };
+            if args.fenced_probe && kind == "info" {
+                kind = "fail";
+            }
             let mut event = fields([
                 ("op", "produce".into()),
                 ("type", kind.into()),
@@ -1035,7 +1044,6 @@ mod history_tests {
     #[test]
     fn only_a_refusal_made_before_the_append_is_definite() {
         for code in [
-            ErrorCode::Fenced,
             ErrorCode::WrongRange,
             ErrorCode::WrongCluster,
             ErrorCode::Unauthorized,
@@ -1043,7 +1051,9 @@ mod history_tests {
         ] {
             assert!(refusal_is_definite(code), "{code:?}");
         }
-        for code in [ErrorCode::Overloaded, ErrorCode::Storage] {
+        // `Fenced` too can come after the append: the broker checks the lease
+        // again before it publishes a replicated batch's commit.
+        for code in [ErrorCode::Overloaded, ErrorCode::Storage, ErrorCode::Fenced] {
             assert!(!refusal_is_definite(code), "{code:?}");
         }
     }

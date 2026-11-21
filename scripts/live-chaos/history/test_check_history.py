@@ -103,6 +103,33 @@ class CleanHistories(unittest.TestCase):
         self.assertTrue(h.check()["valid"])
 
 
+    def test_a_retry_acknowledged_where_its_unanswered_attempt_landed_is_one_copy(self):
+        # The leader died before answering; the producer, restarted as a new
+        # process under the same id and epoch, resent the batch, and the new
+        # leader answered it from the copy that had landed.
+        h = History()
+        h.produce("produce:P:1:100", 1, 0, 10, "info")
+        h.produce("produce:P:1:200", 1, 0, 10, "ok", 10)
+        h.read("r", [(0, 0, 10)], 10)
+        self.assertTrue(h.check()["valid"])
+
+    def test_the_search_backtracks_to_the_attempt_that_explains_the_whole_run(self):
+        # An earlier unanswered 0..4 fits first and dead-ends at 5; the later
+        # unanswered 0..9 explains the visible run whole (review of #878).
+        h = History()
+        h.produce("a", 1, 0, 5, "info").produce("b", 1, 0, 10, "info")
+        h.read("r", [(0, 0, 10)], 10)
+        self.assertTrue(h.check()["valid"], h.check())
+
+    def test_a_producer_under_a_new_epoch_writes_new_records(self):
+        # Scenario 09's resumed producer: epoch 2 restarts at sequence 0, and
+        # its records are not copies of epoch 1's.
+        h = History()
+        h.produce("produce:P:1:100", 1, 0, 10, "info")
+        h.produce("produce:P:2:200", 1, 0, 10, "ok", 20)
+        h.read("r", [(0, 0, 10), (10, 0, 10)], 20)
+        self.assertTrue(h.check()["valid"])
+
 class Violations(unittest.TestCase):
     def test_611_an_acknowledged_suffix_truncated_at_failover_is_lost(self):
         h = History()
@@ -150,6 +177,15 @@ class Violations(unittest.TestCase):
         h = History()
         h.produce("p", 1, 0, 10, "ok", 10).produce("p", 2, 10, 10, "info")
         h.read("r", [(0, 0, 20), (20, 10, 10)], 30)
+        self.assertEqual(kinds(h.check()), {"duplicate"})
+
+    def test_an_unanswered_attempt_cannot_explain_a_copy_of_its_acknowledged_retry(self):
+        # Review of #878: the retry was acknowledged at 10..19, so the same
+        # producer's records at 0..9 are a second copy, not the attempt.
+        h = History()
+        h.produce("produce:P:1:100", 1, 0, 10, "info")
+        h.produce("produce:P:1:200", 1, 0, 10, "ok", 20)
+        h.read("r", [(0, 0, 10), (10, 0, 10)], 20)
         self.assertEqual(kinds(h.check()), {"duplicate"})
 
     def test_an_acknowledged_record_visible_a_second_time_is_a_duplicate(self):
