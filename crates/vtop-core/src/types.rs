@@ -200,6 +200,25 @@ pub enum ProgressMarker {
         start_offset: i64,
         end_offset: i64,
         consumer_group: String,
+        /// The topic's id (the broker's UUID for it, base64url without
+        /// padding) when this range was read. A topic that is deleted and
+        /// created again under the same name numbers its offsets from zero
+        /// again and gets a new id, so the name and an offset cannot tell
+        /// the two logs apart and the id can: the ledger resumes a partition
+        /// from the highest committed end among the rows of ONE id.
+        ///
+        /// LEDGER ONLY: [`ProgressMarker::for_manifest`] clears it, so a
+        /// manifest is byte for byte what released readers verify. `None` on
+        /// a row written before the field existed, on a broker that has no
+        /// topic ids (before Kafka 2.8) or did not answer, and for a stored
+        /// value that is empty. Omitted when `None`, so such a marker
+        /// serializes as the code before it wrote it.
+        #[serde(
+            default,
+            deserialize_with = "plausible_topic_id",
+            skip_serializing_if = "Option::is_none"
+        )]
+        topic_id: Option<String>,
     },
     File {
         path: String,
@@ -420,6 +439,25 @@ where
     })
 }
 
+/// A marker's stored topic id, or `None` when it is absent, not a string, or
+/// empty: an id no writer produces reads as "unknown", never as an id that
+/// could match another row's.
+fn plausible_topic_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Stored {
+        Text(String),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Option::<Stored>::deserialize(deserializer)? {
+        Some(Stored::Text(text)) => Some(text).filter(|t| !t.is_empty()),
+        Some(Stored::Other(_)) | None => None,
+    })
+}
+
 impl ProgressMarker {
     /// The [`SourceType`] this marker belongs to.
     pub fn source_type(&self) -> SourceType {
@@ -474,6 +512,12 @@ impl ProgressMarker {
             (Some(a), Some(b)) => a == b,
             _ => true,
         };
+        // Two known ids that differ are two incarnations of the topic, whose
+        // offsets are not one range; an unknown id proves no change.
+        let same_topic_id = |a: &Option<String>, b: &Option<String>| match (a, b) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        };
         let mut span = last.clone();
         match (first, &mut span) {
             (
@@ -482,6 +526,7 @@ impl ProgressMarker {
                     partition: first_partition,
                     consumer_group: first_group,
                     start_offset: first_start,
+                    topic_id: first_topic_id,
                     ..
                 },
                 ProgressMarker::Kafka {
@@ -489,11 +534,13 @@ impl ProgressMarker {
                     partition,
                     consumer_group,
                     start_offset,
+                    topic_id,
                     ..
                 },
             ) if first_topic == topic
                 && first_partition == partition
                 && first_group == consumer_group
+                && same_topic_id(first_topic_id, topic_id)
                 && first_start <= start_offset =>
             {
                 *start_offset = *first_start;
@@ -591,7 +638,7 @@ impl ProgressMarker {
     pub fn for_manifest(&self) -> Self {
         let mut marker = self.clone();
         match &mut marker {
-            ProgressMarker::Kafka { .. } => {}
+            ProgressMarker::Kafka { topic_id, .. } => *topic_id = None,
             ProgressMarker::File {
                 content_fingerprint,
                 tail_fingerprint,
@@ -913,6 +960,7 @@ mod tests {
             start_offset: start,
             end_offset: end,
             consumer_group: "g".into(),
+            topic_id: None,
         }
     }
 
@@ -1021,6 +1069,102 @@ mod tests {
         let mut widened = other.clone();
         widened.widen_received_times(&first);
         assert_eq!(widened, other, "another spool's times were lent");
+    }
+
+    /// A Kafka row as every release before the topic id writes it: the v0.3
+    /// fixture, captured from that release.
+    const PRE_TOPIC_ID_KAFKA_ROW: &str = include_str!("../tests/fixtures/markers/kafka-0.3.json");
+
+    /// A Kafka row from before the topic id decodes with none and re-encodes
+    /// byte for byte; a marker with one round-trips, an older reader (which
+    /// ignores the key) sees the same marker, and a manifest never carries it.
+    #[test]
+    fn markers_written_before_the_topic_id_decode_as_unknown_and_a_manifest_carries_none() {
+        let old: ProgressMarker = serde_json::from_str(PRE_TOPIC_ID_KAFKA_ROW).unwrap();
+        assert!(matches!(
+            &old,
+            ProgressMarker::Kafka {
+                topic_id: None,
+                partition: 3,
+                ..
+            }
+        ));
+        assert_eq!(
+            serde_json::to_string(&old).unwrap(),
+            PRE_TOPIC_ID_KAFKA_ROW.trim()
+        );
+
+        let mut marker = old.clone();
+        if let ProgressMarker::Kafka { topic_id, .. } = &mut marker {
+            *topic_id = Some("Zk3pXK7bTfyqY0v9mQw1ZA".into());
+        }
+        let json = serde_json::to_string(&marker).unwrap();
+        assert!(
+            json.contains(r#""topic_id":"Zk3pXK7bTfyqY0v9mQw1ZA""#),
+            "{json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<ProgressMarker>(&json).unwrap(),
+            marker
+        );
+        // What the code before the field does with it: serde ignores the
+        // unknown key, so the marker it reads is the old one.
+        let mut as_older: serde_json::Value = serde_json::from_str(&json).unwrap();
+        as_older.as_object_mut().unwrap().remove("topic_id");
+        assert_eq!(
+            as_older,
+            serde_json::from_str::<serde_json::Value>(PRE_TOPIC_ID_KAFKA_ROW).unwrap()
+        );
+
+        let manifest = serde_json::to_string(&marker.for_manifest()).unwrap();
+        assert_eq!(
+            manifest,
+            PRE_TOPIC_ID_KAFKA_ROW.trim(),
+            "an older verify-manifest drops what it does not know and would fail the \
+             self-hash: {manifest}"
+        );
+    }
+
+    /// A stored topic id that no writer produces (empty, not a string) reads
+    /// as unknown, never as an id another row could match.
+    #[test]
+    fn an_empty_or_malformed_stored_topic_id_reads_as_unknown() {
+        for stored in [r#""""#, "null", "7", r#"["x"]"#] {
+            let json = PRE_TOPIC_ID_KAFKA_ROW.replace(
+                r#""consumer_group":"vtop-archive""#,
+                &format!(r#""consumer_group":"vtop-archive","topic_id":{stored}"#),
+            );
+            let marker: ProgressMarker = serde_json::from_str(&json).unwrap();
+            assert!(
+                matches!(marker, ProgressMarker::Kafka { topic_id: None, .. }),
+                "{stored}"
+            );
+        }
+    }
+
+    /// Two ranges of one topic name read under different ids are two logs
+    /// whose offsets are unrelated: no span is claimed across them. An unknown
+    /// id on either side proves no change.
+    #[test]
+    fn a_span_never_joins_two_incarnations_of_a_topic() {
+        let with_id = |start: i64, end: i64, id: Option<&str>| {
+            let mut m = kafka("t", 0, start, end);
+            if let ProgressMarker::Kafka { topic_id, .. } = &mut m {
+                *topic_id = id.map(str::to_owned);
+            }
+            m
+        };
+        let first = with_id(0, 0, Some("old"));
+        let last = with_id(5, 9, Some("new"));
+        assert_eq!(ProgressMarker::spanning(&first, &last), last);
+        assert_eq!(
+            ProgressMarker::spanning(&with_id(0, 0, Some("a")), &with_id(5, 9, Some("a"))),
+            with_id(0, 9, Some("a"))
+        );
+        assert_eq!(
+            ProgressMarker::spanning(&with_id(0, 0, None), &with_id(5, 9, Some("a"))),
+            with_id(0, 9, Some("a"))
+        );
     }
 
     /// #620 with #622: a span ends where the LAST read ended, so its tail
