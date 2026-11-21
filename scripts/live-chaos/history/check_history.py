@@ -394,6 +394,18 @@ def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) 
             offset = batch.offset_of(i)
             if claimed.get(offset, (None, None))[1] == (batch.identity(), batch.first_sequence + i):
                 sent_by[offset] = min(sent_by.get(offset, batch.time_us), batch.time_us)
+    # An earlier unanswered attempt of the same records may have put them
+    # there first: a retry is answered with the offsets it already holds
+    # (review of #878).
+    attempts: dict[str, list[Batch]] = defaultdict(list)
+    for batch in batches:
+        if batch.outcome == "info":
+            attempts[batch.identity()].append(batch)
+    for offset in list(sent_by):
+        identity, sequence = claimed[offset][1]
+        for attempt in attempts.get(identity, []):
+            if attempt.first_sequence <= sequence < attempt.first_sequence + attempt.count:
+                sent_by[offset] = min(sent_by[offset], attempt.time_us)
     for offset, sent in sorted(sent_by.items()):
         seen = first_seen_us.get(offset)
         if seen is not None and sent >= seen:
