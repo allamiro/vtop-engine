@@ -1462,23 +1462,38 @@ pub async fn verify_manifest_deep(
 
     // 3b. How the store keeps the manifest and the object, when the backend
     // was configured to ask for encryption at rest: said only then.
+    // The JSON report carries every result, `not_requested` included, so a
+    // consumer of `--json` can name the object that failed and why.
     let mut encryption = Vec::new();
+    let mut encryption_json = Vec::new();
     for (what, uri) in [
         ("manifest", manifest_uri),
         ("object", parsed.fields().object.uri.as_str()),
     ] {
-        match backend.check_encryption(uri, None).await {
-            Ok(vtop_upload::EncryptionCheck::NotRequested) => {}
-            Ok(vtop_upload::EncryptionCheck::Encrypted) => encryption.push(format!("{what} OK")),
+        let (state, reason) = match backend.check_encryption(uri, None).await {
+            Ok(vtop_upload::EncryptionCheck::NotRequested) => ("not_requested", None),
+            Ok(vtop_upload::EncryptionCheck::Encrypted) => {
+                encryption.push(format!("{what} OK"));
+                ("encrypted", None)
+            }
             Ok(vtop_upload::EncryptionCheck::Violation(why)) => {
                 failed = true;
                 encryption.push(format!("{what} FAILED ({why})"));
+                ("violation", Some(why))
             }
             Err(e) => {
                 failed = true;
-                encryption.push(format!("{what} FAILED (could not be checked: {e})"));
+                let why = format!("could not be checked: {e}");
+                encryption.push(format!("{what} FAILED ({why})"));
+                ("unchecked", Some(why))
             }
-        }
+        };
+        encryption_json.push(serde_json::json!({
+            "target": what,
+            "uri": uri,
+            "state": state,
+            "reason": reason,
+        }));
     }
     if !encryption.is_empty() {
         lines.push(format!("encryption      : {}", encryption.join("; ")));
@@ -1525,6 +1540,7 @@ pub async fn verify_manifest_deep(
         "manifest_verified_with_key": verified_with,
         "object_size_ok": size_ok,
         "object_content": checksum_status,
+        "encryption": encryption_json,
         "ledger": ledger_status,
         "backend": backend.backend_name(),
         "passed": !failed,

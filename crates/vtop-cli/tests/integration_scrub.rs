@@ -2202,6 +2202,57 @@ async fn verify_says_how_the_manifest_and_object_are_kept_and_fails_on_one_unenc
     );
 }
 
+/// Review of #856: `vtopctl verify --json` printed `passed: false` with every
+/// reported check a success when encryption alone failed, because the
+/// encryption results reached only the human-readable lines. The JSON names
+/// each object, how the store keeps it, and why it failed.
+#[tokio::test]
+async fn verify_json_names_the_object_kept_unencrypted_and_why() {
+    let a = archive(1).await;
+    let keyring = a.engine.config.resolve_manifest_keyring().unwrap();
+    let muri = a.ledger().await[0].manifest_uri.clone().unwrap();
+    let run = || async {
+        vtop_cli::commands::verify_manifest_deep(
+            a.engine.store.as_ref(),
+            a.engine.backend.as_ref(),
+            &muri,
+            &keyring,
+        )
+        .await
+        .unwrap()
+    };
+    let plain = run().await;
+    assert!(plain.passed, "{:?}", plain.lines);
+    let object_uri = plain.json["object_uri"].as_str().unwrap().to_owned();
+    assert_eq!(
+        plain.json["encryption"],
+        serde_json::json!([
+            {"target": "manifest", "uri": muri, "state": "not_requested", "reason": null},
+            {"target": "object", "uri": object_uri, "state": "not_requested", "reason": null},
+        ]),
+        "{:#}",
+        plain.json
+    );
+
+    a.mock.set_unencrypted_suffix(Some(&object_uri), false);
+    let verify = run().await;
+    assert!(!verify.passed);
+    assert_eq!(verify.json["passed"], false);
+    let encryption = verify.json["encryption"].as_array().unwrap();
+    assert_eq!(encryption.len(), 2, "{:#}", verify.json);
+    assert_eq!(encryption[0]["target"], "manifest");
+    assert_eq!(encryption[0]["state"], "encrypted");
+    assert!(encryption[0]["reason"].is_null(), "{:#}", verify.json);
+    assert_eq!(encryption[1]["target"], "object");
+    assert_eq!(encryption[1]["uri"], object_uri.as_str());
+    assert_eq!(encryption[1]["state"], "violation");
+    let reason = encryption[1]["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("encryption at rest missing") && reason.contains(&object_uri),
+        "{reason}"
+    );
+}
+
 /// A receipt kept without the encryption is a receipt finding, like one that
 /// does not authenticate; the batch's own content is fine.
 #[tokio::test]
