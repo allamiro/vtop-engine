@@ -155,6 +155,25 @@ const INITIAL_FRAME_CAPACITY: usize = 64 * 1024;
 /// What ListOffsets answers as the timestamp of a boundary lookup: unknown.
 const TIMESTAMP_UNKNOWN: i64 = -1;
 
+/// The most one Fetch response may carry, whatever `max_bytes` and each
+/// partition's `partition_max_bytes` ask for (50 MiB, the default of Kafka's
+/// own `fetch.max.bytes`).
+///
+/// Both numbers come off the wire as an `i32`. Taken as they stand, one
+/// request could ask a node to read, copy and encode up to 2 GiB of log into
+/// a single response, and a client can send such a request on every session
+/// it holds.
+const MAX_FETCH_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
+
+/// The byte budget for a whole Fetch response: what the client asked for,
+/// at least one byte (the at-least-one-batch rule), at most
+/// [`MAX_FETCH_RESPONSE_BYTES`].
+fn fetch_response_budget(requested: i32) -> usize {
+    usize::try_from(requested.max(1))
+        .unwrap_or(usize::MAX)
+        .min(MAX_FETCH_RESPONSE_BYTES)
+}
+
 /// Resolves when `shutdown` reads `true`; never on a dropped sender, which
 /// is not a signal (see `serve`).
 async fn shutdown_signalled(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
@@ -2687,7 +2706,7 @@ impl Gateway {
             // partition: the first partition with data keeps its
             // at-least-one-batch guarantee, and once the budget is spent the
             // rest report their watermarks without asking for records.
-            let mut remaining = usize::try_from(request.max_bytes.max(1)).unwrap_or(usize::MAX);
+            let mut remaining = fetch_response_budget(request.max_bytes);
             let mut total = 0_usize;
             let mut any_error = false;
             for topic in &request.topics {
@@ -7131,6 +7150,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read_fetch(&reply, 4).1, 3, "nothing appended");
+    }
+
+    /// A Fetch that asks for the most an `i32` can name is served at most
+    /// [`MAX_FETCH_RESPONSE_BYTES`], and one that asks for little keeps its
+    /// own budget, never less than one byte.
+    #[test]
+    fn a_fetch_response_budget_is_capped() {
+        assert_eq!(fetch_response_budget(i32::MAX), MAX_FETCH_RESPONSE_BYTES);
+        assert_eq!(
+            fetch_response_budget(MAX_FETCH_RESPONSE_BYTES as i32 + 1),
+            MAX_FETCH_RESPONSE_BYTES
+        );
+        assert_eq!(fetch_response_budget(1 << 20), 1 << 20);
+        assert_eq!(fetch_response_budget(0), 1);
+        assert_eq!(fetch_response_budget(i32::MIN), 1);
     }
 
     /// One byte budget per response (review): the second partition gets
