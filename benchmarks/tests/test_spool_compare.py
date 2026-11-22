@@ -345,3 +345,31 @@ def test_first_object_after_each_restart():
     base = checker.parse_time("2026-11-22T00:00:00Z")
     assert run.first_object_after(listing, [base + 5, base + 20]) == "7.5"
     assert run.first_object_after(listing, [base + 40]) == ""
+
+
+@pytest.mark.parametrize("name", ["hosted-crash", "full"])
+def test_every_put_trigger_is_reachable_with_whole_32_mib_objects(name):
+    # Fluent Bit and Vector upload one object per 32 MiB: the backlog must hold at least
+    # kills x the largest Nth PUT of them, or a trigger can never fire (review of #908).
+    plan = plans.select(plans.load_plans(os.path.join(SPOOL, "plans.json")), name)
+    for cell in plan["cells"]:
+        if cell["cell"] in ("crash-K1", "crash-K2"):
+            params = cell["params"]
+            need = params["kills_per_run"] * params.get("n_range", (2, 12))[1] * 32 * 2**20
+            assert params["records"] * 201 >= need, (cell["cell"], params)
+
+
+def test_nothing_is_timed_or_crashed_for_a_system_whose_smoke_did_not_pass(tmp_path):
+    env = fixture.environment("r")
+    driver = run.Runner(None, env, str(tmp_path), "")
+    item = plans.Planned("vector", "acks", "drain", 1, {"source": "file", "rotation": "rename"}, {}, "performance")
+    assert driver.smoke_failed(item) is None  # no smoke yet in this run
+    row = runner.base_row(env, item._replace(cell="smoke", metric_class="correctness"), system_version="x",
+                          image_digest="x", config_sha256="x")
+    row.update({"status": "failed", "note": "smoke: 3 gaps", "started_at": "t", "wall_seconds": "1"})
+    schema.append_row(os.path.join(str(tmp_path), "spool.csv"), KIND, row)
+    assert "did not pass its smoke" in driver.smoke_failed(item)
+    assert driver.smoke_failed(item._replace(system="fluent-bit", profile="durable")) is None
+    assert driver.smoke_failed(item._replace(cell="smoke")) is None
+    with pytest.raises(runner.CellRefused, match="did not pass its smoke"):
+        driver.execute(item)

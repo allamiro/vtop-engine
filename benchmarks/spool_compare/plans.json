@@ -70,7 +70,7 @@
       ]
     },
     "hosted-crash": {
-      "_comment": "A GitHub-hosted runner (workflow_dispatch): crash-K1..K3, 9 kills per kind per tool, reduced backlog, 1 CPU per tool. Correctness only (#748 'Where it runs'); split from hosted-rotation so each fits one job.",
+      "_comment": "A GitHub-hosted runner (workflow_dispatch): crash-K1..K3, 9 kills per kind per tool, reduced backlog, 1 CPU per tool. Correctness only (#748 'Where it runs'); split from hosted-rotation so each fits one job. The backlog (about 300 MB) makes about nine 32 MiB objects per tool, so a trigger between the 1st and 3rd PUT of each life is reachable (review of #908).",
       "host_class": "hosted",
       "systems": [
         "fluent-bit",
@@ -109,7 +109,7 @@
         {
           "cell": "crash-K1",
           "repetitions": 3,
-          "minutes_per_run": 3,
+          "minutes_per_run": 5,
           "variants": [
             {
               "source": "file",
@@ -117,17 +117,21 @@
             }
           ],
           "params": {
-            "records": 100000,
-            "rotate_bytes": 2097152,
+            "records": 1600000,
+            "rotate_bytes": 16777216,
             "seed": 748,
             "kills_per_run": 3,
-            "kill_seed": 748
+            "kill_seed": 748,
+            "n_range": [
+              1,
+              3
+            ]
           }
         },
         {
           "cell": "crash-K2",
           "repetitions": 3,
-          "minutes_per_run": 3,
+          "minutes_per_run": 5,
           "variants": [
             {
               "source": "file",
@@ -135,17 +139,21 @@
             }
           ],
           "params": {
-            "records": 100000,
-            "rotate_bytes": 2097152,
+            "records": 1600000,
+            "rotate_bytes": 16777216,
             "seed": 748,
             "kills_per_run": 3,
-            "kill_seed": 748
+            "kill_seed": 748,
+            "n_range": [
+              1,
+              3
+            ]
           }
         },
         {
           "cell": "crash-K3",
           "repetitions": 3,
-          "minutes_per_run": 3,
+          "minutes_per_run": 5,
           "variants": [
             {
               "source": "file",
@@ -153,11 +161,15 @@
             }
           ],
           "params": {
-            "records": 100000,
-            "rotate_bytes": 2097152,
+            "records": 1600000,
+            "rotate_bytes": 16777216,
             "seed": 748,
             "kills_per_run": 3,
-            "kill_seed": 748
+            "kill_seed": 748,
+            "n_range": [
+              1,
+              3
+            ]
           }
         }
       ]
@@ -339,11 +351,15 @@
             }
           ],
           "params": {
-            "records": 1500000,
+            "records": 6000000,
             "rotate_bytes": 67108864,
             "seed": 748,
             "kills_per_run": 3,
-            "kill_seed": 748
+            "kill_seed": 748,
+            "n_range": [
+              2,
+              8
+            ]
           }
         },
         {
@@ -357,11 +373,15 @@
             }
           ],
           "params": {
-            "records": 1500000,
+            "records": 6000000,
             "rotate_bytes": 67108864,
             "seed": 748,
             "kills_per_run": 3,
-            "kill_seed": 748
+            "kill_seed": 748,
+            "n_range": [
+              2,
+              8
+            ]
           }
         },
         {

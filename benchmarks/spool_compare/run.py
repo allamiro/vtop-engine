@@ -204,13 +204,21 @@ class Lab:
     def container(self) -> str:
         return self.compose("ps", "-a", "-q", self.system).stdout.strip()
 
+    def create_tool(self) -> str:
+        """Create the tool's container without starting it, so a kill can be armed and the cgroup sampled
+        before the tool can issue a single request or spend a cycle."""
+        self.compose("up", "--no-start", self.system)
+        return self.container()
+
     def start_tool(self) -> float:
-        """Start (or restart) the tool; a tool that exits at start is a refused row with its own error."""
+        """Start the created tool; a tool that exits at start is a refused row with its own error.
+
+        Exit 137 is SIGKILL: a K1 or K2 kill the tap fired during the first seconds, not a failed start."""
         started = time.time()
-        self.compose("up", "-d", "--no-recreate", self.system)
+        self.compose("start", self.system)
         time.sleep(3)
         state = lab.container_exit(self.container())
-        if not state["running"]:
+        if not state["running"] and state["exit_code"] != 137:
             raise runner.CellRefused(f"{self.system} exited {state['exit_code']} at start: "
                                      f"{lab.logs_tail(self.container(), 15)}")
         return started
@@ -374,6 +382,9 @@ class Runner:
 
     def execute(self, item: plans.Planned) -> dict[str, Any]:
         config = require_config(item.system, item.profile)
+        reason = self.smoke_failed(item)
+        if reason:
+            raise runner.CellRefused(reason)
         self.index += 1
         key = "-".join(item.key(KIND.variant_columns))
         logs = os.path.join(self.run_dir, "logs", key)
@@ -399,6 +410,39 @@ class Runner:
             finally:
                 tool.down()
 
+    def _wait_fired(self, tool: Lab, prefix: str, fired: int, timeout: float) -> bool:
+        """Wait for the tap's next kill; give up when the tool has gone quiet (no new object for the quiet
+        period) or the cell's timeout passes: a trigger past the tool's last PUT can never fire."""
+        deadline = time.time() + timeout
+        shape, changed = None, time.time()
+        while time.time() < deadline:
+            if len(tool.tap_ctl("/state")["fired"]) > fired:
+                return True
+            entries = tool.listing(prefix)
+            now = (len(entries), sum(int(e.get("size", 0)) for e in entries))
+            if now != shape:
+                shape, changed = now, time.time()
+            elif time.time() - changed >= QUIET_SECONDS:
+                return False
+            time.sleep(2)
+        return False
+
+    def smoke_failed(self, item: plans.Planned) -> str | None:
+        """Why a system's smoke did not pass in this run, if it did not: nothing is timed or crashed before it
+        passes (#748). None when the smoke passed or this run has no smoke for the system and profile."""
+        if item.cell == "smoke":
+            return None
+        path = os.path.join(self.run_dir, f"{KIND.name}.csv")
+        if not os.path.exists(path):
+            return None
+        smokes = [row for row in schema.read_rows(path, KIND)
+                  if row["cell"] == "smoke" and row["system"] == item.system and row["profile"] == item.profile]
+        bad = [row for row in smokes if row["status"] != "ok"]
+        if bad:
+            return (f"{item.system} {item.profile} did not pass its smoke ({bad[0]['source']}/{bad[0]['rotation']}: "
+                    f"{bad[0]['status']}, {bad[0]['note'][:160]}); nothing is timed or crashed before it does")
+        return None
+
     def _cell(self, item: plans.Planned, tool: Lab, logs: str) -> dict[str, Any]:
         p = item.params
         records = int(p.get("records", 0))
@@ -407,38 +451,40 @@ class Runner:
         out: dict[str, Any] = {}
         restarts: list[float] = []
         rotations_by_harness = 0
-        if item.cell == "live":
-            before = None
-            started = tool.start_tool()
-            rate = live_rate(self.run_dir, item, float(p.get("live_fraction", 0.5)), p.get("rate"))
-            p = dict(p, rate=rate)
-            seconds = float(p.get("warmup_seconds", 120)) + float(p.get("measure_seconds", 600))
-            tool.gen("/live", {"rate": rate, "seconds": seconds})
-            _wait(lambda: not tool.gen("/state").get("live_running"), seconds + 120, "the live writer", 5)
-        else:
+        if item.cell != "live":
             preload = records if item.cell != "down-while-rotating" else records // 3
             tool.gen("/backlog", {"count": preload})
-            before = tool.request_counts()
-            started = tool.start_tool()
-        sampler = cgroup.Sampler(tool.container(), docker_api.stats)
+        kind = item.cell.split("-")[1] if item.cell.startswith("crash-") else ""
+        points = []
+        if kind:
+            points = kills.schedule(int(p.get("kill_seed", 748)), kind, item.repetition,
+                                    int(p.get("kills_per_run", 3)), n_range=tuple(p.get("n_range", (2, 12))),
+                                    seconds_range=tuple(p.get("seconds_range", (5.0, 40.0))))
+        container = tool.create_tool()
+        if kind in ("K1", "K2"):
+            # Armed before the container's first life can send a request (review of #908).
+            tool.tap_ctl("/reset", {})
+            tool.tap_ctl("/arm", {"kind": kind, "n": points[0].n, "container": container})
+        before = tool.request_counts() if item.cell != "live" else None
+        # Sampled from before the start: the drain window opens at the start, and the CPU baseline must too.
+        sampler = cgroup.Sampler(container, docker_api.stats)
         with sampler:
-            if item.cell in ("crash-K1", "crash-K2", "crash-K3", "crash-K4-rotation"):
-                kind = item.cell.split("-")[1]
-                points = kills.schedule(int(p.get("kill_seed", 748)), kind, item.repetition,
-                                        int(p.get("kills_per_run", 3)),
-                                        n_range=tuple(p.get("n_range", (2, 12))),
-                                        seconds_range=tuple(p.get("seconds_range", (5.0, 40.0))))
+            started = tool.start_tool()
+            if item.cell == "live":
+                rate = live_rate(self.run_dir, item, float(p.get("live_fraction", 0.5)), p.get("rate"))
+                p = dict(p, rate=rate)
+                seconds = float(p.get("warmup_seconds", 120)) + float(p.get("measure_seconds", 600))
+                tool.gen("/live", {"rate": rate, "seconds": seconds})
+                _wait(lambda: not tool.gen("/state").get("live_running"), seconds + 120, "the live writer", 5)
+            if kind:
                 life = started
                 fired = 0
-                for point in points:
+                for index, point in enumerate(points):
                     if kind in ("K1", "K2"):
-                        tool.tap_ctl("/arm", {"kind": kind, "n": point.n, "container": tool.container()})
-                        done = _until(lambda count=fired: len(tool.tap_ctl("/state")["fired"]) > count, timeout)
-                        if not done:
-                            break  # the tool finished before its Nth PUT: fewer kills, recorded as such
+                        if not self._wait_fired(tool, prefix, fired, timeout):
+                            break  # the tool went idle before its Nth PUT: fewer kills, recorded as such
                         event = tool.tap_ctl("/state")["fired"][-1]
                         killed_at, delay = event["killed_at"], event["kill_delay_ms"]
-                        tool.tap_ctl("/reset", {})
                     elif kind == "K3":
                         wait = life + float(point.at_seconds) - time.time()
                         if wait > 0:
@@ -450,13 +496,18 @@ class Runner:
                         delay = ""
                         tool.gen("/backlog", {"count": max(records // 10, 1)})
                     fired += 1
-                    last = lab.last_log_line(tool.container())
+                    last = lab.last_log_line(container)
                     _until(lambda: not tool.running(), 30)
+                    if kind in ("K1", "K2"):
+                        # The restarted life counts its PUTs from zero, and its trigger is armed before it starts.
+                        tool.tap_ctl("/reset", {})
+                        if index + 1 < len(points):
+                            tool.tap_ctl("/arm", {"kind": kind, "n": points[index + 1].n, "container": container})
                     life = tool.restart_tool()
                     restarts.append(life)
                     self.record_kill(item, point, kind, killed_at, delay, life, last)
                 if fired == 0:
-                    raise runner.ToolFailed(f"no {kind} kill fired: the tool finished before the first trigger")
+                    raise runner.ToolFailed(f"no {kind} kill fired: the tool went idle before the first trigger")
                 out["kills"] = fired
             elif item.cell == "down-while-rotating":
                 quiesce(lambda: tool.listing(prefix), tool.running, quiet=QUIET_SECONDS, timeout=timeout)
