@@ -74,7 +74,17 @@ pub struct NodeObservability {
     /// owner. The served source holds the same cell, so a probe installed late
     /// takes effect on the next request rather than the next restart.
     probe: Arc<std::sync::RwLock<Option<ReadinessProbe>>>,
+    /// The capped listeners of every role in this process (#732), read by
+    /// one collector registered at construction. One, not one per role:
+    /// a co-located process runs the metadata and the data role against
+    /// this one registry, and a second collector with the same family name
+    /// would be refused at registration and stop the process.
+    connection_limits: ConnectionLimits,
 }
+
+/// The listeners [`ConnectionLimitCollector`] reports, shared with the
+/// [`NodeObservability`] that roles add them through.
+type ConnectionLimits = Arc<std::sync::Mutex<Vec<Arc<vtop_meta::transport::ConnectionLimit>>>>;
 
 /// Serves this node's registry, and its readiness as `gate AND probe`.
 struct NodeSource {
@@ -143,11 +153,27 @@ impl NodeObservability {
         // The audit trail's counters (#694), at 0 from the first scrape.
         vtop_observe::audit::register_counters(&registry)
             .map_err(|error| format!("register audit counters: {error}"))?;
+        let connection_limits = ConnectionLimits::default();
+        registry
+            .register(Box::new(ConnectionLimitCollector::new(Arc::clone(
+                &connection_limits,
+            ))?))
+            .map_err(|error| format!("register listener connection limits: {error}"))?;
         Ok(Self {
             registry,
             gate: ReadinessGate::starting("node is still starting"),
             probe: Arc::new(std::sync::RwLock::new(None)),
+            connection_limits,
         })
+    }
+
+    /// Report a capped listener's refusals (#732) on this node's metrics,
+    /// under `vtop_listener_connections_refused_total{plane}`.
+    pub fn watch_connection_limit(&self, limit: Arc<vtop_meta::transport::ConnectionLimit>) {
+        self.connection_limits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(limit);
     }
 
     /// Install a live readiness condition, evaluated on every `/readyz`
@@ -192,6 +218,9 @@ impl NodeObservability {
         // is fatal like a bind failure, never a plaintext endpoint instead.
         let bound = match config.tls.as_ref() {
             Some(tls) => {
+                // The endpoint's key is checked like every other (#732, S1).
+                crate::tls::check_private_key(&tls.key)
+                    .map_err(|error| format!("observability tls: {error}"))?;
                 let settings = vtop_observe::TlsSettings::from_pem_files(
                     &tls.cert,
                     &tls.key,
@@ -916,6 +945,8 @@ pub struct BrokerCollector {
     group_commit_bytes: CounterFamily,
     group_commit_sync_nanos: CounterFamily,
     group_commit_queue_wait_nanos: CounterFamily,
+    group_commit_overloaded: CounterFamily,
+    group_commit_split_groups: CounterFamily,
     produce_phase_seconds: CounterFamily,
     memory_rejections: CounterFamily,
     backpressure_nanos: CounterFamily,
@@ -1033,6 +1064,19 @@ impl BrokerCollector {
                 "broker_group_commit_queue_wait_nanoseconds_total",
                 "Nanoseconds the longest-waiting request of each group waited to join it, \
                  summed over groups (one wait per group, not per request)",
+                &[],
+            )?,
+            group_commit_overloaded: CounterFamily::new(
+                "broker_group_commit_overloaded_total",
+                "Produce requests answered Overloaded (retryable, nothing appended) because \
+                 the group-commit queue was full",
+                &[],
+            )?,
+            group_commit_split_groups: CounterFamily::new(
+                "broker_group_commit_split_groups_total",
+                "Commit groups the log refused as a whole for something one member caused \
+                 (a sequence, fencing or size refusal) and re-ran request by request, so \
+                 only that member failed",
                 &[],
             )?,
             produce_phase_seconds: CounterFamily::new(
@@ -1250,6 +1294,11 @@ impl BrokerCollector {
                     &self.group_commit_queue_wait_nanos,
                     metrics.queue_wait_nanos_total(),
                 ),
+                (&self.group_commit_overloaded, metrics.overloaded_total()),
+                (
+                    &self.group_commit_split_groups,
+                    metrics.split_groups_total(),
+                ),
             ] {
                 families.push(family.family([(Vec::new(), total)]));
             }
@@ -1282,6 +1331,8 @@ impl BrokerCollector {
             &self.group_commit_bytes.desc,
             &self.group_commit_sync_nanos.desc,
             &self.group_commit_queue_wait_nanos.desc,
+            &self.group_commit_overloaded.desc,
+            &self.group_commit_split_groups.desc,
             &self.produce_phase_seconds.desc,
             &self.memory_rejections.desc,
             &self.backpressure_nanos.desc,
@@ -2089,6 +2140,60 @@ impl Collector for ServerCollector {
 }
 
 // ---------------------------------------------------------------------------
+// Listener connection caps
+// ---------------------------------------------------------------------------
+
+/// Connections a capped listener closed (#732: M6, R7), by listener and why.
+///
+/// `reason` is `capacity` (closed at accept, the cap was reached) or
+/// `handshake_timeout` (no first request within the handshake deadline, so
+/// a silent socket cannot keep its slot). `plane` is a closed set: `meta_peer` and `meta_admin` on a metadata node,
+/// `replica` on a data node. Any increase means a peer opened more
+/// connections than the node's `max_*_connections` allows: legitimate load
+/// that needs a higher cap, or a flood.
+pub struct ConnectionLimitCollector {
+    limits: ConnectionLimits,
+    refused: CounterFamily,
+}
+
+impl ConnectionLimitCollector {
+    fn new(limits: ConnectionLimits) -> Result<Self, String> {
+        Ok(Self {
+            limits,
+            refused: CounterFamily::new(
+                "listener_connections_refused_total",
+                "Connections a capped listener closed, by listener and why: capacity (closed at \
+                 accept, the listener already held its max_*_connections) or handshake_timeout \
+                 (no first request within the handshake deadline)",
+                &["plane", "reason"],
+            )?,
+        })
+    }
+}
+
+impl Collector for ConnectionLimitCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        vec![&self.refused.desc]
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        let limits = self
+            .limits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        vec![self.refused.family(limits.iter().flat_map(|limit| {
+            [
+                (vec![limit.label(), "capacity"], limit.refused_total()),
+                (
+                    vec![limit.label(), "handshake_timeout"],
+                    limit.handshake_timeouts_total(),
+                ),
+            ]
+        }))]
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Promotion
 // ---------------------------------------------------------------------------
 
@@ -2179,7 +2284,8 @@ impl KafkaRefusalCollector {
                 "Kafka requests this node's gateway refused, by api and reason; \
                  no_offset_store is an OffsetCommit on a node with no metadata plane, \
                  unserved_api a request (CreateTopics, DescribeConfigs, ...) the gateway \
-                 does not serve",
+                 does not serve, not_leader a produce, fetch or list-offsets this node \
+                 answered NOT_LEADER_OR_FOLLOWER because it does not hold the range",
                 &["api", "reason"],
             )?,
         })
@@ -3189,13 +3295,23 @@ mod tests {
         for series in [
             r#"vtop_kafka_requests_refused_total{api="offset_commit",reason="no_offset_store"} 0"#,
             r#"vtop_kafka_requests_refused_total{api="unserved",reason="unserved_api"} 0"#,
+            r#"vtop_kafka_requests_refused_total{api="produce",reason="not_leader"} 0"#,
+            r#"vtop_kafka_requests_refused_total{api="fetch",reason="not_leader"} 0"#,
+            r#"vtop_kafka_requests_refused_total{api="list_offsets",reason="not_leader"} 0"#,
         ] {
             assert!(text.contains(series), "{series} missing: {text}");
         }
         refusals.count(vtop_kafka::Refusal::OffsetCommitWithoutStore);
         refusals.count(vtop_kafka::Refusal::OffsetCommitWithoutStore);
         refusals.count(vtop_kafka::Refusal::UnservedApi);
+        refusals.count(vtop_kafka::Refusal::FetchNotLeader);
         let text = scrape(&registry);
+        assert!(
+            text.contains(
+                r#"vtop_kafka_requests_refused_total{api="fetch",reason="not_leader"} 1"#
+            ),
+            "{text}"
+        );
         assert!(
             text.contains(
                 r#"vtop_kafka_requests_refused_total{api="offset_commit",reason="no_offset_store"} 2"#
@@ -3673,6 +3789,53 @@ mod tests {
         assert!(
             unexpected.is_empty(),
             "labels {unexpected:?} are not in the bounded set {BOUNDED:?}"
+        );
+    }
+
+    /// #732: the refusals of every capped listener, from every role in the
+    /// process, are exported under one family with a bounded `plane` label,
+    /// at 0 before any refusal.
+    #[test]
+    fn listener_connection_refusals_are_exported_by_plane() {
+        use std::net::SocketAddr;
+        use vtop_meta::transport::ConnectionLimit;
+        let peer = Arc::new(ConnectionLimit::meta_peer(1));
+        let admin = Arc::new(ConnectionLimit::meta_admin(1));
+        let from: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let _held = peer.admit(from).unwrap();
+        assert!(peer.admit(from).is_none());
+        assert!(peer.admit(from).is_none());
+        // One NodeObservability, as a co-located process shares between its
+        // metadata and data roles: each role adds its listeners, and nothing
+        // registers a second collector (review: that refused the process).
+        let observability = NodeObservability::new("colocated", "1").unwrap();
+        observability.watch_connection_limit(peer);
+        observability.watch_connection_limit(admin);
+        observability.watch_connection_limit(Arc::new(ConnectionLimit::replica(1)));
+        let text = scrape(&observability.registry);
+        assert!(
+            text.contains(
+                r#"vtop_listener_connections_refused_total{plane="meta_peer",reason="handshake_timeout"} 0"#
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                r#"vtop_listener_connections_refused_total{plane="meta_peer",reason="capacity"} 2"#
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                r#"vtop_listener_connections_refused_total{plane="meta_admin",reason="capacity"} 0"#
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                r#"vtop_listener_connections_refused_total{plane="replica",reason="capacity"} 0"#
+            ),
+            "{text}"
         );
     }
 }

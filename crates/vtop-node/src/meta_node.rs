@@ -126,6 +126,8 @@ pub async fn serve(
         config.admin_transport,
         config.admin_authorization.is_some(),
     )?;
+    crate::config::check_connection_cap("max_peer_connections", config.max_peer_connections)?;
+    crate::config::check_connection_cap("max_admin_connections", config.max_admin_connections)?;
     let env = Env::real();
     let node = start_meta_node(
         &env,
@@ -201,7 +203,8 @@ pub async fn serve(
         PlaneTransport::PlaintextOnAnyInterface => {
             PeerServer::plaintext_on_any_interface(MetaNodeId(config.node_id), peer_handler)
         }
-    };
+    }
+    .with_max_connections(config.max_peer_connections);
     // An absent policy keeps the pre-#238 behaviour — any CA-signed client may
     // do anything — so it warns rather than passing silently. The warning names
     // the concrete exposure, not just the missing key: an operator who reads
@@ -246,7 +249,8 @@ pub async fn serve(
             AdminServer::plaintext_on_any_interface(admin_handler, authorizer)
         }
     }
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| error.to_string())?
+    .with_max_connections(config.max_admin_connections);
 
     // The operational surface comes up before the ready marker so a scraper or
     // health gate can observe the node from the same instant a script can.
@@ -256,6 +260,8 @@ pub async fn serve(
     observability.register(Box::new(crate::observe::MetaAuditCollector::new(
         Arc::clone(&node.consensus),
     )?))?;
+    observability.watch_connection_limit(peer_server.connection_limit());
+    observability.watch_connection_limit(admin_server.connection_limit());
     observability.register(Box::new(crate::observe::MetaGroupCursorCollector::new(
         Arc::clone(&node.consensus) as Arc<dyn crate::observe::GroupCursorSource>,
     )?))?;

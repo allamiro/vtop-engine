@@ -1,5 +1,8 @@
 # Generated from the code by scripts/update-surface-snapshots.sh (#719); do not edit by hand. One item per line, sorted.
+vtop_audit_delivery_lag_entries gauge
 vtop_audit_events_total counter action,outcome
+vtop_audit_gaps_total counter reason
+vtop_audit_replayed_total counter reason
 vtop_audit_write_failures_total counter sink
 vtop_broker_backpressure_events_total counter
 vtop_broker_backpressure_nanoseconds_total counter
@@ -18,9 +21,11 @@ vtop_broker_group_commit_bytes_total counter
 vtop_broker_group_commit_enabled gauge
 vtop_broker_group_commit_last_batch_bytes gauge
 vtop_broker_group_commit_last_batch_records gauge
+vtop_broker_group_commit_overloaded_total counter
 vtop_broker_group_commit_queue_wait_nanoseconds_total counter
 vtop_broker_group_commit_records_total counter
 vtop_broker_group_commit_requests_total counter
+vtop_broker_group_commit_split_groups_total counter
 vtop_broker_group_commit_sync_nanoseconds_total counter
 vtop_broker_group_commits_total counter
 vtop_broker_held_fencing_epoch gauge range,topic
@@ -51,6 +56,7 @@ vtop_broker_sessions_accepted_total counter role
 vtop_broker_sessions_active gauge role
 vtop_broker_sessions_refused_total counter reason
 vtop_kafka_requests_refused_total counter api,reason
+vtop_listener_connections_refused_total counter plane,reason
 vtop_meta_group_cursor_offset gauge group,range,topic
 vtop_meta_group_cursor_series_truncated gauge
 vtop_meta_raft_last_applied_index gauge

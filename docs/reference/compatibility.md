@@ -114,10 +114,25 @@ warning. Verification receipts stay opt-in for 1.0.
 
 What is tested today:
 
-- A data node's directory (segment log v1), written by the newest patch of
-  each minor from v0.2, built from each tag's source, must open under the
-  current build, serve its records byte for byte, and still serve them after
-  a restart ([`scripts/upgrade-compat.sh`](../../scripts/upgrade-compat.sh)).
+- **A data node's directory, in the compatibility matrix** (the `segments`
+  cell of [`scripts/compat/expected.yaml`](../../scripts/compat/expected.yaml),
+  which runs [`scripts/upgrade-compat.sh`](../../scripts/upgrade-compat.sh)).
+  For the newest patch of each minor since v0.2 (the newest minor on a pull
+  request, all of them nightly) the release's **published** `vtop-node`,
+  checked against its `SHA256SUMS` and Sigstore bundle, writes a directory:
+  the single `range.active` before v0.3.0, sealed segments with their indexes,
+  commit markers, manifests, producer snapshots and the broker's epoch
+  journals from v0.3.0, and segment format v2 with its chunk sidecar from
+  v0.5.0 (`segment_format: v2`, which the default writer does not produce).
+  The current build must open it, quarantine nothing, serve every record byte
+  for byte, and serve them again after a restart. The directories written by
+  v0.2.1, v0.3.1, v0.5.0, v0.8.0 and v0.10.1 are also committed as fixtures
+  (`crates/vtop-log/tests/fixtures/segments/<tag>/<profile>/`, each tag with
+  a `PROVENANCE`), which `released_segment_dirs` (every record reads, every
+  sealed segment verifies) and `released_journals` (the producer-epoch and
+  fencing-epoch journals read as what the release recorded) open on every
+  build. The retention and truncate intents are not among them: a clean run
+  never leaves one, so no released binary's intent is captured yet.
 - The metadata tier rolls from the newest release to the current build, one
   voter at a time (live-chaos scenario 22).
 - A metadata voter's directory (the Raft log, the snapshot, the applied,
@@ -128,7 +143,9 @@ What is tested today:
   rewrites nothing, and a new write that survives a reopen
   (`released_meta_dirs` in `vtop-meta`; the fixtures carry a `PROVENANCE`).
   [`scripts/compat/cells/meta.sh`](../../scripts/compat/cells/meta.sh) runs
-  the same live, in both directions, against a released binary.
+  the same live, in both directions, against the published `vtop-node`: the
+  `meta` cell of the compatibility matrix, for the newest patch of each minor
+  since v0.8.0 (the newest minor on a pull request, all of them nightly).
 - The released `vtopctl` of v0.7.0 and later is run over a manifest archive
   the current build wrote: v0.8.0 and later must verify it, and v0.7.0 must
   report the documented self-hash failure
@@ -192,6 +209,7 @@ what they do is recorded, not promised):
 | State ledger, SQLite | Runs `status`, `list-batches` and `process-once`, then (`scripts/ledger-compat.sh`) archives, audits coverage over the digests and writes the nullable columns it knows, and the current build carries on over what it wrote. | `ledger-sqlite` forward |
 | Prune digest and audit trail | Reads the digest (`audit-coverage`, `scrub`) with the `sealed_at` key it does not know, and verifies and lists the audit chain. | `digests-audit` forward |
 | State ledger, PostgreSQL | After the current build ran `vtopctl migrate` and wrote, runs `status`, `list-batches` and `process-once`. Nightly. | `ledger-postgres` forward |
+| Metadata voter directory | Opens what the current build wrote at its baseline feature level and raised to its highest, reports the applied index, takes a write and comes back after a SIGKILL. Below the raised level it reports a lower level instead of refusing (see the table below): there is no supported way back after a raise. | `meta` forward |
 
 Each is `pass` in `expected.yaml` for the previous release, with one recorded
 refusal: **a release before v0.8.0 stops on a ledger that holds a
@@ -209,7 +227,8 @@ What an older binary does with newer data, by case:
 | A Kafka progress marker with a `topic_id` | Ignores the key. It resumes a partition from the newest committed row, as it always did, and its pruning keeps that row. | Supported: an optional field in an unhashed document, read as unknown when absent. | No |
 | A ledger row in a state, or of a source type, N-1 does not know | Fails closed. | One-way: needs a marker or version bump, so the refusal comes at startup and not mid-run. | No |
 | A `0.4` manifest | v0.8.0 and later verify it; v0.7.0 and earlier report it as tampered. | The documented cutoff. Archives are never rewritten; set `write_version: "0.3"` to stop writing more. | Yes: v0.7.0, and v0.8.0 and later (the `manifest` cell of the Compat workflow) |
-| A metadata log entry or snapshot record from a raised feature level | The voter refuses to start, saying *newer format*, and changes nothing. Today that holds for a new command kind, log entry kind, value tag or key category; other enum values inside records are reported as corrupt until [#763](https://github.com/allamiro/vtop-engine/pull/763). A raise whose level a release does not support is not such a record: the command is one it decodes, and it applies it as a rejection. | One-way at the raise, which is operator-gated and permanent. The notes say which level first puts a new kind in the log. | Partly. Level 8 is the highest raise today and adds no kind: v0.10.1 reads it, and v0.8.0 and v0.9.0 (level 7) open the directory and take writes: they report level 3 while the raise is still in the log (they apply it as a rejection) and level 8 once it is inside a snapshot (they install the snapshot as it is), so the downgrade is silent, not refused. No release writes a kind an older one cannot decode yet, so the refusal has no live case (`meta.sh` takes `refuse` for the release that adds one) |
+| A metadata log entry or snapshot record from a raised feature level | The voter refuses to start, saying *newer format*, and changes nothing. That holds for a new command kind, log entry kind, value tag or key category, and for the enum values inside records ([#763](https://github.com/allamiro/vtop-engine/pull/763)). A raise whose level a release does not support is not such a record: the command is one it decodes. Releases before v0.11.0 apply it as a rejection; v0.11.0 and later refuse it (next row). | One-way at the raise, which is operator-gated and permanent. The notes say which level first puts a new kind in the log. | Partly. Level 8 is the highest raise today and adds no kind: v0.10.1 reads it, and v0.8.0 and v0.9.0 (level 7) open the directory and take writes: they report level 3 while the raise is still in the log (they apply it as a rejection) and level 8 once it is inside a snapshot (they install the snapshot as it is), so the downgrade is silent, not refused. No release writes a kind an older one cannot decode yet, so the refusal has no live case (`meta.sh` takes `refuse` for the release that adds one) |
+| A metadata directory whose recorded feature level is above the binary's | v0.11.0 and later refuse it, naming the directory's level, their own and what to do (run a newer binary), and change nothing: at open (a snapshot, a raise in the log, or the applied state), when a follower is sent a snapshot above its level, and when a raise above its level is applied. A refused snapshot or raise stops that voter's Raft engine instead of continuing. **Releases before v0.11.0 do not have the check.** v0.8.0 and v0.9.0 (level 7) open a level-8 directory and take writes, reporting level 3 when the raise is still in the log (applied as a rejection) and level 8 once it is inside a snapshot (installed as it is). Published releases cannot change. | Refuse. A raise never reaches the log from a leader below its level, so the case is a downgraded voter, a directory restored over a newer one, or a voter that was not upgraded before the raise ([#758](https://github.com/allamiro/vtop-engine/pull/758) holds a raise back from level 8 while a voter is below it). | Yes: the unit and Raft tests of the vtop-meta crate; the released-binary fixtures ([#846](https://github.com/allamiro/vtop-engine/pull/846)) show what v0.8.0 and v0.9.0 do |
 | A segment v2 directory | Every release since v0.5.0 reads v2. | Supported. A later segment version follows [reader first](#reader-first). | No |
 
 ## Deprecation
@@ -247,10 +266,18 @@ What an older binary does with newer data, by case:
   unknown keys are planned.
   Until then, each release's notes list the new keys an older engine
   silently ignores.
-- **JSON output.** `validate --print-effective` carries
-  `effective_version: 1`, audit records carry `audit_version: 1` and ledger
-  digests carry `vtop_ledger_digest: 1`. The other `--json` reports will
-  gain a `report_version` field, an additive change (planned for v0.11.0).
+- **JSON output.** Every `vtopctl --json` report that is a JSON object
+  carries `report_version`, currently `1`: an additive field, added in
+  v0.11.0, so a script can tell which shape of a report it reads. A report
+  that changes incompatibly bumps the number. Output that is not an object
+  has nowhere to put the field without changing shape, and is versioned by
+  what it is: `validate --print-effective` carries `effective_version: 1`,
+  audit records `audit_version: 1`, receipts `receipt_version: 1`, ledger
+  digests `vtop_ledger_digest: 1` and a chunk proof its `scheme`; `discover`,
+  `process-once`, `list-batches` and `segment verify` print arrays of rows
+  (a row may gain a field), and `status` prints a map from batch state to
+  count. The list is in `crates/vtop-cli/src/report.rs`, and a test fails for
+  a command that prints JSON and is neither stamped nor listed there.
 - **Native protocol.** The rule that a new message kind needs a minor bump,
   and a sender that checks the peer's minor, starts at 1.0. Until then, a
   new kind is added under minor 0, an N-1 peer rejects it as unknown, and it
@@ -319,7 +346,7 @@ table differs from what the registry generates. Edit the registry and run
 | 22 | Kafka gateway: advertised APIs and version ranges | none | C | experimental | experimental |
 | 23 | `config.yaml` | none (`config_version` planned) | D | evolving | classified at the freeze |
 | 24 | `vtopctl validate --print-effective` | `effective_version` `1` | D | JSON stable, text for people | JSON stable |
-| 25 | `vtopctl` JSON output and exit codes | none yet (`report_version` planned) | D | evolving | classified at the freeze |
+| 25 | `vtopctl` JSON output and exit codes | `report_version` `1` on every object report | D | evolving | classified at the freeze |
 | 26 | Metric names and labels | none | D | evolving | a stable subset |
 | 27 | Helm values | the chart `version` | D | evolving | classified at the freeze |
 <!-- inventory:end -->

@@ -750,7 +750,7 @@ enum AdminTransport {
 }
 
 #[derive(Debug, Deserialize)]
-struct MetaAdminConfig {
+pub(crate) struct MetaAdminConfig {
     /// `host:port` of the admin mTLS listener to ask FIRST.
     endpoint: String,
     /// rustls server name (usually matches a SAN on the server cert).
@@ -841,7 +841,7 @@ fn parse_node_state(value: &str) -> Result<NodeState, String> {
     }
 }
 
-fn load_admin_config(path: &Path) -> Result<MetaAdminConfig, String> {
+pub(crate) fn load_admin_config(path: &Path) -> Result<MetaAdminConfig, String> {
     let text =
         fs::read_to_string(path).map_err(|error| format!("read {}: {error}", path.display()))?;
     serde_yaml::from_str(&text).map_err(|error| format!("parse {}: {error}", path.display()))
@@ -1033,7 +1033,7 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&status_json(&status))
+                    crate::report::pretty(&status_json(&status))
                         .map_err(|error| error.to_string())?
                 );
             } else {
@@ -1101,7 +1101,7 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&membership_json(&status.membership))
+                    crate::report::pretty(&membership_json(&status.membership))
                         .map_err(|error| error.to_string())?
                 );
             } else {
@@ -1158,7 +1158,7 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
+                    crate::report::pretty(&serde_json::json!({
                         "found": view.found,
                         "range_generation": view.range_generation,
                         "fencing_epoch": view.fencing_epoch,
@@ -1224,7 +1224,7 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
+                    crate::report::pretty(&serde_json::json!({
                         "group_uuid": group_uuid,
                         "group_found": view.group_found,
                         "read_at_applied_index": view.read_at_applied_index,
@@ -1342,7 +1342,7 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
             let (transitions, read_at_applied_index) = read.unwrap_or_default();
             if !found {
                 if json {
-                    println!("{}", serde_json::json!({ "found": false }));
+                    println!("{}", crate::report::report_json!({ "found": false }));
                 } else {
                     println!("range not found");
                 }
@@ -1409,7 +1409,7 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
+                    crate::report::pretty(&serde_json::json!({
                         "found": true,
                         "read_at_applied_index": read_at_applied_index,
                         "transitions": transitions.iter().zip(&audit.records).map(|(view, record)| transition_json(view, record)).collect::<Vec<_>>(),
@@ -1520,7 +1520,7 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
+                    crate::report::pretty(&serde_json::json!({
                         "feature_level": versions.feature_level,
                         "read_at_applied_index": read.read_at_applied_index,
                         "truncated": read.truncated,
@@ -1604,7 +1604,7 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
+                    crate::report::pretty(&serde_json::json!({
                         "topic_uuid": topic_uuid,
                         "range_uuid": range_uuid,
                         "range_found": view.range_found,
@@ -1808,7 +1808,7 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&placement_json(&placement))
+                    crate::report::pretty(&placement_json(&placement))
                         .map_err(|error| error.to_string())?
                 );
             } else {
@@ -2276,7 +2276,7 @@ pub(crate) async fn propose_and_print_noting(
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&propose_json(&response.log_id, &response.response))
+            crate::report::pretty(&propose_json(&response.log_id, &response.response))
                 .map_err(|error| error.to_string())?
         );
     } else {
@@ -2380,7 +2380,7 @@ fn print_membership_change(
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
+            crate::report::pretty(&serde_json::json!({
                 "status": "ok",
                 "action": action,
                 "membership": membership_json(membership),

@@ -288,6 +288,26 @@ pub(crate) fn applied_raft_log_id(storage: &MetaStorage) -> Option<LogId<NodeId>
     Some(raft_log_id(term, raft_index))
 }
 
+/// Say, on stderr, that this node refused a directory, a snapshot or a raise
+/// above the feature level it supports (#743), and what it did about it.
+/// Not rate-limited: it happens once, because the refusal stops this node's
+/// Raft engine (a storage error is fatal to it), and an operator must see
+/// why. This crate has no logger; the process boundary captures stderr.
+pub(crate) fn report_newer_level_refusal(
+    what: &str,
+    data_dir: &Path,
+    error: &crate::MetaStoreError,
+) {
+    if matches!(error, crate::MetaStoreError::NewerFeatureLevel { .. }) {
+        eprintln!(
+            "metadata node refused {what} in {}: {error}. This node's Raft engine stopped \
+             instead of continuing at a level it does not understand; its state was not changed \
+             and it takes no further writes. Upgrade this node, then restart it",
+            data_dir.display()
+        );
+    }
+}
+
 pub(crate) fn read_snapshot_file_bytes(
     inner: &MetaRaftInner,
     path: &Path,
@@ -334,7 +354,10 @@ pub(crate) fn install_snapshot_bytes(
 
     let mut snapshots = MetaSnapshots::open_in(&inner.env, &inner.data_dir, inner.cluster_id)
         .map_err(sto_err_logs)?;
-    snapshots.install(&publish_bytes).map_err(sto_err_logs)?;
+    snapshots.install(&publish_bytes).map_err(|error| {
+        report_newer_level_refusal("a snapshot from the leader", &inner.data_dir, &error);
+        sto_err_logs(error)
+    })?;
     // Full recovery path: newest snapshot + replay limited by durable applied.
     inner.storage =
         MetaStorage::open_with(&inner.env, &inner.data_dir, inner.cluster_id, inner.config)

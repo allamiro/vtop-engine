@@ -6,7 +6,8 @@ use crate::raft::convert::{
     to_meta_index, to_raft_index,
 };
 use crate::raft::store::{
-    applied_raft_log_id, install_snapshot_bytes, read_snapshot_file_bytes, MetaRaftStore,
+    applied_raft_log_id, install_snapshot_bytes, read_snapshot_file_bytes,
+    report_newer_level_refusal, MetaRaftStore,
 };
 use crate::raft::type_config::{MetaRaftTypeConfig, NodeId, Response};
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine, Snapshot};
@@ -120,10 +121,14 @@ impl RaftStateMachine<MetaRaftTypeConfig> for MetaRaftStateMachine {
         let first = to_meta_index(entries[0].get_log_id().index);
         let last = entries.last().expect("non-empty");
         let through_meta = to_meta_index(last.get_log_id().index);
-        let responses = guard
-            .storage
-            .apply_through(through_meta)
-            .map_err(|error| sto_err_apply(*last.get_log_id(), error))?;
+        let responses = guard.storage.apply_through(through_meta).map_err(|error| {
+            report_newer_level_refusal(
+                "a feature level raise this build does not support",
+                &guard.data_dir,
+                &error,
+            );
+            sto_err_apply(*last.get_log_id(), error)
+        })?;
 
         let mut resp_iter = responses.into_iter();
         let mut out = Vec::with_capacity(entries.len());
@@ -250,5 +255,150 @@ impl RaftStateMachine<MetaRaftTypeConfig> for MetaRaftStateMachine {
             },
             snapshot: Box::new(Cursor::new(bytes)),
         }))
+    }
+}
+
+/// #743: a follower never installs a snapshot, and no voter applies a raise,
+/// above the feature level this build supports. Each is a storage error,
+/// which stops this node's Raft engine; nothing is written first.
+#[cfg(test)]
+mod feature_level_refusal_tests {
+    use super::*;
+    use crate::command::{
+        CommandEnvelope, MetadataCommand, BASELINE_FEATURE_LEVEL, SUPPORTED_FEATURE_LEVEL,
+    };
+    use crate::state::MetaStateMachine;
+    use crate::storage::log::{MetaLogEntry, MetaLogPayload, MetaMembership};
+    use crate::storage::snapshot::encode_snapshot_file;
+    use crate::MetaStorageConfig;
+    use openraft::{CommittedLeaderId, Membership};
+    use std::collections::BTreeSet;
+    use std::path::Path;
+    use uuid::Uuid;
+    use vtop_log::sim::SimStorage;
+
+    const ABOVE: u32 = SUPPORTED_FEATURE_LEVEL + 1;
+
+    fn cluster() -> Uuid {
+        Uuid::from_u128(0x743)
+    }
+
+    fn follower() -> (SimStorage, vtop_log::env::Env, MetaRaftStateMachine) {
+        let sim = SimStorage::new();
+        sim.create_dir_all(Path::new("/follower"));
+        let env = sim.env(0x743);
+        let store = MetaRaftStore::open(&env, "/follower", cluster(), MetaStorageConfig::default())
+            .unwrap();
+        (sim, env, MetaRaftStateMachine::new(store))
+    }
+
+    fn snapshot_at(level: u32) -> (SnapshotMeta<NodeId, openraft::EmptyNode>, Vec<u8>) {
+        let payload = MetaStateMachine::at_feature_level_for_test(level)
+            .encode_snapshot()
+            .unwrap();
+        let membership = MetaMembership {
+            voters: vec![crate::MetaNodeId(1), crate::MetaNodeId(2)],
+            learners: vec![],
+            joint_outgoing: None,
+        };
+        let bytes = encode_snapshot_file(
+            cluster(),
+            10,
+            3,
+            &membership,
+            "from-the-leader",
+            &payload,
+            None,
+        )
+        .unwrap();
+        let meta = SnapshotMeta {
+            last_log_id: Some(LogId::new(CommittedLeaderId::new(3, 0), 9)),
+            last_membership: StoredMembership::new(
+                Some(LogId::new(CommittedLeaderId::new(3, 0), 0)),
+                Membership::new(vec![BTreeSet::from([1u64, 2u64])], None::<BTreeSet<u64>>),
+            ),
+            snapshot_id: "from-the-leader".to_owned(),
+        };
+        (meta, bytes)
+    }
+
+    #[tokio::test]
+    async fn a_follower_refuses_to_install_a_snapshot_above_its_level() {
+        let (_sim, env, mut machine) = follower();
+        let (meta, bytes) = snapshot_at(ABOVE);
+        let error = machine
+            .install_snapshot(&meta, Box::new(Cursor::new(bytes)))
+            .await
+            .expect_err("a snapshot above this build's level was installed");
+        let text = error.to_string();
+        assert!(text.contains(&format!("feature level {ABOVE}")), "{text}");
+        assert!(
+            text.contains(&format!("supports ({SUPPORTED_FEATURE_LEVEL})")),
+            "{text}"
+        );
+        assert!(text.contains("Run a newer binary"), "{text}");
+        // Nothing was written: no state, no applied frontier, no snapshot.
+        machine.store().with_storage(|storage| {
+            assert_eq!(storage.last_applied(), 0);
+            assert_eq!(storage.state().feature_level(), BASELINE_FEATURE_LEVEL);
+            assert_eq!(storage.snapshots().published_count(), 0);
+        });
+        // And the directory still opens, as it was.
+        let reopened = MetaRaftStore::open_in(&env, "/follower", cluster()).unwrap();
+        reopened.with_storage(|storage| {
+            assert_eq!(storage.last_applied(), 0);
+            assert_eq!(storage.state().feature_level(), BASELINE_FEATURE_LEVEL);
+        });
+    }
+
+    #[tokio::test]
+    async fn a_follower_installs_a_snapshot_at_its_level() {
+        let (_sim, _env, mut machine) = follower();
+        let (meta, bytes) = snapshot_at(SUPPORTED_FEATURE_LEVEL);
+        machine
+            .install_snapshot(&meta, Box::new(Cursor::new(bytes)))
+            .await
+            .expect("a snapshot at this build's level is installed");
+        machine.store().with_storage(|storage| {
+            assert_eq!(storage.last_applied(), 10);
+            assert_eq!(storage.state().feature_level(), SUPPORTED_FEATURE_LEVEL);
+        });
+    }
+
+    #[tokio::test]
+    async fn a_raise_above_this_builds_level_stops_the_node_instead_of_being_rejected() {
+        let (_sim, _env, mut machine) = follower();
+        let command = MetadataCommand::SetFeatureLevel {
+            env: CommandEnvelope {
+                request_id: Uuid::from_u128(1),
+                issued_at_ms: 1_750_000_000_000,
+            },
+            feature_level: ABOVE,
+        };
+        machine
+            .store()
+            .lock()
+            .storage
+            .append(&[MetaLogEntry {
+                term: 1,
+                index: 1,
+                payload: MetaLogPayload::Normal(command.clone()),
+            }])
+            .unwrap();
+        let entry = Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, 0), 0),
+            payload: EntryPayload::Normal(command),
+        };
+        let error = machine
+            .apply(vec![entry])
+            .await
+            .expect_err("a raise above this build's level was applied");
+        let text = error.to_string();
+        assert!(text.contains(&format!("feature level {ABOVE}")), "{text}");
+        assert!(text.contains("Run a newer binary"), "{text}");
+        machine.store().with_storage(|storage| {
+            assert_eq!(storage.last_applied(), 0, "the frontier moved");
+            assert_eq!(storage.state().feature_level(), BASELINE_FEATURE_LEVEL);
+        });
     }
 }
