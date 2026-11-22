@@ -1,0 +1,14 @@
+{
+  "identities": [
+    {
+      "name": "vtoplab",
+      "credentials": [
+        {
+          "accessKey": "vtoplab",
+          "secretKey": "vtoplab-secret-key"
+        }
+      ],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}

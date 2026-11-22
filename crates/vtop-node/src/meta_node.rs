@@ -257,6 +257,9 @@ pub async fn serve(
     observability.register(Box::new(MetaRaftCollector::new(Arc::clone(
         &node.consensus,
     ))?))?;
+    observability.register(Box::new(crate::observe::MetaAuditCollector::new(
+        Arc::clone(&node.consensus),
+    )?))?;
     observability.watch_connection_limit(peer_server.connection_limit());
     observability.watch_connection_limit(admin_server.connection_limit());
     observability.register(Box::new(crate::observe::MetaGroupCursorCollector::new(

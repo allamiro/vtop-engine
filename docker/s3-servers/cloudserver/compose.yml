@@ -1,0 +1,61 @@
+# The S3 compatibility matrix's Zenko CloudServer leg (#722, second wave).
+# Scality's CloudServer 9.5.5 with its file backends for data and metadata.
+# Apache-2.0. The two services every server's compose file has (see
+# docker/s3-servers/minio/compose.yml). The image is amd64 only. LAB-ONLY
+# credentials; the loopback bind is the boundary.
+name: vtop-s3-cloudserver
+
+services:
+  server:
+    # ghcr.io/scality/cloudserver:9.5.5 (amd64), pinned by digest (D7). The
+    # Docker Hub repository the README names lists only 2019 tags.
+    image: ghcr.io/scality/cloudserver:9.5.5@sha256:d4bacb4665468fa902fc9c99346c09c2c01d5e1745db200118cfca8595e98709
+    platform: linux/amd64
+    environment:
+      SCALITY_ACCESS_KEY_ID: vtoplab
+      SCALITY_SECRET_ACCESS_KEY: vtoplab-secret-key
+      S3BACKEND: file
+      S3DATAPATH: /data
+      S3METADATAPATH: /metadata
+      REMOTE_MANAGEMENT_DISABLE: "1"
+      # The name the tests and the init reach it by, so requests to
+      # http://server:8000 are served rather than refused as an unknown
+      # endpoint.
+      ENDPOINT: server
+    ports:
+      - "127.0.0.1:8000:8000"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    pids_limit: 1024
+    mem_limit: 2g
+    volumes:
+      - data:/data
+      - metadata:/metadata
+
+  init:
+    # amazon/aws-cli 2.40.3, pinned by digest (D7, D8).
+    image: amazon/aws-cli:2.40.3@sha256:33a16c53ea442e918b58df67301ad76a8fb57082c39f7e78753b898c3f3e87c2
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    pids_limit: 256
+    mem_limit: 256m
+    read_only: true
+    tmpfs: [/tmp]
+    entrypoint: ["/bin/sh", "/bootstrap.sh"]
+    environment:
+      HOME: /tmp
+      S3_ENDPOINT: http://server:8000
+      AWS_ACCESS_KEY_ID: vtoplab
+      AWS_SECRET_ACCESS_KEY: vtoplab-secret-key
+      CREATE_LOCKED: "true"
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+    volumes:
+      - ../init/bootstrap.sh:/bootstrap.sh:ro
+    depends_on: [server]
+
+volumes:
+  data:
+  metadata:
