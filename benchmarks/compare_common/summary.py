@@ -517,8 +517,9 @@ def committed_runs_by_kind(repo: str = REPO) -> dict[str, str]:
     for kind in KIND_ORDER:
         found = regenerate.committed_runs(kind, repo)
         if len(found) > 1:
-            raise schema.RunRefused(f"{len(found)} committed {kind} runs ({', '.join(os.path.basename(r) for r in found)}); "
-                                    "the summary draws one per kind, and the kind's own page can show only one")
+            names = ", ".join(os.path.basename(r) for r in found)
+            raise schema.RunRefused(f"{len(found)} committed {kind} runs ({names}); the summary draws one per "
+                                    "kind, and the kind's own page can show only one")
         if found:
             out[kind] = found[0]
     return out

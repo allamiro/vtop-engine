@@ -117,7 +117,7 @@ def test_the_products_table_states_licence_version_and_evidence_from_the_registr
 def test_a_product_that_may_not_be_published_is_never_listed(tmp_path):
     page, _ = _page(tmp_path)
     reg = registry.load()
-    for pid, entry in reg["products"].items():
+    for entry in reg["products"].values():
         if not entry["publish_ok"]:
             assert entry["name"] not in page
 
@@ -197,7 +197,8 @@ def test_two_committed_runs_of_a_kind_are_refused(monkeypatch):
 
 def test_regenerate_draws_the_summary_from_the_runs_it_found_and_checks_its_output(monkeypatch):
     seen = {}
-    monkeypatch.setattr(regenerate, "committed_runs", lambda kind, repo=REPO: [f"/runs/{kind}-1"] if kind == "link" else [])
+    monkeypatch.setattr(regenerate, "committed_runs",
+                        lambda kind, repo=REPO: [f"/runs/{kind}-1"] if kind == "link" else [])
     monkeypatch.setattr(regenerate.kr, "check_stack", lambda pins: None)
     monkeypatch.setattr(regenerate.kr, "check_font", lambda: None)
     monkeypatch.setattr(regenerate.kr, "check_runs_unchanged", lambda runs: None)
