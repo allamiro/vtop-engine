@@ -175,7 +175,8 @@ def parse_time(text: str) -> float:
     if not match:
         raise ValueError(f"not a timestamp: {text!r}")
     head, frac, tail = match.groups()
-    frac = (frac or "")[:7]
+    # Python < 3.11 takes exactly 3 or 6 fractional digits; Go prints 1 to 9 (`.25`, `.123456789`).
+    frac = "." + ((frac or ".")[1:] + "000000")[:6]
     return dt.datetime.fromisoformat(head + frac + (tail or "+00:00")).timestamp()
 
 
