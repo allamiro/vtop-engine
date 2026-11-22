@@ -186,18 +186,33 @@ meta:
     electionTimeoutMinMs: 300
     electionTimeoutMaxMs: 600
     heartbeatIntervalMs: 60
-  # Admin authorization (#238). SEMANTICS ARE THREE-VALUED upstream:
-  #   - block absent (enabled: false): authenticate but do not authorize —
-  #     every CA-signed client may do anything; the node WARNS at startup so
-  #     this stays a deliberate choice.
-  #   - block present with names: only those CNs may run cluster-scoped
-  #     commands (bootstrap, membership, administrative lease grants).
-  #   - block present and EMPTY: nobody may — a real configuration for a
-  #     cluster administered out of band, enforced as written.
+  # Admin authorization (#238). ON BY DEFAULT since v0.11.0 (#732, M2): only
+  # the certificate CNs named below may run cluster-scoped commands
+  # (`meta init`, membership, administrative lease grants). A data node may
+  # still act on its own range lease under its own certificate. The chart
+  # REFUSES TO RENDER with the policy on and no operator named, because no
+  # certificate could then bootstrap the cluster.
+  #
+  # The three shapes:
+  #   - enabled: true, operatorCommonNames: [names]: only those CNs are
+  #     operators. The default shape; you supply the names.
+  #   - enabled: true, operatorCommonNames: [], allowNoOperators: true:
+  #     NOBODY may run cluster-scoped commands, for a cluster administered out
+  #     of band. Enforced as written.
+  #   - enabled: false: LAB OPT-OUT. Authenticate but do not authorize: every
+  #     certificate the CA signed (every data node's included) may run
+  #     `meta init`, change membership and grant leases. The node warns at
+  #     startup and NOTES.txt warns at install. A plaintext admin plane
+  #     (transport.admin: plaintext) needs this, since it has no certificate
+  #     to match.
   adminAuthorization:
-    enabled: false
-    # Certificate Common Names permitted to run cluster-scoped admin commands.
+    enabled: true
+    # Certificate Common Names permitted to run cluster-scoped admin commands:
+    # the CN of the certificate in each operator's vtopctl admin.yaml.
     operatorCommonNames: []
+    # Render an enabled policy with no operators (nobody may run
+    # cluster-scoped commands). Off, an empty list is refused at render.
+    allowNoOperators: false
   # Signed leadership-transition statements (#240 item 5). When secretName
   # is set, every metadata pod reads the 32-byte hex key from that Secret —
   # injected as VTOP_TRANSITION_MAC_KEY and named to the config as

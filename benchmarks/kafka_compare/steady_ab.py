@@ -114,7 +114,7 @@ def main(argv: list[str] | None = None) -> int:
     os.makedirs(args.out)
     work = tempfile.mkdtemp(prefix="kc-steady-ab-")
     certs = os.path.join(work, "certs")
-    failover.mint_certs(certs)
+    failover.mint_certs(certs, args.client_image)
     ids = {k: json.loads(phase1.sh(["docker", "image", "inspect", v]).stdout)[0]["Id"] for k, v in engines.items()}
     env = {"what": "steady-state A/B of two VTOP node images, no faults, interleaved; see steady_ab.py",
            "engines": {k: {"image": engines[k], "image_id": ids[k]} for k in engines},

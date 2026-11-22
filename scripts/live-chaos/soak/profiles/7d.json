@@ -1,0 +1,42 @@
+{
+  "name": "7d",
+  "description": "Criterion A3 of #714 (#727): three metadata and three data nodes for 7 days under continuous quorum produce, one fault every hour, every fault kind in turn.",
+  "duration_s": 604800,
+  "first_fault_after_s": 3600,
+  "fault_interval_s": 3600,
+  "quiet_tail_s": 3600,
+  "fault_cycle": ["range_leader_kill", "partition", "pause", "disk_full", "clock_step", "meta_leader_kill"],
+  "fault_hold_s": {
+    "range_leader_kill": 30,
+    "meta_leader_kill": 30,
+    "partition": 120,
+    "pause": 60,
+    "disk_full": 300,
+    "clock_step": 300
+  },
+  "clock_step_seconds": [3600, -3600],
+  "recovery_timeout_s": 600,
+  "rate_records_per_s": 5,
+  "batch": 10,
+  "value_bytes": 512,
+  "sample_interval_s": 30,
+  "read_interval_s": 900,
+  "max_segment_bytes": 4194304,
+  "retention_bytes": 67108864,
+  "data_tmpfs_mib": 256,
+  "criteria": {
+    "trend_window_fraction": 0.8,
+    "trend_min_pairs": 200,
+    "trend": {
+      "rss_bytes": {"max_growth_pct": 5, "min_abs_growth": 33554432},
+      "open_fds": {"max_growth_pct": 5, "min_abs_growth": 16},
+      "data_dir_bytes": {"max_growth_pct": 10, "min_abs_growth": 16777216}
+    },
+    "max_data_dir_bytes": 100663296,
+    "max_rss_bytes": 2147483648,
+    "min_samples_fraction": 0.9,
+    "max_sample_gap_s": 300,
+    "min_acked_fraction": 0.5,
+    "max_read_gap_s": 3600
+  }
+}
