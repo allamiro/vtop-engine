@@ -8916,6 +8916,32 @@ mod tests {
 
     /// Run passes until the batch at `start` reaches `state` (the batch
     /// tasks run between passes), or fail after a bound.
+    /// Runs passes of `source_type` until the ledger holds `n` batches that
+    /// did not reach VERIFIED, and returns them: a window sealed in one pass
+    /// stays in flight across cycles, and settles in a later one.
+    async fn passes_until_failed(
+        engine: &mut Engine,
+        source_type: &SourceType,
+        n: usize,
+    ) -> Vec<BatchRecord> {
+        for _ in 0..200 {
+            let failed: Vec<_> = engine
+                .store
+                .list_batches()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|b| matches!(b.state, BatchState::Failed | BatchState::ReplayRequired))
+                .collect();
+            if failed.len() >= n {
+                return failed;
+            }
+            let _ = engine.run_source(source_type.clone(), false).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("{n} batches never failed");
+    }
+
     async fn pass_until(engine: &mut Engine, start: u64, state: BatchState) {
         for _ in 0..200 {
             if states_of_range(engine, start).await.contains(&state) {
@@ -9058,13 +9084,10 @@ mod tests {
             write!(f, "line 2\nline 3\n").unwrap();
         }
         // This pass seals [0, 7) and [7, 21), and the store refuses both.
-        let failed = engine.run_source(source_type.clone(), false).await;
-        let failed = failed.unwrap_or_default();
+        // They stay in flight across cycles, so they settle in a later pass.
+        let failed = passes_until_failed(&mut engine, &source_type, 2).await;
         assert_eq!(
-            failed
-                .iter()
-                .filter(|o| o.final_state == BatchState::Failed)
-                .count(),
+            failed.len(),
             2,
             "both windows of the pass failed: {failed:?}"
         );
@@ -9125,17 +9148,10 @@ mod tests {
                 .unwrap();
             write!(f, "{}{}", line('b'), line('c')).unwrap();
         }
-        // The old content's rewind is refused (its bytes are gone), so the
-        // pass reports an error; what matters is what the ledger holds.
-        let _ = engine.run_source(SourceType::File, false).await;
-        let failed: Vec<_> = engine
-            .store
-            .list_batches()
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|b| matches!(b.state, BatchState::Failed | BatchState::ReplayRequired))
-            .collect();
+        // The old content's rewind is refused (its bytes are gone), so a
+        // pass reports an error; what matters is what the ledger holds. The
+        // windows stay in flight across cycles and settle in a later pass.
+        let failed = passes_until_failed(&mut engine, &SourceType::File, 2).await;
         assert_eq!(
             failed.len(),
             2,
