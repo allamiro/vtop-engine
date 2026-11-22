@@ -1,0 +1,124 @@
+{
+  "halves": 6,
+  "halves_accepted": 6,
+  "halves_refused_or_failed": 0,
+  "repetitions": 3,
+  "complete_pairs": 3,
+  "pairs": [
+    {
+      "repetition": 1,
+      "uncapped_run": "competing-flow-bulk-uncapped-20261120T185844Z-vdhn78",
+      "capped_run": "competing-flow-bulk-capped-20261120T190821Z-xvrb79",
+      "uncapped_exit_code": "0",
+      "capped_exit_code": "0",
+      "complete": true,
+      "without_cap": {
+        "run_id": "competing-flow-bulk-uncapped-20261120T185844Z-vdhn78",
+        "competitor_goodput_mbps_with": 6.26,
+        "competitor_goodput_mbps_without": 9.563,
+        "share_of_solo_pct": 65.46,
+        "competitor_goodput_mbps_over_vtop_window": 6.57,
+        "vtop_goodput_mbps_with": 2.312,
+        "competitor_jain_index": 0.8131,
+        "vtop_attributed_cycles": 3,
+        "vtop_window_seconds": 84.156,
+        "upload_max_egress_bytes_per_second": ""
+      },
+      "with_cap": {
+        "run_id": "competing-flow-bulk-capped-20261120T190821Z-xvrb79",
+        "competitor_goodput_mbps_with": 7.513,
+        "competitor_goodput_mbps_without": 9.564,
+        "share_of_solo_pct": 78.55,
+        "competitor_goodput_mbps_over_vtop_window": 7.52,
+        "vtop_goodput_mbps_with": 1.641,
+        "competitor_jain_index": 0.7083,
+        "vtop_attributed_cycles": 2,
+        "vtop_window_seconds": 79.809,
+        "upload_max_egress_bytes_per_second": "262144"
+      },
+      "competitor_goodput_mbps_with_minus_without_cap": 1.253
+    },
+    {
+      "repetition": 2,
+      "uncapped_run": "competing-flow-bulk-uncapped-20261120T192723Z-g2znby",
+      "capped_run": "competing-flow-bulk-capped-20261120T191753Z-9y5472",
+      "uncapped_exit_code": "0",
+      "capped_exit_code": "0",
+      "complete": true,
+      "without_cap": {
+        "run_id": "competing-flow-bulk-uncapped-20261120T192723Z-g2znby",
+        "competitor_goodput_mbps_with": 6.816,
+        "competitor_goodput_mbps_without": 9.563,
+        "share_of_solo_pct": 71.27,
+        "competitor_goodput_mbps_over_vtop_window": 6.746,
+        "vtop_goodput_mbps_with": 2.242,
+        "competitor_jain_index": 0.7993,
+        "vtop_attributed_cycles": 3,
+        "vtop_window_seconds": 86.798,
+        "upload_max_egress_bytes_per_second": ""
+      },
+      "with_cap": {
+        "run_id": "competing-flow-bulk-capped-20261120T191753Z-9y5472",
+        "competitor_goodput_mbps_with": 7.494,
+        "competitor_goodput_mbps_without": 9.564,
+        "share_of_solo_pct": 78.36,
+        "competitor_goodput_mbps_over_vtop_window": 7.459,
+        "vtop_goodput_mbps_with": 1.644,
+        "competitor_jain_index": 0.7102,
+        "vtop_attributed_cycles": 2,
+        "vtop_window_seconds": 79.691,
+        "upload_max_egress_bytes_per_second": "262144"
+      },
+      "competitor_goodput_mbps_with_minus_without_cap": 0.678
+    },
+    {
+      "repetition": 3,
+      "uncapped_run": "competing-flow-bulk-uncapped-20261120T193650Z-8qwqfc",
+      "capped_run": "competing-flow-bulk-capped-20261120T194633Z-wnljol",
+      "uncapped_exit_code": "0",
+      "capped_exit_code": "0",
+      "complete": true,
+      "without_cap": {
+        "run_id": "competing-flow-bulk-uncapped-20261120T193650Z-8qwqfc",
+        "competitor_goodput_mbps_with": 6.631,
+        "competitor_goodput_mbps_without": 9.564,
+        "share_of_solo_pct": 69.33,
+        "competitor_goodput_mbps_over_vtop_window": 6.637,
+        "vtop_goodput_mbps_with": 2.282,
+        "competitor_jain_index": 0.8075,
+        "vtop_attributed_cycles": 3,
+        "vtop_window_seconds": 85.262,
+        "upload_max_egress_bytes_per_second": ""
+      },
+      "with_cap": {
+        "run_id": "competing-flow-bulk-capped-20261120T194633Z-wnljol",
+        "competitor_goodput_mbps_with": 7.538,
+        "competitor_goodput_mbps_without": 9.564,
+        "share_of_solo_pct": 78.82,
+        "competitor_goodput_mbps_over_vtop_window": 7.559,
+        "vtop_goodput_mbps_with": 1.603,
+        "competitor_jain_index": 0.7029,
+        "vtop_attributed_cycles": 2,
+        "vtop_window_seconds": 81.738,
+        "upload_max_egress_bytes_per_second": "262144"
+      },
+      "competitor_goodput_mbps_with_minus_without_cap": 0.907
+    }
+  ],
+  "median_over_complete_pairs": {
+    "without_cap": {
+      "competitor_goodput_mbps_with": 6.631,
+      "competitor_goodput_mbps_without": 9.563,
+      "share_of_solo_pct": 69.33,
+      "vtop_goodput_mbps_with": 2.282,
+      "competitor_jain_index": 0.807
+    },
+    "with_cap": {
+      "competitor_goodput_mbps_with": 7.513,
+      "competitor_goodput_mbps_without": 9.564,
+      "share_of_solo_pct": 78.55,
+      "vtop_goodput_mbps_with": 1.641,
+      "competitor_jain_index": 0.708
+    }
+  }
+}

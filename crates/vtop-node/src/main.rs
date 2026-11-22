@@ -108,6 +108,16 @@ enum Command {
         /// the producer on a socket that never answers or closes.
         #[arg(long, default_value_t = 0)]
         request_timeout_ms: u64,
+        /// Append every batch's invocation and outcome here as JSON lines,
+        /// for the history checker (#728).
+        #[arg(long)]
+        history: Option<PathBuf>,
+        /// The target is a leader the caller has fenced: record any answer
+        /// short of an acknowledgement as a refusal whose records must never
+        /// become visible, whatever the error code (`Fenced` alone cannot say
+        /// whether the batch was appended first).
+        #[arg(long)]
+        fenced_probe: bool,
     },
     /// Fetch from offset 0 and byte-verify everything below the committed HWM.
     Verify {
@@ -140,6 +150,10 @@ enum Command {
         batch: u32,
         #[arg(long, default_value_t = 128)]
         value_bytes: usize,
+        /// Append every visible record (as runs) and the high watermark
+        /// here as JSON lines, the read half of a history (#728).
+        #[arg(long)]
+        dump: Option<PathBuf>,
     },
     /// Query a follower's local committed offset over the replica plane.
     ReplicaStatus {
@@ -294,6 +308,8 @@ async fn run(cli: Cli) -> Result<i32, String> {
             rate_anchor_unix_micros,
             ack_log,
             request_timeout_ms,
+            history,
+            fenced_probe,
         } => {
             let config = client::ClientConfig::load(&client_config)?;
             client::produce(
@@ -310,6 +326,8 @@ async fn run(cli: Cli) -> Result<i32, String> {
                     rate_anchor_unix_micros,
                     ack_log,
                     request_timeout_ms,
+                    history,
+                    fenced_probe,
                 },
             )
             .await
@@ -322,6 +340,7 @@ async fn run(cli: Cli) -> Result<i32, String> {
             max_offset_gaps,
             batch,
             value_bytes,
+            dump,
         } => {
             let config = client::ClientConfig::load(&client_config)?;
             client::verify(
@@ -333,6 +352,7 @@ async fn run(cli: Cli) -> Result<i32, String> {
                     max_offset_gaps,
                     batch,
                     value_bytes,
+                    dump,
                 },
             )
             .await

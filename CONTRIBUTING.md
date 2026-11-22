@@ -54,7 +54,7 @@ Shell changes are linted with the same pinned shellcheck CI uses, in two steps:
 docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.11.0 \
   docker/*.sh scripts/release-notes.sh scripts/k8s-smoke.sh \
   scripts/k8s-forward.sh scripts/e2e-smoke.sh scripts/upgrade-compat.sh \
-  scripts/manifest-compat.sh scripts/ledger-compat.sh \
+  scripts/manifest-compat.sh scripts/ledger-compat.sh scripts/compat/*.sh \
   scripts/traffic-snapshot.sh scripts/test-progress.sh scripts/check-naming.sh \
   scripts/check-egress-claims.sh scripts/kafka-broker.sh
 
