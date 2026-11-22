@@ -207,6 +207,7 @@ nav:
       - "Deprecations: commands, flags and metrics": deprecations.md
       - Data-safety register: reference/data-safety-register.md
       - Component status: reference/component-status.md
+      - 1.0 release gate: reference/release-gate.md
       - Tamper evidence: reference/tamper-evidence.md
       - Protocol (normative draft): VTOP_PROTOCOL_DRAFT.md
       - Design documents:
@@ -227,6 +228,7 @@ nav:
       - Metadata saturation research: METADATA_SATURATION_RESEARCH.md
       - Live chaos validation: LIVE_CHAOS_VALIDATION.md
       - Engine soak validation: SOAK_VALIDATION.md
+      - Cluster soak validation: CLUSTER_SOAK_VALIDATION.md
   - Roadmap and releases:
       - Roadmap: ROADMAP.md
       - Versioning and support: SUPPORT.md

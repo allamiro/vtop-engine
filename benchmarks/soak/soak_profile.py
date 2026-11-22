@@ -19,7 +19,7 @@ PROFILE_DIR = Path(__file__).resolve().parent / "profiles"
 # The faults the driver can inject, in the order a cycle visits them by
 # default. A profile may use a subset or reorder them, but a fault the
 # injectors do not implement is refused when the profile is loaded.
-FAULT_KINDS = ("kill9", "broker_restart", "partition", "store_outage", "clock_step")
+FAULT_KINDS = ("kill9", "broker_restart", "partition", "store_outage", "clock_step", "enospc")
 
 # Trend series the evaluator gates. `fault_windows` says whether samples taken
 # while a fault is active (and until the engine has recovered from it) are
@@ -140,6 +140,8 @@ def validate(profile: dict) -> dict:
     for kind in cycle:
         if not isinstance(hold.get(kind), int) or hold[kind] < 0:
             raise ProfileError(f"fault_hold_s must give a non-negative integer for '{kind}'")
+    if "enospc" in cycle and hold["enospc"] < 1:
+        raise ProfileError("fault_hold_s.enospc must be at least 1: the engine needs time to meet the full disk")
     steps = profile["clock_step_seconds"]
     if not isinstance(steps, list) or not all(isinstance(s, int) and s != 0 for s in steps):
         raise ProfileError("clock_step_seconds must be a list of non-zero integers")

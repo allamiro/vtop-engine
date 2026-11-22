@@ -296,3 +296,65 @@ def test_the_subprocess_runner_reports_a_timeout_as_124_and_a_missing_binary_as_
     timed_out = soak_lab.subprocess_runner(["sleep", "5"], 0.2)
     assert timed_out.code == 124 and "timed out" in timed_out.err
     assert soak_lab.subprocess_runner(["definitely-not-a-binary-xyz"], 5).code == 127
+
+
+def test_the_tmpfs_goes_over_the_work_directory_in_the_engines_mount_namespace_only(tmp_path):
+    runner = Recorder()
+    make_lab(tmp_path, runner).mount_work_tmpfs()
+    argv = runner.calls[0]
+    assert argv[:3] == ["docker", "run", "--rm"]
+    assert "--privileged" in argv and "--network" in argv  # the helper, not the engine, holds the privilege
+    assert argv[argv.index("--pid") + 1] == "container:vtop-t-engine"
+    assert argv[argv.index("--entrypoint") + 1] == "nsenter" and "img:1" in argv
+    assert argv[argv.index("--") + 1 :] == [
+        "mount",
+        "-t",
+        "tmpfs",
+        "-o",
+        f"size={soak_lab.ENOSPC_TMPFS_BYTES},uid=10001,gid=10001,mode=0700",
+        "tmpfs",
+        "/data/work",
+    ]
+
+
+def test_lifting_the_tmpfs_is_a_lazy_unmount_in_the_same_namespace(tmp_path):
+    runner = Recorder()
+    make_lab(tmp_path, runner).unmount_work_tmpfs()
+    argv = runner.calls[0]
+    assert argv[argv.index("--") + 1 :] == ["umount", "-l", "/data/work"]
+    assert argv[argv.index("-t") + 1 :][:2] == ["1", "-m"]
+
+
+def test_a_refused_mount_is_an_error_that_says_what_it_printed(tmp_path):
+    runner = Recorder({"nsenter": soak_lab.Result(1, "", "mount: permission denied")})
+    with pytest.raises(soak_lab.LabError, match="permission denied"):
+        make_lab(tmp_path, runner).mount_work_tmpfs()
+
+
+def test_the_mount_depth_counts_the_mounts_on_the_work_directory_in_the_engine(tmp_path):
+    runner = Recorder({"mountinfo": soak_lab.Result(0, "2\n", "")})
+    assert make_lab(tmp_path, runner).work_mount_depth() == 2
+    assert runner.calls[0][:3] == ["docker", "exec", "vtop-t-engine"]
+    assert '"/data/work"' in runner.calls[0][-1] and "/proc/self/mountinfo" in runner.calls[0][-1]
+
+
+def test_the_filler_and_the_probe_run_inside_the_engine_container(tmp_path):
+    runner = Recorder()
+    lab = make_lab(tmp_path, runner)
+    lab.fill_work()
+    lab.probe_work_write()
+    assert runner.calls[0][:4] == ["docker", "exec", "vtop-t-engine", "dd"]
+    assert "of=/data/work/.soak-filler" in runner.calls[0]
+    assert runner.calls[1][:4] == ["docker", "exec", "vtop-t-engine", "sh"]
+    assert "dd if=/dev/zero of=/data/work/.soak-probe" in runner.calls[1][-1]  # dash's printf says "I/O error"
+
+
+def test_the_engines_log_is_read_from_the_daemons_own_clock(tmp_path):
+    runner = Recorder(
+        {"info": soak_lab.Result(0, "2026-01-01T00:00:00.5Z\n", ""), "logs": soak_lab.Result(0, "out", "err")}
+    )
+    lab = make_lab(tmp_path, runner)
+    since = lab.daemon_time()
+    assert since == "2026-01-01T00:00:00.5Z"
+    assert lab.engine_log_since(since) == "out\nerr"
+    assert runner.calls[-1] == ["docker", "logs", "--since", since, "vtop-t-engine"]

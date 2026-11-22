@@ -33,6 +33,11 @@ glibc builds, while the musl archives are checked by the release smoke run
 described below and nothing more. They use musl's own memory allocator,
 whose performance under load has not been measured here.
 
+On the musl builds, name a Kafka broker by an address it listens on, or by a
+name that resolves to one. musl resolves `localhost` to `::1` only (the glibc
+builds try `127.0.0.1` as well), so `bootstrap_servers: ["localhost:9092"]`
+does not reach a broker that listens on IPv4 alone; `127.0.0.1:9092` does.
+
 ### glibc floor
 
 The `-linux-gnu` binaries of v0.10.2 and later need glibc 2.17. They are built

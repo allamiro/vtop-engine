@@ -16,7 +16,7 @@ docker pull ghcr.io/allamiro/vtop-engine:latest   # the newest release, currentl
 | Base | `debian:bookworm-slim`, pinned by digest |
 | User | `vtop`, uid `10001` |
 | Entrypoint | `docker/entrypoint.sh`, default command `run` |
-| Features | Default build: Kafka source included, no PostgreSQL. |
+| Features | Kafka source and the PostgreSQL state store (`--features vtop-cli/postgres`), from the release after v0.10.2; v0.10.2 and earlier images have no PostgreSQL. No Kerberos, no test features. |
 | Signing | Keyless cosign signature, SBOM and provenance attestations. See [Verify a release](../RELEASE_VERIFICATION.md#container-image). |
 
 Pin a version tag in anything you deploy. `latest` moves with each release.
