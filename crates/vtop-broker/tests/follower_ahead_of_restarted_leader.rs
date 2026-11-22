@@ -262,7 +262,7 @@ fn produce_value(
 }
 
 /// A follower holding SHARED records, then FOLLOWER_ONLY more of the lost
-/// tail, with `floor` as the highest high-water mark it has observed.
+/// tail, with `floor` as the high-water mark it has observed.
 fn follower_with_tail(
     node: Uuid,
     dir: &TempDir,
@@ -270,7 +270,7 @@ fn follower_with_tail(
     range: &RangeIdentity,
     v2: bool,
     meta: &MetaFencingEpoch,
-    floor: u64,
+    floor: &ClusterCommittedOffset,
 ) -> Arc<InProcessFollower> {
     let follower = Arc::new(
         InProcessFollower::new(
@@ -280,7 +280,7 @@ fn follower_with_tail(
             range.clone(),
             EPOCH,
             meta.clone(),
-            ClusterCommittedOffset::new(floor),
+            floor.clone(),
         )
         .unwrap(),
     );
@@ -307,13 +307,18 @@ enum FirstWrite {
 /// Stage the restart, over `tls` or a plaintext plane: a leader holding
 /// SHARED records, two followers holding SHARED + FOLLOWER_ONLY, the
 /// followers' high-water mark at `floor`. Returns the outcome of the leader's
-/// first quorum write, and the followers.
+/// first quorum write, and the followers; the plane stays up while the third
+/// value is held.
 fn restarted_leader_behind_both_followers(
     tls: bool,
     v2: bool,
     floor: u64,
     first_write: FirstWrite,
-) -> (Result<(), ErrorResponse>, Vec<Arc<InProcessFollower>>) {
+) -> (
+    Result<(), ErrorResponse>,
+    Vec<Arc<InProcessFollower>>,
+    impl Sized,
+) {
     let runtime: Runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -347,7 +352,7 @@ fn restarted_leader_behind_both_followers(
             &range,
             v2,
             &meta,
-            floor,
+            &ClusterCommittedOffset::new(floor),
         ));
         follower_dirs.push(dir);
     }
@@ -443,9 +448,11 @@ fn restarted_leader_behind_both_followers(
             Err(error) => break Err(error),
         }
     };
-    drop(servers);
-    drop(runtime);
-    (outcome, followers)
+    (
+        outcome,
+        followers,
+        (runtime, servers, leader, follower_dirs),
+    )
 }
 
 fn expected_after_new_record() -> Vec<String> {
@@ -459,7 +466,7 @@ fn expected_after_new_record() -> Vec<String> {
 /// acknowledged. Its first write goes through, over them: both followers end
 /// holding the leader's log, and the records only they held are gone.
 fn a_leader_behind_its_followers_replaces_their_unacknowledged_tail(tls: bool, v2: bool) {
-    let (outcome, followers) =
+    let (outcome, followers, _plane) =
         restarted_leader_behind_both_followers(tls, v2, 0, FirstWrite::NewRecord);
     assert!(
         outcome.is_ok(),
@@ -471,13 +478,16 @@ fn a_leader_behind_its_followers_replaces_their_unacknowledged_tail(tls: bool, v
     );
     let expected = expected_after_new_record();
     for (index, follower) in followers.iter().enumerate() {
-        assert_eq!(
-            follower.next_offset(),
-            SHARED + 1,
+        // One follower's ack is the quorum; the other takes the leader's
+        // append on its own session, so both are awaited.
+        assert!(
+            await_within(Duration::from_secs(10), || follower.next_offset()
+                == SHARED + 1),
             "follower {index} must hold exactly the leader's {} records, not the \
-             {} it kept from before the restart",
+             {} it kept from before the restart: it holds {}",
             SHARED + 1,
             SHARED + FOLLOWER_ONLY,
+            follower.next_offset(),
         );
         // The leader's mark reaches the follower with the next frame, so it
         // is awaited, then the served records are the leader's.
@@ -516,7 +526,7 @@ fn a_v2_leader_behind_its_followers_replaces_their_unacknowledged_tail_on_a_tls_
 #[test]
 fn a_retry_of_the_record_a_follower_already_holds_discards_nothing() {
     for v2 in [false, true] {
-        let (outcome, followers) =
+        let (outcome, followers, _plane) =
             restarted_leader_behind_both_followers(false, v2, 0, FirstWrite::RetryOfLostRecord);
         assert!(outcome.is_ok(), "v2={v2}: {:?}", outcome.err());
         for follower in &followers {
@@ -537,7 +547,7 @@ fn a_retry_of_the_record_a_follower_already_holds_discards_nothing() {
 #[test]
 fn an_acknowledged_tail_is_never_discarded_and_the_write_over_it_is_refused() {
     for v2 in [false, true] {
-        let (outcome, followers) = restarted_leader_behind_both_followers(
+        let (outcome, followers, _plane) = restarted_leader_behind_both_followers(
             false,
             v2,
             SHARED + FOLLOWER_ONLY,
@@ -570,17 +580,25 @@ fn an_append_over_a_followers_tail_is_judged_by_its_bytes_and_its_mark() {
         // Different bytes, unacknowledged: discarded from the offset, then
         // appended.
         let dir = tempfile::tempdir().unwrap();
-        let follower = follower_with_tail(FOLLOWERS[0], &dir, 0xE1, &range, v2, &meta, 0);
+        let mark = ClusterCommittedOffset::new(0);
+        let follower = follower_with_tail(FOLLOWERS[0], &dir, 0xE1, &range, v2, &meta, &mark);
         let response = follower
             .apply_append(&append_request(&range, SHARED, new_value()))
             .unwrap();
         assert_eq!(response.local_committed_offset, SHARED + 1, "v2={v2}");
         assert_eq!(follower.next_offset(), SHARED + 1, "v2={v2}");
+        mark.advance_to(SHARED + 1);
+        assert_eq!(
+            served_values(&follower),
+            expected_after_new_record(),
+            "v2={v2}"
+        );
 
         // The same, as the second member of a batch whose first member is a
         // retry of a record the follower holds.
         let dir = tempfile::tempdir().unwrap();
-        let follower = follower_with_tail(FOLLOWERS[0], &dir, 0xE2, &range, v2, &meta, 0);
+        let mark = ClusterCommittedOffset::new(0);
+        let follower = follower_with_tail(FOLLOWERS[0], &dir, 0xE2, &range, v2, &meta, &mark);
         let response = follower
             .apply_append_batch(&[
                 append_request(&range, SHARED, record_value(SHARED)),
@@ -589,12 +607,16 @@ fn an_append_over_a_followers_tail_is_judged_by_its_bytes_and_its_mark() {
             .unwrap();
         assert_eq!(response.local_committed_offset, SHARED + 2, "v2={v2}");
         assert_eq!(follower.next_offset(), SHARED + 2, "v2={v2}");
+        mark.advance_to(SHARED + 2);
+        let mut expected: Vec<String> = (0..=SHARED)
+            .map(|sequence| String::from_utf8(record_value(sequence)).unwrap())
+            .collect();
+        expected.push(String::from_utf8(new_value()).unwrap());
         assert_eq!(
-            &served_values(&follower)[..(SHARED as usize)],
-            &(0..SHARED)
-                .map(|sequence| String::from_utf8(record_value(sequence)).unwrap())
-                .collect::<Vec<_>>()[..],
-            "v2={v2}: the shared prefix is untouched"
+            served_values(&follower),
+            expected,
+            "v2={v2}: the retried record and the shared prefix are untouched, and the \
+             conflicting one is the leader's"
         );
 
         // Different bytes below the follower's mark: refused, nothing lost.
@@ -606,7 +628,7 @@ fn an_append_over_a_followers_tail_is_judged_by_its_bytes_and_its_mark() {
             &range,
             v2,
             &meta,
-            SHARED + FOLLOWER_ONLY,
+            &ClusterCommittedOffset::new(SHARED + FOLLOWER_ONLY),
         );
         let refusal = follower
             .apply_append(&append_request(&range, SHARED, new_value()))

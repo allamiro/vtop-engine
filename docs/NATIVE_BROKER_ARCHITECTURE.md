@@ -908,6 +908,7 @@ benefits have been measured for VTOP traffic.
 |---|---|
 | Torn active tail | Truncate only bytes beyond the durable commit boundary after validating the last committed frame. |
 | Complete but uncommitted tail survives restart | Hide and truncate it; never infer commit from survival. Producer retry is safe through epoch/sequence rules. |
+| Leader restarts with a log shorter than a follower's (it lost a tail the follower kept) | The follower compares an append that lands below its tail by its bytes. A record it already holds byte for byte is a retry and is acknowledged. A different record conflicts: the follower discards its tail from that offset and takes the leader's, because a leader holds every record its epoch acknowledged, so nothing above its end was. A conflict below the follower's committed high-water mark is refused and nothing is discarded; the leader is then the replica missing acknowledged records and is repaired from one that holds them. |
 | Checksum failure below committed point | Quarantine the local segment; do not serve it; repair from a verified replica/tier. |
 | Crash during seal | Recover either active+commit marker or one complete sealed generation; never expose a partial seal. |
 | Leader loses epoch during append | Followers reject old epoch; leader returns no success and cannot advance commit. |
