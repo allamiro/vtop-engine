@@ -1341,6 +1341,11 @@ jobs:
         run: python -m unittest discover -s scripts/compat/tests -p 'test_format_registry.py' -v
       - name: format registry (every magic and version constant has an entry)
         run: python scripts/check-format-registry.py
+      # The upgrade-compat job's checkout is shallow, and scenario 22 reads the
+      # newest release's source from its tag, so that job must fetch the tag.
+      # Checked here, because the upgrade job runs only when its paths change.
+      - name: the upgrade job fetches the tag scenario 22 reads
+        run: python -m unittest discover -s scripts/compat/tests -p 'test_upgrade_job.py' -v
       # The list of config keys an older engine silently ignores, which a
       # release's notes carry (#743). It reads the schema out of config.rs
       # and the reference page, so its tests run against fixture refs and
@@ -1736,6 +1741,11 @@ jobs:
             | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
           [[ -n "$tag" ]] || { echo "no published release found"; exit 1; }
           dir="$(scripts/compat/fetch-release.sh "$tag" released x86_64-unknown-linux-gnu)"
+          # Scenario 22 reads the release's feature level, and whether it
+          # answers the version question, from its tag's source (`git show
+          # "$tag:..."`), and the checkout above is shallow with no tags:
+          # fetch that one tag and its tree, not the whole history.
+          git fetch --no-tags --depth=1 origin "+refs/tags/$tag:refs/tags/$tag"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "dir=$dir" >> "$GITHUB_OUTPUT"
 
