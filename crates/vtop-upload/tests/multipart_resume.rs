@@ -79,15 +79,22 @@ async fn upload(
     data: &[u8],
 ) -> Result<(), VtopError> {
     let (digest, fence) = fence_for(data);
-    upload_resumable(
-        backend,
-        cfg,
-        path,
-        uri,
-        Some(ObjectChecksum::new("sha256", &digest)),
-        fence,
+    // A call that never ends fails the test instead of stalling the suite:
+    // the retries of a part are bounded, and this is what notices if they
+    // stop being (the clock is paused, so this is virtual time).
+    tokio::time::timeout(
+        Duration::from_secs(600),
+        upload_resumable(
+            backend,
+            cfg,
+            path,
+            uri,
+            Some(ObjectChecksum::new("sha256", &digest)),
+            fence,
+        ),
     )
     .await
+    .expect("the upload call never finished: its retries must be bounded")
     .map(|_| ())
 }
 
