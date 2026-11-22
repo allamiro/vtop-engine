@@ -23,7 +23,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from typing import Any
+from typing import Any, NamedTuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -44,6 +44,75 @@ SYSTEM_STYLE = {
     "kafka": {"label": "Apache Kafka", "color": colours.colour("kafka", "light"), "marker": "o", "hatch": ""},
     "vtop": {"label": "VTOP (Kafka gateway)", "color": colours.colour("vtop", "light"), "marker": "s", "hatch": ""},
 }
+
+
+class Series(NamedTuple):
+    """One thing a chart draws and a table lists: Kafka, or VTOP at one `group_commit` setting.
+
+    A run that did not vary group commit has the two series it always had. One that did (#752) has
+    Kafka and one VTOP series per setting. Both VTOP series take VTOP's one validated colour
+    (colours.py has two validated slots, and a third system needs its own): `off` is told apart from
+    `on` by a hatched bar, a diamond marker and a dashed line, never by colour alone."""
+
+    system: str
+    group_commit: str  # "" for Kafka and for a run without the axis
+    label: str
+    short: str  # in a chart's "no result" note
+    color: str
+    marker: str
+    hatch: str
+    linestyle: str
+
+
+GROUP_COMMIT_STYLE = {"off": {"marker": "D", "hatch": "////", "linestyle": "--"},
+                      "on": {"marker": "s", "hatch": "", "linestyle": "-"}}
+
+
+def series_for(env: dict[str, Any]) -> list[Series]:
+    """The series of the run `env` describes, Kafka first."""
+    kafka, vtop = SYSTEM_STYLE["kafka"], SYSTEM_STYLE["vtop"]
+    out = [Series("kafka", "", kafka["label"], "Kafka", kafka["color"], kafka["marker"], kafka["hatch"], "-")]
+    settings = env["matrix"].get("group_commits") or []
+    if not settings:
+        return out + [Series("vtop", "", vtop["label"], "VTOP", vtop["color"], vtop["marker"], vtop["hatch"], "-")]
+    for setting in settings:
+        style = GROUP_COMMIT_STYLE[setting]
+        out.append(Series("vtop", setting, f"VTOP, group commit {setting}", f"gc {setting}", vtop["color"],
+                          style["marker"], style["hatch"], style["linestyle"]))
+    return out
+
+
+def _vtop_series(series: list[Series]) -> list[Series]:
+    return [ser for ser in series if ser.system == "vtop"]
+
+
+def _offsets(count: int, step: float) -> list[float]:
+    """Positions of `count` side-by-side marks about 0, `step` apart."""
+    return [(index - (count - 1) / 2) * step for index in range(count)]
+
+
+def series_note(series: list[Series]) -> str:
+    """One sentence for a chart's subtitle saying how the settings are told apart; empty when there is only the
+    one VTOP series."""
+    settings = [ser.group_commit for ser in _vtop_series(series) if ser.group_commit]
+    if len(settings) < 2:
+        return ""
+    return (" VTOP is drawn at each group commit setting (#752), in its one colour: off hatched or dashed, with "
+            "diamond markers; on solid, with square markers.")
+
+
+def _legend_patch_style(ser: Series) -> dict[str, Any]:
+    """A legend swatch matching the bar: a hatched series sets face and edge apart, which `color=` would override."""
+    if ser.hatch:
+        return {"facecolor": ser.color, "linewidth": 0, **_bar_style(ser)}
+    return {"color": ser.color}
+
+
+def _bar_style(ser: Series) -> dict[str, Any]:
+    """Extra bar arguments: a hatch in the surface colour, for the series that has one."""
+    return {"hatch": ser.hatch, "edgecolor": SURFACE} if ser.hatch else {}
+
+
 SURFACE = colours.SURFACES["docs"]
 INK = "#0b0b0b"
 INK_2 = "#52514e"
@@ -93,12 +162,22 @@ def _all_sustained(selected: list[dict[str, str]]) -> bool:
 
 
 def cell_summary(rows: list[dict[str, str]], system: str, mode: str, size: int, column: str,
-                 load_pct: int | None = None) -> dict[str, Any]:
-    """Median/min/max of `column` over the ok repetitions, plus what did not run."""
+                 load_pct: int | None = None, group_commit: str | None = None) -> dict[str, Any]:
+    """Median/min/max of `column` over the ok repetitions, plus what did not run.
+
+    `group_commit` selects VTOP's setting (`""` for a row with none); left out, every row of the system is
+    taken, which is refused when they hold more than one setting: a median over `off` and `on` together
+    describes neither."""
     criteria: dict[str, Any] = {"system": system, "mode": mode, "record_size": size}
     if load_pct is not None:
         criteria["load_pct"] = load_pct
+    if group_commit is not None:
+        criteria["group_commit"] = group_commit
     selected = schema.select(rows, **criteria)
+    if group_commit is None and len({row["group_commit"] for row in selected}) > 1:
+        raise schema.ReportRefused(f"the {system} rows of this cell hold several group commit settings "
+                                   f"({', '.join(sorted({row['group_commit'] for row in selected}))}); name "
+                                   "one rather than pool them into one median")
     ok = [row for row in selected if row["status"] == "ok"]
     not_ok = [row for row in selected if row["status"] != "ok"]
     out: dict[str, Any] = {"n": len(selected), "ok": len(ok), "not_ok": not_ok, "summary": None,
@@ -218,6 +297,7 @@ def _tick(value: float) -> str:
 def throughput_chart(plt, rows, env, run_id, mode: str, title: str, subtitle: str, name: str,
                      img_dir: str) -> list[str]:
     sizes = env["matrix"]["record_sizes"]
+    series = series_for(env)
     width_in, height_in = 10.0, 5.0
     fig, axes = plt.subplots(1, 2, figsize=(width_in, height_in))
     fig.subplots_adjust(left=0.08, right=0.985, top=1 - 1.55 / height_in, bottom=1.05 / height_in, wspace=0.26)
@@ -228,11 +308,10 @@ def throughput_chart(plt, rows, env, run_id, mode: str, title: str, subtitle: st
         _style_axes(ax)
         ax.grid(axis="y")
         top = 0.0
-        for index, system in enumerate(("kafka", "vtop")):
-            style = SYSTEM_STYLE[system]
+        for ser, offset in zip(series, _offsets(len(series), width + gap)):
             for position, size in enumerate(sizes):
-                cell = cell_summary(rows, system, mode, size, column)
-                x = position + (index - 0.5) * (width + gap)
+                cell = cell_summary(rows, ser.system, mode, size, column, group_commit=ser.group_commit)
+                x = position + offset
                 summary = cell["summary"]
                 if summary is None:
                     # The gap is drawn by name; the reason is in the report's table.
@@ -240,8 +319,8 @@ def throughput_chart(plt, rows, env, run_id, mode: str, title: str, subtitle: st
                     ax.text(x, 0, f" no result ({status})", rotation=90, ha="center", va="bottom",
                             fontsize=7, color=INK_2)
                     continue
-                ax.bar(x, summary.median, width=width, color=style["color"], linewidth=0,
-                       label=style["label"] if position == 0 else None)
+                ax.bar(x, summary.median, width=width, color=ser.color, linewidth=0,
+                       label=ser.label if position == 0 else None, **_bar_style(ser))
                 ax.errorbar(x, summary.median, yerr=[[summary.median - summary.low], [summary.high - summary.median]],
                             fmt="none", ecolor=INK_2, elinewidth=1, capsize=3, capthick=1)
                 label = compact(summary.median) if column == "records_per_sec" else _mib(summary.median)
@@ -258,9 +337,8 @@ def throughput_chart(plt, rows, env, run_id, mode: str, title: str, subtitle: st
         ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _p: _tick(v)))
         ax.set_title(f"{unit} (bar: median of repetitions; whiskers: min-max)", loc="left", fontsize=8.5,
                      color=INK_2)
-    handles = [plt.Rectangle((0, 0), 1, 1, color=SYSTEM_STYLE[s]["color"], label=SYSTEM_STYLE[s]["label"])
-               for s in ("kafka", "vtop")]
-    fig.legend(handles=handles, loc="upper left", ncol=2, fontsize=8.5,
+    handles = [plt.Rectangle((0, 0), 1, 1, label=ser.label, **_legend_patch_style(ser)) for ser in series]
+    fig.legend(handles=handles, loc="upper left", ncol=len(series), fontsize=8.5,
                bbox_to_anchor=(0.07, 1 - 0.88 / height_in), handlelength=1.2, columnspacing=1.6)
     _header(fig, height_in, title, subtitle)
     text = footer.footer_text(env)
@@ -275,31 +353,33 @@ def latency_chart(plt, rows, env, run_id, img_dir: str) -> list[str]:
 
     sizes = env["matrix"]["record_sizes"]
     pcts = env["matrix"]["load_pcts"]
+    series = series_for(env)
     width_in = 12.0
-    height_in = 2.9 * len(sizes) + 2.3
+    # A third series (VTOP at two group commit settings) can wrap the legend onto a second row: room for it.
+    spare = 0.0 if len(series) == 2 else 0.35
+    height_in = 2.9 * len(sizes) + 2.3 + spare
     fig, axes = plt.subplots(len(sizes), len(PERCENTILES), figsize=(width_in, height_in), squeeze=False,
                              sharey=True)
-    fig.subplots_adjust(left=0.065, right=0.99, top=1 - 1.6 / height_in, bottom=1.1 / height_in, hspace=0.55,
-                        wspace=0.07)
+    fig.subplots_adjust(left=0.065, right=0.99, top=1 - (1.6 + spare) / height_in, bottom=1.1 / height_in,
+                        hspace=0.55, wspace=0.07)
     hollow_seen = False
     high = None
-    dodge = {"kafka": -0.07, "vtop": 0.07}
+    dodge = _offsets(len(series), 0.14 if len(series) == 2 else 0.2)
     for r, size in enumerate(sizes):
         for c, (column, label) in enumerate(PERCENTILES):
             ax = axes[r][c]
             _style_axes(ax)
             ax.set_yscale("log")
             ax.grid(axis="y", which="major")
-            for system in ("kafka", "vtop"):
-                style = SYSTEM_STYLE[system]
+            for ser, shift in zip(series, dodge):
                 xs, ys = [], []
                 for i, pct in enumerate(pcts):
-                    x = i + dodge[system]
-                    cell = cell_summary(rows, system, "fixed_rate", size, column, pct)
+                    x = i + shift
+                    cell = cell_summary(rows, ser.system, "fixed_rate", size, column, pct,
+                                        group_commit=ser.group_commit)
                     summary = cell["summary"]
                     if summary is None:
-                        short = "Kafka" if system == "kafka" else "VTOP"
-                        ax.text(x, 0.97, f"{short}:\nno\nresult", transform=ax.get_xaxis_transform(), ha="center",
+                        ax.text(x, 0.97, f"{ser.short}:\nno\nresult", transform=ax.get_xaxis_transform(), ha="center",
                                 va="top", fontsize=6.5, color=INK_2, linespacing=1.1)
                         continue
                     median = max(summary.median, LOG_FLOOR_MS)
@@ -310,9 +390,9 @@ def latency_chart(plt, rows, env, run_id, img_dir: str) -> list[str]:
                                 elinewidth=1, capsize=2.5, capthick=1, zorder=2)
                     sustained = cell["sustained"]
                     hollow_seen = hollow_seen or not sustained
-                    ax.plot(x, median, marker=style["marker"], markersize=7.5, zorder=4,
-                            markerfacecolor=style["color"] if sustained else SURFACE,
-                            markeredgecolor=SURFACE if sustained else style["color"],
+                    ax.plot(x, median, marker=ser.marker, markersize=7.5, zorder=4,
+                            markerfacecolor=ser.color if sustained else SURFACE,
+                            markeredgecolor=SURFACE if sustained else ser.color,
                             markeredgewidth=1.6, linestyle="none")
                     if sustained:
                         xs.append(i)
@@ -321,9 +401,11 @@ def latency_chart(plt, rows, env, run_id, img_dir: str) -> list[str]:
                 # fell behind its offer is not a latency AT that offer.
                 for j in range(1, len(xs)):
                     if xs[j] == xs[j - 1] + 1:
-                        ax.plot([xs[j - 1] + dodge[system], xs[j] + dodge[system]], ys[j - 1:j + 1],
-                                color=style["color"], linewidth=2, solid_capstyle="round", zorder=3)
-            offered = [cell_summary(rows, "kafka", "fixed_rate", size, column, pct)["offered"] for pct in pcts]
+                        ax.plot([xs[j - 1] + shift, xs[j] + shift], ys[j - 1:j + 1],
+                                color=ser.color, linewidth=2, solid_capstyle="round", zorder=3,
+                                **({"linestyle": ser.linestyle} if ser.linestyle != "-" else {}))
+            offered = [cell_summary(rows, "kafka", "fixed_rate", size, column, pct, group_commit="")["offered"]
+                       for pct in pcts]
             ax.set_xticks(range(len(pcts)))
             ax.set_xticklabels([f"{pct}%\n{compact(rate)}/s" if rate else f"{pct}%" for pct, rate in
                                 zip(pcts, offered)], fontsize=7.5)
@@ -335,8 +417,9 @@ def latency_chart(plt, rows, env, run_id, img_dir: str) -> list[str]:
                 ax.set_ylabel("produce latency, ms (log scale)")
     if high is not None:
         axes[0][0].set_ylim(LOG_FLOOR_MS * 0.8, high * 1.8)
-    handles = [Line2D([], [], color=SYSTEM_STYLE[s]["color"], marker=SYSTEM_STYLE[s]["marker"], linewidth=2,
-                      markersize=7, markeredgecolor=SURFACE, label=SYSTEM_STYLE[s]["label"]) for s in ("kafka", "vtop")]
+    handles = [Line2D([], [], color=ser.color, marker=ser.marker, linewidth=2, markersize=7,
+                      markeredgecolor=SURFACE, label=ser.label,
+                      **({"linestyle": ser.linestyle} if ser.linestyle != "-" else {})) for ser in series]
     if hollow_seen:
         handles.append(Line2D([], [], color=INK_2, marker="o", linestyle="none", markersize=7,
                               markerfacecolor=SURFACE, markeredgecolor=INK_2,
@@ -347,7 +430,7 @@ def latency_chart(plt, rows, env, run_id, img_dir: str) -> list[str]:
     _header(fig, height_in, "Produce latency at fixed offered load (open loop), VTOP vs Apache Kafka",
             _wrap("x axis: % of KAFKA's median saturation for the cell (records/s beneath), offered to both systems. "
                   "Marker: median of repetitions; whiskers: min-max. Latency is send() to acknowledgement as the "
-                  "JVM perf tool measures it, in whole ms (a 0 is drawn at 0.5).", 200))
+                  "JVM perf tool measures it, in whole ms (a 0 is drawn at 0.5)." + series_note(series), 200))
     text = footer.footer_text(env)
     _footer(fig, text, 230)
     paths = _save(fig, img_dir, "kafka-compare-produce-latency", text)
@@ -397,6 +480,9 @@ def write_markdown(rows, env, run_id, csv_rel: str, env_rel: str, images: dict[s
     sizes = env["matrix"]["record_sizes"]
     pcts = env["matrix"]["load_pcts"]
     reps = env["matrix"]["repetitions"]
+    series = series_for(env)
+    vtops = _vtop_series(series)
+    settings = [ser.group_commit for ser in vtops if ser.group_commit]
     machine = f"{c['host_cpu']} ({c['host_model']}), {c['docker_platform']}"
     lines: list[str] = []
     add = lines.append
@@ -434,6 +520,14 @@ def write_markdown(rows, env, run_id, csv_rel: str, env_rel: str, images: dict[s
         "Kafka acknowledges once the in-sync replicas have the batch in their page cache (`flush.messages` "
         "unset), while a VTOP quorum acknowledgement means two replicas have **fsynced** the append. The "
         "`fsync-parity` profile is phase 2.")
+    if settings:
+        asked = " and ".join(f"`group_commit: {{enabled: {'true' if name == 'on' else 'false'}}}`"
+                             for name in settings)
+        add(f"- **VTOP's group commit (#752).** VTOP ran with {asked} in the leader's node config, "
+            "written explicitly for each setting (a change of the node's default cannot change what a setting "
+            "means), and the node's own `vtop_broker_group_commit_enabled` gauge was read to confirm it before "
+            "anything was timed. Every other VTOP setting is the same in each. Kafka has no counterpart, so it "
+            "ran once and is one series; each VTOP row names its setting in the CSV's `group_commit` column.")
     add("- **Open-loop latency (rule 6).** Latency comes from fixed offered rates (`--throughput`) at "
         f"{', '.join(f'{p}%' for p in pcts)} of **Kafka's** median saturation for the cell, offered to both "
         "systems. A run more than 5% short of its offered rate is flagged *not sustained*: the tool's throttle "
@@ -454,21 +548,26 @@ def write_markdown(rows, env, run_id, csv_rel: str, env_rel: str, images: dict[s
     add("| record size | system | records/s | MiB/s |")
     add("|---|---|---|---|")
     for size in sizes:
-        for system in ("kafka", "vtop"):
-            rps = cell_summary(rows, system, "saturation", size, "records_per_sec")
-            mib = cell_summary(rows, system, "saturation", size, "mib_per_sec")
-            add(f"| {size_label(size)} | {SYSTEM_STYLE[system]['label']} | {_summary_cell(rps)} | "
-                f"{_summary_cell(mib, 2)} |")
+        for ser in series:
+            rps = cell_summary(rows, ser.system, "saturation", size, "records_per_sec", group_commit=ser.group_commit)
+            mib = cell_summary(rows, ser.system, "saturation", size, "mib_per_sec", group_commit=ser.group_commit)
+            add(f"| {size_label(size)} | {ser.label} | {_summary_cell(rps)} | {_summary_cell(mib, 2)} |")
     add("")
+    kafka_series = series[0]
     for size in sizes:
-        ratio = _ratio(cell_summary(rows, "kafka", "saturation", size, "records_per_sec"),
-                       cell_summary(rows, "vtop", "saturation", size, "records_per_sec"))
-        if ratio is not None:
-            faster = "Kafka" if ratio >= 1 else "VTOP"
-            factor = ratio if ratio >= 1 else 1 / ratio
-            add(f"- {size_label(size)} records: **{faster}** saturates at {factor:.1f}x the other's median "
-                "records/s.")
+        for ser in vtops:
+            ratio = _ratio(cell_summary(rows, "kafka", "saturation", size, "records_per_sec", group_commit=""),
+                           cell_summary(rows, "vtop", "saturation", size, "records_per_sec",
+                                        group_commit=ser.group_commit))
+            if ratio is not None:
+                faster = "Kafka" if ratio >= 1 else "VTOP"
+                factor = ratio if ratio >= 1 else 1 / ratio
+                against = f" ({kafka_series.short} vs {ser.label})" if ser.group_commit else ""
+                add(f"- {size_label(size)} records{against}: **{faster}** saturates at {factor:.1f}x the other's "
+                    "median records/s.")
     add("")
+    if len(settings) >= 2:
+        add(ablation_section(rows, sizes, series))
     add("## Produce latency at fixed offered load")
     add("")
     add(f"![Produce latency]({images['produce-latency']})")
@@ -478,30 +577,35 @@ def write_markdown(rows, env, run_id, csv_rel: str, env_rel: str, images: dict[s
     add("|---|---|---|---|---|---|---|---|---|")
     for size in sizes:
         for pct in pcts:
-            for system in ("kafka", "vtop"):
-                p50 = cell_summary(rows, system, "fixed_rate", size, "lat_p50_ms", pct)
-                p99 = cell_summary(rows, system, "fixed_rate", size, "lat_p99_ms", pct)
-                p999 = cell_summary(rows, system, "fixed_rate", size, "lat_p999_ms", pct)
+            for ser in series:
+                kw = {"group_commit": ser.group_commit}
+                p50 = cell_summary(rows, ser.system, "fixed_rate", size, "lat_p50_ms", pct, **kw)
+                p99 = cell_summary(rows, ser.system, "fixed_rate", size, "lat_p99_ms", pct, **kw)
+                p999 = cell_summary(rows, ser.system, "fixed_rate", size, "lat_p999_ms", pct, **kw)
                 offered = p50["offered"]
                 achieved = _fmt(p50["achieved"].median) if p50["summary"] is not None else "-"
                 sustained = ("yes" if p50["sustained"] else "**no**") if p50["summary"] is not None else "-"
                 add(f"| {size_label(size)} | {pct}% | {_fmt(offered) if offered else '-'} | "
-                    f"{SYSTEM_STYLE[system]['label']} | {achieved} | {sustained} | {_summary_cell(p50)} | "
+                    f"{ser.label} | {achieved} | {sustained} | {_summary_cell(p50)} | "
                     f"{_summary_cell(p99)} | {_summary_cell(p999)} |")
     add("")
     for size in sizes:
-        for system in ("kafka", "vtop"):
-            cells = [cell_summary(rows, system, "fixed_rate", size, "lat_p50_ms", pct) for pct in pcts]
+        for ser in series:
+            cells = [cell_summary(rows, ser.system, "fixed_rate", size, "lat_p50_ms", pct,
+                                  group_commit=ser.group_commit) for pct in pcts]
             held = [pct for pct, cell in zip(pcts, cells) if cell["summary"] is not None and cell["sustained"]]
-            add(f"- {size_label(size)} records, {SYSTEM_STYLE[system]['label']}: sustained "
+            add(f"- {size_label(size)} records, {ser.label}: sustained "
                 f"{len(held)} of {len(pcts)} offered rates in every repetition"
                 + (f" ({', '.join(f'{p}%' for p in held)})." if held else "."))
-        vtop_sat = cell_summary(rows, "vtop", "saturation", size, "records_per_sec")["summary"]
-        lowest = cell_summary(rows, "kafka", "fixed_rate", size, "lat_p50_ms", pcts[0])["offered"]
-        if vtop_sat is not None and lowest and vtop_sat.high < lowest:
-            add(f"- {size_label(size)} records: VTOP's fastest saturation repetition ({_fmt(vtop_sat.high)} "
-                f"records/s) is below the lowest offered rate ({_fmt(lowest)} records/s), so none of its "
-                "fixed-rate runs could be open-loop; see *Reading the results*.")
+        lowest = cell_summary(rows, "kafka", "fixed_rate", size, "lat_p50_ms", pcts[0], group_commit="")["offered"]
+        for ser in vtops:
+            vtop_sat = cell_summary(rows, "vtop", "saturation", size, "records_per_sec",
+                                    group_commit=ser.group_commit)["summary"]
+            if vtop_sat is not None and lowest and vtop_sat.high < lowest:
+                who = "VTOP" if not ser.group_commit else f"VTOP (group commit {ser.group_commit})"
+                add(f"- {size_label(size)} records: {who}'s fastest saturation repetition ({_fmt(vtop_sat.high)} "
+                    f"records/s) is below the lowest offered rate ({_fmt(lowest)} records/s), so none of its "
+                    "fixed-rate runs could be open-loop; see *Reading the results*.")
     add("")
     if any(row["mode"] == "consume" for row in rows):
         add("## Consume throughput")
@@ -515,15 +619,15 @@ def write_markdown(rows, env, run_id, csv_rel: str, env_rel: str, images: dict[s
         add("| record size | system | records/s | MiB/s |")
         add("|---|---|---|---|")
         for size in sizes:
-            for system in ("kafka", "vtop"):
-                rps = cell_summary(rows, system, "consume", size, "records_per_sec")
-                mib = cell_summary(rows, system, "consume", size, "mib_per_sec")
-                add(f"| {size_label(size)} | {SYSTEM_STYLE[system]['label']} | {_summary_cell(rps)} | "
-                    f"{_summary_cell(mib, 2)} |")
+            for ser in series:
+                rps = cell_summary(rows, ser.system, "consume", size, "records_per_sec",
+                                   group_commit=ser.group_commit)
+                mib = cell_summary(rows, ser.system, "consume", size, "mib_per_sec", group_commit=ser.group_commit)
+                add(f"| {size_label(size)} | {ser.label} | {_summary_cell(rps)} | {_summary_cell(mib, 2)} |")
         add("")
     add("## Reading the results")
     add("")
-    add(READING.format(lowest_pct=pcts[0]))
+    add(reading(pcts[0], bool(settings)))
     add("")
     add("## Gateway gaps met (rule 10)")
     add("")
@@ -545,6 +649,8 @@ def write_markdown(rows, env, run_id, csv_rel: str, env_rel: str, images: dict[s
                 "docker_vm_arch", "docker_storage_driver", "volume_filesystem", "kafka_image", "vtop_commit",
                 "vtop_image", "client", "client_java", "profile"):
         add(f"| `{key}` | `{c.get(key)}` |")
+    if settings:
+        add(f"| `vtop_group_commit` | `{', '.join(settings)}` |")
     add(f"| run | `{run_id}`, started {env['started_at']}, finished {env.get('finished_at', '?')} |")
     add(f"| charts | matplotlib {matplotlib.__version__} |")
     add("")
@@ -558,8 +664,29 @@ def write_markdown(rows, env, run_id, csv_rel: str, env_rel: str, images: dict[s
         handle.write("\n".join(lines))
 
 
+GROUP_COMMIT_UNWIRED = """\
+2. **No group commit on the gateway path.** `vtop-node data` appends each produce request as its own durability
+   barrier: the broker's group-commit mode (one fsync and replication round shared by many concurrent
+   requests) exists in `vtop-broker` but is not wired into the node. The client caps a request at
+   `batch.size` (16 KiB by default) whatever the record size, so a ceiling set per request shows up as a
+   roughly constant MiB/s across record sizes and a record rate that falls as records grow, which is the shape
+   of VTOP's cells here.
+"""
+
+# For a run that varied the node's group commit (#752): what it measured is in the ablation table, so
+# nothing is argued from the code about it.
+GROUP_COMMIT_MEASURED = """\
+2. **Group commit on the gateway path.** The node's group commit (`group_commit.enabled`, #752: one fsync
+   and replication round shared by concurrent produce requests on a range) is a setting, and this run measured
+   VTOP with it off and on, so its effect on these cells is in the tables above, not argued from the code. The
+   client caps a request at `batch.size` (16 KiB by default) whatever the record size, and one connection has
+   one request in the broker at a time, so a ceiling set per request shows up as a roughly constant MiB/s
+   across record sizes and a record rate that falls as records grow; whether sharing a barrier lifts that
+   ceiling depends on how many requests are in the broker at once, which is what the ablation reads out.
+"""
+
 READING = """\
-Where Kafka is faster, the reasons known from the code and the configuration are these. None of them was
+Where Kafka is faster, the reasons known from the code and the configuration are these. {none_of_them} was
 isolated by a separate measurement in this phase; they are the explanation the code supports, not a proof.
 
 1. **What an acknowledgement costs.** Under `defaults`, a Kafka `acks=all` acknowledgement waits for the
@@ -569,12 +696,7 @@ isolated by a separate measurement in this phase; they are the explanation the c
    for fsyncs and a replication round trip before it is answered. This is the largest single difference, and
    it is a difference in the guarantee as much as in speed; the `fsync-parity` profile (phase 2) prices the
    same guarantee on Kafka.
-2. **No group commit on the gateway path.** `vtop-node data` appends each produce request as its own durability
-   barrier: the broker's group-commit mode (one fsync and replication round shared by many concurrent
-   requests) exists in `vtop-broker` but is not wired into the node. The client caps a request at
-   `batch.size` (16 KiB by default) whatever the record size, so a ceiling set per request shows up as a
-   roughly constant MiB/s across record sizes and a record rate that falls as records grow, which is the shape
-   of VTOP's cells here.
+{group_commit_item}
 3. **Translation in the gateway.** Every Kafka record batch is decoded, validated (CRC, attributes) and
    re-appended through the native broker, which frames it again for the replica plane; Kafka validates the
    batch and appends it with offsets assigned in place, without taking its records apart. The cost is CPU and
@@ -596,6 +718,40 @@ here; adding VTOP-relative rates is a phase-2 item.
 Nothing here measures what VTOP adds over Kafka on this path (fenced epochs, the verified commit rule, the
 evidence chain; see [COMPARISON.md](../COMPARISON.md)), and nothing here is a failover, archive or crash
 measurement (#597, #598, #599)."""
+
+def reading(lowest_pct: int, group_commit_measured: bool) -> str:
+    """The "Reading the results" text. Its second explanation depends on whether the run measured group commit."""
+    item = GROUP_COMMIT_MEASURED if group_commit_measured else GROUP_COMMIT_UNWIRED
+    none_of_them = ("Except for group commit (2), which the ablation above measures, none of them"
+                    if group_commit_measured else "None of them")
+    return READING.format(lowest_pct=lowest_pct, group_commit_item=item.rstrip("\n"),
+                          none_of_them=none_of_them)
+
+
+def ablation_section(rows, sizes: list[int], series: list[Series]) -> str:
+    """The group-commit ablation (#752): VTOP's saturation with the setting off and on, per record size."""
+    off = next(ser for ser in series if ser.group_commit == "off")
+    on = next(ser for ser in series if ser.group_commit == "on")
+    lines = [
+        "## Group commit ablation",
+        "",
+        "VTOP's produce throughput at saturation with the node's `group_commit.enabled` off and on (#752): the "
+        "same cells, the same client, one VTOP cluster brought up fresh per setting. `on / off` is the ratio "
+        "of the two medians (the ranges are in the throughput table above). It says how far the setting moved "
+        "the cell, not why; a ratio near 1 means it did not.",
+        "",
+        "| record size | group commit off records/s | group commit on records/s | on / off |",
+        "|---|---|---|---|",
+    ]
+    for size in sizes:
+        cells = {ser.group_commit: cell_summary(rows, "vtop", "saturation", size, "records_per_sec",
+                                                group_commit=ser.group_commit) for ser in (off, on)}
+        ratio = _ratio(cells["on"], cells["off"])
+        lines.append(f"| {size_label(size)} | {_summary_cell(cells['off'])} | {_summary_cell(cells['on'])} | "
+                     f"{f'{ratio:.2f}x' if ratio is not None else '-'} |")
+    lines.append("")
+    return "\n".join(lines)
+
 
 def percent(fraction: float) -> str:
     return f"{fraction * 100:g}%"

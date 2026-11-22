@@ -154,6 +154,8 @@ def capture_environment(run_id: str, matrix: dict, vtop_image: str, limits: dict
     c["vtop_commit"] = engine_commit()
     c["harness_commit"] = phase1.git("rev-parse", "HEAD")
     c["profile"] = PROFILE
+    # The HA cluster has no `group_commit:` axis (#752); the throughput run's record of one is not its own.
+    c.pop("vtop_group_commit", None)
     c["client"] = "kafka-verifiable-producer (JVM) vs vtop-node produce (native); NOT the same client path"
     c["client_kafka"] = f"kafka-verifiable-producer.sh {KAFKA_IMAGE.split('@')[0].split(':')[-1]} (JVM)"
     c["client_vtop"] = "vtop-node produce (native protocol, TLS) via vtop/failover-driver.sh"
