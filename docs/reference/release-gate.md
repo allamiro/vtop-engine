@@ -29,8 +29,8 @@ component is production, preview or experimental; the
 | Item | Value |
 |---|---|
 | Evaluated | 2026-11-22 |
-| Met | 15 |
-| Partial | 10 |
+| Met | 16 |
+| Partial | 9 |
 | Not met | 5 |
 | 1.0.0-rc.1 may be cut | no |
 | 1.0.0 may be cut | no |
@@ -74,7 +74,7 @@ only for a met row.
 | E3 | Backup and restore of the state store | met | `scripts/restore-drill.sh` in `.github/workflows/ci.yml::restore-drill-sqlite` and `.github/workflows/postgres-matrix.yml::restore-drill`, with RPO and RTO in `docs/operate/backup-and-recovery.md` (#829). | none | 2026-11-22 |
 | E4 | Disaster-recovery drills | partial | A lost ledger restored from a backup is drilled (E3, #829); a lost ledger with no backup, a lost bucket and a lost region are not. | #735 | 2026-11-22 |
 | E5 | Capacity guidance | partial | Starting points in `docs/PRODUCTION_HA.md`; no table tied to measurements. | #736 | 2026-11-22 |
-| E6 | Supported topology and engine host loss | partial | One engine per ledger, enforced at startup; the crash sweep kills the engine process (`.github/workflows/engine-crash-sweep.yml::sweep`), and its `postgres-kafka-host-loss` leg takes the engine's host and recovers on a standby over the same ledger, nightly; the procedure and a single-replica deployment example are in `docs/deploy/engine-host-loss.md` (#875). Open: whether a documented example is enough for the supported deployment, or a chart that CI deploys is needed. | #739 | 2026-11-22 |
+| E6 | Supported topology and engine host loss | met | One engine per ledger, enforced at startup; the crash sweep kills the engine process (`.github/workflows/engine-crash-sweep.yml::sweep`), and its `postgres-kafka-host-loss` leg takes the engine's host and recovers on a standby over the same ledger, nightly, with no record missing; the procedure and a single-replica deployment example are in `docs/deploy/engine-host-loss.md` (#875). A documented example is the supported deployment for 1.0; an engine chart is not planned. | none | 2026-11-22 |
 | F1 | Published, reproducible benchmarks with limits stated | partial | Charts redrawn from committed data (`.github/workflows/ci.yml::benchmark-charts`; `docs/benchmarks`); one laptop, no dedicated hardware. | #737, #736 | 2026-11-22 |
 | G1 | A real deployment | not met | No deployment outside the lab has reported. | #738 | 2026-11-22 |
 | H1 | Docs agree with the code and with each other | met | Every status claim re-read (#776); `scripts/check-release-versions.py` in the docs workflow. | none | 2026-11-22 |

@@ -212,6 +212,12 @@ jobs:
             "$CLEANUP_IMAGE" -rf /data/kafka /data/minio /data/engine-state /data/engine-work
       - name: Unit tests
         working-directory: benchmarks
+        env:
+          # Ubuntu 24.04 marks its Python externally managed (PEP 668), so a
+          # plain `pip install --user` is refused there. The soak host is an
+          # ephemeral runner used for this one job; a user-site install on it
+          # touches nothing a system package owns.
+          PIP_BREAK_SYSTEM_PACKAGES: "1"
         run: python3 -m pip install --user --disable-pip-version-check pytest pyyaml && python3 -m pytest soak/tests
       - name: Build the engine image and the lab's MinIO
         run: |
