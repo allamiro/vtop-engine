@@ -60,6 +60,8 @@ bytes = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The multipart part type a test store passes through.
+bytes = { workspace = true }
 # The surface snapshot (#719): the vtopctl command tree and the engine's
 # metric families, against docs/surface/.
 vtop-surface = { workspace = true, features = ["clap"] }

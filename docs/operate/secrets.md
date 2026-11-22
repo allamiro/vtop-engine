@@ -234,7 +234,9 @@ template {
 
 ```yaml
 manifest:
+  write_version: "0.4"
   mac:
+    active: q4-2026
     keys:
       - { id: q4-2026, file: /vault/secrets/manifest-q4 }
 ```

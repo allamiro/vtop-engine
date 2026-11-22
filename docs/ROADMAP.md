@@ -1458,6 +1458,35 @@ restore drill, a pilot). Failover and crash-durability measurements against
 Apache Kafka stay open (#597, #599), as does the head-to-head throughput run
 (#596).
 
+**Upgrade note for v0.11.0: the Helm chart turns admin authorization on by
+default (#732, M2).** `meta.adminAuthorization.enabled` now defaults to
+`true`. An existing install that never set it now renders only when
+`meta.adminAuthorization.operatorCommonNames` names the Common Names of your
+operator certificates. Otherwise `helm upgrade` stops at render with a message
+naming the three ways out, and nothing is changed in the cluster. Before
+upgrading:
+
+- Find the CN of each certificate your `vtopctl` uses against the admin plane
+  (`openssl x509 -noout -subject -in operator.pem`), and add it:
+  `--set 'meta.adminAuthorization.operatorCommonNames={vtop-admin}'`.
+- Once the policy is on, other certificates the CA signed, data nodes' included,
+  can no longer run `meta init`, change membership or grant leases. A data
+  node keeps its own lease, version report and group cursors. From metadata
+  feature level 9 a data node's lease *release* at shutdown names its
+  holder, and the policy admits it from the node's own certificate (#850,
+  #870). Raise to level 9 after upgrading (every metadata voter and data node
+  first, then `vtopctl meta enable-features --level 9`), and releases are
+  immediate. Below level 9 a release names no holder, so the policy refuses
+  it as an operator's command and the lease lapses on its deadline (15 s by
+  default): a planned handover waits that long.
+- A cluster administered out of band can set `allowNoOperators: true` (nobody
+  may run cluster-scoped commands). A lab can opt out with `enabled: false`;
+  the install notes then print a WARNING. A plaintext admin plane
+  (`transport.admin: plaintext`) needs the opt-out.
+- Turning the policy on changes no on-disk or wire format and is not a
+  one-way step: setting `enabled: false` again removes it on the next
+  rollout.
+
 ---
 
 ## Versioning
