@@ -1142,3 +1142,113 @@ fn v1_snapshot_rejects_corruption_trailing_oversize_unknown_version_and_mismatch
         Err(MetaStoreError::Corrupt { .. })
     ));
 }
+
+/// The `meta_decode` fuzz target's golden seeds (#743): the pinned vectors
+/// above, each behind the selector byte the target reads (`0` a command,
+/// `3` a snapshot payload, `4` log entry frames). The seeds for every
+/// command and response kind are written by `vtop-meta`'s own tests.
+fn golden_fuzz_seeds() -> Vec<(&'static str, Vec<u8>)> {
+    let with = |selector: u8, hex: &str| {
+        let mut bytes = vec![selector];
+        bytes.extend_from_slice(&from_hex(hex));
+        bytes
+    };
+    vec![
+        (
+            "golden-command-set-feature-level",
+            with(0, GOLDEN_SET_FEATURE_LEVEL_HEX),
+        ),
+        (
+            "golden-command-set-range-replica-set",
+            with(0, GOLDEN_SET_RANGE_REPLICA_SET_HEX),
+        ),
+        (
+            "golden-command-attest-unproven-promotion",
+            with(0, GOLDEN_ATTEST_UNPROVEN_PROMOTION_HEX),
+        ),
+        (
+            "golden-command-report-node-version",
+            with(0, GOLDEN_REPORT_NODE_VERSION_HEX),
+        ),
+        (
+            "golden-command-report-promotion-v050",
+            with(0, GOLDEN_REPORT_PROMOTION_V050_HEX),
+        ),
+        (
+            "golden-command-report-promotion-with-lineage",
+            with(0, GOLDEN_REPORT_PROMOTION_WITH_LINEAGE_HEX),
+        ),
+        (
+            "golden-command-split-range",
+            with(0, GOLDEN_SPLIT_COMMAND_HEX),
+        ),
+        ("golden-snapshot-state", with(3, GOLDEN_STATE_PAYLOAD_HEX)),
+        (
+            "golden-snapshot-split-state",
+            with(3, GOLDEN_SPLIT_STATE_PAYLOAD_HEX),
+        ),
+        (
+            "golden-snapshot-retention",
+            with(3, GOLDEN_RETENTION_PAYLOAD_HEX),
+        ),
+        (
+            "golden-snapshot-retention-before-transitions",
+            with(3, GOLDEN_RETENTION_PAYLOAD_HEX_BEFORE_TRANSITIONS),
+        ),
+        ("golden-frames-entry", with(4, GOLDEN_ENTRY_FRAME_HEX)),
+    ]
+}
+
+fn golden_fuzz_seed_dir() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus/meta_decode")
+}
+
+/// Rewrites the golden seeds. Run on purpose after a format change:
+/// `cargo test -p vtop-meta --test codec_golden -- --ignored write_golden_fuzz_seeds`.
+#[test]
+#[ignore = "writes fuzz/corpus/meta_decode; run on purpose"]
+fn write_golden_fuzz_seeds() {
+    let dir = golden_fuzz_seed_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, bytes) in golden_fuzz_seeds() {
+        std::fs::write(dir.join(format!("{name}.seed")), bytes).unwrap();
+    }
+}
+
+/// The committed golden seeds are the pinned vectors, and each decodes with
+/// the decoder the target gives it, so the fuzzer starts from bytes this
+/// build accepts.
+#[test]
+fn the_committed_golden_fuzz_seeds_are_the_pinned_vectors_and_decode() {
+    for (name, bytes) in golden_fuzz_seeds() {
+        let path = golden_fuzz_seed_dir().join(format!("{name}.seed"));
+        let committed = std::fs::read(&path).unwrap_or_else(|error| {
+            panic!("{}: {error}; run write_golden_fuzz_seeds", path.display())
+        });
+        assert_eq!(
+            committed, bytes,
+            "{name}: stale; run write_golden_fuzz_seeds"
+        );
+        let payload = &bytes[1..];
+        match bytes[0] {
+            0 => {
+                MetadataCommand::decode(payload).unwrap_or_else(|error| panic!("{name}: {error}"));
+            }
+            3 => {
+                MetaStateMachine::decode_snapshot(payload)
+                    .unwrap_or_else(|error| panic!("{name}: {error}"));
+            }
+            4 => {
+                let (sim, env) = sim_env();
+                drop(sim);
+                let mut chunk = from_hex(GOLDEN_CHUNK_HEADER_HEX);
+                chunk.extend_from_slice(payload);
+                write_sim_file(&env, "log-00000000000000000001.vmlog", &chunk);
+                let log = MetaLog::open_in(&env, ROOT, cluster_id(), MetaLogConfig::default())
+                    .unwrap_or_else(|error| panic!("{name}: {error}"));
+                assert_eq!(log.entry_count(), 1, "{name}");
+            }
+            other => panic!("{name}: selector {other}"),
+        }
+    }
+}

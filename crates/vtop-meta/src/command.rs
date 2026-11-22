@@ -3396,7 +3396,7 @@ fn decode_uuid_list(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn envelope(request: u128) -> CommandEnvelope {
@@ -3517,7 +3517,7 @@ mod tests {
         }
     }
 
-    fn every_command() -> Vec<MetadataCommand> {
+    pub(crate) fn every_command() -> Vec<MetadataCommand> {
         vec![
             // An operator's command with its actor (#706), and a node's with
             // an IPv6 peer: every actor and peer shape is in
@@ -3981,7 +3981,7 @@ mod tests {
         ]
     }
 
-    fn every_response() -> Vec<MetadataResponse> {
+    pub(crate) fn every_response() -> Vec<MetadataResponse> {
         vec![
             MetadataResponse::Ack { generation: 3 },
             MetadataResponse::TopicCreated {

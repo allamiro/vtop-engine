@@ -17,7 +17,11 @@
 #      inherited by assumption;
 #   4. the old leader, restarted, never reports ready and is refused with a
 #      stale epoch — because it is FENCED, not merely unreachable;
-#   5. every replica's sealed artifact independently verifies.
+#   5. every replica's sealed artifact independently verifies;
+#   6. the recorded operation history (#728) — both producers, the fenced
+#      probe, and every read — passes the history checker: each acknowledged
+#      batch read back once at its acknowledged offset, in order, and no
+#      record visible that a refused (fenced) produce carried.
 source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
 # A v2 range (#240): the promotion boundary marker this scenario asserts is
@@ -82,7 +86,8 @@ log "leader holds the range at epoch $EPOCH_BEFORE"
 CLIENT_CFG="$(emit_client_config_at_epoch "$EPOCH_BEFORE")"
 "$VTOP_NODE" produce --client-config "$CLIENT_CFG" --addr "$(native_addr)" \
   --records "$RECORDS" --batch "$BATCH" --durability quorum \
-  --acked-file "$WORKDIR/acked" > "$WORKDIR/logs/produce.log" 2>&1 &
+  --acked-file "$WORKDIR/acked" --history "$(history_file produce)" \
+  > "$WORKDIR/logs/produce.log" 2>&1 &
 PRODUCER=$!
 KILL_FLOOR=$((RECORDS / 10))
 [[ "$KILL_FLOOR" -ge 1 ]] || KILL_FLOOR=1
@@ -340,8 +345,13 @@ produce_deadline_base_ms=$(( $(date +%s%3N) + PROGRESS_TIMEOUT_SECONDS * 1000 ))
 produce_deadline_ms=$produce_deadline_base_ms
 diag_spent_ms=0
 attempts=0
+# Every attempt is its own process in the history. An attempt refused with
+# "quorum not reached" is recorded as unanswered rather than refused: the
+# leader appended the batch before the quorum wait expired, so the retry's
+# acknowledgement may name the records that attempt wrote.
+RESUMED_HISTORY="$(history_file produce-after-failover)"
 until "$VTOP_NODE" produce --client-config "$VERIFY_CFG" --addr "$(native_addr)" \
-  --records "$BATCH" --batch "$BATCH" \
+  --records "$BATCH" --batch "$BATCH" --history "$RESUMED_HISTORY" \
   --durability quorum > "$WORKDIR/logs/produce-after-failover.log" 2>&1; do
   attempts=$((attempts + 1))
   # Diagnostics are charged to their own budget (#410): the scrape used to
@@ -447,7 +457,8 @@ log "the new leader acknowledged fresh quorum writes"
 # One boundary marker per promoted epoch sits in the log, invisible to the
 # consumer (#240): epochs are minted from 1, so the current epoch bounds how
 # many offsets the consumer's view may skip — anything beyond is still loss.
-CHAOS_MAX_OFFSET_GAPS="$EPOCH_AFTER" \
+READ_HISTORY="$(history_file read)"
+CHAOS_MAX_OFFSET_GAPS="$EPOCH_AFTER" CHAOS_READ_HISTORY="$READ_HISTORY" \
   await_verified_floor "$VERIFY_CFG" "$(native_addr)" "$ACKED" "$ACKED"
 log "every one of the $ACKED acknowledged records survived the failover, byte-exact"
 
@@ -487,9 +498,19 @@ await_metric_at_least "$(data_metrics_addr 3)" vtop_broker_meta_fencing_epoch "$
   "restarted-old-leader never observed the rival grant"
 await_not_ready "$(data_metrics_addr 3)" "restarted-old-leader"
 assert_fenced_produce "$(old_leader_native_addr)" "$EPOCH_BEFORE" \
-  "the restarted old leader accepted a produce under its stale epoch"
+  "the restarted old leader accepted a produce under its stale epoch" \
+  "$(history_file fenced-produce)"
 log "the restarted old leader observed the rival grant at epoch $EPOCH_AFTER and is fenced"
 stop_node_now "$OLD"
+
+# --- the history, read once more after the fenced probe (#728) ---------------
+# The read above came before the old leader was restarted, so it cannot speak
+# for what the restart did. This one, from the range's real leader, closes
+# the history: everything both producers were told, everything the fenced
+# probe was refused, and everything each read saw is checked against it.
+CHAOS_MAX_OFFSET_GAPS="$EPOCH_AFTER" CHAOS_READ_HISTORY="$READ_HISTORY" \
+  await_verified_floor "$VERIFY_CFG" "$(native_addr)" "$ACKED" "$ACKED"
+check_history
 
 # --- artifacts must independently verify ------------------------------------
 stop_node_now "$NEW"
