@@ -13,7 +13,7 @@
 //! `VTOP_TEST_S3_ENDPOINT=http://localhost:9000 AWS_ACCESS_KEY_ID=minioadmin
 //!  AWS_SECRET_ACCESS_KEY=minioadmin cargo test -p vtop-cli
 //!  --test live_s3_verification_receipts -- --ignored --test-threads=1`
-//! It deletes every object it writes. CI runs it in the `minio-integration`
+//! It deletes every object it writes. CI runs it in the `s3-compat`
 //! job. `VTOP_TEST_S3_SERVER` names the server and its capability file
 //! (#722).
 #![cfg(unix)]
