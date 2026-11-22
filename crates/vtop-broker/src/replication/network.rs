@@ -455,6 +455,22 @@ pub trait ReplicaPeerHandler: Send + Sync {
         range: &vtop_protocol::RangeIdentity,
     ) -> Result<ReplicaStatusResponse, (ErrorCode, String)>;
 
+    /// Whether the connection's peer may drive this replica's WRITE path: an
+    /// append, a high-water-mark update or a fence.
+    ///
+    /// `peer` is the UUID in the verified certificate's common name, and
+    /// `None` on a plaintext plane, which has no identity to judge. A
+    /// certificate that chains to the plane's CA proves the peer is trusted
+    /// by it, not that it is a member of this range's replica set: where one
+    /// CA also signs client certificates, any client would otherwise be able
+    /// to append to, or fence, a follower.
+    ///
+    /// Defaults to allowing, as the plane always did, so a handler that keeps
+    /// no replica set is unchanged. The cluster node's handler overrides it.
+    fn authorize_writer(&self, _peer: Option<Uuid>) -> Result<(), (ErrorCode, String)> {
+        Ok(())
+    }
+
     /// Which fencing epoch wrote each stretch of this replica's log (#240).
     ///
     /// Defaults to empty, which means UNKNOWN rather than "no leadership
@@ -1086,18 +1102,27 @@ fn dispatch_replica_frame(
     } = frame;
     let message =
         match message {
-            Message::ReplicaAppendRequest(request) => match handler.apply_append(&request) {
+            Message::ReplicaAppendRequest(request) => match handler
+                .authorize_writer(peer)
+                .and_then(|()| handler.apply_append(&request))
+            {
                 Ok(response) => Message::ReplicaAppendResponse(response),
                 Err((code, message)) => error_message(code, message),
             },
             Message::ReplicaAppendBatchRequest(batch) => {
-                match handler.apply_append_batch(&batch.requests) {
+                match handler
+                    .authorize_writer(peer)
+                    .and_then(|()| handler.apply_append_batch(&batch.requests))
+                {
                     Ok(response) => Message::ReplicaAppendResponse(response),
                     Err((code, message)) => error_message(code, message),
                 }
             }
             Message::CommittedHwmUpdate(update) => {
-                let _ = handler.observe_hwm(&update);
+                // No answer to an update, so a refusal is silent too.
+                if handler.authorize_writer(peer).is_ok() {
+                    let _ = handler.observe_hwm(&update);
+                }
                 return None;
             }
             Message::ReplicaEpochHistoryRequest(request) => {
@@ -1169,7 +1194,9 @@ fn dispatch_replica_frame(
                         start_offset: entry.start_offset,
                     })
                     .collect();
-                match handler.fence(&request.range, request.fencing_epoch, &leader_epoch_starts) {
+                match handler.authorize_writer(peer).and_then(|()| {
+                    handler.fence(&request.range, request.fencing_epoch, &leader_epoch_starts)
+                }) {
                     Ok(response) => Message::ReplicaFenceResponse(response),
                     Err((code, message)) => error_message(code, message),
                 }
@@ -3527,6 +3554,90 @@ mod tests {
             "{message}"
         );
         drop(client);
+    }
+
+    /// A peer the handler does not authorize as a writer cannot append, send
+    /// a high-water mark or fence: the handler's write methods are not called.
+    #[test]
+    fn a_peer_that_is_not_authorized_to_write_reaches_no_write_method() {
+        struct Gated;
+        impl ReplicaPeerHandler for Gated {
+            fn node_id(&self) -> Uuid {
+                Uuid::from_u128(1)
+            }
+            fn apply_append(
+                &self,
+                _: &ReplicaAppendRequest,
+            ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
+                panic!("an unauthorized peer reached apply_append")
+            }
+            fn apply_append_batch(
+                &self,
+                _: &[ReplicaAppendRequest],
+            ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
+                panic!("an unauthorized peer reached apply_append_batch")
+            }
+            fn observe_hwm(&self, _: &CommittedHwmUpdate) -> Result<(), (ErrorCode, String)> {
+                panic!("an unauthorized peer reached observe_hwm")
+            }
+            fn status(
+                &self,
+                _: &RangeIdentity,
+            ) -> Result<ReplicaStatusResponse, (ErrorCode, String)> {
+                panic!("status is not under test")
+            }
+            fn fence(
+                &self,
+                _: &RangeIdentity,
+                _: u64,
+                _: &[crate::fencing_epochs::EpochStart],
+            ) -> Result<vtop_protocol::ReplicaFenceResponse, (ErrorCode, String)> {
+                panic!("an unauthorized peer reached fence")
+            }
+            fn authorize_writer(&self, peer: Option<Uuid>) -> Result<(), (ErrorCode, String)> {
+                Err((
+                    ErrorCode::InvalidRequest,
+                    format!("{peer:?} is not in the replica set"),
+                ))
+            }
+        }
+        let range = RangeIdentity {
+            topic: "events.v1".to_owned(),
+            topic_epoch: 1,
+            range_id: Uuid::from_u128(0xC1),
+            range_generation: 0,
+        };
+        let frame = |message| WireFrame {
+            request_id: 1,
+            stream_id: 1,
+            message,
+        };
+        let peer = Some(Uuid::from_u128(0xBAD));
+        let append = Message::ReplicaAppendRequest(ReplicaAppendRequest {
+            range: range.clone(),
+            fencing_epoch: 1,
+            leader_node_id: Uuid::from_u128(0xBAD),
+            expected_base_offset: 0,
+            producer_id: Uuid::from_u128(0xBAD),
+            producer_epoch: 1,
+            first_sequence: 0,
+            records: Vec::new(),
+        });
+        let reply = dispatch_replica_frame(&Gated, peer, frame(append)).expect("answered");
+        assert!(matches!(reply.message, Message::Error(_)), "{reply:?}");
+        let fence = Message::ReplicaFenceRequest(vtop_protocol::ReplicaFenceRequest {
+            range: range.clone(),
+            fencing_epoch: 1,
+            leader_epoch_starts: Vec::new(),
+        });
+        let reply = dispatch_replica_frame(&Gated, peer, frame(fence)).expect("answered");
+        assert!(matches!(reply.message, Message::Error(_)), "{reply:?}");
+        let hwm = Message::CommittedHwmUpdate(CommittedHwmUpdate {
+            range,
+            fencing_epoch: 1,
+            committed_high_watermark: 5,
+        });
+        assert!(dispatch_replica_frame(&Gated, peer, frame(hwm)).is_none());
     }
 
     /// The plaintext status plane never evaluates TLS naming (#410): an
