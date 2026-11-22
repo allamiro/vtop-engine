@@ -678,3 +678,64 @@ def test_store_requests_by_method_from_minio_metrics():
     assert store.per_gib(counts, 2**30)["PUT"] == 15
     with pytest.raises(ValueError, match="backwards"):
         store.requests_by_method(after, before)
+
+
+def test_every_build_input_changes_the_image_tag(monkeypatch):
+    # Review of #906: the tag hashed only crates and Cargo.lock, so a commit that changed
+    # the root manifest, .cargo or docker/ reused the previous image under the new commit.
+    from compare_common import lab
+    from kafka_compare import run as kafka_run
+
+    trees = {path: f"tree-of-{path}" for path in kafka_run.BUILD_INPUTS}
+
+    def fake_sh(args, **_kwargs):
+        path = args[-1].split(":", 1)[1]
+        if path in trees:
+            return subprocess.CompletedProcess(args, 0, trees[path] + "\n", "")
+        return subprocess.CompletedProcess(args, 1, "", "")
+
+    monkeypatch.setattr(lab, "sh", fake_sh)
+    base = lab.engine_tree()
+    assert lab.engine_tree() == base
+    for path in kafka_run.BUILD_INPUTS:
+        changed = dict(trees)
+        changed[path] = "different"
+        monkeypatch.setattr(lab, "sh", lambda args, c=changed, **_k: subprocess.CompletedProcess(
+            args, 0, c[args[-1].split(":", 1)[1]] + "\n", ""))
+        assert lab.engine_tree() != base, path
+    gone = dict(trees)
+    del gone[".cargo"]
+    monkeypatch.setattr(lab, "sh", lambda args, **_k: subprocess.CompletedProcess(
+        args, 0 if args[-1].split(":", 1)[1] in gone else 1, gone.get(args[-1].split(":", 1)[1], "") + "\n", ""))
+    assert lab.engine_tree() != base
+
+
+def _crash_rows(statuses):
+    return [{"cell": "crash-K1", "system": "vtop", "profile": "strong", "status": status, "gaps": str(gaps)}
+            for status, gaps in statuses]
+
+
+def test_a_total_over_a_partial_set_of_runs_is_not_a_value_to_rank():
+    # Review of #906: one completed fault trial out of three must not look like the fewest losses.
+    import types
+    kind = types.SimpleNamespace(variant_columns=())
+    metric = creport.Metric("gaps", "gaps", "gaps", "lower", ("crash-K1",), reduce="sum", digits=0)
+    group = ("crash-K1", ())
+    full = creport.value(_crash_rows([("ok", 2), ("ok", 0), ("ok", 1)]), kind, metric, group, "vtop", "strong")
+    assert full.summary is not None and full.summary.median == 3
+    partial = creport.value(_crash_rows([("ok", 0), ("failed", 5), ("refused", 0)]), kind, metric, group, "vtop",
+                            "strong")
+    assert partial.summary is None
+    assert partial.stub == "incomplete: 1 of 3 runs usable"
+
+
+def test_the_footer_names_the_versions_the_run_recorded_not_the_registry_pin(monkeypatch):
+    reg = registry.load()
+    other = next(s for s in registry.family_order(reg, "archive") if s != "vtop")
+    env = {"comparable": {}, "store": "s", "plan": {"name": "p"}, "run_id": "r", "started_at": "2026-11-22T00:00:00Z"}
+    rows = [{"system": other, "system_version": "0.0.1-benchmarked"}]
+    text = creport.footer_text(env, [other], reg, rows)
+    assert f"{registry.product(reg, other)['name']} 0.0.1-benchmarked" in text
+    assert registry.product(reg, other)["version"] not in text.replace("0.0.1-benchmarked", "") or \
+        registry.product(reg, other)["version"] == "0.0.1-benchmarked"
+    assert registry.product(reg, other)["version"] in creport.footer_text(env, [other], reg)

@@ -71,9 +71,17 @@ def git(*args: str) -> str:
 
 
 def engine_tree() -> str:
-    """What the VTOP image is built from: the crates tree and the lock file."""
-    return hashlib.sha256((git("rev-parse", "HEAD:crates") + git("rev-parse", "HEAD:Cargo.lock")).encode()
-                          ).hexdigest()[:12]
+    """What the VTOP image is built from: every input docker/Dockerfile reads
+    (kafka_compare.run.BUILD_INPUTS: the manifests, the lock file, `.cargo`, the
+    crates and `docker/`), as HEAD holds them. An input HEAD does not have counts
+    as absent, so adding or removing one changes the tag too."""
+    from kafka_compare import run as kafka_run
+
+    parts = []
+    for path in kafka_run.BUILD_INPUTS:
+        found = sh(["git", "-C", REPO, "rev-parse", "--verify", "--quiet", f"HEAD:{path}"], check=False)
+        parts.append(f"{path}={found.stdout.strip() if found.returncode == 0 else '-'}")
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:12]
 
 
 def ensure_vtop_image(rebuild: bool = False) -> str:
