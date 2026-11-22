@@ -29,8 +29,8 @@ component is production, preview or experimental; the
 | Item | Value |
 |---|---|
 | Evaluated | 2026-11-22 |
-| Met | 15 |
-| Partial | 10 |
+| Met | 16 |
+| Partial | 9 |
 | Not met | 5 |
 | 1.0.0-rc.1 may be cut | no |
 | 1.0.0 may be cut | no |
@@ -55,7 +55,7 @@ only for a met row.
 | A4 | Jepsen-style history check of the cluster plane | partial | Recorder and data-plane checker (`scripts/live-chaos/history/check_history.py`; #878), fed by scenarios 04 and 09 in `.github/workflows/ci.yml::live-chaos`. Lease and metadata histories, the 24-hour campaign and the live bug re-introductions are open. | #728 | 2026-11-22 |
 | A5 | Fuzz and mutation | partial | `.github/workflows/fuzz-nightly.yml::fuzz` over 12 decoders with a persisted corpus; `.github/workflows/ci.yml::mutants-gate` (`scripts/mutants-gate.py`); the recovery path's mutation score gated per file, nightly (`.github/workflows/fuzz-nightly.yml::mutants`; #900). The verify code (`vtop-upload`) and the file-continuity code (`vtop-adapters`) still score under the 0.80 floor and stay report only. | #729 | 2026-11-22 |
 | A6 | Every bug lands with a test that failed first | met | The rule in `CONTRIBUTING.md`; the release notes name the tests. | none | 2026-11-22 |
-| B1 | AWS S3 and one other S3 provider | not met | MinIO only in CI (`.github/workflows/ci.yml::minio-integration`; `crates/vtop-upload/tests/live_s3_verification.rs`). The live S3 tests run against a named server and its capability file (`crates/vtop-s3-testkit`; #764), but no other server and no AWS run is in CI. A store without Object Lock or versioning is refused at startup (#770). | #722 | 2026-11-22 |
+| B1 | AWS S3 and one other S3 provider | not met | The live S3 tests run on every pull request against MinIO, RustFS, Garage, SeaweedFS, Versity and CloudServer, each with its capability file (`.github/workflows/ci.yml::s3-compat`, calling `.github/workflows/s3-compat-matrix.yml::leg`; `crates/vtop-upload/tests/live_s3_verification.rs`; `crates/vtop-s3-testkit`, #764). No AWS run is in CI yet: the `s3-aws` leg is configured and runs once v0.11.0 is released. A store without Object Lock or versioning is refused at startup (#770). | #722 | 2026-11-22 |
 | B2 | Real Kafka versions | met | `.github/workflows/kafka-matrix.yml::kafka` (Apache Kafka 3.7 to 4.4, TLS and SASL listeners, Redpanda; #834); `.github/workflows/kafka-cluster.yml::cluster` (three brokers, a leader stopped mid-read; #874). The [nightly of 2026-11-20](https://github.com/allamiro/vtop-engine/actions/runs/44730486247) passed; the nightly of 2026-11-21 failed one leg on a paused-partition race that #877 fixed the same day. | none | 2026-11-22 |
 | B3 | State store versions | met | `.github/workflows/postgres-matrix.yml::postgres` on PostgreSQL 14 to 18 (#761; [nightly of 2026-11-21](https://github.com/allamiro/vtop-engine/actions/runs/44881713701)); `crates/vtop-state/tests/pg_battery.rs`. | none | 2026-11-22 |
 | B4 | Platforms | met | Release archives smoked on every Linux, with a glibc 2.17 and a static musl build, and each Linux archive run against a live Kafka broker before publishing; the dry run builds the commit about to be tagged (`.github/workflows/release.yml::binaries`; #842, #901); the workspace's tests on macOS arm64, macOS x86_64 and aarch64 Linux nightly (`.github/workflows/platform-tests.yml::test`; #876). The minimum glibc and macOS versions are stated in `docs/install/binaries.md`. Its issue is closed. | none | 2026-11-22 |
@@ -74,7 +74,7 @@ only for a met row.
 | E3 | Backup and restore of the state store | met | `scripts/restore-drill.sh` in `.github/workflows/ci.yml::restore-drill-sqlite` and `.github/workflows/postgres-matrix.yml::restore-drill`, with RPO and RTO in `docs/operate/backup-and-recovery.md` (#829). | none | 2026-11-22 |
 | E4 | Disaster-recovery drills | partial | A lost ledger restored from a backup is drilled (E3, #829); a lost ledger with no backup, a lost bucket and a lost region are not. | #735 | 2026-11-22 |
 | E5 | Capacity guidance | partial | Starting points in `docs/PRODUCTION_HA.md`; no table tied to measurements. | #736 | 2026-11-22 |
-| E6 | Supported topology and engine host loss | partial | One engine per ledger, enforced at startup; the crash sweep kills the engine process (`.github/workflows/engine-crash-sweep.yml::sweep`), and its `postgres-kafka-host-loss` leg takes the engine's host and recovers on a standby over the same ledger, nightly; the procedure and a single-replica deployment example are in `docs/deploy/engine-host-loss.md` (#875). Open: whether a documented example is enough for the supported deployment, or a chart that CI deploys is needed. | #739 | 2026-11-22 |
+| E6 | Supported topology and engine host loss | met | One engine per ledger, enforced at startup; the crash sweep kills the engine process (`.github/workflows/engine-crash-sweep.yml::sweep`), and its `postgres-kafka-host-loss` leg takes the engine's host and recovers on a standby over the same ledger, nightly, with no record missing; the procedure and a single-replica deployment example are in `docs/deploy/engine-host-loss.md` (#875). A documented example is the supported deployment for 1.0; an engine chart is not planned. | none | 2026-11-22 |
 | F1 | Published, reproducible benchmarks with limits stated | partial | Charts redrawn from committed data (`.github/workflows/ci.yml::benchmark-charts`; `docs/benchmarks`); one laptop, no dedicated hardware. | #737, #736 | 2026-11-22 |
 | G1 | A real deployment | not met | No deployment outside the lab has reported. | #738 | 2026-11-22 |
 | H1 | Docs agree with the code and with each other | met | Every status claim re-read (#776); `scripts/check-release-versions.py` in the docs workflow. | none | 2026-11-22 |

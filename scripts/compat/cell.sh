@@ -9,7 +9,7 @@
 # Usage: cell.sh <cell> <tag> <direction> <expect> <released-bin-dir> <head-bin-dir> [message]
 #   <released-bin-dir> is what scripts/compat/fetch-release.sh printed;
 #   <head-bin-dir> holds this build's vtopctl, and its vtop-node for the
-#   segments and meta cells;
+#   segments, wire and meta cells;
 #   [message] is the text a `refuse` expectation must find.
 # COMPAT_WORKDIR keeps the cell's files and logs there.
 set -euo pipefail
@@ -41,7 +41,7 @@ case "$CELL:$DIRECTION" in
     MANIFEST_COMPAT_KEEP=1 MANIFEST_COMPAT_WORKDIR="$WORKDIR" \
       exec "$here/../manifest-compat.sh" "$HEAD/vtopctl" "$TAG" "$RELEASED/vtopctl" "$EXPECT"
     ;;
-  ledger-sqlite:* | digests-audit:* | ledger-postgres:* | segments:* | meta:*)
+  ledger-sqlite:* | digests-audit:* | ledger-postgres:* | segments:* | wire:* | meta:*)
     # Each cell script takes the directories, and keeps its own logs.
     exec "$here/cells/$CELL.sh" "$TAG" "$DIRECTION" "$EXPECT" "$RELEASED" "$HEAD" \
       "$WORKDIR/$CELL-$DIRECTION" "$MESSAGE"
