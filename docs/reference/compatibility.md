@@ -114,10 +114,25 @@ warning. Verification receipts stay opt-in for 1.0.
 
 What is tested today:
 
-- A data node's directory (segment log v1), written by the newest patch of
-  each minor from v0.2, built from each tag's source, must open under the
-  current build, serve its records byte for byte, and still serve them after
-  a restart ([`scripts/upgrade-compat.sh`](../../scripts/upgrade-compat.sh)).
+- **A data node's directory, in the compatibility matrix** (the `segments`
+  cell of [`scripts/compat/expected.yaml`](../../scripts/compat/expected.yaml),
+  which runs [`scripts/upgrade-compat.sh`](../../scripts/upgrade-compat.sh)).
+  For the newest patch of each minor since v0.2 (the newest minor on a pull
+  request, all of them nightly) the release's **published** `vtop-node`,
+  checked against its `SHA256SUMS` and Sigstore bundle, writes a directory:
+  the single `range.active` before v0.3.0, sealed segments with their indexes,
+  commit markers, manifests, producer snapshots and the broker's epoch
+  journals from v0.3.0, and segment format v2 with its chunk sidecar from
+  v0.5.0 (`segment_format: v2`, which the default writer does not produce).
+  The current build must open it, quarantine nothing, serve every record byte
+  for byte, and serve them again after a restart. The directories written by
+  v0.2.1, v0.3.1, v0.5.0, v0.8.0 and v0.10.1 are also committed as fixtures
+  (`crates/vtop-log/tests/fixtures/segments/<tag>/<profile>/`, each tag with
+  a `PROVENANCE`), which `released_segment_dirs` (every record reads, every
+  sealed segment verifies) and `released_journals` (the producer-epoch and
+  fencing-epoch journals read as what the release recorded) open on every
+  build. The retention and truncate intents are not among them: a clean run
+  never leaves one, so no released binary's intent is captured yet.
 - The metadata tier rolls from the newest release to the current build, one
   voter at a time (live-chaos scenario 22).
 - A metadata voter's directory (the Raft log, the snapshot, the applied,
@@ -128,7 +143,9 @@ What is tested today:
   rewrites nothing, and a new write that survives a reopen
   (`released_meta_dirs` in `vtop-meta`; the fixtures carry a `PROVENANCE`).
   [`scripts/compat/cells/meta.sh`](../../scripts/compat/cells/meta.sh) runs
-  the same live, in both directions, against a released binary.
+  the same live, in both directions, against the published `vtop-node`: the
+  `meta` cell of the compatibility matrix, for the newest patch of each minor
+  since v0.8.0 (the newest minor on a pull request, all of them nightly).
 - The released `vtopctl` of v0.7.0 and later is run over a manifest archive
   the current build wrote: v0.8.0 and later must verify it, and v0.7.0 must
   report the documented self-hash failure
@@ -192,6 +209,7 @@ what they do is recorded, not promised):
 | State ledger, SQLite | Runs `status`, `list-batches` and `process-once`, then (`scripts/ledger-compat.sh`) archives, audits coverage over the digests and writes the nullable columns it knows, and the current build carries on over what it wrote. | `ledger-sqlite` forward |
 | Prune digest and audit trail | Reads the digest (`audit-coverage`, `scrub`) with the `sealed_at` key it does not know, and verifies and lists the audit chain. | `digests-audit` forward |
 | State ledger, PostgreSQL | After the current build ran `vtopctl migrate` and wrote, runs `status`, `list-batches` and `process-once`. Nightly. | `ledger-postgres` forward |
+| Metadata voter directory | Opens what the current build wrote at its baseline feature level and raised to its highest, reports the applied index, takes a write and comes back after a SIGKILL. Below the raised level it reports a lower level instead of refusing (see the table below): there is no supported way back after a raise. | `meta` forward |
 
 Each is `pass` in `expected.yaml` for the previous release, with one recorded
 refusal: **a release before v0.8.0 stops on a ledger that holds a
