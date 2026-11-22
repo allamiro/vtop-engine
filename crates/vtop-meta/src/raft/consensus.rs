@@ -1159,6 +1159,12 @@ impl Consensus for OpenraftConsensus {
                 }
             }
         }
+        // A lease longer than the ceiling is refused first: the clock-skew
+        // tolerance below grows with the lease asked for, so an unbounded
+        // lease would make that tolerance unbounded too.
+        if let Some(why) = command.lease_duration_refusal() {
+            return Err(ConsensusError::Refused(why));
+        }
         // A lease deadline is built from the proposer's clock, and the lease
         // agent compares it with its own: a proposer whose clock is far from
         // the leader's would steal or poison a lease. Refuse it BEFORE it is

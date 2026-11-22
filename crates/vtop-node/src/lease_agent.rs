@@ -2502,6 +2502,13 @@ impl LeaseAgentConfig {
         if self.lease_duration.is_zero() {
             return Err("lease_duration must be greater than zero".into());
         }
+        if self.lease_duration > Duration::from_millis(vtop_meta::MAX_LEASE_DURATION_MS) {
+            return Err(format!(
+                "lease_duration ({:?}) is longer than the {} ms the metadata plane grants",
+                self.lease_duration,
+                vtop_meta::MAX_LEASE_DURATION_MS
+            ));
+        }
         if self.renew_interval >= self.lease_duration {
             return Err(format!(
                 "renew_interval ({:?}) must be shorter than lease_duration ({:?}), or the \
