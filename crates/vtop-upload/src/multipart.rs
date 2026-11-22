@@ -1310,17 +1310,31 @@ pub async fn cleanup_abandoned(
     backend: &dyn UploadBackend,
     cfg: &MultipartUploadConfig,
 ) -> Result<usize, VtopError> {
-    cleanup_abandoned_except(backend, cfg, &|_: &str| false).await
+    cleanup_abandoned_except(backend, cfg, &|_: &str| Some(Box::new(()))).await
 }
 
-/// [`cleanup_abandoned`], leaving alone the sessions whose object key `live`
-/// says an upload in this process is still working on: a slow part, or its
-/// retries, can outlast the abandonment window, and the age of a session
-/// file says nothing about whether its upload is alive.
+/// What a sweep holds on one object key while it aborts the key's session:
+/// dropping it lets an upload of the key start.
+pub type SweepClaim = Box<dyn std::any::Any + Send>;
+
+/// [`cleanup_abandoned`], leaving alone the sessions whose object key an
+/// upload in this process is still working on: a slow part, or its retries,
+/// can outlast the abandonment window, and the age of a session file says
+/// nothing about whether its upload is alive.
+///
+/// `claim` is asked for each session old enough to sweep. It answers `None`
+/// when an upload of that key is live, and otherwise a [`SweepClaim`] that
+/// keeps an upload of the key from starting until the sweep has aborted the
+/// session and deleted its file. Checking whether the key is live and acting
+/// on the answer are two steps, so the answer alone cannot keep a batch that
+/// resumes the session in between from having its upload aborted and its
+/// checkpoint deleted (review of #895). The session is read again once the
+/// claim is held, because a batch that resumed it just before has made it
+/// young again.
 pub async fn cleanup_abandoned_except(
     backend: &dyn UploadBackend,
     cfg: &MultipartUploadConfig,
-    live: &(dyn Fn(&str) -> bool + Sync),
+    claim: &(dyn Fn(&str) -> Option<SweepClaim> + Sync),
 ) -> Result<usize, VtopError> {
     let dir = &cfg.state_dir;
     if !dir.exists() {
@@ -1360,9 +1374,18 @@ pub async fn cleanup_abandoned_except(
             }
         };
         let age = now.saturating_sub(session.updated_at_unix_secs);
-        if age < cfg.abandon_after_secs || live(&session.object_uri) {
+        if age < cfg.abandon_after_secs {
             continue;
         }
+        let Some(_claimed) = claim(&session.object_uri) else {
+            continue;
+        };
+        // With the key held no upload can resume this session; one that did
+        // so before the claim has rewritten it (or finished and removed it).
+        let session = match load_session(&path) {
+            Ok(s) if now.saturating_sub(s.updated_at_unix_secs) >= cfg.abandon_after_secs => s,
+            _ => continue,
+        };
         // The session file is the ONLY record of the remote upload id
         // (#482, review): deleting it after a FAILED abort orphans the
         // remote parts with nothing left to retry the abort against. So a
@@ -1907,6 +1930,58 @@ mod tests {
         assert_eq!(cleaned, 1);
         assert!(!path.exists());
         assert_eq!(backend.pending_multipart_count(), 0);
+    }
+
+    /// Review of #895: a batch that resumes an expired session just after the
+    /// sweep found it old, and before the sweep holds the key, has made it
+    /// young again. The sweep reads the session once it holds the key, and
+    /// leaves the upload and its checkpoint alone.
+    #[tokio::test]
+    async fn a_session_resumed_before_the_sweep_holds_its_key_is_left_alone() {
+        let data = vec![3_u8; 3_000];
+        let (file, digest) = tmp_file(&data);
+        let state = tempfile::tempdir().unwrap();
+        let backend =
+            MockBackend::new().with_multipart_fail_after_parts(Arc::new(AtomicUsize::new(1)));
+        let uri = "s3://bucket/resumed.segment";
+        let f = fence(&digest, data.len() as u64, 1);
+        let mut cfg = cfg(state.path(), 1_000);
+        let _ = upload_resumable(
+            &backend,
+            &cfg,
+            file.path(),
+            uri,
+            Some(ObjectChecksum::new("blake3", &digest)),
+            f.clone(),
+        )
+        .await
+        .expect_err("interrupt");
+        let path = session_path(state.path(), uri, &f);
+        let mut session = load_session(&path).unwrap();
+        session.updated_at_unix_secs = 1;
+        save_session(&path, &session).unwrap();
+        cfg.abandon_after_secs = 10;
+
+        // The batch resumes the session between the sweep's age check and
+        // its claim: the claim is asked for, and by then the session is young.
+        let resume = || {
+            let mut resumed = load_session(&path).unwrap();
+            resumed.updated_at_unix_secs = now_unix_secs();
+            save_session(&path, &resumed).unwrap();
+            Some(Box::new(()) as SweepClaim)
+        };
+        let cleaned = cleanup_abandoned_except(&backend, &cfg, &|_: &str| resume())
+            .await
+            .unwrap();
+        assert_eq!(cleaned, 0, "a resumed session was swept");
+        assert!(
+            path.exists(),
+            "the resumed session's checkpoint was deleted"
+        );
+        assert!(
+            backend.pending_multipart_count() >= 1,
+            "the resumed upload was aborted"
+        );
     }
 
     /// A failed abort keeps the session (#482, review): the session file is
