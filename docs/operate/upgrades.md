@@ -20,6 +20,46 @@ promises, and the rules for changing one, are in the
 [compatibility policy](../reference/compatibility.md); which releases get
 fixes is in [Versioning and support](../SUPPORT.md).
 
+## Upgrading from v0.10.3 to v0.10.4
+
+v0.10.4 fixes a lost range in the archive engine that v0.7.0 through v0.10.3
+carry, pauses writes to a bucket whose versioning is suspended under a running
+engine, and fixes four cluster-plane faults: a full disk during a segment
+roll, a follower a new leader could not catch up, a candidate that kept
+winning the lease without a quorum, and a broken epoch history nobody was
+told about. The full notes are in
+[v0.10.4](../ROADMAP.md#v0104--two-failed-windows-of-one-source-no-longer-lose-the-lower-one-and-a-bucket-that-stops-versioning-pauses-writes)
+in the roadmap.
+
+- **Nothing to do for the lost-range fix (#891).** In v0.7.0 through
+  v0.10.3, when two or more windows of one file, spool file or Kafka
+  partition failed in the same cycle, the source rewound to the highest
+  failed start and the lower range was never archived. To check a ledger
+  those releases wrote, run `vtopctl audit-coverage` (with `--check-storage`
+  to also probe the objects) and look for a unit with an unarchived range
+  below a later commit. A range the bug lost still has its FAILED or SUPERSEDED row (or a prune digest of one), so it is reported as a failed hole and the command fails, for Kafka partitions as for files; a Kafka gap that no failed row explains is reported without failing, so read the report as well as the exit status. See
+  [Scrub and coverage audit](scrub-and-audit.md#coverage-audit).
+- **With `upload.require_object_versioning` set, a bucket whose versioning
+  is suspended is no longer written to until it is re-enabled (#883).** The
+  engine logs the ERROR `bucket_versioning_paused`, sets
+  `vtop_bucket_versioning_paused`, and replays the batches once versioning
+  is Enabled. Load the new alert rules so `VtopBucketVersioningPaused` pages.
+- **New metrics and alerts.** `vtop_bucket_versioning_paused`,
+  `vtop_bucket_versioning_paused_batches_total`,
+  `vtop_broker_follower_below_catch_up_horizon` and
+  `vtop_broker_epoch_history_broken` are new. The Prometheus rules gain
+  `VtopBucketVersioningPaused`, `VtopStateStoreWritesSlow` and
+  `VtopEpochHistoryBroken`; the Grafana alerts gain "Follower below the
+  catch-up horizon". Reload `observability/prometheus/vtop-rules.yaml`, or
+  upgrade the chart if it renders the PrometheusRule.
+- **Otherwise a drop-in replacement.** Replace the binaries in any order;
+  v0.10.3 and v0.10.4 engines, voters and data nodes can run side by side.
+  No config key or default, schema marker, wire format or cluster feature
+  level changes, and no one-way step is added.
+- **Helm chart 0.6.3** (`appVersion` 0.10.4). No template or values change;
+  the chart's copy of the alert rules gains the three alerts above.
+- Downgrade is not supported.
+
 ## Upgrading from v0.10.2 to v0.10.3
 
 v0.10.3 fixes where a Kafka partition resumes, makes the `localfs` backend
