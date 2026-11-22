@@ -1,0 +1,67 @@
+# Vector 0.61.0, profile `disk-buffer`, for the spool comparison (#748). Each setting names
+# its page under https://vector.dev/docs/ (as published for 0.61).
+#
+# telemetry: Vector has no usage reporting; its API server is off
+# (reference/api/: `api.enabled`, default false, stated here).
+
+# reference/configuration/global-options/#data_dir: checkpoints and buffers on the tool's own volume.
+data_dir: /var/lib/vector
+
+api:
+  enabled: false
+
+sources:
+  spool:
+    # reference/configuration/sources/file/
+    type: file
+    # The active file and its rotated names, the same pattern every tool is given;
+    # a renamed file keeps its fingerprint (below) and is not read twice
+    # (sources/file/ "File rotation").
+    include:
+      - /spool/file/app.log*
+      - /spool/syslog-spool/app.log*
+    # A backlog is read from its first byte, as every other tool reads it.
+    read_from: beginning
+    # sources/file/#fingerprint: device and inode, so a copytruncate rotation's
+    # truncated file is recognised as the same file and re-read from zero.
+    fingerprint:
+      strategy: device_and_inode
+    # sources/file/#acknowledgements is deprecated in favour of the sink's setting below.
+
+sinks:
+  s3:
+    # reference/configuration/sinks/aws_s3/
+    type: aws_s3
+    inputs: [spool]
+    bucket: bench
+    key_prefix: "vector/%Y/%m/%d/"
+    region: us-east-1
+    # sinks/aws_s3/#endpoint: the lab MinIO (the S3 tap in crash cells).
+    endpoint: http://minio:9000
+    force_path_style: true
+    # #744 rule 15: one JSON line per record, gzip at its default level.
+    encoding:
+      codec: json
+    framing:
+      method: newline_delimited
+    compression: gzip
+    # #744 rule 15: about 32 MiB or 60 s per object.
+    batch:
+      max_bytes: 33554432
+      timeout_secs: 60
+    # sinks/aws_s3/#request.concurrency: the default.
+    request:
+      concurrency: adaptive
+    # reference/end-to-end-acknowledgements/: the file checkpoint advances only
+    # after this sink has delivered the event.
+    acknowledgements:
+      enabled: true
+    # reference/configuration/sinks/aws_s3/#buffer: a disk buffer; with it an event is
+    # acknowledged once it is in the buffer, which is synced every 500 ms
+    # (reference/end-to-end-acknowledgements/). The documented durability trade.
+    buffer:
+      type: disk
+      max_size: 1073741824
+      when_full: block
+    # Credentials come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in the
+    # container's environment (sinks/aws_s3/#auth, the default chain).

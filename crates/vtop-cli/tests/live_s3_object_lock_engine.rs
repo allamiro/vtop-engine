@@ -27,7 +27,7 @@
 //!  --test live_s3_object_lock_engine -- --ignored --test-threads=1`
 //! The objects it writes are under a one-day governance retention; the test
 //! deletes them with `x-amz-bypass-governance-retention`, which the lab's
-//! root credentials may use. CI runs it in the `minio-integration` job.
+//! root credentials may use. CI runs it in the `s3-compat` matrix (#722).
 //! `VTOP_TEST_S3_SERVER` names the server and its capability file (#722).
 #![cfg(unix)]
 
@@ -40,7 +40,7 @@ use vtop_cli::testkit::file_config;
 use vtop_cli::Engine;
 use vtop_core::config::{ObjectLockConfig, ObjectLockMode, StreamsConfig, VtopConfig};
 use vtop_core::types::SourceType;
-use vtop_s3_testkit::{Capability, LiveS3, S3Settings};
+use vtop_s3_testkit::{Capability, LiveS3, RefusalAt, S3Settings};
 
 /// How to reach the store, from `VTOP_TEST_S3_*` (#722), read once.
 fn settings() -> S3Settings {
@@ -127,11 +127,48 @@ async fn s3_client() -> aws_sdk_s3::Client {
     aws_sdk_s3::Client::from_conf(conf)
 }
 
+/// The refusal on a store without Object Lock or versioning (#722; Garage):
+/// the engine, started as `vtopctl run` starts it, refuses at startup in three
+/// parts (#770). Against the plain bucket: such a store has no locked one.
+async fn refused_at_startup(capability: Capability, at: RefusalAt) {
+    assert_eq!(
+        at,
+        RefusalAt::Startup,
+        "VTOP refuses {capability} at startup"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(dir.path(), &plain_bucket(), "vtop-it-722-refusal");
+    let parts: &[&str] = match capability {
+        Capability::ObjectLock | Capability::ObjectLockEnforced => &[
+            "the store does not implement S3 Object Lock",
+            "the engine did not start",
+            "remove upload.object_lock",
+        ],
+        Capability::Versioning => {
+            // The hardened profile alone, so its own check is the one asked.
+            cfg.upload.object_lock = None;
+            &[
+                "versioning",
+                "the engine did not start",
+                "upload.require_object_versioning: false",
+            ]
+        }
+        other => panic!("no refusal is asserted for {other}"),
+    };
+    let err = match Engine::new_exclusive(cfg, StreamsConfig { streams: vec![] }).await {
+        Ok(_) => panic!("an engine must not start on a store without {capability}"),
+        Err(e) => e.to_string(),
+    };
+    for part in parts {
+        assert!(err.contains(part), "{err:?} should say {part:?}");
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires an S3-compatible endpoint with Object Lock"]
 async fn live_the_engine_refuses_a_bucket_without_object_lock_at_startup() {
     let live = LiveS3::from_env();
-    live.case(
+    live.case_with_refusal(
         "engine.object_lock.refuses_a_plain_bucket_at_startup",
         &[Capability::ObjectLock],
         || async {
@@ -152,55 +189,140 @@ async fn live_the_engine_refuses_a_bucket_without_object_lock_at_startup() {
                 assert!(err.contains(&part), "{err:?} should say {part:?}");
             }
         },
+        refused_at_startup,
     )
     .await;
+}
+
+/// One batch the engine archived under the lock into the locked bucket, and
+/// what the cases below need to look at it and clean it up.
+struct Archived {
+    engine: Engine,
+    client: aws_sdk_s3::Client,
+    bucket: String,
+    /// The receipt's uri.
+    receipt: String,
+    /// The object, the manifest and the receipt: uri, key and version id.
+    written: Vec<(String, String, String)>,
+    // Held so the engine's state directory outlives the case.
+    _dir: tempfile::TempDir,
+}
+
+fn key_of(bucket: &str, uri: &str) -> String {
+    uri.strip_prefix(&format!("s3://{bucket}/"))
+        .unwrap()
+        .to_owned()
+}
+
+async fn archive_one_locked_batch() -> Archived {
+    let dir = tempfile::tempdir().unwrap();
+    let bucket = locked_bucket();
+    let prefix = format!("vtop-it-684-engine-{}", unix_now());
+    let mut engine = Engine::new_exclusive(
+        config(dir.path(), &bucket, &prefix),
+        StreamsConfig { streams: vec![] },
+    )
+    .await
+    .expect("a locked bucket passes the startup check");
+    let before = unix_now();
+    let out = engine.process_once(SourceType::File).await.unwrap();
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert!(out[0].committed, "{out:?}");
+    let row = engine
+        .store
+        .get_batch(&out[0].batch_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let client = s3_client().await;
+    let receipt =
+        vtop_core::partitioning::receipt_uri(row.manifest_uri.as_deref().unwrap()).unwrap();
+    let mut written = Vec::new();
+    for uri in [
+        row.object_uri.clone().unwrap(),
+        row.manifest_uri.clone().unwrap(),
+        receipt.clone(),
+    ] {
+        let key = key_of(&bucket, &uri);
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            head.object_lock_mode().map(|m| m.as_str()),
+            Some("GOVERNANCE"),
+            "{uri}"
+        );
+        let until = head.object_lock_retain_until_date().unwrap().secs();
+        assert!(
+            until >= before + 86_400 && until <= unix_now() + 86_400 + 1,
+            "{uri} is retained one day from its write: {until}"
+        );
+        written.push((uri, key, head.version_id().unwrap().to_owned()));
+    }
+    Archived {
+        engine,
+        client,
+        bucket,
+        receipt,
+        written,
+        _dir: dir,
+    }
+}
+
+impl Archived {
+    /// The scrub, reading the retention of the batch's object and manifest
+    /// and of the receipt back through the backend (#710).
+    async fn scrub(&self) -> vtop_cli::scrub::ScrubReport {
+        let rows = vtop_cli::scrub::committed_rows(
+            self.engine.store.list_batches().await.unwrap(),
+            Vec::new(),
+        );
+        self.engine
+            .scrub(
+                rows,
+                &ScrubOptions {
+                    check_retention: Some(ObjectLockMode::Governance),
+                    check_receipts: true,
+                    ..ScrubOptions::default()
+                },
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Delete what the batch wrote: the lab's root credentials may bypass
+    /// governance.
+    async fn clean_up(self) {
+        for (uri, key, version) in self.written {
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .version_id(&version)
+                .bypass_governance_retention(true)
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("cleaning up {uri}: {e:?}"));
+        }
+    }
 }
 
 #[tokio::test]
 #[ignore = "requires an S3-compatible endpoint with Object Lock"]
 async fn live_the_engine_archives_a_batch_under_the_configured_lock() {
     let live = LiveS3::from_env();
-    live.case(
+    live.case_with_refusal(
         "engine.object_lock.archives_a_batch_locked",
-        &[Capability::Versioning, Capability::ObjectLock],
+        &[Capability::ObjectLock, Capability::Versioning],
         || async {
-            let dir = tempfile::tempdir().unwrap();
-            let bucket = locked_bucket();
-            let prefix = format!("vtop-it-684-engine-{}", unix_now());
-            let mut engine = Engine::new_exclusive(
-                config(dir.path(), &bucket, &prefix),
-                StreamsConfig { streams: vec![] },
-            )
-            .await
-            .expect("a locked bucket passes the startup check");
-            let before = unix_now();
-            let out = engine.process_once(SourceType::File).await.unwrap();
-            assert_eq!(out.len(), 1, "{out:?}");
-            assert!(out[0].committed, "{out:?}");
-            let row = engine
-                .store
-                .get_batch(&out[0].batch_id)
-                .await
-                .unwrap()
-                .unwrap();
-
-            // The scrub reads the retention back through the backend (#710): the
-            // batch's object and manifest, and the receipt at its key.
-            let rows = vtop_cli::scrub::committed_rows(
-                engine.store.list_batches().await.unwrap(),
-                Vec::new(),
-            );
-            let report = engine
-                .scrub(
-                    rows,
-                    &ScrubOptions {
-                        check_retention: Some(ObjectLockMode::Governance),
-                        check_receipts: true,
-                        ..ScrubOptions::default()
-                    },
-                )
-                .await
-                .unwrap();
+            // The scrub finds the batch's and the receipt's retention locked
+            // (#710).
+            let archived = archive_one_locked_batch().await;
+            let report = archived.scrub().await;
             assert!(report.passed, "{report:#?}");
             let locked = RetentionResult::Locked.as_str();
             assert_eq!(report.retention.get(locked), Some(&1), "{report:#?}");
@@ -209,68 +331,43 @@ async fn live_the_engine_archives_a_batch_under_the_configured_lock() {
                 Some(&1),
                 "{report:#?}"
             );
+            archived.clean_up().await;
+        },
+        refused_at_startup,
+    )
+    .await;
+}
 
-            let client = s3_client().await;
-            let receipt =
-                vtop_core::partitioning::receipt_uri(row.manifest_uri.as_deref().unwrap()).unwrap();
-            let key_of = |uri: &str| {
-                uri.strip_prefix(&format!("s3://{bucket}/"))
-                    .unwrap()
-                    .to_owned()
-            };
-            let mut written = Vec::new();
-            for uri in [
-                row.object_uri.clone().unwrap(),
-                row.manifest_uri.clone().unwrap(),
-                receipt.clone(),
-            ] {
-                let key = key_of(&uri);
-                let head = client
-                    .head_object()
-                    .bucket(&bucket)
-                    .key(&key)
-                    .send()
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    head.object_lock_mode().map(|m| m.as_str()),
-                    Some("GOVERNANCE"),
-                    "{uri}"
-                );
-                let until = head.object_lock_retain_until_date().unwrap().secs();
-                assert!(
-                    until >= before + 86_400 && until <= unix_now() + 86_400 + 1,
-                    "{uri} is retained one day from its write: {until}"
-                );
-                written.push((uri, key, head.version_id().unwrap().to_owned()));
-            }
-
-            // Clear the receipt's retention, as a principal allowed to bypass
-            // governance can (#710): the scrub reports the receipt, not the batch.
-            client
+/// The scrub's `missing` finding (#710) against a real store: the receipt's
+/// retention is cleared by a principal allowed to bypass governance, and the
+/// scrub reports the receipt, and only the receipt. Clearing takes an empty
+/// `PutObjectRetention`, which not every store accepts
+/// (`object_lock_retention_clear`).
+#[tokio::test]
+#[ignore = "requires an S3-compatible endpoint with Object Lock"]
+async fn live_a_receipt_whose_retention_was_cleared_is_reported_by_the_scrub() {
+    let live = LiveS3::from_env();
+    live.case_with_refusal(
+        "engine.object_lock.scrub_reports_a_receipt_without_retention",
+        &[
+            Capability::ObjectLock,
+            Capability::Versioning,
+            Capability::ObjectLockRetentionClear,
+        ],
+        || async {
+            let archived = archive_one_locked_batch().await;
+            archived
+                .client
                 .put_object_retention()
-                .bucket(&bucket)
-                .key(key_of(&receipt))
+                .bucket(&archived.bucket)
+                .key(key_of(&archived.bucket, &archived.receipt))
                 .bypass_governance_retention(true)
                 .retention(aws_sdk_s3::types::ObjectLockRetention::builder().build())
                 .send()
                 .await
                 .expect("the lab's root credentials may clear a governance retention");
-            let rows = vtop_cli::scrub::committed_rows(
-                engine.store.list_batches().await.unwrap(),
-                Vec::new(),
-            );
-            let report = engine
-                .scrub(
-                    rows,
-                    &ScrubOptions {
-                        check_retention: Some(ObjectLockMode::Governance),
-                        check_receipts: true,
-                        ..ScrubOptions::default()
-                    },
-                )
-                .await
-                .unwrap();
+            let report = archived.scrub().await;
+            let locked = RetentionResult::Locked.as_str();
             assert!(!report.passed, "{report:#?}");
             assert_eq!(report.retention.get(locked), Some(&1), "{report:#?}");
             assert_eq!(
@@ -286,20 +383,9 @@ async fn live_the_engine_archives_a_batch_under_the_configured_lock() {
                 Some(RetentionResult::Missing),
                 "{report:#?}"
             );
-
-            // Clean up: the lab's root credentials may bypass governance.
-            for (uri, key, version) in written {
-                client
-                    .delete_object()
-                    .bucket(&bucket)
-                    .key(&key)
-                    .version_id(&version)
-                    .bypass_governance_retention(true)
-                    .send()
-                    .await
-                    .unwrap_or_else(|e| panic!("cleaning up {uri}: {e:?}"));
-            }
+            archived.clean_up().await;
         },
+        refused_at_startup,
     )
     .await;
 }
@@ -315,7 +401,7 @@ async fn live_the_engine_archives_a_batch_under_the_configured_lock() {
 #[ignore = "requires an S3-compatible endpoint with Object Lock"]
 async fn live_a_replay_over_an_ended_lock_commits_a_fresh_locked_object() {
     let live = LiveS3::from_env();
-    live.case(
+    live.case_with_refusal(
         "engine.object_lock.a_replay_over_an_ended_lock_commits_a_fresh_object",
         &[Capability::Versioning, Capability::ObjectLock],
         || async {
@@ -451,6 +537,7 @@ async fn live_a_replay_over_an_ended_lock_commits_a_fresh_locked_object() {
                     .unwrap_or_else(|e| panic!("cleaning up {:?}: {e:?}", v.key()));
             }
         },
+        refused_at_startup,
     )
     .await;
 }
@@ -552,6 +639,51 @@ async fn tier_backend(bucket: &str) -> std::sync::Arc<dyn vtop_upload::UploadBac
     vtop_upload::build_backend(&upload).await.unwrap()
 }
 
+/// The refusal on a store without Object Lock or versioning (#722; Garage),
+/// for `vtopctl tier copy`: the command checks the store before it writes,
+/// so it refuses, in words, with nothing copied. Against the plain bucket:
+/// such a store has no locked one.
+async fn tier_copy_refused_before_writing(capability: Capability, at: RefusalAt) {
+    assert_eq!(
+        at,
+        RefusalAt::Startup,
+        "a tier copy refuses before it writes, which the capability file calls startup"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let (sealed, root) = seal_segment(dir.path());
+    let (bucket, step, parts): (String, &str, &[&str]) = match capability {
+        Capability::ObjectLock | Capability::ObjectLockEnforced => (
+            plain_bucket(),
+            "object lock preflight",
+            &[
+                "the store does not implement S3 Object Lock",
+                "nothing was copied",
+                "remove upload.object_lock",
+            ],
+        ),
+        Capability::Versioning => (
+            locked_bucket(),
+            "versioning preflight",
+            &["versioning", "nothing was copied"],
+        ),
+        other => panic!("no refusal is asserted for {other}"),
+    };
+    let object_uri = format!("s3://{bucket}/vtop-it-722-tier-refusal/bundle.segment");
+    let err = vtop_cli::tier_tools::run_tier_copy(
+        tier_backend(&bucket).await.as_ref(),
+        &tier_request(&sealed, root, &object_uri),
+    )
+    .await
+    .expect_err("a tier copy must not write to a store without the capability");
+    assert!(
+        err.contains(&format!("refusing at {step}")),
+        "{err:?} should say {step:?}"
+    );
+    for part in parts {
+        assert!(err.contains(part), "{err:?} should say {part:?}");
+    }
+}
+
 /// #684 for the cluster plane's cold tier: `vtopctl tier copy` with
 /// `upload.object_lock` writes the segment and its manifest under the lock
 /// and checks both retentions before it proposes the evidence; the store,
@@ -560,97 +692,110 @@ async fn tier_backend(bucket: &str) -> std::sync::Arc<dyn vtop_upload::UploadBac
 #[tokio::test]
 #[ignore = "requires an S3-compatible endpoint with Object Lock"]
 async fn live_a_tier_copy_is_written_and_checked_under_the_lock() {
-    let dir = tempfile::tempdir().unwrap();
-    let (sealed, root) = seal_segment(dir.path());
-    let client = s3_client().await;
+    // Needs Object Lock and versioning on the server; a server whose
+    // capability file says it lacks them has the tier copy refuse before it
+    // writes, and that refusal is what the case asserts there (the S3
+    // compatibility matrix, #722).
+    let live = LiveS3::from_env();
+    live.case_with_refusal(
+        "tier.copy.written_and_checked_under_the_lock",
+        &[Capability::ObjectLock, Capability::Versioning],
+        || async {
+            let dir = tempfile::tempdir().unwrap();
+            let (sealed, root) = seal_segment(dir.path());
+            let client = s3_client().await;
 
-    // A bucket without Object Lock: refused, nothing written.
-    let plain = plain_bucket();
-    let prefix = format!("vtop-it-684-tier-{}", unix_now());
-    let refused = vtop_cli::tier_tools::run_tier_copy(
-        tier_backend(&plain).await.as_ref(),
-        &tier_request(
-            &sealed,
-            root,
-            &format!("s3://{plain}/{prefix}/bundle.segment"),
-        ),
-    )
-    .await
-    .expect_err("a tier copy to a bucket without Object Lock was written");
-    assert!(
-        refused.contains(&format!(
-            "bucket {plain} does not have Object Lock enabled; nothing was copied"
-        )),
-        "{refused}"
-    );
-    let listed = client
-        .list_object_versions()
-        .bucket(&plain)
-        .prefix(&prefix)
-        .send()
-        .await
-        .unwrap();
-    assert!(listed.versions().is_empty(), "{listed:?}");
-
-    // A locked bucket: written, checked, and locked in the store.
-    let bucket = locked_bucket();
-    let object_uri = format!("s3://{bucket}/{prefix}/bundle.segment");
-    let before = unix_now();
-    let command = vtop_cli::tier_tools::run_tier_copy(
-        tier_backend(&bucket).await.as_ref(),
-        &tier_request(&sealed, root, &object_uri),
-    )
-    .await
-    .expect("a locked tier copy must succeed");
-    let vtop_meta::MetadataCommand::CommitTierEvidence {
-        object_version_id,
-        manifest_version_id,
-        ..
-    } = command
-    else {
-        panic!("not tier evidence: {command:?}");
-    };
-    let written = [
-        (
-            format!("{prefix}/bundle.segment"),
-            object_version_id.expect("the segment's version"),
-        ),
-        (
-            format!("{prefix}/bundle.segment.manifest.json"),
-            manifest_version_id.expect("the manifest's version"),
-        ),
-    ];
-    for (key, version) in &written {
-        let head = client
-            .head_object()
-            .bucket(&bucket)
-            .key(key)
-            .version_id(version)
-            .send()
+            // A bucket without Object Lock: refused, nothing written.
+            let plain = plain_bucket();
+            let prefix = format!("vtop-it-684-tier-{}", unix_now());
+            let refused = vtop_cli::tier_tools::run_tier_copy(
+                tier_backend(&plain).await.as_ref(),
+                &tier_request(
+                    &sealed,
+                    root,
+                    &format!("s3://{plain}/{prefix}/bundle.segment"),
+                ),
+            )
             .await
-            .unwrap();
-        assert_eq!(
-            head.object_lock_mode().map(|m| m.as_str()),
-            Some("GOVERNANCE"),
-            "{key}"
-        );
-        let until = head.object_lock_retain_until_date().unwrap().secs();
-        assert!(
-            until >= before + 86_400 && until <= unix_now() + 86_400 + 1,
-            "{key} is retained one day from its write: {until}"
-        );
-    }
+            .expect_err("a tier copy to a bucket without Object Lock was written");
+            assert!(
+                refused.contains(&format!(
+                    "bucket {plain} does not have Object Lock enabled; nothing was copied"
+                )),
+                "{refused}"
+            );
+            let listed = client
+                .list_object_versions()
+                .bucket(&plain)
+                .prefix(&prefix)
+                .send()
+                .await
+                .unwrap();
+            assert!(listed.versions().is_empty(), "{listed:?}");
 
-    // Clean up: the lab's root credentials may bypass governance.
-    for (key, version) in written {
-        client
-            .delete_object()
-            .bucket(&bucket)
-            .key(&key)
-            .version_id(version)
-            .bypass_governance_retention(true)
-            .send()
+            // A locked bucket: written, checked, and locked in the store.
+            let bucket = locked_bucket();
+            let object_uri = format!("s3://{bucket}/{prefix}/bundle.segment");
+            let before = unix_now();
+            let command = vtop_cli::tier_tools::run_tier_copy(
+                tier_backend(&bucket).await.as_ref(),
+                &tier_request(&sealed, root, &object_uri),
+            )
             .await
-            .unwrap_or_else(|e| panic!("cleaning up {key}: {e:?}"));
-    }
+            .expect("a locked tier copy must succeed");
+            let vtop_meta::MetadataCommand::CommitTierEvidence {
+                object_version_id,
+                manifest_version_id,
+                ..
+            } = command
+            else {
+                panic!("not tier evidence: {command:?}");
+            };
+            let written = [
+                (
+                    format!("{prefix}/bundle.segment"),
+                    object_version_id.expect("the segment's version"),
+                ),
+                (
+                    format!("{prefix}/bundle.segment.manifest.json"),
+                    manifest_version_id.expect("the manifest's version"),
+                ),
+            ];
+            for (key, version) in &written {
+                let head = client
+                    .head_object()
+                    .bucket(&bucket)
+                    .key(key)
+                    .version_id(version)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    head.object_lock_mode().map(|m| m.as_str()),
+                    Some("GOVERNANCE"),
+                    "{key}"
+                );
+                let until = head.object_lock_retain_until_date().unwrap().secs();
+                assert!(
+                    until >= before + 86_400 && until <= unix_now() + 86_400 + 1,
+                    "{key} is retained one day from its write: {until}"
+                );
+            }
+
+            // Clean up: the lab's root credentials may bypass governance.
+            for (key, version) in written {
+                client
+                    .delete_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .version_id(version)
+                    .bypass_governance_retention(true)
+                    .send()
+                    .await
+                    .unwrap_or_else(|e| panic!("cleaning up {key}: {e:?}"));
+            }
+        },
+        tier_copy_refused_before_writing,
+    )
+    .await;
 }

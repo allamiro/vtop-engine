@@ -1363,6 +1363,21 @@ impl MetaStateMachine {
         }
     }
 
+    /// A state machine whose recorded level is `level`, whatever this build
+    /// supports: what a newer release's snapshot holds, for tests that open,
+    /// install or replay one.
+    #[cfg(test)]
+    pub(crate) fn at_feature_level_for_test(level: u32) -> Self {
+        let mut machine = Self::new();
+        machine.records.insert(
+            MetaKey::ClusterConfig.encode(),
+            MetaValue::ClusterConfig(ClusterConfigRecord {
+                feature_level: level,
+            }),
+        );
+        machine
+    }
+
     /// The range's recorded replica set, if one was ever recorded (#553).
     pub fn range_replica_set(
         &self,
@@ -1662,6 +1677,12 @@ impl MetaStateMachine {
         })
     }
 
+    /// A raise above this build's level is rejected here, but the durable
+    /// store never lets one reach this point: `MetaStorage` refuses a log
+    /// entry that raises above [`crate::command::SUPPORTED_FEATURE_LEVEL`]
+    /// before it applies (a rejection would leave this voter at a level the
+    /// other voters are not at, and the directory would still open). The
+    /// rejection stays for callers that apply to a bare state machine.
     fn set_feature_level(&mut self, requested: u32) -> MetadataResponse {
         self.raise_feature_level(requested, crate::command::SUPPORTED_FEATURE_LEVEL)
     }

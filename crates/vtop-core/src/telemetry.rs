@@ -303,6 +303,12 @@ pub struct Metrics {
     /// Batches accumulated but not yet sealed. A gauge that climbs without
     /// bound means sealing has stalled.
     pub inflight_batches: IntGauge,
+    /// Batches sealed and on their way to VERIFIED and their source commit,
+    /// across source types: uploading, verifying, or verified and waiting
+    /// for a batch sealed before them. Bounded by the upload width and the
+    /// in-flight byte budget; one that stays at its ceiling while commits
+    /// stop is a store that does not answer.
+    pub sealed_batches_in_flight: IntGauge,
     /// Uploads the engine keeps in flight this cycle (#102): the configured
     /// width, or the adaptive controller's current one. Read beside
     /// `upload_throttled_total`: a width that fell is a store that asked.
@@ -452,7 +458,7 @@ pub struct Metrics {
 
 /// The values of `action` on `vtop_audit_events_total` (#694); the same set
 /// as `vtop_observe::audit::Action`.
-pub const AUDIT_ACTIONS: [&str; 14] = [
+pub const AUDIT_ACTIONS: [&str; 15] = [
     "ledger.replay",
     "ledger.prune",
     "ledger.migrate",
@@ -465,6 +471,7 @@ pub const AUDIT_ACTIONS: [&str; 14] = [
     "node.repair",
     "node.reconfigure_range",
     "promotion.attest",
+    "audit.gap",
     "security.override",
     "native.session",
 ];
@@ -733,6 +740,11 @@ impl Metrics {
             "Batches accumulated in memory but not yet sealed",
         ))?;
         registry.register(Box::new(inflight_batches.clone()))?;
+        let sealed_batches_in_flight = IntGauge::with_opts(Opts::new(
+            "sealed_batches_in_flight",
+            "Batches sealed and not yet settled: uploading, verifying, or verified and waiting for a batch sealed before them",
+        ))?;
+        registry.register(Box::new(sealed_batches_in_flight.clone()))?;
         let upload_width = IntGauge::with_opts(Opts::new(
             "upload_width",
             "Uploads kept in flight this cycle: the configured width, or the adaptive controller's current width when batching.adaptive_width is enabled",
@@ -776,6 +788,7 @@ impl Metrics {
             batch_duration_seconds,
             compression_ratio,
             inflight_batches,
+            sealed_batches_in_flight,
             upload_width,
             bucket_versioning_paused,
             bucket_versioning_paused_batches_total,

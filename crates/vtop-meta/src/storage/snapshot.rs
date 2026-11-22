@@ -9,8 +9,8 @@
 //! corruption, never as a state to limp along with.
 
 use super::{
-    codec_corrupt, corrupt, io_error, is_atomic_temp_name, write_atomic, MetaStoreError,
-    MetaStoreResult,
+    codec_corrupt, corrupt, io_error, is_atomic_temp_name, refuse_newer_level, write_atomic,
+    MetaStoreError, MetaStoreResult,
 };
 use crate::storage::log::MetaMembership;
 use crate::storage::membership_log_id::MembershipLogId;
@@ -348,7 +348,25 @@ impl MetaSnapshots {
     /// bytes are renamed into place; nothing invalid can ever be published.
     pub fn install(&mut self, bytes: &[u8]) -> MetaStoreResult<SnapshotMeta> {
         let probe = self.dir.join("snapshot-install.vmsnap");
-        let (meta, _payload) = decode_snapshot_file(&probe, self.cluster_id, bytes)?;
+        let (meta, payload) = decode_snapshot_file(&probe, self.cluster_id, bytes)?;
+        // A snapshot at a feature level above this build's is refused BEFORE
+        // it is published (#743): a follower that installed it as it is
+        // would report a level it does not implement and take writes, and
+        // the directory would keep opening. Nothing is written and nothing
+        // in the directory changes.
+        let state = crate::state::MetaStateMachine::decode_snapshot(&payload)
+            .map_err(|error| codec_corrupt(&probe, &error))?;
+        refuse_newer_level(
+            &self.dir,
+            state.feature_level(),
+            crate::command::SUPPORTED_FEATURE_LEVEL,
+            || {
+                format!(
+                    "recorded in the snapshot being installed, covering log index {}",
+                    meta.last_index
+                )
+            },
+        )?;
         self.publish(
             meta.last_index,
             meta.last_term,

@@ -13,6 +13,11 @@
 # SOAK_CPUS_<SERVICE> (kafka, minio, producer, engine) cap a container's CPUs;
 # unset, none is capped, which is how the 72 hour run goes.
 #
+# The enospc fault needs nothing from this file: it lays a small tmpfs over the
+# engine's work directory from outside, in the engine's mount namespace, so the
+# engine's volume and its dropped capabilities are as they are for every other
+# fault (soak_lab.Lab.mount_work_tmpfs).
+#
 # Nothing here is published to the host except toxiproxy's admin API on
 # loopback. The engine reaches Kafka and MinIO ONLY through toxiproxy, which
 # is how a partition or a store outage is made without touching either of

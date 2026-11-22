@@ -126,6 +126,7 @@ each add the same delta and leave the export permanently above its source.
 | Metric | Type | Meaning |
 |---|---|---|
 | `vtop_node_info{role,node_id}` | gauge | Always 1; identifies the process. |
+| `vtop_listener_connections_refused_total{plane,reason}` | counter | Connections a capped listener closed (#732). `plane`: `meta_peer` (`max_peer_connections`, default 256) and `meta_admin` (`max_admin_connections`, default 1024) on a metadata node, `replica` (`max_replica_connections`, default 256) on a data node that serves the replica plane. `reason`: `capacity`, closed at accept because the cap was reached (open connections are not touched); `handshake_timeout`, closed because it sent no first request within 10 s of accept, so a silent socket cannot keep its slot. A rate-limited WARN names the peer and the key. |
 
 ### Metadata nodes
 
@@ -183,6 +184,8 @@ not keep publishing the follower lag it saw at the instant of the failover.
 | `vtop_broker_group_commit_sync_nanoseconds_total` | counter | Time spent flushing groups: the local fsync, the replication round and the commit **together**, not the fsync alone. Divided by `commits_total` it is the mean barrier per group; `vtop_broker_produce_phase_seconds_total` splits it. |
 | `vtop_broker_group_commit_queue_wait_nanoseconds_total` | counter | For each group, how long its longest-waiting request waited to join, summed over groups: one wait per group, not a sum over requests. |
 | `vtop_broker_group_commit_last_batch_records` / `_bytes` | gauge | Size of the most recent group. |
+| `vtop_broker_group_commit_overloaded_total` | counter | Produce requests answered `Overloaded` (retryable, nothing appended) because `group_commit.max_pending_requests` requests were already queued. A rate above zero means the range receives more than one barrier can drain; the node also logs a rate-limited WARN. |
+| `vtop_broker_group_commit_split_groups_total` | counter | Groups the log refused as a whole for something one member caused (a sequence, fencing or size refusal) and re-ran request by request, so only that member failed (#752). A steady rate means a client keeps sending a request the log refuses. |
 | `vtop_broker_requests_total{kind,outcome}` | counter | Requests answered, by kind (`produce`, `fetch`, `commit_cursor`, `fetch_cursor`, `replica_append`, `other`) and whether the broker served or refused. A refusal is often the system working — a fencing rejection is correct behaviour — so it is counted apart from a success rather than folded into one error rate. |
 | `vtop_broker_request_duration_seconds{kind}` | histogram | Time the broker held a request. **Measured around its own work, not the socket write**, so a slow consumer's TCP backpressure cannot be mistaken for a slow log. Buckets run 50µs–1s, dense where an fsync and a quorum round-trip live. |
 | `vtop_broker_produced_records_total` / `_bytes_total` | counter | Volume accepted by *successful* produce requests; a refused append is not throughput. |
@@ -316,6 +319,13 @@ the transfers it grants or refuses to `vtopctl node repair`. They go to the
 append-only JSONL file; a set but unwritable path stops `meta`, `data` and
 `node` at startup, naming the path. `vtop_audit_events_total{action,outcome}`
 and `vtop_audit_write_failures_total{sink}` are on every node's `/metrics`.
+A metadata node also exports its applied-record delivery (#706):
+`vtop_audit_replayed_total{reason}` (records delivered again after a crash or
+a refusing sink, marked `replayed`), `vtop_audit_gaps_total{reason}`
+(`audit.gap` records: ranges it could not re-derive) and
+`vtop_audit_delivery_lag_entries` (applied entries not yet delivered; above 0
+for long means the audit sink is failing). See
+[operate/auditing.md](operate/auditing.md).
 Read a node's file with `vtopctl audit list --file`; see
 [operate/auditing.md](operate/auditing.md).
 
