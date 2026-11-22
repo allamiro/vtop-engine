@@ -1,0 +1,59 @@
+# VTOP, profile `verify-off` (non-default, labelled), for the archive comparison (#746).
+# It isolates what verification costs: the same configuration as `strong` with the verification floor lowered
+# (`upload.require_strong_verification: false`, which docs/configure/reference.md says "accepts same-size
+# corruption") and the checksum algorithm `none` (docs/configure/streams.md: "`none` checks size only"; refused
+# while the floor is strong). It is run in `drain` and `live` only, never in a crash or fault cell, where it would
+# measure a deliberate weakening (#746), and it is never a second orange bar.
+#
+# telemetry: as `strong`; the compose file sets OTEL_SDK_DISABLED=true.
+
+engine:
+  name: archive-bench
+  tenant: bench
+  state_store: "sqlite:///data/state/vtop-state.db"
+  work_dir: /data/work
+  work_retention_seconds: 86400
+  work_max_bytes: 10737418240
+  log_level: INFO
+
+batching:
+  max_records: 100000000
+  max_bytes: 33554432
+  max_batch_age_seconds: 60
+  max_concurrent_batches: 8
+
+compression:
+  type: gzip
+  level: 6
+
+# docs/configure/reference.md "checksum.algorithm": `none` verifies size only.
+checksum:
+  algorithm: none
+
+sources:
+  kafka:
+    enabled: true
+    bootstrap_servers:
+      - kafka:9092
+    consumer_group: vtop-bench
+    topic_include_regex: "^bench$"
+    auto_offset_reset: earliest
+    enable_auto_commit: false
+
+upload:
+  backend: s3_native
+  bucket: bench
+  prefix: "vtop/"
+  endpoint_url: http://minio:9000
+  region: us-east-1
+  force_path_style: true
+  verify_tls: false
+  # The lab creates the bucket before any tool starts (the harness's `mc mb`), so no tool makes a bucket PUT:
+  # the S3 tap counts every PUT, and a bucket PUT answered 409 would be the Nth request that a K2 trigger
+  # waits for and never sees succeed (docs/configure/reference.md "upload.create_bucket", default false).
+  create_bucket: false
+  # The deliberate weakening this profile exists to measure.
+  require_strong_verification: false
+
+partitioning:
+  template: "source={source}/format={format}/"

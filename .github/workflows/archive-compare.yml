@@ -1,0 +1,91 @@
+name: archive comparison (VTOP, Vector, Kafka Connect S3)
+
+# The archive comparison's harness (#746): a Kafka topic archived to object storage, correctness cells only, on a
+# GitHub-hosted runner. It never runs on a pull request.
+#
+# WHAT IT RUNS. `benchmarks/archive_compare/run.py --plan <plan>` with one of the plans in
+# benchmarks/archive_compare/plans.json that a hosted runner is valid for:
+# `smoke` (the default, and the nightly run: every tool, 2,000 records read back byte for byte, one K2 kill; about
+# 25 minutes with the image builds), `hosted-store-kills` (smoke, then crash-K1 and crash-K2: 9 kills per kind per
+# tool) or `hosted-time-kills-fault` (smoke, then crash-K3 and verify-fault). Each tool gets 1 CPU, as #746 asks of a
+# hosted run. Durations are the plan's: the durations of a plan are settings in plans.json, and a plan that does not
+# fit a job is split, not stretched.
+#
+# WHAT IT IS NOT. A hosted runner is valid for correctness metrics only (gaps, duplicates, torn and orphan objects,
+# corrupted read-backs): the schema refuses a performance row from a hosted host (#744 section 4.4), so the drain
+# and live cells never run here. Two hosted runs on different CPU models are separate runs, never merged into one
+# chart.
+#
+# A RESULT IS COMMITTED BY HAND. The run directory is uploaded as an artifact;
+# `gh run download <run> -n archive-compare-<plan>-<run>` gives the directory to commit under
+# benchmarks/archive_compare/results/ in a data PR. Nothing here commits.
+on:
+  workflow_dispatch:
+    inputs:
+      plan:
+        description: "smoke, hosted-store-kills or hosted-time-kills-fault"
+        required: false
+        default: "smoke"
+  schedule:
+    # Nightly smoke, so a broken harness, a moved image or a changed connector shows up within a day.
+    - cron: "23 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: archive-compare-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  archive:
+    name: archive comparison (${{ inputs.plan || 'smoke' }})
+    runs-on: ubuntu-latest
+    # hosted-store-kills is projected at about 3.4 hours, plus the engine and connector image builds.
+    timeout-minutes: 330
+    env:
+      PLAN: ${{ inputs.plan || 'smoke' }}
+    steps:
+      - name: The plan input is one a hosted runner is valid for
+        run: |
+          case "${PLAN}" in
+            smoke|hosted-store-kills|hosted-time-kills-fault) ;;
+            *) echo "::error::plan must be smoke, hosted-store-kills or hosted-time-kills-fault, got '${PLAN}'"; exit 1 ;;
+          esac
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      # Before anything long: the plan is one the kind can run and fits the job, and a hosted plan holds no
+      # performance cell. The runner's CPU model and Docker are recorded in environment.json by the run itself.
+      - name: Plan
+        working-directory: benchmarks
+        run: python3 -m compare_common.plan archive_compare/plans.json "${PLAN}" --max-hours 5
+
+      - name: Run the plan
+        run: |
+          set -o pipefail
+          python3 benchmarks/archive_compare/run.py --plan "${PLAN}" --host-class hosted --tool-cpus 1 \
+            --no-disk-probe --run-id "archive-${PLAN}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --max-hours 5 \
+            2>&1 | tee "${RUNNER_TEMP}/archive-run.log"
+
+      - name: Upload the run directory
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: archive-compare-${{ inputs.plan || 'smoke' }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            benchmarks/archive_compare/results/
+            ${{ runner.temp }}/archive-run.log
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Leave no lab behind
+        if: always()
+        run: |
+          for project in $(docker compose ls -a --format json | python3 -c 'import json,sys; print(" ".join(p["Name"] for p in json.load(sys.stdin) if p["Name"].startswith("vtop746-")))'); do
+            docker compose -p "${project}" down -v --remove-orphans || true
+          done
