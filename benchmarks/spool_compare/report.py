@@ -61,7 +61,8 @@ REPORT = creport.Report(
                       (M("p50", "write-to-visible p50, ms", "visible_p50_ms", "lower", ("live",), digits=0),
                        M("p99", "write-to-visible p99, ms", "visible_p99_ms", "lower", ("live",), digits=0))),
         creport.Chart("spool-crash", "What a kill -9 and a rotation cost",
-                      "Summed over the runs, three kills per run. K1: at the start of the Nth PUT; K2: right after "
+                      "Summed over the runs, three kills planned per run; a run whose later triggers never fired is "
+                      "left out of the totals and named. K1: at the start of the Nth PUT; K2: right after "
                       "the store answered it; K3: at a seeded time; K4: inside a seeded window after a rotation; "
                       "down-while-rotating: two rotations while the tool was stopped.",
                       (M("gaps", "lines lost (gaps)", "gaps", "lower", CRASH, reduce="sum", digits=0),
@@ -73,7 +74,10 @@ REPORT = creport.Report(
            "Not ranked: compression ratio, inotify against polling (a configuration choice, recorded in each "
            "tool's configuration file), and verification (classified as in #744 (e); no fault is injected here). "
            "Vector's `disk-buffer` profile is in the CSV and the tables, never a second bar of Vector's colour. "
-           "Power-cut survival of each tool's own state is not measured here (#748: wave 3)."),
+           "A K1 or K2 run whose tool went idle before every planned kill fired keeps its observed counts in the "
+           "CSV and is left out of the crash totals (the table names it), so no total mixes complete and "
+           "incomplete kill schedules. Power-cut survival of each tool's own state is not measured here "
+           "(#748: wave 3)."),
 )
 
 

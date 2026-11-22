@@ -59,7 +59,7 @@ PERF_COLUMNS = ("window_seconds", "lines_per_sec", "mib_per_sec", "source_bytes"
                 "cpu_seconds_per_gib", "peak_rss_sampled_bytes", "put_per_gib", "get_per_gib", "head_per_gib",
                 "list_per_gib", "other_per_gib", "objects", "object_size_p50_bytes", "object_size_p99_bytes")
 LIVE_COLUMNS = ("offered_rate", "achieved_rate", "sustained", "visible_p50_ms", "visible_p99_ms")
-CRASH_COLUMNS = ("kills", "rotations", "seconds_to_first_object_after_restart")
+CRASH_COLUMNS = ("kills_planned", "kills", "rotations", "seconds_to_first_object_after_restart")
 METRIC_COLUMNS = CHECK_COLUMNS + PERF_COLUMNS + LIVE_COLUMNS + CRASH_COLUMNS
 
 # The metric columns an `ok` row of each cell must carry.
@@ -67,10 +67,10 @@ REQUIRED = {
     "smoke": CHECK_COLUMNS,
     "drain": CHECK_COLUMNS + PERF_COLUMNS,
     "live": CHECK_COLUMNS + LIVE_COLUMNS,
-    "crash-K1": CHECK_COLUMNS + ("kills",),
-    "crash-K2": CHECK_COLUMNS + ("kills",),
-    "crash-K3": CHECK_COLUMNS + ("kills",),
-    "crash-K4-rotation": CHECK_COLUMNS + ("kills", "rotations"),
+    "crash-K1": CHECK_COLUMNS + ("kills_planned", "kills"),
+    "crash-K2": CHECK_COLUMNS + ("kills_planned", "kills"),
+    "crash-K3": CHECK_COLUMNS + ("kills_planned", "kills"),
+    "crash-K4-rotation": CHECK_COLUMNS + ("kills_planned", "kills", "rotations"),
     "down-while-rotating": CHECK_COLUMNS + ("rotations",),
 }
 
@@ -96,9 +96,21 @@ def check_row(row: dict[str, str]) -> list[str]:
         problems.append(f"sustained is {row.get('sustained')!r}, not true or false")
     if row["cell"] in CRASH_CELLS and int(float(row["kills"])) < 1:
         problems.append("a crash row with no kill")
+    if row["cell"] in CRASH_CELLS and int(float(row["kills"])) > int(float(row["kills_planned"])):
+        problems.append(f"a crash row with {row['kills']} kills of {row['kills_planned']} planned")
     if row["cell"] in ("crash-K4-rotation", "down-while-rotating") and int(float(row["rotations"])) < 1:
         problems.append("a rotation cell with no rotation")
     return problems
+
+
+def unusable(row: dict[str, str]) -> str | None:
+    """Why an ok row cannot join comparative totals: a K1/K2 run whose later triggers never fired (the tool
+    went idle first) was killed fewer times than planned, and its gaps and duplicates are not comparable with a
+    run that took every kill. The observed counts stay in the CSV (review of #908)."""
+    if row["cell"] in CRASH_CELLS and row.get("kills") and row.get("kills_planned"):
+        if int(float(row["kills"])) < int(float(row["kills_planned"])):
+            return f"incomplete kill schedule: {int(float(row['kills']))} of {int(float(row['kills_planned']))} kills"
+    return None
 
 
 KIND = schema.Kind(
@@ -111,4 +123,5 @@ KIND = schema.Kind(
     profiles=PROFILES,
     forbidden=None,
     check_row=check_row,
+    unusable=unusable,
 )

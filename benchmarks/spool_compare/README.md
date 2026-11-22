@@ -41,7 +41,7 @@ Each system run is its own Compose project ([`compose.yml`](compose.yml)) on fre
 | `smoke` | correctness | 10,000 lines across rotated files; every line present exactly once, or the tool is `failed` and nothing is timed |
 | `drain` | performance | a 4 GiB backlog across rotated files; lines/s and MiB/s of source bytes, CPU-seconds per GiB and sampled peak RSS (the tool's cgroup), store requests per GiB (MinIO's own counters) |
 | `live` | performance | the generator at 50% of the slowest tool's median drain rate for the variant; 2 min warm-up, 10 min measured; write-to-visible p50 and p99 per line |
-| `crash-K1`, `crash-K2` | correctness | through the S3 tap: `kill -9` at the start of the Nth PUT (K1) or right after the store answered it (K2); restart; three kills per run |
+| `crash-K1`, `crash-K2` | correctness | through the S3 tap: `kill -9` at the start of the Nth PUT (K1) or right after the store answered it (K2); restart; three kills planned per run. A run whose tool went idle before every trigger fired keeps its observed counts and `kills_planned` in the CSV, is left out of the crash totals, and the report names it |
 | `crash-K3` | correctness | `kill -9` at a seeded time after each (re)start |
 | `crash-K4-rotation` | correctness | the harness rotates the active file at a seeded moment and the kill follows inside a seeded window (0 to 500 ms); then lines are written to the new file and the tool restarts |
 | `down-while-rotating` | correctness | the tool drains a third, is stopped, the file is rotated twice with lines written after each, the tool starts; a run where the tool was running at a rotation is `refused` |
@@ -65,6 +65,8 @@ python3 benchmarks/spool_compare/run.py --plan smoke --host-class laptop
 # The full plan on the dedicated Linux host, in resumable pieces.
 python3 benchmarks/spool_compare/run.py --plan full --budget-minutes 180 --cooldown-seconds 60
 python3 benchmarks/spool_compare/run.py --plan full --resume spool-<stamp> --budget-minutes 180
+# (a resume reads the plan, the --tools selection and the host class the run recorded; repeating one that
+# disagrees is refused)
 
 # What a run directory still lacks: exit 0 when complete, 2 with the missing keys listed.
 python3 benchmarks/spool_compare/run.py --check benchmarks/spool_compare/results/spool-<stamp>

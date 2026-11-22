@@ -57,6 +57,7 @@ def metrics(item: plans.Planned) -> dict:
                     "visible_p50_ms": "31000", "visible_p99_ms": "62000"})
     elif item.cell.startswith("crash"):
         out.update({"kills": item.params.get("kills_per_run", 3),
+                    "kills_planned": item.params.get("kills_per_run", 3),
                     "gaps": 40 if item.system == "fluent-bit" else 0,
                     "duplicates": 0 if item.system == "vtop" else 25})
         if item.cell == "crash-K4-rotation":

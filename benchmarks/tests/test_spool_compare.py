@@ -389,3 +389,85 @@ def test_a_live_run_that_lost_lines_did_not_sustain_its_rate():
     assert run.live_sustained(100.0, 100.0, 0)
     assert not run.live_sustained(100.0, 100.0, 9)  # every line accepted, nine never delivered
     assert not run.live_sustained(100.0, 10.0, 0)
+
+
+# -------------------------------------------------- resume and incomplete kill schedules (review of #908)
+
+
+def _stub_the_lab(monkeypatch, tmp_path):
+    """Everything main() would ask Docker or git for, answered; the host does not change between calls."""
+    facts = {"host_cpu": "fixture CPU", "host_logical_cpus": "8", "host_os": "Linux 6.1",
+             "host_disk": "fixture NVMe", "docker_platform": "Docker Engine", "docker_vm_cpus": 8,
+             "docker_vm_kernel": "6.1"}
+    monkeypatch.setattr(run.environment, "host_facts", lambda probe_disk=True: dict(facts))
+    monkeypatch.setattr(run.environment, "git", lambda *argv: "0" * 40)
+    monkeypatch.setattr(run.environment, "config_drift", lambda paths: [])
+    monkeypatch.setattr(run.lab, "engine_tree", lambda: "tree")
+    monkeypatch.setattr(run.lab, "image_id", lambda image: "sha256:" + "1" * 64)
+    monkeypatch.setattr(run.lab, "ensure_vtop_image", lambda rebuild: "vtop-compare:tree")
+    monkeypatch.setattr(run.lab, "ensure_minio_image", lambda: None)
+    monkeypatch.setattr(run.lab, "ensure_image", lambda image: None)
+    monkeypatch.setattr(run, "check", lambda run_dir: 0)
+    seen = []
+
+    def run_plan(run_dir, kind, env, describe, execute, **kw):
+        seen.append(env)
+        return runner.Outcome(0, 0, 0, False)
+
+    monkeypatch.setattr(run.runner, "run_plan", run_plan)
+    return seen
+
+
+@pytest.mark.parametrize("first", [
+    ["--plan", "full", "--host-class", "dedicated"],
+    ["--plan", "full", "--host-class", "dedicated", "--tools", "vtop,vector"],
+])
+def test_a_resume_needs_no_repeated_arguments(monkeypatch, tmp_path, first):
+    seen = _stub_the_lab(monkeypatch, tmp_path)
+    common = ["--results", str(tmp_path), "--max-hours", "1000"]
+    assert run.main(first + common + ["--run-id", "spool-x"]) == 0
+    recorded = seen[-1]
+    assert recorded["comparable"]["host_class"] == "dedicated"
+    # The default plan is `smoke` on a `laptop`: the resume must not build its environment from that.
+    assert run.main(["--resume", "spool-x"] + common) == 0
+    assert len(seen) == 2
+    assert seen[-1]["plan"] == recorded["plan"]
+    assert seen[-1]["comparable"]["host_class"] == "dedicated"
+    assert seen[-1]["plan"]["systems"] == recorded["plan"]["systems"]
+
+
+def test_a_resume_that_repeats_a_different_plan_is_refused(monkeypatch, tmp_path, capsys):
+    seen = _stub_the_lab(monkeypatch, tmp_path)
+    common = ["--results", str(tmp_path), "--max-hours", "1000"]
+    assert run.main(["--plan", "full", "--host-class", "dedicated", "--tools", "vtop,vector",
+                     "--run-id", "spool-x"] + common) == 0
+    for argv in (["--tools", "vtop"], ["--plan", "smoke"], ["--host-class", "laptop"]):
+        assert run.main(["--resume", "spool-x"] + argv + common) == 2
+    assert "cannot resume with" in capsys.readouterr().err
+    assert len(seen) == 1
+
+
+def _crash_rows(tmp_path):
+    run_dir = fixture.write_run(str(tmp_path))
+    rows, env = schema.load_run(run_dir, KIND)
+    return rows, env
+
+
+def test_a_crash_run_with_fewer_kills_than_planned_is_left_out_of_the_totals(tmp_path):
+    from compare_common import report as creport
+
+    rows, env = _crash_rows(tmp_path)
+    metric = creport.Metric("gaps", "lines lost", "gaps", "lower", ("crash-K1",), reduce="sum", digits=0)
+    victim = next(r for r in rows if r["cell"] == "crash-K1" and r["system"] == "vtop")
+    group = ("crash-K1", (victim["source"], victim["rotation"]))
+    whole = creport.value(rows, KIND, metric, group, "vtop", victim["profile"])
+    assert whole.summary is not None and whole.stub is None
+    victim["kills"] = "2"  # the tool went idle before its third trigger: gaps and duplicates are the observed ones
+    victim["gaps"] = "7"
+    assert KIND.check_row(victim) == []  # the observed counts are kept, not refused
+    assert "2 of 3 kills" in KIND.unusable(victim)
+    partial = creport.value(rows, KIND, metric, group, "vtop", victim["profile"])
+    assert partial.summary is None
+    assert "incomplete kill schedule" in partial.stub
+    victim["kills"] = "4"
+    assert any("4 kills of 3 planned" in problem for problem in KIND.check_row(victim))

@@ -107,12 +107,15 @@ def value(rows: Sequence[dict[str, str]], kind: schema.Kind, metric: Metric, gro
     cell, variant = group
     selected = [row for row in rows if row["cell"] == cell and row["system"] == system and row["profile"] == profile
                 and tuple(row[column] for column in kind.variant_columns) == variant]
-    usable, stubs = [], []
+    usable, stubs, kind_reason = [], [], ""
     for row in selected:
         if row["status"] != "ok":
             stubs.append(row["status"])
         elif row.get("sustained", "") == "false":
             stubs.append("not sustained")
+        elif getattr(kind, "unusable", None) and kind.unusable(row):
+            stubs.append(kind.unusable(row))
+            kind_reason = stubs[-1]
         elif row.get(metric.column, "") == "":
             stubs.append("not measured")
         else:
@@ -122,7 +125,8 @@ def value(rows: Sequence[dict[str, str]], kind: schema.Kind, metric: Metric, gro
     if metric.reduce == "sum" and len(usable) < len(selected):
         # A total over the repetitions that happened is not comparable with a total over all of them: a
         # tool that completed one of three fault trials would otherwise lose fewer records (review of #906).
-        return Value(None, f"incomplete: {len(usable)} of {len(selected)} runs usable", len(selected))
+        why = f" ({kind_reason})" if kind_reason else ""
+        return Value(None, f"incomplete: {len(usable)} of {len(selected)} runs usable{why}", len(selected))
     if metric.reduce == "sum":
         total = sum(usable)
         return Value(stats.Summary(total, total, total, len(usable)), None, len(selected))

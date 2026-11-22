@@ -27,6 +27,7 @@ here commits.
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import os
@@ -511,6 +512,10 @@ class Runner:
                 if fired == 0:
                     raise runner.ToolFailed(f"no {kind} kill fired: the tool went idle before the first trigger")
                 out["kills"] = fired
+                out["kills_planned"] = len(points)
+                if fired < len(points):
+                    out["note"] = (f"{fired} of {len(points)} planned kills: the tool went idle before the next "
+                                   "trigger, so this run is left out of comparative totals")
             elif item.cell == "down-while-rotating":
                 quiesce(lambda: tool.listing(prefix), tool.running, quiet=QUIET_SECONDS, timeout=timeout)
                 third = records // 3
@@ -581,7 +586,8 @@ class Runner:
                         "visible_p50_ms": f"{stats.percentile(lags, 50):.0f}" if lags else "",
                         "visible_p99_ms": f"{stats.percentile(lags, 99):.0f}" if lags else ""})
         if sampler.errors:
-            out["note"] = f"{len(sampler.errors)} cgroup samples failed: {sampler.errors[0][:120]}"
+            out["note"] = "; ".join(filter(None, (out.get("note"),
+                f"{len(sampler.errors)} cgroup samples failed: {sampler.errors[0][:120]}")))
         return out
 
 
@@ -662,15 +668,48 @@ def check(run_dir: str) -> int:
     return 0 if not (problems or extra or missing) else 2
 
 
+def plan_for(args: argparse.Namespace, recorded: dict[str, Any] | None) -> dict[str, Any]:
+    """The plan this invocation runs. A fresh run builds it from the arguments; a resume takes the plan the
+    run recorded (its name, its tool selection after `--tools`, its host class), so `--resume <dir>` needs no
+    repeated arguments and builds the same environment the run began with. An argument that was repeated and
+    disagrees with the record is refused, not silently ignored (review of #908)."""
+    wanted_name = "smoke" if args.smoke else args.plan
+    wanted_tools = [t.strip() for t in args.tools.split(",") if t.strip()] if args.tools else None
+    if recorded is not None:
+        plan = copy.deepcopy(recorded.get("plan"))
+        if not isinstance(plan, dict):
+            raise plans.PlanRefused("cannot resume: environment.json records no plan")
+        disagree = []
+        if wanted_name and wanted_name != plan.get("name"):
+            disagree.append(f"--plan {wanted_name} (recorded: {plan.get('name')})")
+        if wanted_tools is not None and set(wanted_tools) != set(plan.get("systems") or []):
+            disagree.append(f"--tools {args.tools} (recorded: {','.join(plan.get('systems') or [])})")
+        if args.host_class and args.host_class != plan.get("host_class"):
+            disagree.append(f"--host-class {args.host_class} (recorded: {plan.get('host_class')})")
+        if disagree:
+            raise plans.PlanRefused("cannot resume with " + "; ".join(disagree) + ": a resume continues the plan "
+                                    "the run recorded, so leave these arguments out")
+        return plan
+    plan = plans.select(plans.load_plans(os.path.join(HERE, "plans.json")), wanted_name or "smoke")
+    if wanted_tools is not None:
+        plan["systems"] = [s for s in plan["systems"] if s in wanted_tools]
+    if args.host_class:
+        plan["host_class"] = args.host_class
+    return plan
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--plan", default="smoke", help="a plan in plans.json: smoke, hosted, full")
+    parser.add_argument("--plan", default=None, help="a plan in plans.json: smoke (the default), hosted, full; a "
+                        "resume reads the plan the run recorded")
     parser.add_argument("--smoke", action="store_true", help="the same as --plan smoke")
     parser.add_argument("--tools", default=None, help="comma-separated subset of the plan's systems")
     parser.add_argument("--host-class", choices=plans.HOST_CLASSES, default=None,
                         help="override the plan's host class (laptop for a smoke on a laptop)")
     parser.add_argument("--run-id", default=None)
-    parser.add_argument("--resume", default=None, metavar="RUN_ID")
+    parser.add_argument("--resume", default=None, metavar="RUN_ID",
+                        help="continue a run from its directory; its plan, tool selection and host class are "
+                        "the recorded ones, so none of them is repeated")
     parser.add_argument("--budget-minutes", type=float, default=None)
     parser.add_argument("--cooldown-seconds", type=float, default=0.0)
     parser.add_argument("--max-hours", type=float, default=30.0)
@@ -685,13 +724,18 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.check:
         return check(args.check)
+    recorded = None
+    if args.resume:
+        resume_dir = os.path.join(args.results, lab.check_run_id(args.resume))
+        try:
+            recorded = schema.read_environment(resume_dir)
+        except schema.RunRefused as exc:
+            print(f"resume refused: {exc}", file=sys.stderr)
+            return 2
+        if (recorded.get("comparable") or {}).get("host_disk") == "not probed":
+            args.no_disk_probe = True  # a hosted run recorded no disk probe; its resume must not add one
     try:
-        plan = plans.select(plans.load_plans(os.path.join(HERE, "plans.json")), "smoke" if args.smoke else args.plan)
-        if args.tools:
-            wanted = [t.strip() for t in args.tools.split(",") if t.strip()]
-            plan["systems"] = [s for s in plan["systems"] if s in wanted]
-        if args.host_class:
-            plan["host_class"] = args.host_class
+        plan = plan_for(args, recorded)
         plans.check_plan(plan, KIND)
         print(plans.describe(plan, KIND, args.cooldown_seconds))
         plans.check_budget(plan, KIND, args.max_hours, args.cooldown_seconds)
@@ -719,9 +763,9 @@ def main(argv: list[str] | None = None) -> int:
             lab.ensure_image(registry.product(reg, system)["image"])
     comparable = comparable_block(args, plan, vtop_image, configs)
     if args.resume:
-        run_dir = os.path.join(args.results, lab.check_run_id(args.resume))
+        run_dir = resume_dir
+        env = recorded
         try:
-            env = schema.read_environment(run_dir)
             runner.check_resume(env, comparable)
         except schema.RunRefused as exc:
             print(f"resume refused: {exc}", file=sys.stderr)
