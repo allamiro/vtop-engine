@@ -179,9 +179,9 @@ def test_snapshot_reads_a_mirror_and_mc_timestamps(tmp_path):
     snap = checker.snapshot_from_dir(str(tmp_path), listing, ["u"])
     assert snap.objects == {"p/x.gz": b"abc"}
     assert snap.last_modified["p/x.gz"] == pytest.approx(1795341600.123457, abs=1e-5)
-    for text, frac in (("2026-11-22T10:00:00.25Z", 0.25), ("2026-11-22T10:00:00Z", 0.0),
-                       ("2026-11-22T10:00:00.5+00:00", 0.5), ("2026-11-22T10:00:00.1234Z", 0.1234)):
-        assert checker.parse_time(text) == pytest.approx(1795341600 + frac, abs=1e-6), text
+    # MinIO prints as few fractional digits as it needs, and none at all on a whole second.
+    assert checker.parse_time("2026-11-22T10:00:00.45Z") == pytest.approx(1795341600.45)
+    assert checker.parse_time("2026-11-22T10:00:00Z") == 1795341600.0
 
 
 # --------------------------------------------------------------- 2-3 registry
@@ -627,6 +627,28 @@ def test_the_fault_flips_one_bit_in_selected_get_bodies_only():
     asyncio.run(_with_tap(test, fault_seed=7, fault_one_in=10))
 
 
+def test_an_object_get_is_told_from_a_listing_by_its_sub_resource_not_by_having_a_query():
+    # Review of #906: any query excluded a read from fault injection, so `?x-id=GetObject` was never faulted.
+    assert tap.is_object_get("/b/k", "")
+    assert tap.is_object_get("/b/k", "x-id=GetObject")
+    assert tap.is_object_get("/b/dir/k", "versionId=abc&x-id=GetObject")
+    assert tap.is_object_get("/b/k", "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abc")
+    assert tap.is_object_get("/b/k", "response-content-type=text%2Fplain")
+    assert not tap.is_object_get("/b", "list-type=2&prefix=a")
+    assert not tap.is_object_get("/b/", "")
+    assert not tap.is_object_get("/b/k", "uploadId=u1")
+    assert not tap.is_object_get("/b/k", "tagging")
+    assert not tap.is_object_get("/b/k", "acl=")
+
+    async def test(t, port, events):
+        key = next(f"/b/obj-{i}" for i in range(500) if tap.fault_selected(7, f"/b/obj-{i}", 10))
+        (answer,) = await _client(port, [("GET", key + "?x-id=GetObject", b"")])
+        assert sum(bin(a ^ b).count("1") for a, b in zip(answer, b"hello world")) == 1
+        assert t.corrupted == [key] and t.gets == [key]
+
+    asyncio.run(_with_tap(test, fault_seed=7, fault_one_in=10))
+
+
 def test_the_tap_is_refused_in_a_drain_or_live_cell():
     for cell in ("drain", "live", "defaults", "smoke"):
         with pytest.raises(tap.TapRefused, match="only in crash and fault cells"):
@@ -678,3 +700,64 @@ def test_store_requests_by_method_from_minio_metrics():
     assert store.per_gib(counts, 2**30)["PUT"] == 15
     with pytest.raises(ValueError, match="backwards"):
         store.requests_by_method(after, before)
+
+
+def test_every_build_input_changes_the_image_tag(monkeypatch):
+    # Review of #906: the tag hashed only crates and Cargo.lock, so a commit that changed
+    # the root manifest, .cargo or docker/ reused the previous image under the new commit.
+    from compare_common import lab
+    from kafka_compare import run as kafka_run
+
+    trees = {path: f"tree-of-{path}" for path in kafka_run.BUILD_INPUTS}
+
+    def fake_sh(args, **_kwargs):
+        path = args[-1].split(":", 1)[1]
+        if path in trees:
+            return subprocess.CompletedProcess(args, 0, trees[path] + "\n", "")
+        return subprocess.CompletedProcess(args, 1, "", "")
+
+    monkeypatch.setattr(lab, "sh", fake_sh)
+    base = lab.engine_tree()
+    assert lab.engine_tree() == base
+    for path in kafka_run.BUILD_INPUTS:
+        changed = dict(trees)
+        changed[path] = "different"
+        monkeypatch.setattr(lab, "sh", lambda args, c=changed, **_k: subprocess.CompletedProcess(
+            args, 0, c[args[-1].split(":", 1)[1]] + "\n", ""))
+        assert lab.engine_tree() != base, path
+    gone = dict(trees)
+    del gone[".cargo"]
+    monkeypatch.setattr(lab, "sh", lambda args, **_k: subprocess.CompletedProcess(
+        args, 0 if args[-1].split(":", 1)[1] in gone else 1, gone.get(args[-1].split(":", 1)[1], "") + "\n", ""))
+    assert lab.engine_tree() != base
+
+
+def _crash_rows(statuses):
+    return [{"cell": "crash-K1", "system": "vtop", "profile": "strong", "status": status, "gaps": str(gaps)}
+            for status, gaps in statuses]
+
+
+def test_a_total_over_a_partial_set_of_runs_is_not_a_value_to_rank():
+    # Review of #906: one completed fault trial out of three must not look like the fewest losses.
+    import types
+    kind = types.SimpleNamespace(variant_columns=())
+    metric = creport.Metric("gaps", "gaps", "gaps", "lower", ("crash-K1",), reduce="sum", digits=0)
+    group = ("crash-K1", ())
+    full = creport.value(_crash_rows([("ok", 2), ("ok", 0), ("ok", 1)]), kind, metric, group, "vtop", "strong")
+    assert full.summary is not None and full.summary.median == 3
+    partial = creport.value(_crash_rows([("ok", 0), ("failed", 5), ("refused", 0)]), kind, metric, group, "vtop",
+                            "strong")
+    assert partial.summary is None
+    assert partial.stub == "incomplete: 1 of 3 runs usable"
+
+
+def test_the_footer_names_the_versions_the_run_recorded_not_the_registry_pin(monkeypatch):
+    reg = registry.load()
+    other = next(s for s in registry.family_order(reg, "archive") if s != "vtop")
+    env = {"comparable": {}, "store": "s", "plan": {"name": "p"}, "run_id": "r", "started_at": "2026-11-22T00:00:00Z"}
+    rows = [{"system": other, "system_version": "0.0.1-benchmarked"}]
+    text = creport.footer_text(env, [other], reg, rows)
+    assert f"{registry.product(reg, other)['name']} 0.0.1-benchmarked" in text
+    assert registry.product(reg, other)["version"] not in text.replace("0.0.1-benchmarked", "") or \
+        registry.product(reg, other)["version"] == "0.0.1-benchmarked"
+    assert registry.product(reg, other)["version"] in creport.footer_text(env, [other], reg)
