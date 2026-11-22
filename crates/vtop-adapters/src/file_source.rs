@@ -121,15 +121,17 @@ struct DeleteCandidate {
 }
 
 /// The ctime of a file, `(seconds, nanoseconds)`; `None` without one.
-#[cfg(unix)]
 fn ctime_of(md: &std::fs::Metadata) -> Option<(i64, i64)> {
-    use std::os::unix::fs::MetadataExt;
-    Some((md.ctime(), md.ctime_nsec()))
-}
-
-#[cfg(not(unix))]
-fn ctime_of(_md: &std::fs::Metadata) -> Option<(i64, i64)> {
-    None
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((md.ctime(), md.ctime_nsec()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = md;
+        None
+    }
 }
 
 /// A ctime as a marker records it (#619): RFC 3339 in UTC, up to nanosecond
@@ -149,15 +151,17 @@ fn parse_ctime(text: &str) -> Option<(i64, i64)> {
 }
 
 /// How many names (hard links) a file has; `None` without that notion.
-#[cfg(unix)]
 fn nlink_of(md: &std::fs::Metadata) -> Option<u64> {
-    use std::os::unix::fs::MetadataExt;
-    Some(md.nlink())
-}
-
-#[cfg(not(unix))]
-fn nlink_of(_md: &std::fs::Metadata) -> Option<u64> {
-    None
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(md.nlink())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = md;
+        None
+    }
 }
 
 /// Why a file a candidate describes is kept, and the candidate dropped: the
@@ -3162,22 +3166,28 @@ fn move_aside(path: &Path, mut next_name: impl FnMut() -> PathBuf) -> std::io::R
 /// `renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(RENAME_EXCL)` on
 /// Apple platforms, both atomic. A filesystem or kernel that does not support
 /// the flag falls back to [`rename_unless_exists`].
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
-    use rustix::fs::{renameat_with, RenameFlags, CWD};
-    use rustix::io::Errno;
-    match renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE) {
-        Ok(()) => Ok(()),
-        Err(e) if e == Errno::INVAL || e == Errno::NOSYS || e == Errno::NOTSUP => {
-            rename_unless_exists(from, to)
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    {
+        use rustix::fs::{renameat_with, RenameFlags, CWD};
+        match renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE) {
+            Ok(()) => Ok(()),
+            Err(e) if lacks_noreplace(e) => rename_unless_exists(from, to),
+            Err(e) => Err(e.into()),
         }
-        Err(e) => Err(e.into()),
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    {
+        rename_unless_exists(from, to)
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
-    rename_unless_exists(from, to)
+/// Whether `errno` says the filesystem or kernel has no no-replace rename, as
+/// opposed to a rename that failed for its own reason.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn lacks_noreplace(errno: rustix::io::Errno) -> bool {
+    use rustix::io::Errno;
+    errno == Errno::INVAL || errno == Errno::NOSYS || errno == Errno::NOTSUP
 }
 
 /// Where no atomic no-replace rename exists: refuse a destination that is
@@ -3231,15 +3241,17 @@ fn put_back(aside: &Path, path: &Path) {
 /// The (device, inode) pair that makes two directory entries provably one
 /// file. `metadata` follows symlinks, so a link and its target answer the
 /// same pair — which is exactly the aliasing #378 asks about.
-#[cfg(unix)]
 fn dev_ino(md: &std::fs::Metadata) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    Some((md.dev(), md.ino()))
-}
-
-#[cfg(not(unix))]
-fn dev_ino(_md: &std::fs::Metadata) -> Option<(u64, u64)> {
-    None
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((md.dev(), md.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = md;
+        None
+    }
 }
 
 /// Another configured source that names the file a delete unlinked, if one
@@ -4384,15 +4396,17 @@ impl SourceAdapter for FileSource {
     }
 }
 
-#[cfg(unix)]
 fn inode_of(md: &std::fs::Metadata) -> Option<u64> {
-    use std::os::unix::fs::MetadataExt;
-    Some(md.ino())
-}
-
-#[cfg(not(unix))]
-fn inode_of(_md: &std::fs::Metadata) -> Option<u64> {
-    None
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(md.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = md;
+        None
+    }
 }
 
 #[cfg(test)]
@@ -10667,7 +10681,14 @@ mod tests {
                     .write_all(chunk.as_bytes())
                     .unwrap();
                 let file = std::fs::read(&path).unwrap();
-                loop {
+                // At 17 records a read, a round is over in a dozen reads: a
+                // file that keeps being read from byte 0 never runs dry, and
+                // must fail here instead of hanging the run.
+                for pass in 0.. {
+                    assert!(
+                        pass < 100,
+                        "whole_file={whole_file} round {round}: still reading after {pass} reads"
+                    );
                     let read = fs
                         .read_batch_candidates(&src(&path), 17, 1 << 20, Duration::ZERO)
                         .await
@@ -10881,6 +10902,1961 @@ mod tests {
                     ContentFingerprint::of_tail(&read)
                 );
             }
+        }
+    }
+
+    // ---- mutation testing of the file-continuity code (#729) --------------
+    //
+    // Tests for behaviour the nightly mutation run (cargo-mutants over
+    // continuity.rs, rotated.rs and file_source.rs) showed nothing pinned:
+    // what a delete decision tells the operator and at which level, which
+    // files a delete may even look at, what a restart seed carries, and how
+    // the re-read of a rotated file is bounded.
+
+    /// The events a scope emits: `(level, message)`.
+    #[derive(Clone, Default)]
+    struct Events(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+    struct Message(String);
+
+    impl tracing::field::Visit for Message {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    impl tracing::Subscriber for Events {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            self.0
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), message.0));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    impl Events {
+        /// Record this thread's events until the guard is dropped.
+        fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+            let events = Self::default();
+            let guard = tracing::subscriber::set_default(events.clone());
+            (events, guard)
+        }
+
+        /// The levels of the events whose message contains `needle`.
+        fn levels(&self, needle: &str) -> Vec<tracing::Level> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, message)| message.contains(needle))
+                .map(|(level, _)| *level)
+                .collect()
+        }
+    }
+
+    #[test]
+    fn a_delete_decision_is_logged_at_the_level_it_names() {
+        let (events, _guard) = Events::capture();
+        let mut fs = FileSource::new(vec![], TelemetryFormat::Raw, true);
+        for level in [
+            tracing::Level::ERROR,
+            tracing::Level::WARN,
+            tracing::Level::INFO,
+            tracing::Level::DEBUG,
+        ] {
+            fs.notify(
+                "deleted",
+                level,
+                "/x",
+                None,
+                0,
+                format!("decided at {level}"),
+            );
+            assert_eq!(
+                events.levels(&format!("decided at {level}")),
+                [level],
+                "logged once, at {level}"
+            );
+        }
+        assert_eq!(fs.notices.len(), 4, "and every one is kept for the tests");
+    }
+
+    /// How a candidate is judged when its marker named no inode or no first
+    /// page: kept, and said to be unprovable - unless the file is longer than
+    /// the archived range, which only means it is still being written.
+    #[cfg(unix)]
+    #[test]
+    fn a_marker_without_an_inode_or_a_first_page_is_unprovable_not_rewritten() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        std::fs::write(&path, b"one\ntwo\n").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let inode = file.metadata().unwrap().ino();
+        let content = ContentFingerprint::of(b"one\ntwo\n");
+        let candidate = |inode, content: Option<ContentFingerprint>, end_byte| DeleteCandidate {
+            inode,
+            content,
+            tail: None,
+            end_byte,
+            mtime: None,
+            ctime: None,
+            nlink: None,
+            since: Instant::now(),
+            told: false,
+        };
+        let kept = |candidate: DeleteCandidate| match candidate.compare(&file, true) {
+            Compared::Kept(why) => why,
+            Compared::Unchanged => panic!("a file that cannot be proven was judged unchanged"),
+        };
+        assert_eq!(kept(candidate(Some(inode), None, 8)), Kept::Unprovable);
+        assert_eq!(
+            kept(candidate(None, content.clone(), 8)),
+            Kept::Unprovable,
+            "no inode"
+        );
+        assert_eq!(kept(candidate(None, None, 8)), Kept::Unprovable);
+        assert_eq!(
+            kept(candidate(None, None, 4)),
+            Kept::Grew { len: 8 },
+            "longer than what was archived: still being written"
+        );
+        assert_eq!(kept(candidate(Some(inode), None, 4)), Kept::Grew { len: 8 });
+    }
+
+    /// A chmod moves the ctime and nothing else: no byte was written, but
+    /// nothing can tell it from a rewrite that set the mtime back, so the
+    /// file is kept - and, with one name, the message does not blame links.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_chmod_after_the_commit_keeps_the_file_and_names_no_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let quiet = Duration::from_millis(50);
+        let mut fs = committed(&path, quiet).await;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        pass_after(&mut fs, &path, quiet).await;
+        assert_eq!(
+            std::fs::read_to_string(&path).ok().as_deref(),
+            Some("one\ntwo\n"),
+            "deleted although its ctime moved: {:?}",
+            fs.notices
+        );
+        assert!(
+            notice(
+                &fs,
+                &format!("not deleting {path}: its 8 bytes look archived")
+            ),
+            "{:?}",
+            fs.notices
+        );
+        assert!(
+            !fs.notices.iter().any(|n| n.contains("names (hard links)")),
+            "a file with one name was blamed on its links: {:?}",
+            fs.notices
+        );
+    }
+
+    /// With two names the hint about the other name is added to a ctime that
+    /// moved - and to nothing else: a file that grew is kept for that.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_hint_about_other_names_is_only_for_a_moved_ctime() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let quiet = Duration::from_millis(50);
+        let make = |name: &str| {
+            let path = dir.path().join(name).to_string_lossy().into_owned();
+            std::fs::write(&path, "one\ntwo\n").unwrap();
+            std::fs::hard_link(&path, dir.path().join(format!("{name}.link"))).unwrap();
+            path
+        };
+        let touched = make("touched.log");
+        let mut fs = committed(&touched, quiet).await;
+        std::fs::set_permissions(&touched, std::fs::Permissions::from_mode(0o640)).unwrap();
+        pass_after(&mut fs, &touched, quiet).await;
+        assert!(
+            notice(&fs, "It had 2 names (hard links) when it was archived"),
+            "{:?}",
+            fs.notices
+        );
+
+        let grown = make("grown.log");
+        let mut fs = committed(&grown, quiet).await;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&grown)
+            .unwrap()
+            .write_all(b"three\n")
+            .unwrap();
+        pass_after(&mut fs, &grown, quiet).await;
+        assert!(
+            notice(&fs, &format!("not deleting {grown}: 6 bytes were appended")),
+            "{:?}",
+            fs.notices
+        );
+        assert!(
+            !fs.notices.iter().any(|n| n.contains("names (hard links)")),
+            "the hint is for a moved ctime only: {:?}",
+            fs.notices
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_descriptors_are_one_file_only_when_device_and_inode_agree() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        std::fs::write(&a, "a").unwrap();
+        std::fs::write(&b, "b").unwrap();
+        std::fs::hard_link(&a, dir.path().join("a.link")).unwrap();
+        let open = |p: &Path| std::fs::File::open(p).unwrap();
+        let (fa, fa_again, fb, fa_link) = (
+            open(&a),
+            open(&a),
+            open(&b),
+            open(&dir.path().join("a.link")),
+        );
+        assert!(same_file(&fa, &fa_again));
+        assert!(same_file(&fa, &fa_link), "a hard link is the same file");
+        assert!(!same_file(&fa, &fb));
+        assert!(!same_file(&fb, &fa));
+        let md = |f: &std::fs::File| f.metadata().unwrap();
+        assert_eq!(dev_ino(&md(&fa)), Some((md(&fa).dev(), md(&fa).ino())));
+        assert_eq!(dev_ino(&md(&fa)), dev_ino(&md(&fa_link)));
+        assert_ne!(dev_ino(&md(&fa)), dev_ino(&md(&fb)));
+        assert_eq!(inode_of(&md(&fb)), Some(md(&fb).ino()));
+        assert_eq!(nlink_of(&md(&fa)), Some(2));
+        assert_eq!(nlink_of(&md(&fb)), Some(1));
+    }
+
+    /// A restart seed carries whatever evidence its row has, however little:
+    /// an inode alone, a length alone, a first page alone, a tail alone.
+    #[test]
+    fn a_seed_keeps_each_piece_of_evidence_it_is_given() {
+        let page = ContentFingerprint::of(b"one\ntwo\n");
+        let seeded = |inode, size, content, tail| {
+            let mut fs = FileSource::new(vec![], TelemetryFormat::Raw, false);
+            fs.seed_committed_from("/x", 8, inode, size, content, tail);
+            fs.cursors.remove("/x").unwrap().seen
+        };
+        assert!(seeded(None, None, None, None).is_none(), "nothing known");
+        assert_eq!(seeded(Some(7), None, None, None).unwrap().inode, Some(7));
+        assert_eq!(seeded(None, Some(40), None, None).unwrap().file_size, 40);
+        assert_eq!(
+            seeded(None, None, page.clone(), None).unwrap().content,
+            page
+        );
+        assert_eq!(
+            seeded(None, None, None, page.clone()).unwrap().tail,
+            continuity::Tail::at(8, page)
+        );
+    }
+
+    /// The row to seed from: a newest row that names no inode (a legacy row)
+    /// is the one used, however well a later row matches the file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_newest_row_with_no_inode_is_the_seed() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "new 1\nnew 2\n").unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let read = read_one(&mut fs, &path).await;
+        let current = ArchivedEnd {
+            inode: Some(inode),
+            end_byte: 12,
+            content: read[0].progress_end.content_fingerprint().cloned(),
+            tail: read[0].progress_end.tail_fingerprint().cloned(),
+        };
+        let legacy = ArchivedEnd {
+            inode: None,
+            end_byte: 30,
+            content: None,
+            tail: None,
+        };
+        assert_eq!(
+            FileSource::seed_choice(&path, &[legacy.clone(), current.clone()]),
+            0
+        );
+        assert_eq!(FileSource::seed_choice(&path, &[]), 0);
+        assert_eq!(FileSource::seed_choice(&path, &[current]), 0);
+    }
+
+    /// What a read of a file to its end recorded in its marker: what a restart
+    /// seeds from, and the mtime and ctime the marker names.
+    #[cfg(unix)]
+    struct Row {
+        inode: Option<u64>,
+        end: u64,
+        size: u64,
+        content: Option<ContentFingerprint>,
+        tail: Option<ContentFingerprint>,
+        mtime: String,
+        ctime: Option<String>,
+    }
+
+    #[cfg(unix)]
+    async fn archived_row(path: &str) -> Row {
+        let mut fs = FileSource::new(vec![path.to_owned()], TelemetryFormat::Raw, false);
+        let read = read_one(&mut fs, path).await;
+        let ProgressMarker::File {
+            inode,
+            end_byte,
+            file_size,
+            mtime,
+            ctime,
+            content_fingerprint,
+            tail_fingerprint,
+            ..
+        } = read[0].progress_end.clone()
+        else {
+            panic!("a file marker");
+        };
+        Row {
+            inode,
+            end: end_byte,
+            size: file_size,
+            content: content_fingerprint,
+            tail: tail_fingerprint,
+            mtime,
+            ctime,
+        }
+    }
+
+    /// A restart arms the delete of a fully archived file only on evidence
+    /// that it is the file archived: the seed names its inode AND its first
+    /// page, saw the file end where the commit did, and the file at the path
+    /// has that inode and that length.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_restart_arms_a_delete_only_on_the_evidence_it_needs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let row = archived_row(&path).await;
+        let (inode, end, size, content, tail, mtime, ctime) = (
+            row.inode,
+            row.end,
+            row.size,
+            row.content,
+            row.tail,
+            row.mtime,
+            row.ctime,
+        );
+        let armed = |seed_inode: Option<u64>,
+                     seed_size: u64,
+                     seed_content: Option<ContentFingerprint>,
+                     ctime: Option<&str>| {
+            let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true);
+            fs.seed_committed_from(
+                &path,
+                end,
+                seed_inode,
+                Some(seed_size),
+                seed_content,
+                tail.clone(),
+            );
+            fs.arm_delete_from_seed(&path, Some(&mtime), ctime);
+            fs.cursors[&path].delete_candidate.is_some()
+        };
+        assert!(
+            armed(inode, size, content.clone(), ctime.as_deref()),
+            "the control: every piece of evidence agrees"
+        );
+        assert!(!armed(inode, size, None, None), "no first page");
+        assert!(!armed(None, size, content.clone(), None), "no inode");
+        assert!(
+            !armed(inode, size + 8, content.clone(), None),
+            "the batch saw the file longer than it archived of it"
+        );
+    }
+
+    /// The file at the path, not the seed, is what the delete is armed for:
+    /// another inode, or the same inode longer than the archived range, is
+    /// not the file that was archived, mtime and all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_restart_does_not_arm_a_delete_for_another_file_or_a_longer_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let row = archived_row(&path).await;
+        let (inode, end, size, content, tail, mtime) = (
+            row.inode,
+            row.end,
+            row.size,
+            row.content,
+            row.tail,
+            row.mtime,
+        );
+        let original = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let arm = |path: &str| {
+            let mut fs = FileSource::new(vec![path.to_owned()], TelemetryFormat::Raw, true);
+            fs.seed_committed_from(path, end, inode, Some(size), content.clone(), tail.clone());
+            // A row from before the ctime was recorded: the mtime is what
+            // is compared, and it is put back below.
+            fs.arm_delete_from_seed(path, Some(&mtime), None);
+            fs.cursors[path].delete_candidate.is_some()
+        };
+        let set_mtime = |path: &str| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(original)
+                .unwrap();
+        };
+        assert!(arm(&path), "the control: the file as archived");
+
+        // The same inode, longer, with its mtime put back.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"three\n")
+            .unwrap();
+        set_mtime(&path);
+        assert!(!arm(&path), "longer than the archived range");
+
+        // Another file, as long as the archived range, mtime put back.
+        let other = dir.path().join("other.log").to_string_lossy().into_owned();
+        std::fs::write(&other, "ONE\nTWO\n").unwrap();
+        set_mtime(&other);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&other, &path).unwrap();
+        assert!(!arm(&path), "another inode");
+    }
+
+    // ---- the descriptors kept on files that left their path (#621) --------
+
+    /// A descriptor on a file of `bytes` in `dir`, as the adapter holds one:
+    /// its first page fingerprinted, `read_end` bytes handed out of it and
+    /// `committed` of them archived.
+    #[cfg(unix)]
+    fn held_on(dir: &Path, name: &str, read_end: u64, committed: u64) -> HeldFile {
+        use std::os::unix::fs::MetadataExt;
+        let path = dir.join(name);
+        std::fs::write(&path, b"one\ntwo\n").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let inode = file.metadata().unwrap().ino();
+        HeldFile::new(
+            file,
+            inode,
+            ContentFingerprint::of(b"one\ntwo\n").unwrap(),
+            read_end,
+            committed,
+            8,
+        )
+    }
+
+    #[cfg(unix)]
+    fn rotated_file(path: &str, held: HeldFile, replaying: bool) -> RotatedFile {
+        RotatedFile {
+            path: path.to_owned(),
+            held,
+            replay: replaying.then_some(Replay {
+                read_byte: 0,
+                drained: false,
+            }),
+        }
+    }
+
+    /// A rotated file's descriptor is kept an hour unused, by default.
+    #[test]
+    fn a_rotated_descriptor_is_held_for_an_hour_and_128_files_by_default() {
+        let fs = FileSource::new(vec![], TelemetryFormat::Raw, false);
+        assert_eq!(rotated::HOLD_FOR, Duration::from_secs(60 * 60));
+        assert_eq!(fs.hold_for, rotated::HOLD_FOR);
+        assert_eq!(fs.max_held, 128);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rotated_descriptor_is_closed_only_when_unused_for_its_hold_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _guard) = Events::capture();
+        let closed = "closed the descriptor on a rotated file after";
+
+        let mut fs = FileSource::new(vec![], TelemetryFormat::Raw, false)
+            .with_hold_limits(8, Duration::from_secs(3600));
+        fs.rotated
+            .push(rotated_file("/a", held_on(dir.path(), "a", 8, 8), false));
+        fs.expire_rotated();
+        assert_eq!(fs.rotated.len(), 1, "used a moment ago: kept");
+        assert!(
+            events.levels(closed).is_empty(),
+            "{:?}",
+            events.levels(closed)
+        );
+
+        // No hold time: what is idle goes, what is being re-read stays.
+        let mut fs = FileSource::new(vec![], TelemetryFormat::Raw, false)
+            .with_hold_limits(8, Duration::ZERO);
+        fs.rotated.push(rotated_file(
+            "/idle",
+            held_on(dir.path(), "idle", 8, 8),
+            false,
+        ));
+        fs.rotated.push(rotated_file(
+            "/busy",
+            held_on(dir.path(), "busy", 8, 0),
+            true,
+        ));
+        fs.expire_rotated();
+        let left: Vec<&str> = fs.rotated.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(left, ["/busy"]);
+        assert_eq!(events.levels(closed), [tracing::Level::INFO]);
+    }
+
+    /// A read restarted on a rotated-away file's successor: its descriptor is
+    /// kept for the ranges not archived yet, and for a range already handed
+    /// back to be read again - and closed when nothing waits on it.
+    #[cfg(unix)]
+    #[test]
+    fn a_rotation_keeps_the_descriptor_only_while_a_range_of_it_is_unarchived() {
+        let dir = tempfile::tempdir().unwrap();
+        let rotation = Discontinuity::Rotated { from: 1, to: 2 };
+        let retire = |read_end: u64, committed: u64, read_byte_before: u64, why: Discontinuity| {
+            let mut fs = FileSource::new(vec![], TelemetryFormat::Raw, false);
+            fs.held.insert(
+                "/a".to_owned(),
+                held_on(dir.path(), "a", read_end, committed),
+            );
+            fs.retire_held("/a", read_byte_before, why);
+            assert!(fs.held.is_empty(), "the path no longer holds it");
+            fs.rotated
+        };
+        // Read to 8, none archived, the cursor not rewound: kept, no re-read.
+        let kept = retire(8, 0, 8, rotation);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].replay, None);
+        // Everything archived and nothing rewound: closed.
+        assert!(retire(8, 8, 8, rotation).is_empty());
+        // Archived, but the cursor was rewound into it before the rotation:
+        // the re-read was promised, so it starts - above what is committed.
+        let rewound = retire(8, 6, 4, rotation);
+        assert_eq!(rewound.len(), 1);
+        assert_eq!(
+            rewound[0].replay,
+            Some(Replay {
+                read_byte: 6,
+                drained: false
+            })
+        );
+        // A truncation leaves the descriptor on the new content: closed.
+        assert!(retire(
+            8,
+            0,
+            4,
+            Discontinuity::Truncated {
+                read_byte: 8,
+                observed: 8,
+                size: 2
+            }
+        )
+        .is_empty());
+    }
+
+    /// `hold` after a read that handed out nothing (end at start): the
+    /// descriptor of that file is let go once nothing is outstanding on it,
+    /// and only that file's.
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_read_releases_the_held_descriptor_only_when_nothing_is_outstanding() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = held_on(dir.path(), "a", 8, 8);
+        let identity = |inode| FileIdentity {
+            inode: Some(inode),
+            file_size: 8,
+            mtime: String::new(),
+            ctime: None,
+            content: ContentFingerprint::of(b"one\ntwo\n"),
+            tail: None,
+        };
+        let inode = held.inode;
+        let run = |held: HeldFile, read_inode: u64| {
+            let mut fs = FileSource::new(vec![], TelemetryFormat::Raw, false);
+            fs.held.insert("/a".to_owned(), held);
+            fs.hold("/a", None, &identity(read_inode), 8, 8);
+            fs.held.len()
+        };
+        assert_eq!(run(held_on(dir.path(), "a", 8, 8), inode), 0, "archived");
+        assert_eq!(
+            run(held_on(dir.path(), "a", 8, 3), inode),
+            1,
+            "a range of it is not archived yet"
+        );
+        assert_eq!(
+            run(held_on(dir.path(), "a", 8, 8), inode + 1),
+            1,
+            "another file's empty read is not this one's"
+        );
+    }
+
+    /// `hold` after a read that handed a range out: the descriptor already
+    /// held for the file is refreshed in place; one given for another file,
+    /// or a new one for the same file, replaces it.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_refreshes_the_descriptor_held_for_its_file_and_not_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = |inode: u64, size: u64| FileIdentity {
+            inode: Some(inode),
+            file_size: size,
+            mtime: String::new(),
+            ctime: None,
+            content: ContentFingerprint::of(b"one\ntwo\n"),
+            tail: None,
+        };
+        let fresh = |read_end| {
+            let mut fs = FileSource::new(vec![], TelemetryFormat::Raw, false);
+            fs.held
+                .insert("/a".to_owned(), held_on(dir.path(), "a", read_end, 0));
+            fs
+        };
+        let inode = fresh(0).held["/a"].inode;
+
+        // The same file, no new descriptor: the range extends what is held.
+        let mut fs = fresh(5);
+        fs.hold("/a", None, &identity(inode, 40), 5, 8);
+        assert_eq!(fs.held["/a"].read_end, 8);
+        assert_eq!(fs.held["/a"].min_len, 40, "seen at that length");
+        let mut fs = fresh(20);
+        fs.hold("/a", None, &identity(inode, 40), 5, 8);
+        assert_eq!(fs.held["/a"].read_end, 20, "never lowered");
+
+        // Another file's read with no descriptor to give: nothing changes.
+        let mut fs = fresh(5);
+        fs.hold("/a", None, &identity(inode + 1, 40), 5, 8);
+        assert_eq!(fs.held["/a"].read_end, 5);
+        assert_eq!(fs.held["/a"].inode, inode);
+
+        // A new descriptor for the same file replaces the held one.
+        let mut fs = fresh(20);
+        let given = std::fs::File::open(dir.path().join("a")).unwrap();
+        fs.hold("/a", Some(given), &identity(inode, 40), 5, 8);
+        assert_eq!(fs.held["/a"].read_end, 8, "the new record, not the old");
+    }
+
+    /// At the limit, room is made by closing the rotated file unused longest
+    /// that is not being re-read; one that is being re-read is never closed.
+    #[cfg(unix)]
+    #[test]
+    fn room_is_never_made_by_closing_a_re_read_in_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fs = FileSource::new(vec![], TelemetryFormat::Raw, false)
+            .with_hold_limits(1, Duration::from_secs(3600));
+        fs.rotated.push(rotated_file(
+            "/busy",
+            held_on(dir.path(), "busy", 8, 0),
+            true,
+        ));
+        assert!(!fs.make_room(), "the only descriptor is being re-read");
+        assert_eq!(fs.rotated.len(), 1);
+
+        let mut fs = FileSource::new(vec![], TelemetryFormat::Raw, false)
+            .with_hold_limits(1, Duration::from_secs(3600));
+        fs.rotated.push(rotated_file(
+            "/idle",
+            held_on(dir.path(), "idle", 8, 8),
+            false,
+        ));
+        assert!(fs.make_room());
+        assert!(fs.rotated.is_empty());
+    }
+
+    /// A commit settles only the rotated file it names: the path and the
+    /// inode.
+    #[cfg(unix)]
+    #[test]
+    fn a_commit_closes_only_the_rotated_file_it_settles() {
+        let dir = tempfile::tempdir().unwrap();
+        let inode = held_on(dir.path(), "a", 8, 8).inode;
+        let settle = |path: &str, inode: u64| {
+            let mut fs = FileSource::new(vec![], TelemetryFormat::Raw, false);
+            fs.rotated
+                .push(rotated_file("/a", held_on(dir.path(), "a", 8, 8), false));
+            fs.note_committed(path, Some(inode), 8, None, None);
+            fs.rotated.len()
+        };
+        assert_eq!(settle("/a", inode), 0, "its ranges are all archived");
+        assert_eq!(settle("/b", inode), 1, "another path");
+        assert_eq!(settle("/a", inode + 1), 1, "another inode");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_path_with_a_range_being_re_read_is_replaying() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fs = FileSource::new(vec![], TelemetryFormat::Raw, false);
+        fs.rotated
+            .push(rotated_file("/a", held_on(dir.path(), "a", 8, 0), false));
+        fs.rotated
+            .push(rotated_file("/b", held_on(dir.path(), "b", 8, 0), true));
+        assert_eq!(fs.replaying("/a"), None, "nothing handed back");
+        assert_eq!(fs.replaying("/b"), Some(1));
+        assert_eq!(fs.replaying("/c"), None);
+    }
+
+    /// Recovery asks which paths have a rotated file's range being re-read:
+    /// sorted, once each.
+    #[cfg(unix)]
+    #[test]
+    fn the_paths_being_re_read_are_listed_sorted_and_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fs = FileSource::new(vec![], TelemetryFormat::Raw, false);
+        assert!(fs.rotated_replay_paths().is_empty());
+        for (path, name, replaying) in [
+            ("/b", "b", true),
+            ("/a", "a1", true),
+            ("/a", "a2", true),
+            ("/c", "c", false),
+        ] {
+            fs.rotated.push(rotated_file(
+                path,
+                held_on(dir.path(), name, 8, 0),
+                replaying,
+            ));
+        }
+        assert_eq!(fs.rotated_replay_paths(), ["/a", "/b"]);
+    }
+
+    /// A re-read of a rotated file folds into the record of THAT file: the
+    /// path's, the inode's, and one being re-read.
+    #[cfg(unix)]
+    #[test]
+    fn a_re_read_advances_the_record_of_the_file_it_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = held_on(dir.path(), "target", 8, 0);
+        let inode = target.inode;
+        let mut fs = FileSource::new(vec![], TelemetryFormat::Raw, false);
+        // Entries a read of /a from `inode` must leave alone come first.
+        fs.rotated
+            .push(rotated_file("/b", held_on(dir.path(), "b", 8, 0), true));
+        let mut other_inode = held_on(dir.path(), "other", 8, 0);
+        other_inode.inode = inode + 1;
+        fs.rotated.push(rotated_file("/a", other_inode, true));
+        let mut drained = held_on(dir.path(), "drained", 8, 0);
+        drained.inode = inode;
+        fs.rotated.push(RotatedFile {
+            path: "/a".to_owned(),
+            held: drained,
+            replay: Some(Replay {
+                read_byte: 3,
+                drained: true,
+            }),
+        });
+        fs.rotated.push(rotated_file("/a", target, true));
+        for entry in &mut fs.rotated[..3] {
+            entry.held.read_end = 0;
+        }
+
+        let slice = SliceRead {
+            cut: CutOutcome::None,
+            records: vec![b"one".to_vec()],
+            start: 0,
+            end: 4,
+            verbatim: false,
+            identity: FileIdentity {
+                inode: Some(inode),
+                file_size: 30,
+                mtime: String::new(),
+                ctime: None,
+                content: None,
+                tail: None,
+            },
+            discontinuity: None,
+            start_tail: None,
+            descriptor: None,
+        };
+        fs.apply_rotated("/a", slice);
+        let states: Vec<(u64, u64, bool)> = fs
+            .rotated
+            .iter()
+            .map(|r| {
+                (
+                    r.held.read_end,
+                    r.held.min_len,
+                    r.replay.is_some_and(|replay| replay.read_byte == 4),
+                )
+            })
+            .collect();
+        assert_eq!(
+            states,
+            [(0, 8, false), (0, 8, false), (0, 8, false), (8, 30, true)],
+            "only the file the re-read came from advances (read_end, length seen, position)"
+        );
+    }
+
+    /// Recovery tells a rotated file's re-read what is already archived of
+    /// it: it starts above the newest row of that file, never one of another
+    /// file or of another path, and never below what is committed.
+    #[cfg(unix)]
+    #[test]
+    fn a_re_read_starts_above_what_the_ledger_says_is_archived_of_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = held_on(dir.path(), "a", 8, 0);
+        let inode = held.inode;
+        // Other entries on the very same file: only the path and the re-read
+        // in progress tell them from the one recovery means.
+        let on_same_file = || {
+            HeldFile::new(
+                std::fs::File::open(dir.path().join("a")).unwrap(),
+                inode,
+                ContentFingerprint::of(b"one\ntwo\n").unwrap(),
+                8,
+                0,
+                8,
+            )
+        };
+        let page = ContentFingerprint::of(b"one\ntwo\n");
+        let row = |inode: u64, end: usize| ArchivedEnd {
+            inode: Some(inode),
+            end_byte: end as u64,
+            content: page.clone(),
+            tail: ContentFingerprint::of_tail(&b"one\ntwo\n"[..end]),
+        };
+        let mut fs = FileSource::new(vec![], TelemetryFormat::Raw, false);
+        fs.rotated.push(rotated_file("/b", on_same_file(), true));
+        fs.rotated.push(rotated_file("/a", on_same_file(), false));
+        fs.rotated.push(rotated_file("/a", held, true));
+        fs.raise_rotated_replay_floor(
+            "/a",
+            &[
+                row(inode, 4),
+                // Another inode, however well its pages fit this file.
+                row(inode + 1, 6),
+            ],
+        );
+        let floors: Vec<(u64, Option<u64>)> = fs
+            .rotated
+            .iter()
+            .map(|r| (r.held.committed, r.replay.map(|replay| replay.read_byte)))
+            .collect();
+        assert_eq!(
+            floors,
+            [(0, Some(0)), (0, None), (4, Some(4))],
+            "the newest row of the file, in the entry of that path being re-read"
+        );
+        // A later row of the file raises it further, and an older one lowers
+        // nothing.
+        fs.raise_rotated_replay_floor("/a", &[row(inode, 8), row(inode, 4)]);
+        assert_eq!(fs.rotated[2].held.committed, 8);
+    }
+
+    /// The range of a file handed back after it left the path is the one
+    /// whose inode it names, whatever else of that path is held.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_range_is_matched_to_the_rotated_file_of_its_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let wanted = held_on(dir.path(), "wanted", 8, 0);
+        let inode = wanted.inode;
+        let mut earlier = held_on(dir.path(), "earlier", 8, 0);
+        earlier.inode = inode + 1;
+        let mut fs = FileSource::new(vec!["/a".to_owned()], TelemetryFormat::Raw, false);
+        fs.rotated.push(rotated_file("/a", earlier, false));
+        fs.rotated.push(rotated_file("/a", wanted, false));
+        let page = ContentFingerprint::of(b"one\ntwo\n");
+        let marker = ProgressMarker::File {
+            path: "/a".to_owned(),
+            inode: Some(inode),
+            start_byte: 0,
+            end_byte: 8,
+            file_size: 8,
+            mtime: String::new(),
+            ctime: None,
+            content_fingerprint: page,
+            tail_fingerprint: ContentFingerprint::of_tail(b"one\ntwo\n"),
+        };
+        assert!(fs.replay_rotated(&marker));
+        assert_eq!(fs.rotated.len(), 2, "the other file's record is left alone");
+        assert_eq!(fs.rotated[0].replay, None);
+        assert!(
+            fs.rotated[1].replay.is_some(),
+            "the range is re-read from its file"
+        );
+    }
+
+    /// A descriptor on a rotated file is re-proven before it is read: the
+    /// length it was seen at, the first page, the inode, and the page it
+    /// last read up to. Each refuses on its own.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rotated_file_is_re_read_only_when_each_part_of_its_identity_holds() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rotated").to_string_lossy().into_owned();
+        // 6000 bytes: longer than the first page.
+        let text: String = (0..600).map(|i| format!("line-{i:04}\n")).collect();
+        assert_eq!(text.len(), 6000);
+        std::fs::write(&path, &text).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let content = ContentFingerprint::of(text.as_bytes()).unwrap();
+        let read =
+            |min_len: u64, start: u64, inode: u64, content: &ContentFingerprint| RotatedRead {
+                file: std::fs::File::open(&path).unwrap(),
+                inode,
+                content: content.clone(),
+                min_len,
+                tail: None,
+                start,
+            };
+        let reread = |read: RotatedRead| async move {
+            FileSource::read_rotated(read, "/app.log", 1000, 1 << 20, false).await
+        };
+        assert!(
+            reread(read(6000, 0, inode, &content)).await.is_ok(),
+            "the control"
+        );
+
+        // Shorter than it was seen to be, with its first page intact.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(5000)
+            .unwrap();
+        let err = reread(read(6000, 0, inode, &content)).await.err().unwrap();
+        assert!(err.to_string().contains("shorter"), "{err}");
+        // The range starts past the end of what is left.
+        let err = reread(read(100, 5200, inode, &content))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("shorter"), "{err}");
+        // Another inode with the same first page.
+        let err = reread(read(100, 0, inode + 1, &content))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("first bytes"), "{err}");
+        // The same inode with another first page.
+        let other = ContentFingerprint::of(b"NOT the first page\n").unwrap();
+        let err = reread(read(100, 0, inode, &other)).await.err().unwrap();
+        assert!(err.to_string().contains("first bytes"), "{err}");
+    }
+
+    /// A range re-read from a descriptor is not read again by the next pass
+    /// while it waits to be committed: the re-read moves on from where it
+    /// stopped, and the path's new file comes after it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rewound_range_is_re_read_once_even_before_it_commits() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "old 1\nold 2\n").unwrap();
+        let old_inode = std::fs::metadata(&path).unwrap().ino();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let first = read_all_one(&mut fs, &path).await;
+        fs.replay_from_marker(&first[0].progress_start)
+            .await
+            .unwrap();
+        let rotated = format!("{path}.1");
+        std::fs::rename(&path, &rotated).unwrap();
+        std::fs::write(&path, "new 1\n").unwrap();
+        std::fs::remove_file(&rotated).unwrap();
+
+        let mut old = 0;
+        let mut new = 0;
+        for _ in 0..4 {
+            // Nothing is committed: the re-read must still not repeat.
+            for read in read_all_one(&mut fs, &path).await {
+                if read.is_empty() {
+                    continue;
+                }
+                if file_marker(&read.progress_end).0 == Some(old_inode) {
+                    old += 1;
+                } else {
+                    new += 1;
+                }
+            }
+        }
+        assert_eq!((old, new), (1, 1), "the old range once, then the new file");
+    }
+
+    // ---- reading one file: budgets, cuts and the pages below the cursor ----
+
+    /// `read_opened` on a file of `bytes`, read from `start`.
+    async fn read_opened_bytes(
+        bytes: &[u8],
+        start: u64,
+        max_records: usize,
+        max_bytes: usize,
+        whole_file: bool,
+        cut: Option<u64>,
+    ) -> Result<SliceRead, VtopError> {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(bytes).unwrap();
+        file.flush().unwrap();
+        let open = tokio::fs::File::open(file.path()).await.unwrap();
+        FileSource::read_opened(
+            open,
+            "/opened",
+            start,
+            max_records,
+            max_bytes,
+            whole_file,
+            bytes.len() as u64,
+            None,
+            cut,
+        )
+        .await
+    }
+
+    /// A whole file is one record of at most `max_bytes`: exactly that many
+    /// is fine, one more is refused.
+    #[tokio::test]
+    async fn a_whole_file_record_may_be_exactly_the_byte_budget() {
+        let exact = read_opened_bytes(b"0123456789", 0, 10, 10, true, None)
+            .await
+            .unwrap();
+        assert_eq!((exact.records.len(), exact.end), (1, 10));
+        let over = read_opened_bytes(b"0123456789A", 0, 10, 10, true, None)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            over.to_string().contains("exceeding max_bytes=10"),
+            "{over}"
+        );
+        let from = read_opened_bytes(b"0123456789A", 4, 10, 10, true, None)
+            .await
+            .unwrap();
+        assert_eq!((from.records[0].len(), from.end), (7, 11));
+    }
+
+    /// A whole-file record cannot stop inside the file: a recorded end that
+    /// is the end of the file is reached, any other is refused.
+    #[tokio::test]
+    async fn a_whole_file_read_reaches_a_recorded_end_only_at_the_end_of_the_file() {
+        let at = |cut| read_opened_bytes(b"0123456789", 0, 10, 100, true, cut);
+        assert_eq!(at(Some(10)).await.unwrap().cut, CutOutcome::Reached(10));
+        assert!(matches!(
+            at(Some(4)).await.unwrap().cut,
+            CutOutcome::Refused(4, reason) if reason.contains("cannot stop at the recorded end")
+        ));
+        assert_eq!(at(None).await.unwrap().cut, CutOutcome::None);
+    }
+
+    /// The byte budget counts what has been read: a window of lines ends at
+    /// it, and a line that fits it exactly is read.
+    #[tokio::test]
+    async fn the_byte_budget_ends_a_window_and_admits_a_line_that_fits_it_exactly() {
+        // Two 5-byte lines use the 10; the empty line after them does not fit.
+        let read = read_opened_bytes(b"aaaa\nbbbb\n\n", 0, 100, 10, false, None)
+            .await
+            .unwrap();
+        assert_eq!(read.records, [b"aaaa".to_vec(), b"bbbb".to_vec()]);
+        assert_eq!(read.end, 10);
+        // One line of exactly the budget.
+        let exact = read_opened_bytes(b"abcd\nxyz\n", 0, 100, 5, false, None)
+            .await
+            .unwrap();
+        assert_eq!(exact.records, [b"abcd".to_vec()]);
+        let over = read_opened_bytes(b"abcdef\n", 0, 100, 5, false, None)
+            .await
+            .err()
+            .unwrap();
+        assert!(over.to_string().contains("exceeds max_bytes=5"), "{over}");
+    }
+
+    /// A recorded end the file does not reach is not reached; one at a line
+    /// boundary is, and one inside a line is refused.
+    #[tokio::test]
+    async fn a_recorded_end_is_reached_only_where_the_read_stops_on_it() {
+        let at = |cut| read_opened_bytes(b"one\ntwo\n", 0, 100, 1 << 20, false, cut);
+        assert_eq!(
+            at(Some(100)).await.unwrap().cut,
+            CutOutcome::None,
+            "the file ends first"
+        );
+        let to_four = at(Some(4)).await.unwrap();
+        assert_eq!(
+            (to_four.records.len(), to_four.cut),
+            (1, CutOutcome::Reached(4))
+        );
+        assert_eq!(at(Some(8)).await.unwrap().cut, CutOutcome::Reached(8));
+        assert!(matches!(
+            at(Some(6)).await.unwrap().cut,
+            CutOutcome::Refused(6, _)
+        ));
+    }
+
+    /// The hook a test sets runs once, right after the first record.
+    #[tokio::test]
+    async fn the_read_hook_runs_after_the_first_record() {
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ran.clone();
+        READ_HOOKS
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(
+                "/opened".to_owned(),
+                Box::new(move || flag.store(true, std::sync::atomic::Ordering::SeqCst)),
+            );
+        read_opened_bytes(b"only\n", 0, 10, 100, false, None)
+            .await
+            .unwrap();
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// The page below a read's start is the page of the file that ends there,
+    /// whatever the cursor last fingerprinted: after a rewind into the file
+    /// the old tail sits at another offset and is not used.
+    #[tokio::test]
+    async fn a_rewound_reads_start_marker_fingerprints_the_page_below_its_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let text: String = (0..120)
+            .map(|i| format!("line-{i:04}-{}\n", "x".repeat(89)))
+            .collect();
+        assert_eq!(text.len(), 12_000);
+        std::fs::write(&path, &text).unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let mut windows = Vec::new();
+        for _ in 0..3 {
+            let read = fs
+                .read_batch_candidates(&src(&path), 50, 1 << 20, Duration::ZERO)
+                .await
+                .unwrap();
+            windows.push(read[0].clone());
+        }
+        let second = &windows[1];
+        assert_eq!(file_marker(&second.progress_start).1, 5_000);
+        fs.replay_from_marker(&second.progress_start).await.unwrap();
+        let again = fs
+            .read_batch_candidates(&src(&path), 50, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(file_marker(&again[0].progress_start).1, 5_000);
+        assert_eq!(
+            again[0].progress_start.tail_fingerprint(),
+            ContentFingerprint::of_tail(&text.as_bytes()[..5_000]).as_ref(),
+            "the page that ends at the start of the re-read"
+        );
+        assert_eq!(
+            again[0].progress_start.tail_fingerprint(),
+            second.progress_start.tail_fingerprint()
+        );
+    }
+
+    /// A restart seed whose tail is shorter than a page: the first read's
+    /// start marker still fingerprints the whole page below the seed's
+    /// offset, not the shorter piece the seed carried.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_seeds_short_tail_is_checked_but_not_what_the_start_marker_records() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let text: String = (0..20).map(|i| format!("line-{i:04}\n")).collect();
+        std::fs::write(&path, &text).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        fs.seed_committed_from(
+            &path,
+            100,
+            Some(inode),
+            Some(200),
+            ContentFingerprint::of(text.as_bytes()),
+            ContentFingerprint::of(&text.as_bytes()[90..100]),
+        );
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(lines(&read).len(), 10, "resumed at the seed's offset");
+        assert_eq!(
+            read[0].progress_start.tail_fingerprint().map(|t| t.len),
+            Some(100),
+            "the 100 bytes below byte 100, not the 10 the seed carried"
+        );
+    }
+
+    /// A bound re-read of a file that was truncated is refused: the range
+    /// was cut from other content.
+    #[tokio::test]
+    async fn a_bound_re_read_of_a_truncated_file_is_refused() {
+        let f = write_log(&["a1", "a2", "a3"]);
+        let path = f.path().to_string_lossy().into_owned();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let first = fs
+            .read_batch_candidates(&src(&path), 10, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.replay_from_marker(&first[0].progress_start)
+            .await
+            .unwrap();
+        let range = ReplayRange {
+            start: first[0].progress_start.clone(),
+            end: first[0].progress_end.clone(),
+        };
+        assert_eq!(fs.bound_replays(&[range]), [true]);
+        // Truncated in place and rewritten shorter.
+        std::fs::write(&path, "zz\n").unwrap();
+        let read = fs
+            .read_batch_candidates(&src(&path), 10, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(lines(&read), ["zz"], "the new content is read from byte 0");
+        let refused = fs.take_refused_cuts();
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(refused[0].reason.contains("replaced"), "{refused:?}");
+    }
+
+    /// After a window rebuilt as cut, the read goes on in the same pass with
+    /// what is left of the budgets - of records and of bytes - and with none
+    /// of them left, it does not.
+    #[tokio::test]
+    async fn the_read_after_a_cut_uses_only_what_is_left_of_the_budgets() {
+        // "a1\na2\na3\n" is 9 bytes, 3 records; b1..b4 follow.
+        let read_on = |max_records: usize, max_bytes: usize| async move {
+            let mut f = write_log(&["a1", "a2", "a3"]);
+            let path = f.path().to_string_lossy().into_owned();
+            let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+            let first = fs
+                .read_batch_candidates(&src(&path), 10, 1 << 20, Duration::ZERO)
+                .await
+                .unwrap();
+            for tag in ["b1", "b2", "b3", "b4"] {
+                writeln!(f, "{tag}").unwrap();
+            }
+            f.flush().unwrap();
+            fs.replay_from_marker(&first[0].progress_start)
+                .await
+                .unwrap();
+            let range = ReplayRange {
+                start: first[0].progress_start.clone(),
+                end: first[0].progress_end.clone(),
+            };
+            assert_eq!(fs.bound_replays(&[range]), [true]);
+            let again = fs
+                .read_batch_candidates(&src(&path), max_records, max_bytes, Duration::ZERO)
+                .await
+                .unwrap();
+            lines(&again)
+        };
+        assert_eq!(
+            read_on(100, 1 << 20).await,
+            ["a1", "a2", "a3", "b1", "b2", "b3", "b4"],
+            "no budget in the way"
+        );
+        assert_eq!(
+            read_on(5, 1 << 20).await,
+            ["a1", "a2", "a3", "b1", "b2"],
+            "two records are left of five"
+        );
+        assert_eq!(
+            read_on(100, 15).await,
+            ["a1", "a2", "a3", "b1", "b2"],
+            "six bytes are left of fifteen"
+        );
+        assert_eq!(
+            read_on(100, 9).await,
+            ["a1", "a2", "a3"],
+            "the window used the whole byte budget"
+        );
+        assert_eq!(
+            read_on(3, 1 << 20).await,
+            ["a1", "a2", "a3"],
+            "and the whole record budget"
+        );
+    }
+
+    /// A pass over a file that has not changed since it was read to its end
+    /// does not open it, and says so; a pass that reads it does not.
+    #[tokio::test]
+    async fn an_unchanged_file_is_counted_as_skipped_and_a_read_one_is_not() {
+        let f = write_log(&["a", "b"]);
+        let path = f.path().to_string_lossy().into_owned();
+        let skipped = "file_cycle_skipped_unchanged";
+        let (events, _guard) = Events::capture();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        read_all_one(&mut fs, &path).await;
+        assert!(events.levels(skipped).is_empty(), "the first pass reads it");
+        read_all_one(&mut fs, &path).await;
+        assert_eq!(events.levels(skipped), [tracing::Level::DEBUG]);
+    }
+
+    /// The pass's time is booked to what it did: read time to a pass that
+    /// produced records, not to an idle one.
+    #[tokio::test]
+    async fn a_pass_that_read_records_books_its_time_as_productive() {
+        let f = write_log(&["a", "b"]);
+        let path = f.path().to_string_lossy().into_owned();
+        READ_HOOKS
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(
+                path.clone(),
+                Box::new(|| std::thread::sleep(Duration::from_millis(40))),
+            );
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let report = fs
+            .read_all_batch_candidates(&[src(&path)], 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(report.productive_ms >= 40, "{}", report.productive_ms);
+        assert_eq!((report.empty_ms, report.failed_ms), (0, 0));
+    }
+
+    /// A commit says the file is fully archived and waits for the quiet
+    /// period only when there is a quiet period to wait out.
+    #[tokio::test]
+    async fn a_commit_says_it_is_waiting_only_when_there_is_a_quiet_period() {
+        let waiting = "is fully archived; it is deleted once it has stayed unwritten";
+        let (events, _guard) = Events::capture();
+        for (quiet, said) in [
+            (Duration::from_secs(3600), vec![tracing::Level::DEBUG]),
+            (Duration::ZERO, vec![]),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("app.log").to_string_lossy().into_owned();
+            std::fs::write(&path, "one\ntwo\n").unwrap();
+            committed(&path, quiet).await;
+            assert_eq!(events.levels(waiting), said, "quiet {quiet:?}");
+            events.0.lock().unwrap().clear();
+        }
+    }
+
+    /// A commit of a batch read before the file was rotated: no delete was
+    /// due for it. Said only when the batch had reached the end of its file;
+    /// a batch that read part of it was never a delete's to decide.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stale_commit_says_nothing_of_a_delete_unless_it_reached_its_files_end() {
+        let stale_commit = |max_records: usize| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("app.log").to_string_lossy().into_owned();
+            std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+            let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+                .with_delete_quiet_period(Duration::ZERO);
+            let read = fs
+                .read_batch_candidates(&src(&path), max_records, 1 << 20, Duration::ZERO)
+                .await
+                .unwrap();
+            // Rotated away, and a new file at the path.
+            std::fs::rename(&path, format!("{path}.1")).unwrap();
+            std::fs::write(&path, "fresh\n").unwrap();
+            fs.commit_progress(&read[0].progress_end).await.unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "fresh\n");
+            fs.notices
+                .iter()
+                .any(|n| n.contains("not deleting") && n.contains("for this commit"))
+        };
+        assert!(
+            stale_commit(100).await,
+            "it reached the end of its file: the delete that was due is said not to happen"
+        );
+        assert!(
+            !stale_commit(1).await,
+            "it read the first line of three: no delete was ever due"
+        );
+    }
+
+    /// An in-process commit of an earlier window leaves the read head where
+    /// the later windows put it: only a recovered commit resets it.
+    #[tokio::test]
+    async fn committing_an_earlier_window_does_not_move_the_read_head_back() {
+        let f = write_log(&["l1", "l2", "l3"]);
+        let path = f.path().to_string_lossy().into_owned();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let mut windows = Vec::new();
+        for _ in 0..3 {
+            let read = fs
+                .read_batch_candidates(&src(&path), 1, 1 << 20, Duration::ZERO)
+                .await
+                .unwrap();
+            windows.push(read[0].clone());
+        }
+        fs.commit_progress(&windows[0].progress_end).await.unwrap();
+        assert_eq!(fs.cursors[&path].committed_byte, 3);
+        assert_eq!(fs.cursors[&path].read_byte, 9, "the later windows are read");
+        let next = fs
+            .read_batch_candidates(&src(&path), 10, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(lines(&next).is_empty(), "nothing is read twice");
+    }
+
+    /// A recovered commit that names an inode but no first page keeps the
+    /// first page the seed recorded for that inode.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_recovered_commit_without_a_first_page_keeps_the_seeds() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let page = ContentFingerprint::of(b"one\ntwo\n");
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        fs.seed_committed_from(&path, 8, Some(inode), Some(8), page.clone(), None);
+        let marker = ProgressMarker::File {
+            path: path.clone(),
+            inode: Some(inode),
+            start_byte: 0,
+            end_byte: 8,
+            file_size: 8,
+            mtime: String::new(),
+            ctime: None,
+            content_fingerprint: None,
+            tail_fingerprint: None,
+        };
+        fs.commit_progress(&marker).await.unwrap();
+        let seen = fs.cursors[&path].seen.as_ref().unwrap();
+        assert_eq!(seen.inode, Some(inode));
+        assert_eq!(seen.content, page, "a legacy row names none of its own");
+    }
+
+    /// A batch read in a generation the file has left is stale even when the
+    /// file has regrown to repeat it byte for byte: only the record of
+    /// generations can tell.
+    #[tokio::test]
+    async fn a_commit_from_before_a_truncation_is_stale_when_the_file_regrows_the_same_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let line = |i: usize| format!("line-{i:04}\n");
+        let all: String = (0..12).map(line).collect();
+        std::fs::write(&path, &all).unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let old = fs
+            .read_batch_candidates(&src(&path), 10, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(old[0].records.len(), 10);
+        let old_end = old[0].progress_end.clone();
+
+        // Truncated and rewritten with the first five lines again.
+        let five: String = (0..5).map(line).collect();
+        std::fs::write(&path, &five).unwrap();
+        let second = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(second[0].records.len(), 5);
+        // It regrows to the very bytes it had: by inode, length, first page
+        // and the page below the old range's end, the old range is current.
+        let rest: String = (5..12).map(line).collect();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(rest.as_bytes())
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), all);
+        fs.commit_progress(&old_end).await.unwrap();
+        assert_eq!(
+            fs.cursors[&path].committed_byte, 0,
+            "the range is of the file before the truncation"
+        );
+        let third = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(third[0].records.len(), 7, "line 5 onwards: nothing skipped");
+    }
+
+    /// A commit whose range ends beyond the file as it is now is not current,
+    /// whether or not its marker recorded the page below its end.
+    #[tokio::test]
+    async fn a_commit_beyond_the_end_of_a_truncated_file_is_not_current_without_a_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "aaa\nbbb\nccc\n").unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        let mut old_end = read[0].progress_end.clone();
+        if let ProgressMarker::File {
+            tail_fingerprint, ..
+        } = &mut old_end
+        {
+            *tail_fingerprint = None;
+        }
+        std::fs::write(&path, "zzz\n").unwrap();
+        fs.commit_progress(&old_end).await.unwrap();
+        assert_eq!(
+            fs.cursors[&path].committed_byte, 0,
+            "the cursor was carried to a byte that is no longer in the file"
+        );
+    }
+
+    /// A directory under a delete's hidden name is not a source, and a file
+    /// two patterns find is one.
+    #[tokio::test]
+    async fn leftovers_of_a_delete_are_discovered_once_and_only_when_they_are_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let by_ext = dir.path().join("*.log").to_string_lossy().into_owned();
+        let by_name = dir.path().join("app*").to_string_lossy().into_owned();
+        std::fs::write(dir.path().join("app.log"), "x\n").unwrap();
+        std::fs::write(dir.path().join(".vtop-delete.1.1"), "left\n").unwrap();
+        std::fs::create_dir(dir.path().join(".vtop-delete.2.2")).unwrap();
+        let fs = FileSource::new(vec![by_ext, by_name], TelemetryFormat::Raw, true);
+        let found = fs.discover_sources().await.unwrap();
+        let mut names: Vec<String> = found
+            .iter()
+            .map(|s| {
+                Path::new(&s.source_name)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        assert_eq!(names, [".vtop-delete.1.1", "app.log"], "{found:?}");
+    }
+
+    // ---- a delete that finds something else at the path --------------------
+
+    /// A committed file whose delete is due, with `path` then changed by
+    /// `swap`: the job the next pass would run.
+    #[cfg(unix)]
+    async fn due_after(path: &str, swap: impl FnOnce()) -> DeleteJob {
+        let quiet = Duration::from_millis(20);
+        let fs = committed(path, quiet).await;
+        swap();
+        std::thread::sleep(quiet * 2);
+        fs.due_delete(path).expect("the delete is due")
+    }
+
+    /// What the job is, as a delete of the path meets it: the link a writer
+    /// swapped in is not unlinked in the file's place.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_delete_finding_a_symbolic_link_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let moved = format!("{path}.1");
+        let job = due_after(&path, || {
+            std::fs::rename(&path, &moved).unwrap();
+            std::os::unix::fs::symlink(&moved, &path).unwrap();
+        })
+        .await;
+        assert!(matches!(job.run(), DeleteAttempt::Kept(Kept::Symlink)));
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    /// A FIFO at the path is never opened: an open waits for a writer and
+    /// would hold a thread for as long as none comes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_delete_finding_a_fifo_never_opens_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let job = due_after(&path, || {
+            std::fs::remove_file(&path).unwrap();
+            let made = std::process::Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(made.success());
+        })
+        .await;
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(job.run());
+        });
+        match result.recv_timeout(Duration::from_secs(10)) {
+            Ok(attempt) => assert!(
+                matches!(attempt, DeleteAttempt::Kept(Kept::OtherFile { .. })),
+                "kept as another file"
+            ),
+            Err(_) => {
+                // Let the open that is waiting go, so the run can end.
+                let _ = std::fs::OpenOptions::new().write(true).open(&path);
+                panic!("the delete opened a FIFO and waited for a writer");
+            }
+        }
+    }
+
+    /// A path that cannot be examined for a reason other than being gone is
+    /// a failure to try again; a path that is gone is not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_delete_that_cannot_examine_the_path_fails_and_one_that_finds_nothing_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let path = sub.join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        // A file where the directory was: the path cannot be looked up.
+        let job = due_after(&path, || {
+            std::fs::remove_dir_all(&sub).unwrap();
+            std::fs::write(&sub, "not a directory").unwrap();
+        })
+        .await;
+        match job.run() {
+            DeleteAttempt::Failed { what, .. } => {
+                assert!(what.contains("could not be examined"), "{what}")
+            }
+            other => panic!("expected a failure to retry, got {}", describe(&other)),
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let job = due_after(&path, || std::fs::remove_file(&path).unwrap()).await;
+        assert!(matches!(job.run(), DeleteAttempt::Kept(Kept::Gone)));
+    }
+
+    #[cfg(unix)]
+    fn describe(attempt: &DeleteAttempt) -> &'static str {
+        match attempt {
+            DeleteAttempt::Deleted { .. } => "deleted",
+            DeleteAttempt::Kept(_) => "kept",
+            DeleteAttempt::Open { .. } => "open",
+            DeleteAttempt::Refused(_) => "refused",
+            DeleteAttempt::Stuck(_) => "stuck",
+            DeleteAttempt::Failed { .. } => "failed",
+        }
+    }
+
+    /// A file a process holds open is kept every pass, and said so once at
+    /// info and then at debug: a pass a minute for a writer that never closes
+    /// is not a line a minute.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_file_held_open_is_said_so_once_and_then_quietly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let mut writer = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writer.write_all(b"one\ntwo\n").unwrap();
+        let (events, _guard) = Events::capture();
+        let mut fs = committed_with_writer(&path).await;
+        for _ in 0..2 {
+            pass_after(&mut fs, &path, Duration::ZERO).await;
+        }
+        writer.write_all(b"three\n").unwrap();
+        let open = "it is open elsewhere";
+        assert_eq!(
+            events.levels(open),
+            [
+                tracing::Level::INFO,
+                tracing::Level::DEBUG,
+                tracing::Level::DEBUG
+            ],
+            "the commit's own attempt, then two passes"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn committed_with_writer(path: &str) -> FileSource {
+        let mut fs = FileSource::new(vec![path.to_owned()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO);
+        let read = fs
+            .read_batch_candidates(&src(path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        fs
+    }
+
+    // ---- moving a file aside ------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rename_that_may_not_replace_refuses_a_name_that_is_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let (from, to) = (dir.path().join("from"), dir.path().join("to"));
+        std::fs::write(&from, "from").unwrap();
+        std::fs::write(&to, "to").unwrap();
+        for rename in [rename_noreplace, rename_unless_exists] {
+            let error = rename(&from, &to).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+            assert_eq!(std::fs::read_to_string(&to).unwrap(), "to");
+            assert_eq!(std::fs::read_to_string(&from).unwrap(), "from");
+        }
+        std::fs::remove_file(&to).unwrap();
+        rename_unless_exists(&from, &to).unwrap();
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "from");
+        assert!(!from.exists());
+        std::fs::rename(&to, &from).unwrap();
+        rename_noreplace(&from, &to).unwrap();
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "from");
+        assert!(!from.exists());
+    }
+
+    /// Only the errors that mean "this filesystem has no no-replace rename"
+    /// fall back to the check-then-rename; a rename that failed for its own
+    /// reason is that reason.
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn only_a_missing_noreplace_falls_back_to_a_check_then_rename() {
+        use rustix::io::Errno;
+        for lacking in [Errno::INVAL, Errno::NOSYS, Errno::NOTSUP] {
+            assert!(lacks_noreplace(lacking), "{lacking:?}");
+        }
+        for failed in [
+            Errno::NOENT,
+            Errno::EXIST,
+            Errno::ACCESS,
+            Errno::XDEV,
+            Errno::PERM,
+        ] {
+            assert!(!lacks_noreplace(failed), "{failed:?}");
+        }
+        let missing = rename_noreplace(Path::new("/no/such/file"), Path::new("/no/such/to"));
+        assert_eq!(missing.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+    }
+
+    // ---- replaying, and where a replay stands -------------------------------
+
+    fn marker_sized(
+        path: &str,
+        start: u64,
+        end: u64,
+        file_size: u64,
+        inode: Option<u64>,
+    ) -> ProgressMarker {
+        ProgressMarker::File {
+            path: path.to_owned(),
+            inode,
+            start_byte: start,
+            end_byte: end,
+            file_size,
+            mtime: String::new(),
+            ctime: None,
+            content_fingerprint: None,
+            tail_fingerprint: None,
+        }
+    }
+
+    fn marker_at(path: &str, start: u64, end: u64, inode: Option<u64>) -> ProgressMarker {
+        marker_sized(path, start, end, end, inode)
+    }
+
+    /// A range that starts past the end of the file is refused; one that
+    /// starts exactly at its end is a range of nothing, and is not.
+    #[tokio::test]
+    async fn a_range_is_replayed_from_the_end_of_the_file_but_not_from_beyond_it() {
+        let f = write_log(&["one"]); // 4 bytes
+        let path = f.path().to_string_lossy().into_owned();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        // The range's own length is no longer than the file: only its start
+        // is under test.
+        let beyond = marker_sized(&path, 5, 5, 0, None);
+        let error = fs.replay_from_marker(&beyond).await.unwrap_err();
+        assert!(error.to_string().contains("truncated"), "{error}");
+        let at_end = marker_sized(&path, 4, 4, 0, None);
+        fs.replay_from_marker(&at_end).await.unwrap();
+        assert_eq!(fs.cursors[&path].read_byte, 4);
+    }
+
+    /// Where a rotated file's re-read stands answers only for a marker of
+    /// that file at that path.
+    #[cfg(unix)]
+    #[test]
+    fn a_re_read_position_is_answered_only_for_the_path_and_inode_it_belongs_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fs = FileSource::new(vec![], TelemetryFormat::Raw, false);
+        let mut push = |path: &str, name: &str, inode: Option<u64>, read_byte: u64| {
+            let mut held = held_on(dir.path(), name, 8, 0);
+            if let Some(inode) = inode {
+                held.inode = inode;
+            }
+            fs.rotated.push(RotatedFile {
+                path: path.to_owned(),
+                held,
+                replay: Some(Replay {
+                    read_byte,
+                    drained: false,
+                }),
+            });
+        };
+        // The inode asked for, under another path; another inode, under the
+        // path asked for.
+        push("/other", "elsewhere", Some(1001), 7);
+        push("/a", "earlier", Some(1002), 5);
+        push("/a", "right", None, 3);
+        let right = fs.rotated[2].held.inode;
+        assert_eq!(
+            fs.read_position(&marker_at("/a", 0, 8, Some(1001))),
+            None,
+            "/other is another path"
+        );
+        assert_eq!(
+            fs.read_position(&marker_at("/a", 0, 8, Some(right))),
+            Some(3)
+        );
+    }
+
+    /// A rewind's record of the file it rewound is valid only while the read
+    /// head is where the rewind put it: a later read supersedes it.
+    #[tokio::test]
+    async fn a_stale_rewind_record_does_not_decide_which_file_the_cursor_is_in() {
+        let mut fs = FileSource::new(vec![], TelemetryFormat::Raw, false);
+        fs.cursors.insert(
+            "/a".to_owned(),
+            FileCursor {
+                read_byte: 9,
+                rewound_for: Some((41, 5)),
+                seen: Some(FileIdentity {
+                    inode: Some(42),
+                    file_size: 9,
+                    mtime: String::new(),
+                    ctime: None,
+                    content: None,
+                    tail: None,
+                }),
+                ..FileCursor::default()
+            },
+        );
+        assert_eq!(
+            fs.read_position(&marker_at("/a", 0, 9, Some(42))),
+            Some(9),
+            "the cursor read the file since: it is the file it saw"
+        );
+        assert_eq!(
+            fs.read_position(&marker_at("/a", 0, 9, Some(41))),
+            None,
+            "the rewind of file 41 is over"
+        );
+        // While the head is where the rewind left it, the rewound file counts.
+        fs.cursors.get_mut("/a").unwrap().read_byte = 5;
+        assert_eq!(fs.read_position(&marker_at("/a", 0, 5, Some(41))), Some(5));
+    }
+
+    /// Which replays are bound to the end of the window that failed: a range
+    /// of the same path with something in it.
+    #[test]
+    fn only_a_range_with_bytes_in_one_path_is_bound_and_the_bounds_are_limited() {
+        let mut fs = FileSource::new(vec![], TelemetryFormat::Raw, false);
+        let range = |start: ProgressMarker, end: ProgressMarker| ReplayRange { start, end };
+        let ranges = [
+            range(marker_at("/a", 4, 4, None), marker_at("/a", 4, 4, None)),
+            range(marker_at("/a", 6, 6, None), marker_at("/a", 6, 4, None)),
+            range(marker_at("/a", 0, 0, None), marker_at("/b", 0, 9, None)),
+            range(marker_at("/a", 0, 0, None), marker_at("/a", 0, 9, None)),
+        ];
+        assert_eq!(fs.bound_replays(&ranges), [false, false, false, true]);
+
+        let many: Vec<ReplayRange> = (1..=MAX_CUTS_PER_PATH as u64 + 5)
+            .map(|end| range(marker_at("/c", 0, 0, None), marker_at("/c", 0, end, None)))
+            .collect();
+        assert!(fs.bound_replays(&many).iter().all(|bound| *bound));
+        assert_eq!(
+            fs.cuts["/c"].len(),
+            MAX_CUTS_PER_PATH,
+            "the oldest are dropped"
+        );
+        assert!(!fs.cuts["/c"].contains_key(&1));
+        assert!(fs.cuts["/c"].contains_key(&(MAX_CUTS_PER_PATH as u64 + 5)));
+    }
+
+    /// Reading an earlier window again does not lower how far the held
+    /// descriptor's file has been read: ranges handed out beyond it are still
+    /// outstanding.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn re_reading_an_earlier_window_keeps_the_furthest_read_end_of_the_held_file() {
+        let f = write_log(&["l1", "l2", "l3"]);
+        let path = f.path().to_string_lossy().into_owned();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let mut windows = Vec::new();
+        for _ in 0..2 {
+            let read = fs
+                .read_batch_candidates(&src(&path), 1, 1 << 20, Duration::ZERO)
+                .await
+                .unwrap();
+            windows.push(read[0].clone());
+        }
+        assert_eq!(fs.held[&path].read_end, 6);
+        fs.replay_from_marker(&windows[0].progress_start)
+            .await
+            .unwrap();
+        let again = fs
+            .read_batch_candidates(&src(&path), 1, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(lines(&again), ["l1"]);
+        assert_eq!(fs.held[&path].read_end, 6, "the second window is still out");
+    }
+
+    /// A restart arms the delete with the page below the committed end the
+    /// seed carried, so the delete checks it too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_armed_delete_carries_the_tail_the_seed_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let row = archived_row(&path).await;
+        assert!(row.tail.is_some());
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true);
+        fs.seed_committed_from(
+            &path,
+            row.end,
+            row.inode,
+            Some(row.size),
+            row.content.clone(),
+            row.tail.clone(),
+        );
+        fs.arm_delete_from_seed(&path, Some(&row.mtime), row.ctime.as_deref());
+        let candidate = fs.cursors[&path].delete_candidate.as_ref().unwrap();
+        assert_eq!(candidate.tail, row.tail);
+        assert_eq!(candidate.end_byte, row.end);
+        assert_eq!(candidate.content, row.content);
+    }
+
+    /// A path whose file cannot be opened - for a reason other than being
+    /// gone - is a failure to try again, not a file that is gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_delete_that_cannot_open_the_file_fails_and_does_not_call_it_gone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let job = due_after(&path, || {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        })
+        .await;
+        if std::fs::File::open(&path).is_ok() {
+            // The superuser opens anything: there is no such failure to see.
+            return;
+        }
+        match job.run() {
+            DeleteAttempt::Failed { what, .. } => {
+                assert!(what.contains("could not be opened"), "{what}")
+            }
+            other => panic!("expected a failure to retry, got {}", describe(&other)),
         }
     }
 }
