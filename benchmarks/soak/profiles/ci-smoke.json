@@ -14,13 +14,14 @@
   "fault_interval_s": 75,
   "first_fault_after_s": 60,
   "quiet_tail_s": 90,
-  "fault_cycle": ["kill9", "broker_restart", "partition", "store_outage", "clock_step"],
+  "fault_cycle": ["kill9", "broker_restart", "partition", "store_outage", "clock_step", "enospc"],
   "fault_hold_s": {
     "kill9": 0,
     "broker_restart": 0,
     "partition": 20,
     "store_outage": 25,
-    "clock_step": 25
+    "clock_step": 25,
+    "enospc": 25
   },
   "clock_step_seconds": [3600, -3600],
   "recovery_timeout_s": 180,

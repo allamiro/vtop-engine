@@ -15,7 +15,8 @@ Inputs, in a run directory:
                  counters, summed over their labels) and, when taken, lag
                  (the topic's end offset and the group's committed offset).
   events.jsonl   run_start, engine_start, engine_exit, fault_start,
-                 fault_end, recovered, prune, audit, scrub, run_end.
+                 fault_end, fault_probe, recovered, prune, audit, scrub,
+                 run_end.
   finals.json    the checks after the load stopped and the engine drained:
                  audit_coverage, scrub, tail.
 
@@ -442,13 +443,10 @@ def check_unplanned_exits(events: list[dict]) -> Criterion:
     )
 
 
-def check_commit_rule(samples: list[dict]) -> Criterion:
-    """The core invariant, as the engine's counters show it: it never commits
-    past what it verified (`vtop_commits_total` <= `vtop_verified_total`), and
-    no verification ever failed. A scrape reads the two counters a moment
-    apart, so a single sample with one more commit than verifications could be
-    that moment; a breach counts when two samples in a row in the same engine
-    lifetime show it, since a real one does not heal."""
+def _commit_rule_breaches(samples: list[dict]) -> tuple[list[str], float, int]:
+    """The commit rule over `samples`: the breaches (two samples in a row in
+    one engine lifetime with more commits than verifications), the
+    verification failures counted, and how many samples carried the counters."""
     breaches: list[str] = []
     previous_bad: dict | None = None
     failures = []
@@ -470,8 +468,18 @@ def check_commit_rule(samples: list[dict]) -> Criterion:
             previous_bad = sample
         else:
             previous_bad = None
-    failed = counter_increase(failures)
     seen = sum(1 for s in samples if (s.get("metrics") or {}).get(M_COMMITS) is not None)
+    return breaches, counter_increase(failures), seen
+
+
+def check_commit_rule(samples: list[dict]) -> Criterion:
+    """The core invariant, as the engine's counters show it: it never commits
+    past what it verified (`vtop_commits_total` <= `vtop_verified_total`), and
+    no verification ever failed. A scrape reads the two counters a moment
+    apart, so a single sample with one more commit than verifications could be
+    that moment; a breach counts when two samples in a row in the same engine
+    lifetime show it, since a real one does not heal."""
+    breaches, failed, seen = _commit_rule_breaches(samples)
     problems = breaches[:3]
     if failed:
         problems.append(f"{failed:.0f} verification failure(s)")
@@ -484,6 +492,75 @@ def check_commit_rule(samples: list[dict]) -> Criterion:
         f"{len(breaches)} breach(es), {failed:.0f} verification failure(s), over {seen} scraped samples",
         "0 breaches, 0 failures, counters scraped",
         "; ".join(problems),
+    )
+
+
+# The fewest samples with the engine's counters a disk-full window must hold
+# for its commit-rule check to count: one breach is two such samples in a row.
+ENOSPC_MIN_COUNTER_SAMPLES = 2
+
+
+def check_enospc(profile: dict, samples: list[dict], events: list[dict]) -> Criterion | None:
+    """The disk-full fault, judged on what it did to the engine. The injector
+    proves its own side (a write failed with ENOSPC, then worked again) and
+    records it in a `fault_probe` event; this reads that record back, and
+    reads the engine's side from the run's own evidence: its log showed the
+    condition, nothing was committed beyond what was verified while the disk
+    was full or until the engine had recovered (judged only on a window whose
+    samples carried the counters), and the audit after the fault found no hole. None when the plan has no such
+    fault, so a profile without one is not asked for it."""
+    plan = [f for f in soak_profile.build_plan(profile) if f.kind == "enospc"]
+    if not plan:
+        return None
+    probes = {e["id"]: e for e in events if e.get("kind") == "fault_probe" and e.get("fault") == "enospc"}
+    started = {e["id"]: e for e in events if e.get("kind") == "fault_start"}
+    recovered = {e["id"]: e for e in events if e.get("kind") == "recovered"}
+    audits = {e.get("trigger"): e for e in events if e.get("kind") == "audit"}
+    problems: list[str] = []
+    clean = 0
+    for fault in plan:
+        probe, start, rec = probes.get(fault.id), started.get(fault.id), recovered.get(fault.id)
+        if start is None or rec is None:
+            problems.append(f"#{fault.id}: no fault_start and recovered pair to judge")
+            continue
+        if probe is None:
+            problems.append(f"#{fault.id}: no record that a write failed with ENOSPC and the engine felt it")
+            continue
+        found = []
+        if not probe.get("write_failed_enospc"):
+            found.append("no write failed with ENOSPC")
+        if not (isinstance(probe.get("engine_enospc_lines"), int) and probe["engine_enospc_lines"] >= 1):
+            found.append("the engine logged no disk-full condition")
+        if not probe.get("writes_resumed"):
+            found.append("writes did not resume once space was freed")
+        window = [s for s in samples if start["elapsed_s"] <= s["elapsed_s"] <= rec["elapsed_s"]]
+        # Verification failures are the commit_rule's alone. A breach needs two
+        # samples in a row, so a window with fewer than two that carried the
+        # counters (a failed scrape all through the fault) shows nothing, and
+        # silence is no evidence the engine committed only what it verified.
+        breaches, _, counted = _commit_rule_breaches(window)
+        if counted < ENOSPC_MIN_COUNTER_SAMPLES:
+            found.append(
+                f"{counted} sample(s) in the fault window carried the engine's counters, "
+                f"{ENOSPC_MIN_COUNTER_SAMPLES} needed to judge the commit rule"
+            )
+        if breaches:
+            found.append(breaches[0])
+        audit = audits.get(f"fault:{fault.id}")
+        if audit is None or not audit.get("ok"):
+            found.append("the audit after the fault found a hole or did not run")
+        if found:
+            problems.append(f"#{fault.id}: " + ", ".join(found))
+        else:
+            clean += 1
+    return Criterion(
+        "enospc_recovered",
+        "every disk-full fault was felt by the engine, which committed nothing unverified and left no hole",
+        not problems,
+        f"{clean} of {len(plan)} disk-full faults clean",
+        "each: a write failed with ENOSPC, the engine logged it, writes resumed, no commit beyond a verification, "
+        "no hole in the audit after it",
+        "; ".join(problems[:5]) + (f"; and {len(problems) - 5} more" if len(problems) > 5 else ""),
     )
 
 
@@ -692,10 +769,12 @@ def evaluate(profile: dict, samples: list[dict], events: list[dict], finals: dic
     """The verdict: every criterion, and whether all of them passed."""
     samples = sorted(samples, key=lambda s: s["elapsed_s"])
     events = sorted(events, key=lambda e: e["elapsed_s"])
+    enospc = check_enospc(profile, samples, events)
     criteria: list[Criterion] = [
         check_run_completed(profile, samples, events),
         check_samples(profile, samples),
         *check_faults(profile, events),
+        *([enospc] if enospc else []),
         check_unplanned_exits(events),
         check_commit_rule(samples),
         *check_trends(profile, samples, events),
