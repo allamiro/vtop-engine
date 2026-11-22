@@ -380,3 +380,14 @@ def test_tuned_results_are_drawn_but_never_ranked(tmp_path):
     scores = creport.scoreboard(rows, KIND, ranked, systems, profiles, link_report.group_label)
     assert scores and not any("best of grid" in score.group for score in scores)
     assert "if m.ranked" in inspect.getsource(creport.build)  # the page's scoreboard takes ranked metrics only
+
+
+def test_the_runner_and_the_loader_apply_one_hosted_rule():
+    # Review of #907: a CPU share of 0.6 is "link" by the bottleneck rule but over the hosted limit.
+    assert link.bottleneck("wan100-policed", 0.6) == "link"
+    reason = link.hosted_refusal("link", 0.6)
+    assert reason and "at most 0.5" in reason
+    assert link.hosted_refusal("link", 0.4) is None and link.hosted_refusal("cpu", 0.1)
+    assert link.hosted_refusal("link", None)
+    source = inspect.getsource(link_run.execute)
+    assert "hosted_refusal" in source

@@ -403,9 +403,10 @@ def execute(lab_: Lab, env: dict[str, Any], item: plans.Planned, counter: list[i
             out["cpu_seconds_per_gib"] = f"{cpu / (judged.payload_bytes / 2**30):.2f}"
     else:
         out["bottleneck"] = "unknown"
-    if hosted and item.cell == "committed" and out.get("bottleneck") != "link":
-        out.update({"status": "refused", "note": f"a hosted row needs the link as its bottleneck; recorded "
-                                                 f"{out.get('bottleneck')!r} (cpu_share {out.get('cpu_share')!r})"})
+    if hosted and item.cell == "committed":
+        reason = link.hosted_refusal(out.get("bottleneck"), float(out["cpu_share"]) if out.get("cpu_share") else None)
+        if reason:
+            out.update({"status": "refused", "note": reason})
     if "status" not in out:
         status, note = link.run_status(item.cell, tool.code, out, judged.objects_committed, judged.files_expected,
                                        tool.output)

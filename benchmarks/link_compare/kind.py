@@ -316,6 +316,16 @@ def window_mbps(samples: Sequence[tuple[float, dict[str, int]]], flow: str, star
     return delta * 8 / 1e6 / (inside[-1][0] - inside[0][0])
 
 
+def hosted_refusal(bottleneck_: str | None, cpu_share: float | None) -> str | None:
+    """Why a hosted `committed` row cannot count, or None: the recorded bottleneck must be the link AND the
+    tool's CPU share at most HOSTED_CPU_SHARE_LIMIT (#747 test 8). One rule for the runner, which records a
+    `refused` row, and for the loader, which refuses an ok row that breaks it (review of #907)."""
+    if bottleneck_ != "link" or cpu_share is None or cpu_share > HOSTED_CPU_SHARE_LIMIT:
+        return (f"a hosted row is accepted only where the recorded bottleneck is the link and the tool's CPU "
+                f"share is at most {HOSTED_CPU_SHARE_LIMIT} (bottleneck {bottleneck_!r}, cpu_share {cpu_share!r})")
+    return None
+
+
 def run_status(cell: str, exit_code: Any, out: dict[str, Any], committed: int, expected: int,
                tool_output: str = "") -> tuple[str, str]:
     """(status, note) of one tool run (#744 rule 18: a failure is recorded as measured, never retried).
@@ -376,11 +386,9 @@ def check_row(row: dict[str, str]) -> list[str]:
     if cell in ("tuned-grid", "tuned") and not missing and not 1 <= int(float(row["grid_size"])) <= MAX_GRID:
         problems.append(f"grid_size {row['grid_size']} is not between 1 and {MAX_GRID}")
     if row["host_class"] == "hosted" and cell == "committed":
-        share = _num(row, "cpu_share")
-        if row.get("bottleneck") != "link" or share is None or share > HOSTED_CPU_SHARE_LIMIT:
-            problems.append(f"a hosted row is accepted only where the recorded bottleneck is the link and the "
-                            f"tool's CPU share is at most {HOSTED_CPU_SHARE_LIMIT} (bottleneck "
-                            f"{row.get('bottleneck')!r}, cpu_share {row.get('cpu_share')!r})")
+        reason = hosted_refusal(row.get("bottleneck"), _num(row, "cpu_share"))
+        if reason:
+            problems.append(reason)
         if row.get("cpu_seconds_per_gib", "") != "":
             problems.append("CPU-seconds from a hosted runner are never recorded")
     return problems
