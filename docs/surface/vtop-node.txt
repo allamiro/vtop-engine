@@ -33,6 +33,7 @@ vtop-node verify --batch value=<BATCH> default=512
 vtop-node verify --client-config value=<CLIENT_CONFIG> required
 vtop-node verify --dump value=<DUMP>
 vtop-node verify --expect-at-least value=<EXPECT_AT_LEAST> default=0
+vtop-node verify --from-offset value=<FROM_OFFSET> default=0
 vtop-node verify --max-offset-gaps value=<MAX_OFFSET_GAPS> default=0
 vtop-node verify --value-bytes value=<VALUE_BYTES> default=128
 vtop-node verify --verify-content-through value=<VERIFY_CONTENT_THROUGH> default=18446744073709551615
