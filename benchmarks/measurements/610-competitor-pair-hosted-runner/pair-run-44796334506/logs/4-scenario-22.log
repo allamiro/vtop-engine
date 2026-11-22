@@ -1,0 +1,13 @@
+[bench] runner_mode=container: the engine runs inside the compose stack (profile `containerized` must be up)
+[bench] emulator calibration: 9.573 Mbit/s through the shaped path (configured 10.0 Mbit/s)
+[bench] scenario=competing-flow-bulk-uncapped run_id=competing-flow-bulk-uncapped-20261120T192723Z-g2znby
+[bench] results -> /home/runner/work/_temp/pair/results/competing-flow-bulk-uncapped-20261120T192723Z-g2znby
+[bench] netem on vtop-bench-netem: 100 ms round trip ±0 ms, 0.0% loss (random), 10000 kbit/s bottleneck at 1.0x BDP
+[bench] competitor alone before: 9.562 Mbit/s over 120.189s on the empty link
+[bench] seeded 250 files (7510785 bytes) format=jsonl size=small
+[bench] competitor beside VTOP: bulk for 120s (+3s ramp)
+[bench] competitor alone after: 9.564 Mbit/s over 120.159s on the empty link
+[bench] competitor with VTOP: 6.816 Mbit/s vs 9.563 Mbit/s alone (71% of it); over the 3 engine cycle(s) inside it (86.798s) VTOP 2.242 Mbit/s against the flow's 6.746; Jain 0.7993
+[bench] netem removed from vtop-bench-netem
+[bench] done: 3250 ok, 0 failed, 0 replayed in 303.661s
+[bench] summary: /home/runner/work/_temp/pair/results/competing-flow-bulk-uncapped-20261120T192723Z-g2znby/summary.md

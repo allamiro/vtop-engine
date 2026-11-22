@@ -85,6 +85,7 @@ pub(crate) fn announce(config: &VtopConfig, streams: &StreamsConfig) {
                 .inc_by(0);
         }
     }
+    announce_encryption(config);
     if let Some(mx) = telemetry::metrics() {
         let size_only = !config.upload.require_strong_verification;
         let tenant = config.engine.tenant.as_str();
@@ -94,6 +95,87 @@ pub(crate) fn announce(config: &VtopConfig, streams: &StreamsConfig) {
         mx.verification_mode
             .with_label_values(&[tenant, "strong"])
             .set(i64::from(!size_only));
+    }
+}
+
+/// What the startup summary says about `upload.server_side_encryption`, and
+/// the level to say it at: INFO for a settled mode, WARN where the engine
+/// cannot confirm what it asked for (a KMS alias, which a store never reports
+/// back).
+pub(crate) fn encryption_notice(config: &VtopConfig) -> (bool, String) {
+    use vtop_core::config::ServerSideEncryptionMode as Mode;
+    let sse = &config.upload.server_side_encryption;
+    match sse.mode {
+        Mode::None => (
+            false,
+            "upload.server_side_encryption.mode = \"none\": the engine asks for no server-side \
+             encryption and checks none; objects are encrypted only if the bucket's default \
+             encryption says so"
+                .to_owned(),
+        ),
+        Mode::SseS3 => (
+            false,
+            "upload.server_side_encryption.mode = \"sse-s3\": every object, manifest and \
+             receipt is written with x-amz-server-side-encryption: AES256, and a batch whose \
+             stored object is not reported as AES256 fails verification and is replayed"
+                .to_owned(),
+        ),
+        Mode::SseKms => {
+            let bucket_key = if sse.bucket_key {
+                ", with an S3 Bucket Key"
+            } else {
+                ""
+            };
+            match sse.kms_key_id.as_deref() {
+                None => (
+                    false,
+                    format!(
+                        "upload.server_side_encryption.mode = \"sse-kms\" with no kms_key_id{bucket_key}: \
+                         every write asks for aws:kms and names no key, so the store uses its \
+                         default KMS key (on AWS, the account's AWS-managed aws/s3 key); a batch \
+                         whose stored object is not reported as aws:kms fails verification and is \
+                         replayed. Which key the store used is not checked"
+                    ),
+                ),
+                Some(key) if vtop_upload::encryption::is_kms_alias(key) => (
+                    true,
+                    format!(
+                        "upload.server_side_encryption.kms_key_id is an alias ({key}){bucket_key}: \
+                         every write asks for aws:kms under it and a batch whose stored object is \
+                         not reported as aws:kms fails verification, but a store reports the \
+                         key's ARN and never the alias, so which key it used is not confirmed. \
+                         Name the key by id or ARN to have the key checked as well"
+                    ),
+                ),
+                Some(key) => (
+                    false,
+                    format!(
+                        "upload.server_side_encryption.mode = \"sse-kms\", kms_key_id = {key}{bucket_key}: \
+                         every write asks for aws:kms under that key, and a batch whose stored \
+                         object is not reported as aws:kms under it fails verification and is \
+                         replayed"
+                    ),
+                ),
+            }
+        }
+    }
+}
+
+/// Logs [`encryption_notice`] and sets `vtop_server_side_encryption_mode`.
+fn announce_encryption(config: &VtopConfig) {
+    let mode = config.upload.server_side_encryption.mode;
+    let (warn, notice) = encryption_notice(config);
+    if warn {
+        tracing::warn!(server_side_encryption = mode.as_str(), "{notice}");
+    } else {
+        tracing::info!(server_side_encryption = mode.as_str(), "{notice}");
+    }
+    if let Some(mx) = telemetry::metrics() {
+        for m in telemetry::SERVER_SIDE_ENCRYPTION_MODES {
+            mx.server_side_encryption_mode
+                .with_label_values(&[config.engine.tenant.as_str(), m])
+                .set(i64::from(m == mode.as_str()));
+        }
     }
 }
 
@@ -380,6 +462,71 @@ mod tests {
             "manifest:\n  write_version: \"0.4\"\n  mac:\n    active: q4\n    keys:\n      \
              - {id: q3, env: K3, legacy: true}\n      - {id: q4, file: /k4}\n    retired: [q1]\n",
         )
+    }
+
+    fn sse_config(block: &str) -> VtopConfig {
+        VtopConfig::from_yaml_str(&format!(
+            "engine: {{name: t, state_store: 'sqlite::memory:', work_dir: /unused}}\n\
+             batching: {{}}\ncompression: {{}}\nsources: {{}}\n\
+             upload:\n  bucket: b\n  server_side_encryption: {block}\n"
+        ))
+        .unwrap()
+    }
+
+    /// The startup summary names the mode, says what a mismatch does, and is
+    /// a WARN only where the engine cannot confirm the key.
+    #[test]
+    fn the_startup_summary_says_what_encryption_was_asked_for_and_checked() {
+        let say = |block: &str| encryption_notice(&sse_config(block));
+        let (warn, text) = say("{mode: none}");
+        assert!(
+            !warn && text.contains("no server-side encryption"),
+            "{text}"
+        );
+        let (warn, text) = say("{mode: sse-s3}");
+        assert!(
+            !warn && text.contains("AES256") && text.contains("replayed"),
+            "{text}"
+        );
+        let (warn, text) = say("{mode: sse-kms}");
+        assert!(
+            !warn && text.contains("no kms_key_id") && text.contains("aws/s3"),
+            "{text}"
+        );
+        let (warn, text) = say("{mode: sse-kms, kms_key_id: 'key-1', bucket_key: true}");
+        assert!(
+            !warn && text.contains("key-1") && text.contains("Bucket Key"),
+            "{text}"
+        );
+        let (warn, text) = say("{mode: sse-kms, kms_key_id: 'alias/vtop'}");
+        assert!(
+            warn && text.contains("alias") && text.contains("not confirmed"),
+            "{text}"
+        );
+    }
+
+    /// The gauge reads 1 for the configured mode and 0 for the others.
+    #[test]
+    fn startup_sets_the_encryption_mode_gauge() {
+        let m = vtop_core::telemetry::init().expect("metrics registry");
+        let mut cfg = sse_config("{mode: sse-kms}");
+        cfg.engine.tenant = "tenant-sse-gauge".into();
+        announce_encryption(&cfg);
+        let scrape = m.encode().unwrap();
+        let value = |mode: &str| {
+            scrape
+                .lines()
+                .filter(|l| l.starts_with("vtop_server_side_encryption_mode{"))
+                .filter(|l| l.contains("tenant=\"tenant-sse-gauge\""))
+                .find(|l| l.contains(&format!("mode=\"{mode}\"")))
+                .and_then(|l| l.rsplit(' ').next())
+                .and_then(|v| v.parse::<i64>().ok())
+        };
+        assert_eq!(
+            (value("none"), value("sse-s3"), value("sse-kms")),
+            (Some(0), Some(0), Some(1)),
+            "{scrape}"
+        );
     }
 
     /// #685, review of #703: recovery's message for a key it cannot use says

@@ -17,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.10.2"
+version = "0.10.3"
 edition = "2021"
 # MSRV: the floor is now set by aws-smithy-types 1.6.3, which declares
 # rust-version 1.94.1 (it raised the 1.94.0 floor sqlx 0.9 set, which had
@@ -135,17 +135,17 @@ quote = { version = "1", default-features = false }
 # path locally, and the version is what a published crate would resolve. Without
 # it these are wildcard dependencies, which crates.io rejects outright - so the
 # workspace could not actually be published as declared.
-vtop-core = { path = "crates/vtop-core", version = "0.10.2" }
-vtop-log = { path = "crates/vtop-log", version = "0.10.2" }
-vtop-protocol = { path = "crates/vtop-protocol", version = "0.10.2" }
-vtop-broker = { path = "crates/vtop-broker", version = "0.10.2" }
-vtop-meta = { path = "crates/vtop-meta", version = "0.10.2" }
-vtop-observe = { path = "crates/vtop-observe", version = "0.10.2" }
-vtop-surface = { path = "crates/vtop-surface", version = "0.10.2" }
-vtop-kafka = { path = "crates/vtop-kafka", version = "0.10.2" }
-vtop-adapters = { path = "crates/vtop-adapters", version = "0.10.2", default-features = false }
-vtop-upload = { path = "crates/vtop-upload", version = "0.10.2" }
-vtop-state = { path = "crates/vtop-state", version = "0.10.2" }
+vtop-core = { path = "crates/vtop-core", version = "0.10.3" }
+vtop-log = { path = "crates/vtop-log", version = "0.10.3" }
+vtop-protocol = { path = "crates/vtop-protocol", version = "0.10.3" }
+vtop-broker = { path = "crates/vtop-broker", version = "0.10.3" }
+vtop-meta = { path = "crates/vtop-meta", version = "0.10.3" }
+vtop-observe = { path = "crates/vtop-observe", version = "0.10.3" }
+vtop-surface = { path = "crates/vtop-surface", version = "0.10.3" }
+vtop-kafka = { path = "crates/vtop-kafka", version = "0.10.3" }
+vtop-adapters = { path = "crates/vtop-adapters", version = "0.10.3", default-features = false }
+vtop-upload = { path = "crates/vtop-upload", version = "0.10.3" }
+vtop-state = { path = "crates/vtop-state", version = "0.10.3" }
 
 [profile.release]
 opt-level = 3
