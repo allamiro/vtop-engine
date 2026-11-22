@@ -27,7 +27,7 @@ def test_the_72h_profile_states_the_issues_load_and_cadence():
     assert p["rate_records_per_s"] == 1000
     assert p["record_bytes"] == 700
     assert p["fault_interval_s"] == 30 * 60
-    assert set(p["fault_cycle"]) == {"kill9", "broker_restart", "partition", "store_outage", "clock_step"}
+    assert set(p["fault_cycle"]) == {"kill9", "broker_restart", "partition", "store_outage", "clock_step", "enospc"}
     assert p["criteria"]["trend_window_fraction"] == 0.8
 
 
@@ -41,6 +41,39 @@ def test_the_72h_plan_is_a_fault_every_thirty_minutes_with_a_quiet_tail():
     assert {f.kind for f in plan} == set(p["fault_cycle"])
     # every kind is injected many times, not once
     assert min(sum(1 for f in plan if f.kind == k) for k in p["fault_cycle"]) >= 20
+
+
+def test_the_72h_plan_has_142_faults_split_over_six_kinds():
+    # A fault every 30 minutes from minute 30 to the last hour's start fixes the
+    # count at 142; six kinds in turn put 24 of the first four and 23 of the last two.
+    plan = soak_profile.build_plan(soak_profile.load("72h"))
+    assert len(plan) == 142
+    counts = {k: sum(1 for f in plan if f.kind == k) for k in soak_profile.FAULT_KINDS}
+    assert counts == {
+        "kill9": 24,
+        "broker_restart": 24,
+        "partition": 24,
+        "store_outage": 24,
+        "clock_step": 23,
+        "enospc": 23,
+    }
+
+
+def test_both_profiles_hold_a_full_disk_long_enough_for_the_engine_to_meet_it():
+    for name in ("72h", "ci-smoke"):
+        p = soak_profile.load(name)
+        assert "enospc" in p["fault_cycle"] and p["fault_hold_s"]["enospc"] >= 1
+
+
+def test_the_smoke_plan_injects_a_full_disk(smoke):
+    assert "enospc" in {f.kind for f in soak_profile.build_plan(smoke)}
+
+
+def test_a_full_disk_with_no_hold_is_refused(smoke):
+    broken = copy.deepcopy(smoke)
+    broken["fault_hold_s"]["enospc"] = 0
+    with pytest.raises(soak_profile.ProfileError, match="enospc must be at least 1"):
+        soak_profile.validate(broken)
 
 
 def test_the_smoke_plan_reaches_every_kind_and_the_clock_both_ways(smoke):
