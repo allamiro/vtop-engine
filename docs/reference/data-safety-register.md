@@ -32,8 +32,10 @@ does not add it, because a suspected report is not yet a classified bug.
 
 ## Quiet period
 
-The quiet period is the number of days since the most recent `data-safety`
-issue was opened:
+The quiet period is the number of days since the most recent data-safety bug
+was found: the most recent `data-safety` issue's opening date, or the latest
+*Found* date in the [pull-request table](#found-and-fixed-in-a-pull-request),
+whichever is later:
 
 ```bash
 scripts/check-data-safety-register.py --quiet-days
@@ -60,6 +62,12 @@ When an issue is labelled `data-safety`, add a row in issue-number order:
 - **Fixed**: the PR, the first release that carries it and the merge date;
   `open` while the issue is open.
 - **Found by**: review, soak or chaos run, user, CI, or other.
+
+A data-safety bug found while working on something else is fixed in a pull
+request, not filed as an issue. Its row goes in the
+[pull-request table](#found-and-fixed-in-a-pull-request) instead, keyed by
+that pull request, with the same columns; its *Found* date is the day the
+pull request was opened.
 
 `scripts/check-data-safety-register.py` compares the table below with the
 labelled issues. The `data-safety register` workflow runs it on every pull
@@ -120,3 +128,14 @@ to the table below with the reason; the check enforces either place.
 | [#577](https://github.com/allamiro/vtop-engine/issues/577) | An Unknown-lineage answer was counted by offset. Neither the issue nor its fix (#607) shows a path to a lost record. Revisit if the history checker (#728) finds one. |
 | [#626](https://github.com/allamiro/vtop-engine/issues/626) | Duplicates only: a replay writes a second object. Open. |
 | [#627](https://github.com/allamiro/vtop-engine/issues/627) | The running engine's rewind after a failed FAILED write costs at most a duplicate (#638's test `a_failed_failed_write_costs_one_duplicate_object_and_no_gap`). The documented rule would have lost the range, and #638 corrected the docs. |
+
+## Found and fixed in a pull request
+
+Data-safety bugs found while working and fixed in the pull request that found
+them, with no issue filed. The check keeps these rows unique and in order,
+refuses a labelled issue here, and counts their *Found* dates in the quiet
+period.
+
+| Pull request | Class | Component | Introduced | Found | Fixed | Found by | What happened |
+|---|---|---|---|---|---|---|---|
+| [#891](https://github.com/allamiro/vtop-engine/pull/891) | lost range | engine; file, syslog-spool and Kafka sources | #563 (a157549, a failed range handed back to its source) · v0.7.0; v0.7.0 through v0.10.3 carry it | 2026-11-21 | #891 · open (v0.10.4) | review (while prototyping pipelined archive cycles) | Two windows of one unit that failed in the same pass were both handed back, and the source applied the higher start last: the next pass read on above the lower window, a later window committed past it, and the restart's rewind of it was clamped to that commit, so it was never archived. Reproduced for the file and spool sources through the engine and for all three at the adapter. |

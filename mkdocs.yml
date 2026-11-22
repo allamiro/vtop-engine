@@ -210,6 +210,7 @@ nav:
       - Design documents:
           - Architecture: ARCHITECTURE.md
           - Production HA (design and status): PRODUCTION_HA.md
+          - Epoch history after a failed journal write: EPOCH_HISTORY_AFTER_A_FAILED_WRITE.md
           - Security model: SECURITY_MODEL.md
           - Native broker architecture: NATIVE_BROKER_ARCHITECTURE.md
           - Comparison: COMPARISON.md
@@ -223,6 +224,7 @@ nav:
       - Write amplification and proof overhead: WRITE_AMP_PROOF_OVERHEAD.md
       - Metadata saturation research: METADATA_SATURATION_RESEARCH.md
       - Live chaos validation: LIVE_CHAOS_VALIDATION.md
+      - Engine soak validation: SOAK_VALIDATION.md
   - Roadmap and releases:
       - Roadmap: ROADMAP.md
       - Versioning and support: SUPPORT.md

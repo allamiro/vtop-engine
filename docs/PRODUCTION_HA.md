@@ -1304,16 +1304,37 @@ Invariant preserved: source progress is NEVER advanced for unverified data.
 
 ---
 
-## 16. Backup, restore & disaster recovery **[PROPOSED]**
+## 16. Backup, restore & disaster recovery **[IMPLEMENTED for the state store (#734); the rest [PROPOSED]]**
+
+**Implemented and drilled.** The ledger's backup and restore, for SQLite
+(`sqlite3 .backup` while the engine runs) and PostgreSQL (`pg_dump`; a base
+backup with WAL archiving, restored to the end of the archive or to a time),
+with the commands, the recovery targets and the measured numbers in
+[Backup and recovery](operate/backup-and-recovery.md). `scripts/restore-drill.sh`
+runs each procedure against a live engine: it destroys the ledger, restores
+it, starts the engine again, and fails unless `audit-coverage --check-storage`
+shows no hole, `scrub --sample` is clean, every source record is in a
+committed object, the audit trail's chain verifies, and the measured RPO and
+RTO are inside the bounds the page documents. SQLite runs on a pull request
+that touches the state store; PostgreSQL runs nightly on every supported
+major, from the images pinned in `postgres-matrix.yml`.
+
 ```text
-- State store: Postgres PITR (WAL archiving) or distributed-SQL backup policy.
-- Object store: bucket replication or MinIO/S3 backup policy; Object Lock retention.
-- Restore test cadence: scheduled DR drills (e.g., quarterly).
-- Targets: define explicit RPO and RTO.
-- DR startup sequence: restore state store → restore/verify object store →
-  start engine (recovery scan re-reconciles incomplete batches).
-- Post-restore validation: reconcile state-store rows vs object-store contents
-  (orphan objects / missing objects / stale in-flight rows).
+- State store: SQLite online backup; PostgreSQL dump, or base backup + WAL
+  archiving (PITR).                                              [IMPLEMENTED]
+- Targets: RPO and RTO measured, with documented bounds the drill
+  enforces.                                                      [IMPLEMENTED]
+- DR startup sequence: restore state store -> start engine (recovery scan
+  re-reconciles incomplete batches); the engine reads again what the
+  restored ledger does not show as committed.                    [IMPLEMENTED, file source]
+- Post-restore validation: audit-coverage --check-storage, scrub --sample,
+  audit verify.                                                  [IMPLEMENTED]
+- Object store: bucket replication or MinIO/S3 backup policy; Object Lock
+  retention.                                                     [PROPOSED]
+- Distributed-SQL backup policy.                                 [PROPOSED]
+- Restore drill against a ledger of production size, a Kafka source (whose
+  offsets live in the broker), a source that deletes after commit, and the
+  metadata tier.                                                 [PROPOSED]
 ```
 
 ---

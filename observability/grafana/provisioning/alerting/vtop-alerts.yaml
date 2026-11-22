@@ -258,6 +258,63 @@ groups:
             minutes. The range is running with less redundancy than configured.
           runbook_url: "https://github.com/allamiro/vtop-engine/blob/main/observability/README.md#replication-health"
 
+      # A follower durable only below its leader's log start (#881): retention
+      # reclaimed the records it lacks, so no append can catch it up and the
+      # range runs a replica short until it is rebuilt. Five minutes rides out
+      # the session that catches a follower up from just above the start.
+      - uid: vtop-follower-below-catch-up-horizon
+        title: Follower below the catch-up horizon
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: mimir
+            model:
+              refId: A
+              instant: true
+              expr: max by (follower) (vtop_broker_follower_below_catch_up_horizon)
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+                  operator:
+                    type: and
+                  query:
+                    params: [C]
+                  reducer:
+                    type: last
+                    params: []
+                  type: query
+              intervalMs: 1000
+              maxDataPoints: 43200
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        isPaused: false
+        labels:
+          severity: warning
+          service: vtop-node
+        annotations:
+          summary: "A follower is behind its leader's catch-up horizon"
+          description: >-
+            Follower {{ $labels.follower }} is durable only below its leader's log start:
+            retention reclaimed the records it lacks, so the leader cannot catch it up and the
+            range runs with one replica fewer than configured. Rebuild it from the leader.
+          runbook_url: "https://github.com/allamiro/vtop-engine/blob/main/observability/README.md#replication-health"
+
       # A follower whose lag only grows will not catch up on its own: it is starved
       # of bandwidth or disk, and it holds the committed floor down, which blocks
       # retention (#561). A burst grows lag briefly; 15 minutes of growth does not.
