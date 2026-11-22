@@ -19,9 +19,9 @@
 //!   it names this variable in `sasl_password_env`, as a deployment does.
 //! - `VTOP_TEST_KAFKA_SSL_CA`: the CA certificate that signed the broker's
 //!   certificate (`ssl_ca_location`)
-//!
-//! Mutual TLS has no hook: `sources.kafka` has no client certificate or key
-//! setting to carry one.
+//! - `VTOP_TEST_KAFKA_SSL_CERT`, `VTOP_TEST_KAFKA_SSL_KEY`: the client
+//!   certificate and key for a listener that requires one (mutual TLS:
+//!   `ssl_certificate_location`, `ssl_key_location`)
 
 use vtop_core::config::KafkaSourceConfig;
 
@@ -45,4 +45,6 @@ pub fn apply(cfg: &mut KafkaSourceConfig) {
     cfg.sasl_username = present("VTOP_TEST_KAFKA_SASL_USERNAME");
     cfg.sasl_password_env = present(PASSWORD_ENV).map(|_| PASSWORD_ENV.to_string());
     cfg.ssl_ca_location = present("VTOP_TEST_KAFKA_SSL_CA");
+    cfg.ssl_certificate_location = present("VTOP_TEST_KAFKA_SSL_CERT");
+    cfg.ssl_key_location = present("VTOP_TEST_KAFKA_SSL_KEY");
 }
