@@ -11,8 +11,10 @@
 # A GitHub-hosted job stops at 6 hours, so the campaign is split into legs
 # that run side by side: `hours` is the total, each leg runs hours/legs, and
 # each leg's job timeout is its campaign time plus 30 minutes. The plan job
-# refuses a split whose legs would pass 5.5 hours on a hosted runner; on a
-# self-hosted runner (the `runner` input) a leg may run up to 5 days.
+# (scripts/live-chaos/plan_legs.py) refuses a split whose legs would pass 5.5
+# hours on a GitHub-hosted runner, which is any `ubuntu-*`, `windows-*` or
+# `macos-*` label; on any other label (a self-hosted runner) a leg may run up
+# to 5 days.
 #
 # With `reintroduce` set, it runs no campaign: it re-introduces that fixed
 # data-safety bug into a scratch build and shows the checkers catch it
@@ -35,7 +37,7 @@ on:
         default: "04 05 06 07 09 14 23"
         required: true
       runner:
-        description: "runs-on label for the legs (a self-hosted label lifts the 5.5-hour leg limit to 5 days)"
+        description: "runs-on label for the legs (a label that does not start with ubuntu-, windows- or macos- is a self-hosted runner and lifts the 5.5-hour leg limit to 5 days)"
         default: "ubuntu-latest"
         required: true
       reintroduce:
@@ -66,32 +68,13 @@ jobs:
       hours_per_leg: ${{ steps.plan.outputs.hours_per_leg }}
       timeout_minutes: ${{ steps.plan.outputs.timeout_minutes }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - id: plan
         env:
           HOURS: ${{ inputs.hours }}
           LEGS: ${{ inputs.legs }}
           RUNNER: ${{ inputs.runner }}
-        run: |
-          python3 - << 'PY' >> "$GITHUB_OUTPUT"
-          import json, math, os, sys
-          hours, legs = float(os.environ["HOURS"]), int(os.environ["LEGS"])
-          if hours <= 0 or not 1 <= legs <= 32:
-              sys.exit(f"hours must be positive and legs 1 to 32, got {hours} and {legs}")
-          per = hours / legs
-          # A leg's job gets its campaign time plus 30 minutes for the build
-          # and the last scenario, so the timeout never cuts a leg short
-          # (review of #904). A hosted job stops at 6 hours whatever this
-          # says; a self-hosted one at 5 days.
-          timeout = math.ceil(per * 60) + 30
-          limit = 360 if os.environ["RUNNER"] == "ubuntu-latest" else 7200
-          if timeout > limit:
-              sys.exit(f"{hours} h over {legs} legs is {per:.2f} h a leg, which with 30 minutes of "
-                       f"setup passes the {limit} minutes this runner allows a job: raise legs to at "
-                       f"least {math.ceil(hours * 60 / (limit - 30))}")
-          print(f"legs={json.dumps(list(range(1, legs + 1)))}")
-          print(f"hours_per_leg={per:.4f}")
-          print(f"timeout_minutes={timeout}")
-          PY
+        run: python3 scripts/live-chaos/plan_legs.py >> "$GITHUB_OUTPUT"
 
   campaign:
     name: campaign leg ${{ matrix.leg }}
