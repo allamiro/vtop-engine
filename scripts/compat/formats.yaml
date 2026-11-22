@@ -231,6 +231,7 @@ formats:
       - {file: crates/vtop-meta/src/storage/log.rs, name: ENTRY_MAGIC, value: 'b"VTOPMLE1"'}
     fixtures: [crates/vtop-meta/tests/fixtures/meta]
     fuzz: [meta_decode, meta_storage_files]
+    cells: [meta]
 
   - id: 16
     name: Metadata command set
@@ -294,6 +295,7 @@ formats:
       - "raising the feature level (vtopctl meta enable-features): permanent; a voter older than the level refuses a log that holds its kinds"
     fixtures: [crates/vtop-meta/tests/fixtures/meta]
     fuzz: [meta_decode]
+    cells: [meta]
 
   - id: 17
     name: Metadata snapshot and state encoding
@@ -364,6 +366,7 @@ formats:
           CATEGORY_PROMOTION_ATTESTATION: 22
     fixtures: [crates/vtop-meta/tests/fixtures/meta]
     fuzz: [meta_decode, meta_storage_files]
+    cells: [meta]
 
   - id: 18
     name: Metadata hard state, applied, purged, membership log id
@@ -382,6 +385,7 @@ formats:
       - {file: crates/vtop-meta/src/storage/membership_log_id.rs, name: MEMBERSHIP_LOG_ID_VERSION, value: '1'}
     fixtures: [crates/vtop-meta/tests/fixtures/meta]
     fuzz: [meta_storage_files]
+    cells: [meta]
 
   - id: 19
     name: Native protocol

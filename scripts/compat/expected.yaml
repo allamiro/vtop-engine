@@ -58,6 +58,23 @@ cells:
     since: v0.2.0
     directions: [upgrade]
 
+  # A metadata voter's directory (scripts/compat/cells/meta.sh): the Raft log,
+  # the snapshot, and the applied, purged and hard-state files.
+  #   upgrade  the release's vtop-node writes it with
+  #            scripts/compat/meta-scenario.sh, raised to the highest feature
+  #            level it accepts, and this build opens it, answers a
+  #            compare-and-swap only the replayed state satisfies, raises the
+  #            level and comes back after a SIGKILL;
+  #   forward  this build writes it, at its baseline level and raised to its
+  #            highest, and the release opens each, takes a write and comes
+  #            back after a SIGKILL. A release below the raised level opens
+  #            it and reports a lower level (it applies the raise as a
+  #            rejection): silent, not refused, which the compatibility page
+  #            records. v0.7.0 has no `node-versions` to read the level with.
+  meta:
+    since: v0.8.0
+    directions: [upgrade, forward]
+
   # The PostgreSQL ledger (cells/ledger-postgres.sh). The published archives
   # have no `postgres` feature, so the release is built from its tag with it,
   # and a throwaway server runs beside it: nightly and on demand only.

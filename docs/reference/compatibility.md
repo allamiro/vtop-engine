@@ -143,7 +143,9 @@ What is tested today:
   rewrites nothing, and a new write that survives a reopen
   (`released_meta_dirs` in `vtop-meta`; the fixtures carry a `PROVENANCE`).
   [`scripts/compat/cells/meta.sh`](../../scripts/compat/cells/meta.sh) runs
-  the same live, in both directions, against a released binary.
+  the same live, in both directions, against the published `vtop-node`: the
+  `meta` cell of the compatibility matrix, for the newest patch of each minor
+  since v0.8.0 (the newest minor on a pull request, all of them nightly).
 - The released `vtopctl` of v0.7.0 and later is run over a manifest archive
   the current build wrote: v0.8.0 and later must verify it, and v0.7.0 must
   report the documented self-hash failure
@@ -207,6 +209,7 @@ what they do is recorded, not promised):
 | State ledger, SQLite | Runs `status`, `list-batches` and `process-once`, then (`scripts/ledger-compat.sh`) archives, audits coverage over the digests and writes the nullable columns it knows, and the current build carries on over what it wrote. | `ledger-sqlite` forward |
 | Prune digest and audit trail | Reads the digest (`audit-coverage`, `scrub`) with the `sealed_at` key it does not know, and verifies and lists the audit chain. | `digests-audit` forward |
 | State ledger, PostgreSQL | After the current build ran `vtopctl migrate` and wrote, runs `status`, `list-batches` and `process-once`. Nightly. | `ledger-postgres` forward |
+| Metadata voter directory | Opens what the current build wrote at its baseline feature level and raised to its highest, reports the applied index, takes a write and comes back after a SIGKILL. Below the raised level it reports a lower level instead of refusing (see the table below): there is no supported way back after a raise. | `meta` forward |
 
 Each is `pass` in `expected.yaml` for the previous release, with one recorded
 refusal: **a release before v0.8.0 stops on a ledger that holds a
