@@ -123,16 +123,61 @@ class Matrix(unittest.TestCase):
             ],
         )
 
-    def test_an_only_newest_cell_runs_the_newest_release_alone_in_every_mode(self):
+    def test_an_only_newest_cell_runs_the_newest_release_alone_on_a_pull_request(self):
         cells = dict(EXPECTED["cells"], ledger={"since": "v0.7.0", "directions": ["forward"],
                                                 "only_newest": True})
         expected = dict(EXPECTED, cells=cells)
-        for mode in ("full", "pr"):
-            got = [r for r in rows(select.matrix(expected, TAGS, mode)) if r[0] == "ledger"]
-            self.assertEqual(got, [("ledger", "v0.9.0", "forward", "pass")], mode)
+        got = [r for r in rows(select.matrix(expected, TAGS, "pr")) if r[0] == "ledger"]
+        self.assertEqual(got, [("ledger", "v0.9.0", "forward", "pass")])
         # A newer release replaces it the day it is published.
-        got = [r for r in rows(select.matrix(expected, TAGS + ["v0.10.0"], "full")) if r[0] == "ledger"]
+        got = [r for r in rows(select.matrix(expected, TAGS + ["v0.10.0"], "pr")) if r[0] == "ledger"]
         self.assertEqual(got, [("ledger", "v0.10.0", "forward", "pass")])
+
+    def test_the_nightly_run_adds_n_minus_2_to_an_only_newest_cell(self):
+        # The nightly matrix covers the two previous minors, N-1 and N-2, of
+        # every cell, also of one a pull request runs on the newest alone.
+        cells = dict(EXPECTED["cells"], ledger={"since": "v0.7.0", "directions": ["forward"],
+                                                "only_newest": True})
+        expected = dict(EXPECTED, cells=cells)
+        got = [r for r in rows(select.matrix(expected, TAGS, "full")) if r[0] == "ledger"]
+        self.assertEqual(got, [("ledger", "v0.8.0", "forward", "pass"), ("ledger", "v0.9.0", "forward", "pass")])
+        got = [r for r in rows(select.matrix(expected, TAGS + ["v0.10.0"], "full")) if r[0] == "ledger"]
+        self.assertEqual(got, [("ledger", "v0.10.0", "forward", "pass"), ("ledger", "v0.9.0", "forward", "pass")])
+
+    def test_an_n_minus_2_that_predates_the_cell_is_not_invented(self):
+        cells = dict(EXPECTED["cells"], young={"since": "v0.9.0", "directions": ["forward"], "only_newest": True})
+        got = [r for r in rows(select.matrix(dict(EXPECTED, cells=cells), TAGS, "full")) if r[0] == "young"]
+        self.assertEqual(got, [("young", "v0.9.0", "forward", "pass")])
+
+    def test_every_cell_says_how_many_minors_behind_the_newest_release_it_runs(self):
+        got = {(c["cell"], c["tag"]): c["age"] for c in select.matrix(EXPECTED, TAGS, "full")}
+        self.assertEqual(got[("ledger-sqlite", "v0.9.0")], "N-1")
+        self.assertEqual(got[("ledger-sqlite", "v0.8.0")], "N-2")
+        self.assertEqual(got[("ledger-sqlite", "v0.7.0")], "N-3")
+        # Newer releases move the labels the day they are tagged.
+        got = {(c["cell"], c["tag"]): c["age"] for c in select.matrix(EXPECTED, TAGS + ["v0.10.0"], "pr")}
+        self.assertEqual(got[("ledger-sqlite", "v0.10.0")], "N-1")
+
+    def test_the_nightly_run_has_n_minus_1_and_n_minus_2_for_every_cell_and_direction(self):
+        full = select.matrix(select.load(select.DEFAULT_EXPECTED), TAGS + ["v0.10.0", "v0.10.4"], "full")
+        for name in {c["cell"] for c in full}:
+            for direction in {c["direction"] for c in full if c["cell"] == name}:
+                ages = {c["age"] for c in full if c["cell"] == name and c["direction"] == direction}
+                self.assertTrue({"N-1", "N-2"} <= ages, (name, direction, ages))
+
+    def test_a_pull_request_stays_on_n_minus_1_apart_from_the_exception_boundaries(self):
+        pr = select.matrix(EXPECTED, TAGS + ["v0.10.0"], "pr")
+        self.assertEqual({c["age"] for c in pr if c["cell"] == "ledger-sqlite"}, {"N-1"})
+
+    def test_an_upgrade_cell_cannot_be_limited_to_the_newest_release(self):
+        # N-2 to N is supported for state at rest, so what N-2 wrote must be
+        # opened by this build: an upgrade cell may not skip it.
+        for only in (True, ["upgrade"]):
+            cells = dict(EXPECTED["cells"], ledger={"since": "v0.7.0", "directions": ["upgrade"], "only_newest": only})
+            expected = dict(EXPECTED, cells=cells)
+            with self.assertRaises(select.ExpectedError) as caught:
+                select.matrix(expected, TAGS, "full")
+            self.assertIn("state at rest", str(caught.exception))
 
     def test_an_exact_tag_exception(self):
         expected = dict(EXPECTED, exceptions=[
@@ -161,7 +206,10 @@ class Matrix(unittest.TestCase):
         })
         expected = dict(EXPECTED, cells=cells)
         got = sorted((c["direction"], c["tag"]) for c in select.matrix(expected, TAGS, "full") if c["cell"] == "ledger")
-        self.assertEqual(got, [("forward", "v0.9.0"), ("upgrade", "v0.7.0"), ("upgrade", "v0.8.0"), ("upgrade", "v0.9.0")])
+        self.assertEqual(got, [("forward", "v0.8.0"), ("forward", "v0.9.0"),
+                               ("upgrade", "v0.7.0"), ("upgrade", "v0.8.0"), ("upgrade", "v0.9.0")])
+        pr = sorted((c["direction"], c["tag"]) for c in select.matrix(expected, TAGS, "pr") if c["cell"] == "ledger")
+        self.assertEqual(pr, [("forward", "v0.9.0"), ("upgrade", "v0.9.0")])
 
     def test_a_nightly_only_cell_runs_in_the_full_matrix_and_never_on_a_pull_request(self):
         cells = dict(EXPECTED["cells"], heavy={

@@ -1361,8 +1361,14 @@ jobs:
         run: python -m pip install --disable-pip-version-check --require-hashes -r scripts/compat/requirements.txt
       - name: the registry check can fail for each drift it exists to catch
         run: python -m unittest discover -s scripts/compat/tests -p 'test_format_registry.py' -v
-      - name: format registry (every magic and version constant has an entry)
-        run: python scripts/check-format-registry.py
+      # Also the byte lock (every golden file hashed in scripts/compat/
+      # golden.lock, a changed one fails naming the file and its format) and
+      # the freeze (a frozen format's constants, tags and golden bytes move
+      # only by a recorded exception). --base compares with the registry at
+      # HEAD^1, as the surface check below does, so a format cannot be
+      # un-frozen by editing the registry alone.
+      - name: format registry (every magic and version constant has an entry; golden files locked; frozen formats unchanged)
+        run: python scripts/check-format-registry.py --base HEAD^1
       # The list of config keys an older engine silently ignores, which a
       # release's notes carry (#743). It reads the schema out of config.rs
       # and the reference page, so its tests run against fixture refs and

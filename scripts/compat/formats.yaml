@@ -21,8 +21,37 @@
 #   marker                      may quote one of the entry's constants as
 #                               {NAME}, so the table follows its value;
 #   fixtures, fuzz              paths and fuzz targets that exist today;
+#   fixtures, golden            the golden files the byte lock holds: a file,
+#                               a directory or a glob each (README.md files
+#                               are prose and skipped); every file under
+#                               crates/*/tests/fixtures and tests/snapshots,
+#                               docs/surface and fuzz/corpus/**/golden-* must
+#                               be named by some entry;
+#   state                       unfrozen (the default) or frozen. Freezing is
+#                               a release decision (policy, "What frozen
+#                               means"), made by adding
+#                                 state: frozen
+#                                 frozen:
+#                                   at: <release it froze at, e.g. v0.12.0>
+#                                   digest: <check-format-registry.py --digest ID>
+#                                   waive: {cells: <why>, fuzz: <why>}   # only if needed
+#                               A frozen entry needs golden files, upgrade and
+#                               forward cells and a fuzz target (or a waiver
+#                               with its reason). After that, any change to its
+#                               constants, magics, tags or golden bytes fails
+#                               until recorded under frozen.exceptions:
+#                                 exceptions:
+#                                   - {digest: <new digest>, ref: "#N", why: <reason>}
+#                               and CI (--base) refuses to un-freeze it or
+#                               edit what it froze at;
 #   one_way                     one-way steps taken so far, with the operator
 #                               action that takes each.
+
+# The byte lock on golden files: scripts/compat/golden.lock holds the SHA-256
+# of every golden file an entry names (policy rule 6). Regenerate it, as a
+# deliberate act whose diff review reads, with
+#   python3 scripts/check-format-registry.py --write-lock
+golden_lock: scripts/compat/golden.lock
 
 formats:
   - id: 1
@@ -31,6 +60,7 @@ formats:
     marker: "`version` `0.1` to `0.4`; writes `0.3`, `0.4` opt-in"
     status: stable reader, evolving writer
     at_1_0: reads `0.1` to `0.4` forever, writes `0.4`
+    state: unfrozen
     constants:
       - {file: crates/vtop-core/src/manifest.rs, name: VTOP_VERSION, value: '"0.3"'}
       - {file: crates/vtop-core/src/manifest.rs, name: VTOP_VERSION_04, value: '"0.4"'}
@@ -39,6 +69,7 @@ formats:
       - {file: crates/vtop-core/src/manifest.rs, name: LEGACY_VERSIONS, value: '["0.1", "0.2", "0.3"]'}
       - {file: crates/vtop-core/src/manifest.rs, name: CANONICAL_VERSIONS, value: '["0.4"]'}
     fixtures: [crates/vtop-core/tests/fixtures/manifests]
+    golden: ['crates/vtop-core/tests/snapshots/snapshot_manifest__*.snap']
     fuzz: [manifest_parse]
     cells: [manifest]
     one_way:
@@ -50,6 +81,7 @@ formats:
     marker: "`receipt_version` `1`"
     status: evolving
     at_1_0: stable
+    state: unfrozen
     constants:
       - {file: crates/vtop-core/src/manifest/receipt.rs, name: RECEIPT_VERSION, value: '"1"'}
     fixtures:
@@ -63,6 +95,7 @@ formats:
     marker: "none: the key's shape"
     status: partition path stable, file-name scheme evolving
     at_1_0: stable
+    state: unfrozen
 
   - id: 4
     name: Ledger digest (`ledger-digest-*.jsonl`)
@@ -70,6 +103,7 @@ formats:
     marker: "`vtop_ledger_digest` `1`"
     status: evolving
     at_1_0: stable, read forever
+    state: unfrozen
     constants:
       - {file: crates/vtop-cli/src/coverage.rs, name: DIGEST_VERSION, value: '1'}
     fixtures: [crates/vtop-cli/tests/fixtures/ledger-sqlite]
@@ -81,9 +115,10 @@ formats:
     marker: "`PRAGMA user_version` `1`"
     status: evolving
     at_1_0: stable
+    state: unfrozen
     constants:
       - {file: crates/vtop-state/src/sqlite_store.rs, name: SQLITE_SCHEMA_VERSION, value: '1'}
-    fixtures: [crates/vtop-cli/tests/fixtures/ledger-sqlite]
+    fixtures: [crates/vtop-cli/tests/fixtures/ledger-sqlite, crates/vtop-cli/tests/fixtures/ledger-v0.9.0]
     cells: [ledger-sqlite]
 
   - id: 6
@@ -92,6 +127,7 @@ formats:
     marker: schema marker `3`
     status: evolving
     at_1_0: stable
+    state: unfrozen
     constants:
       - {file: crates/vtop-state/src/pg_store.rs, name: SCHEMA_VERSION, value: '3'}
       - {file: crates/vtop-state/src/pg_store.rs, name: MIN_SCHEMA_VERSION, value: '3'}
@@ -107,6 +143,8 @@ formats:
     marker: "none: optional fields (Kafka `topic_id`: ledger only, never in a manifest)"
     status: evolving; key names frozen
     at_1_0: stable
+    state: unfrozen
+    fixtures: [crates/vtop-core/tests/fixtures/markers]
 
   - id: 8
     name: "`audit_events` table and hash chain"
@@ -114,6 +152,7 @@ formats:
     marker: "`audit_version` column"
     status: evolving
     at_1_0: stable
+    state: unfrozen
     fixtures: [crates/vtop-cli/tests/fixtures/ledger-sqlite/v0.10.1]
     cells: [digests-audit]
 
@@ -123,6 +162,7 @@ formats:
     marker: "`audit_version` `1`"
     status: evolving
     at_1_0: stable
+    state: unfrozen
     constants:
       - {file: crates/vtop-observe/src/audit.rs, name: AUDIT_VERSION, value: '1'}
     fixtures: [crates/vtop-cli/tests/fixtures/audit/audit-v1.jsonl]
@@ -133,6 +173,7 @@ formats:
     marker: "`VTOPSEG1`, `VTOPREC1`, `VTOPIDX1`; `VTOPSEG2`, `VTOPREC2`; `VTOPCHK1`; `VTOPCMT1`"
     status: v1 stable, v2 evolving
     at_1_0: v1 stable; v2's status and the release that makes it the default writer are decided in their own issue
+    state: unfrozen
     constants:
       - {file: crates/vtop-log/src/codec.rs, name: HEADER_MAGIC, value: 'b"VTOPSEG1"'}
       - {file: crates/vtop-log/src/codec.rs, name: RECORD_MAGIC, value: 'b"VTOPREC1"'}
@@ -156,6 +197,7 @@ formats:
     marker: "`VTOPRIN1`, `VTOPTIN1`, `VTOPPRD1`"
     status: evolving
     at_1_0: classified at the freeze
+    state: unfrozen
     constants:
       - {file: crates/vtop-log/src/retention_intent.rs, name: MAGIC, value: 'b"VTOPRIN1"'}
       - {file: crates/vtop-log/src/retention_intent.rs, name: VERSION, value: '1'}
@@ -171,6 +213,7 @@ formats:
     marker: "`VTOPFNC1`, `VTOPFLN1`, `VTOPEPC1`, `VTOPKDS1`, `VTOPFLR1`"
     status: evolving
     at_1_0: classified at the freeze
+    state: unfrozen
     constants:
       - {file: crates/vtop-broker/src/fencing_epochs.rs, name: MAGIC, value: 'b"VTOPFNC1"'}
       - {file: crates/vtop-broker/src/fencing_epochs.rs, name: VERSION, value: '1'}
@@ -193,6 +236,7 @@ formats:
     marker: "`schema_version` `1`"
     status: evolving
     at_1_0: stable
+    state: unfrozen
     constants:
       - {file: crates/vtop-upload/src/multipart.rs, name: SESSION_SCHEMA, value: '1'}
     fixtures: [crates/vtop-upload/tests/fixtures/multipart-session-v0.8.0.json]
@@ -203,6 +247,7 @@ formats:
     marker: "`vtop_scrub_cursor` `1`"
     status: evolving
     at_1_0: classified at the freeze
+    state: unfrozen
     constants:
       - {file: crates/vtop-cli/src/scrub.rs, name: CURSOR_VERSION, value: '1'}
 
@@ -212,12 +257,14 @@ formats:
     marker: "`VTOPMLG1`, `VTOPMLE1`"
     status: evolving
     at_1_0: "follows #740"
+    state: unfrozen
     constants:
       - {file: crates/vtop-meta/src/storage/log.rs, name: CHUNK_MAGIC, value: 'b"VTOPMLG1"'}
       - {file: crates/vtop-meta/src/storage/log.rs, name: CHUNK_VERSION, value: '1'}
       - {file: crates/vtop-meta/src/storage/log.rs, name: ENTRY_MAGIC, value: 'b"VTOPMLE1"'}
     fixtures: [crates/vtop-meta/tests/fixtures/meta]
     fuzz: [meta_decode]
+    golden: ['fuzz/corpus/meta_decode/golden-frames-*.seed']
 
   - id: 16
     name: Metadata command set
@@ -225,6 +272,7 @@ formats:
     marker: command kinds, feature levels {BASELINE_FEATURE_LEVEL} to {SUPPORTED_FEATURE_LEVEL}
     status: evolving, level-gated
     at_1_0: "follows #740"
+    state: unfrozen
     constants:
       - {file: crates/vtop-meta/src/command.rs, name: BASELINE_FEATURE_LEVEL, value: '3'}
       - {file: crates/vtop-meta/src/command.rs, name: SUPPORTED_FEATURE_LEVEL, value: '8'}
@@ -281,6 +329,7 @@ formats:
       - "raising the feature level (vtopctl meta enable-features): permanent; a voter older than the level refuses a log that holds its kinds"
     fixtures: [crates/vtop-meta/tests/fixtures/meta]
     fuzz: [meta_decode]
+    golden: ['fuzz/corpus/meta_decode/golden-command-*.seed']
 
   - id: 17
     name: Metadata snapshot and state encoding
@@ -288,6 +337,7 @@ formats:
     marker: "`VTOPMSN1` v1 and v2, payload version `1`"
     status: evolving, level-gated
     at_1_0: "follows #740"
+    state: unfrozen
     constants:
       - {file: crates/vtop-meta/src/storage/snapshot.rs, name: SNAPSHOT_MAGIC, value: 'b"VTOPMSN1"'}
       - {file: crates/vtop-meta/src/storage/snapshot.rs, name: SNAPSHOT_VERSION_V1, value: '1'}
@@ -351,6 +401,7 @@ formats:
           CATEGORY_PROMOTION_ATTESTATION: 22
     fixtures: [crates/vtop-meta/tests/fixtures/meta]
     fuzz: [meta_decode]
+    golden: ['fuzz/corpus/meta_decode/golden-snapshot-*.seed']
 
   - id: 18
     name: Metadata hard state, applied, purged, membership log id
@@ -358,6 +409,7 @@ formats:
     marker: "`VTOPMHS1`, `VTOPMAP1`, `VTOPMPG1`, `VTOPMML1`"
     status: evolving
     at_1_0: "follows #740"
+    state: unfrozen
     constants:
       - {file: crates/vtop-meta/src/storage/hardstate.rs, name: HARD_STATE_MAGIC, value: 'b"VTOPMHS1"'}
       - {file: crates/vtop-meta/src/storage/hardstate.rs, name: HARD_STATE_VERSION, value: '1'}
@@ -375,6 +427,7 @@ formats:
     marker: "`VTPW`, major `1`, minor `0`"
     status: evolving
     at_1_0: "follows #740"
+    state: unfrozen
     constants:
       - {file: crates/vtop-protocol/src/lib.rs, name: MAGIC, value: 'b"VTPW"'}
       - {file: crates/vtop-protocol/src/lib.rs, name: PROTOCOL_MAJOR, value: '1'}
@@ -386,6 +439,7 @@ formats:
     marker: replica protocol `1` and `2`
     status: evolving
     at_1_0: "follows #740"
+    state: unfrozen
     constants:
       - {file: crates/vtop-protocol/src/lib.rs, name: REPLICA_PROTOCOL_LEGACY, value: '1'}
       - {file: crates/vtop-protocol/src/lib.rs, name: REPLICA_PROTOCOL_HANDSHAKE, value: '2'}
@@ -400,6 +454,7 @@ formats:
     marker: "`VTPM`, version `1`"
     status: evolving
     at_1_0: "follows #740"
+    state: unfrozen
     constants:
       - {file: crates/vtop-meta/src/transport/wire.rs, name: VTPM_MAGIC, value: 'b"VTPM"'}
       - {file: crates/vtop-meta/src/transport/wire.rs, name: VTPM_VERSION, value: '1'}
@@ -414,6 +469,7 @@ formats:
     marker: none
     status: experimental
     at_1_0: experimental
+    state: unfrozen
 
   - id: 23
     name: "`config.yaml`"
@@ -421,6 +477,7 @@ formats:
     marker: none (`config_version` planned)
     status: evolving
     at_1_0: classified at the freeze
+    state: unfrozen
 
   - id: 24
     name: "`vtopctl validate --print-effective`"
@@ -428,6 +485,7 @@ formats:
     marker: "`effective_version` `1`"
     status: JSON stable, text for people
     at_1_0: JSON stable
+    state: unfrozen
     fixtures: [crates/vtop-cli/tests/fixtures/effective.json, crates/vtop-cli/tests/fixtures/effective.txt]
 
   - id: 25
@@ -436,6 +494,9 @@ formats:
     marker: none yet (`report_version` planned)
     status: evolving
     at_1_0: classified at the freeze
+    state: unfrozen
+    # The command trees: the surface snapshot tests compare against these.
+    golden: [docs/surface/vtopctl.txt, docs/surface/vtop-node.txt]
 
   - id: 26
     name: Metric names and labels
@@ -443,6 +504,8 @@ formats:
     marker: none
     status: evolving
     at_1_0: a stable subset
+    state: unfrozen
+    golden: [docs/surface/metrics-engine.txt, docs/surface/metrics-node.txt]
 
   - id: 27
     name: Helm values
@@ -450,6 +513,7 @@ formats:
     marker: the chart `version`
     status: evolving
     at_1_0: classified at the freeze
+    state: unfrozen
 
 # Constants whose names look like format markers but are not.
 not_formats:
