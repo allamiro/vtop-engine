@@ -155,7 +155,7 @@ opened 2026-11-15, #782). The criterion IDs (A1, B1 and so on) are those of
 
 - **Why:** `preview`, `production` at 1.0: the default single-engine ledger, with the shared battery and power-loss tests; no restore drill yet.
 - **Tests and CI:** `crates/vtop-state/src/test_battery.rs`; `ledger_power_loss.rs`, `ledger_v0_9_0.rs` (a ledger a released binary wrote opens under this build); the crash sweep uses it.
-- **Open criteria:** E3 backup and restore drill (#734); SQLite migrates on every open, so a ledger change has no operator-gated one-way step yet (compatibility policy); one engine per ledger.
+- **Open criteria:** E3 backup and restore drill (#734); a SQLite one-way schema step is taken only by `vtopctl migrate` (#866): an existing ledger below a step refuses to open and names the command, and the step list is empty today, so no step has been needed yet; one engine per ledger.
 - **Docs:** `deploy/single-node.md`.
 
 ### PostgreSQL state store
