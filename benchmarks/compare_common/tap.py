@@ -62,6 +62,24 @@ def refuse_in_cell(cell: str) -> None:
                          "go straight to the store and count requests from the store's own metrics")
 
 
+# The query parameters an object read can carry: a version, the SDK's operation tag, a part, and response
+# overrides. Any other one names a sub-resource (a listing, the parts of an upload, tags, an ACL), not the body.
+_OBJECT_READ_PARAMS = ("versionid", "x-id", "partnumber")
+
+
+def is_object_get(path: str, query: str) -> bool:
+    """A GET of an object's bytes: a key under the bucket, and no sub-resource in the query (review of #906)."""
+    if "/" not in path.strip("/"):
+        return False  # the bucket itself: a listing or a bucket sub-resource
+    for name, _value in urllib.parse.parse_qsl(query, keep_blank_values=True):
+        name = name.lower()
+        if name not in _OBJECT_READ_PARAMS and not name.startswith("response-"):
+            if name.startswith("x-amz-"):
+                continue  # signature and SDK bookkeeping parameters
+            return False
+    return True
+
+
 def fault_selected(seed: int, key: str, one_in: int) -> bool:
     digest = hashlib.sha256(f"{seed}:{key}".encode()).digest()
     return int.from_bytes(digest[:8], "big") % one_in == 0
@@ -288,7 +306,7 @@ class Tap:
         client_writer.write(response_head)
         mutate = None
         key = urllib.parse.unquote(url.path)
-        if method == "GET" and status < 300 and not url.query:
+        if method == "GET" and status < 300 and is_object_get(url.path, url.query):
             self.gets.append(key)
             if self.fault_seed is not None and fault_selected(self.fault_seed, key, self.fault_one_in):
                 seed = self.fault_seed

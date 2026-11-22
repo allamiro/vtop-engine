@@ -627,6 +627,28 @@ def test_the_fault_flips_one_bit_in_selected_get_bodies_only():
     asyncio.run(_with_tap(test, fault_seed=7, fault_one_in=10))
 
 
+def test_an_object_get_is_told_from_a_listing_by_its_sub_resource_not_by_having_a_query():
+    # Review of #906: any query excluded a read from fault injection, so `?x-id=GetObject` was never faulted.
+    assert tap.is_object_get("/b/k", "")
+    assert tap.is_object_get("/b/k", "x-id=GetObject")
+    assert tap.is_object_get("/b/dir/k", "versionId=abc&x-id=GetObject")
+    assert tap.is_object_get("/b/k", "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abc")
+    assert tap.is_object_get("/b/k", "response-content-type=text%2Fplain")
+    assert not tap.is_object_get("/b", "list-type=2&prefix=a")
+    assert not tap.is_object_get("/b/", "")
+    assert not tap.is_object_get("/b/k", "uploadId=u1")
+    assert not tap.is_object_get("/b/k", "tagging")
+    assert not tap.is_object_get("/b/k", "acl=")
+
+    async def test(t, port, events):
+        key = next(f"/b/obj-{i}" for i in range(500) if tap.fault_selected(7, f"/b/obj-{i}", 10))
+        (answer,) = await _client(port, [("GET", key + "?x-id=GetObject", b"")])
+        assert sum(bin(a ^ b).count("1") for a, b in zip(answer, b"hello world")) == 1
+        assert t.corrupted == [key] and t.gets == [key]
+
+    asyncio.run(_with_tap(test, fault_seed=7, fault_one_in=10))
+
+
 def test_the_tap_is_refused_in_a_drain_or_live_cell():
     for cell in ("drain", "live", "defaults", "smoke"):
         with pytest.raises(tap.TapRefused, match="only in crash and fault cells"):
