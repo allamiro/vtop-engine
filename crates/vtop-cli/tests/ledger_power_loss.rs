@@ -396,7 +396,7 @@ async fn a_power_loss_archives_again_only_the_batches_still_in_flight() {
     let inner = vtop_state::connect_state_store(&format!("sqlite://{}", db.display()))
         .await
         .unwrap();
-    a.store = Box::new(Recorder {
+    a.store = std::sync::Arc::new(Recorder {
         inner,
         wal: wal_of(&db),
         log: log.clone(),
@@ -543,7 +543,7 @@ async fn a_power_loss_replay_of_an_uploaded_range_writes_no_second_object() {
     let inner = vtop_state::connect_state_store(&format!("sqlite://{}", db.display()))
         .await
         .unwrap();
-    a.store = Box::new(Recorder {
+    a.store = std::sync::Arc::new(Recorder {
         inner,
         wal: wal_of(&db),
         log: log.clone(),

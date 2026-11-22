@@ -19,6 +19,8 @@
 #                   The engine crash sweep (#725) needs a build with the
 #                   `failpoints` feature, which can live beside the
 #                   --no-default-features build the cluster scenarios use.
+#   CHAOS_VTOP_NODE the vtop-node to run (default: target/$CHAOS_PROFILE/vtop-node);
+#                   the bug re-introduction runner (#728) points both at a patched build.
 #   CHAOS_NO_CERTS=1 skip the TLS material init_workdir generates; the
 #                   engine sweep starts no cluster node
 set -euo pipefail
@@ -26,7 +28,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT_DIR="$REPO_ROOT/scripts/live-chaos"
 CHAOS_PROFILE="${CHAOS_PROFILE:-release}"
-VTOP_NODE="$REPO_ROOT/target/$CHAOS_PROFILE/vtop-node"
+VTOP_NODE="${CHAOS_VTOP_NODE:-$REPO_ROOT/target/$CHAOS_PROFILE/vtop-node}"
 VTOPCTL="${CHAOS_VTOPCTL:-$REPO_ROOT/target/$CHAOS_PROFILE/vtopctl}"
 
 CLUSTER_ID="${CHAOS_CLUSTER_ID:-11111111-2222-3333-4444-555555555555}"
@@ -550,6 +552,17 @@ emit_lease_yaml() {
   echo "  lease_duration_ms: $LEASE_DURATION_MS"
   echo "  renew_interval_ms: $LEASE_RENEW_MS"
   echo "  poll_interval_ms: $LEASE_POLL_MS"
+  # CHAOS_LEASE_ADMIN_PEERS=1 names all three metadata nodes, so the lease
+  # agent follows a redirect when the one it asks first is not the leader
+  # (#292). A run that kills or partitions the metadata leader needs it (the
+  # cluster soak, #727); scenario 23 spells the same list itself.
+  if [[ "${CHAOS_LEASE_ADMIN_PEERS:-0}" == "1" ]]; then
+    local m
+    echo "  admin_peers:"
+    for m in 1 2 3; do
+      echo "    - { node_id: $m, endpoint: \"$(meta_host "$m"):$(meta_admin_port "$m")\" }"
+    done
+  fi
 }
 
 # emit_follower_config <n: 1|2> [data_dir] [fencing_epoch] [watch-meta-id]
@@ -1118,11 +1131,108 @@ history_file() {
   printf '%s/history/%s.jsonl\n' "$WORKDIR" "$1"
 }
 
+# record_read <client-config> <addr> [max-offset-gaps] — one read to the
+# committed high watermark, recorded in the read history whatever it finds,
+# for a scenario about to judge a run the checker should see first. It never
+# fails: a read that verify rejects leaves nothing in the history.
+record_read() {
+  "$VTOP_NODE" verify --client-config "$1" --addr "$2" --expect-at-least 0 \
+    --max-offset-gaps "${3:-0}" --dump "$(history_file read)" \
+    > "$WORKDIR/logs/record-read.log" 2>&1 || true
+}
+
+# --- control-plane histories (#728) -------------------------------------------
+# Who led, recorded beside what the clients did: record_control.py polls each
+# metadata node's Raft status, reads the range's lease through metadata (a
+# linearizable read, rotated over the nodes), and scrapes each data node's own
+# view of whether it is the authorized leaseholder, stamping every
+# observation with the instants it was asked for and answered.
+# check_control.py holds that to one Raft leader per term, one lease holder
+# and one acting data-plane leader per epoch, linearizable lease reads, and a
+# deposed leader stopping by its lease's deadline. The files live under
+# history/control/, apart from the data-plane files check_history.py reads.
+CONTROL_RECORDER_PID=""
+CONTROL_RECORDER_STARTED=0
+
+# control_history_start <meta-ids...> [-- <name>=<metrics-addr>=<node-uuid> ...]
+# Starts the recorder in the background; check_history checks what it has
+# written, and the scenario's exit stops it. CHAOS_CONTROL_LEASE_MS,
+# CHAOS_CONTROL_STATUS_MS and CHAOS_CONTROL_NODE_MS set the polling intervals.
+control_history_start() {
+  local -a args=()
+  while [[ $# -gt 0 && "$1" != "--" ]]; do
+    args+=(--meta "$1=$(emit_admin_config "$1")")
+    shift
+  done
+  [[ "${1:-}" == "--" ]] && shift
+  while [[ $# -gt 0 ]]; do
+    args+=(--node "$1")
+    shift
+  done
+  [[ -z "$CONTROL_RECORDER_PID" ]] || fail "control_history_start: a recorder is already running"
+  mkdir -p "$WORKDIR/history/control" || fail "cannot create $WORKDIR/history/control"
+  python3 "$SCRIPT_DIR/history/record_control.py" \
+    --out "$WORKDIR/history/control/control.jsonl" --vtopctl "$VTOPCTL" \
+    --topic "$TOPIC_UUID" --range "$RANGE_ID" \
+    --lease-interval-ms "${CHAOS_CONTROL_LEASE_MS:-500}" \
+    --status-interval-ms "${CHAOS_CONTROL_STATUS_MS:-2000}" \
+    --node-interval-ms "${CHAOS_CONTROL_NODE_MS:-400}" \
+    "${args[@]}" > "$WORKDIR/logs/control-recorder.log" 2>&1 &
+  CONTROL_RECORDER_PID=$!
+  CONTROL_RECORDER_STARTED=1
+  echo "$CONTROL_RECORDER_PID" >> "$WORKDIR/pids"
+}
+
+# control_history_stop — stop the recorder; it finishes the line it is writing.
+control_history_stop() {
+  [[ -n "$CONTROL_RECORDER_PID" ]] || return 0
+  kill -TERM "$CONTROL_RECORDER_PID" 2>/dev/null || true
+  wait "$CONTROL_RECORDER_PID" 2>/dev/null || true
+  CONTROL_RECORDER_PID=""
+}
+
+# check_control_history — check what the recorder has written so far. The
+# recorder keeps running, so a scenario that goes on (scenario 23's second
+# failover) is recorded and checked again; a line it is writing at that
+# moment is ignored as cut short. A scenario that started the recorder is
+# held to it (review of #904): the recorder must still be running, and the
+# history must hold an answered observation of every kind, or a recorder that
+# failed or saw nothing would pass as a clean history. The summary is kept in
+# logs/control-check.json either way.
+check_control_history() {
+  local files=("$WORKDIR"/history/control/*.jsonl) report="$WORKDIR/logs/control-check.json"
+  local -a require=()
+  if [[ "$CONTROL_RECORDER_STARTED" == 1 ]]; then
+    [[ -e "${files[0]}" ]] \
+      || fail "the control recorder wrote nothing (see $WORKDIR/logs/control-recorder.log)"
+    if [[ -n "$CONTROL_RECORDER_PID" ]] && ! kill -0 "$CONTROL_RECORDER_PID" 2>/dev/null; then
+      fail "the control recorder stopped before the history was checked (see $WORKDIR/logs/control-recorder.log)"
+    fi
+    require=(--require-observations)
+  fi
+  [[ -e "${files[0]}" ]] || return 0
+  if ! python3 "$SCRIPT_DIR/history/check_control.py" ${require[@]+"${require[@]}"} "${files[@]}" \
+    > "$report" 2>&1; then
+    cat "$report" >&2
+    fail "the control-plane history breaks a leadership promise (see $report)"
+  fi
+  log "control history checked: $(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+o = d["observations"]
+n = lambda op: o.get(op, {}).get("ok", 0)
+print(n("lease_read"), "lease reads,", n("meta_status"), "Raft status reads,", n("node_lease"),
+      "data-node reads; epochs led", d["epochs_led"])
+' "$report")"
+}
+
 # check_history — check every history file the scenario
-# recorded. The summary is kept in logs/history-check.json either way.
+# recorded. The summary is kept in logs/history-check.json either way. A
+# control-plane history, when one was recorded, is checked too.
 check_history() {
   local files=("$WORKDIR"/history/*.jsonl) report="$WORKDIR/logs/history-check.json"
   [[ -e "${files[0]}" ]] || fail "no history was recorded under $WORKDIR/history"
+  check_control_history
   if ! python3 "$SCRIPT_DIR/history/check_history.py" "${files[@]}" \
     > "$report" 2>&1; then
     cat "$report" >&2

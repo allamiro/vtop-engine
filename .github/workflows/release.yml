@@ -721,7 +721,7 @@ jobs:
             -e KAFKA_NODE_ID=1 \
             -e KAFKA_PROCESS_ROLES=broker,controller \
             -e KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
-            -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 \
+            -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://127.0.0.1:9092 \
             -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
             -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
             -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
@@ -776,7 +776,10 @@ jobs:
           sources:
             kafka:
               enabled: true
-              bootstrap_servers: ["localhost:9092"]
+              # An address, not the name localhost: the static musl builds
+              # resolve localhost to ::1 only, and the broker is published on
+              # IPv4 (127.0.0.1:9092), so a musl engine never reached it.
+              bootstrap_servers: ["127.0.0.1:9092"]
               consumer_group: vtop-smoke
               topic_include_regex: "^smoke_events$"
               topic_exclude_regex: "^__.*"

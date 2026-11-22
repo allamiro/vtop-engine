@@ -279,7 +279,8 @@ typed twice, never inherited from one line.
 What each plaintext plane costs, in the node's own words: the Raft sender is
 self-asserted (`peer`); every reachable peer may change membership and grant
 leases, and `meta.adminAuthorization` cannot apply, so the chart refuses the
-combination (`admin`); fencing and promotion are refused, so only a
+combination and asks for `meta.adminAuthorization.enabled: false` by name
+(`admin`); fencing and promotion are refused, so only a
 **standalone** range serves it — a replicated topology is refused at render,
 because its candidates would be refused by the node (`replica`); the
 configured principal is admitted on its declaration alone (`native`). The
@@ -290,6 +291,35 @@ A Secret is required only for the planes left at `tls`: with every plane
 plaintext the chart renders without `tls.metaSecretName` or
 `tls.dataSecretName`, mounts nothing, and `helm/vtop/ci/plaintext-values.yaml`
 is that shape.
+
+## Admin authorization: on by default (#732)
+
+The metadata admin plane authorizes every cluster-scoped command by the
+caller's certificate Common Name: `meta init`, membership changes,
+administrative lease grants. Only the CNs in
+`meta.adminAuthorization.operatorCommonNames` may run them. A data node may
+still act on its own range lease, report its own version and keep its own
+groups' cursors under its own certificate; reads are open to any certificate
+the CA signed.
+
+The policy is **on by default since v0.11.0**. Before, the chart left it off,
+and every certificate the CA signed, every data node's included, could change
+membership and grant leases.
+
+| Values | Rendered policy |
+|---|---|
+| `operatorCommonNames: [vtop-admin]` (you supply the names) | Only those CNs are operators. |
+| `operatorCommonNames: []` (the default, unchanged) | **Refused at render**: no certificate could bootstrap the cluster. The message names the three ways out. |
+| `operatorCommonNames: []` and `allowNoOperators: true` | Nobody may run cluster-scoped commands: a cluster administered out of band. Enforced as written. |
+| `enabled: false` | **Lab opt-out.** No policy: every certificate the CA signed is an operator. The node warns at every start, and the install notes print a WARNING. |
+
+A plaintext admin plane (`transport.admin: plaintext`) carries no certificate,
+so no policy can apply there: the chart refuses `enabled: true` with it and
+asks for the opt-out by name (`helm/vtop/ci/plaintext-values.yaml` is that
+shape).
+
+Nothing falls back to an open admin plane: a missing operator list is a
+render error, never an unauthorized cluster.
 
 ## Observability TLS (#294)
 
@@ -389,10 +419,13 @@ helm install vtop helm/vtop \
   --set data.range.topic=telemetry \
   --set data.range.rangeId=aaaaaaaa-0000-0000-0000-0000000000c1 \
   --set data.segmentId=aaaaaaaa-0000-0000-0000-0000000000d1 \
-  --set data.principalId=aaaaaaaa-0000-0000-0000-0000000000ce
+  --set data.principalId=aaaaaaaa-0000-0000-0000-0000000000ce \
+  --set 'meta.adminAuthorization.operatorCommonNames={vtop-admin}'
 ```
 
-Then bootstrap the Raft group once (see the post-install NOTES):
+The last line names the Common Name of the certificate your `vtopctl` uses
+for the admin plane (see "Admin authorization" below). Then bootstrap the Raft
+group once with that certificate (see the post-install NOTES):
 
 ```
 kubectl -n <ns> port-forward pod/<release>-0 9200:9200 &
@@ -437,8 +470,9 @@ certificates also carry that Service's DNS name as a shared SAN.
 | `meta.timers.electionTimeoutMinMs` | `300` | Mirrors the binary default. |
 | `meta.timers.electionTimeoutMaxMs` | `600` | |
 | `meta.timers.heartbeatIntervalMs` | `60` | |
-| `meta.adminAuthorization.enabled` | `false` | `false` = block absent: authenticate-only, node warns at startup. `true` + empty list = **nobody** may run cluster-scoped commands (enforced as written). |
-| `meta.adminAuthorization.operatorCommonNames` | `[]` | Certificate CNs allowed cluster-scoped admin commands. |
+| `meta.adminAuthorization.enabled` | `true` | On since v0.11.0 (#732). `false` is the **lab opt-out**: no policy, every CA-signed certificate is an operator, the node warns at startup and NOTES.txt prints a WARNING. Required for `transport.admin: plaintext`. |
+| `meta.adminAuthorization.operatorCommonNames` | `[]` — **required** while enabled | Certificate CNs allowed cluster-scoped admin commands (`meta init`, membership, administrative lease grants). Empty while enabled is refused at render unless `allowNoOperators` is set. |
+| `meta.adminAuthorization.allowNoOperators` | `false` | `true` renders an enabled policy with no operators: **nobody** may run cluster-scoped commands (a cluster administered out of band). |
 | `meta.transitionMacKey.secretName` | `""` | Secret holding the 32-byte hex key that signs leadership-transition statements (#240). Injected as `VTOP_TRANSITION_MAC_KEY` into every metadata process and named to its config; empty means unsigned. A named Secret missing at startup is a hard error. |
 | `meta.transitionMacKey.secretKey` | `key` | The key within that Secret. |
 | `data.topology` | `standalone` | `standalone` = one independent range per pod; `replicated` = one range, every pod a candidate, role from the lease (section above). |

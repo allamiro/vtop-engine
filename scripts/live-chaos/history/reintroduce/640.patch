@@ -1,0 +1,18 @@
+diff --git a/crates/vtop-broker/src/replication/mod.rs b/crates/vtop-broker/src/replication/mod.rs
+index 67d15312..b3e82bba 100644
+--- a/crates/vtop-broker/src/replication/mod.rs
++++ b/crates/vtop-broker/src/replication/mod.rs
+@@ -525,6 +525,13 @@ impl InProcessFollower {
+     /// journal that fails here is marked broken and also counts as done,
+     /// since nothing more may be recorded in it.
+     fn follow_leader_lineage(&self, epoch: u64, tail: u64) -> bool {
++        // RE-INTRODUCED #640 (test build only, scripts/live-chaos/history/reintroduce):
++        // a follower never files caught-up records under the leader's
++        // lineage, as before #648; an adopted epoch is recorded at its tail.
++        if std::hint::black_box(true) {
++            let _ = (epoch, tail);
++            return false;
++        }
+         let mut guard = self
+             .fencing_epoch_journal
+             .lock()

@@ -119,7 +119,8 @@ enum Command {
         #[arg(long)]
         fenced_probe: bool,
     },
-    /// Fetch from offset 0 and byte-verify everything below the committed HWM.
+    /// Fetch from offset 0 (or `--from-offset`) and byte-verify everything
+    /// below the committed HWM.
     Verify {
         #[arg(long)]
         client_config: PathBuf,
@@ -154,6 +155,15 @@ enum Command {
         /// here as JSON lines, the read half of a history (#728).
         #[arg(long)]
         dump: Option<PathBuf>,
+        /// Start reading here instead of at offset 0: a range under
+        /// retention (#290) refuses a fetch below its log start, so a
+        /// reader of a long-running range starts at the
+        /// `vtop_broker_log_start_offset` it scraped (the cluster soak,
+        /// #727). The floor and the gap budget count from here; content
+        /// verification by position assumes offset 0, so pass
+        /// `--verify-content-through 0` with it.
+        #[arg(long, default_value_t = 0)]
+        from_offset: u64,
     },
     /// Query a follower's local committed offset over the replica plane.
     ReplicaStatus {
@@ -341,6 +351,7 @@ async fn run(cli: Cli) -> Result<i32, String> {
             batch,
             value_bytes,
             dump,
+            from_offset,
         } => {
             let config = client::ClientConfig::load(&client_config)?;
             client::verify(
@@ -353,6 +364,7 @@ async fn run(cli: Cli) -> Result<i32, String> {
                     batch,
                     value_bytes,
                     dump,
+                    from_offset,
                 },
             )
             .await
