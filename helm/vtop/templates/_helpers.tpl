@@ -140,8 +140,23 @@ chart says so at render time instead.
 {{- if and (eq (toString $t.replica) "plaintext") (eq (toString .Values.data.topology) "replicated") -}}
 {{- fail "\n\ntransport.replica is plaintext but data.topology is replicated: a replicated range is rendered as candidates, and the node refuses a candidate on a plaintext replica plane — promotion needs fencing, which is refused there. Use topology standalone, or serve the replica plane with tls." -}}
 {{- end -}}
-{{- if and (eq (toString $t.admin) "plaintext") .Values.meta.adminAuthorization.enabled -}}
-{{- fail "\n\ntransport.admin is plaintext but meta.adminAuthorization.enabled is true: without a client certificate there is no caller identity to enforce the policy against, and the node refuses that config before Raft starts. Disable the policy, or serve the admin plane with tls." -}}
+{{- $authz := .Values.meta.adminAuthorization -}}
+{{- if and (eq (toString $t.admin) "plaintext") $authz.enabled -}}
+{{- fail "\n\ntransport.admin is plaintext but meta.adminAuthorization.enabled is true (the default since v0.11.0): without a client certificate there is no caller identity to enforce the policy against, and the node refuses that config before Raft starts. For a lab, opt out with meta.adminAuthorization.enabled: false (every peer that reaches the admin port is then an operator), or serve the admin plane with tls." -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Admin authorization is on by default (#732, M2). An enabled policy with no
+operator named would render a cluster no certificate can bootstrap, so it is
+refused unless allowNoOperators says that is the intent. Included where the
+policy is rendered, after the identities, so a render with nothing set still
+stops at the first missing identity.
+*/}}
+{{- define "vtop.adminAuthorizationGuard" -}}
+{{- $authz := .Values.meta.adminAuthorization -}}
+{{- if and $authz.enabled (empty $authz.operatorCommonNames) (not $authz.allowNoOperators) -}}
+{{- fail "\n\nmeta.adminAuthorization is enabled (the default since v0.11.0) but meta.adminAuthorization.operatorCommonNames is empty: no certificate could run `vtopctl meta init` or any other cluster-scoped command, so the cluster could never be bootstrapped. Set operatorCommonNames to the Common Names of your operator certificates (for example --set 'meta.adminAuthorization.operatorCommonNames={vtop-admin}'). To administer the cluster out of band with no operator at all, set meta.adminAuthorization.allowNoOperators: true. For a lab only, meta.adminAuthorization.enabled: false turns the policy off, and every certificate the CA signed may then change membership and grant range leases." -}}
 {{- end -}}
 {{- end }}
 
@@ -395,6 +410,7 @@ timers:
   election_timeout_min_ms: {{ int $v.meta.timers.electionTimeoutMinMs }}
   election_timeout_max_ms: {{ int $v.meta.timers.electionTimeoutMaxMs }}
   heartbeat_interval_ms: {{ int $v.meta.timers.heartbeatIntervalMs }}
+{{- include "vtop.adminAuthorizationGuard" $root }}
 {{- if $v.meta.adminAuthorization.enabled }}
 # Present-but-empty is the STRICTEST policy (nobody may run cluster-scoped
 # commands), absent is authenticate-only — the chart emits exactly what
@@ -642,6 +658,7 @@ meta:
     election_timeout_min_ms: {{ int $v.meta.timers.electionTimeoutMinMs }}
     election_timeout_max_ms: {{ int $v.meta.timers.electionTimeoutMaxMs }}
     heartbeat_interval_ms: {{ int $v.meta.timers.heartbeatIntervalMs }}
+{{- include "vtop.adminAuthorizationGuard" $root }}
 {{- if $v.meta.adminAuthorization.enabled }}
   # Present-but-empty is the STRICTEST policy (nobody may run cluster-scoped
   # commands), absent is authenticate-only — the chart emits exactly what

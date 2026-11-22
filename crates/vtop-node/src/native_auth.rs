@@ -258,6 +258,12 @@ mod tests {
         std::fs::write(&paths.ca, &trusted.pem).unwrap();
         std::fs::write(&paths.cert, &own.cert_pem).unwrap();
         std::fs::write(&paths.key, &own.key_pem).unwrap();
+        // Owner-only, as a node requires of every TLS private key (#732).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&paths.key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         paths
     }
 

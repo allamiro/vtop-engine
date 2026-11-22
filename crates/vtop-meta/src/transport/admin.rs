@@ -5,6 +5,7 @@
 //! façade. Openraft types never cross this boundary.
 
 use super::authz::{AdminAuthorizer, AdminIdentity, Refusal};
+use super::limit::{ConnectionLimit, DEFAULT_MAX_ADMIN_CONNECTIONS};
 use super::maybe_tls::{judge_dialect, tls_handshake_hint, DialectVerdict, MaybeTls};
 use super::tls::{server_name, TlsMaterial};
 use super::wire::{
@@ -157,6 +158,8 @@ pub struct AdminServer {
     /// Only consulted when `acceptor` is `None`; TLS endpoints carry identity
     /// and are bound wherever the operator chooses.
     exposure: PlaintextExposure,
+    /// How many connections are served at once (#732, M6).
+    limit: Arc<ConnectionLimit>,
 }
 
 /// How far a PLAINTEXT admin endpoint may be reachable.
@@ -189,6 +192,7 @@ impl AdminServer {
             authorizer: Arc::new(authorizer),
             // Unused for a TLS endpoint, which carries caller identity.
             exposure: PlaintextExposure::LoopbackOnly,
+            limit: Arc::new(ConnectionLimit::meta_admin(DEFAULT_MAX_ADMIN_CONNECTIONS)),
         })
     }
 
@@ -226,6 +230,7 @@ impl AdminServer {
             handler,
             authorizer: Arc::new(authorizer),
             exposure: PlaintextExposure::LoopbackOnly,
+            limit: Arc::new(ConnectionLimit::meta_admin(DEFAULT_MAX_ADMIN_CONNECTIONS)),
         })
     }
 
@@ -252,6 +257,33 @@ impl AdminServer {
         Ok(server)
     }
 
+    /// Serve at most `max` connections at once (#732, M6); the default is
+    /// [`DEFAULT_MAX_ADMIN_CONNECTIONS`]. A connection over the cap is closed
+    /// at accept and counted on [`AdminServer::connection_limit`].
+    pub fn with_max_connections(mut self, max: usize) -> Self {
+        self.limit = Arc::new(
+            ConnectionLimit::meta_admin(max)
+                .with_handshake_deadline(self.limit.handshake_deadline()),
+        );
+        self
+    }
+
+    /// Close a connection that has not sent its first request within
+    /// `deadline` of accept (default
+    /// [`super::limit::DEFAULT_HANDSHAKE_DEADLINE`]), so a silent socket
+    /// cannot hold a slot.
+    pub fn with_handshake_deadline(mut self, deadline: std::time::Duration) -> Self {
+        self.limit = Arc::new(
+            ConnectionLimit::meta_admin(self.limit.max()).with_handshake_deadline(deadline),
+        );
+        self
+    }
+
+    /// The cap and its refusal count, for the node's metrics.
+    pub fn connection_limit(&self) -> Arc<ConnectionLimit> {
+        Arc::clone(&self.limit)
+    }
+
     pub async fn serve(self, listener: TcpListener) -> TransportResult<()> {
         // CHECKED AT BIND TIME, not per connection: the question is about the
         // address this endpoint is reachable on, and answering it once means a
@@ -276,12 +308,20 @@ impl AdminServer {
             );
         }
         loop {
-            let (tcp, _) = listener.accept().await?;
+            let (tcp, peer) = listener.accept().await?;
+            // Over the cap: closed now, before the handshake, and counted.
+            let Some(slot) = self.limit.admit(peer) else {
+                drop(tcp);
+                continue;
+            };
             let acceptor = self.acceptor.clone();
             let handler = Arc::clone(&self.handler);
             let authorizer = Arc::clone(&self.authorizer);
+            let limit = Arc::clone(&self.limit);
             tokio::spawn(async move {
-                let _ = serve_admin_connection(acceptor, tcp, handler, authorizer).await;
+                let _slot = slot;
+                let _ =
+                    serve_admin_connection(acceptor, tcp, handler, authorizer, &limit, peer).await;
             });
         }
     }
@@ -292,31 +332,38 @@ async fn serve_admin_connection(
     tcp: TcpStream,
     handler: Arc<dyn AdminHandler>,
     authorizer: Arc<AdminAuthorizer>,
+    limit: &ConnectionLimit,
+    peer: SocketAddr,
 ) -> TransportResult<()> {
-    // Observed here, from the socket, once: it is what the leader records
-    // beside the certificate's identity (#706).
-    let peer = tcp
-        .peer_addr()
-        .ok()
-        .map(|address| address.ip().to_canonical());
-    // Judged before the handshake or the first frame (#294 slice 6): a peer
-    // speaking the other transport is refused by name instead of failing as
-    // a bad magic here and a reset there.
-    if let DialectVerdict::Refused(message) =
-        judge_dialect(&tcp, "admin", "admin_transport", acceptor.is_some()).await?
-    {
-        return Err(TransportError::CrossMode(message));
-    }
-    let mut stream = match acceptor {
-        Some(acceptor) => MaybeTls::Tls(Box::new(
-            acceptor
-                .accept(tcp)
-                .await
-                .map_err(|error| TransportError::Tls(format!("admin accept: {error}")))?
-                .into(),
-        )),
-        None => MaybeTls::Plain(tcp),
+    // One deadline from accept to the first request (#732): the connection
+    // holds a slot, and one that never speaks must not hold it forever.
+    let deadline = tokio::time::Instant::now() + limit.handshake_deadline();
+    let established = tokio::time::timeout_at(deadline, async {
+        // Judged before the handshake or the first frame (#294 slice 6): a
+        // peer speaking the other transport is refused by name instead of
+        // failing as a bad magic here and a reset there.
+        if let DialectVerdict::Refused(message) =
+            judge_dialect(&tcp, "admin", "admin_transport", acceptor.is_some()).await?
+        {
+            return Err(TransportError::CrossMode(message));
+        }
+        Ok(match acceptor {
+            Some(acceptor) => MaybeTls::Tls(Box::new(
+                acceptor
+                    .accept(tcp)
+                    .await
+                    .map_err(|error| TransportError::Tls(format!("admin accept: {error}")))?
+                    .into(),
+            )),
+            None => MaybeTls::Plain(tcp),
+        })
+    })
+    .await;
+    let Ok(established) = established else {
+        limit.handshake_expired(peer);
+        return Ok(());
     };
+    let mut stream = established?;
     // Identity is established once, from the certificate the handshake already
     // verified, and is fixed for the connection's lifetime. Deriving it
     // per-frame would invite a caller to influence it through frame content;
@@ -343,12 +390,26 @@ async fn serve_admin_connection(
     // Warned once per connection (#694): the audit records of its writes
     // name no actor, and the operator should know why.
     let mut warned_anonymous = false;
+    // Observed from the socket at accept, once: it is what the leader records
+    // beside the certificate's identity (#706).
     let caller = ProposalCaller {
         identity: identity.clone(),
-        peer,
+        peer: Some(peer.ip().to_canonical()),
     };
+    let mut first = true;
     loop {
-        let frame = match read_frame(&mut stream).await {
+        let read = if std::mem::take(&mut first) {
+            match tokio::time::timeout_at(deadline, read_frame(&mut stream)).await {
+                Ok(read) => read,
+                Err(_) => {
+                    limit.handshake_expired(peer);
+                    return Ok(());
+                }
+            }
+        } else {
+            read_frame(&mut stream).await
+        };
+        let frame = match read {
             Ok(frame) => frame,
             Err(TransportError::Closed) => return Ok(()),
             Err(error) => return Err(error),
@@ -1995,6 +2056,47 @@ mod tests {
         assert_eq!(predates_replica_set_read(), "unexpected response kind 27");
     }
 
+    /// #732 (M6): the admin plane serves at most `max_admin_connections`;
+    /// the connection over the cap is closed at accept and counted.
+    #[tokio::test]
+    async fn an_admin_connection_over_the_cap_is_closed_and_counted() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = AdminServer::plaintext(
+            Arc::new(CountingHandler::default()) as Arc<dyn AdminHandler>,
+            AdminAuthorizer::permissive(),
+        )
+        .expect("a permissive plaintext endpoint is allowed")
+        .with_max_connections(1);
+        let limit = server.connection_limit();
+        assert_eq!(limit.label(), "meta_admin");
+        let task = tokio::spawn(server.serve(listener));
+        crate::transport::limit::probe::the_second_of_a_cap_of_one_is_closed(addr, &limit).await;
+        task.abort();
+    }
+
+    /// Review of #732: a connection that sends nothing loses its slot at
+    /// the handshake deadline, so silent sockets cannot lock the plane out.
+    #[tokio::test]
+    async fn a_silent_admin_connection_is_closed_at_the_handshake_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = AdminServer::plaintext(
+            Arc::new(CountingHandler::default()) as Arc<dyn AdminHandler>,
+            AdminAuthorizer::permissive(),
+        )
+        .expect("a permissive plaintext endpoint is allowed")
+        .with_max_connections(1)
+        .with_handshake_deadline(Duration::from_millis(200));
+        let limit = server.connection_limit();
+        let task = tokio::spawn(server.serve(listener));
+        crate::transport::limit::probe::a_silent_connection_loses_its_slot_at_the_deadline(
+            addr, &limit,
+        )
+        .await;
+        task.abort();
+    }
+
     #[derive(Default)]
     struct CountingHandler {
         proposals: AtomicUsize,
@@ -2773,6 +2875,8 @@ mod tests {
             tcp,
             Arc::clone(&handler),
             Arc::new(AdminAuthorizer::permissive()),
+            &ConnectionLimit::meta_admin(1),
+            "127.0.0.1:9".parse().unwrap(),
         )
         .await
         .unwrap_err();
@@ -2794,6 +2898,8 @@ mod tests {
             tcp,
             handler,
             Arc::new(AdminAuthorizer::permissive()),
+            &ConnectionLimit::meta_admin(1),
+            "127.0.0.1:9".parse().unwrap(),
         )
         .await
         .unwrap_err();

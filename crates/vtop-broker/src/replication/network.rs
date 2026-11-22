@@ -21,13 +21,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
-use tokio::time::{sleep, timeout};
+use tokio::time::{sleep, timeout, timeout_at};
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use uuid::Uuid;
 use vtop_meta::transport::{
-    judge_dialect, tls_handshake_hint, warn_rate_limited, with_tls_handshake_hint, DialectVerdict,
-    MaybeTls,
+    judge_dialect, tls_handshake_hint, warn_rate_limited, with_tls_handshake_hint, ConnectionLimit,
+    DialectVerdict, MaybeTls, DEFAULT_MAX_REPLICA_CONNECTIONS,
 };
 use vtop_protocol::{
     read_frame, write_frame, CommittedHwmUpdate, ErrorCode, ErrorResponse, Message, ProtocolError,
@@ -663,6 +663,9 @@ pub struct ReplicaPeerServer {
     /// The finalized level dialers are held to (#634); unknown until the
     /// node that owns this server reads one.
     cluster_level: super::version::ClusterFeatureLevel,
+    /// How many connections are served at once (#732, R7), as the native
+    /// plane caps its sessions.
+    limit: Arc<ConnectionLimit>,
 }
 
 impl ReplicaPeerServer {
@@ -677,6 +680,7 @@ impl ReplicaPeerServer {
             handler,
             exposure: PlaintextExposure::LoopbackOnly,
             cluster_level: super::version::ClusterFeatureLevel::unknown(),
+            limit: Arc::new(ConnectionLimit::replica(DEFAULT_MAX_REPLICA_CONNECTIONS)),
         })
     }
 
@@ -686,6 +690,31 @@ impl ReplicaPeerServer {
     pub fn with_cluster_level(mut self, level: super::version::ClusterFeatureLevel) -> Self {
         self.cluster_level = level;
         self
+    }
+
+    /// Serve at most `max` connections at once (#732, R7); the default is
+    /// [`DEFAULT_MAX_REPLICA_CONNECTIONS`]. A connection over the cap is
+    /// closed at accept and counted on [`ReplicaPeerServer::connection_limit`].
+    pub fn with_max_connections(mut self, max: usize) -> Self {
+        self.limit = Arc::new(
+            ConnectionLimit::replica(max).with_handshake_deadline(self.limit.handshake_deadline()),
+        );
+        self
+    }
+
+    /// Close a connection that has not sent its first frame within
+    /// `deadline` of accept (default
+    /// [`vtop_meta::transport::DEFAULT_HANDSHAKE_DEADLINE`]), so a silent
+    /// socket cannot hold a slot.
+    pub fn with_handshake_deadline(mut self, deadline: Duration) -> Self {
+        self.limit =
+            Arc::new(ConnectionLimit::replica(self.limit.max()).with_handshake_deadline(deadline));
+        self
+    }
+
+    /// The cap and its refusal count, for the node's metrics.
+    pub fn connection_limit(&self) -> Arc<ConnectionLimit> {
+        Arc::clone(&self.limit)
     }
 
     /// A replica endpoint with NO TLS, on loopback only (#294 slice 3).
@@ -742,6 +771,7 @@ impl ReplicaPeerServer {
             handler,
             exposure: PlaintextExposure::LoopbackOnly,
             cluster_level: super::version::ClusterFeatureLevel::unknown(),
+            limit: Arc::new(ConnectionLimit::replica(DEFAULT_MAX_REPLICA_CONNECTIONS)),
         }
     }
 
@@ -824,19 +854,29 @@ impl ReplicaPeerServer {
                             });
                         }
                     };
+                    // Over the cap: closed now, before the handshake, and
+                    // counted (#732, R7).
+                    let Some(slot) = self.limit.admit(peer) else {
+                        drop(tcp);
+                        continue;
+                    };
                     let acceptor = self.acceptor.clone();
                     let handler = Arc::clone(&self.handler);
                     let version = super::version::ReplicaVersionPolicy::new(
                         self.local_id,
                         self.cluster_level.clone(),
                     );
+                    let limit = Arc::clone(&self.limit);
                     connections.spawn(async move {
+                        let _slot = slot;
                         // A session that ends on a protocol refusal is SAID
                         // (#453): the leader on the other end sees only a
                         // missing ack, and without this line nobody sees why.
                         // Ordinary ends — a leader gone, a reset — stay quiet,
                         // as before.
-                        match serve_follower_connection(acceptor, tcp, handler, version).await {
+                        match serve_follower_connection(acceptor, tcp, handler, version, &limit, peer)
+                            .await
+                        {
                             // A leader gone, a reset: an ordinary end, quiet.
                             Ok(()) | Err(crate::BrokerError::Protocol(ProtocolError::Io(_))) => {}
                             Err(crate::BrokerError::Protocol(ProtocolError::Limit(what))) => {
@@ -884,32 +924,45 @@ async fn serve_follower_connection(
     tcp: TcpStream,
     handler: Arc<dyn ReplicaPeerHandler>,
     version: super::version::ReplicaVersionPolicy,
+    limit: &ConnectionLimit,
+    peer: SocketAddr,
 ) -> BrokerResult<()> {
-    // Judged before the handshake or the first frame (#294 slice 6): a peer
-    // speaking the other transport is refused by name instead of failing as
-    // a bad magic here and a reset there.
-    let verdict = judge_dialect(&tcp, "replica", "replica_transport", acceptor.is_some())
-        .await
-        .map_err(|source| crate::BrokerError::Io {
-            path: std::path::PathBuf::from("replica-peer-accept"),
-            source,
-        })?;
-    if let DialectVerdict::Refused(message) = verdict {
-        return Err(crate::BrokerError::CrossMode(message));
-    }
-    let mut stream = match acceptor {
-        Some(acceptor) => {
-            let tls = acceptor
-                .accept(tcp)
-                .await
-                .map_err(|source| crate::BrokerError::Io {
-                    path: std::path::PathBuf::from("replica-peer-accept"),
-                    source,
-                })?;
-            MaybeTls::Tls(Box::new(tls.into()))
+    // One deadline from accept to the first frame (#732): the connection
+    // holds a slot, and one that never speaks must not hold it forever.
+    let deadline = tokio::time::Instant::now() + limit.handshake_deadline();
+    let established = tokio::time::timeout_at(deadline, async {
+        // Judged before the handshake or the first frame (#294 slice 6): a
+        // peer speaking the other transport is refused by name instead of
+        // failing as a bad magic here and a reset there.
+        let verdict = judge_dialect(&tcp, "replica", "replica_transport", acceptor.is_some())
+            .await
+            .map_err(|source| crate::BrokerError::Io {
+                path: std::path::PathBuf::from("replica-peer-accept"),
+                source,
+            })?;
+        if let DialectVerdict::Refused(message) = verdict {
+            return Err(crate::BrokerError::CrossMode(message));
         }
-        None => MaybeTls::Plain(tcp),
+        Ok(match acceptor {
+            Some(acceptor) => {
+                let tls = acceptor
+                    .accept(tcp)
+                    .await
+                    .map_err(|source| crate::BrokerError::Io {
+                        path: std::path::PathBuf::from("replica-peer-accept"),
+                        source,
+                    })?;
+                MaybeTls::Tls(Box::new(tls.into()))
+            }
+            None => MaybeTls::Plain(tcp),
+        })
+    })
+    .await;
+    let Ok(established) = established else {
+        limit.handshake_expired(peer);
+        return Ok(());
     };
+    let mut stream = established?;
     // `None` here means the plane is plaintext and NO identity exists — not
     // that a certificate was unreadable, which stays an error. The two want
     // opposite treatment, and `dispatch_replica_frame` is where that is spent.
@@ -923,7 +976,11 @@ async fn serve_follower_connection(
     // `session` is the version the session runs at: what a later wire
     // change (one only a peer at a newer protocol may be sent) branches on,
     // and what every later frame is judged by.
-    let (mut first, session) = match read_frame(&mut stream, REPLICA_LIMITS).await {
+    let Ok(opening) = timeout_at(deadline, read_frame(&mut stream, REPLICA_LIMITS)).await else {
+        limit.handshake_expired(peer);
+        return Ok(());
+    };
+    let (mut first, session) = match opening {
         Ok(Some(frame)) => {
             match super::version::accept_session(&mut stream, frame, &version).await? {
                 super::version::Accepted::Hello(peer) => (None, peer),
@@ -3305,6 +3362,115 @@ mod tests {
     use crate::memory_budget::MemoryBudgetConfig;
     use vtop_protocol::{ProduceRecord, RangeIdentity};
 
+    /// #732 (R7): the replica plane serves at most `max_replica_connections`,
+    /// as the native plane caps its sessions. The connection over the cap is
+    /// closed at accept and counted, the open one is untouched, and a freed
+    /// slot is served again.
+    #[tokio::test]
+    async fn a_replica_connection_over_the_cap_is_closed_and_counted() {
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+        struct Silent;
+        impl ReplicaPeerHandler for Silent {
+            fn node_id(&self) -> Uuid {
+                Uuid::from_u128(1)
+            }
+            fn apply_append(
+                &self,
+                _: &ReplicaAppendRequest,
+            ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
+                unreachable!("no frame is sent")
+            }
+            fn apply_append_batch(
+                &self,
+                _: &[ReplicaAppendRequest],
+            ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
+                unreachable!("no frame is sent")
+            }
+            fn observe_hwm(&self, _: &CommittedHwmUpdate) -> Result<(), (ErrorCode, String)> {
+                unreachable!("no frame is sent")
+            }
+            fn status(
+                &self,
+                _: &RangeIdentity,
+            ) -> Result<ReplicaStatusResponse, (ErrorCode, String)> {
+                unreachable!("no frame is sent")
+            }
+        }
+        async fn eventually(what: &str, done: impl Fn() -> bool) {
+            for _ in 0..500 {
+                if done() {
+                    return;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+            panic!("timed out waiting until {what}");
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ReplicaPeerServer::plaintext(Uuid::from_u128(1), Arc::new(Silent))
+            .with_max_connections(1);
+        let limit = server.connection_limit();
+        assert_eq!(limit.label(), "replica");
+        let (stop, stopped) = oneshot::channel();
+        let task = tokio::spawn(server.serve(listener, stopped));
+
+        let held = TcpStream::connect(addr).await.unwrap();
+        eventually("the first connection holds the slot", || limit.open() == 1).await;
+        let mut over = TcpStream::connect(addr).await.unwrap();
+        let mut byte = [0_u8; 1];
+        assert!(
+            matches!(
+                timeout(Duration::from_secs(5), over.read(&mut byte)).await,
+                Ok(Ok(0)) | Ok(Err(_))
+            ),
+            "the connection over the cap was not closed"
+        );
+        assert_eq!(limit.refused_total(), 1);
+        assert_eq!(limit.open(), 1, "the held connection is untouched");
+        drop(held);
+        eventually("the first connection's slot is freed", || limit.open() == 0).await;
+        let _next = TcpStream::connect(addr).await.unwrap();
+        eventually("a new connection takes the freed slot", || {
+            limit.open() == 1
+        })
+        .await;
+        assert_eq!(limit.refused_total(), 1, "the freed slot was served");
+
+        stop.send(()).unwrap();
+        task.await.unwrap().unwrap();
+
+        // Review of #732: a connection that sends nothing loses its slot at
+        // the handshake deadline, so silent sockets cannot lock the plane out.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ReplicaPeerServer::plaintext(Uuid::from_u128(1), Arc::new(Silent))
+            .with_max_connections(1)
+            .with_handshake_deadline(Duration::from_millis(200));
+        let limit = server.connection_limit();
+        let (stop, stopped) = oneshot::channel();
+        let task = tokio::spawn(server.serve(listener, stopped));
+        let mut silent = TcpStream::connect(addr).await.unwrap();
+        eventually("the silent connection holds the slot", || limit.open() == 1).await;
+        assert!(
+            matches!(
+                timeout(Duration::from_secs(5), silent.read(&mut byte)).await,
+                Ok(Ok(0)) | Ok(Err(_))
+            ),
+            "the silent connection was not closed at its deadline"
+        );
+        assert_eq!(limit.handshake_timeouts_total(), 1);
+        eventually("the slot is freed", || limit.open() == 0).await;
+        let _next = TcpStream::connect(addr).await.unwrap();
+        eventually("a new connection takes the freed slot", || {
+            limit.open() == 1
+        })
+        .await;
+        assert_eq!(limit.refused_total(), 0);
+        stop.send(()).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
     /// #294 slice 6: a TLS hello on a plaintext replica plane is refused by
     /// name before the handler is asked anything.
     #[tokio::test]
@@ -3350,6 +3516,8 @@ mod tests {
             tcp,
             Arc::new(Unreached),
             super::super::version::ReplicaVersionPolicy::default(),
+            &ConnectionLimit::replica(1),
+            client.local_addr().unwrap(),
         )
         .await
         .unwrap_err();

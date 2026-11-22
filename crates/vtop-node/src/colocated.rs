@@ -61,6 +61,11 @@ impl ColocatedNodeConfig {
             self.data.replica_transport,
         )?;
         crate::config::refuse_kafka_gateway_misuse(self.data.role, self.data.kafka.as_ref())?;
+        crate::config::refuse_group_commit_misuse(
+            self.data.role,
+            &self.data.range.identity(),
+            self.data.group_commit.as_ref(),
+        )?;
         // And the partition topology, before either role binds (review). This
         // check lives in `data_node::run` for the standalone entry and in
         // `serve` for direct callers, but `run` below binds the shared

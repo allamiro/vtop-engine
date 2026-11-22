@@ -23,6 +23,7 @@
 
 pub mod admin;
 pub mod authz;
+pub mod limit;
 mod maybe_tls;
 pub mod peer;
 pub mod tls;
@@ -34,6 +35,10 @@ pub use admin::{
     AdminHandler, AdminServer, ProposalCaller,
 };
 pub use authz::{AdminAuthorizer, AdminIdentity, CommandClass, Refusal};
+pub use limit::{
+    ConnectionLimit, DEFAULT_MAX_ADMIN_CONNECTIONS, DEFAULT_MAX_PEER_CONNECTIONS,
+    DEFAULT_MAX_REPLICA_CONNECTIONS,
+};
 pub use maybe_tls::{
     cross_mode_refusal, judge_dialect, sniff_dialect, tls_handshake_hint, warn_rate_limited,
     with_tls_handshake_hint, DialectVerdict, MaybeTls, WireDialect,
