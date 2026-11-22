@@ -47,3 +47,5 @@ tokio = { workspace = true, features = ["test-util"] }
 # scanning its text: layout-independent, and a macro is a node it can refuse.
 syn = { workspace = true }
 quote = { workspace = true }
+# Which S3 server a live test runs against, and what it expects of it (#722).
+vtop-s3-testkit = { workspace = true }
