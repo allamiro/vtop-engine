@@ -33,9 +33,9 @@ notifications tools cannot rely on):
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
-import random
 import shutil
 import sys
 import threading
@@ -48,6 +48,7 @@ STYLES = ("rename", "copytruncate")
 APPS = ("sshd", "nginx", "kernel", "cron", "postfix", "sudo")
 HOSTS = ("edge-1", "edge-2", "core-1", "core-2")
 FILLER = "abcdefghijklmnopqrstuvwxyz0123456789" * 64
+MASK = (1 << 64) - 1
 BASE_EPOCH = 1_795_000_000  # 2026-11-17, fixed so the backlog's timestamps do not depend on the clock
 
 
@@ -57,15 +58,24 @@ def make_id(tag: str, seq: int) -> str:
     return f"vtb-{tag}-{seq:010d}"
 
 
+@functools.lru_cache(maxsize=8)
+def _stamp(second: int) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(BASE_EPOCH + second))
+
+
 def line(seed: int, tag: str, seq: int, size: int = 200) -> str:
     """One RFC 5424 line (no trailing newline) of exactly `size` bytes, a pure function of its arguments."""
-    rng = random.Random(f"{seed}:{seq}")
-    stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(BASE_EPOCH + seq // 1000))
-    head = (f"<{rng.randint(1, 191)}>1 {stamp}.{seq % 1000:03d}Z {rng.choice(HOSTS)} {rng.choice(APPS)} "
-            f"{rng.randint(1, 65535)} ID{rng.randint(1, 99)} - id={make_id(tag, seq)} msg=")
+    # A 64-bit mix of (seed, seq) picks every field: a pure function, and fast enough for a 4 GiB backlog.
+    x = ((seed * 0x100000001B3) ^ (seq * 0x9E3779B97F4A7C15)) & MASK
+    x = ((x ^ (x >> 31)) * 0xBF58476D1CE4E5B9) & MASK
+    x ^= x >> 29
+    stamp = _stamp(seq // 1000)
+    head = (f"<{1 + x % 191}>1 {stamp}.{seq % 1000:03d}Z {HOSTS[(x >> 8) % len(HOSTS)]} "
+            f"{APPS[(x >> 12) % len(APPS)]} {1 + (x >> 16) % 65535} ID{1 + (x >> 32) % 99} - "
+            f"id={make_id(tag, seq)} msg=")
     if len(head) >= size:
         raise ValueError(f"a {size}-byte line cannot hold the {len(head)}-byte header")
-    offset = rng.randrange(len(FILLER) // 2)
+    offset = (x >> 40) % (len(FILLER) // 2)
     return head + FILLER[offset:offset + size - len(head)]
 
 

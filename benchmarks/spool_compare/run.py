@@ -180,7 +180,8 @@ class Lab:
         return json.loads(text) if text.startswith(("{", "[")) else text
 
     def gen(self, path: str, body: dict | None = None) -> Any:
-        answer = self._http("generator", 9400, path, body)
+        # A 4 GiB backlog is written in one request: allow it an hour.
+        answer = self._http("generator", 9400, path, body, timeout=3600)
         if answer is None:
             raise RuntimeError(f"generator {path} did not answer")
         return answer
