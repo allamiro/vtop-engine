@@ -62,6 +62,7 @@ Rules:
 ## Metrics
 
 - **Names:** `vtop_<noun>_total` for counters, `vtop_<noun>` for gauges, `_seconds` and `_bytes` units in the name. Register them in `vtop-core/src/telemetry.rs` and add new names to the endpoint test.
+- **The surface snapshot (#719):** every family's name, type and labels are committed in `docs/surface/metrics-engine.txt` and `metrics-node.txt`. After adding or changing one, run `scripts/update-surface-snapshots.sh`; a rename or a dropped label also needs a row in `docs/deprecations.md`. A new node collector type goes in `every_collector` in `crates/vtop-node/src/observe/surface_snapshot.rs`.
 - **Labels must have bounded cardinality:** `tenant`, `source_type`, `format`, `state`, `mode`. **Never** `batch_id`, a path, a key, a topic-partition from user input, or an error string. Those belong in logs and spans.
 - **Every new failure or refusal path gets a counter,** so an alert can catch it without parsing logs. #664 and #674's `vtop_recovery_unsupported_manifest_total` are the pattern.
 - **Keep counters self-consistent across restarts.** See the comment in `commit_recovered` on counting a verification at recovery, so that `commits_total` never exceeds `verified_total`.
