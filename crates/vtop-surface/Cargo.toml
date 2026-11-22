@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
 description = "The operator-facing surface of the VTOP processes as data: every metric family a registry carries, and every command and flag of a command tree, for the snapshot gate (#719)."
 
 [features]
