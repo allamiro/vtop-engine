@@ -1216,6 +1216,14 @@ fn golden_fuzz_seeds() -> Vec<(&'static str, Vec<u8>)> {
             "golden-command-split-range",
             with(0, GOLDEN_SPLIT_COMMAND_HEX),
         ),
+        (
+            "golden-command-attributed-named",
+            with(0, GOLDEN_ATTRIBUTED_NAMED_HEX),
+        ),
+        (
+            "golden-command-attributed-node-v4",
+            with(0, GOLDEN_ATTRIBUTED_NODE_V4_HEX),
+        ),
         ("golden-snapshot-state", with(3, GOLDEN_STATE_PAYLOAD_HEX)),
         (
             "golden-snapshot-split-state",
