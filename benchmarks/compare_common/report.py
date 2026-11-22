@@ -279,15 +279,23 @@ def draw_chart(plt, chart: Chart, rows, kind, systems, profiles, names, group_la
                img_dir: str) -> list[str]:
     from kafka_compare import footer as kfooter
 
+    import textwrap
+
+    from matplotlib.ticker import MaxNLocator
+
     palette = colours.series(colours_order(kind), systems)
     panels = len(chart.metrics)
-    width, height = 7.5, 1.6 + 2.6 * panels
+    subtitle = textwrap.fill(chart.subtitle, 120)
+    head = 0.95 + 0.14 * subtitle.count("\n")
+    width, height = 7.5, head + 0.65 + 2.6 * panels
     fig = plt.figure(figsize=(width, height))
     fig.text(0.012, 1 - 0.18 / height, chart.title, fontsize=12.5, color=INK, ha="left", va="top")
-    fig.text(0.012, 1 - 0.50 / height, chart.subtitle, fontsize=8, color=INK_2, ha="left", va="top")
+    fig.text(0.012, 1 - 0.50 / height, subtitle, fontsize=8, color=INK_2, ha="left", va="top", linespacing=1.4)
     for index, metric in enumerate(chart.metrics):
-        ax = fig.add_axes((0.09, 1 - (0.95 + 2.6 * (index + 1)) / height + 0.45 / height, 0.88,
+        ax = fig.add_axes((0.09, 1 - (head + 2.6 * (index + 1)) / height + 0.45 / height, 0.88,
                            2.0 / height))
+        if metric.digits == 0:
+            ax.yaxis.set_major_locator(MaxNLocator(integer=True))
         group_list = groups(rows, kind, metric)
         n = len(systems)
         bar = 0.8 / max(n, 1)
