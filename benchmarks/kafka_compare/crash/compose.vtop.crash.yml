@@ -1,0 +1,23 @@
+# VTOP for the whole-replica-set crash benchmark (#599), layered on compose.vtop.yml: the three nodes'
+# home directories (their data) are bind mounts under ${CRASH_DATA_ROOT}, one filesystem for all
+# three, and the CPUs per node come from ${CRASH_NODE_CPUS}. Every engine setting is the shipped one.
+services:
+  vtop-1:
+    cpus: ${CRASH_NODE_CPUS:-2}
+  vtop-2:
+    cpus: ${CRASH_NODE_CPUS:-2}
+  vtop-3:
+    cpus: ${CRASH_NODE_CPUS:-2}
+volumes:
+  vtop-1-data:
+    driver: local
+    driver_opts: { type: none, o: bind, device: "${CRASH_DATA_ROOT:?set CRASH_DATA_ROOT}/vtop-1" }
+  vtop-2-data:
+    driver: local
+    driver_opts: { type: none, o: bind, device: "${CRASH_DATA_ROOT:?set CRASH_DATA_ROOT}/vtop-2" }
+  vtop-3-data:
+    driver: local
+    driver_opts: { type: none, o: bind, device: "${CRASH_DATA_ROOT:?set CRASH_DATA_ROOT}/vtop-3" }
+networks:
+  bench:
+    name: kc-crash-vtop-bench
