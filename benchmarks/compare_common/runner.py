@@ -94,6 +94,11 @@ def run_plan(run_dir: str, kind: schema.Kind, env: dict[str, Any],
     csv_path = os.path.join(run_dir, f"{kind.name}.csv")
     schema.ensure_header(csv_path, kind)
     done_keys = finished_keys(csv_path, kind)
+    # Nothing is timed for a tool whose smoke did not pass (#744): a configuration that lost or duplicated
+    # records must not get a performance ranking (review of #908). Rows read on a resume count too.
+    smoke_failed = {(row["system"], row["profile"]) for row in
+                    (schema.read_rows(csv_path, kind) if done_keys else []) if row["cell"] == "smoke"
+                    and row["status"] != "ok"}
     items = plans.schedule(env["plan"], kind)
     start = clock()
     done = skipped = 0
@@ -113,6 +118,8 @@ def run_plan(run_dir: str, kind: schema.Kind, env: dict[str, Any],
         began = clock()
         row["started_at"] = _now()
         try:
+            if kind.cells.get(item.cell) == "performance" and (item.system, item.profile) in smoke_failed:
+                raise CellRefused(f"the {item.system} {item.profile} smoke did not pass, so nothing is timed for it")
             metrics = execute(item)
             row.update(metrics)
             row.setdefault("status", "ok")
@@ -123,6 +130,8 @@ def run_plan(run_dir: str, kind: schema.Kind, env: dict[str, Any],
             row["status"] = "refused"
             row["note"] = str(exc) or "refused, no reason given"
         row["wall_seconds"] = f"{clock() - began:.1f}"
+        if item.cell == "smoke" and row["status"] != "ok":
+            smoke_failed.add((item.system, item.profile))
         schema.append_row(csv_path, kind, row)
         done_keys.add(key)
         done += 1
