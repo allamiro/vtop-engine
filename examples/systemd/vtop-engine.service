@@ -1,0 +1,43 @@
+# One VTOP archive engine as a systemd service (#739).
+#
+# One engine per ledger: install this on one host only. To move the engine to
+# another host after losing this one, follow docs/deploy/engine-host-loss.md
+# (fence this host first). Paths and the user are examples; the state-store
+# URL comes from the environment file, never from config.yaml.
+[Unit]
+Description=VTOP archive engine
+Documentation=https://allamiro.github.io/vtop-engine/deploy/engine-host-loss/
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=vtop
+Group=vtop
+# VTOP_STATE_STORE=postgres://...?sslmode=verify-full, the S3 credentials,
+# and VTOP_METRICS_ADDR=127.0.0.1:9090 for /metrics, /healthz and /readyz.
+EnvironmentFile=/etc/vtop/engine.env
+ExecStart=/usr/local/bin/vtopctl run --config /etc/vtop/config.yaml
+# SIGTERM is an orderly stop: the engine finishes the pass in progress and
+# flushes what it buffered. Give it one source pass plus one flush.
+KillSignal=SIGTERM
+TimeoutStopSec=120
+# A crash restarts the engine on this host; recovery resumes from the ledger.
+Restart=on-failure
+RestartSec=5
+# Limits: size them to batching.max_bytes times max_concurrent_batches, plus
+# the source client's buffers.
+MemoryMax=2G
+CPUQuota=200%
+LimitNOFILE=65536
+# The work directory is scratch the engine owns; keep it on a local disk.
+StateDirectory=vtop
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/vtop
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
