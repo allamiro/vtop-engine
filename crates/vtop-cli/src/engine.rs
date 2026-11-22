@@ -8900,8 +8900,6 @@ mod tests {
             .collect()
     }
 
-    /// Run passes until the batch at `start` reaches `state` (the batch
-    /// tasks run between passes), or fail after a bound.
     /// Runs passes of `source_type` until the ledger holds `n` batches that
     /// did not reach VERIFIED, and returns them: a window sealed in one pass
     /// stays in flight across cycles, and settles in a later one.
@@ -8928,6 +8926,8 @@ mod tests {
         panic!("{n} batches never failed");
     }
 
+    /// Run passes until the batch at `start` reaches `state` (the batch
+    /// tasks run between passes), or fail after a bound.
     async fn pass_until(engine: &mut Engine, start: u64, state: BatchState) {
         for _ in 0..200 {
             if states_of_range(engine, start).await.contains(&state) {
