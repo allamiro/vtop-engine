@@ -642,8 +642,12 @@ def main(argv: list[str] | None = None) -> int:
     comparable = comparable_block(args, plan, vtop_image, configs)
     if args.resume:
         run_dir = os.path.join(args.results, lab.check_run_id(args.resume))
-        env = schema.read_environment(run_dir)
-        runner.check_resume(env, comparable)
+        try:
+            env = schema.read_environment(run_dir)
+            runner.check_resume(env, comparable)
+        except schema.RunRefused as exc:
+            print(f"resume refused: {exc}", file=sys.stderr)
+            return 2
     else:
         run_id = lab.check_run_id(args.run_id or lab.new_run_id("spool"))
         run_dir = os.path.join(args.results, run_id)
