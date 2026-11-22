@@ -919,7 +919,7 @@ pub fn count_failure(sink: Sink) {
 /// The two counters, built and registered into `registry` and installed as
 /// the process's: for a process whose catalogue does not already define them
 /// (`vtop-node`; the engine's is `vtop_core::telemetry`).
-pub fn register_counters(registry: &prometheus::Registry) -> Result<(), prometheus::Error> {
+pub fn register_counters(registry: &vtop_surface::Registry) -> Result<(), prometheus::Error> {
     let events = IntCounterVec::new(
         prometheus::Opts::new("audit_events_total", EVENTS_HELP),
         &["action", "outcome"],

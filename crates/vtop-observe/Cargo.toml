@@ -13,6 +13,7 @@ http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true, features = ["client-legacy"] }
 prometheus = { workspace = true }
+vtop-surface = { workspace = true }
 rustls = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
