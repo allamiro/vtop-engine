@@ -1,0 +1,144 @@
+# The spool comparison's lab (#748): one Compose project per tool run, fresh volumes each time.
+#
+#   run.py drives it; by hand:
+#   TOOL_CONFIG=$PWD/benchmarks/spool_compare/tools/vector/acks.yaml VTOP_IMAGE=vtop-compare:<tree> \
+#     docker compose -p vtop748-try -f benchmarks/spool_compare/compose.yml up -d minio generator vector
+#
+# Every tool runs in the same limit class (#744 rule 12): TOOL_CPUS (2; 1 on a
+# hosted runner), TOOL_MEMORY (2g), no swap. A test reads these limits from this
+# file and fails if any tool differs. The generator writes the spool on a named
+# volume that every tool mounts read-only; each tool's state is its own named
+# volume. In crash and fault cells STORE_ALIAS=minio-real and the S3 tap takes
+# the name `minio`, so every tool reaches the store through it unchanged.
+
+x-tool-env: &tool-env
+  AWS_ACCESS_KEY_ID: minioadmin
+  AWS_SECRET_ACCESS_KEY: minioadmin
+  AWS_REGION: us-east-1
+  OTEL_SDK_DISABLED: "true"
+
+services:
+  minio:
+    image: vtop-minio:RELEASE.2025-09-07T16-13-09Z
+    pull_policy: never
+    command: ["server", "/data"]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      # The harness reads minio_s3_requests_total without a token (compare_common/store.py).
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+      MC_HOST_lab: http://minioadmin:minioadmin@127.0.0.1:9000
+    ports: ["127.0.0.1::9000"]
+    volumes: [minio-data:/data]
+    networks:
+      lab:
+        aliases: ["${STORE_ALIAS:-minio}"]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  tap:
+    image: ${HARNESS_IMAGE:-python:3.12.16-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b}
+    profiles: ["tap"]
+    working_dir: /bench
+    command: ["python", "-m", "compare_common.tap", "--listen", "0.0.0.0:9000", "--upstream", "minio-real:9000",
+              "--control", "0.0.0.0:9300", "--trace", "/logs/tap.csv"]
+    ports: ["127.0.0.1::9300"]
+    volumes:
+      - ${BENCH_DIR:-..}:/bench:ro
+      - ${RUN_LOGS:-/tmp}:/logs
+      # The tap kills the tool through the Docker Engine API (compare_common/docker_api.py).
+      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+    networks:
+      lab:
+        aliases: ["minio"]
+
+  generator:
+    image: ${HARNESS_IMAGE:-python:3.12.16-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b}
+    working_dir: /bench
+    command: ["python", "-m", "spool_compare.generator", "serve", "--spool", "/spool", "--control", "0.0.0.0:9400"]
+    ports: ["127.0.0.1::9400"]
+    volumes:
+      - ${BENCH_DIR:-..}:/bench:ro
+      - spool:/spool
+    networks: [lab]
+
+  # Makes the tools' state volumes writable by their users (VTOP runs as uid 10001).
+  volume-init:
+    image: ${HARNESS_IMAGE:-python:3.12.16-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b}
+    command: ["sh", "-c", "mkdir -p /vtop/state /vtop/work && chown -R 10001:10001 /vtop && chmod 0755 /spool"]
+    volumes:
+      - vtop-data:/vtop
+      - spool:/spool
+    networks: [lab]
+
+  vtop:
+    image: ${VTOP_IMAGE:-vtop-compare:missing}
+    pull_policy: never
+    profiles: ["vtop"]
+    environment:
+      <<: *tool-env
+      VTOP_CONFIG: /etc/vtop/config.yaml
+    volumes:
+      - ${TOOL_CONFIG:-/dev/null}:/etc/vtop/config.yaml:ro
+      - spool:/spool:ro
+      - vtop-data:/data
+    cpus: ${TOOL_CPUS:-2}
+    mem_limit: ${TOOL_MEMORY:-2g}
+    memswap_limit: ${TOOL_MEMORY:-2g}
+    networks: [lab]
+
+  vector:
+    image: timberio/vector:0.61.0-debian@sha256:f6c23b5a7e16fb2838d33619ef7acf4bad2289a7cf22bc90efc2371f520c4ea2
+    profiles: ["vector"]
+    command: ["--config", "/etc/vector/vector.yaml"]
+    environment: *tool-env
+    volumes:
+      - ${TOOL_CONFIG:-/dev/null}:/etc/vector/vector.yaml:ro
+      - spool:/spool:ro
+      - vector-data:/var/lib/vector
+    cpus: ${TOOL_CPUS:-2}
+    mem_limit: ${TOOL_MEMORY:-2g}
+    memswap_limit: ${TOOL_MEMORY:-2g}
+    networks: [lab]
+
+  fluent-bit:
+    image: fluent/fluent-bit:5.2.0@sha256:a48190bf67679495a332fd61025421a46e7e4d168380185a8e16da2e9acc3126
+    profiles: ["fluent-bit"]
+    command: ["/fluent-bit/bin/fluent-bit", "-c", "/fluent-bit/etc/bench.conf"]
+    environment: *tool-env
+    volumes:
+      - ${TOOL_CONFIG:-/dev/null}:/fluent-bit/etc/bench.conf:ro
+      - spool:/spool:ro
+      - fluent-bit-data:/data
+    cpus: ${TOOL_CPUS:-2}
+    mem_limit: ${TOOL_MEMORY:-2g}
+    memswap_limit: ${TOOL_MEMORY:-2g}
+    networks: [lab]
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.165.0@sha256:e40d61f10c9a617cca1ffd1be4d7e2b3a4b0f0001798ff07e58cabe82e618cea
+    profiles: ["otel-collector"]
+    command: ["--config", "/etc/otelcol/config.yaml"]
+    environment: *tool-env
+    volumes:
+      - ${TOOL_CONFIG:-/dev/null}:/etc/otelcol/config.yaml:ro
+      - spool:/spool:ro
+      - otel-data:/data
+    cpus: ${TOOL_CPUS:-2}
+    mem_limit: ${TOOL_MEMORY:-2g}
+    memswap_limit: ${TOOL_MEMORY:-2g}
+    networks: [lab]
+
+volumes:
+  spool:
+  minio-data:
+  vtop-data:
+  vector-data:
+  fluent-bit-data:
+  otel-data:
+
+networks:
+  lab:

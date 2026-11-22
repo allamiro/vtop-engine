@@ -1,0 +1,430 @@
+{
+  "kind": "spool",
+  "plan_version": 1,
+  "_comment": "What each spool run owes (#748). `minutes_per_run` is an estimate per system run, not a measurement; `python3 -m compare_common.plan spool_compare/plans.json <name>` prints the projection. Variant keys other than source and rotation are per-variant parameters. Lines are 200 bytes plus the newline.",
+  "plans": {
+    "smoke": {
+      "_comment": "Minutes on a laptop or a hosted runner: proves the stack, the generator's rotations, the checker and a rotation kill end to end on tiny data. Correctness only.",
+      "host_class": "laptop",
+      "systems": [
+        "fluent-bit",
+        "vtop",
+        "vector"
+      ],
+      "profiles": {
+        "fluent-bit": [
+          "durable"
+        ],
+        "vtop": [
+          "strong"
+        ],
+        "vector": [
+          "acks"
+        ]
+      },
+      "cells": [
+        {
+          "cell": "smoke",
+          "repetitions": 1,
+          "minutes_per_run": 3,
+          "variants": [
+            {
+              "source": "file",
+              "rotation": "rename"
+            },
+            {
+              "source": "syslog-spool",
+              "rotation": "copytruncate"
+            }
+          ],
+          "params": {
+            "records": 10000,
+            "rotate_bytes": 524288,
+            "seed": 748,
+            "timeout_minutes": 10
+          }
+        },
+        {
+          "cell": "crash-K4-rotation",
+          "repetitions": 1,
+          "minutes_per_run": 4,
+          "variants": [
+            {
+              "source": "file",
+              "rotation": "rename"
+            }
+          ],
+          "params": {
+            "records": 20000,
+            "rotate_bytes": 1048576,
+            "seed": 748,
+            "kills_per_run": 1,
+            "kill_seed": 748,
+            "seconds_range": [
+              2.0,
+              6.0
+            ],
+            "timeout_minutes": 10
+          }
+        }
+      ]
+    },
+    "hosted-crash": {
+      "_comment": "A GitHub-hosted runner (workflow_dispatch): crash-K1..K3, 9 kills per kind per tool, reduced backlog, 1 CPU per tool. Correctness only (#748 'Where it runs'); split from hosted-rotation so each fits one job.",
+      "host_class": "hosted",
+      "systems": [
+        "fluent-bit",
+        "vtop",
+        "vector"
+      ],
+      "profiles": {
+        "fluent-bit": [
+          "durable"
+        ],
+        "vtop": [
+          "strong"
+        ],
+        "vector": [
+          "acks",
+          "disk-buffer"
+        ]
+      },
+      "cells": [
+        {
+          "cell": "smoke",
+          "repetitions": 1,
+          "minutes_per_run": 3,
+          "variants": [
+            {
+              "source": "file",
+              "rotation": "rename"
+            }
+          ],
+          "params": {
+            "records": 10000,
+            "rotate_bytes": 524288,
+            "seed": 748
+          }
+        },
+        {
+          "cell": "crash-K1",
+          "repetitions": 3,
+          "minutes_per_run": 3,
+          "variants": [
+            {
+              "source": "file",
+              "rotation": "rename"
+            }
+          ],
+          "params": {
+            "records": 100000,
+            "rotate_bytes": 2097152,
+            "seed": 748,
+            "kills_per_run": 3,
+            "kill_seed": 748
+          }
+        },
+        {
+          "cell": "crash-K2",
+          "repetitions": 3,
+          "minutes_per_run": 3,
+          "variants": [
+            {
+              "source": "file",
+              "rotation": "rename"
+            }
+          ],
+          "params": {
+            "records": 100000,
+            "rotate_bytes": 2097152,
+            "seed": 748,
+            "kills_per_run": 3,
+            "kill_seed": 748
+          }
+        },
+        {
+          "cell": "crash-K3",
+          "repetitions": 3,
+          "minutes_per_run": 3,
+          "variants": [
+            {
+              "source": "file",
+              "rotation": "rename"
+            }
+          ],
+          "params": {
+            "records": 100000,
+            "rotate_bytes": 2097152,
+            "seed": 748,
+            "kills_per_run": 3,
+            "kill_seed": 748
+          }
+        }
+      ]
+    },
+    "hosted-rotation": {
+      "_comment": "A GitHub-hosted runner (workflow_dispatch): crash-K4-rotation and down-while-rotating in both rotation styles, reduced backlog, 1 CPU per tool. Correctness only.",
+      "host_class": "hosted",
+      "systems": [
+        "fluent-bit",
+        "vtop",
+        "vector"
+      ],
+      "profiles": {
+        "fluent-bit": [
+          "durable"
+        ],
+        "vtop": [
+          "strong"
+        ],
+        "vector": [
+          "acks",
+          "disk-buffer"
+        ]
+      },
+      "cells": [
+        {
+          "cell": "smoke",
+          "repetitions": 1,
+          "minutes_per_run": 3,
+          "variants": [
+            {
+              "source": "file",
+              "rotation": "rename"
+            }
+          ],
+          "params": {
+            "records": 10000,
+            "rotate_bytes": 524288,
+            "seed": 748
+          }
+        },
+        {
+          "cell": "crash-K4-rotation",
+          "repetitions": 3,
+          "minutes_per_run": 3,
+          "variants": [
+            {
+              "source": "file",
+              "rotation": "rename"
+            },
+            {
+              "source": "file",
+              "rotation": "copytruncate"
+            }
+          ],
+          "params": {
+            "records": 100000,
+            "rotate_bytes": 2097152,
+            "seed": 748,
+            "kills_per_run": 3,
+            "kill_seed": 748
+          }
+        },
+        {
+          "cell": "down-while-rotating",
+          "repetitions": 3,
+          "minutes_per_run": 3,
+          "variants": [
+            {
+              "source": "file",
+              "rotation": "rename"
+            },
+            {
+              "source": "file",
+              "rotation": "copytruncate"
+            }
+          ],
+          "params": {
+            "records": 100000,
+            "rotate_bytes": 2097152,
+            "seed": 748
+          }
+        }
+      ]
+    },
+    "full": {
+      "_comment": "The dedicated Linux host: every cell at the sizes #748 names (a 4 GiB backlog is 21,474,836 lines of 200 bytes).",
+      "host_class": "dedicated",
+      "systems": [
+        "fluent-bit",
+        "vtop",
+        "vector"
+      ],
+      "profiles": {
+        "fluent-bit": [
+          "durable"
+        ],
+        "vtop": [
+          "strong"
+        ],
+        "vector": [
+          "acks",
+          "disk-buffer"
+        ]
+      },
+      "cells": [
+        {
+          "cell": "smoke",
+          "repetitions": 1,
+          "minutes_per_run": 3,
+          "variants": [
+            {
+              "source": "file",
+              "rotation": "rename"
+            },
+            {
+              "source": "syslog-spool",
+              "rotation": "copytruncate"
+            }
+          ],
+          "params": {
+            "records": 10000,
+            "rotate_bytes": 524288,
+            "seed": 748
+          }
+        },
+        {
+          "cell": "drain",
+          "repetitions": 3,
+          "minutes_per_run": 12,
+          "variants": [
+            {
+              "source": "file",
+              "rotation": "rename"
+            },
+            {
+              "source": "syslog-spool",
+              "rotation": "rename"
+            }
+          ],
+          "params": {
+            "records": 21474836,
+            "rotate_bytes": 67108864,
+            "seed": 748,
+            "timeout_minutes": 90
+          }
+        },
+        {
+          "cell": "live",
+          "repetitions": 3,
+          "minutes_per_run": 14,
+          "profiles": {
+            "vector": [
+              "acks"
+            ]
+          },
+          "variants": [
+            {
+              "source": "file",
+              "rotation": "rename"
+            }
+          ],
+          "params": {
+            "live_fraction": 0.5,
+            "warmup_seconds": 120,
+            "measure_seconds": 600,
+            "rotate_bytes": 67108864,
+            "seed": 748
+          }
+        },
+        {
+          "cell": "crash-K1",
+          "repetitions": 3,
+          "minutes_per_run": 8,
+          "variants": [
+            {
+              "source": "file",
+              "rotation": "rename"
+            }
+          ],
+          "params": {
+            "records": 1500000,
+            "rotate_bytes": 67108864,
+            "seed": 748,
+            "kills_per_run": 3,
+            "kill_seed": 748
+          }
+        },
+        {
+          "cell": "crash-K2",
+          "repetitions": 3,
+          "minutes_per_run": 8,
+          "variants": [
+            {
+              "source": "file",
+              "rotation": "rename"
+            }
+          ],
+          "params": {
+            "records": 1500000,
+            "rotate_bytes": 67108864,
+            "seed": 748,
+            "kills_per_run": 3,
+            "kill_seed": 748
+          }
+        },
+        {
+          "cell": "crash-K3",
+          "repetitions": 3,
+          "minutes_per_run": 8,
+          "variants": [
+            {
+              "source": "file",
+              "rotation": "rename"
+            }
+          ],
+          "params": {
+            "records": 1500000,
+            "rotate_bytes": 67108864,
+            "seed": 748,
+            "kills_per_run": 3,
+            "kill_seed": 748
+          }
+        },
+        {
+          "cell": "crash-K4-rotation",
+          "repetitions": 3,
+          "minutes_per_run": 8,
+          "variants": [
+            {
+              "source": "file",
+              "rotation": "rename"
+            },
+            {
+              "source": "file",
+              "rotation": "copytruncate"
+            }
+          ],
+          "params": {
+            "records": 1500000,
+            "rotate_bytes": 16777216,
+            "seed": 748,
+            "kills_per_run": 3,
+            "kill_seed": 748
+          }
+        },
+        {
+          "cell": "down-while-rotating",
+          "repetitions": 3,
+          "minutes_per_run": 8,
+          "variants": [
+            {
+              "source": "file",
+              "rotation": "rename"
+            },
+            {
+              "source": "file",
+              "rotation": "copytruncate"
+            }
+          ],
+          "params": {
+            "records": 1500000,
+            "rotate_bytes": 16777216,
+            "seed": 748
+          }
+        }
+      ]
+    }
+  }
+}
