@@ -1116,6 +1116,13 @@ fn jitter_seed(part: u32, attempt: u32) -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
+    mix_seed(nanos, part, attempt)
+}
+
+/// The clock reading folded with the part and the attempt, so parts that fail
+/// at the same instant still draw different waits. Apart from the clock it
+/// is a function of its arguments, which is what lets a test fix the clock.
+fn mix_seed(nanos: u64, part: u32, attempt: u32) -> u64 {
     nanos ^ (u64::from(part) << 32) ^ u64::from(attempt)
 }
 
@@ -2004,7 +2011,7 @@ mod tests {
     }
 
     /// ...and on failure, with what the session keeps, and then on the resume.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn the_report_says_what_was_kept_and_what_a_resume_reused() {
         let (file, data, digest) = three_part_file(2);
         let state = tempfile::tempdir().unwrap();
@@ -2217,5 +2224,846 @@ mod tests {
             .await
             .unwrap();
         assert!(v.passed && !v.backend_limited, "{v:?}");
+    }
+
+    // ---- #729: what the resumable upload accepts, refuses and keeps ----
+
+    /// A call that never ends is a failure of its own, not a hung test: a
+    /// retry loop that loses its bound would otherwise stall the suite.
+    async fn bounded<F: std::future::Future>(call: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(60), call)
+            .await
+            .expect("the upload call never finished: its retries must be bounded")
+    }
+
+    async fn upload_resumable(
+        backend: &dyn UploadBackend,
+        cfg: &MultipartUploadConfig,
+        local_path: &Path,
+        object_uri: &str,
+        checksum: Option<ObjectChecksum<'_>>,
+        fence: MultipartFence,
+    ) -> Result<StoredObject, VtopError> {
+        bounded(super::upload_resumable(
+            backend, cfg, local_path, object_uri, checksum, fence,
+        ))
+        .await
+    }
+
+    async fn upload_resumable_with_report(
+        backend: &dyn UploadBackend,
+        cfg: &MultipartUploadConfig,
+        local_path: &Path,
+        object_uri: &str,
+        checksum: Option<ObjectChecksum<'_>>,
+        fence: MultipartFence,
+        report: &mut MultipartReport,
+    ) -> Result<StoredObject, VtopError> {
+        bounded(super::upload_resumable_with_report(
+            backend, cfg, local_path, object_uri, checksum, fence, report,
+        ))
+        .await
+    }
+
+    /// The operator-facing events a test run logged, by their `event` field.
+    #[derive(Clone, Default)]
+    struct EventLog(Arc<std::sync::Mutex<Vec<String>>>);
+
+    struct EventName(Option<String>);
+
+    impl tracing::field::Visit for EventName {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "event" {
+                self.0 = Some(value.to_owned());
+            }
+        }
+        fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+    }
+
+    impl tracing::Subscriber for EventLog {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut name = EventName(None);
+            event.record(&mut name);
+            if let Some(name) = name.0 {
+                self.0.lock().unwrap().push(name);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    impl EventLog {
+        fn count(&self, event: &str) -> usize {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| *e == event)
+                .count()
+        }
+    }
+
+    fn requested(mode: crate::base::ObjectLockMode, hold: bool) -> crate::base::RequestedRetention {
+        crate::base::RequestedRetention {
+            mode,
+            retain_until_unix_secs: 4_000_000_000,
+            legal_hold: hold,
+        }
+    }
+
+    fn lock_policy(mode: crate::base::ObjectLockMode, hold: bool) -> crate::base::ObjectLockPolicy {
+        crate::base::ObjectLockPolicy::from_config(&crate::base::ObjectLockConfig {
+            mode,
+            retain_days: 30,
+            legal_hold: hold,
+        })
+    }
+
+    /// A session an earlier process left, with nothing uploaded yet.
+    fn earlier_session(
+        uri: &str,
+        local: &Path,
+        fence: &MultipartFence,
+        part_size: u64,
+        retention: Option<crate::base::RequestedRetention>,
+    ) -> MultipartSession {
+        let now = now_unix_secs();
+        MultipartSession {
+            schema_version: SESSION_SCHEMA,
+            backend_id: "mock".into(),
+            object_uri: uri.into(),
+            local_path: local.to_path_buf(),
+            upload_id: "mpu-earlier".into(),
+            part_size_bytes: part_size,
+            fence: fence.clone(),
+            phase: MultipartSessionPhase::InProgress,
+            parts: BTreeMap::new(),
+            created_at_unix_secs: now,
+            updated_at_unix_secs: now,
+            completed_version_id: None,
+            retention,
+        }
+    }
+
+    /// The wait is the first output of splitmix64 seeded with the `seed`,
+    /// scaled into `[0, ceiling]`: the published test vectors of that
+    /// generator for seeds 0 and 1, so the draw is uniform and the same on
+    /// every platform.
+    #[test]
+    fn the_jitter_is_a_uniform_draw_of_the_seed() {
+        let backoff = PartBackoff {
+            base: Duration::from_secs(1_000),
+            cap: Duration::from_secs(1_000),
+        };
+        for (seed, output) in [
+            (0_u64, 0xe220_a839_7b1d_cdaf_u64),
+            (1, 0x910a_2dec_8902_5cc1),
+        ] {
+            let fraction = (output >> 11) as f64 / (1_u64 << 53) as f64;
+            assert_eq!(
+                backoff.delay(1, seed),
+                Duration::from_secs(1_000).mul_f64(fraction),
+                "seed {seed}"
+            );
+        }
+        // A draw never exceeds its ceiling, whatever the seed.
+        let default = PartBackoff::default();
+        for seed in (0..2_000_u64).map(|n| n.wrapping_mul(0x9e37_79b9_7f4a_7c15)) {
+            assert!(default.delay(2, seed) <= default.ceiling(2), "seed {seed}");
+        }
+    }
+
+    /// Parts that fail at the same instant must not draw the same wait: the
+    /// seed differs for every part and every attempt, whatever the clock.
+    #[test]
+    fn the_seed_differs_for_every_part_and_attempt_at_one_clock_reading() {
+        let nanos = 0x0123_4567_89ab_cdef_u64;
+        let seeds: std::collections::BTreeSet<u64> = (1..=8_u32)
+            .flat_map(|part| (1..=8_u32).map(move |attempt| mix_seed(nanos, part, attempt)))
+            .collect();
+        assert_eq!(seeds.len(), 64);
+        assert_ne!(jitter_seed(1, 1), jitter_seed(2, 1));
+    }
+
+    #[test]
+    fn a_session_is_not_taken_for_an_object_of_no_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MultipartUploadConfig {
+            threshold_bytes: 0,
+            ..cfg(dir.path(), 1_000)
+        };
+        let backend = MockBackend::new();
+        assert!(!cfg.should_multipart(&backend, 0), "nothing to send");
+        assert!(cfg.should_multipart(&backend, 1));
+        let cfg = MultipartUploadConfig {
+            threshold_bytes: 5_000,
+            ..cfg
+        };
+        assert!(!cfg.should_multipart(&backend, 4_999));
+        assert!(
+            cfg.should_multipart(&backend, 5_000),
+            "the threshold itself multiparts"
+        );
+    }
+
+    /// A session file that is already gone is deleted; one that cannot be
+    /// deleted for another reason is an error the caller sees.
+    #[test]
+    fn deleting_a_session_tolerates_a_missing_file_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        delete_session(&dir.path().join("absent.multipart.json")).unwrap();
+        let present = dir.path().join("present.multipart.json");
+        std::fs::write(&present, b"{}").unwrap();
+        delete_session(&present).unwrap();
+        assert!(!present.exists());
+        // A directory is not a file the sweep may remove.
+        let not_a_file = dir.path().join("dir.multipart.json");
+        std::fs::create_dir(&not_a_file).unwrap();
+        let err = delete_session(&not_a_file).unwrap_err();
+        assert!(
+            err.to_string().contains("deleting multipart session"),
+            "{err}"
+        );
+    }
+
+    /// Each unusable setting is refused ON ITS OWN, before anything is sent.
+    #[tokio::test]
+    async fn every_unusable_tuning_value_is_refused_alone() {
+        let (file, data, digest) = three_part_file(7);
+        let state = tempfile::tempdir().unwrap();
+        let backend = MockBackend::new();
+        let good = cfg(state.path(), 1_000);
+        let broken = [
+            MultipartUploadConfig {
+                part_size_bytes: 0,
+                ..good.clone()
+            },
+            MultipartUploadConfig {
+                max_parallelism: 0,
+                ..good.clone()
+            },
+            MultipartUploadConfig {
+                part_attempts: 0,
+                ..good.clone()
+            },
+        ];
+        for bad in broken {
+            let err = upload_resumable(
+                &backend,
+                &bad,
+                file.path(),
+                "s3://b/tuning.raw",
+                Some(ObjectChecksum::new("blake3", &digest)),
+                fence(&digest, data.len() as u64, 1),
+            )
+            .await
+            .expect_err("a zero tuning value must be refused");
+            assert!(matches!(err, VtopError::Config(_)), "{err:?}");
+        }
+        assert_eq!(backend.part_sends_total(), 0);
+    }
+
+    /// The widest pool the limit allows is accepted; one past it is not.
+    #[tokio::test]
+    async fn a_parallelism_at_the_permit_limit_is_accepted() {
+        let (file, data, digest) = three_part_file(8);
+        let state = tempfile::tempdir().unwrap();
+        let backend = MockBackend::new();
+        let at_limit = MultipartUploadConfig {
+            max_parallelism: MAX_SEMAPHORE_PERMITS,
+            ..cfg(state.path(), 1_000)
+        };
+        upload_resumable(
+            &backend,
+            &at_limit,
+            file.path(),
+            "s3://b/wide.raw",
+            Some(ObjectChecksum::new("blake3", &digest)),
+            fence(&digest, data.len() as u64, 1),
+        )
+        .await
+        .expect("a pool as wide as the limit is a plan, not a typo");
+        let past = MultipartUploadConfig {
+            max_parallelism: MAX_SEMAPHORE_PERMITS + 1,
+            ..at_limit
+        };
+        assert!(upload_resumable(
+            &backend,
+            &past,
+            file.path(),
+            "s3://b/wider.raw",
+            Some(ObjectChecksum::new("blake3", &digest)),
+            fence(&digest, data.len() as u64, 1),
+        )
+        .await
+        .is_err());
+    }
+
+    /// The fence describes the bytes the checksum describes: a different
+    /// digest or a different algorithm is refused, each alone; the
+    /// algorithm's spelling is not compared by case.
+    #[tokio::test]
+    async fn a_checksum_that_disagrees_with_the_fence_is_refused() {
+        let (file, data, digest) = three_part_file(9);
+        let state = tempfile::tempdir().unwrap();
+        let backend = MockBackend::new();
+        let cfg = cfg(state.path(), 1_000);
+        let other_digest = vtop_core::checksum::blake3_bytes(b"other bytes");
+        let sha = vtop_core::checksum::sha256_bytes(&data);
+        for (algorithm, hex) in [
+            ("blake3", other_digest.as_str()),
+            ("sha256", digest.as_str()),
+            ("sha256", sha.as_str()),
+        ] {
+            let err = upload_resumable(
+                &backend,
+                &cfg,
+                file.path(),
+                "s3://b/fence-digest.raw",
+                Some(ObjectChecksum::new(algorithm, hex)),
+                fence(&digest, data.len() as u64, 1),
+            )
+            .await
+            .expect_err("the checksum names other bytes than the fence");
+            assert!(
+                err.to_string().contains("disagrees with upload checksum"),
+                "{err}"
+            );
+        }
+        assert_eq!(backend.part_sends_total(), 0);
+        upload_resumable(
+            &backend,
+            &cfg,
+            file.path(),
+            "s3://b/fence-digest.raw",
+            Some(ObjectChecksum::new("BLAKE3", &digest)),
+            fence(&digest, data.len() as u64, 1),
+        )
+        .await
+        .expect("the same digest and algorithm, spelled in capitals");
+    }
+
+    /// Completed an object, then leave behind the session a crash between the
+    /// store's answer and the delete would leave: `Completed`, naming
+    /// `version` and `retention`.
+    async fn completed_object_with_session(
+        backend: &MockBackend,
+        state: &Path,
+        file: &Path,
+        (digest, len): (&str, u64),
+        uri: &str,
+        version: Option<&str>,
+        retention: Option<crate::base::RequestedRetention>,
+    ) {
+        let (first, _) = run(backend, &cfg(state, 1_000), file, uri, digest, len).await;
+        first.unwrap();
+        let f = fence(digest, len, 1);
+        let mut session = earlier_session(uri, file, &f, 1_000, retention);
+        session.phase = MultipartSessionPhase::Completed;
+        session.completed_version_id = version.map(str::to_owned);
+        save_session(&session_path(state, uri, &f), &session).unwrap();
+    }
+
+    /// A call that finds its upload already completed re-verifies the object
+    /// and cites the version the session recorded, with the lock it carries:
+    /// a version the session pinned, not one the current key has moved to.
+    #[tokio::test]
+    async fn a_completed_session_returns_its_pinned_version_and_its_lock() {
+        let (file, data, digest) = three_part_file(10);
+        let state = tempfile::tempdir().unwrap();
+        let backend = MockBackend::new();
+        let uri = "s3://b/pinned.raw";
+        let lock = requested(crate::base::ObjectLockMode::Governance, true);
+        completed_object_with_session(
+            &backend,
+            state.path(),
+            file.path(),
+            (&digest, data.len() as u64),
+            uri,
+            Some("v-pinned"),
+            Some(lock),
+        )
+        .await;
+        let (result, report) = run(
+            &backend,
+            &cfg(state.path(), 1_000),
+            file.path(),
+            uri,
+            &digest,
+            data.len() as u64,
+        )
+        .await;
+        let stored = result.unwrap();
+        assert_eq!(stored.version_id.as_deref(), Some("v-pinned"));
+        assert_eq!(stored.retention, Some(lock));
+        assert!(report.completed && !report.resumed, "{report:?}");
+        assert!(
+            std::fs::read_dir(state.path()).unwrap().next().is_none(),
+            "the finished session is removed"
+        );
+    }
+
+    /// An empty recorded version names nothing: it is never cited.
+    #[tokio::test]
+    async fn an_empty_recorded_version_is_not_cited() {
+        let (file, data, digest) = three_part_file(11);
+        let state = tempfile::tempdir().unwrap();
+        let backend = MockBackend::new();
+        let uri = "s3://b/unpinned.raw";
+        let lock = requested(crate::base::ObjectLockMode::Compliance, false);
+        for (n, version) in [Some(""), None].into_iter().enumerate() {
+            let uri = format!("{uri}-{n}");
+            completed_object_with_session(
+                &backend,
+                state.path(),
+                file.path(),
+                (&digest, data.len() as u64),
+                &uri,
+                version,
+                Some(lock),
+            )
+            .await;
+            let (result, _) = run(
+                &backend,
+                &cfg(state.path(), 1_000),
+                file.path(),
+                &uri,
+                &digest,
+                data.len() as u64,
+            )
+            .await;
+            let stored = result.unwrap();
+            assert_eq!(stored.version_id, None, "{version:?}");
+            assert_eq!(stored.retention, Some(lock), "{version:?}");
+        }
+    }
+
+    /// The re-check of an already completed upload is the strong one: a
+    /// store that cannot read the body back, or that reads another one,
+    /// does not complete it.
+    #[tokio::test]
+    async fn a_completed_session_is_accepted_only_on_a_strong_verification() {
+        let (file, data, digest) = three_part_file(12);
+        let len = data.len() as u64;
+        for (backend, says) in [
+            (MockBackend::limited(), "could not strongly verify"),
+            (MockBackend::failing(), "could not strongly verify"),
+        ] {
+            let state = tempfile::tempdir().unwrap();
+            let uri = "s3://b/recheck.raw";
+            completed_object_with_session(
+                &backend,
+                state.path(),
+                file.path(),
+                (&digest, len),
+                uri,
+                Some("v1"),
+                None,
+            )
+            .await;
+            let (result, report) = run(
+                &backend,
+                &cfg(state.path(), 1_000),
+                file.path(),
+                uri,
+                &digest,
+                len,
+            )
+            .await;
+            let err = result.expect_err("a weak or failed re-check must not complete the object");
+            assert!(err.to_string().contains(says), "{err}");
+            assert!(!report.completed, "{report:?}");
+        }
+    }
+
+    /// A throttle the store answers to a request that is not a part is still
+    /// a throttle in the report, so the engine's width controller sees it.
+    #[tokio::test]
+    async fn a_throttle_on_a_request_that_is_not_a_part_is_counted() {
+        let (file, data, digest) = three_part_file(13);
+        let len = data.len() as u64;
+        let state = tempfile::tempdir().unwrap();
+        let backend = MockBackend::new().with_head_fault(crate::HeadFault::Throttled);
+        let uri = "s3://b/head-throttle.raw";
+        completed_object_with_session(
+            &backend,
+            state.path(),
+            file.path(),
+            (&digest, len),
+            uri,
+            Some("v1"),
+            None,
+        )
+        .await;
+        let (result, report) = run(
+            &backend,
+            &cfg(state.path(), 1_000),
+            file.path(),
+            uri,
+            &digest,
+            len,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(VtopError::UploadThrottled(_))),
+            "{result:?}"
+        );
+        assert_eq!(
+            (report.requests, report.throttled_requests),
+            (2, 1),
+            "the read-back and the head, the head throttled"
+        );
+    }
+
+    /// A kept part whose bytes no longer match the local file is not trusted:
+    /// it is sent again, and only it.
+    #[tokio::test]
+    async fn a_kept_part_that_no_longer_matches_the_local_bytes_is_sent_again() {
+        let (file, data, digest) = three_part_file(14);
+        let len = data.len() as u64;
+        let state = tempfile::tempdir().unwrap();
+        let fail_after = Arc::new(AtomicUsize::new(2));
+        let backend = MockBackend::new().with_multipart_fail_after_parts(fail_after.clone());
+        let mut cfg = cfg(state.path(), 1_000);
+        cfg.max_parallelism = 1;
+        let uri = "s3://b/revalidate.raw";
+        let (result, _) = run(&backend, &cfg, file.path(), uri, &digest, len).await;
+        result.expect_err("interrupted after two parts");
+        let path = session_path(state.path(), uri, &fence(&digest, len, 1));
+        let mut session = load_session(&path).unwrap();
+        assert_eq!(session.parts.len(), 2);
+        session.parts.get_mut(&1).unwrap().part_digest_hex = "0".repeat(64);
+        save_session(&path, &session).unwrap();
+
+        fail_after.store(usize::MAX, Ordering::SeqCst);
+        let (result, report) = run(&backend, &cfg, file.path(), uri, &digest, len).await;
+        result.unwrap();
+        assert_eq!(report.parts_reused, 1, "only part 2 is still trusted");
+        assert_eq!(backend.part_sends(1), 2, "part 1 is sent again");
+        assert_eq!(backend.part_sends(2), 1, "part 2 is not");
+    }
+
+    /// A retry notice is let through again once the whole window has passed,
+    /// not a moment after it.
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_notice_is_admitted_when_the_window_has_just_passed() {
+        let notices = RetryNotices::new(Duration::from_secs(60));
+        assert_eq!(notices.admit(), Some(0));
+        tokio::time::advance(Duration::from_secs(59)).await;
+        assert_eq!(notices.admit(), None);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(
+            notices.admit(),
+            Some(1),
+            "60 s after the notice is the next one"
+        );
+    }
+
+    #[test]
+    fn a_url_without_a_query_is_left_as_it_is() {
+        let text = "PUT https://bucket.s3.example.com/key/part failed; see s3://b/k";
+        assert_eq!(redact_urls(text), text);
+        assert_eq!(
+            redact_urls("https://u:p@host.example/a#frag and http://h.example"),
+            "https://host.example/a?[redacted] and http://h.example"
+        );
+    }
+
+    /// The sizes the resume notice speaks in.
+    #[test]
+    fn sizes_are_spoken_in_the_largest_unit_they_fill() {
+        const KIB: u64 = 1024;
+        for (bytes, said) in [
+            (0, "0 bytes"),
+            (1_023, "1023 bytes"),
+            (KIB, "1.0 KiB"),
+            (1_536, "1.5 KiB"),
+            (KIB * KIB - 1, "1024.0 KiB"),
+            (KIB * KIB, "1.0 MiB"),
+            (KIB * KIB * 5 / 2, "2.5 MiB"),
+            (KIB * KIB * KIB - 1, "1024.0 MiB"),
+            (KIB * KIB * KIB, "1.0 GiB"),
+            (KIB * KIB * KIB * 7 / 2, "3.5 GiB"),
+        ] {
+            assert_eq!(human_bytes(bytes), said, "{bytes} bytes");
+        }
+    }
+
+    /// The sweep leaves a session younger than the abandon window alone and
+    /// takes one as old as it (a window of zero takes every session).
+    #[tokio::test]
+    async fn the_sweep_leaves_a_young_session_and_takes_one_as_old_as_the_window() {
+        let (file, data, digest) = three_part_file(15);
+        let len = data.len() as u64;
+        let state = tempfile::tempdir().unwrap();
+        let backend =
+            MockBackend::new().with_multipart_fail_after_parts(Arc::new(AtomicUsize::new(1)));
+        let uri = "s3://b/young.raw";
+        let mut cfg = cfg(state.path(), 1_000);
+        let (result, _) = run(&backend, &cfg, file.path(), uri, &digest, len).await;
+        result.expect_err("interrupted");
+        let path = session_path(state.path(), uri, &fence(&digest, len, 1));
+
+        cfg.abandon_after_secs = 3_600;
+        assert_eq!(cleanup_abandoned(&backend, &cfg).await.unwrap(), 0);
+        assert!(path.exists(), "a young session is kept");
+        assert_eq!(backend.pending_multipart_count(), 1);
+
+        cfg.abandon_after_secs = 0;
+        assert_eq!(cleanup_abandoned(&backend, &cfg).await.unwrap(), 1);
+        assert!(!path.exists());
+        assert_eq!(backend.pending_multipart_count(), 0);
+    }
+
+    /// The sweep removes a session the store no longer holds, and a completed
+    /// one, without asking the store to abort anything.
+    #[tokio::test]
+    async fn the_sweep_removes_what_the_store_has_already_dropped() {
+        let (file, data, digest) = three_part_file(16);
+        let len = data.len() as u64;
+        let state = tempfile::tempdir().unwrap();
+        let backend = MockBackend::new().with_failing_abort();
+        let mut cfg = cfg(state.path(), 1_000);
+        cfg.abandon_after_secs = 0;
+        let f = fence(&digest, len, 1);
+        let mut completed = earlier_session("s3://b/done.raw", file.path(), &f, 1_000, None);
+        completed.phase = MultipartSessionPhase::Completed;
+        let path = session_path(state.path(), "s3://b/done.raw", &f);
+        save_session(&path, &completed).unwrap();
+        // Not a session file: never touched.
+        let other = state.path().join("notes.txt");
+        std::fs::write(&other, b"keep").unwrap();
+
+        assert_eq!(cleanup_abandoned(&backend, &cfg).await.unwrap(), 1);
+        assert!(!path.exists() && other.exists());
+
+        // An in-progress one the store dropped: its abort answers "gone",
+        // which is what the sweep wanted.
+        let backend = MockBackend::new();
+        let gone = earlier_session("s3://b/gone.raw", file.path(), &f, 1_000, None);
+        let path = session_path(state.path(), "s3://b/gone.raw", &f);
+        save_session(&path, &gone).unwrap();
+        assert_eq!(cleanup_abandoned(&backend, &cfg).await.unwrap(), 1);
+        assert!(!path.exists());
+    }
+
+    /// Leaves the session an interrupted upload (one part sent, then a fault)
+    /// leaves behind, and returns the backend that holds its upload.
+    async fn leave_interrupted_session(
+        failing_abort: bool,
+        state: &Path,
+        file: &Path,
+        (digest, len): (&str, u64),
+        uri: &str,
+    ) -> MockBackend {
+        let backend =
+            MockBackend::new().with_multipart_fail_after_parts(Arc::new(AtomicUsize::new(1)));
+        let backend = if failing_abort {
+            backend.with_failing_abort()
+        } else {
+            backend
+        };
+        let (result, _) = run(&backend, &cfg(state, 1_000), file, uri, digest, len).await;
+        result.expect_err("interrupted");
+        backend
+    }
+
+    /// An operator's abort ends the store's upload and forgets the session;
+    /// an upload the store already dropped needs nothing; a failed abort
+    /// keeps the session so it can be tried again; a finished session has
+    /// nothing to abort.
+    #[tokio::test]
+    async fn aborting_a_session_ends_the_upload_and_keeps_the_record_until_it_has() {
+        let (file, data, digest) = three_part_file(17);
+        let len = data.len() as u64;
+        let f = fence(&digest, len, 1);
+        let uri = "s3://b/abort.raw";
+        let (file, digest) = (file.path(), digest.as_str());
+
+        // Aborted at the store and forgotten.
+        let state = tempfile::tempdir().unwrap();
+        let backend =
+            leave_interrupted_session(false, state.path(), file, (digest, len), uri).await;
+        assert_eq!(backend.pending_multipart_count(), 1);
+        abort_session(&backend, state.path(), uri, &f)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.pending_multipart_count(),
+            0,
+            "the upload was aborted"
+        );
+        assert!(!session_path(state.path(), uri, &f).exists());
+
+        // Already dropped by the store: nothing left to abort.
+        let state = tempfile::tempdir().unwrap();
+        let backend =
+            leave_interrupted_session(false, state.path(), file, (digest, len), uri).await;
+        backend.expire_pending_multiparts();
+        abort_session(&backend, state.path(), uri, &f)
+            .await
+            .unwrap();
+        assert!(!session_path(state.path(), uri, &f).exists());
+
+        // The store refuses: the error is returned and the record stays.
+        let state = tempfile::tempdir().unwrap();
+        let backend = leave_interrupted_session(true, state.path(), file, (digest, len), uri).await;
+        abort_session(&backend, state.path(), uri, &f)
+            .await
+            .expect_err("a failed abort is an error");
+        assert!(session_path(state.path(), uri, &f).exists());
+        assert_eq!(backend.pending_multipart_count(), 1);
+
+        // A finished session: removed, with no abort sent.
+        let state = tempfile::tempdir().unwrap();
+        let backend = MockBackend::new().with_failing_abort();
+        let mut done = earlier_session(uri, file, &f, 1_000, None);
+        done.phase = MultipartSessionPhase::Completed;
+        save_session(&session_path(state.path(), uri, &f), &done).unwrap();
+        abort_session(&backend, state.path(), uri, &f)
+            .await
+            .unwrap();
+        assert!(!session_path(state.path(), uri, &f).exists());
+
+        // No session: nothing to do.
+        abort_session(&backend, state.path(), uri, &f)
+            .await
+            .unwrap();
+    }
+
+    /// A session is refused for the lock only where its mode or legal hold
+    /// differs from what the backend asks for, or it has none, or its lock
+    /// has ended; a backend that asks for no lock accepts any session.
+    #[test]
+    fn a_session_whose_lock_cannot_serve_this_backend_says_why() {
+        use crate::base::ObjectLockMode::{Compliance, Governance};
+        let dir = tempfile::tempdir().unwrap();
+        let f = fence("ab", 1, 1);
+        let session = |retention| earlier_session("s3://b/k", dir.path(), &f, 1_000, retention);
+        let backend = MockBackend::new().with_object_lock(lock_policy(Governance, false));
+
+        assert_eq!(
+            lock_mismatch(&session(Some(requested(Governance, false))), &backend),
+            None
+        );
+        assert_eq!(
+            lock_mismatch(&session(None), &backend).as_deref(),
+            Some("without an Object Lock")
+        );
+        assert_eq!(
+            lock_mismatch(&session(Some(requested(Compliance, false))), &backend).as_deref(),
+            Some("under mode compliance with legal_hold=false, not mode governance with legal_hold=false")
+        );
+        assert_eq!(
+            lock_mismatch(&session(Some(requested(Governance, true))), &backend).as_deref(),
+            Some("under mode governance with legal_hold=true, not mode governance with legal_hold=false")
+        );
+        let ended = crate::base::RequestedRetention {
+            retain_until_unix_secs: 1_000,
+            ..requested(Governance, false)
+        };
+        assert!(lock_mismatch(&session(Some(ended)), &backend)
+            .unwrap()
+            .starts_with("under a retention that ended at"));
+        // No lock asked for: whatever the session carries is left as it is.
+        let unlocked = MockBackend::new();
+        assert_eq!(lock_mismatch(&session(None), &unlocked), None);
+        assert_eq!(
+            lock_mismatch(&session(Some(requested(Compliance, true))), &unlocked),
+            None
+        );
+    }
+
+    /// An upload the store cannot continue is abandoned; when even the abort
+    /// fails the operator is told its parts stay at the store, and when the
+    /// store says it is gone already there is nothing to tell.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_abort_of_a_lost_upload_is_logged_and_a_gone_one_is_not() {
+        let (file, data, digest) = three_part_file(18);
+        let len = data.len() as u64;
+        for (failing_abort, logged) in [(false, 0), (true, 1)] {
+            let state = tempfile::tempdir().unwrap();
+            let backend = MockBackend::new().with_part_fault(1, crate::PartFault::SessionGone, 1);
+            let backend = if failing_abort {
+                backend.with_failing_abort()
+            } else {
+                backend
+            };
+            let log = EventLog::default();
+            let _guard = tracing::subscriber::set_default(log.clone());
+            let (result, report) = run(
+                &backend,
+                &cfg(state.path(), 1_000),
+                file.path(),
+                "s3://b/lost.raw",
+                &digest,
+                len,
+            )
+            .await;
+            result.unwrap();
+            assert!(report.restarted && report.completed, "{report:?}");
+            assert_eq!(log.count("multipart_session_restarted"), 1);
+            assert_eq!(
+                log.count("multipart_abort_failed"),
+                logged,
+                "failing: {failing_abort}"
+            );
+        }
+    }
+
+    /// A session created without the lock this backend asks for is aborted
+    /// and replaced; as above, only a failed abort is the operator's news.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_abort_of_a_session_without_the_lock_is_logged_and_a_gone_one_is_not() {
+        use crate::base::ObjectLockMode::Governance;
+        let (file, data, digest) = three_part_file(19);
+        let len = data.len() as u64;
+        for (failing_abort, logged) in [(false, 0), (true, 1)] {
+            let state = tempfile::tempdir().unwrap();
+            let backend = MockBackend::new().with_object_lock(lock_policy(Governance, false));
+            let backend = if failing_abort {
+                backend.with_failing_abort()
+            } else {
+                backend
+            };
+            let uri = "s3://b/unlocked-session.raw";
+            let f = fence(&digest, len, 1);
+            save_session(
+                &session_path(state.path(), uri, &f),
+                &earlier_session(uri, file.path(), &f, 1_000, None),
+            )
+            .unwrap();
+            let log = EventLog::default();
+            let _guard = tracing::subscriber::set_default(log.clone());
+            let (result, report) = run(
+                &backend,
+                &cfg(state.path(), 1_000),
+                file.path(),
+                uri,
+                &digest,
+                len,
+            )
+            .await;
+            let stored = result.unwrap();
+            assert!(
+                stored.retention.is_some(),
+                "the new upload carries the lock"
+            );
+            assert!(report.completed && !report.resumed, "{report:?}");
+            assert_eq!(log.count("multipart_session_lock_mismatch"), 1);
+            assert_eq!(
+                log.count("multipart_abort_failed"),
+                logged,
+                "failing: {failing_abort}"
+            );
+        }
     }
 }
