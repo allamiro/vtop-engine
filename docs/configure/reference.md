@@ -208,6 +208,9 @@ The Kafka releases the source is tested against are listed in
 | `sasl_username` | - | Kafka `sasl.username`. |
 | `sasl_password_env` | - | Name of the environment variable holding the SASL password. |
 | `ssl_ca_location` | - | Kafka `ssl.ca.location`. |
+| `ssl_certificate_location` | - | Mutual TLS: the PEM client certificate (`ssl.certificate.location`). Set with `ssl_key_location`, and only with `security_protocol` `SSL` or `SASL_SSL`. See [Kafka brokers](../install/kafka.md#mutual-tls). |
+| `ssl_key_location` | - | Mutual TLS: the PEM key of the client certificate (`ssl.key.location`). |
+| `ssl_key_password_env` | - | Name of the environment variable holding the client key's passphrase, for an encrypted key. |
 
 ### `sources.file`
 
