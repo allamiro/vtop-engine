@@ -328,7 +328,8 @@ def test_a_failed_tool_is_a_failed_row_that_still_says_how_many_files_it_committ
     # Exit 0 with nothing committed: the payload-derived columns cannot be measured, so not an ok row.
     status, note = link.run_status("defaults", 0, {"objects_committed": 0}, 0, 48)
     assert status == "failed" and note.startswith("could not measure") and "0 of 48" in note
-    assert link.run_status("smoke", 0, {}, 3, 4) == ("failed", "3 of 4 files committed")
+    assert link.run_status("smoke", 0, {}, 3, 4) == ("failed", "3 of 4 files committed, 0 extra and 0 mismatched "
+                                                               "objects")
     full = {column: "1" for column in link.REQUIRED["defaults"]}
     assert link.run_status("defaults", 0, full, 48, 48) == ("ok", "")
 
@@ -404,3 +405,17 @@ def test_a_resumed_run_never_reuses_an_earlier_rows_directory_or_bucket():
     buckets = {slug.rsplit("-", 1)[-1] for slug in slugs}
     assert len(buckets) == len(slugs)
     assert "counter[0]:04d" not in inspect.getsource(link_run.execute)
+
+
+def test_surplus_copies_are_extra_and_a_smoke_with_extra_or_mismatched_objects_fails():
+    # Review of #907: a file stored under two keys was committed once and extra zero.
+    manifest = {"f0.bin": (10, "a" * 64), "f1.bin": (10, "b" * 64)}
+    judged = link.judge_readback(manifest, [("k1", 10, "a" * 64), ("k2", 10, "a" * 64), ("f1.bin", 10, "b" * 64)])
+    assert judged.objects_committed == 2 and judged.objects_extra == 1
+    out = {column: "1" for column in link.REQUIRED["smoke"]}
+    assert link.run_status("smoke", 0, dict(out, objects_extra=1, objects_mismatched=0), 4, 4)[0] == "failed"
+    assert link.run_status("smoke", 0, dict(out, objects_extra=0, objects_mismatched=1), 4, 4)[0] == "failed"
+    assert link.run_status("smoke", 0, dict(out, objects_extra=0, objects_mismatched=0), 4, 4) == ("ok", "")
+    row = _row(cell="smoke", metric_class="correctness", objects_committed="48", files_expected="48",
+               objects_extra="1")
+    assert any("1 extra" in p for p in link.check_row(row))

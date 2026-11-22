@@ -128,6 +128,9 @@ def judge_readback(manifest: dict[str, tuple[int, str]], objects: Iterable[tuple
         else:
             extra += 1
     committed = [k for k in wanted if k in stored]
+    # A file stored under more than one key is committed once; every copy beyond the first is extra
+    # (a duplicate-output regression must show, review of #907).
+    extra += sum(count - 1 for count in stored.values())
     return Readback(len(manifest), len(committed), mismatched, extra, sum(size for size, _sha in committed),
                     sorted(names_by_key[k] for k in wanted if k not in stored))
 
@@ -326,6 +329,13 @@ def hosted_refusal(bottleneck_: str | None, cpu_share: float | None) -> str | No
     return None
 
 
+def _int(value: Any) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
+
+
 def run_status(cell: str, exit_code: Any, out: dict[str, Any], committed: int, expected: int,
                tool_output: str = "") -> tuple[str, str]:
     """(status, note) of one tool run (#744 rule 18: a failure is recorded as measured, never retried).
@@ -337,8 +347,10 @@ def run_status(cell: str, exit_code: Any, out: dict[str, Any], committed: int, e
     counted = f"{committed} of {expected} files committed"
     if exit_code not in (0, None):
         return "failed", f"exited {exit_code} ({counted}): {' '.join(tool_output.split())[-400:]}"
-    if cell == "smoke" and committed != expected:
-        return "failed", counted
+    if cell == "smoke" and (committed != expected or _int(out.get("objects_extra")) or
+                            _int(out.get("objects_mismatched"))):
+        return "failed", (f"{counted}, {_int(out.get('objects_extra'))} extra and "
+                          f"{_int(out.get('objects_mismatched'))} mismatched objects")
     missing = [column for column in REQUIRED.get(cell, ()) if out.get(column) in ("", None)]
     if missing:
         return "failed", f"could not measure {', '.join(missing)} ({counted})"
@@ -378,9 +390,11 @@ def check_row(row: dict[str, str]) -> list[str]:
             check_calibrations(row["link_profile"], before, after)
         except LinkRefused as exc:
             problems.append(f"an ok row whose calibrations disagree: {exc}")
-    if cell == "smoke" and not missing and row["objects_committed"] != row["files_expected"]:
+    if cell == "smoke" and not missing and (row["objects_committed"] != row["files_expected"] or
+                                            _int(row["objects_extra"]) or _int(row["objects_mismatched"])):
         problems.append(f"a smoke row with {row['objects_committed']} of {row['files_expected']} objects "
-                        "committed is not ok")
+                        f"committed, {row['objects_extra']} extra and {row['objects_mismatched']} mismatched "
+                        "is not ok")
     if cell == "equal-conns" and not missing and row["connections_actual"] != row["connections"]:
         problems.append(f"connections_actual {row['connections_actual']} is not the cell's {row['connections']}")
     if cell in ("tuned-grid", "tuned") and not missing and not 1 <= int(float(row["grid_size"])) <= MAX_GRID:
