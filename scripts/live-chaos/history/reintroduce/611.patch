@@ -1,0 +1,16 @@
+diff --git a/crates/vtop-broker/src/replication/mod.rs b/crates/vtop-broker/src/replication/mod.rs
+index 67d15312..47eef0b6 100644
+--- a/crates/vtop-broker/src/replication/mod.rs
++++ b/crates/vtop-broker/src/replication/mod.rs
+@@ -1850,6 +1850,11 @@ impl InProcessFollower {
+                 )
+             })
+         };
++        // RE-INTRODUCED #611 (test build only, scripts/live-chaos/history/reintroduce):
++        // every divergence discards the suffix, whichever side holds the
++        // acknowledged records, as before #616.
++        let _ = supersedes;
++        let supersedes = true;
+         // NEVER a dispute below this replica's own high-water mark (#616
+         // regression, found by the promotion crash sweep in the #640 shape).
+         // Everything below the mark is committed, and a committed record is

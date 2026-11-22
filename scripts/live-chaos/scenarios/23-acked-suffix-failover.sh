@@ -33,6 +33,10 @@
 #   * LIVENESS: some candidate serves quorum produce at a newer epoch within
 #     two lease durations plus an election timeout once every fault is
 #     removed.
+#   * HISTORY (#728): the producers, every read and who led are recorded,
+#     and both history checkers pass. Should C lead after all, a read of what
+#     it serves goes into the history before the scenario fails, so the
+#     checker judges the run first and names the lost records.
 # When L comes back holding records past R's tail that nobody acknowledged
 # (its own copy lands first, so a kill can leave one in-flight batch there),
 # nothing fences it and no quorum forms: that is #641. The scenario then
@@ -129,6 +133,14 @@ PIDS[1]=$(start_candidate 1 "$LEADER_ID")
 PIDS[2]=$(start_candidate 2 "$LEADER_ID")
 PIDS[3]=$(start_candidate 3 "$LEADER_ID")
 
+# Who leads, recorded from here to the end (#728).
+CONTROL_NODES=()
+for n in 1 2 3; do
+  read -r uuid _ <<<"$(candidate_identity "$n")"
+  CONTROL_NODES+=("candidate-$n=$(data_metrics_addr $((n + 10)))=$uuid")
+done
+control_history_start 1 2 3 -- "${CONTROL_NODES[@]}"
+
 read -r HOLDER EPOCH <<<"$(await_any_lease_holder "$LEADER_ID")"
 L="$(candidate_by_uuid "$HOLDER")"
 await_log_line "$WORKDIR/logs/data-candidate-$L.log" \
@@ -145,7 +157,8 @@ CLIENT_CFG="$(emit_client_config_at_epoch "$EPOCH")"
 "$VTOP_NODE" produce --client-config "$CLIENT_CFG" \
   --addr "$(candidate_native_addr "$L")" \
   --records "$TOTAL" --batch "$BATCH" --durability quorum \
-  --acked-file "$ACKED_FILE" > "$WORKDIR/logs/produce.log" 2>&1 &
+  --acked-file "$ACKED_FILE" --history "$(history_file produce)" \
+  > "$WORKDIR/logs/produce.log" 2>&1 &
 PRODUCER=$!
 echo "$PRODUCER" >> "$WORKDIR/pids"
 await_acked_floor "$ACKED_FILE" "$SHARED"
@@ -206,6 +219,7 @@ if [[ -n "$C_RECORDS" && "$C_RECORDS" -ge "$ACKED" ]]; then
 serving=none (shape not reached)"
   log "SKIP: C came back holding every one of the $ACKED acknowledged records; the #611 \
 shape (C lacking acknowledged records) was not reached"
+  check_control_history
   exit 77
 fi
 C_EPOCH="$(await_lease_holder "$LEADER_ID" "$C_UUID" \
@@ -217,14 +231,26 @@ log "C=$C holds the lease at epoch $C_EPOCH; R=$R thawed to answer its fence"
 # --- the #611 claim: R, not C, takes the range ------------------------------
 R_LOG="$WORKDIR/logs/data-candidate-$R.log"
 C_LOG="$WORKDIR/logs/data-candidate-$C.log"
-await_log_line "$R_LOG" "data_node_role_changed role=leader" \
-  "R holds every acknowledged record and must take the range once C is refused" \
-  $((2 * LEASE_DURATION_MS / 1000 + ELECTION_TIMEOUT_SECONDS))
-R_EPOCH="$(sed -n 's/.*data_node_role_changed role=leader .* epoch=\([0-9]*\).*/\1/p' "$R_LOG" | tail -1)"
+# Whichever leads first. R must; should C, what it serves is read into the
+# history and checked before the scenario fails, so the history checker is
+# the first to judge the run (#728: it must catch #611 re-introduced).
+deadline=$((SECONDS + 2 * LEASE_DURATION_MS / 1000 + ELECTION_TIMEOUT_SECONDS))
+until grep -q "data_node_role_changed role=leader" "$R_LOG" "$C_LOG" 2>/dev/null; do
+  [[ $SECONDS -lt $deadline ]] \
+    || fail "R holds every acknowledged record and must take the range once C is refused: \
+neither R nor C logged a role change"
+  sleep 0.2
+done
 if grep -q "data_node_role_changed role=leader" "$C_LOG"; then
+  C_LED_AT="$(sed -n 's/.*data_node_role_changed role=leader .* epoch=\([0-9]*\).*/\1/p' "$C_LOG" | tail -1)"
+  sleep 2  # the boundary marker, so the read has a published mark to read to
+  record_read "$(emit_client_config_at_epoch "${C_LED_AT:-$C_EPOCH}" 2)" \
+    "$(candidate_native_addr "$C")" "${C_LED_AT:-$C_EPOCH}"
+  check_history
   fail "C=$C became leader without the $((ACKED - FROZEN_AT)) acknowledged records it never \
 received (#611): $(grep "data_node_role_changed" "$C_LOG" | tail -1)"
 fi
+R_EPOCH="$(sed -n 's/.*data_node_role_changed role=leader .* epoch=\([0-9]*\).*/\1/p' "$R_LOG" | tail -1)"
 if grep -q "refusing promotion: fewer than a majority" "$C_LOG"; then
   REFUSED=yes
 else
@@ -260,6 +286,7 @@ if [[ -n "$L_NEXT" && -n "$R_NEXT" && "$L_NEXT" -gt "$R_NEXT" ]]; then
 c_refused_by_r=$REFUSED r_epoch=$R_EPOCH r_next=$R_NEXT l_next=$L_NEXT serving=none (#641)"
   log "SKIP: L returned holding $((L_NEXT - R_NEXT)) unacknowledged record(s) past R's tail \
 and is never fenced (#641); no quorum can form until it is"
+  check_control_history
   exit 77
 fi
 
@@ -276,6 +303,7 @@ while :; do
     if "$VTOP_NODE" produce --client-config "$(emit_client_config_at_epoch "$epoch" 2)" \
       --addr "$(candidate_native_addr "$n")" --records "$BATCH" --batch "$BATCH" \
       --durability quorum --acked-file "$WORKDIR/acked-after" \
+      --history "$(history_file produce-after)" \
       > "$WORKDIR/logs/produce-after.log" 2>&1; then
       SERVING="$n" SERVING_EPOCH="$epoch"
       break
@@ -289,10 +317,11 @@ done
 log "candidate $SERVING serves quorum produce at epoch $SERVING_EPOCH"
 
 # --- safety: every acknowledged record, byte-exact ---------------------------
-CHAOS_MAX_OFFSET_GAPS="$SERVING_EPOCH" \
+CHAOS_MAX_OFFSET_GAPS="$SERVING_EPOCH" CHAOS_READ_HISTORY="$(history_file read)" \
   await_verified_floor "$(emit_client_config_at_epoch "$SERVING_EPOCH" 2)" \
   "$(candidate_native_addr "$SERVING")" "$ACKED" "$ACKED"
 log "all $ACKED acknowledged records read back byte-exact from candidate $SERVING"
+check_history
 
 log "RESULT seed=$SEED shared=$FROZEN_AT acked=$ACKED c=$C r=$R c_records=${C_RECORDS:-?} c_epoch=$C_EPOCH \
 c_refused_by_r=$REFUSED r_epoch=$R_EPOCH r_next=${R_NEXT:-?} l_next=${L_NEXT:-?} \
