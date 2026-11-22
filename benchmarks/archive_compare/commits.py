@@ -1,4 +1,4 @@
-"""The offset sampler (#746 "live"): time to source-committed and the consumer group's lag, from the broker's own record.
+"""The offset sampler (#746 "live"): time to source-committed and the consumer group's lag, from the broker.
 
 Every offset a group commits is a record of `__consumer_offsets`, and the broker stamps it. The lab's `commits`
 service (compose.yml) writes each one, as it happens, to `commits.jsonl` with the Kafka tools' own formatter, so
@@ -30,7 +30,7 @@ class Commit(NamedTuple):
 
 
 def parse(text: str) -> list[Commit]:
-    """Offset commits in the formatter's output. Group metadata, tombstones and a partly written last object are skipped."""
+    """Offset commits in the formatter's output. Group metadata, tombstones and a partly written tail are skipped."""
     decoder = json.JSONDecoder()
     out: list[Commit] = []
     index = 0

@@ -17,7 +17,7 @@
       ]
     },
     "hosted": {
-      "_comment": "A GitHub-hosted runner (workflow_dispatch): correctness cells only, reduced dataset, 1 CPU per tool (#746 'Where it runs').",
+      "_comment": "A GitHub-hosted runner (workflow_dispatch): correctness cells only, reduced dataset, 1 CPU per tool (#746 'Where it runs'). Projected over one hosted job's limit, so the workflow runs it as the two plans below; this whole plan is for one machine.",
       "host_class": "hosted",
       "systems": ["connect-lenses", "vtop", "vector"],
       "profiles": {"connect-lenses": ["exactly-once"], "vtop": ["strong"], "vector": ["acks", "disk-buffer"]},
@@ -30,6 +30,38 @@
         {"cell": "crash-K2", "repetitions": 3, "minutes_per_run": 8,
          "variants": [{"record_size": 1024, "records": 100000}],
          "params": {"partitions": 3, "kills_per_run": 3, "kill_seed": 746}},
+        {"cell": "crash-K3", "repetitions": 3, "minutes_per_run": 8,
+         "variants": [{"record_size": 1024, "records": 100000}],
+         "params": {"partitions": 3, "kills_per_run": 3, "kill_seed": 746}},
+        {"cell": "verify-fault", "repetitions": 3, "minutes_per_run": 6,
+         "variants": [{"record_size": 1024, "records": 100000}],
+         "params": {"partitions": 3, "fault_seed": 746, "fault_one_in": 10}}
+      ]
+    },
+    "hosted-store-kills": {
+      "_comment": "The hosted plan's kills on the store's requests (K1, K2), which go through the S3 tap: one hosted job, about 3.4 hours projected, with its own smoke.",
+      "host_class": "hosted",
+      "systems": ["connect-lenses", "vtop", "vector"],
+      "profiles": {"connect-lenses": ["exactly-once"], "vtop": ["strong"], "vector": ["acks", "disk-buffer"]},
+      "cells": [
+        {"cell": "smoke", "repetitions": 1, "minutes_per_run": 3,
+         "variants": [{"record_size": 1024, "records": 10000}], "params": {"partitions": 3}},
+        {"cell": "crash-K1", "repetitions": 3, "minutes_per_run": 8,
+         "variants": [{"record_size": 1024, "records": 100000}],
+         "params": {"partitions": 3, "kills_per_run": 3, "kill_seed": 746}},
+        {"cell": "crash-K2", "repetitions": 3, "minutes_per_run": 8,
+         "variants": [{"record_size": 1024, "records": 100000}],
+         "params": {"partitions": 3, "kills_per_run": 3, "kill_seed": 746}}
+      ]
+    },
+    "hosted-time-kills-fault": {
+      "_comment": "The hosted plan's kills at a seeded time (K3) and the corrupted read-back cell: one hosted job, about 3 hours projected, with its own smoke.",
+      "host_class": "hosted",
+      "systems": ["connect-lenses", "vtop", "vector"],
+      "profiles": {"connect-lenses": ["exactly-once"], "vtop": ["strong"], "vector": ["acks", "disk-buffer"]},
+      "cells": [
+        {"cell": "smoke", "repetitions": 1, "minutes_per_run": 3,
+         "variants": [{"record_size": 1024, "records": 10000}], "params": {"partitions": 3}},
         {"cell": "crash-K3", "repetitions": 3, "minutes_per_run": 8,
          "variants": [{"record_size": 1024, "records": 100000}],
          "params": {"partitions": 3, "kills_per_run": 3, "kill_seed": 746}},

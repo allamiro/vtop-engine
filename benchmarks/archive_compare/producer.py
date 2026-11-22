@@ -132,7 +132,7 @@ def backlog(out: IO[bytes], seed: int, tag: str, start: int, count: int, size: i
     for seq in range(start, start + count):
         data = line(seed, tag, seq, size, partitions)
         out.write(data)
-        written += len(data) - len(key_of(seq)) - len(KEY_SEPARATOR)
+        written += len(data) - len(key_of(seq)) - len(KEY_SEPARATOR) - 1  # the value, not its newline
     out.flush()
     return written
 

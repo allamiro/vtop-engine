@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the archive comparison (#746): a Kafka topic to object storage, VTOP against Vector and Kafka Connect S3 (Lenses).
+"""Run the archive comparison (#746): a Kafka topic to object storage, VTOP, Vector and Kafka Connect S3 (Lenses).
 
     python3 benchmarks/archive_compare/run.py --plan smoke                 # minutes, any host
     python3 benchmarks/archive_compare/run.py --plan full --dry-run        # the cells and projected hours
@@ -65,7 +65,8 @@ DEVIATIONS = [
     "The record is one JSON object per Kafka value. VTOP and Vector store the value as it came, newline-framed; "
     "Connect (Lenses) parses it with its JSON converter and writes it again, so its bytes may differ and its "
     "content may not. The smoke counts byte-exact and JSON-equal records separately; the checker reads the id token "
-    "in either form, and MiB/s is of source bytes (the value as produced), so the framing does not change it (rule 15).",
+    "in either form, and MiB/s is of source bytes (the value as produced), so the framing does not change it "
+    "(rule 15).",
     "Object size is set by each tool's documented threshold nearest to 'about 32 MiB uncompressed or 60 s': VTOP "
     "`batching.max_bytes` and Vector `batch.max_bytes` count uncompressed payload; Connect (Lenses) `flush.size` "
     "counts the staged file. The measured object sizes (p50 and p99) are reported.",
@@ -688,8 +689,10 @@ class Runner:
                        logs: str, partitions: int, total: int) -> dict[str, int]:
         p = item.params
         state = tool.tap_ctl("/state")
-        data_keys = [key for key in snap.objects if not check_bucket.is_orphan(key) and not check_bucket.is_metadata(key)]
-        selected = faults.selected_keys(data_keys, BUCKET, int(p.get("fault_seed", 746)), int(p.get("fault_one_in", 10)))
+        data_keys = [key for key in snap.objects
+                     if not check_bucket.is_orphan(key) and not check_bucket.is_metadata(key)]
+        selected = faults.selected_keys(data_keys, BUCKET, int(p.get("fault_seed", 746)),
+                                        int(p.get("fault_one_in", 10)))
         flipped = faults.flipped_keys(state.get("corrupted", []), BUCKET)
         trace_path = os.path.join(logs, "tap.csv")
         trace = list(csv.DictReader(open(trace_path, encoding="utf-8"))) if os.path.exists(trace_path) else []  # noqa: SIM115
