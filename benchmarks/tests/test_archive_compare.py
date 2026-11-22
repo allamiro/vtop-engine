@@ -768,3 +768,11 @@ def test_a_scaled_down_plan_file_can_be_named_and_is_checked_like_a_shipped_one(
 def json_load(path):
     with open(path, encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def test_the_measured_window_starts_after_the_warmup_of_the_producers_first_record_and_lasts_the_measure_time():
+    produced = [(i, i % 3, i // 3, 1000.0 + i * 0.1) for i in range(500)]  # 10 records a second for 50 s
+    window = run.measured_window(produced, warmup=10.0, measure=30.0)
+    assert window[0][3] >= 1010.0 and window[-1][3] < 1040.0
+    assert len(window) == 300 and len(window) / 30.0 == 10.0  # the achieved rate is the offered one, not inflated
+    assert run.measured_window([], 10.0, 30.0) == []

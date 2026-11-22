@@ -436,6 +436,16 @@ def live_rate(run_dir: str, item: plans.Planned, fraction: float, fixed: Any = N
     return round(min(stats.median(v) for v in by_system.values()) * fraction, 1)
 
 
+def measured_window(produced: list[tuple[int, int, int, float]], warmup: float,
+                    measure: float) -> list[tuple[int, int, int, float]]:
+    """The records of the measured window: after `warmup` seconds from the producer's FIRST record (not from the
+    tool's start, which the producer's own start-up follows), and for `measure` seconds."""
+    if not produced:
+        return []
+    first = min(at for _seq, _part, _off, at in produced)
+    return [row for row in produced if first + warmup <= row[3] < first + warmup + measure]
+
+
 def kill_points(item: plans.Planned) -> list[kills.KillPoint]:
     p = item.params
     kind = item.cell.split("-")[1] if item.cell.startswith("crash-") else ""
@@ -596,6 +606,8 @@ class Runner:
                               str(rate), "--seconds", str(seconds), "--log", "/logs/produced.csv",
                               "--partitions", str(partitions)], timeout=seconds + 600)
                 produced = commits.read_produced(tool.produced_path)
+                if not produced:
+                    raise RuntimeError("the live producer logged no record: nothing was offered")
                 total = len(produced)
                 ends = producer.counts(0, total, partitions)
             if kind:
@@ -681,11 +693,11 @@ class Runner:
                         "object_size_p99_bytes": int(stats.percentile(sizes, 99)),
                         "compression_ratio": f"{result.present_unique * (size + 1) / max(result.data_bytes, 1):.2f}"})
         if live_cell:
-            warm = started + float(p.get("warmup_seconds", 120))
-            measured = [row for row in produced if row[3] >= warm]
+            measured = measured_window(produced, float(p.get("warmup_seconds", 120)),
+                                       float(p.get("measure_seconds", 600)))
             visible = [(result.first_visible[seq] - at) * 1000 for seq, _part, _off, at in measured
                        if seq in result.first_visible]
-            committed = commits.source_committed_ms(timeline, produced, after=warm)
+            committed = commits.source_committed_ms(timeline, measured)
             achieved = len(measured) / float(p.get("measure_seconds", 600))
             out.update({"offered_rate": p["rate"], "achieved_rate": f"{achieved:.1f}",
                         # A tool that lost records is not sustaining the offered rate, whatever it accepted: its
