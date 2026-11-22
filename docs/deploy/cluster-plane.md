@@ -81,7 +81,7 @@ What the operator does: nothing. The failover needs no restart, no config
 change and no client change. The client's outage is the lease's lapse, the
 election of a survivor, the survivor opening the range at a write quorum
 ([#750](https://github.com/allamiro/vtop-engine/issues/750)), and one metadata
-refresh. Live-chaos scenarios 26 and 27 measure it for librdkafka and for the
+refresh. Live-chaos scenarios 27 and 28 measure it for librdkafka and for the
 JVM client, with `metadata.recovery.strategy` both ways:
 [Kafka clients and a failover](../LIVE_CHAOS_VALIDATION.md#kafka-clients-and-a-failover-751).
 

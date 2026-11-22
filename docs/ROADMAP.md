@@ -1427,12 +1427,18 @@ A patch release: no schema, wire format, feature level, config key or one-way st
 
 The theme is **the gateway at the speed its durability allows, and the road
 to 1.0**: wire group commit into the data node's quorum write (#752) and let a
-Kafka client follow a failover through a candidate node (#751); finish the
+Kafka client follow a failover through a candidate node (#751: the gateway
+is served from candidate nodes and live-chaos scenarios 27 and 28 show a
+librdkafka and a JVM client resuming 5.5 s to 6.6 s after a leader kill on one
+host, with debug binaries and a 6 s lease; what is left is the chart's default
+lease, the co-located `vtop-node node` shape, and a consumer group's
+coordinator across a failover, which #751 scopes out); finish the
 format inventory and the tested upgrade and downgrade matrix (#743); and work
 the criteria in #714 that must be met before VTOP is called anything but a
 prototype (crash and soak testing, real S3 targets, security hardening, a
 restore drill, a pilot). Failover and crash-durability measurements against
-Apache Kafka stay open (#597, #599), as does the head-to-head throughput run
+Apache Kafka stay open (#597, #599; the failover run has not been repeated
+through a Kafka client), as does the head-to-head throughput run
 (#596).
 
 ---

@@ -112,8 +112,17 @@ All 30 failovers, 15 per system, read back every acknowledged record:
 **0 lost, 0 duplicated**, 14,250,000 records in all. Kafka's producer resumes
 sooner after a `kill -9` of the leader (10.2 s, against 25.7 s for VTOP) and
 after an orderly stop; a network partition costs both about 30 s. VTOP was
-driven through its native client, because a Kafka client cannot yet follow a
-VTOP failover.
+driven through its native client in that run, which predates #751: a Kafka
+client could not follow a VTOP failover then.
+A Kafka client now can, with no restart and no configuration change (#751):
+live-chaos scenarios 27 and 28 killed the range leader under a stock
+librdkafka producer and under the JVM client of Apache Kafka 4.4.0, and each
+resumed 5.5 s to 6.6 s later (librdkafka 5.7 s to 6.6 s in four runs, the JVM
+client 5.5 s to 5.8 s in eight), with every acknowledged record read back once
+and in order. That is one host, debug binaries and a 6 s lease, against the
+chart's 15 s default; it is not a comparison with Kafka's numbers above, and it
+does not cover the co-located `vtop-node node` shape or a consumer group across
+a failover ([details](docs/LIVE_CHAOS_VALIDATION.md#kafka-clients-and-a-failover-751)).
 Data and the full report: [kafka-failover.md](docs/benchmarks/kafka-failover.md).
 
 ### Produce throughput, against Apache Kafka
@@ -265,8 +274,11 @@ The limits that matter most when evaluating it:
   corruption.** Strong verification is the default; the opt-out is reported at
   startup, by `vtopctl validate`, and in the metrics.
 - **The Kafka gateway is slower than Apache Kafka**, by 12.0x to 13.9x in
-  records per second in the comparison above, and a Kafka client cannot yet
-  follow a VTOP failover.
+  records per second in the comparison above. A Kafka client follows a VTOP
+  failover without reconfiguration (#751), measured on one host with debug
+  binaries and a 6 s lease; the chart's 15 s lease default, the co-located
+  `vtop-node node` shape and a consumer group across a failover are not
+  measured.
 - **Not built yet:** public-key manifest signatures and a million-file
   benchmark.
 

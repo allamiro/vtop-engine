@@ -1803,8 +1803,8 @@ jobs:
 
       # Scenario 17 drives the Kafka gateway with a stock client: kafkacat is
       # librdkafka, the library under every non-JVM Kafka client (#225).
-      # Scenarios 17 to 21, 24 and 26 use it.
-      - name: Install a stock Kafka client for scenarios 17 to 21, 24 and 26
+      # Scenarios 17 to 21, 24 and 27 use it.
+      - name: Install a stock Kafka client for scenarios 17 to 21, 24 and 27
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq kafkacat
@@ -1827,12 +1827,12 @@ jobs:
       # it is needed. Supplying the directory also sets WORKDIR_GENERATED=0,
       # which suppresses that cleanup, so the tree is still there afterwards.
       #
-      # Scenario 27 runs the JVM Kafka client (#751): the Apache Kafka
+      # Scenario 28 runs the JVM Kafka client (#751): the Apache Kafka
       # distribution is copied out of the apache/kafka image pinned below (the
       # 4.4.0 line of kafka-matrix.yml, by the same digest) and run on the
       # runner's JVM, once per metadata.recovery.strategy, each a full
       # failover. Measured at 75 s for both on two CPUs with debug binaries,
-      # plus the image pull; scenario 26 (librdkafka, the kafkacat above) 43 s.
+      # plus the image pull; scenario 27 (librdkafka, the kafkacat above) 43 s.
       # Without the variable the scenario SKIPS (exit 77).
       - name: Run the live chaos suite
         id: chaos

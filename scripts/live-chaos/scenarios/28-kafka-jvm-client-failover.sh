@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# 27 — the JVM Kafka client follows a failover, under both metadata recovery
+# 28 — the JVM Kafka client follows a failover, under both metadata recovery
 # strategies (#751).
 #
-# Scenario 26 is librdkafka. The JVM client is the other half of "a stock
+# Scenario 27 is librdkafka. The JVM client is the other half of "a stock
 # Kafka client", and it is not the same client: it keeps no bootstrap list once
 # it holds a metadata response, and which recovery it does when its leader
 # dies is a setting, `metadata.recovery.strategy` (KIP-899):
@@ -19,7 +19,7 @@
 # scenario runs the same failover once per strategy and reports, for each, the
 # time from the kill to the first acknowledgement after it.
 #
-# Per strategy, on a fresh cluster (three candidates serving Kafka, as 26):
+# Per strategy, on a fresh cluster (three candidates serving Kafka, as 27):
 #   1. kafka-verifiable-producer, the Apache Kafka distribution's own test
 #      client, with enable.idempotence=true and acks=all, produces a paced
 #      stream bootstrapped from all three;
@@ -45,12 +45,12 @@ if [[ -z "$KAFKA_HOME" && -z "$KAFKA_IMAGE" ]]; then
 fi
 source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
-# A v2 range, as 26.
+# A v2 range, as 27.
 export CHAOS_SEGMENT_FORMAT=v2
 
 require_binaries
 require_command java "Install a JVM, 17 or newer: the Kafka distribution's client tools run on it."
-transport_plaintext && fail "scenario 27 needs TLS: candidates cannot run under CHAOS_TRANSPORT=plaintext"
+transport_plaintext && fail "scenario 28 needs TLS: candidates cannot run under CHAOS_TRANSPORT=plaintext"
 init_workdir
 BASE_WORKDIR="$WORKDIR"
 
@@ -243,7 +243,7 @@ for strategy in $STRATEGIES; do
   run_variant "$strategy"
 done
 WORKDIR="$BASE_WORKDIR"
-SCENARIO="27-kafka-jvm-client-failover"
+SCENARIO="28-kafka-jvm-client-failover"
 log "results:"
 sed 's/^/  /' "$BASE_WORKDIR/failover-results.txt"
 log "PASS"

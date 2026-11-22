@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 26 — a Kafka client follows a failover with no restart and no config
+# 27 — a Kafka client follows a failover with no restart and no config
 # change (#751).
 #
 # Three candidates (#284), each serving the Kafka gateway and each listing all
@@ -41,8 +41,8 @@ export CHAOS_SEGMENT_FORMAT=v2
 
 require_binaries
 KCAT="$(command -v kcat || command -v kafkacat || true)"
-[[ -n "$KCAT" ]] || fail "scenario 26 needs kcat, librdkafka's client: brew install kcat / apt-get install kafkacat"
-transport_plaintext && fail "scenario 26 needs TLS: candidates cannot run under CHAOS_TRANSPORT=plaintext"
+[[ -n "$KCAT" ]] || fail "scenario 27 needs kcat, librdkafka's client: brew install kcat / apt-get install kafkacat"
+transport_plaintext && fail "scenario 27 needs TLS: candidates cannot run under CHAOS_TRANSPORT=plaintext"
 init_workdir
 
 RECORDS="${CHAOS_KAFKA_RECORDS:-4000}"

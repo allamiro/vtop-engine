@@ -75,7 +75,7 @@ NATIVE_PORT="${CHAOS_NATIVE_PORT:-9400}"
 # kafka-5 for the two partitions of scenarios 21 and 24 (24 also takes
 # replica-4, replica-5 and data-metrics 4 and 5 for its second range's
 # followers, and checks its own bound), and kafka-6 to kafka-8 for the three
-# candidates of scenarios 26 and 27 (#751, candidate_kafka_port). Above the
+# candidates of scenarios 27 and 28 (#751, candidate_kafka_port). Above the
 # candidate natives (NATIVE_PORT + 11..13) so the default layout has no overlap.
 KAFKA_BASE_PORT="${CHAOS_KAFKA_BASE_PORT:-$((NATIVE_PORT + 20))}"
 # Observability endpoints (#224). Every node gets one so scenarios can gate on
@@ -1574,7 +1574,7 @@ emit_candidate_config() {
     echo "segment_id: $SEGMENT_ID"
     echo "native_listen: \"$(candidate_native_addr "$n")\""
     echo "replica_listen: \"$(replica_addr $((n - 1)))\""
-    # The Kafka gateway (#751), for scenarios 26 and 27: every member serves
+    # The Kafka gateway (#751), for scenarios 27 and 28: every member serves
     # it and lists every member as a broker, so a client bootstrapped from any
     # of them finds the holder after a failover.
     [[ -n "${CHAOS_CANDIDATE_KAFKA:-}" ]] && emit_candidate_kafka_yaml "$n"
@@ -1672,7 +1672,7 @@ candidate_by_uuid() {
   fail "lease holder $1 is not one of the three candidates"
 }
 
-# bring_up_kafka_candidates — the cluster scenarios 26 and 27 (#751) start
+# bring_up_kafka_candidates — the cluster scenarios 27 and 28 (#751) start
 # from: a three-node metadata plane, the topic and the three candidates
 # registered, then three candidates that each serve the Kafka gateway and list
 # all three as brokers. Nothing is scripted about who leads: it returns when
