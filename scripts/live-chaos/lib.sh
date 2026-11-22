@@ -310,6 +310,9 @@ cleanup() {
     done < "$WORKDIR/pids"
   fi
   wait 2>/dev/null || true
+  # A script that mounts or stops something undoes it here, before the work
+  # directory goes (the engine sweep's faults, #725).
+  if declare -F chaos_extra_cleanup > /dev/null; then chaos_extra_cleanup || true; fi
   if [[ "${CHAOS_KEEP:-0}" != "1" && "${WORKDIR_GENERATED:-0}" == "1" ]]; then
     rm -rf "$WORKDIR"
   elif [[ -n "${WORKDIR:-}" ]]; then

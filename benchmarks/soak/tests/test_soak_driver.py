@@ -141,6 +141,30 @@ def test_the_evidence_tarball_lists_a_checksum_for_every_file(tmp_path):
     assert listed["samples.jsonl"] == hashlib.sha256(b'{"elapsed_s": 1}\n').hexdigest()
 
 
+def test_the_evidence_leaves_out_the_engines_unreadable_control_files(tmp_path):
+    # Review of #838: a run interrupted during a clock step leaves the shim's
+    # marker, mode 0600 and owned by the engine's user, and the entrypoint's
+    # wrapper in ctl/; packaging must not need to read them.
+    run = tmp_path / "soak-x"
+    (run / "ctl" / "bin").mkdir(parents=True)
+    (run / "samples.jsonl").write_text("{}\n")
+    (run / "ctl" / "ld_preload").write_text("/opt/soak/shims/skew+3600.so\n")
+    marker = run / "ctl" / "skew-loaded"
+    marker.write_text("1795290470\n")
+    marker.chmod(0)
+    (run / "ctl" / "bin" / "vtopctl").write_text("#!/bin/sh\n")
+    try:
+        out = soak_driver.write_evidence(run, tmp_path / "soak-x.tar.gz")
+    finally:
+        marker.chmod(0o600)
+    with tarfile.open(out) as tar:
+        names = tar.getnames()
+        sums = tar.extractfile("soak-x/SHA256SUMS").read().decode()
+    assert "soak-x/ctl/ld_preload" in names and "soak-x/samples.jsonl" in names
+    assert not any(n.startswith("soak-x/ctl/bin") or n == "soak-x/ctl/skew-loaded" for n in names)
+    assert "skew-loaded" not in sums and "ctl/bin" not in sums
+
+
 def test_preflight_refuses_a_disk_without_the_profiles_free_space(tmp_path, monkeypatch):
     import collections
 

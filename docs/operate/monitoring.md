@@ -83,7 +83,10 @@ test, a runbook section, and an objective on [Service level objectives](slos.md)
 | [VtopRetentionLoss](runbooks.md#vtopretentionloss) | page | Any increase of `vtop_retention_lost_records_total` |
 | [VtopSourceReplayRefused](runbooks.md#vtopsourcereplayrefused) | page | Any increase of `vtop_source_replay_refused_total`, or the series first appearing non-zero |
 | [VtopRecoveryLedgerWriteFailed](runbooks.md#vtoprecoveryledgerwritefailed) | page | `vtop_recovery_held_total{reason="ledger_write_failed"}` above zero: at startup the state store refused recovery's replay decision (the series appears with the first hold, so the rule fires on the value, until a restart that holds nothing) |
+| [VtopBucketVersioningPaused](runbooks.md#vtopbucketversioningpaused) | page | `vtop_bucket_versioning_paused` above zero for 5 minutes: with `upload.require_object_versioning` set, a bucket stopped keeping object versions and the engine stopped writing to it |
 | [VtopMultipartSessionsPiling](runbooks.md#vtopmultipartsessionspiling) | ticket | A session kept 30 to 36 hours ago (past the 24 h abandon window and the 6 h sweep interval), and none resumed or swept for 36 hours |
+| [VtopStateStoreWritesSlow](runbooks.md#vtopstatestorewritesslow) | ticket | More than 5% of the batches committed in 15 minutes spent over a second in their ledger writes (`vtop_stage_duration_seconds{stage="state_write"}`), held for 15 minutes |
+| [VtopEpochHistoryBroken](runbooks.md#vtopepochhistorybroken) | page | A data node replica's epoch history is broken (`vtop_broker_epoch_history_broken` is 1) for a minute: a journal write failed, so it gets no replication session until it is repaired |
 
 The thresholds are defaults, listed at the top of the file. The rules route
 nowhere by themselves: point Prometheus at your Alertmanager and route on the
@@ -110,6 +113,7 @@ holds the Grafana rules the optional observability stack loads:
 | Range retention failing | `vtop_broker_retention_last_pass_failed` for 10 minutes |
 | Follower disconnected | `vtop_broker_follower_connected` at 0 for 2 minutes |
 | Follower lag growing | Rising `vtop_broker_follower_lag_records` for 15 minutes |
+| Follower below the catch-up horizon | `vtop_broker_follower_below_catch_up_horizon` at 1 for 5 minutes |
 | Fencing epoch churn | A range's fencing epoch rising within 30 minutes |
 | Promotion boundary stuck | `vtop_broker_boundary_pending` for 2 minutes |
 | Metadata leader lost its quorum | `vtop_meta_raft_millis_since_quorum_ack` on the leader past its threshold, for 1 minute |
