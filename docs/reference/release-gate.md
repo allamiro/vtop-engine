@@ -29,9 +29,9 @@ component is production, preview or experimental; the
 | Item | Value |
 |---|---|
 | Evaluated | 2026-11-22 |
-| Met | 12 |
-| Partial | 12 |
-| Not met | 6 |
+| Met | 14 |
+| Partial | 11 |
+| Not met | 5 |
 | 1.0.0-rc.1 may be cut | no |
 | 1.0.0 may be cut | no |
 
@@ -53,20 +53,20 @@ only for a met row.
 | A2 | Fault and crash testing | met | (a) `.github/workflows/engine-crash-sweep.yml::sweep` kills `vtopctl run` at every failpoint on SQLite and PostgreSQL, Kafka, file and spool sources, a store outage and ENOSPC (`scripts/live-chaos/engine/run-sweep.sh`; #836, #871); [nightly of 2026-11-21](https://github.com/allamiro/vtop-engine/actions/runs/44916357611)). (b) `crates/vtop-log/tests/sim_crash_sweep.rs`; `.github/workflows/ci.yml::live-chaos`. | none | 2026-11-22 |
 | A3 | Long soak, engine 72 h and cluster 7 days | not met | The engine soak's driver and evaluator are built (`.github/workflows/soak.yml::soak-72h`; `docs/SOAK_VALIDATION.md`); no 72-hour or 7-day run has completed. | #726, #727 | 2026-11-22 |
 | A4 | Jepsen-style history check of the cluster plane | partial | Recorder and data-plane checker (`scripts/live-chaos/history/check_history.py`; #878), fed by scenarios 04 and 09 in `.github/workflows/ci.yml::live-chaos`. Lease and metadata histories, the 24-hour campaign and the live bug re-introductions are open. | #728 | 2026-11-22 |
-| A5 | Fuzz and mutation | partial | `.github/workflows/fuzz-nightly.yml::fuzz` over 12 decoders with a persisted corpus; `.github/workflows/ci.yml::mutants-gate` (`scripts/mutants-gate.py`). | #729 | 2026-11-22 |
+| A5 | Fuzz and mutation | partial | `.github/workflows/fuzz-nightly.yml::fuzz` over 12 decoders with a persisted corpus; `.github/workflows/ci.yml::mutants-gate` (`scripts/mutants-gate.py`); the recovery path's mutation score gated per file, nightly (`.github/workflows/fuzz-nightly.yml::mutants`; #900). The verify code (`vtop-upload`) and the file-continuity code (`vtop-adapters`) still score under the 0.80 floor and stay report only. | #729 | 2026-11-22 |
 | A6 | Every bug lands with a test that failed first | met | The rule in `CONTRIBUTING.md`; the release notes name the tests. | none | 2026-11-22 |
-| B1 | AWS S3 and one other S3 provider | not met | MinIO only (`.github/workflows/ci.yml::minio-integration`; `crates/vtop-upload/tests/live_s3_verification.rs`). A store without Object Lock or versioning is refused at startup (#770). | #722 | 2026-11-22 |
+| B1 | AWS S3 and one other S3 provider | not met | MinIO only in CI (`.github/workflows/ci.yml::minio-integration`; `crates/vtop-upload/tests/live_s3_verification.rs`). The live S3 tests run against a named server and its capability file (`crates/vtop-s3-testkit`; #764), but no other server and no AWS run is in CI. A store without Object Lock or versioning is refused at startup (#770). | #722 | 2026-11-22 |
 | B2 | Real Kafka versions | met | `.github/workflows/kafka-matrix.yml::kafka` (Apache Kafka 3.7 to 4.4, TLS and SASL listeners, Redpanda; #834); `.github/workflows/kafka-cluster.yml::cluster` (three brokers, a leader stopped mid-read; #874). The [nightly of 2026-11-20](https://github.com/allamiro/vtop-engine/actions/runs/44730486247) passed; the nightly of 2026-11-21 failed one leg on a paused-partition race that #877 fixed the same day. | none | 2026-11-22 |
 | B3 | State store versions | met | `.github/workflows/postgres-matrix.yml::postgres` on PostgreSQL 14 to 18 (#761; [nightly of 2026-11-21](https://github.com/allamiro/vtop-engine/actions/runs/44881713701)); `crates/vtop-state/tests/pg_battery.rs`. | none | 2026-11-22 |
 | B4 | Platforms | partial | Release archives smoked on every Linux, with a glibc 2.17 and a static musl build (`.github/workflows/release.yml::binaries`; #842); the workspace's tests on macOS arm64, macOS x86_64 and aarch64 Linux nightly (`.github/workflows/platform-tests.yml::test`; #876). | #724 | 2026-11-22 |
-| C1 | Persisted and wire formats inventoried and frozen | partial | `scripts/compat/formats.yaml` and `scripts/check-format-registry.py` (#783); `docs/reference/compatibility.md`; `.github/workflows/compat.yml::cell` (#846). The 1.0 freeze is not declared. | #743 | 2026-11-22 |
+| C1 | Persisted and wire formats inventoried and frozen | partial | `scripts/compat/formats.yaml` and `scripts/check-format-registry.py` (#783); `docs/reference/compatibility.md`; `.github/workflows/compat.yml::cell` (#846); the state ledger, its digests and the audit trail against released binaries, both ways (#833). The 1.0 freeze is not declared. | #743 | 2026-11-22 |
 | C2 | Config keys | partial | `scripts/check-config-reference.py`; `scripts/config-keys-since.py` lists the keys an older engine ignores (#858). Config carries no version and has no strict mode. | #743 | 2026-11-22 |
-| C3 | CLI and metric names | not met | No snapshot gate on `main`; one is in review. | #719 | 2026-11-22 |
+| C3 | CLI and metric names | met | `crates/vtop-cli/tests/surface_snapshot.rs` compares the `vtopctl` command and flag tree and every engine metric name with its labels against `docs/surface/`, and `vtop-node` does the same for its tree and metrics; a removal or rename with no entry in `docs/deprecations.md` fails `scripts/check-surface-deprecations.py` in `.github/workflows/ci.yml::claims` (#839). | none | 2026-11-22 |
 | C4 | Upgrade and downgrade guarantees | partial | `.github/workflows/ci.yml::upgrade-compat` (`scripts/upgrade-compat.sh`); downgrade is replaced by the drilled restore of E3 (#829). N to N+2 rolling upgrade under load is not tested. | #743 | 2026-11-22 |
 | C5 | Versioning, deprecation and support window | met | `docs/SUPPORT.md` (#777). | none | 2026-11-22 |
 | D1 | External security review | not met | No independent review has been commissioned. | #730 | 2026-11-22 |
 | D2 | Threat model coverage | met | Section 17 of `docs/SECURITY_MODEL.md`, checked by `scripts/check-threat-map.py` in `.github/workflows/ci.yml::claims` (#828). | none | 2026-11-22 |
-| D3 | Supply chain | partial | Archive and image provenance verified before publishing (#825); a report-only rebuild compares the binaries (`.github/workflows/release.yml::reproduce`; #823); advisory review dates (`scripts/check-advisory-review.py`; `.github/workflows/advisory-review.yml::check`). | #731 | 2026-11-22 |
+| D3 | Supply chain | met | Archive and image provenance verified before publishing (#825); a second build of each archive target compares the binaries, and its differences are reported (`.github/workflows/release.yml::reproduce`; #823), with the build time a release records pinned to the tagged commit so it no longer differs (#902); advisory review dates (`scripts/check-advisory-review.py`; `.github/workflows/advisory-review.yml::check`). | none | 2026-11-22 |
 | D4 | Secret handling | met | `crates/vtop-core/src/secret_file.rs`; `crates/vtop-cli/tests/secret_file_permissions.rs`; `docs/operate/secrets.md` (#775). | none | 2026-11-22 |
 | D5 | Disclosure policy | met | `SECURITY.md`, checked by `scripts/check-security-policy.py` (#760). | none | 2026-11-22 |
 | E1 | Runbooks completed by someone who did not write them | partial | `docs/operate/runbooks.md`; no runbook has been run by a second person. | #735 | 2026-11-22 |
@@ -74,7 +74,7 @@ only for a met row.
 | E3 | Backup and restore of the state store | met | `scripts/restore-drill.sh` in `.github/workflows/ci.yml::restore-drill-sqlite` and `.github/workflows/postgres-matrix.yml::restore-drill`, with RPO and RTO in `docs/operate/backup-and-recovery.md` (#829). | none | 2026-11-22 |
 | E4 | Disaster-recovery drills | partial | A lost ledger restored from a backup is drilled (E3, #829); a lost ledger with no backup, a lost bucket and a lost region are not. | #735 | 2026-11-22 |
 | E5 | Capacity guidance | partial | Starting points in `docs/PRODUCTION_HA.md`; no table tied to measurements. | #736 | 2026-11-22 |
-| E6 | Supported topology and engine host loss | partial | One engine per ledger, enforced at startup; the crash sweep kills the engine process (`.github/workflows/engine-crash-sweep.yml::sweep`). The host-loss drill and the deployment examples are in review. | #739 | 2026-11-22 |
+| E6 | Supported topology and engine host loss | partial | One engine per ledger, enforced at startup; the crash sweep kills the engine process (`.github/workflows/engine-crash-sweep.yml::sweep`), and its `postgres-kafka-host-loss` leg takes the engine's host and recovers on a standby over the same ledger, nightly; the procedure and a single-replica deployment example are in `docs/deploy/engine-host-loss.md` (#875). Open: whether a documented example is enough for the supported deployment, or a chart that CI deploys is needed. | #739 | 2026-11-22 |
 | F1 | Published, reproducible benchmarks with limits stated | partial | Charts redrawn from committed data (`.github/workflows/ci.yml::benchmark-charts`; `docs/benchmarks`); one laptop, no dedicated hardware. | #737, #736 | 2026-11-22 |
 | G1 | A real deployment | not met | No deployment outside the lab has reported. | #738 | 2026-11-22 |
 | H1 | Docs agree with the code and with each other | met | Every status claim re-read (#776); `scripts/check-release-versions.py` in the docs workflow. | none | 2026-11-22 |
