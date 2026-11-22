@@ -49,6 +49,17 @@ def test_the_fixture_run_draws_every_chart_and_the_page(kind, tmp_path):
             assert re.search(rf"^\| {re.escape(creport.md_cell(metric.label))} \|", page, re.M), metric.label
 
 
+def test_secondary_profiles_appear_in_the_tables_and_not_in_the_charts_or_ranking(tmp_path):
+    # Review of #906: the full plan runs vtop/verify-off and vector/disk-buffer; their values are in the
+    # tables as columns of their own, and the scoreboard still ranks primary profiles only.
+    _spec, _written, out = _build("archive", tmp_path, "a")
+    page = (out / "page.md").read_text()
+    assert "verify-off (secondary)" in page and "disk-buffer (secondary)" in page
+    scoreboard = page.split("## Scoreboard", 1)[1].split("\n## ", 1)[0]
+    ranked = "\n".join(line for line in scoreboard.splitlines() if line.startswith("|"))
+    assert "verify-off" not in ranked and "disk-buffer" not in ranked
+
+
 @pytest.mark.parametrize("kind", KINDS)
 def test_the_output_is_deterministic(kind, tmp_path):
     _spec, first, out_a = _build(kind, tmp_path, "a")
