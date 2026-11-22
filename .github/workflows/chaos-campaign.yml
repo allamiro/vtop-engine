@@ -1,0 +1,216 @@
+# The long nemesis campaign over the cluster plane (#728, criterion A4 of
+# #714): the live-chaos scenarios that hold a nemesis (kill, pause, partition,
+# clock skew, disk full), run one after another with fresh seeds for many
+# hours, each judged by its own assertions and by the history checkers.
+#
+# DISPATCH ONLY. It never runs on a pull request or a schedule: a 24-hour
+# campaign is the maintainer's to start. The pull-request cost of the history
+# checkers stays inside ci.yml's live-chaos job (their unit tests, and the
+# scenarios that record histories).
+#
+# A GitHub-hosted job stops at 6 hours, so the campaign is split into legs
+# that run side by side: `hours` is the total, each leg runs hours/legs, and
+# each leg's job timeout is its campaign time plus 30 minutes. The plan job
+# refuses a split whose legs would pass 5.5 hours on a hosted runner; on a
+# self-hosted runner (the `runner` input) a leg may run up to 5 days.
+#
+# With `reintroduce` set, it runs no campaign: it re-introduces that fixed
+# data-safety bug into a scratch build and shows the checkers catch it
+# (scripts/live-chaos/history/reintroduce/run.sh).
+name: chaos campaign
+
+on:
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: "Total campaign hours, split across the legs"
+        default: "24"
+        required: true
+      legs:
+        description: "Legs run side by side; each runs hours/legs"
+        default: "6"
+        required: true
+      scenarios:
+        description: "Scenario numbers to cycle through"
+        default: "04 05 06 07 09 14 23"
+        required: true
+      runner:
+        description: "runs-on label for the legs (a self-hosted label lifts the 5.5-hour leg limit to 5 days)"
+        default: "ubuntu-latest"
+        required: true
+      reintroduce:
+        description: "Instead of a campaign, re-introduce one fixed bug and show the checkers catch it"
+        type: choice
+        default: "none"
+        options: ["none", "611", "641", "261", "640"]
+      reintroduce_runs:
+        description: "Runs for a re-introduction"
+        default: "3"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chaos-campaign
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: plan the legs
+    if: inputs.reintroduce == 'none'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      legs: ${{ steps.plan.outputs.legs }}
+      hours_per_leg: ${{ steps.plan.outputs.hours_per_leg }}
+      timeout_minutes: ${{ steps.plan.outputs.timeout_minutes }}
+    steps:
+      - id: plan
+        env:
+          HOURS: ${{ inputs.hours }}
+          LEGS: ${{ inputs.legs }}
+          RUNNER: ${{ inputs.runner }}
+        run: |
+          python3 - << 'PY' >> "$GITHUB_OUTPUT"
+          import json, math, os, sys
+          hours, legs = float(os.environ["HOURS"]), int(os.environ["LEGS"])
+          if hours <= 0 or not 1 <= legs <= 32:
+              sys.exit(f"hours must be positive and legs 1 to 32, got {hours} and {legs}")
+          per = hours / legs
+          # A leg's job gets its campaign time plus 30 minutes for the build
+          # and the last scenario, so the timeout never cuts a leg short
+          # (review of #904). A hosted job stops at 6 hours whatever this
+          # says; a self-hosted one at 5 days.
+          timeout = math.ceil(per * 60) + 30
+          limit = 360 if os.environ["RUNNER"] == "ubuntu-latest" else 7200
+          if timeout > limit:
+              sys.exit(f"{hours} h over {legs} legs is {per:.2f} h a leg, which with 30 minutes of "
+                       f"setup passes the {limit} minutes this runner allows a job: raise legs to at "
+                       f"least {math.ceil(hours * 60 / (limit - 30))}")
+          print(f"legs={json.dumps(list(range(1, legs + 1)))}")
+          print(f"hours_per_leg={per:.4f}")
+          print(f"timeout_minutes={timeout}")
+          PY
+
+  campaign:
+    name: campaign leg ${{ matrix.leg }}
+    needs: plan
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ fromJSON(needs.plan.outputs.timeout_minutes) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: ${{ fromJSON(needs.plan.outputs.legs) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      # The live-chaos job's cache, read and written under its own key: this
+      # workflow adds no cache entry of its own.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-chaos-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Enable and verify unprivileged namespaces
+        run: |
+          set -euo pipefail
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || \
+            echo "note: sysctl unavailable on this image; relying on the probe"
+          unshare -rm bash -c 'mount -t tmpfs -o size=1m tmpfs /mnt && echo "mount namespaces OK"'
+
+      - name: Build harness binaries
+        run: |
+          cargo build -p vtop-node --bin vtop-node
+          cargo build -p vtop-cli --no-default-features --bin vtopctl
+
+      - name: Test the history checkers
+        run: python3 -m unittest discover -s scripts/live-chaos/history -p 'test_*.py'
+
+      - name: Run the campaign
+        env:
+          CHAOS_PROFILE: debug
+          CAMPAIGN_HOURS: ${{ needs.plan.outputs.hours_per_leg }}
+          CAMPAIGN_SCENARIOS: ${{ inputs.scenarios }}
+          CAMPAIGN_OUT: ${{ runner.temp }}/campaign
+        run: scripts/live-chaos/history/campaign.sh
+
+      - name: Keep the runs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: campaign-leg-${{ matrix.leg }}
+          path: ${{ runner.temp }}/campaign/
+          if-no-files-found: warn
+          retention-days: 14
+
+  report:
+    name: campaign report
+    needs: campaign
+    if: always() && needs.campaign.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: campaign-leg-*
+          path: legs
+      - name: Sum the legs
+        run: |
+          python3 - << 'PY'
+          import glob, json, os
+          from collections import Counter
+          runs = []
+          for path in sorted(glob.glob("legs/*/runs.jsonl")):
+              runs += [json.loads(l) for l in open(path) if l.strip()]
+          verdicts = Counter(r["verdict"] for r in runs)
+          hours = sum(r["seconds"] for r in runs) / 3600
+          violated = [r for r in runs if "VIOLATED" in (r["data_history"], r["control_history"])]
+          lines = [
+              "## Chaos campaign",
+              "",
+              f"{len(runs)} runs over {hours:.1f} hours of scenario time: "
+              + ", ".join(f"{k} {v}" for k, v in sorted(verdicts.items())),
+              "",
+              f"History violations: {len(violated)}",
+          ]
+          lines += [f"- run {r['run']} {r['scenario']} seed {r['seed']}: {r['violations']}" for r in violated]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("\n".join(lines) + "\n")
+          print("\n".join(lines))
+          if not runs or verdicts.get("FAIL") or violated:
+              raise SystemExit(1)
+          PY
+
+  reintroduce:
+    name: re-introduce #${{ inputs.reintroduce }}
+    if: inputs.reintroduce != 'none'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Re-introduce the bug, run its scenarios, judge the histories
+        env:
+          REINTRODUCE_OUT: ${{ runner.temp }}/reintroduce
+          BUG: ${{ inputs.reintroduce }}
+          RUNS: ${{ inputs.reintroduce_runs }}
+        run: scripts/live-chaos/history/reintroduce/run.sh "$BUG" "$RUNS"
+      - name: Keep the runs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: reintroduce-${{ inputs.reintroduce }}
+          path: |
+            ${{ runner.temp }}/reintroduce/summary.jsonl
+            ${{ runner.temp }}/reintroduce/build.log
+            ${{ runner.temp }}/reintroduce/run-*
+          if-no-files-found: warn
+          retention-days: 14

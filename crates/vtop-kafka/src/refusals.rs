@@ -22,18 +22,35 @@ pub enum Refusal {
     /// A request whose api key this gateway does not serve (CreateTopics,
     /// DescribeConfigs and the rest): the connection is closed.
     UnservedApi,
+    /// A Produce this node answered NOT_LEADER_OR_FOLLOWER because it does
+    /// not hold the range (#751): a candidate that follows, or a leader whose
+    /// lease moved on.
+    ProduceNotLeader,
+    /// The same for a Fetch.
+    FetchNotLeader,
+    /// The same for a ListOffsets.
+    ListOffsetsNotLeader,
 }
 
 impl Refusal {
     /// Every refusal, in export order. A new variant goes here too, or it is
     /// never exported (a test pins the count).
-    pub const ALL: [Refusal; 2] = [Refusal::OffsetCommitWithoutStore, Refusal::UnservedApi];
+    pub const ALL: [Refusal; 5] = [
+        Refusal::OffsetCommitWithoutStore,
+        Refusal::UnservedApi,
+        Refusal::ProduceNotLeader,
+        Refusal::FetchNotLeader,
+        Refusal::ListOffsetsNotLeader,
+    ];
 
     /// The `api` label.
     pub fn api(self) -> &'static str {
         match self {
             Refusal::OffsetCommitWithoutStore => "offset_commit",
             Refusal::UnservedApi => "unserved",
+            Refusal::ProduceNotLeader => "produce",
+            Refusal::FetchNotLeader => "fetch",
+            Refusal::ListOffsetsNotLeader => "list_offsets",
         }
     }
 
@@ -42,6 +59,9 @@ impl Refusal {
         match self {
             Refusal::OffsetCommitWithoutStore => "no_offset_store",
             Refusal::UnservedApi => "unserved_api",
+            Refusal::ProduceNotLeader | Refusal::FetchNotLeader | Refusal::ListOffsetsNotLeader => {
+                "not_leader"
+            }
         }
     }
 
@@ -49,6 +69,9 @@ impl Refusal {
         match self {
             Refusal::OffsetCommitWithoutStore => 0,
             Refusal::UnservedApi => 1,
+            Refusal::ProduceNotLeader => 2,
+            Refusal::FetchNotLeader => 3,
+            Refusal::ListOffsetsNotLeader => 4,
         }
     }
 }
@@ -114,7 +137,10 @@ mod tests {
             refusals.snapshot(),
             vec![
                 (Refusal::OffsetCommitWithoutStore, 0),
-                (Refusal::UnservedApi, 2)
+                (Refusal::UnservedApi, 2),
+                (Refusal::ProduceNotLeader, 0),
+                (Refusal::FetchNotLeader, 0),
+                (Refusal::ListOffsetsNotLeader, 0),
             ]
         );
     }
