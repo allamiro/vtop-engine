@@ -32,9 +32,12 @@ type: application
 # VtopObjectLockFallback (#757), values.yaml gains comments on extraVolumes
 # (#775) and ci/ gains a render example; carries appVersion 0.10.2.
 # 0.6.2: no template or values change — the bump carries appVersion 0.10.3.
-version: 0.6.2
+# 0.6.3: no template or values-key change — the shipped alert rules gain
+# VtopStateStoreWritesSlow (#872), VtopBucketVersioningPaused (#883) and
+# VtopEpochHistoryBroken (#894); carries appVersion 0.10.4.
+version: 0.6.3
 # Must track the workspace version in Cargo.toml; the GHCR image tags follow it.
-appVersion: "0.10.3"
+appVersion: "0.10.4"
 kubeVersion: ">=1.25.0-0"
 home: https://github.com/allamiro/vtop-engine
 sources:
