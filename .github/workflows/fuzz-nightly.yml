@@ -300,11 +300,12 @@ jobs:
   # GATED where the maintainer's rule on #729 can be met: each file of a leg
   # with `gate` fails the job below its own threshold, which is the file's
   # measured score minus 5 points and never below 0.80 (scripts/mutants-gate.py
-  # --file-min-score). The recovery path in vtop-state is gated. REPORT ONLY
-  # where it cannot yet: vtop-upload and vtop-adapters measured 0.64 to 0.77
-  # over the nights of 2026-11-16 to 2026-11-21, under the 0.80 floor, so a
-  # gate there would fail every night until tests are added; their score is
-  # recorded in the step summary and joins the gate once it reaches 0.85.
+  # --file-min-score). The recovery path in vtop-state and the file-continuity
+  # code in vtop-adapters are gated. REPORT ONLY where it cannot yet:
+  # vtop-upload measured 0.64 to 0.71 over the nights of 2026-11-16 to
+  # 2026-11-21, under the 0.80 floor, so a gate there would fail every night
+  # until tests are added; its score is recorded in the step summary and joins
+  # the gate once it reaches 0.85.
   #
   # The legs take up to two hours (vtop-adapters measured 110 minutes); the
   # budget leaves room for a slow runner, which the old 120 minutes did not:
@@ -324,9 +325,16 @@ jobs:
             files: crates/vtop-upload/src/base.rs crates/vtop-upload/src/multipart.rs
             gate: ""
           # File continuity: identity, rotation and resume across restarts.
+          # Gated: each file's score after the tests of #729 (continuity.rs
+          # 79 of 82 = 0.963, rotated.rs 33 of 34 = 0.971, file_source.rs 497
+          # of 510 = 0.975; the nightly measured 0.759, 0.765 and 0.741),
+          # minus 5 points, rounded down.
           - package: vtop-adapters
             files: crates/vtop-adapters/src/continuity.rs crates/vtop-adapters/src/rotated.rs crates/vtop-adapters/src/file_source.rs
-            gate: ""
+            gate: >-
+              crates/vtop-adapters/src/continuity.rs=0.91
+              crates/vtop-adapters/src/rotated.rs=0.92
+              crates/vtop-adapters/src/file_source.rs=0.92
           # Recovery: the ledger's claims, fences and the store's recovery
           # reads. Gated: each file's score after the tests of #729 (fence.rs
           # 36 of 38 = 0.947, sqlite_store.rs 67 of 71 = 0.944, store.rs 13
