@@ -210,3 +210,16 @@ def test_a_malformed_run_date_is_refused(tmp_path):
     (src / "results-x.jsonl").write_text(json.dumps(dict(case("a", ["put_get_head"], "pass"), server="x")) + "\n")
     with pytest.raises(report.Refused, match="not a YYYY-MM-DD date"):
         report.ingest(str(src), str(repo))
+
+
+@pytest.mark.parametrize("server", ["../../.github/workflows/evil", "a/b", ".hidden", "", "MinIO", 7])
+def test_an_ingested_server_that_is_not_a_plain_id_is_refused(tmp_path, server):
+    """The lines come from a downloaded artifact, and the id names the file written under RESULTS."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    src = tmp_path / "dl"
+    src.mkdir()
+    (src / "results-x.jsonl").write_text(json.dumps(dict(case("a", ["put_get_head"], "pass"), server=server)) + "\n")
+    with pytest.raises(report.Refused, match="is not a server id"):
+        report.ingest(str(src), str(repo))
+    assert not (tmp_path / ".github").exists() and not (repo / report.RESULTS).exists()
