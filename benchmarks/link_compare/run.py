@@ -332,6 +332,16 @@ def best_grid_point(csv_path: str, item: plans.Planned, grids: dict[str, Any]) -
     return dict(grids[item.system][int(best["grid_point"].lstrip("g")) - 1])
 
 
+def run_slug(item: plans.Planned) -> str:
+    """A stable, unique, path- and bucket-safe name for one planned row: its key, and a hash of it."""
+    import hashlib
+    import re
+
+    key = item.key(KIND.variant_columns)
+    readable = re.sub(r"[^a-z0-9]+", "-", "-".join(part for part in key if part).lower()).strip("-")
+    return f"{readable[:80]}-{hashlib.sha256('/'.join(key).encode()).hexdigest()[:10]}"
+
+
 def execute(lab_: Lab, env: dict[str, Any], item: plans.Planned, counter: list[int]) -> dict[str, Any]:
     files = int(item.params.get("files", 48))
     file_mib = float(item.params.get("file_mib", 20))
@@ -345,9 +355,12 @@ def execute(lab_: Lab, env: dict[str, Any], item: plans.Planned, counter: list[i
         raise runner.CellRefused(str(exc)) from exc
     lab_.ensure_dataset(files, file_mib, int(item.params.get("seed", SEED)))
     counter[0] += 1
-    bucket = f"{lab_.prefix}-{counter[0]:04d}".lower()
+    # Named by the planned row's key, not by how many runs this invocation made: a resumed run must
+    # never reuse an earlier row's configuration or log directory (review of #907).
+    slug = run_slug(item)
+    bucket = f"{lab_.prefix}-{slug.rsplit('-', 1)[-1]}".lower()
     lab_.mc("mb", "--ignore-existing", f"lab/{bucket}")
-    cfg_dir = os.path.join(lab_.run_dir, "configs", f"{counter[0]:04d}-{item.system}")
+    cfg_dir = os.path.join(lab_.run_dir, "configs", slug)
     tool = ToolRun(lab_, item.system, settings, bucket, files, file_bytes, cfg_dir,
                    timeout=float(item.params.get("timeout_minutes", 60)) * 60)
     shape, calibration_shape = link_shape(lab_, profile)

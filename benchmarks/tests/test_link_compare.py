@@ -391,3 +391,16 @@ def test_the_runner_and_the_loader_apply_one_hosted_rule():
     assert link.hosted_refusal("link", None)
     source = inspect.getsource(link_run.execute)
     assert "hosted_refusal" in source
+
+
+def test_a_resumed_run_never_reuses_an_earlier_rows_directory_or_bucket():
+    # Review of #907: names came from an invocation-local counter, so a resume overwrote earlier rows' files.
+    plan = plans.select(plans.load_plans(link_run.PLANS), "full")
+    items = plans.schedule(plan, KIND)
+    slugs = [link_run.run_slug(item) for item in items]
+    assert len(set(slugs)) == len(slugs) == 220
+    assert all(re.fullmatch(r"[a-z0-9-]+", slug) for slug in slugs)
+    assert link_run.run_slug(items[7]) == link_run.run_slug(plans.schedule(plan, KIND)[7])  # stable across calls
+    buckets = {slug.rsplit("-", 1)[-1] for slug in slugs}
+    assert len(buckets) == len(slugs)
+    assert "counter[0]:04d" not in inspect.getsource(link_run.execute)
