@@ -78,5 +78,25 @@ After the first install, bootstrap the metadata Raft group once. The steps are
 printed by the chart's post-install notes and described in
 [Kubernetes with Helm](../deploy/kubernetes.md#steps).
 
+## The Kafka gateway on a replicated range
+
+With `data.topology: replicated` and `data.kafka.enabled: true` every pod
+serves the Kafka gateway and lists every data pod as a broker, so a Kafka
+client that bootstrapped from any pod follows a failover to the pod that took
+the range, with no restart and no config change. The gateway has no identity
+check, so the render is refused until `data.kafka.acknowledgeUnauthenticated`
+is `true`; restrict the port with `networkPolicy.clientFrom` or the mesh.
+
+```bash
+helm template vtop helm/vtop \
+  -f helm/vtop/ci/replicated-values.yaml \
+  -f helm/vtop/ci/replicated-kafka-values.yaml
+```
+
+What a client sees through a failover, and the measured times, are in
+[Live chaos validation](../LIVE_CHAOS_VALIDATION.md#kafka-clients-and-a-failover-751).
+The values are in the
+[chart README](../../helm/vtop/README.md#the-kafka-gateway-on-a-replicated-range).
+
 Every value, its default and its meaning is in the
 [chart README](../../helm/vtop/README.md#values).

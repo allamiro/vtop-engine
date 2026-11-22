@@ -54,7 +54,10 @@ without editing a scenario:
 | `CHAOS_META_ADMIN_BASE_PORT` | `9200` | Metadata admin ports are this base plus node ID. |
 | `CHAOS_REPLICA_BASE_PORT` | `9300` | Replica ports are this base plus replica number. |
 | `CHAOS_NATIVE_PORT` | `9400` | Native producer/fetch port. |
-| `CHAOS_KAFKA_BASE_PORT` | `9420` | Kafka gateway listeners (#225): kafka-0 for scenario 16's standalone, kafka-1 for scenario 17's leader, kafka-2 for scenario 18's, kafka-3 for scenarios 19 and 20, kafka-4 and kafka-5 for scenario 21's two partitions. |
+| `CHAOS_KAFKA_BASE_PORT` | `9420` | Kafka gateway listeners (#225): kafka-0 for scenario 16's standalone, kafka-1 for scenario 17's leader, kafka-2 for scenario 18's, kafka-3 for scenarios 19 and 20, kafka-4 and kafka-5 for the two partitions of scenarios 21 and 24, kafka-6 to kafka-8 for the three candidates of scenarios 26 and 27 (#751). |
+| `CHAOS_KAFKA_RECORDS`, `CHAOS_KAFKA_KILL_AFTER_ACKS`, `CHAOS_KAFKA_FAILOVER_LIMIT_SECONDS` | `4000`, `800`, `60` (scenario 26); `3000`, `600`, `60` (scenario 27) | The records streamed, the acknowledgements after which the leader is killed, and the longest the client may wait for an acknowledgement after the kill (#751). |
+| `CHAOS_KAFKA_PACE_EVERY`, `CHAOS_KAFKA_PACE_SLEEP` | `10`, `0.1` | Scenario 26's pace: a pause of that many seconds after every that many records, 100 records a second. Scenario 27 sets `CHAOS_KAFKA_RATE` (default `100`), records a second, instead. |
+| `CHAOS_KAFKA_HOME`, `CHAOS_KAFKA_IMAGE`, `CHAOS_KAFKA_STRATEGIES` | unset, unset, `rebootstrap none` | Scenario 27's client: an unpacked Apache Kafka distribution, or an `apache/kafka` image to copy `/opt/kafka` out of with `docker`; with neither the scenario skips. The `metadata.recovery.strategy` values to run, one failover each. A JVM (17 or newer) must be on `PATH`. |
 | `CHAOS_META_METRICS_BASE_PORT` | `9500` | Metadata `/metrics` ports are this base plus node ID (#224). |
 | `CHAOS_DATA_METRICS_BASE_PORT` | `9600` | Data-plane `/metrics` ports: base+0 for the leader, base+1/2 for followers. |
 | `CHAOS_TOPIC_UUID` | `aaaaaaaa-…-b1` | Metadata's UUID for the topic, distinct from the wire-level topic name. |

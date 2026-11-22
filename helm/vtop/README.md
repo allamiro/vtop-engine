@@ -145,6 +145,40 @@ vtopctl --json meta range-lease \
 
 then aim produce/fetch at that holder's own headless FQDN on the native port.
 
+### The Kafka gateway on a replicated range (#751)
+
+A Kafka client cannot be pointed at "the holder": which pod that is changes
+when the holder dies. With `data.kafka.enabled: true` (replicated only) every
+pod serves the Kafka gateway on `ports.kafka` and lists **every** data pod as a
+broker, so a stock client that bootstrapped from any pod finds the holder, and
+follows a failover to the survivor that took the range, with no restart and no
+config change:
+
+- A pod that does not hold the range answers a produce or a fetch
+  `NOT_LEADER_OR_FOLLOWER`. Its Metadata names the lease holder as the
+  partition's leader, so the client's next metadata refresh goes there. A
+  lapsed or absent lease names nobody (`LEADER_NOT_AVAILABLE`) until a
+  survivor takes the range.
+- Broker ids are the data ordinal (0 to 255, so at most 256 data pods).
+  Each pod advertises its own headless FQDN, which resolves inside the cluster
+  only; set `data.kafka.advertisedHosts` (one address per data pod, in
+  ordinal order) when clients are outside, for example per-pod NodePort or
+  LoadBalancer addresses, each reaching that pod's `ports.kafka`.
+- **The gateway has no identity check.** It listens on every interface of the
+  pod and admits whoever reaches the port, so the render is refused until
+  `data.kafka.acknowledgeUnauthenticated` is `true`, and the port belongs
+  behind `networkPolicy.clientFrom` (which then opens it) or the mesh.
+- Group membership is held in memory by each gateway, so after a failover a
+  group's members rejoin; committed offsets are on the metadata plane and
+  survive.
+- Not rendered: `kafka.partitions` and `kafka.topics` (a candidate refuses both
+  by name), and a load-balanced Service for the port: a client must reach the
+  pod it is told about, so the headless Service carries the port and clients
+  dial the pods.
+
+`ci/replicated-kafka-values.yaml` is the overlay CI renders on top of
+`ci/replicated-values.yaml` and on `ci/separated-values.yaml`.
+
 ## TLS: required, never defaulted
 
 The chart ships **no credentials of any kind** and refuses to render until
@@ -416,12 +450,16 @@ certificates also carry that Service's DNS name as a shared SAN.
 | `data.range.rangeGeneration` | `0` | |
 | `data.segmentId` | — **required** | Segment UUID. |
 | `data.principalId` | — **required** | The one client principal accepted (= client cert CN). Never defaulted. |
+| `data.kafka.enabled` | `false` | Serve the Kafka gateway from every pod of a replicated range (#751; section above). Refused outside `replicated`. |
+| `data.kafka.acknowledgeUnauthenticated` | `false` | **Required when enabled.** The gateway carries no vtop identity and listens on every interface. |
+| `data.kafka.advertisedHosts` | `[]` | One address per data pod, in ordinal order, that clients dial for it; empty advertises each pod's headless FQDN (in-cluster only). |
 | `data.lease.enabled` | `false` | Metadata-driven leadership (#223); credential is the node's own data cert. **Required under `replicated`.** |
 | `data.lease.adminEndpoint` | `127.0.0.1:9200` | Local admin listener — legitimate under co-location. |
 | `data.lease.serverName` | `""` | Falls back to `tls.serverName`, then the pod's own FQDN. |
 | `data.lease.topicUuid` | — **required when enabled** | Metadata's topic UUID (not the wire name). |
 | `data.lease.leaseDurationMs` / `renewIntervalMs` / `pollIntervalMs` | `15000`/`5000`/`2000` | Mirrors binary defaults; keep the poll short. |
 | `ports.metaPeer` / `metaAdmin` / `replica` / `native` / `observability` | `9100`/`9200`/`9300`/`9400`/`9500` | Same well-known ports on every pod. |
+| `ports.kafka` | `9092` | The Kafka gateway, when `data.kafka.enabled`. |
 | `logFormat` | `json` | `VTOP_LOG_FORMAT`; `""` keeps pretty logs. |
 | `service.type` / `service.annotations` | `ClusterIP` / `{}` | Client Service (admin + obs only). |
 | `persistence.meta.size` / `storageClass` / `accessModes` | `10Gi` / `""` / `[ReadWriteOnce]` | Raft log volume. |
@@ -433,7 +471,7 @@ certificates also carry that Service's DNS name as a shared SAN.
 | `podDisruptionBudget.enabled` / `maxUnavailable` | `true` / `1` | Quorum — do not raise with 3 replicas. |
 | `networkPolicy.enabled` | `false` | Enable where the CNI enforces policy. |
 | `networkPolicy.metricsFrom` | `[]` | Peers allowed to scrape; **empty allows all sources on that one port**. |
-| `networkPolicy.clientFrom` | `[]` | Peers allowed the admin + native planes; empty = none (mTLS still applies everywhere). |
+| `networkPolicy.clientFrom` | `[]` | Peers allowed the admin + native planes, and the Kafka port when `data.kafka.enabled`; empty = none. mTLS still applies on the admin and native planes; the Kafka port has no identity check, so this is its only gate. |
 | `networkPolicy.extraEgress` | `[]` | Appended verbatim. |
 | `metrics.prometheusAnnotations` | `true` | `prometheus.io/*` pod annotations. |
 | `metrics.serviceMonitor.enabled` | `false` | Fails clearly if the CRD is absent; offline template needs `--api-versions monitoring.coreos.com/v1`. |

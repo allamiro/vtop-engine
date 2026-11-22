@@ -303,6 +303,34 @@ data:
   # which is a manual post-install step (see NOTES.txt).
   topology: standalone
 
+  # The Kafka gateway on a replicated range (#751): every candidate serves it
+  # on `ports.kafka` and lists every data pod as a broker, so a stock Kafka
+  # client that bootstrapped from any pod follows a failover with no restart
+  # and no config change. A pod that does not hold the range answers a produce
+  # or a fetch NOT_LEADER_OR_FOLLOWER, and its Metadata names the lease holder
+  # as the partition's leader; when the holder dies, the client's next
+  # metadata refresh finds the survivor that took the range.
+  #
+  # Off by default, and only under `topology: replicated` (enforced at render
+  # time): a standalone pod's gateway would serve one of several independent
+  # ranges. The gateway carries no vtop identity: whoever can reach the port
+  # produces and fetches, so `acknowledgeUnauthenticated` must be set, and
+  # the port belongs behind `networkPolicy` (`clientFrom`) or the mesh.
+  #
+  # Group membership is in memory per gateway, so after a failover a group's
+  # members rejoin; committed offsets are on the metadata plane and survive.
+  kafka:
+    enabled: false
+    # Required when enabled: the gateway listens on every interface of the pod
+    # and admits any peer that can reach it.
+    acknowledgeUnauthenticated: false
+    # What a client dials for each data pod, indexed by data ordinal. Empty
+    # uses each pod's own headless FQDN, which resolves inside the cluster
+    # only. Set it (one entry per data pod, each reaching that pod's
+    # `ports.kafka`) when clients are outside, for example per-pod NodePort
+    # or LoadBalancer addresses.
+    advertisedHosts: []
+
   # Drive range leadership from the metadata plane (#223) instead of the
   # static fencing epoch. Off by default to match the upstream co-located
   # harness, and REQUIRED under `topology: replicated`, where it is what
@@ -339,6 +367,8 @@ ports:
   metaAdmin: 9200
   replica: 9300
   native: 9400
+  # The Kafka gateway (data.kafka), when it is enabled.
+  kafka: 9092
   # /metrics, /healthz, /readyz. UNAUTHENTICATED by design (#78): keep it off
   # any public network — enable networkPolicy below or restrict at the mesh.
   observability: 9500

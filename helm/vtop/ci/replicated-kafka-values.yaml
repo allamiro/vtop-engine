@@ -1,0 +1,16 @@
+# The replicated shape with the Kafka gateway on (#751). An overlay on
+# `replicated-values.yaml`, not a standalone file:
+#
+#   helm template vtop helm/vtop \
+#     -f helm/vtop/ci/replicated-values.yaml \
+#     -f helm/vtop/ci/replicated-kafka-values.yaml
+#
+# Every pod serves the gateway and lists every pod as a broker, so a stock
+# Kafka client that bootstrapped from any pod follows a failover.
+#
+# The gateway has no vtop identity, so the acknowledgement is required; the
+# smoke test's namespace has no outside client and no NetworkPolicy to name.
+data:
+  kafka:
+    enabled: true
+    acknowledgeUnauthenticated: true

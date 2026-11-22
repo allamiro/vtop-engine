@@ -189,6 +189,15 @@
         },
         "segmentId": { "$ref": "#/$defs/uuidOrEmpty" },
         "principalId": { "$ref": "#/$defs/uuidOrEmpty" },
+        "kafka": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "acknowledgeUnauthenticated": { "type": "boolean" },
+            "advertisedHosts": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+          }
+        },
         "lease": {
           "type": "object",
           "additionalProperties": false,
@@ -212,6 +221,7 @@
         "metaAdmin": { "$ref": "#/$defs/port" },
         "replica": { "$ref": "#/$defs/port" },
         "native": { "$ref": "#/$defs/port" },
+        "kafka": { "$ref": "#/$defs/port" },
         "observability": { "$ref": "#/$defs/port" }
       }
     },

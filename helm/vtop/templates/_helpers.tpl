@@ -251,6 +251,14 @@ No output; only failures. Expects the root context.
 {{- if hasKey $v.data "leaderOrdinal" -}}
 {{- fail "\n\ndata.leaderOrdinal is retired (#284): \"replicated\" renders every pod as a CANDIDATE and the role follows the metadata lease, so failover no longer needs a re-render. Remove the value." -}}
 {{- end -}}
+{{- if $v.data.kafka.enabled -}}
+{{- if ne $v.data.topology "replicated" -}}
+{{- fail "\n\ndata.kafka.enabled is set but data.topology is not \"replicated\" (#751): the chart renders the Kafka gateway only for a replicated range, where every pod is a candidate and a client follows the lease holder. A standalone pod would serve one of several independent ranges. Set data.topology to replicated, or turn data.kafka.enabled off." -}}
+{{- end -}}
+{{- if not $v.data.kafka.acknowledgeUnauthenticated -}}
+{{- fail "\n\ndata.kafka.enabled is set without data.kafka.acknowledgeUnauthenticated (#751): the Kafka gateway carries no vtop identity and listens on every interface of the pod, so whoever can reach the port can produce and fetch. Restrict the port with networkPolicy.clientFrom or the mesh, then set data.kafka.acknowledgeUnauthenticated to true." -}}
+{{- end -}}
+{{- end -}}
 {{- if eq $v.data.topology "replicated" -}}
 {{- if not $v.data.lease.enabled -}}
 {{- fail "\n\ndata.topology \"replicated\" requires data.lease.enabled: candidates acquire the range through the metadata lease (#284). Without it no pod would ever lead." -}}
@@ -259,6 +267,41 @@ No output; only failures. Expects the root context.
 {{- fail (printf "\n\ndata.fencingEpoch is %d but must be 0 under \"replicated\": candidates learn their epoch from lease grants (minted from 1), and a static floor at or above the first grant refuses it." (int $v.data.fencingEpoch)) -}}
 {{- end -}}
 {{- end -}}
+{{- end }}
+
+{{/*
+The `kafka:` block of the data pod at an ordinal (#751), for a replicated
+range: this pod's listener and broker id, and EVERY data pod as a broker, the
+same list on each, because a client told only about a dead broker has nowhere
+to go. The broker id is the data ordinal. Expects
+(dict "root" $ "ordinal" <int> "count" <data pod count> "separated" <bool>);
+the caller indents it into its own block.
+*/}}
+{{- define "vtop.kafkaGateway" -}}
+{{- $root := .root -}}
+{{- $v := $root.Values -}}
+{{- if and (gt (len $v.data.kafka.advertisedHosts) 0) (ne (len $v.data.kafka.advertisedHosts) (int .count)) -}}
+{{- fail (printf "\n\ndata.kafka.advertisedHosts has %d entries but there are %d data pods: list one address per data pod, indexed by data ordinal, or leave it empty to advertise each pod's own FQDN." (len $v.data.kafka.advertisedHosts) (int .count)) -}}
+{{- end -}}
+# The Kafka gateway (#751). Every candidate serves it; the one holding the
+# range answers, the others name the holder in Metadata.
+kafka:
+  listen: "0.0.0.0:{{ $v.ports.kafka }}"
+  any_interface: true
+  topic: {{ $v.data.range.topic | quote }}
+  node_id: {{ int .ordinal }}
+  brokers:
+{{- range $j := until (int .count) }}
+{{- $host := "" }}
+{{- if gt (len $v.data.kafka.advertisedHosts) 0 }}
+{{- $host = index $v.data.kafka.advertisedHosts $j }}
+{{- else if $.separated }}
+{{- $host = include "vtop.tierPodFqdn" (dict "root" $root "tier" "data" "ordinal" $j) }}
+{{- else }}
+{{- $host = include "vtop.podFqdn" (dict "root" $root "ordinal" $j) }}
+{{- end }}
+    - { node_uuid: {{ index $v.data.nodeUuids $j }}, node_id: {{ $j }}, host: {{ $host | quote }}, port: {{ $v.ports.kafka }} }
+{{- end }}
 {{- end }}
 
 {{/*
@@ -505,6 +548,9 @@ native_tls:
 # The one client principal the produce/fetch authorizer accepts; never
 # defaulted by the chart (a default principal is a baked-in credential).
 principal_id: {{ required "\n\ndata.principalId is required: the UUID of the one client principal the produce/fetch authorizer accepts (must equal your client certificate's CN). The chart never defaults credentials (issue #81)." $v.data.principalId }}
+{{- if $v.data.kafka.enabled }}
+{{ include "vtop.kafkaGateway" (dict "root" $root "ordinal" $i "count" $dataCount "separated" true) }}
+{{- end }}
 {{- if $v.data.lease.enabled }}
 {{- /* Under separated mode the co-located default (this process's own
        loopback admin listener) names nothing: there is no metadata process
@@ -745,6 +791,9 @@ data:
   # The one client principal the produce/fetch authorizer accepts; never
   # defaulted by the chart (a default principal is a baked-in credential).
   principal_id: {{ required "\n\ndata.principalId is required: the UUID of the one client principal the produce/fetch authorizer accepts (must equal your client certificate's CN). The chart never defaults credentials (issue #81)." $v.data.principalId }}
+{{- if $v.data.kafka.enabled }}
+{{ include "vtop.kafkaGateway" (dict "root" $root "ordinal" $i "count" (int $v.replicaCount) "separated" false) | indent 2 }}
+{{- end }}
 {{- if $v.data.lease.enabled }}
   # Metadata-driven leadership (#223). The credential is this node's OWN
   # data-plane certificate (CN = node_uuid): the lease names this broker as
