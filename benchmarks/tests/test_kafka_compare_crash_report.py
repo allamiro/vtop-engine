@@ -28,12 +28,14 @@ def read_rows(run_dir):
         return list(csv.DictReader(handle))
 
 
-def synthetic_run(directory, crashes=12, modes=("flakey-drop",), kafka_defaults_loses=True, refuse=()):
+def synthetic_run(directory, crashes=12, modes=("flakey-drop",), kafka_defaults_loses=True, refuse=(),
+                  comparable=None):
     """A complete run of the AWS round's shape. Kafka's defaults lose records in every power-loss crash, the
     fsync-parity configuration and VTOP lose none. `refuse` is a set of (config, crash) written as refused."""
     with open(os.path.join(SMOKE, "environment.json")) as handle:
         env = json.load(handle)
     env["matrix"].update(crashes=crashes, crash_modes=list(modes), smoke=False)
+    env["comparable"].update(comparable or {})
     env["run_id"] = "crash-synthetic"
     env["run_state"] = "complete"
     fingerprint = schema.fingerprint(env)
@@ -120,7 +122,8 @@ def test_a_twelve_crash_run_loads_at_the_default_floor_and_prints_the_bound(tmp_
     _written, _img, doc = render(run, tmp_path)
     page = doc.read_text()
     # 0 of 12: 1 - 0.05 ** (1 / 12) = 22.1 %.
-    assert "| Kafka, fsync on every message | flakey-drop | 12 of 12 |" in page and "| 0 of 12 | - | 0 | 22.1 % |" in page
+    assert "| Kafka, fsync on every message | flakey-drop | 12 of 12 |" in page
+    assert "| 0 of 12 | - | 0 | 22.1 % |" in page
     assert "| Kafka, defaults | flakey-drop | 12 of 12 |" in page and "| 12 of 12 |" in page
     assert "bounded to 22.1 % at 95 %" in page
     # Power loss only: the control's rows and panel are absent, and so is nothing else the plan wrote.
@@ -197,3 +200,12 @@ def test_the_fixture_run_is_the_harness_s_own_not_hand_edited():
     run = cs.load_crash_run(SMOKE)
     assert run.environment["kind"] == "crash" and run.environment["run_state"] == "complete"
     assert len(run.rows) == 12 and run.environment["matrix"]["crashes"] == 2
+
+
+def test_a_disk_name_that_would_break_the_footer_is_a_refusal_not_a_traceback(tmp_path, capsys):
+    run = synthetic_run(tmp_path / "run", comparable={"host_disk": "EBS | gp3"})
+    out = tmp_path / "out"
+    assert kreport.main([run, "--img-dir", str(out / "img"), "--doc", str(out / "p.md")]) == 2
+    err = capsys.readouterr().err
+    assert "report refused" in err and "footer" in err and "host_disk" not in err.replace("disk", "")
+    assert not out.exists()

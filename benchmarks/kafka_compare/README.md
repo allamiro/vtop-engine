@@ -152,6 +152,16 @@ that no run writes. SVG and Markdown must match byte for byte. PNGs must match p
 pixel, not byte for byte: Pillow's macOS and Linux wheels compress identical pixels to different bytes, so a
 PNG whose decoded image is unchanged keeps its committed bytes.
 
+**A second run of a kind, and the crash report.** A run directory may hold a [`report.json`](run_outputs.py),
+`{"doc": "docs/benchmarks/<page>.md", "img_dir": "docs/benchmarks/img/<dir>"}`, which sends that run's page and
+images beside the first run's instead of onto the same files (without it two committed runs of one kind are
+refused, as above). The file is part of the run, committed with it. `report.py` hands a crash run (its directory
+holds `crash.csv`, #599) to [`crash_report.py`](crash_report.py), which reads it through the harness's own
+`crash_schema.load_crash_run` with a floor of ten ok crashes per configuration and mode, writes
+`docs/benchmarks/kafka-crash.md` and `kafka-crash-*.{png,svg}`, and prints the exact binomial upper bound beside every
+cell that lost nothing. The steps for placing a run, in order, are in
+[`../README.md`](../README.md#ingesting-a-results-directory-the-v0110-aws-round).
+
 The same job then runs [`../readme_charts.py`](../readme_charts.py), which draws the project README's
 evidence charts (light and dark SVGs under `docs/assets/readme/`) from these runs and from
 `benchmarks/measurements/`, with the same pinned stack, and fails on any difference there too.

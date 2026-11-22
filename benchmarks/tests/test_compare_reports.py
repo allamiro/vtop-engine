@@ -154,8 +154,8 @@ def test_a_report_json_sends_the_run_s_page_and_images_beside_the_default_ones(k
     spec = importlib.import_module(f"{kind}_compare.report").REPORT
     run = fixture.write_run(str(tmp_path / "runs"))
     with open(os.path.join(run, "report.json"), "w") as handle:
-        json.dump({"doc": f"docs/benchmarks/{kind}-comparison-aws.md", "img_dir": f"docs/benchmarks/{spec.img_dir}/aws"},
-                  handle)
+        json.dump({"doc": f"docs/benchmarks/{kind}-comparison-aws.md",
+                   "img_dir": f"docs/benchmarks/{spec.img_dir}/aws"}, handle)
     written = creport.build(run, spec, str(tmp_path))
     assert str(tmp_path / "docs" / "benchmarks" / f"{kind}-comparison-aws.md") in written
     assert all(p.startswith(str(tmp_path / "docs" / "benchmarks")) for p in written)

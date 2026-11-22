@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 from typing import Any, NamedTuple
 
-from kafka_compare import colours, footer, stats
+from kafka_compare import colours, footer, schema, stats
 from kafka_compare import crash_analysis as ca
 from kafka_compare import crash_schema as cs
 from kafka_compare import report as base
@@ -377,7 +377,7 @@ def write_markdown(run: cs.CrashRun, images: dict[str, str], csv_rel: dict[str, 
     add("")
     add("## Loss: acknowledged records that were not there afterwards")
     add("")
-    add(f"Counted over the ok crashes only. \"95 % bound\" is the exact one-sided upper bound on the chance that a "
+    add("Counted over the ok crashes only. \"95 % bound\" is the exact one-sided upper bound on the chance that a "
         "crash loses something, given that none of the ok crashes did; it is printed only for a cell that lost "
         "nothing.")
     add("")
@@ -470,7 +470,11 @@ def write_markdown(run: cs.CrashRun, images: dict[str, str], csv_rel: dict[str, 
 
 def build(run_dir: str, img_dir: str, doc_path: str, setup_matplotlib, min_ok: int = MIN_OK_CRASHES) -> list[str]:
     run = cs.load_crash_run(run_dir, min_ok=min_ok)  # raises ReportRefused before anything is written
-    text = footer_text(run.environment)
+    try:
+        text = footer_text(run.environment)
+    except (KeyError, ValueError) as exc:
+        raise schema.ReportRefused(f"{run_dir}/environment.json cannot make the footer every image carries: "
+                                   f"{exc!r}") from exc
     plt = setup_matplotlib()
     os.makedirs(img_dir, exist_ok=True)
     os.makedirs(os.path.dirname(os.path.abspath(doc_path)), exist_ok=True)
