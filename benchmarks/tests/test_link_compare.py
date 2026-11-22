@@ -316,3 +316,36 @@ def test_the_dry_run_prints_the_plan_and_touches_no_docker(capsys, monkeypatch):
 def test_a_plan_projected_over_max_hours_is_refused(capsys):
     assert link_run.main(["--plan", "full", "--dry-run", "--max-hours", "5"]) == 2
     assert "over --max-hours" in capsys.readouterr().err
+
+
+# ------------------------------------------------- review of #907: failures and the neighbour window
+
+
+def test_a_failed_tool_is_a_failed_row_that_still_says_how_many_files_it_committed():
+    status, note = link.run_status("defaults", 1, {}, 12, 48, "boom: policer\nreset")
+    assert status == "failed" and "12 of 48 files committed" in note and "boom: policer reset" in note
+    assert link.run_status("defaults", "timeout", {}, 0, 48)[0] == "failed"
+    # Exit 0 with nothing committed: the payload-derived columns cannot be measured, so not an ok row.
+    status, note = link.run_status("defaults", 0, {"objects_committed": 0}, 0, 48)
+    assert status == "failed" and note.startswith("could not measure") and "0 of 48" in note
+    assert link.run_status("smoke", 0, {}, 3, 4) == ("failed", "3 of 4 files committed")
+    full = {column: "1" for column in link.REQUIRED["defaults"]}
+    assert link.run_status("defaults", 0, full, 48, 48) == ("ok", "")
+
+
+def test_both_flows_of_the_jain_index_come_from_the_same_counters_over_the_same_window():
+    text = ("Chain INPUT (policy ACCEPT 0 packets, 0 bytes)\n"
+            "    pkts      bytes target     prot opt in     out     source               destination\n"
+            "     120   180000            tcp  --  *      *       0.0.0.0/0            0.0.0.0/0  tcp dpt:5201 "
+            "/* vtb-neighbour */\n"
+            "     300   450000            tcp  --  *      *       0.0.0.0/0            10.77.47.10 tcp dpt:9000 "
+            "/* vtb-store */\n")
+    assert link.parse_flow_counters(text) == {"vtb-neighbour": 180000, "vtb-store": 450000}
+    samples = [(t, {"vtb-neighbour": 125_000 * t, "vtb-store": 250_000 * t}) for t in range(0, 21)]
+    # The window excludes the samples before 5 s (the omitted ramp) and after 15 s (collection).
+    assert link.window_mbps(samples, "vtb-neighbour", 5, 15) == pytest.approx(1.0)
+    assert link.window_mbps(samples, "vtb-store", 5, 15) == pytest.approx(2.0)
+    with pytest.raises(link.LinkRefused, match="fewer than two"):
+        link.window_mbps(samples, "vtb-store", 5.2, 5.8)
+    source = inspect.getsource(link_run.neighbour)
+    assert "with_tool.bytes" not in source and source.count("window_mbps") >= 2

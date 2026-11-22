@@ -66,6 +66,10 @@ services:
         set -e
         iptables -t nat -A PREROUTING -p tcp --dport 9200 -j DNAT --to-destination 10.77.47.10:9000
         iptables -t nat -A POSTROUTING -d 10.77.47.10 -j MASQUERADE
+        # Per-flow counting rules (no target: they only count) for the neighbour cell: the
+        # tools' traffic forwarded to the store, and the neighbour's iperf3 flow to this box.
+        iptables -I FORWARD 1 -d 10.77.47.10 -p tcp --dport 9000 -m comment --comment vtb-store
+        iptables -I INPUT 1 -p tcp --dport 5201 -m comment --comment vtb-neighbour
         iperf3 -s -p 5201 -D
         exec sleep infinity
     depends_on:

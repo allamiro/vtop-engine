@@ -122,6 +122,14 @@ class Lab:
                       f"/sys/class/net/{self.engine_iface}/statistics/rx_bytes"]).stdout
         return {"rx_bytes": int(out.strip())}
 
+    def flow_counters(self) -> dict[str, int]:
+        """Bytes per flow that crossed the shaped link (compose.yml's `vtb-*` counting rules)."""
+        out: dict[str, int] = {}
+        for chain in ("INPUT", "FORWARD"):
+            text = lab.sh(["docker", "exec", self.container("netem"), "iptables", "-nvx", "-L", chain]).stdout
+            out.update(link.parse_flow_counters(text))
+        return out
+
     def readback(self, bucket: str) -> tuple[list[tuple[str, int, str]], dict[str, float]]:
         """(key, size, sha256) of every object in the bucket, read through the store, and LastModified."""
         from compare_common import checker
@@ -398,45 +406,80 @@ def execute(lab_: Lab, env: dict[str, Any], item: plans.Planned, counter: list[i
     if hosted and item.cell == "committed" and out.get("bottleneck") != "link":
         out.update({"status": "refused", "note": f"a hosted row needs the link as its bottleneck; recorded "
                                                  f"{out.get('bottleneck')!r} (cpu_share {out.get('cpu_share')!r})"})
-    if tool.code not in (0, None):
-        out["note"] = f"{item.system} exited {tool.code}: {' '.join(tool.output.split())[-400:]}"
-    if item.cell == "smoke" and judged.objects_committed != judged.files_expected:
-        out["status"] = "failed"
-        out["note"] = (f"{judged.objects_committed} of {judged.files_expected} files committed (missing "
-                       f"{', '.join(judged.missing[:5])}); " + out.get("note", ""))
+    if "status" not in out:
+        status, note = link.run_status(item.cell, tool.code, out, judged.objects_committed, judged.files_expected,
+                                       tool.output)
+        if status != "ok":
+            out.update({"status": status, "note": f"{item.system} {note}"})
     with open(os.path.join(cfg_dir, "tool-output.txt"), "w", encoding="utf-8") as handle:
         handle.write(f"$ {shlex.join(tool.command)}\nexit {tool.code}\n{tool.output}\n")
     lab_.mc("rb", "--force", f"lab/{bucket}")
     return out
 
 
+class FlowSampler:
+    """The middlebox's per-flow counters every 0.5 s on a thread, timestamped on this host's clock."""
+
+    def __init__(self, lab_: Lab, interval: float = 0.5):
+        self.lab, self.interval = lab_, interval
+        self.samples: list[tuple[float, dict[str, int]]] = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.samples.append((time.time(), self.lab.flow_counters()))
+            except Exception:  # noqa: BLE001 - a missed sample narrows the window, window_mbps refuses an empty one
+                pass
+            self._stop.wait(self.interval)
+
+    def __enter__(self) -> FlowSampler:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+
 def neighbour(lab_: Lab, tool: ToolRun, seconds: int) -> dict[str, Any]:
-    """The #478 instrument: an iperf3 flow alone, beside the tool, and alone again."""
+    """The #478 instrument: an iperf3 flow alone, beside the tool, and alone again.
+
+    Every per-flow rate comes from ONE instrument over ONE window: the middlebox's per-flow counting
+    rules (bytes that crossed the shaped link, headers included, for both flows alike), sampled every
+    0.5 s, over the window iperf3 measured (its reported seconds, ending when it returned, so its
+    omitted ramp is outside). iperf3's own goodput is not mixed with a counter difference."""
     from lib import competitor
 
     spec = competitor.CompetitorSpec(mode="bulk", seconds=seconds, container=lab_.container("probe"))
     run_probe = competitor.docker_exec(spec.container, spec.collection_timeout())
-    alone_before = competitor.measure(spec, run_probe, "alone before").mbps
+
+    def phase(name: str) -> tuple[float, FlowSampler, float, float]:
+        with FlowSampler(lab_) as sampler:
+            sample = competitor.measure(spec, run_probe, name)
+            ended = time.time()
+        start, end = ended - sample.seconds - 0.5, ended - 0.5
+        return link.window_mbps(sampler.samples, "vtb-neighbour", start, end), sampler, start, end
+
+    alone_before, _s, _a, _b = phase("alone before")
     thread = threading.Thread(target=tool.run, daemon=True)
     thread.start()
     time.sleep(15)  # the tool's ramp, outside the shared window
-    counters_before = lab_.rx_bytes()
-    with_tool = competitor.measure(spec, run_probe, "with the tool")
-    counters_after = lab_.rx_bytes()
+    neighbour_with, sampler, start, end = phase("with the tool")
     still_running = thread.is_alive()
     thread.join()
     if not still_running:
         raise runner.CellRefused("the tool finished inside the shared window, so the window was not contended "
                                  "throughout; give it more files or a shorter neighbour_seconds")
-    alone_after = competitor.measure(spec, run_probe, "alone after").mbps
+    tool_with = link.window_mbps(sampler.samples, "vtb-store", start, end)
+    alone_after, _s, _a, _b = phase("alone after")
     if competitor.solo_agreement(alone_before, alone_after) > link.CALIBRATION_TOLERANCE:
-        raise runner.CellRefused(f"the neighbour alone measured {alone_before} Mbit/s before and {alone_after} after: "
-                                 "the link changed under the run")
-    tool_bytes = max(link.wire_bytes(counters_before, counters_after) - with_tool.bytes, 0)
-    tool_mbps = tool_bytes * 8 / 1e6 / with_tool.seconds
-    return {"neighbour_alone_before_mbps": alone_before, "neighbour_with_mbps": with_tool.mbps,
-            "neighbour_alone_after_mbps": alone_after, "tool_with_mbps": f"{tool_mbps:.3f}",
-            "jain_index": link.jain(with_tool.mbps, tool_mbps)}
+        raise runner.CellRefused(f"the neighbour alone measured {alone_before:.3f} Mbit/s before and "
+                                 f"{alone_after:.3f} after: the link changed under the run")
+    return {"neighbour_alone_before_mbps": f"{alone_before:.3f}", "neighbour_with_mbps": f"{neighbour_with:.3f}",
+            "neighbour_alone_after_mbps": f"{alone_after:.3f}", "tool_with_mbps": f"{tool_with:.3f}",
+            "jain_index": link.jain(neighbour_with, tool_with)}
 
 
 # --------------------------------------------------------------------- main

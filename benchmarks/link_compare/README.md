@@ -67,6 +67,14 @@ under `tools/` differs from HEAD: the CSV records the committed file's sha256.
 6. **Read-back**, outside the timed window: every object in the tool's bucket through `mc cat | sha256sum`,
    judged against the manifest (`kind.judge_readback`).
 
+The `neighbour` cell takes every per-flow rate from one instrument over one window: the middlebox's per-flow
+counting rules (`vtb-store`, `vtb-neighbour` in `compose.yml`; bytes that crossed the shaped link, headers
+included, for both flows alike), sampled every 0.5 s, over the window iperf3 measured. Jain's index is
+computed from those two rates, never from iperf3's goodput minus an interface counter.
+
+A tool that exits non-zero, times out, or leaves a column its cell needs unmeasurable is a `failed` row
+whose note still says how many files it committed.
+
 The tool order is rotated by one per repetition (A B C D, B C D A, ...), and the CSV is written in run order.
 
 ## Cells and columns

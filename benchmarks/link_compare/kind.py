@@ -287,6 +287,54 @@ def jain(neighbour_with_mbps: float | None, tool_with_mbps: float | None) -> flo
     return competitor.jain_index([float(neighbour_with_mbps), float(tool_with_mbps)])
 
 
+# ------------------------------------------------------------ per flow
+
+
+def parse_flow_counters(iptables_output: str) -> dict[str, int]:
+    """{comment: bytes} from `iptables -nvx -L <chain>`: the middlebox's per-flow counting rules
+    (`-m comment --comment vtb-<flow>`, no target), which count only packets that crossed the shaped
+    link, since the shaping drops on the ifb before the IP layer sees them."""
+    out: dict[str, int] = {}
+    for line in iptables_output.splitlines():
+        fields = line.split()
+        found = [f for f in fields if f.startswith("vtb-")]
+        if len(fields) > 2 and fields[1].isdigit() and found:
+            out[found[0]] = out.get(found[0], 0) + int(fields[1])
+    return out
+
+
+def window_mbps(samples: Sequence[tuple[float, dict[str, int]]], flow: str, start: float, end: float) -> float:
+    """A flow's rate over [start, end] from timestamped counter samples: the first sample at or after
+    `start` to the last at or before `end`. Both flows of a fairness index are taken over the SAME
+    window this way, so Jain's index compares like with like (#747 test 10, review of #907)."""
+    inside = [(at, counters) for at, counters in samples if start <= at <= end and flow in counters]
+    if len(inside) < 2 or inside[-1][0] - inside[0][0] <= 0:
+        raise LinkRefused(f"fewer than two counter samples of {flow} inside the window {start:.1f}-{end:.1f}")
+    delta = inside[-1][1][flow] - inside[0][1][flow]
+    if delta < 0:
+        raise LinkRefused(f"the {flow} counter went backwards inside the window")
+    return delta * 8 / 1e6 / (inside[-1][0] - inside[0][0])
+
+
+def run_status(cell: str, exit_code: Any, out: dict[str, Any], committed: int, expected: int,
+               tool_output: str = "") -> tuple[str, str]:
+    """(status, note) of one tool run (#744 rule 18: a failure is recorded as measured, never retried).
+
+    `failed` when the tool exited non-zero or timed out, when a smoke did not commit every file, or when
+    a column an ok row of the cell must carry could not be measured (nothing committed, no CPU samples):
+    an ok row with a hole would refuse the whole run at load (review of #907). The note always carries
+    objects committed of N, which the read-back measured whatever the tool did."""
+    counted = f"{committed} of {expected} files committed"
+    if exit_code not in (0, None):
+        return "failed", f"exited {exit_code} ({counted}): {' '.join(tool_output.split())[-400:]}"
+    if cell == "smoke" and committed != expected:
+        return "failed", counted
+    missing = [column for column in REQUIRED.get(cell, ()) if out.get(column) in ("", None)]
+    if missing:
+        return "failed", f"could not measure {', '.join(missing)} ({counted})"
+    return "ok", ""
+
+
 # --------------------------------------------------------------- rows
 
 
