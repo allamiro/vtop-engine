@@ -87,8 +87,11 @@ def test_a_failed_tool_is_a_stub_in_the_chart_and_the_table_not_a_missing_bar(tm
         writer.writerows(rows)
     page, _img, written = _build(tmp_path, (), runs=runs)
     assert any(p.endswith("summary-a-throughput.svg") for p in written)
-    line = next(line for line in page.splitlines() if line.startswith("| records/s | drain, 1 KiB |"))
+    table = page.split("**records/s**", 1)[1].split("\n\n", 2)[1]
+    line = next(line for line in table.splitlines() if line.startswith("| drain, 1 KiB |"))
     assert "| failed |" in line
+    scored = next(line for line in page.splitlines() if line.startswith("| records/s | drain, 1 KiB |"))
+    assert "Vector" not in scored.split("|")[3], "a failed tool has no value to be best with"
 
 
 def test_each_chart_s_source_tool_versions_and_licences_come_from_its_run_and_the_registry(tmp_path):
