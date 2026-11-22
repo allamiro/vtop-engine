@@ -9,6 +9,24 @@ what each release does **not** yet do.
 
 ---
 
+## Next release — the ledger's backup and restore are drilled
+
+- **[#734](https://github.com/allamiro/vtop-engine/issues/734)** — the
+  ledger's backup and restore are written down and drilled. `operate/backup-and-recovery.md`
+  has the commands for SQLite (the online backup, while the engine runs) and
+  PostgreSQL (`pg_dump`; a base backup with WAL archiving, restored to the end
+  of the archive or to a time), the RPO and RTO each procedure is held to, and
+  the numbers the drill measured. `scripts/restore-drill.sh` backs the ledger
+  up under a live engine, kills the engine, destroys the ledger, restores it
+  and starts the engine again, and fails unless `audit-coverage
+  --check-storage` shows no hole, `scrub --sample` is clean, every source
+  record is in a committed object and RPO and RTO are inside the documented
+  bounds. SQLite runs on a pull request that touches the state store;
+  PostgreSQL runs nightly on every supported major, from the images
+  `postgres-matrix.yml` pins. The drill reads a file source; Kafka offsets,
+  a source that deletes after commit, a ledger of production size and the
+  metadata tier are not covered.
+
 ## v0.1.0 — a range that fails over
 
 Metadata leases, a lease agent on the data node, verified promotion, and the
@@ -1091,11 +1109,15 @@ B. Known limitations:
   does.** Old writers are covered by the committed fixtures in
   `crates/vtop-core/tests/fixtures/manifests/` (v0.7.0 and v0.8.0 output, and
   the first `0.4` manifests and receipts release B wrote). Old readers are
-  covered by the `manifest-compat` CI job (`scripts/manifest-compat.sh`): HEAD
-  writes a signed `0.4` archive with receipts, the published v0.8.0 and later
-  `vtopctl` (checked against each release's `SHA256SUMS`) must pass
-  `verify-manifest` on it and accept the config in `validate`, and v0.7.0
-  must report the self-hash failure.
+  covered by the `manifest` cells of the compatibility matrix
+  (`.github/workflows/compat.yml`, running `scripts/manifest-compat.sh`, #743):
+  HEAD writes a signed `0.4` archive with receipts, the published v0.8.0 and
+  later `vtopctl` (checked against each release's `SHA256SUMS` and Sigstore
+  bundle) must pass `verify-manifest` on it and accept the config in
+  `validate`, and v0.7.0 must report the self-hash failure. Pull requests run
+  the newest release and the two sides of the cutoff (v0.7.0 and v0.8.0);
+  the nightly run covers every release. The `ledger-sqlite` cell runs
+  `scripts/ledger-compat.sh` on the newest release.
 
 **Verification receipts (#671 release B).** With
 `manifest.verification_receipts: true` the engine writes

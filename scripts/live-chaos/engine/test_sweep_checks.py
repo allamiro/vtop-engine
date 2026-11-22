@@ -217,6 +217,45 @@ class FileCommitRuleTest(unittest.TestCase):
         self.assertFalse(sc.commit_rule("40", ledger, "p", "w", "file")[0])
 
 
+class SpoolSourceTest(unittest.TestCase):
+    """The spool leg reads its ledger as the file leg does, by its own source type."""
+
+    OK = ("strong", "s3://b/o", "s3://b/m")
+
+    def spool_marker(self, end_byte, path="/in/sweep.log"):
+        m = json.loads(file_marker(end_byte, path=path))
+        m["source_type"] = "syslog_spool"
+        m["spool_id"] = Path(path).name
+        return json.dumps(m)
+
+    def test_summarises_one_spool_and_ignores_a_file_of_the_same_path(self):
+        rows = pg_rows(
+            ("s1", "source_committed", self.spool_marker(1300), *self.OK),
+            ("s2", "verified", self.spool_marker(2600), *self.OK),
+            ("f1", "source_committed", file_marker(9999), *self.OK),
+        )
+        s = sc.summarize(rows, sc.Source("syslog_spool", "/in/sweep.log"))
+        self.assertEqual((s["rows"], s["verified_end"], s["committed_end"]), (2, 2600, 1300))
+
+    def test_a_spool_cursor_past_the_verified_end_is_a_violation_naming_the_spool(self):
+        ledger = {"verified_end": 2600, "states": {"VERIFIED": 1}}
+        self.assertTrue(sc.commit_rule("2600", ledger, "p", "w", "syslog_spool")[0])
+        ok, msg = sc.commit_rule("2601", ledger, "p", "w", "syslog_spool")
+        self.assertFalse(ok)
+        self.assertIn("spool source's ledger cursor", msg)
+
+    def test_the_cli_accepts_a_spool_source(self):
+        out = subprocess.run(
+            [sys.executable, str(Path(sc.__file__)), "ledger", "--rows-json", "syslog_spool", "/in/sweep.log"],
+            input=json.dumps(pg_rows(("s1", "verified", self.spool_marker(40), *self.OK))),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(out.stdout)["verified_end"], 40)
+
+
 def listed_points():
     """The failpoints the engine defines, read from its source."""
     text = (Path(__file__).resolve().parents[3] / "crates/vtop-cli/src/failpoints.rs").read_text()
