@@ -439,7 +439,7 @@ fn a_call_past_the_ceiling_is_reported_once_and_still_waited_for() {
 /// for the call that holds the retired bridge: the retry rotates a new,
 /// empty generation, and the old one is the work that matters. The same holds
 /// for a second quiesce started beside the first. Red against a quiesce that
-/// kept the closed generation only in its own frame (a Codex finding on this
+/// kept the closed generation only in its own frame (a review finding on this
 /// PR).
 #[test]
 fn a_cancelled_quiesce_that_is_retried_still_waits_for_the_call_in_flight() {
@@ -500,7 +500,7 @@ fn a_call_that_starts_after_the_slot_is_cleared_never_reaches_the_old_bridge() {
 /// work the gateway counts. The quiesce waits for what was running when the
 /// slot was cleared, not for the gateway to go idle: traffic that never
 /// touches the retired bridge must not hold a demotion open. Red against a
-/// quiesce that waited on the gateway's total (a Codex finding on this PR).
+/// quiesce that waited on the gateway's total (a review finding on this PR).
 #[test]
 fn work_that_arrives_during_a_demotion_does_not_hold_it_open() {
     fn gate() -> (
