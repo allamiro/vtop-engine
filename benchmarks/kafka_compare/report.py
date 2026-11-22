@@ -12,7 +12,10 @@ environment.json. None is typed here.
 
 A failover run (#597; its directory holds `failover.csv`) is handed to
 failover_report.py, which writes docs/benchmarks/kafka-failover.md under the
-same rules.
+same rules. A crash run (#599; `crash.csv`) is handed to crash_report.py, which
+writes docs/benchmarks/kafka-crash.md. A run whose directory holds a
+`report.json` writes its page and images where that file says (run_outputs.py),
+so a second run of a kind can sit beside the first.
 
 Output is deterministic for a given CSV, environment.json and matplotlib
 version: fixed rcParams, a fixed SVG hash salt, and no timestamps or software
@@ -28,12 +31,14 @@ from typing import Any
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
-from kafka_compare import colours, footer, schema, stats  # noqa: E402
+from kafka_compare import colours, footer, run_outputs, schema, stats  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(HERE))
 DEFAULT_IMG_DIR = os.path.join(REPO, "docs", "benchmarks", "img")
 DEFAULT_DOC = os.path.join(REPO, "docs", "benchmarks", "kafka-comparison.md")
 DEFAULT_FAILOVER_DOC = os.path.join(REPO, "docs", "benchmarks", "kafka-failover.md")
+DEFAULT_CRASH_DOC = os.path.join(REPO, "docs", "benchmarks", "kafka-crash.md")
+IMG_ROOT = "docs/benchmarks/img"
 
 # One colour per system in every chart, from the registry in colours.py
 # (categorical slots 1 and 2, blue and orange, validated for CVD separation
@@ -714,19 +719,31 @@ def build(run_dir: str, img_dir: str, doc_path: str) -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("run_dir", help="benchmarks/kafka_compare/results/<run-id>")
-    parser.add_argument("--img-dir", default=DEFAULT_IMG_DIR)
-    parser.add_argument("--doc", default=None, help="default: kafka-comparison.md, or kafka-failover.md for a "
-                                                     "failover run")
+    parser.add_argument("--img-dir", default=None, help="default: docs/benchmarks/img/, or where the run's "
+                                                         "report.json says")
+    parser.add_argument("--doc", default=None, help="default: kafka-comparison.md, kafka-failover.md for a "
+                                                     "failover run or kafka-crash.md for a crash run, or where "
+                                                     "the run's report.json says")
+    parser.add_argument("--min-ok", type=int, default=None,
+                        help="crash run only: the fewest ok crashes a configuration may have (default "
+                             "crash_report.MIN_OK_CRASHES); lower it to preview a short run, never to commit one")
     args = parser.parse_args(argv)
     try:
+        own = run_outputs.resolve(args.run_dir, REPO, IMG_ROOT)
+        img_dir = args.img_dir or (own.img_dir if own else DEFAULT_IMG_DIR)
+        doc = args.doc or (own.doc if own else None)
         if os.path.isfile(os.path.join(args.run_dir, "failover.csv")):
             from kafka_compare import failover_report
 
-            written = failover_report.build(args.run_dir, args.img_dir, args.doc or DEFAULT_FAILOVER_DOC,
-                                            _setup_matplotlib)
+            written = failover_report.build(args.run_dir, img_dir, doc or DEFAULT_FAILOVER_DOC, _setup_matplotlib)
+        elif os.path.isfile(os.path.join(args.run_dir, "crash.csv")):
+            from kafka_compare import crash_report
+
+            written = crash_report.build(args.run_dir, img_dir, doc or DEFAULT_CRASH_DOC, _setup_matplotlib,
+                                         **({} if args.min_ok is None else {"min_ok": args.min_ok}))
         else:
-            written = build(args.run_dir, args.img_dir, args.doc or DEFAULT_DOC)
-    except schema.ReportRefused as exc:
+            written = build(args.run_dir, img_dir, doc or DEFAULT_DOC)
+    except (run_outputs.OutputsRefused, schema.ReportRefused) as exc:
         print(f"report refused: {exc}", file=sys.stderr)
         return 2
     for path in written:
