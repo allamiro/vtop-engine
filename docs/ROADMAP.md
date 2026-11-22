@@ -31,6 +31,28 @@ what each release does **not** yet do.
   it. An older binary
   ignores the file, so downgrading drops the protection, not the data.
 
+## Next minor release, v0.11.0 — group commit is wired into the data node
+
+- **[#752](https://github.com/allamiro/vtop-engine/issues/752)** — group
+  commit is wired into the data node, **off by default**. A leader,
+  candidate or standalone node's `group_commit:` section
+  (`enabled`, `max_delay_ms`, `max_records`, `max_bytes`,
+  `max_pending_requests`) makes concurrent produce requests on a range share
+  one fsync and one replication round; each is still acknowledged only after
+  the group's local fsync, the quorum ack and the commit advance. The window
+  defaults to 0 (natural batching), so a lone request pays nothing. A node
+  logs its settings at INFO when it is on, refuses invalid settings at
+  startup (a window of a second or more, a zero bound, a group the replica
+  plane could not frame in one append, and the section enabled on a follower;
+  a follower accepts a disabled section and logs that it ignores it), and
+  exports `vtop_broker_group_commit_overloaded_total` and
+  `vtop_broker_group_commit_split_groups_total` beside the existing
+  `vtop_broker_group_commit_*` series. Live-chaos scenario 25 kills the leader
+  under four idempotent `acks=all` producers. Nothing changes for a config
+  without the section. The default turns on only after the single- and
+  two-producer A/B shows no regression; until then the gain for the Kafka
+  comparison is unmeasured.
+
 ## v0.1.0 — a range that fails over
 
 Metadata leases, a lease agent on the data node, verified promotion, and the
@@ -1426,7 +1448,8 @@ A patch release: no schema, wire format, feature level, config key or one-way st
 ## v0.11.0 and beyond
 
 The theme is **the gateway at the speed its durability allows, and the road
-to 1.0**: wire group commit into the data node's quorum write (#752) and let a
+to 1.0**: turn group commit on by default for the data node's quorum write
+(#752; it is wired and off until the A/B gates hold) and let a
 Kafka client follow a failover through a candidate node (#751); finish the
 format inventory and the tested upgrade and downgrade matrix (#743); and work
 the criteria in #714 that must be met before VTOP is called anything but a
