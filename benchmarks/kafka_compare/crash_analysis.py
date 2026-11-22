@@ -40,15 +40,59 @@ CRASH_MODE_LABELS = {
     "flakey-drop": "SIGKILL of all three nodes at once, then every write the page cache had not "
                    "flushed is dropped (dm-flakey drop_writes): power loss of the whole replica set",
 }
-# The configurations: (system, profile). VTOP has one configuration and is
-# paired with both Kafka profiles (it acknowledges after a quorum fsync under either).
+# The configurations: (system, profile). VTOP is paired with both Kafka profiles (it acknowledges after a quorum
+# fsync under either) in three configurations that differ in one setting only, the node's `group_commit:` section
+# (#752): `vtop-shipped` leaves the section out, so the node runs whatever it ships with; the other two name the
+# setting. Which of the last two differs from the shipped one is read from the node's source, see
+# `shipped_group_commit_default` and `default_configs`.
 CONFIGS = {
     "kafka-defaults": ("kafka", "defaults"),
     "kafka-fsync-parity": ("kafka", "fsync-parity"),
     "vtop-shipped": ("vtop", "defaults"),
+    "vtop-group-commit-on": ("vtop", "group-commit-on"),
+    "vtop-group-commit-off": ("vtop", "group-commit-off"),
 }
+# What each VTOP configuration asks of `group_commit.enabled`: None is "the section is not written".
+VTOP_GROUP_COMMIT = {"vtop-shipped": None, "vtop-group-commit-on": True, "vtop-group-commit-off": False}
 VALUE_SEP = "."
+# A record's value is `<crash>.<n>`, padded to the record size with `~` and then `x` (see `record_value`).
+PAD_MARK = "~"
+PAD_FILL = "x"
 CANARY_BYTES = 1048576
+
+_SHIPPED = re.compile(r"pub const GROUP_COMMIT_ON_BY_DEFAULT:\s*bool\s*=\s*(true|false)\s*;")
+
+
+def shipped_group_commit_default(node_config_rs: str) -> bool:
+    """Whether the node ships with group commit on, from `crates/vtop-node/src/config.rs`.
+
+    The harness builds its image from the same tree (a dirty build input is refused), so the constant is what the
+    image does; the leader's own gauge is checked against it at every bring-up."""
+    match = _SHIPPED.search(node_config_rs)
+    if not match:
+        raise ValueError("crates/vtop-node/src/config.rs has no `pub const GROUP_COMMIT_ON_BY_DEFAULT: bool = ...;`, "
+                         "so the shipped group-commit default cannot be read")
+    return match.group(1) == "true"
+
+
+def default_configs(shipped_on: bool | None) -> tuple[str, ...] | None:
+    """Both Kafka profiles, VTOP as shipped, and the group-commit state that differs from the shipped one.
+
+    `vtop-group-commit-off` in a node that ships with it off is `vtop-shipped` twice; the informative pair is
+    shipped against its opposite. None when the shipped default is unknown: only `--configs` can then proceed."""
+    if shipped_on is None:
+        return None
+    other = "vtop-group-commit-off" if shipped_on else "vtop-group-commit-on"
+    return ("kafka-defaults", "kafka-fsync-parity", "vtop-shipped", other)
+
+
+def effective_group_commit(config: str, shipped: bool | None) -> bool | None:
+    """Whether the leader runs with group commit under `config`; None for a Kafka configuration (or when the
+    shipped default is unknown and the configuration does not say)."""
+    if config not in VTOP_GROUP_COMMIT:
+        return None
+    asked = VTOP_GROUP_COMMIT[config]
+    return shipped if asked is None else asked
 
 
 class ParseError(ValueError):
@@ -62,12 +106,34 @@ def value_prefix(crash: int) -> str:
     """The prefix every record of one crash carries: the value is `<prefix>.<n>`.
 
     `kafka-verifiable-producer.sh` sends the counter as the value, and its only `--value-prefix` is an
-    INTEGER (4.3.2: `could not convert ... to Integer`), so the crash number is the prefix and a record
-    is a few bytes of text, not the 1 KiB of #599's plan: this client has no record-size flag.
+    INTEGER (4.3.2: `could not convert ... to Integer`), so the crash number is the prefix. The producer the
+    harness uses for 1 KiB records (crash/client/AckProducer.java) takes the same prefix.
     """
     if crash < 1:
         raise ValueError(f"crash number {crash} must be 1 or more")
     return str(crash)
+
+
+def record_value(prefix: str, seq: int, size: int) -> str:
+    """The value of record `seq` at `size` bytes: `<prefix>.<seq>`, then `~` and `x` up to `size` (ASCII, so
+    characters are bytes). A size at or below the text's own length pads nothing. This is what AckProducer.java
+    sends; the two are kept equal by a test that reads the source."""
+    text = f"{prefix}{VALUE_SEP}{seq}"
+    if size > len(text):
+        text += PAD_MARK + PAD_FILL * (size - len(text) - 1)
+    return text
+
+
+_RECORD = re.compile(rf"^(?P<head>[^{re.escape(VALUE_SEP)}{re.escape(PAD_MARK)}\s]+){re.escape(VALUE_SEP)}"
+                     rf"(?P<seq>0|[1-9][0-9]*)(?:{re.escape(PAD_MARK)}{re.escape(PAD_FILL)}*)?$")
+
+
+def parse_record(value: object) -> tuple[str, int] | None:
+    """(prefix, n) of a value one of our producers sent, padded or not; None for anything else."""
+    if not isinstance(value, str):
+        return None
+    match = _RECORD.match(value)
+    return (match.group("head"), int(match.group("seq"))) if match else None
 
 
 def sentinel_value(crash: int) -> str:
@@ -112,11 +178,11 @@ def parse_acks(lines: Iterable[str], prefix: str) -> ProducerRun:
             startup = float(event["timestamp"])
         elif name == "producer_send_success":
             value = event.get("value")
-            head, _, tail = value.rpartition(VALUE_SEP) if isinstance(value, str) else ("", "", "")
-            if head != prefix or not tail.isdigit() or str(int(tail)) != tail:
-                raise ParseError(f"producer_send_success with {value!r}, not a record this crash sent "
-                                 f"(expected {prefix[:12]}....<n>)")
-            acks.append(Ack(float(event["timestamp"]), int(tail), int(event["offset"])))
+            parsed = parse_record(value)
+            if parsed is None or parsed[0] != prefix:
+                raise ParseError(f"producer_send_success with {str(value)[:40]!r}, not a record this crash sent "
+                                 f"(expected {prefix[:12]}.<n>)")
+            acks.append(Ack(float(event["timestamp"]), parsed[1], int(event["offset"])))
         elif name == "producer_send_error":
             errors += 1
         elif name == "tool_data":
@@ -146,11 +212,11 @@ def parse_consumed(text: str, prefix: str, sentinel: str) -> list[Consumed]:
                 raise ParseError(f"consumer line not in the expected shape: {line[:80]!r}")
             continue
         offset, value = int(match.group(1)), match.group(2)
-        head, _, tail = value.rpartition(VALUE_SEP)
+        parsed = parse_record(value)
         if value == sentinel:
             records.append(Consumed(offset, "sentinel", None))
-        elif head == prefix and tail.isdigit() and str(int(tail)) == tail:
-            records.append(Consumed(offset, "record", int(tail)))
+        elif parsed is not None and parsed[0] == prefix:
+            records.append(Consumed(offset, "record", parsed[1]))
         else:
             records.append(Consumed(offset, "other", None))
     return records

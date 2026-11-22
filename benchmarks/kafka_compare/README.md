@@ -257,9 +257,9 @@ acknowledged records that are missing afterwards, for Kafka as shipped, Kafka ma
 # The short profile: 2 crashes per cell, both modes, SIGKILL and power-loss, about 20 minutes on a 4-vCPU VM.
 python3 benchmarks/kafka_compare/crash.py --smoke --setup-flakey 8192
 
-# The full run on a dedicated Linux host (see below): 3 configurations x 12 power-loss crashes, projected at 0.96 h.
+# The full run on a dedicated Linux host (see below): 4 configurations x 12 power-loss crashes, projected at 1.3 h.
 python3 benchmarks/kafka_compare/crash.py --setup-flakey 10240 --teardown-flakey \
-    --crashes 12 --modes flakey-drop --max-hours 1.5
+    --crashes 12 --modes flakey-drop --max-hours 2
 
 # What a run directory still owes, whatever its state (exit 0 when complete, 2 listing the missing crashes), and
 # the way to continue an interrupted one.
@@ -269,9 +269,9 @@ python3 benchmarks/kafka_compare/crash.py --resume <run-id> --crashes 12 --modes
 
 The projection (`crash_schema.projected_seconds`, checked against `--max-hours` before any container starts, and again
 before every crash) uses per-crash timings measured on the smoke run: a Kafka crash takes about 46 s and a VTOP crash
-about 21 s beyond its trigger (mean 40 s in the default window), so a crash index of the three configurations takes
+about 21 s beyond its trigger (mean 40 s in the default window), so a crash index of the four default configurations takes
 about 4 minutes and 12 of them about an hour; the full length was not run. The issue's 30 crashes per configuration
-are `--crashes 30` (2.4 h), and a `sigkill` control for them doubles that.
+are `--crashes 30` (3.2 h with the four default configurations), and a `sigkill` control for them doubles that.
 
 **The host.** One Linux machine with Docker Engine (Compose v2), a user in the `docker` group with passwordless
 `sudo` (the harness runs only `crash/powercut.sh` through `sudo -n`; run it as root and git will want
@@ -280,7 +280,7 @@ are `--crashes 30` (2.4 h), and a `sigkill` control for them doubles that.
 Nothing in the harness is macOS-specific, and it does not use Docker Desktop: Docker Desktop's VM is not one this
 script can crash. The reference shape for the full run is one EC2 instance of 16 vCPUs and 32 GiB with Ubuntu
 24.04 and a gp3 or instance-store volume (a `c7i.4xlarge` or `m7i.4xlarge`): three 2-CPU nodes, the 4-CPU client and
-headroom, with nothing else running. `environment.json` records the instance type (from the DMI), kernel,
+headroom, with nothing else running. `environment.json` records the instance type (`host_metadata`, from IMDSv2, and the DMI's word in `comparable.host_instance`), the CPU model, kernel,
 filesystem and mount options, the `vm.dirty_*` sysctls, and the disk behind Docker's data. The first run builds
 `vtop-bench:<commit>` from `docker/Dockerfile` if it is not there (the release build took 7 minutes with 2 CPUs). Docker installs with
 `curl -fsSL https://get.docker.com | sudo sh`; the harness needs only the Python standard library.
@@ -314,15 +314,19 @@ configuration and mode sees the same schedule) write the unsynced canary and:
 The client is the same for both systems: `kafka-verifiable-producer.sh` from the pinned apache/kafka image,
 `acks=all`, idempotence on, at a fixed offered rate (default 1,000 records/s), bootstrapped at all three Kafka brokers
 and at VTOP's range leader (the Kafka gateway). It prints one line per acknowledgement with its offset, so
-"acknowledged" is what the client saw before the kill. Records are `<crash>.<n>` (a few bytes): this tool takes only
-an integer `--value-prefix` and has no record-size flag, so the issue's 1 KiB is not reproduced; the loss window of a
-page cache depends on time, not on bytes.
+"acknowledged" is what the client saw before the kill. Records are 1 KiB (`--record-size`, the issue's size): the stock tool has no size option (its `--value-prefix` is an integer and its value is `<prefix>.<n>`), so for a size the client is `crash/client/AckProducer.java`, the same `KafkaProducer` from the same pinned image (compiled in a multi-stage build with a pinned JDK image, since the Kafka image ships a JRE only; `ensure_client_image` builds it once, named for its source), paced the same way and printing the same lines, with the value padded to the size (`<crash>.<n>~xxx...`). It is used for both systems, so nothing differs but the system. `--record-size 0` runs the stock `kafka-verifiable-producer` and a few bytes a record, which needs no build. The size is part of the run's matrix (a resume cannot change it) and a column of every row. A bigger record means more dirty page cache per second, which is why the size matters to the loss window.
 
 **Configurations** (`config`): `kafka-defaults`, `kafka-fsync-parity` (`log.flush.interval.messages=1` on every broker
 through `crash/compose.kafka.fsync-parity.yml`, and `flush.messages=1` on the topic; the brokers' own report of the
-setting is checked and a mismatch refuses the cell), and `vtop-shipped` (the node configuration as shipped: an append is
-acknowledged after 2 of 3 replicas have fsynced it; it answers both Kafka profiles). VTOP has no fsync-policy or
-group-commit switch in its node configuration at this commit, so there is no second VTOP configuration.
+setting is checked and a mismatch refuses the cell), and VTOP in three configurations that differ in the node's
+`group_commit:` section only (#752, `crates/vtop-node/src/config.rs`): `vtop-shipped` (the section left out: the node as
+shipped; an append is acknowledged after 2 of 3 replicas have fsynced it, and it answers both Kafka profiles),
+`vtop-group-commit-on` and `vtop-group-commit-off` (the shipped leader file plus the section, in
+`crash/leader-group-commit-{on,off}.yaml`; the followers never get one). The node ships with group commit **off**
+(`GROUP_COMMIT_ON_BY_DEFAULT = false`), so `vtop-group-commit-off` would repeat `vtop-shipped`; by default a run takes
+both Kafka profiles, `vtop-shipped` and the state that differs from the shipped one (today `vtop-group-commit-on`), read
+from the source, and says so when `--configs` names two that coincide. At every bring-up the leader's own
+`vtop_broker_group_commit_enabled` gauge is read and a mismatch refuses the cell, as the Kafka flush setting is.
 
 **What `flakey-drop` simulates, and what it does not.** The three data directories are on one ext4 filesystem on one
 dm-flakey device over a loop device. After the SIGKILL, `drop_writes` discards every write the page cache has not yet
@@ -353,7 +357,7 @@ holds each crash's three node logs (as they died and after the restart) and a su
 run through `crash_schema.load_crash_run(run_dir, min_ok=N)`, which refuses a partial, mixed-environment or
 unfinished run, a row that is `ok` while its canary did not behave, and fewer than `N` ok crashes in any cell, by name.
 `crash_analysis.upper_bound_95(0, n)` gives the exact binomial bound to print beside every "0 of n": 13.9 % at 20
-crashes, 9.5 % at 30. The issue's plan asks for 30 crashes per configuration (2.4 h projected: `--crashes 30`).
+crashes, 9.5 % at 30. The issue's plan asks for 30 crashes per configuration (3.2 h projected with four configurations: `--crashes 30`).
 
 ## Known gaps
 

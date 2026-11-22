@@ -9,14 +9,19 @@ directories, one producer at a fixed rate with `acks=all` and the idempotent pro
 `t_i` seconds after the producer starts, the crash, the restart, and a read of the whole partition
 to check every record the client saw acknowledged. One row per crash in crash.csv.
 
-THE SAME CLIENT FOR BOTH SYSTEMS: `kafka-verifiable-producer.sh` from the pinned apache/kafka
-image, through the Kafka gateway of VTOP's range leader (compose.vtop.yml, the shape of #596) and
-against the three KRaft brokers (compose.kafka.yml).
+THE SAME CLIENT FOR BOTH SYSTEMS, through the Kafka gateway of VTOP's range leader (compose.vtop.yml,
+the shape of #596) and against the three KRaft brokers (compose.kafka.yml). Records are 1 KiB (`--record-size`,
+the issue's size): `kafka-verifiable-producer.sh` has no size option, so the client is `crash/client/
+AckProducer.java`, the same KafkaProducer from the same pinned apache/kafka image printing the same lines with a
+padded value (built once by `ensure_client_image`). `--record-size 0` uses the stock tool and a few bytes a record.
 
 CONFIGURATIONS: `kafka-defaults` (no flush: an acknowledgement means replicated), `kafka-fsync-parity`
-(`log.flush.interval.messages=1` on every broker and `flush.messages=1` on the topic) and
-`vtop-shipped` (the node configuration as shipped: an append is acknowledged after a quorum of two of
-three has fsynced it; the same configuration answers both Kafka profiles).
+(`log.flush.interval.messages=1` on every broker and `flush.messages=1` on the topic) and VTOP in up to three
+configurations that differ in the node's `group_commit:` section only (#752): `vtop-shipped` (the section left
+out: the node as shipped, and the quorum of two of three has fsynced an append before it is acknowledged; the
+same configuration answers both Kafka profiles), `vtop-group-commit-on` and `vtop-group-commit-off`. By default
+a run takes the shipped one and the state that differs from it, which the node's source says (see
+`shipped_group_commit`); the leader's own gauge is checked against each configuration.
 
 CRASH MODES, and what each does and does not simulate (the report repeats this):
 
@@ -38,10 +43,10 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import math
 import os
-import platform
 import re
 import shlex
 import shutil
@@ -77,6 +82,12 @@ SPEC = {
              "bootstrap": "vtop-1:9092", "data": ["vtop-1", "vtop-2", "vtop-3"]},
 }
 PRODUCER = "kc-crash-producer"
+# The producer with a record size: its source and Dockerfile, and the JDK the pinned apache/kafka image lacks.
+CLIENT_DIR = os.path.join(HERE, "crash", "client")
+JDK_IMAGE = "eclipse-temurin:21.0.11_10-jdk@sha256:98155457fcdbeb0987472e8abf721657b698ede407aad52ac24ae42618c0931c"
+DEFAULT_RECORD_SIZE = 1024
+NODE_CONFIG_RS = os.path.join("crates", "vtop-node", "src", "config.rs")
+LEADER_GAUGE = "vtop_broker_group_commit_enabled"
 # kafka-verifiable-producer.sh sets retries=0 for itself, which also turns idempotence off (#613): both
 # are put back to the client's defaults, as failover.py does.
 PRODUCER_PROPS = ("retries=2147483647", "enable.idempotence=true")
@@ -116,6 +127,7 @@ class Params(NamedTuple):
     seed: int
     idempotent: bool = True
     sustain_floor: float = SUSTAIN_FLOOR
+    record_size: int = DEFAULT_RECORD_SIZE
 
 
 # --------------------------------------------------------------------------- commands
@@ -155,6 +167,83 @@ def compose_files(system: str, config: str | None) -> list[str]:
     if system == "kafka" and config == "kafka-fsync-parity":
         files.append(SPEC["kafka"]["parity_file"])
     return files
+
+
+def client_label(record_size: int) -> str:
+    return "AckProducer (kafka-clients, padded values)" if record_size > 0 else "kafka-verifiable-producer"
+
+
+def shipped_group_commit() -> bool | None:
+    """Whether the node at this checkout ships with group commit on, or None when its source does not say."""
+    try:
+        with open(os.path.join(REPO, NODE_CONFIG_RS), encoding="utf-8") as handle:
+            return ca.shipped_group_commit_default(handle.read())
+    except (OSError, ValueError):
+        return None
+
+
+def vtop_leader_file(config: str) -> str:
+    """The leader's node configuration (relative to this directory) a configuration runs: the shipped file, or
+    that file plus the `group_commit:` section (crash/leader-group-commit-{on,off}.yaml)."""
+    asked = ca.VTOP_GROUP_COMMIT.get(config)
+    if asked is None:
+        return os.path.join("vtop", "leader.yaml")
+    return os.path.join("crash", f"leader-group-commit-{'on' if asked else 'off'}.yaml")
+
+
+def redundant_configs(configs: list[str], shipped: bool | None) -> list[str]:
+    """One line per configuration that runs the same group-commit setting as an earlier one: a replicate, not
+    a comparison, and the operator should know."""
+    seen: dict[bool, str] = {}
+    notes = []
+    for config in configs:
+        effective = ca.effective_group_commit(config, shipped)
+        if effective is None:
+            continue
+        if effective in seen:
+            notes.append(f"{config} runs the same group-commit setting as {seen[effective]} "
+                         f"(group commit {'on' if effective else 'off'}; the node ships with it "
+                         f"{'on' if shipped else 'off'}), so it is a second sample of one configuration")
+        else:
+            seen[effective] = config
+    return notes
+
+
+def verify_group_commit(config: str, metrics: str, shipped: bool | None) -> None:
+    """The leader's own gauge must match the configuration, or the cell is not what its name says (#595 rule 4)."""
+    match = re.search(rf"^{LEADER_GAUGE}\s+(\d+)\s*$", metrics, re.MULTILINE)
+    if not match:
+        raise Refused(f"the leader does not report {LEADER_GAUGE}, so the group-commit setting of {config} cannot "
+                      "be verified")
+    value = int(match.group(1))
+    expected = ca.effective_group_commit(config, shipped)
+    if expected is None:
+        return  # the shipped default could not be read from the source: nothing to compare with
+    if value != int(expected):
+        shipped_says = ("" if config != "vtop-shipped" or shipped is None
+                        else f" (the node's shipped default is {'on' if shipped else 'off'})")
+        raise Refused(f"{config} needs {LEADER_GAUGE} {int(expected)}, the leader reports {value}{shipped_says}")
+
+
+def client_image_name() -> str:
+    """kc-crash-client:<12 hex>, named for the source, the Dockerfile and both pinned images it is built from."""
+    digest = hashlib.sha256()
+    for name in ("Dockerfile", "AckProducer.java"):
+        with open(os.path.join(CLIENT_DIR, name), "rb") as handle:
+            digest.update(name.encode() + b"\0" + handle.read() + b"\0")
+    digest.update(KAFKA_IMAGE.encode() + b"\0" + JDK_IMAGE.encode())
+    return f"kc-crash-client:{digest.hexdigest()[:12]}"
+
+
+def ensure_client_image(rebuild: bool) -> str:
+    """The producer image (see crash/client/Dockerfile), built when it is not there."""
+    image = client_image_name()
+    exists = sh(["docker", "image", "inspect", image], check=False).returncode == 0
+    if rebuild or not exists:
+        log(f"building {image} (the producer with a record size)")
+        sh(["docker", "build", "-t", image, "--build-arg", f"KAFKA_IMAGE={KAFKA_IMAGE}",
+            "--build-arg", f"JDK_IMAGE={JDK_IMAGE}", CLIENT_DIR], timeout=1800)
+    return image
 
 
 def anonymous_volumes(mounts_json: str, project: str) -> list[str]:
@@ -212,7 +301,7 @@ def run_crash(b: Any, p: Params, config: str, mode: str, crash: int, trigger_aft
     row: dict[str, Any] = {
         "system": system, "config": config, "profile": profile, "crash_mode": mode, "crash": crash,
         "seed": p.seed, "trigger_after_s": trigger_after_s, "trigger_method": ca.CRASH_MODE_LABELS[mode],
-        "offered_rate": p.rate, "client": "kafka-verifiable-producer",
+        "offered_rate": p.rate, "record_size": p.record_size, "client": client_label(p.record_size),
         "idempotent": p.idempotent, "started_at": started_at, "needed_manual_repair": False, "note": "",
     }
     b.begin(config, mode, crash)
@@ -405,7 +494,8 @@ class DockerBackend:
             command += ["-f", os.path.join(HERE, name)]
         return sh([*command, *args], timeout=timeout, cwd=HERE, check=check, env={
             "VTOP_IMAGE": self.ctx["vtop_image"], "KAFKA_IMAGE": KAFKA_IMAGE,
-            "CRASH_DATA_ROOT": self.ctx["data_root"], "CRASH_NODE_CPUS": str(self.ctx["node_cpus"])})
+            "CRASH_DATA_ROOT": self.ctx["data_root"], "CRASH_NODE_CPUS": str(self.ctx["node_cpus"]),
+            "CRASH_VTOP_LEADER": "./" + vtop_leader_file(config or self.config).replace(os.sep, "/")})
 
     def down(self, config: str | None = None, volumes: bool = False) -> None:
         sh(["docker", "rm", "-f", PRODUCER], check=False)
@@ -429,10 +519,26 @@ class DockerBackend:
             self.compose(system, "up", "-d", "--wait", "--wait-timeout", "300", config=config, timeout=400)
         except RuntimeError as exc:
             raise Refused(f"the {system} cluster did not come up healthy: {exc}"[:500]) from None
+        if system == "vtop":
+            self.observe_group_commit(config)
         if system == "kafka":
             self.client(["/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", SPEC[system]["bootstrap"],
                          *topic_create_args(config)], timeout=120)
             self.observe_kafka(config)
+
+    def observe_group_commit(self, config: str) -> None:
+        """The leader's own word for group commit, once per configuration, and a refusal when it does not match."""
+        done = sh(["docker", "exec", SPEC["vtop"]["containers"][0], "curl", "-sf", "http://127.0.0.1:9600/metrics"],
+                  check=False, timeout=60)
+        if done.returncode != 0:
+            raise Refused(f"the leader's /metrics could not be read, so the group-commit setting of {config} "
+                          f"cannot be verified: {(done.stderr or done.stdout).strip()[-200:]}")
+        verify_group_commit(config, done.stdout, self.ctx.get("shipped_group_commit"))
+        match = re.search(rf"^{LEADER_GAUGE}\s+(\d+)\s*$", done.stdout, re.MULTILINE)
+        seen = self.ctx["env"]["observed"].setdefault("vtop_group_commit", {})
+        if match and config not in seen:
+            seen[config] = int(match.group(1))
+            self.ctx["save_env"]()
 
     def observe_kafka(self, config: str) -> None:
         """The brokers' own word for the flush settings, once per configuration (rule 8), and a
@@ -492,13 +598,24 @@ class DockerBackend:
     def start_producer(self, config: str, prefix: str, max_messages: int) -> None:
         out = open(os.path.join(self.crash_raw, "producer.out"), "w")
         err = open(os.path.join(self.crash_raw, "producer.err"), "w")
+        size = int(self.ctx.get("record_size", 0))
+        if size > 0:
+            image = self.ctx["client_image"]
+            tool = ["/opt/kafka/bin/kafka-run-class.sh", "AckProducer"]
+            env = ["-e", f"KAFKA_HEAP_OPTS={CLIENT_HEAP}", "-e", "CLASSPATH=/opt/ackproducer"]
+            tail = ["--value-size", str(size)]
+        else:
+            image = KAFKA_IMAGE
+            tool = ["/opt/kafka/bin/kafka-verifiable-producer.sh"]
+            env = ["-e", f"KAFKA_HEAP_OPTS={CLIENT_HEAP}"]
+            tail = []
         command = ["docker", "run", "--rm", "--name", PRODUCER, "--network", SPEC[self.system]["network"],
                    "--cpus", str(self.ctx["client_cpus"]), "--memory", self.ctx["client_memory"],
-                   "-e", f"KAFKA_HEAP_OPTS={CLIENT_HEAP}", "-v", f"{self.crash_raw}:/out", KAFKA_IMAGE,
-                   "/opt/kafka/bin/kafka-verifiable-producer.sh", "--bootstrap-server", SPEC[self.system]["bootstrap"],
+                   *env, "-v", f"{self.crash_raw}:/out", image,
+                   *tool, "--bootstrap-server", SPEC[self.system]["bootstrap"],
                    "--topic", TOPIC, "--acks", "-1", "--command-config", "/out/producer.properties",
                    "--throughput", str(self.ctx["params"].rate), "--max-messages", str(max_messages),
-                   "--value-prefix", prefix]
+                   "--value-prefix", prefix, *tail]
         self.producer = subprocess.Popen(command, stdout=out, stderr=err)
 
     def wait_producer_started(self) -> float:
@@ -650,17 +767,6 @@ class DockerBackend:
 # ------------------------------------------------------------------------ environment
 
 
-def cpu_model() -> str:
-    try:
-        with open("/proc/cpuinfo") as handle:
-            for line in handle:
-                if line.lower().startswith(("model name", "hardware", "cpu model")):
-                    return line.split(":", 1)[1].strip()
-    except OSError:
-        pass
-    return platform.processor() or platform.machine()
-
-
 def instance_type() -> str:
     """The cloud instance type, when the DMI says so (EC2 Nitro writes it to product_name)."""
     try:
@@ -681,19 +787,28 @@ def capture_environment(run_id: str, matrix: dict[str, Any], vtop_image: str, li
         c.pop(key, None)
     c["vtop_commit"] = phase1.git("log", "-1", "--format=%H", "--", "crates", "Cargo.toml", "Cargo.lock", "docker")
     c["harness_commit"] = phase1.git("rev-parse", "HEAD")
-    c["host_cpu"] = cpu_model() if platform.system() == "Linux" else c["host_cpu"]
-    c["host_instance"] = instance_type()
+    c["host_instance"] = instance_type()  # the DMI's word; host_metadata.instance_type is IMDSv2's
     c["node_limits"] = {**limits, "cpus": str(args.node_cpus)}
     c["client_limits"] = {"cpus": str(args.client_cpus), "memory": args.client_memory, "heap": CLIENT_HEAP}
-    c["client"] = ("kafka-verifiable-producer.sh " + KAFKA_IMAGE.split("@")[0].split(":")[-1] +
-                   " (JVM), the same invocation against both systems; reads by kafka-console-consumer.sh")
+    size = int(matrix["record_size"])
+    version = KAFKA_IMAGE.split("@")[0].split(":")[-1]
+    c["record_size"] = size
+    c["client"] = ((f"AckProducer {version} (crash/client: kafka-clients from the pinned image, values padded to "
+                    f"{size} bytes)" if size > 0 else f"kafka-verifiable-producer.sh {version} (JVM)")
+                   + ", the same invocation against both systems; reads by kafka-console-consumer.sh")
+    shipped = shipped_group_commit()
+    c["vtop_group_commit_shipped_default"] = shipped
     c["producer_props"] = ["acks=all (--acks -1)", *PRODUCER_PROPS,
                            "every other producer setting at the client default"]
     c["profiles"] = {
         "kafka-defaults": "Kafka as shipped: no flush.messages, an acknowledgement is replication",
         "kafka-fsync-parity": "log.flush.interval.messages=1 on every broker and flush.messages=1 on the topic",
-        "vtop-shipped": "node configuration as shipped: acknowledged after a quorum (2 of 3) has fsynced; "
-                        "answers both Kafka profiles",
+        "vtop-shipped": "node configuration as shipped (no group_commit section): acknowledged after a quorum "
+                        "(2 of 3) has fsynced; answers both Kafka profiles",
+        "vtop-group-commit-on": "the shipped leader plus group_commit.enabled: true (concurrent produce requests "
+                                "share one fsync and one replication round)",
+        "vtop-group-commit-off": "the shipped leader plus group_commit.enabled: false (each produce request has "
+                                 "its own barrier)",
     }
     c["crash_modes"] = {mode: ca.CRASH_MODE_LABELS[mode] for mode in matrix["crash_modes"]}
     c["data_filesystem"] = dict(line.split("=", 1) for line in host.call("describe").split() if "=" in line)
@@ -715,6 +830,10 @@ def capture_environment(run_id: str, matrix: dict[str, Any], vtop_image: str, li
         "vtop_leader": phase1._read(os.path.join(HERE, "vtop", "leader.yaml")),
         "vtop_follower_1": phase1._read(os.path.join(HERE, "vtop", "follower-1.yaml")),
         "vtop_follower_2": phase1._read(os.path.join(HERE, "vtop", "follower-2.yaml")),
+        "vtop_leader_group_commit_on": phase1._read(os.path.join(HERE, vtop_leader_file("vtop-group-commit-on"))),
+        "vtop_leader_group_commit_off": phase1._read(os.path.join(HERE, vtop_leader_file("vtop-group-commit-off"))),
+        "ack_producer_java": phase1._read(os.path.join(CLIENT_DIR, "AckProducer.java")),
+        "ack_producer_dockerfile": phase1._read(os.path.join(CLIENT_DIR, "Dockerfile")),
         "powercut": phase1._read(POWERCUT),
     }
     return env
@@ -730,7 +849,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="2 crashes per cell in both modes, triggers at 8 to 12 s: a few minutes per "
                              "configuration, to prove the method on this host")
     parser.add_argument("--crashes", type=int, default=None, help="crashes per (configuration, mode); default 30")
-    parser.add_argument("--configs", default=",".join(ca.CONFIGS), help="comma-separated; default all three")
+    parser.add_argument("--configs", default=None,
+                        help="comma-separated, from " + ", ".join(ca.CONFIGS) + "; default: both Kafka profiles, "
+                             "vtop-shipped and the group-commit state that differs from the node's shipped default")
+    parser.add_argument("--record-size", type=int, default=DEFAULT_RECORD_SIZE, metavar="BYTES",
+                        help="bytes per record, the same for both systems (default 1024, the issue's); 0 uses "
+                             "kafka-verifiable-producer, which sends a few bytes and has no size option")
     parser.add_argument("--modes", default=None, help="comma-separated of sigkill, flakey-drop; default flakey-drop")
     parser.add_argument("--rate", type=int, default=1000, help="records per second offered (fixed, open loop)")
     parser.add_argument("--trigger-window", default=None,
@@ -775,7 +899,16 @@ def build_matrix(args: argparse.Namespace) -> dict[str, Any]:
         low, high = (float(part) for part in window.split(","))
     except ValueError:
         raise SystemExit(f"--trigger-window {window!r}: two comma-separated seconds, LOW,HIGH") from None
-    return {"configs": [c for c in args.configs.split(",") if c], "crash_modes": [m for m in modes.split(",") if m],
+    if args.configs is None:
+        configs = ca.default_configs(shipped_group_commit())
+        if configs is None:
+            raise SystemExit(f"--configs: {NODE_CONFIG_RS} does not say whether the node ships with group commit on, "
+                             "so the default pair of VTOP configurations cannot be chosen; name the configurations "
+                             f"({', '.join(ca.CONFIGS)})")
+        configs = list(configs)
+    else:
+        configs = [c for c in args.configs.split(",") if c]
+    return {"configs": configs, "crash_modes": [m for m in modes.split(",") if m], "record_size": args.record_size,
             "crashes": crashes, "rate": args.rate, "seed": args.seed,
             "trigger_window_s": [low, high], "smoke": bool(args.smoke)}
 
@@ -804,6 +937,7 @@ def check_args(args: argparse.Namespace, matrix: dict[str, Any]) -> float:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    phase1.checked_host_disk(args.host_disk)
     if args.check is not None:
         return cs.check_main(args.check)
     matrix = build_matrix(args)
@@ -816,7 +950,9 @@ def main(argv: list[str] | None = None) -> int:
             f"crash loses something is {ca.upper_bound_95(0, matrix['crashes']):.1%} (30 crashes: 9.5 %)")
     limits = phase1.check_equal_limits()
     host = Host(args.data_root, shlex.split(args.host_exec) if args.host_exec is not None else default_host_prefix())
-    disk = args.host_disk or phase1.probe_host_disk()
+    for note in redundant_configs(matrix["configs"], shipped_group_commit()):
+        log(f"note: {note}")
+    disk = phase1.resolve_host_disk(args.host_disk)
     status = host.call("status").strip()
     if "flakey-drop" in matrix["crash_modes"] and status != "flakey":
         if args.setup_flakey is None:
@@ -830,6 +966,7 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(f"{SPEC[system]['project']} is already running; stop it first (one system at a time)")
     sh(["docker", "pull", "-q", KAFKA_IMAGE], timeout=1800)
     vtop_image = ensure_image(args.rebuild)
+    client_image = ensure_client_image(args.rebuild) if matrix["record_size"] > 0 else None
 
     resumed: set[tuple[str, str, int]] = set()
     if args.resume:
@@ -860,8 +997,10 @@ def main(argv: list[str] | None = None) -> int:
         cs.write_header(os.path.join(run_dir, "crash.csv"))
     env["run_state"] = "running"
     phase1.save_environment(run_dir, env)
-    params = Params(rate=args.rate, seed=args.seed)
+    params = Params(rate=args.rate, seed=args.seed, record_size=matrix["record_size"])
     ctx = {"run_dir": run_dir, "env": env, "host": host, "vtop_image": vtop_image, "data_root": args.data_root,
+           "record_size": matrix["record_size"], "client_image": client_image,
+           "shipped_group_commit": shipped_group_commit(),
            "node_cpus": args.node_cpus, "client_cpus": args.client_cpus, "client_memory": args.client_memory,
            "params": params, "save_env": lambda: phase1.save_environment(run_dir, env)}
     backend = DockerBackend(ctx)

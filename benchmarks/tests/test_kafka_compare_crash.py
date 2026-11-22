@@ -219,7 +219,8 @@ def test_a_run_where_kafka_defaults_loses_nothing_in_every_crash_is_flagged_as_a
 
 def matrix(crashes=3):
     return {"configs": ["kafka-defaults", "kafka-fsync-parity", "vtop-shipped"], "crash_modes": ["flakey-drop"],
-            "crashes": crashes, "rate": 1000, "seed": 599, "trigger_window_s": [25.0, 55.0]}
+            "crashes": crashes, "rate": 1000, "seed": 599, "trigger_window_s": [25.0, 55.0],
+            "record_size": 1024}
 
 
 def environment(m=None):
@@ -238,6 +239,7 @@ def good_row(env, config="kafka-defaults", mode="flakey-drop", crash=1, **over):
            "profile": "fsync-parity" if config == "kafka-fsync-parity" else "defaults", "crash_mode": mode,
            "crash": crash, "status": "ok", "seed": 599, "trigger_after_s": 30.0,
            "trigger_method": "dm-flakey drop_writes after SIGKILL of all three", "offered_rate": 1000,
+           "record_size": 1024,
            "client": "kafka-verifiable-producer", "idempotent": True, "send_errors": 0,
            "acked": 39990, "acked_last_seq": 39989, "acked_in_last_10s": 9990, "read_records": 39000,
            "served_end_before_sentinel": 39000, "served_end_after_sentinel": 39001,

@@ -41,6 +41,7 @@ COLUMNS = (
     "trigger_after_s",
     "trigger_method",
     "offered_rate",
+    "record_size",
     "client",
     "idempotent",
     "send_errors",
@@ -72,10 +73,13 @@ COLUMNS = (
     "note",
 )
 
+# Under the broker's default message.max.bytes (1 MiB) with room for the record's own overhead.
+MAX_RECORD_SIZE = 1_000_000
+
 RUN_CONSTANT = ("run_id", "env_fingerprint", "vtop_commit", "kafka_image")
 
 # An ok row carries every one of these as a number (kill_to_drop_ms only in a power-loss mode).
-_NUMERIC_OK = ("seed", "trigger_after_s", "offered_rate", "send_errors", "acked", "read_records",
+_NUMERIC_OK = ("seed", "trigger_after_s", "offered_rate", "record_size", "send_errors", "acked", "read_records",
                "served_end_before_sentinel", "served_end_after_sentinel",
                "read_missing_before_sentinel", "acked_lost", "lost_runs", "present_unacked", "duplicates",
                "reordered", "offset_mismatch", "unexpected", "recovery_seconds", "wall_seconds")
@@ -118,6 +122,10 @@ def check_matrix(matrix: dict[str, Any]) -> None:
         value = matrix.get(key)
         if not _is_int(value) or value < floor:
             raise PlanRefused(f"matrix.{key} is {value!r}: a whole number of at least {floor} is needed")
+    size = matrix.get("record_size")
+    if not _is_int(size) or not 0 <= size <= MAX_RECORD_SIZE:
+        raise PlanRefused(f"matrix.record_size is {size!r}: bytes per record, 0 for the stock client's few bytes, "
+                          f"at most {MAX_RECORD_SIZE}")
     if not _is_int(matrix.get("seed")):
         raise PlanRefused(f"matrix.seed is {matrix.get('seed')!r}: the schedule's seed must be a whole number")
     window = matrix.get("trigger_window_s")

@@ -334,7 +334,7 @@ def test_the_logs_are_saved_even_when_the_read_back_raises():
 
 def small_matrix(crashes=2, modes=("flakey-drop",), configs=("kafka-defaults", "kafka-fsync-parity", "vtop-shipped")):
     return {"configs": list(configs), "crash_modes": list(modes), "crashes": crashes, "rate": 1000,
-            "seed": 599, "trigger_window_s": [10.0, 20.0]}
+            "seed": 599, "trigger_window_s": [10.0, 20.0], "record_size": 1024}
 
 
 class RecordingBackend(FakeBackend):
@@ -488,7 +488,7 @@ def test_the_flush_setting_the_broker_reports_must_match_the_profile():
 def test_the_smoke_profile_is_small_and_covers_every_configuration_in_both_modes():
     args = crash.parse_args(["--smoke"])
     matrix = crash.build_matrix(args)
-    assert matrix["crashes"] == 2 and set(matrix["configs"]) == set(ca.CONFIGS)
+    assert matrix["crashes"] == 2 and set(matrix["configs"]) == set(ca.default_configs(False))
     assert set(matrix["crash_modes"]) == set(ca.CRASH_MODES)
     assert matrix["trigger_window_s"][1] <= 15
     assert cs.projected_seconds(matrix) / 3600 < 1.5
@@ -610,7 +610,8 @@ def test_every_command_the_readme_shows_parses_and_the_full_run_fits_its_own_cap
         runs.append((args, matrix, hours))
     smoke, full, resume = runs
     assert smoke[1]["smoke"] and not full[1]["smoke"]
-    # the documented one-hour command: 12 crashes of three configurations in power-loss mode, about an hour
-    assert full[1]["crashes"] == 12 and full[1]["crash_modes"] == ["flakey-drop"]
-    assert 0.8 <= full[2] <= 1.25, full[2]
+    # the documented command: 12 crashes of four configurations (both Kafka profiles, VTOP as shipped and VTOP with
+    # the other group-commit state) in power-loss mode, about an hour and a quarter
+    assert full[1]["crashes"] == 12 and full[1]["crash_modes"] == ["flakey-drop"] and len(full[1]["configs"]) == 4
+    assert 1.1 <= full[2] <= 1.6, full[2]
     assert resume[0].resume == "<run-id>"
