@@ -1,0 +1,81 @@
+name: platform tests
+
+# The workspace's test suite on the platforms the release archives target
+# besides x86_64 Linux, which every other job runs on (#724, B4 of the
+# production bar): macOS on Apple silicon, macOS on Intel, and aarch64 Linux.
+# `cargo test --workspace` with the default features (the Kafka source
+# included, librdkafka and OpenSSL built from source); the live tests that
+# need a broker or a store are `#[ignore]` and are not run here.
+#
+# The release workflow already runs the archives themselves on every Linux
+# distribution and both macOS runners (a round trip, the coverage audit and a
+# scrub); this is the test suite on the same CPUs and operating systems.
+#
+# Who runs it:
+# - Nightly (05:27 UTC) and on dispatch, over whatever main holds: each leg
+#   is a full build of the workspace on a runner that is slower than the
+#   x86_64 Linux one, so it never runs per pull request.
+# - A pull request that changes this file runs it on its own head (the
+#   schedule runs only from main, so this is the one way a change to it is
+#   proven before it merges).
+#
+# The cache holds the cargo registry only, one narrow key per leg: the
+# target directory is the large part and is rebuilt every night.
+
+on:
+  schedule:
+    # 05:27 UTC: off the hour, after the kafka matrix and the kafka cluster.
+    - cron: "27 5 * * *"
+  pull_request:
+    paths:
+      - '.github/workflows/platform-tests.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: platform-tests-${{ github.event_name == 'schedule' && 'nightly' || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: workspace tests (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      # One platform failing must not hide the result of another.
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos arm64
+            runner: macos-15
+          - name: macos x86_64
+            runner: macos-15-intel
+          - name: linux aarch64
+            runner: ubuntu-24.04-arm
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: platform-tests-registry-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install librdkafka build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang libsasl2-dev libcurl4-openssl-dev zlib1g-dev pkg-config
+      - name: The platform under test
+        run: |
+          uname -a
+          rustc -vV
+      - name: cargo test --workspace
+        run: cargo test --workspace --locked --no-fail-fast

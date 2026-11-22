@@ -295,6 +295,21 @@ upload:
   #   retain_days: 90             # 1..3650, counted from each write
   #   legal_hold: false           # also place a legal hold on every object
 
+  # Encryption at rest through S3 server-side encryption (s3_native only; any
+  # other backend refuses a mode but `none` at load). `none` (the default)
+  # sends no encryption header and checks nothing. Otherwise every object,
+  # manifest and verification receipt write, single-part and multipart, asks
+  # the store to encrypt it, and a batch whose stored object is not reported
+  # as encrypted the way it was asked for FAILS verification and is replayed.
+  # sse-kms with no kms_key_id sends aws:kms and no key, so the store uses its
+  # default KMS key (on AWS, the account's AWS-managed aws/s3 key); with one,
+  # the key the store reports must match it by key id or key ARN. SSE-C is not
+  # supported.
+  # server_side_encryption:
+  #   mode: sse-kms               # none | sse-s3 | sse-kms
+  #   kms_key_id: arn:aws:kms:eu-west-1:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab
+  #   bucket_key: true            # sse-kms only: fewer KMS requests
+
 partitioning:
   template: "tenant={tenant}/source={source}/format={format}/year={yyyy}/month={mm}/day={dd}/hour={hh}/"
   # Which clock fills {yyyy}..{hh} (#559): seal (default) = when the batch was

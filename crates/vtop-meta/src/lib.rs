@@ -40,6 +40,9 @@ pub mod transport;
 pub mod versions;
 mod wire;
 
+#[cfg(test)]
+mod fuzz_seeds;
+
 pub use command::{
     lease_skew_bound_ms, AnswerLineage, Attribution, CommandActor, CommandEnvelope,
     MetadataCommand, MetadataError, MetadataResponse, NodeState, PromotionAttestation,

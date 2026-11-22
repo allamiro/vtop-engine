@@ -432,6 +432,7 @@ The PostgreSQL state store follows the same rule (#694): the engine's runtime ro
 | `s3_native` | `PutObject`, `GetObject`/`HeadObject` (verify), `ListBucket` within prefix | SHA-256 uses a service-computed checksum; BLAKE3 requires read-back. |
 | `awscli` / `s3cmd` / `minio mc` | Same as above | Strong verification downloads and hashes the stored body. |
 | LocalFS | Filesystem write/read on the object tree only | The object tree directory **SHOULD** have restrictive permissions; the engine **SHOULD NOT** require broader filesystem access. |
+| `s3_native` with `upload.server_side_encryption` | The `s3_native` row. With `mode: sse-kms` the runtime identity also needs `kms:GenerateDataKey` and `kms:Decrypt` on the key (the AWS-managed `aws/s3` key when `kms_key_id` is unset), and the `s3:PutObject` that sends the encryption header | A read-back (BLAKE3, or the SHA-256 of a multipart object) decrypts the object, so without `kms:Decrypt` those batches fail. A bucket policy that denies `PutObject` without the header makes a misconfigured engine fail loudly instead of writing plaintext. |
 | `s3_native` with `upload.object_lock` (#684) | The `s3_native` row, plus `s3:PutObjectRetention`, `s3:GetObjectRetention`, `s3:GetBucketObjectLockConfiguration`, `s3:GetObjectVersion`, `s3:GetBucketVersioning`; with `legal_hold: true` also `s3:PutObjectLegalHold` and `s3:GetObjectLegalHold` | S3 returns the lock headers on `HeadObject` only to a caller holding `s3:GetObjectRetention` (`s3:GetObjectLegalHold` for the legal hold), so without it every batch fails its retention check. The runtime identity **SHOULD NOT** hold `s3:BypassGovernanceRetention`. See [OBJECT_LOCK_DEPLOYMENT.md](OBJECT_LOCK_DEPLOYMENT.md). |
 
 Command compatibility backends (`awscli`, `s3cmd`, `minio mc`) **MUST** use an
@@ -485,7 +486,34 @@ Per-format buckets (e.g. `telemetry-{format}`) with optional on-demand creation 
 - The engine does **not** create a locked bucket, set a bucket default retention, or remove a lock. Object Lock is enabled when a bucket is created, and a bucket default retention **SHOULD** be set as the floor: an engine older than v0.10.0 ignores `upload.object_lock` and writes unlocked objects, which only a bucket default retention locks.
 - Where the backend supports it (e.g., S3 Object Lock / WORM), telemetry objects and manifests **SHOULD** be written as immutable for the configured retention period.
 - Immutability complements verification: verification detects tampering, immutability prevents post-write tampering or accidental overwrite.
-- At-rest encryption (server-side or bucket-default) **MAY** be enabled at the storage layer; it is orthogonal to VTOP's integrity guarantees.
+- At-rest encryption **MAY** also be enabled at the storage layer, by a bucket default or a store setting; it is orthogonal to VTOP's integrity guarantees. With `upload.server_side_encryption` unset VTOP asks for none and checks none, so an object is encrypted only if the bucket's default says so.
+
+### 7.1 Encryption at rest (`upload.server_side_encryption`)
+
+With `upload.server_side_encryption.mode` set to `sse-s3` or `sse-kms` (`s3_native` only; any other backend refuses a mode but `none` at config load, because it would write plaintext), VTOP asks the store to encrypt what it writes and then checks that the store did:
+
+- **Every write carries it.** Every object PUT, manifest PUT and verification-receipt PUT (a receipt goes through the manifest write path) and every `CreateMultipartUpload` carries `x-amz-server-side-encryption` (`AES256` for `sse-s3`, `aws:kms` for `sse-kms`). `UploadPart` and `CompleteMultipartUpload` carry none: for SSE-S3 and SSE-KMS S3 takes the encryption from the create.
+- **`sse-kms` and the key.** With `kms_key_id` set, `x-amz-server-side-encryption-aws-kms-key-id` carries it, and `bucket_key: true` adds `x-amz-server-side-encryption-bucket-key-enabled`. With `kms_key_id` **unset**, the request carries `aws:kms` and **no key id**, so the store uses its default KMS key: on AWS, the account's AWS-managed `aws/s3` key, which has no monthly charge.
+- **Verification fails closed.** Before a batch may reach `VERIFIED`, the `HeadObject` of the object and manifest it wrote (the same call that reads the size and the store-computed SHA-256) must report the encryption that was asked for. A store that reports **none**, **another algorithm**, or, when `kms_key_id` is set, **another key** fails the verification the way a checksum mismatch does (`FAILED` then `REPLAY_REQUIRED`, source progress not committed, counted in `vtop_verification_failures_total`), whatever the size and the checksum say: a write that should be encrypted and is not is never committed. The failure message names which of the three it was. An object a replay finds already stored under its key (#626) is judged the same way, so an unencrypted one is never reused. `vtopctl tier copy` reads the setting from its `--upload-config` file and applies it to the segment and the manifest it writes, and verifies both before it returns tier evidence: a segment or a manifest the store reports unencrypted refuses the copy. A verification receipt carries the header too and is checked after it is written, but it is evidence and never holds a batch back (§8.4): one the store reports unencrypted is a failed receipt (a WARN and `vtop_verification_receipts_total{result="failed"}`), not a failed batch.
+- **Every path that touches a stored object judges it.** The backend judges the store's report (`HeadObject`, of the exact version where one is pinned) in two places, which share one rule: `verify_object` for an object and for a manifest a batch writes, and `check_encryption` for a read that has no verification of its own.
+
+  | Path | How it judges encryption |
+  |---|---|
+  | Object and manifest write, single-part and multipart, and a lock-fallback object | The headers on the write; `verify_object` on the object and on the manifest before `VERIFIED` |
+  | An object a replay finds stored under its key (#626), and an earlier attempt's recorded object a batch would adopt (#773) | `verify_object` before it is reused or adopted; an unencrypted one is left as it is and the batch is written under its own key. (Adoption is for backends that cannot tell a missing key from a refused request, which the command backends are, and they refuse this setting; the call is the same `verify_object`.) |
+  | Recovery's re-check of a `VERIFIED` row | The same `check_stored_batch` as the scrub: `verify_object` on the object, `check_encryption` on the pinned manifest version |
+  | `vtopctl scrub` | `verify_object` on the object, `check_encryption` on the pinned manifest version and on the manifest's current key, and on each receipt it reads, each a `mismatched` finding when the store reports otherwise |
+  | `vtopctl tier copy` | The segment and the manifest each through `verify_object` before evidence is returned |
+  | Verification receipt write | `check_encryption` on the version written; a failure is a failed receipt |
+  | `vtopctl verify` | `check_encryption` on the manifest and the object, reported on an `encryption` line and failing the verdict; no line when the backend asked for none |
+  | Manifest write after a batch is already written | None exists: a manifest is written once per attempt, by the path in the first row |
+  - With `kms_key_id` **unset**, an `aws:kms` object passes whichever key the store reports; the check is the algorithm. VTOP does not check that the key is the account's `aws/s3` key.
+  - With `kms_key_id` **set** to a key id or a key ARN, the key the store reports must match it by key id or by key ARN (a store reports the key's ARN). A store that reports `aws:kms` and no key id cannot be used with a named key.
+  - With `kms_key_id` set to an **alias**, only the algorithm is checked, because a store reports the key's ARN and never the alias. The engine logs a WARN at startup saying so. Name the key by id or ARN to have it checked.
+- **Checksums are unchanged.** SSE-S3 and SSE-KMS change neither the store-computed `x-amz-checksum-sha256` nor the read-back: S3 computes and returns the checksum over the plaintext, and a `GetObject` of an encrypted object returns plaintext. The live MinIO test (`live_s3_sse`) verifies a SHA-256 object, a BLAKE3 object and a multipart object under each mode.
+- **Not covered.** SSE-C, DSSE-KMS (`aws:kms:dsse`) and client-side encryption are not supported. A bucket default encryption is the operator's and is not read or changed. Objects written before the mode was set stay as they were, and `vtopctl scrub` reports each as a mismatch (the store reports no encryption), which is accurate: re-encrypt them with a store-side copy. A multipart session begun before the mode was set completes into an unencrypted object, which then fails verification and is replayed under the new setting.
+- **Observability.** The startup summary logs the mode and what a mismatch does, and `vtop_server_side_encryption_mode{tenant,mode}` reads 1 for the configured mode (`none`, `sse-s3`, `sse-kms`), set once at startup by `run`. Alert on `vtop_server_side_encryption_mode{mode="none"} == 1` for a fleet that must encrypt.
+- **Keys are the store's.** VTOP never sees an object key, a data key or a KMS key's material. Who may use the KMS key, rotation and key deletion are KMS policy. A KMS key that is disabled or deleted makes the archive unreadable.
 
 ## 8. Manifest authentication
 
@@ -662,6 +690,38 @@ query string, fragment or user info; the writer refuses such a URI rather
 than record it. The warning for a receipt that could not be written strips
 URL query strings and user info from the store's error.
 
+### 8.5 A manifest is bound to its key (`verify-manifest`)
+
+A genuine manifest copied over another batch's manifest key is intact: its
+self-hash, its MAC, its object and its ledger row all check out. The scrub
+and recovery catch the copy through the ledger, which records which manifest
+belongs at which key (`is batch X's, not Y`). `vtopctl verify-manifest` may
+run with no ledger that knows the batch, so it binds the manifest to its key
+itself: every manifest names the key it was written to, in `manifest.uri`,
+and the check **MUST** find that name equal to the URI it read the manifest
+from, exactly. Otherwise it fails, naming both keys and the batch whose
+manifest it is (`manifest key : FAILED`, `"manifest_key_ok": false`).
+
+What is bound, by manifest version:
+
+| Version | `manifest.uri` present | Covered by the self-hash | Covered by the MAC |
+|---|---|---|---|
+| 0.1 | yes | yes | no MAC exists in 0.1; with a key configured, an unsigned manifest is refused anyway (§8) |
+| 0.2, 0.3 | yes | yes (the re-encoded fields) | yes, when the manifest is signed and a key is configured |
+| 0.4 | yes | yes (the stored document) | yes, when a key is configured |
+
+- **With a key configured**, the binding is authenticated: the MAC covers
+  `manifest.uri` and `batch_id` together, so the key and the batch a manifest
+  names are its signer's statement, and editing either fails the MAC.
+- **Without a key**, the self-hash makes the binding corruption detection
+  only, like every other field: someone who can write the bucket can rewrite
+  `manifest.uri` and recompute the hash. A copied manifest left as it is
+  fails.
+- **Not derived from other fields.** The check does not rebuild the key from
+  the batch id and the partition template: not every writer names a
+  manifest that way (`vtopctl tier` writes `<object>.manifest.json`), and
+  under the MAC the name the manifest carries is already authenticated.
+
 ## 9. Resource exhaustion controls
 
 Resource exhaustion controls are part of the security boundary:
@@ -779,7 +839,7 @@ Removing an ignore removes it from both files and this table together.
 | Transport confidentiality | Configurable (native broker: TLS 1.3 mTLS on every plane whose transport knob is left at its default; a plane switched to plaintext has none) / Configurable (Kafka, S3, PostgreSQL) | The native broker is TLS 1.3 mTLS on every plane whose transport is left at its default. Five node config knobs choose (#294 slice 5). Four are listeners — `peer_transport`, `admin_transport`, `replica_transport`, `native_transport` — each `tls` unless set to `plaintext` (loopback only) or `plaintext-on-any-interface` (spelled out deliberately); the fifth, `lease.transport`, is a dial with `tls` or `plaintext` only, and its loopback bound comes from the admin listener it dials, not from the dial. A plane on any plaintext setting has no transport confidentiality, so a security review of a hand-written node config reads all five. No `vtopctl` flag or Helm value sets them, so chart-rendered deployments are TLS throughout. A plaintext replica plane refuses the verbs whose authorization depends on a client certificate, and a plaintext native plane admits the configured principal on its declaration alone. Kafka/S3/PostgreSQL confidentiality is configured on those clients, not implemented in core. |
 | PostgreSQL transport authentication | Yes for remote hosts | Non-loopback connections require `sslmode=verify-full`; loopback/socket plaintext is limited to local operation. |
 | Backend-limited verification disclosure | Yes | Size-only mode is labeled and rejected by default. |
-| Data-at-rest encryption | Not by VTOP | Delegated to storage layer (SSE/bucket default). |
+| Data-at-rest encryption | Yes, with `upload.server_side_encryption` on `s3_native` (SSE-S3 or SSE-KMS); otherwise not by VTOP | The store encrypts every object, manifest and receipt; VTOP asks for it on every write and fails a batch whose stored object is not reported as encrypted the way it was asked for (§7.1). Keys and key policy are the store's and KMS's. SSE-C, client-side encryption and an encrypted ledger or work directory are not provided; without the setting, encryption is delegated to the storage layer (bucket default). |
 | Object immutability (WORM) | Yes, with `upload.object_lock` on `s3_native` | Objects and manifests written under an S3 Object Lock retention, the bucket's Object Lock checked first, and the stored retention of the exact versions verified before `VERIFIED` (§7, #684). The bucket's Object Lock and its default retention are created by the operator; `vtopctl tier copy` refuses the profile. |
 | MAC key rotation | Yes | Key ids in version 0.4 manifests and a keyring (§8.3). |
 | Public-key manifest signing | Not yet | MAC keys are shared secrets: an auditor needs the key to verify. |
@@ -819,6 +879,7 @@ engine host, a leaked MAC key, encryption at rest).
 | Object Lock retention on versioned manifest buckets | **SHOULD** |
 | With `upload.object_lock`: bucket Object Lock preflight, lock headers on every write, stored retention verified before `VERIFIED` | **MUST** |
 | Bucket default retention as the floor under `upload.object_lock` | **SHOULD** (operator) |
+| With `upload.server_side_encryption`: encryption headers on every write, the store's reported encryption verified before `VERIFIED` | **MUST** |
 | Secret redaction in logs | **MUST** |
 | Refuse a key, state-store, ledger or audit file group or other can write (no override) | **MUST** |
 | Refuse such a file other users can read, outside a closed directory or a read-only Kubernetes Secret mount, unless the documented override is set, and announce and audit each override | **MUST** |
@@ -882,8 +943,10 @@ exchange) and rotate any password set before the switch to
 `password_encryption = scram-sha-256` — that setting governs only how
 NEW passwords are stored, so a legacy MD5 verifier keeps the legacy
 exchange alive until its password is reset. A FIPS-shaped deployment
-does both, and only then can the MD5 path never be offered. At-rest
-encryption is delegated to the storage layer (§7).
+does both, and only then can the MD5 path never be offered. Archive
+objects are encrypted at rest by the store when `upload.server_side_encryption`
+is set (§7.1); otherwise at-rest encryption is delegated to the storage layer
+(§7).
 
 ### 16.3 The questions this inventory exists to ask
 

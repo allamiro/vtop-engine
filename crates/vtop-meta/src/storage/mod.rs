@@ -581,10 +581,13 @@ mod closed_enum_review_tests {
                     continue;
                 }
                 let full = std::fs::read_to_string(&path).unwrap();
-                let source = match full.find("#[cfg(test)]\nmod ") {
-                    Some(at) => &full[..at],
-                    None => &full[..],
-                };
+                // The first test module, private or not: command.rs's is
+                // `pub(crate)` so the fuzz seeds can reuse its values.
+                let source = ["#[cfg(test)]\nmod ", "#[cfg(test)]\npub(crate) mod "]
+                    .iter()
+                    .filter_map(|marker| full.find(marker))
+                    .min()
+                    .map_or(&full[..], |at| &full[..at]);
                 for (at, opening) in source.match_indices("UnknownTag {") {
                     // The struct literal up to its closing brace.
                     let body = &source[at + opening.len()..];

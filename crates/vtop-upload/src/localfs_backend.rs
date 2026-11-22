@@ -327,6 +327,7 @@ impl UploadBackend for LocalFsBackend {
             // The .vtopck file is written by this engine. It is useful as an
             // inventory hint, but cannot prove what bytes are in `path`.
             checksum_sha256: None,
+            encryption: None,
         })
     }
 
@@ -727,5 +728,341 @@ mod tests {
                 "{want:?} not in {ev:?}"
             );
         }
+    }
+}
+
+/// A power-loss test of the localfs backend, against a model of what a power
+/// loss keeps.
+///
+/// **Why not kill a process.** A killed process loses nothing the kernel has
+/// accepted: every completed `write`, `rename` and `mkdir` stays in the page
+/// cache, and the next process sees it whether or not anything was synced. So
+/// a test that kills a writer at an injected point after the rename and before
+/// the directory sync passes with every sync call removed: it cannot fail for
+/// the bug it would be written to catch. Losing unsynced state takes a lost
+/// page cache, which a test can get only from a virtual machine, a
+/// device-mapper target or a FUSE filesystem that drops unsynced writes, none
+/// of which this repository's test runners have.
+///
+/// **The model.** The worst case POSIX allows. After a power loss, a file
+/// holds the bytes it held at its last `fsync`, or none if it was never
+/// synced, and a directory holds the entries it held at its last `fsync`, or
+/// (for one that existed before the write) the entries it held then. Each
+/// sync the backend makes is recorded with a snapshot of what that sync makes
+/// durable (the file's bytes; the directory's names and the inodes they point
+/// at), taken from the real filesystem at the moment of the call. A power
+/// loss after the `k`th sync keeps the tree as it was before the write plus
+/// the first `k` snapshots. Each crash point is also read with every
+/// directory change made so far already written, as background writeback may
+/// have done on its own, and file bytes still only as synced: a rename that
+/// reached the disk before the bytes it names is a torn object. Filesystems
+/// that keep more (ext4 `data=ordered`) keep a superset of this.
+///
+/// **The invariants**, at every crash point, read both ways:
+/// - the key never names bytes that are not durable (a torn object);
+/// - the key holds the object it held before the write, or the new one, never
+///   neither, when it held one before;
+/// - once the put has returned, which is when the engine may verify and
+///   commit it, the key holds the new object in full.
+#[cfg(all(test, unix))]
+mod power_loss {
+    use super::*;
+    use std::collections::HashMap;
+    use std::ffi::OsString;
+    use std::os::unix::fs::{DirEntryExt, MetadataExt};
+
+    /// What one sync makes durable.
+    #[derive(Debug, Clone)]
+    enum Synced {
+        File {
+            ino: u64,
+            bytes: Vec<u8>,
+        },
+        Dir {
+            ino: u64,
+            entries: HashMap<OsString, u64>,
+        },
+    }
+
+    fn snapshot_dir(path: &Path) -> std::io::Result<Synced> {
+        let ino = std::fs::metadata(path)?.ino();
+        let mut entries = HashMap::new();
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            entries.insert(entry.file_name(), entry.ino());
+        }
+        Ok(Synced::Dir { ino, entries })
+    }
+
+    /// Makes the real syncs and records what each made durable. `skip_dirs`
+    /// stands for a backend that does not sync directories (the code before
+    /// #827): the call is neither made nor recorded.
+    #[derive(Default)]
+    struct Snapshots {
+        log: Mutex<Vec<Synced>>,
+        skip_dirs: bool,
+        /// The key's path, and the inode its name points at, live, as each
+        /// sync starts and after the put: what a filesystem that had already
+        /// written every directory change made so far would show.
+        key: Mutex<Option<PathBuf>>,
+        live: Mutex<Vec<Option<u64>>>,
+    }
+
+    impl Snapshots {
+        fn note_live(&self) {
+            if let Some(key) = self.key.lock().unwrap().as_ref() {
+                let ino = std::fs::symlink_metadata(key).ok().map(|m| m.ino());
+                self.live.lock().unwrap().push(ino);
+            }
+        }
+    }
+
+    impl DurabilitySync for Snapshots {
+        fn sync_file(&self, file: &std::fs::File, path: &Path) -> std::io::Result<()> {
+            self.note_live();
+            OsSync.sync_file(file, path)?;
+            let ino = file.metadata()?.ino();
+            let bytes = std::fs::read(path)?;
+            self.log.lock().unwrap().push(Synced::File { ino, bytes });
+            Ok(())
+        }
+        fn sync_dir(&self, path: &Path) -> std::io::Result<()> {
+            if self.skip_dirs {
+                return Ok(());
+            }
+            self.note_live();
+            OsSync.sync_dir(path)?;
+            let snapshot = snapshot_dir(path)?;
+            self.log.lock().unwrap().push(snapshot);
+            Ok(())
+        }
+    }
+
+    /// The tree under `root` as it is now: taken as durable, as a tree that
+    /// was there before the write and has long been flushed. Each file is
+    /// held open in `held` until the write is done: the model names a file by
+    /// its inode, and a file the write replaces would otherwise free its
+    /// inode for the next file the write creates (the sidecar), which the
+    /// model would then read as the replaced object's bytes.
+    fn durable_tree(root: &Path, out: &mut Vec<Synced>, held: &mut Vec<std::fs::File>) {
+        out.push(snapshot_dir(root).unwrap());
+        for entry in std::fs::read_dir(root).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                durable_tree(&path, out, held);
+            } else {
+                held.push(std::fs::File::open(&path).unwrap());
+                out.push(Synced::File {
+                    ino: entry.ino(),
+                    bytes: std::fs::read(&path).unwrap(),
+                });
+            }
+        }
+    }
+
+    /// What a power loss keeps: later snapshots replace earlier ones.
+    #[derive(Default)]
+    struct Image {
+        files: HashMap<u64, Vec<u8>>,
+        dirs: HashMap<u64, HashMap<OsString, u64>>,
+    }
+
+    impl Image {
+        fn of(snapshots: &[Synced]) -> Self {
+            let mut image = Self::default();
+            for s in snapshots {
+                match s {
+                    Synced::File { ino, bytes } => {
+                        image.files.insert(*ino, bytes.clone());
+                    }
+                    Synced::Dir { ino, entries } => {
+                        image.dirs.insert(*ino, entries.clone());
+                    }
+                }
+            }
+            image
+        }
+
+        /// The bytes of the file `ino` names, as synced.
+        fn file(&self, ino: u64) -> Survivor {
+            match self.files.get(&ino) {
+                Some(bytes) => Survivor::Bytes(bytes.clone()),
+                None => Survivor::Torn,
+            }
+        }
+
+        /// What the key under `root_ino` reads as, with directories as synced.
+        fn read(&self, root_ino: u64, components: &[OsString]) -> Survivor {
+            let mut at = root_ino;
+            let (name, dirs) = components.split_last().expect("a key");
+            for dir in dirs {
+                match self.dirs.get(&at).and_then(|entries| entries.get(dir)) {
+                    Some(ino) => at = *ino,
+                    None => return Survivor::Absent,
+                }
+            }
+            match self.dirs.get(&at).and_then(|entries| entries.get(name)) {
+                Some(ino) => self.file(*ino),
+                None => Survivor::Absent,
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Survivor {
+        Absent,
+        /// The key names a file whose bytes were never synced.
+        Torn,
+        Bytes(Vec<u8>),
+    }
+
+    /// A power loss after `k` syncs, read with the directories as synced,
+    /// and with every directory change made so far already written.
+    #[derive(Debug)]
+    struct CrashPoint {
+        synced: Survivor,
+        eager: Survivor,
+    }
+
+    /// Put `bytes` at `uri` through `sync`, with the tree under `root` taken
+    /// as durable before it, and say what a power loss after each of the
+    /// write's syncs leaves at the key: the first entry is a power loss
+    /// before any of them, the last one after the put returned.
+    async fn crash_points(
+        root: &Path,
+        uri: &str,
+        bytes: &[u8],
+        sync: Arc<Snapshots>,
+    ) -> Vec<CrashPoint> {
+        let mut before = Vec::new();
+        let mut held = Vec::new();
+        durable_tree(root, &mut before, &mut held);
+        let root_ino = std::fs::metadata(root).unwrap().ino();
+        let backend = LocalFsBackend::with_sync(root, sync.clone());
+        *sync.key.lock().unwrap() = Some(backend.object_path(uri).unwrap());
+        let source = tests_support::tmp(bytes);
+        let digest = vtop_core::checksum::sha256_bytes(bytes);
+        backend
+            .put_object(
+                source.path(),
+                uri,
+                Some(ObjectChecksum::new("sha256", &digest)),
+            )
+            .await
+            .unwrap();
+        sync.note_live();
+        drop(held);
+        let (bucket, key) = parse_s3_uri(uri).unwrap();
+        let components: Vec<OsString> = std::iter::once(bucket.as_str())
+            .chain(key.split('/'))
+            .map(OsString::from)
+            .collect();
+        let log = sync.log.lock().unwrap().clone();
+        let live = sync.live.lock().unwrap().clone();
+        assert_eq!(live.len(), log.len() + 1, "{live:?}");
+        (0..=log.len())
+            .map(|k| {
+                let mut kept = before.clone();
+                kept.extend_from_slice(&log[..k]);
+                let image = Image::of(&kept);
+                CrashPoint {
+                    synced: image.read(root_ino, &components),
+                    eager: live[k].map_or(Survivor::Absent, |ino| image.file(ino)),
+                }
+            })
+            .collect()
+    }
+
+    /// A new object under directories the write creates (a new bucket and
+    /// new partition directories): absent until its directory entries are
+    /// durable, never torn, and whole once the put has returned.
+    #[tokio::test]
+    async fn a_new_object_survives_a_power_loss_once_the_put_returns() {
+        let root = tempfile::tempdir().unwrap();
+        let got = crash_points(
+            root.path(),
+            "s3://bkt/tenant=t/year=2026/obj.cef.gz",
+            b"new object",
+            Arc::new(Snapshots::default()),
+        )
+        .await;
+        assert!(got.len() > 1, "the write made no syncs: {got:?}");
+        let new = Survivor::Bytes(b"new object".to_vec());
+        for (k, point) in got.iter().enumerate() {
+            for survivor in [&point.synced, &point.eager] {
+                assert!(
+                    *survivor == Survivor::Absent || *survivor == new,
+                    "a power loss after sync {k} leaves {point:?}"
+                );
+            }
+        }
+        assert_eq!(
+            got.last().unwrap().synced,
+            new,
+            "an object the put reported done is lost to a power loss: {got:?}"
+        );
+    }
+
+    /// An object replaced at its key (a replay writing the same derived key,
+    /// #626): at every crash point the key holds the old object or the new
+    /// one, whole, and the new one once the put has returned.
+    #[tokio::test]
+    async fn a_replaced_object_is_old_or_new_at_every_crash_point() {
+        let root = tempfile::tempdir().unwrap();
+        let uri = "s3://bkt/p/obj.cef.gz";
+        LocalFsBackend::new(root.path())
+            .put_object(tests_support::tmp(b"old object").path(), uri, None)
+            .await
+            .unwrap();
+        let got = crash_points(
+            root.path(),
+            uri,
+            b"new object, longer",
+            Arc::new(Snapshots::default()),
+        )
+        .await;
+        let old = Survivor::Bytes(b"old object".to_vec());
+        let new = Survivor::Bytes(b"new object, longer".to_vec());
+        for (k, point) in got.iter().enumerate() {
+            for survivor in [&point.synced, &point.eager] {
+                assert!(
+                    *survivor == old || *survivor == new,
+                    "a power loss after sync {k} leaves {point:?}"
+                );
+            }
+        }
+        assert_eq!(got[0].synced, old);
+        assert_eq!(got.last().unwrap().synced, new);
+    }
+
+    /// The model can fail: without the directory syncs (the backend before
+    /// #827) an object the put reported done is not in the surviving tree.
+    #[tokio::test]
+    async fn without_directory_syncs_the_model_loses_the_object() {
+        let root = tempfile::tempdir().unwrap();
+        let got = crash_points(
+            root.path(),
+            "s3://bkt/p/obj.cef.gz",
+            b"new object",
+            Arc::new(Snapshots {
+                skip_dirs: true,
+                ..Snapshots::default()
+            }),
+        )
+        .await;
+        assert_eq!(got.last().unwrap().synced, Survivor::Absent, "{got:?}");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests_support {
+    use std::io::Write;
+
+    pub(super) fn tmp(data: &[u8]) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(data).unwrap();
+        f.flush().unwrap();
+        f
     }
 }
