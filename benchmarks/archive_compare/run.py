@@ -39,7 +39,7 @@ import tempfile
 import time
 import urllib.request
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 BENCH = os.path.dirname(HERE)
@@ -85,6 +85,7 @@ DEVIATIONS = [
     "consumer group, as in distributed mode (#746 open question 2).",
 ]
 QUIET_SECONDS = 75  # one 60 s batch age and margin: no new object for this long is quiescence
+LAG_GROWTH = 0.05  # the live window's allowed lag growth, a share of its offered records (stats.sustained's tolerance)
 SOURCE_CPUS, SOURCE_MEMORY = "2", "3g"
 
 
@@ -406,9 +407,49 @@ def without_harness(counts: dict[str, int], harness: dict[str, int]) -> dict[str
     return {method: max(0, counts[method] - harness.get(method, 0)) for method in counts}
 
 
-def live_sustained(offered: float, achieved: float, gaps: int) -> bool:
-    """A live run sustained the offered rate only if the records were delivered too."""
-    return stats.sustained(offered, achieved) and not gaps
+class LiveProgress(NamedTuple):
+    """What the sink did during the live cell's measured window, from the group's own commits."""
+    committed_rate: float  # records a second the group committed past, over the window
+    lag_start: int         # records produced but not yet committed past, when the window opened
+    lag_end: int           # the same, when it closed
+
+
+def window_bounds(produced: list[tuple[int, int, int, float]], warmup: float, measure: float) -> tuple[float, float]:
+    """The measured window's start and end, in epoch seconds: after `warmup` from the producer's FIRST record."""
+    first = min(at for _seq, _part, _off, at in produced)
+    return first + warmup, first + warmup + measure
+
+
+def live_progress(timeline: commits.Timeline, produced: list[tuple[int, int, int, float]], warmup: float,
+                  measure: float) -> LiveProgress:
+    """The sink's progress over the measured window, taken from the offset sampler's commits (the broker's stamps).
+
+    The producer is open-loop, so what it logged says what was OFFERED, never what the tool archived; a tool that
+    archives half the offer and drains its backlog after the window must not look as if it kept up. The rate is
+    the offsets the group committed past between the window's start and end, and the lag is the records produced
+    so far less the group's committed offsets at those two instants."""
+    start, end = window_bounds(produced, warmup, measure)
+    partitions = max(part for _seq, part, _off, _at in produced) + 1
+
+    def lag(at: float) -> int:
+        ends = [0] * partitions
+        for _seq, part, offset, stamp in produced:
+            if stamp <= at:
+                ends[part] = max(ends[part], offset + 1)
+        return timeline.lag(ends, at)
+
+    done = sum(timeline.committed(part, end) - timeline.committed(part, start) for part in range(partitions))
+    return LiveProgress(done / measure, lag(start), lag(end))
+
+
+def live_sustained(offered: float, progress: LiveProgress, measure: float, gaps: int) -> bool:
+    """A live run sustained the offered rate only if the SINK kept up through the measured window and the records
+    were delivered too: the group committed at the offered rate (within the shared tolerance) and its lag did not
+    grow by more than that tolerance of the window's offered records. A tool that drains its backlog after the
+    window ended did not sustain the rate in it."""
+    growth = progress.lag_end - progress.lag_start
+    return (stats.sustained(offered, progress.committed_rate) and growth <= offered * measure * LAG_GROWTH
+            and not gaps)
 
 
 def drain_window(started: float, last_object: float, lag_zero_at: float | None) -> float:
@@ -442,8 +483,8 @@ def measured_window(produced: list[tuple[int, int, int, float]], warmup: float,
     tool's start, which the producer's own start-up follows), and for `measure` seconds."""
     if not produced:
         return []
-    first = min(at for _seq, _part, _off, at in produced)
-    return [row for row in produced if first + warmup <= row[3] < first + warmup + measure]
+    start, end = window_bounds(produced, warmup, measure)
+    return [row for row in produced if start <= row[3] < end]
 
 
 def kill_points(item: plans.Planned) -> list[kills.KillPoint]:
@@ -698,11 +739,16 @@ class Runner:
             visible = [(result.first_visible[seq] - at) * 1000 for seq, _part, _off, at in measured
                        if seq in result.first_visible]
             committed = commits.source_committed_ms(timeline, measured)
-            achieved = len(measured) / float(p.get("measure_seconds", 600))
-            out.update({"offered_rate": p["rate"], "achieved_rate": f"{achieved:.1f}",
-                        # A tool that lost records is not sustaining the offered rate, whatever it accepted: its
-                        # latency would be ranked over the surviving records only.
-                        "sustained": "true" if live_sustained(float(p["rate"]), achieved, result.gaps) else "false"})
+            seconds = float(p.get("measure_seconds", 600))
+            progress = live_progress(timeline, produced, float(p.get("warmup_seconds", 120)), seconds)
+            # achieved_rate is the SINK's rate: records a second the tool's group committed past in the window.
+            # The producer is open-loop, so its own count is the offer, not what the tool achieved.
+            out.update({"offered_rate": p["rate"], "achieved_rate": f"{progress.committed_rate:.1f}",
+                        # A tool that fell behind in the window is not sustaining the offered rate, even if it
+                        # drained after (quiescence), and neither is one that lost records: its latency would be
+                        # ranked over the survivors only.
+                        "sustained": "true" if live_sustained(float(p["rate"]), progress, seconds, result.gaps)
+                        else "false"})
             if visible:
                 out.update({"visible_p50_ms": f"{stats.percentile(visible, 50):.0f}",
                             "visible_p99_ms": f"{stats.percentile(visible, 99):.0f}"})

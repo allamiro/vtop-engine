@@ -308,9 +308,57 @@ def test_live_offered_rate_is_a_fraction_of_the_slowest_tools_drain_rate_and_an_
     with pytest.raises(runner.CellRefused, match="no drain result for this record size"):
         run.live_rate(str(tmp_path), item._replace(variant={"record_size": 100}), 0.5)
     # a tool that cannot sustain the offer is not sustained, and a tool that lost records did not either
-    assert run.live_sustained(15000.0, 15000.0, 0)
-    assert not run.live_sustained(15000.0, 9000.0, 0)
-    assert not run.live_sustained(15000.0, 15000.0, 4)
+    kept_up = run.LiveProgress(15000.0, 0, 0)
+    assert run.live_sustained(15000.0, kept_up, 600.0, 0)
+    assert not run.live_sustained(15000.0, run.LiveProgress(9000.0, 0, 3_600_000), 600.0, 0)
+    assert not run.live_sustained(15000.0, kept_up, 600.0, 4)
+
+
+def _live_run(committed_total, *, rate=100.0, seconds=70, warmup=10.0, measure=60.0, partitions=3, until=None):
+    """A producer at `rate` a second for `seconds`, and a group committing `committed_total(s)` records in all
+    by second `s` (spread over the partitions, one commit a second, up to second `until`)."""
+    produced = [(i, i % partitions, i // partitions, 1000.0 + i / rate) for i in range(int(rate * seconds))]
+    stream = []
+    for second in range(1, (until or seconds) + 1):
+        total = int(committed_total(second))
+        for part in range(partitions):
+            stream.append(commits.Commit("g", "bench", part, len(range(part, total, partitions)), 1000.0 + second))
+    timeline = commits.Timeline(stream, "g")
+    return run.live_progress(timeline, produced, warmup, measure)
+
+
+def test_a_tool_archiving_half_the_offer_is_not_sustained_even_if_it_drains_after_the_window():
+    # 100 records/s offered; the tool archives 50/s through the window (seconds 10-70) and then catches up
+    # completely: the producer's own count says 100/s, the sink's progress says 50/s.
+    half = _live_run(lambda s: 50 * s if s <= 70 else 100 * 70, until=200)
+    assert half.committed_rate == pytest.approx(50.0, abs=1.0)
+    assert half.lag_end - half.lag_start >= 2900  # the backlog grew by 50/s for 60 s
+    assert not run.live_sustained(100.0, half, 60.0, 0)
+
+
+def test_a_tool_that_keeps_up_through_the_window_is_sustained():
+    keeping = _live_run(lambda s: 100 * s)
+    assert keeping.committed_rate == pytest.approx(100.0, abs=1.0)
+    assert keeping.lag_end - keeping.lag_start <= 3
+    assert run.live_sustained(100.0, keeping, 60.0, 0)
+    # a commit lag that is steady is not a growing backlog: the tool commits 2 s behind the producer
+    behind = _live_run(lambda s: 100 * max(s - 2, 0))
+    assert run.live_sustained(100.0, behind, 60.0, 0)
+    # keeping up, but a record was lost: still not sustained
+    assert not run.live_sustained(100.0, keeping, 60.0, 1)
+
+
+def test_a_tool_that_lags_in_the_window_and_catches_up_after_it_is_not_sustained():
+    # 80/s through the warm-up and window, then a burst that clears the backlog just after the window ends
+    lagging = _live_run(lambda s: 80 * s if s < 75 else 100 * 70, seconds=75, until=120)
+    assert lagging.committed_rate < 95.0
+    assert not run.live_sustained(100.0, lagging, 60.0, 0)
+
+
+def test_a_tool_that_committed_nothing_in_the_window_has_no_rate_and_is_not_sustained():
+    stalled = _live_run(lambda s: 0, until=5)
+    assert stalled.committed_rate == 0.0
+    assert not run.live_sustained(100.0, stalled, 60.0, 0)
 
 
 def test_a_failed_drain_row_does_not_set_the_live_rate(tmp_path):
