@@ -20,6 +20,70 @@ promises, and the rules for changing one, are in the
 [compatibility policy](../reference/compatibility.md); which releases get
 fixes is in [Versioning and support](../SUPPORT.md).
 
+## Upgrading from v0.10.4 to v0.11.0
+
+v0.11.0 keeps sealed batches in flight across the archive engine's cycles,
+turns the Helm chart's admin authorization on by default, refuses a node TLS
+private key other users can read, caps the connections each cluster listener
+holds, wires group commit into the data node (off by default), and adds
+metadata feature level 9. The full notes are in
+[v0.11.0](../ROADMAP.md#v0110--batches-in-flight-across-cycles-a-cluster-plane-that-is-secure-by-default-and-group-commit-wired-into-the-data-node)
+in the roadmap.
+
+1. **Helm: name your operators first.** `meta.adminAuthorization.enabled` now
+   defaults to `true`, and a render with no
+   `meta.adminAuthorization.operatorCommonNames` stops with a message naming
+   the three ways out; nothing is changed in the cluster. Find the Common Name
+   of each certificate your `vtopctl` uses against the admin plane
+   (`openssl x509 -noout -subject -in operator.pem`) and set
+   `--set 'meta.adminAuthorization.operatorCommonNames={vtop-admin}'`. A lab
+   can set `enabled: false`; a plaintext admin plane needs that opt-out.
+2. **Make every `vtop-node` TLS private key owner-only** (`chmod 0400`, or a
+   `0700` directory the node's user owns) before its node restarts onto this
+   release. A node refuses a key other users can read, with no override
+   ([Secrets](secrets.md#upgrading-to-the-release-with-this-check)).
+3. **Before restarting a data node, check `vtop_broker_epoch_history_broken`.**
+   A replica that broke under v0.10.4 has no mark on disk, so a restart forgets
+   its break; repair it with `vtopctl node repair` instead of restarting it.
+4. **Replace the binaries or the image** on every archive engine, metadata
+   voter and data node, in any order. Below feature level 9 no wire frame,
+   schema marker or on-disk format differs from v0.10.4's.
+5. **Then raise the feature level to 9**, only if you want a cluster command's
+   actor in the replicated log and a data node's lease release to be immediate
+   under the admin policy: `vtopctl meta node-versions --level 9`, then
+   `vtopctl meta enable-features --level 9`. The raise is permanent, and a
+   v0.10.4 voter (which supports up to level 8) cannot read what level 9
+   writes. Below level 9 a data node's release is refused by the policy and
+   the lease lapses on its deadline (15 s by default), so a planned handover
+   waits that long.
+6. **Then use the new settings**, once every engine and node runs this
+   release: the Kafka source's `ssl_certificate_location`, `ssl_key_location`
+   and `ssl_key_password_env` (an older engine ignores them and connects without
+   a client certificate), and the node keys `group_commit:`,
+   `max_peer_connections`, `max_admin_connections`, `max_replica_connections`
+   and `kafka.brokers` (an older node refuses to start with any of them).
+
+- **Archive engine.** It reads while batches upload, so it can hold up to
+  `batching.max_concurrent_batches` times `batching.max_bytes` of sealed
+  batches, and uses more CPU for the same work in less time.
+  `vtop_sealed_batches_in_flight` is new. On a long link to the object store
+  set `net.ipv4.tcp_slow_start_after_idle=0` on the engine's host
+  ([A long link to the object store](../deploy/single-node.md#a-long-link-to-the-object-store)).
+- **`vtopctl tier copy` under `upload.object_lock`** now writes the copy under
+  the lock and checks its retention; before, it refused the config. A
+  `compliance` copy cannot be removed by anyone before its date.
+- **Reports and images.** Every `vtopctl --json` report that is an object gains
+  `"report_version": 1`. The container image's `vtopctl` opens a PostgreSQL
+  state store; the release archives do not.
+- **Connection caps.** The metadata peer, metadata admin and replica listeners
+  hold at most 256, 1024 and 256 connections and close one over the cap at
+  accept; `vtop_listener_connections_refused_total{plane,reason}` counts them.
+- Downgrade is not supported, except for what the
+  [compatibility matrix](../reference/compatibility.md#downgrade) records. A
+  metadata directory raised to level 9 cannot be opened by v0.10.4.
+- **Helm chart 0.7.0** (`appVersion` 0.11.0). A values-contract change: see
+  step 1.
+
 ## Upgrading from v0.10.3 to v0.10.4
 
 v0.10.4 fixes a lost range in the archive engine that v0.7.0 through v0.10.3

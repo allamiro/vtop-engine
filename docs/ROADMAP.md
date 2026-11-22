@@ -9,50 +9,6 @@ what each release does **not** yet do.
 
 ---
 
-## Next release — a broken epoch history survives a restart
-
-- **A broken epoch history survives a restart (#881 follow-up).** When a write
-  to a data node replica's fencing-epoch journal fails (a full disk, above
-  all), the replica's history is marked broken: it answers every fence with
-  no history and gets no replication session (v0.10.4 made that loud, with an
-  ERROR line, `vtop_broker_epoch_history_broken` and `VtopEpochHistoryBroken`).
-  The mark is now also written to disk, as `fencing-epochs.broken` beside the
-  journal, so a restart keeps refusing; before, a restart cleared it and
-  offered the surviving history as if it were whole. `vtopctl node repair`
-  clears it. A mark a full disk refuses is retried on every fence and append
-  until it lands. [Design note](EPOCH_HISTORY_AFTER_A_FAILED_WRITE.md).
-  **Upgrade note: a behaviour change.** A replica whose history broke stays
-  out of its range across restarts until it is repaired, where a restart
-  used to bring it back. A directory that never broke is unaffected. Before
-  restarting each data node onto this release, check
-  `vtop_broker_epoch_history_broken`: a replica that broke under v0.10.4 has
-  no mark on disk, so a restart onto any release forgets its break, as
-  v0.10.4's own restart would. Repair such a replica rather than restarting
-  it. An older binary
-  ignores the file, so downgrading drops the protection, not the data.
-
-## Next minor release, v0.11.0 — group commit is wired into the data node
-
-- **[#752](https://github.com/allamiro/vtop-engine/issues/752)** — group
-  commit is wired into the data node, **off by default**. A leader,
-  candidate or standalone node's `group_commit:` section
-  (`enabled`, `max_delay_ms`, `max_records`, `max_bytes`,
-  `max_pending_requests`) makes concurrent produce requests on a range share
-  one fsync and one replication round; each is still acknowledged only after
-  the group's local fsync, the quorum ack and the commit advance. The window
-  defaults to 0 (natural batching), so a lone request pays nothing. A node
-  logs its settings at INFO when it is on, refuses invalid settings at
-  startup (a window of a second or more, a zero bound, a group the replica
-  plane could not frame in one append, and the section enabled on a follower;
-  a follower accepts a disabled section and logs that it ignores it), and
-  exports `vtop_broker_group_commit_overloaded_total` and
-  `vtop_broker_group_commit_split_groups_total` beside the existing
-  `vtop_broker_group_commit_*` series. Live-chaos scenario 25 kills the leader
-  under four idempotent `acks=all` producers. Nothing changes for a config
-  without the section. The default turns on only after the single- and
-  two-producer A/B shows no regression; until then the gain for the Kafka
-  comparison is unmeasured.
-
 ## v0.1.0 — a range that fails over
 
 Metadata leases, a lease agent on the data node, verified promotion, and the
@@ -1445,47 +1401,125 @@ A patch release: no schema, wire format, feature level, config key or one-way st
   - The threat map's open gaps, listed in [its gaps table](SECURITY_MODEL.md#179-gaps): among them, the Kafka gateway has no TLS, SASL or ACLs, and the metadata, replica and admin servers have no connection cap.
   - #726: the 72 hour soak has not run; its harness is in. #881: the cluster-plane soak is not in. #714: the bar for calling VTOP production-ready. VTOP remains a prototype.
 
-## v0.11.0 and beyond
+## v0.11.0 — batches in flight across cycles, a cluster plane that is secure by default, and group commit wired into the data node
 
-The theme is **the gateway at the speed its durability allows, and the road
-to 1.0**: turn group commit on by default for the data node's quorum write
-(#752; it is wired and off until the A/B gates hold) and let a
-Kafka client follow a failover through a candidate node (#751); finish the
-format inventory and the tested upgrade and downgrade matrix (#743); and work
-the criteria in #714 that must be met before VTOP is called anything but a
-prototype (crash and soak testing, real S3 targets, security hardening, a
-restore drill, a pilot). Failover and crash-durability measurements against
-Apache Kafka stay open (#597, #599), as does the head-to-head throughput run
-(#596).
+v0.10.4 was a patch; this release carries the features held back since v0.10.0 and the cluster-plane and supply-chain work of the production-readiness bar. VTOP is still a prototype: the bar for calling it more is #714.
 
-**Upgrade note for v0.11.0: the Helm chart turns admin authorization on by
-default (#732, M2).** `meta.adminAuthorization.enabled` now defaults to
-`true`. An existing install that never set it now renders only when
-`meta.adminAuthorization.operatorCommonNames` names the Common Names of your
-operator certificates. Otherwise `helm upgrade` stops at render with a message
-naming the three ways out, and nothing is changed in the cluster. Before
-upgrading:
+- **Archive engine.**
+  - Sealed batches stay in flight across cycles: each window is carried to `VERIFIED` by a task of its own while the engine reads on, and commits still come from the front of the seal order only. On a 200 ms link to the object store a Kafka backlog drained about 4 times faster end to end (8.4 to 33.5 MiB/s, one partition, 16 MiB batches) at 0.4 cores instead of 0.08 (#892, #895).
+  - An object's check is sent as soon as `OBJECT_UPLOADED` is recorded and runs beside the manifest upload, one round trip fewer per batch (#892).
+  - A full read pass is no longer followed by an idle sleep or a re-assign of every Kafka partition (#896).
+  - A syslog spool batch's marker records the earliest and latest time its lines start with (#865).
+  - `vtopctl tier copy` writes cold-tier copies under `upload.object_lock` and checks their retention before it records the copy (#868).
+- **Kafka.**
+  - Mutual TLS from the Kafka source to the broker: `ssl_certificate_location`, `ssl_key_location`, `ssl_key_password_env` (#873).
+  - A Kafka source on a link that is not loopback and not TLS is warned about on every start and by `vtopctl validate` (#863).
+  - The gateway outlives its leadership: a bridge slot that is empty while a node follows, holder-aware Metadata with a real leader epoch, a FindCoordinator that names the holder, and a quiesce before a demotion drops the broker (#831).
+  - A candidate node serves the gateway, and a client that bootstrapped from any member follows a failover with no restart and no config change (#860).
+  - The gateway decompresses gzip and zstd produce batches and stores their records as ordinary native records (#762).
+- **Cluster plane.**
+  - Group commit is wired into the data node, **off by default**: a `group_commit:` section makes concurrent produce requests on a range share one fsync and one replication round (#832).
+  - The Helm chart turns admin authorization on by default and refuses to render without an operator named (#864).
+  - A binary refuses a metadata directory raised above the feature level it supports (#852).
+  - At feature level 9 the actor of an audited cluster command is committed in the replicated log (#850), and a data node releases its own range lease under its own identity (#870).
+  - Applied audit records survive a crash, a refusing sink and a snapshot install (#767).
+  - A broken epoch history stays broken across a restart (#903).
+  - A restarted leader catches up followers behind its own log, on a plaintext plane and on a v1 range (#923).
+  - Each metadata peer, metadata admin and replica listener holds at most a configured number of connections (#862).
+  - A node refuses a TLS private key other users can read (#863).
+- **Operating it.**
+  - Every `--json` report that is an object carries `report_version` (#847).
+  - A SQLite one-way step is taken only by `vtopctl migrate` (#866).
+  - The container image's `vtopctl` opens a PostgreSQL state store (#867).
+  - `url` 2.5.9 for RUSTSEC-2026-0592 (#915).
+  - New metrics: `vtop_sealed_batches_in_flight`, `vtop_listener_connections_refused_total{plane,reason}`, `vtop_broker_group_commit_overloaded_total`, `vtop_broker_group_commit_split_groups_total`, `vtop_kafka_gateway_serving`, `vtop_audit_replayed_total{reason}`, `vtop_audit_gaps_total{reason}` and `vtop_audit_delivery_lag_entries`.
+- **Bugs fixed on the way.**
+  - A range written in segment format v2 with `retention` configured panicked on every produce once it had a sealed segment: the range's worker threads panicked and nothing was acknowledged. Retention now sizes a segment the same way for both formats (#881).
+  - A restarted leader whose followers were behind its own log kept `vtop_broker_follower_connected` at 0 and refused every produce with "quorum not reached", in about half of the crashes of a whole replica set that the harness made. No acknowledged record was lost on disk (#923).
+  - A data node's lease release at shutdown was refused under an enforcing admin authorization, so every planned handover waited out the lease (#870).
+  - An object-lock check that SeaweedFS answers with two codes other than `NoSuchObjectLockConfiguration` could not confirm an absent lock, so the replay fallback would have refused (#837).
+- **Release pipeline, tests, CI and docs.**
+  - The 1.0 release gate, a dated status table for every criterion of #714 (#905); the README's generated cards and one data source for the landing page (#795).
+  - Each Linux release archive runs the Kafka path against a live broker before anything is published, and a dry run can build the commit to be tagged (#901, #917). The build time a release records is pinned to the tagged commit's, so `vtopctl` rebuilds bit for bit (#902).
+  - The live S3 tests run against RustFS, Garage, SeaweedFS, Versity and CloudServer beside MinIO, each judged against a capability file, with a generated compatibility table (#764, #837, #841).
+  - Compatibility: the state ledger, its digests and the audit trail against released binaries, both ways (#833); the data-node directory against published `vtop-node` binaries in both segment formats (#835); native frames are byte-locked, a released client meets this build's node, and the Kafka gateway's ranges only widen (#840); a snapshot gate on the `vtopctl` and `vtop-node` command trees and on metric names and labels (#839).
+  - A 7-day cluster-plane soak harness with a fault every hour and its evaluator (#881), with a disk-full fault (#921); lease and leadership histories recorded for scenarios 14 and 23 (#904); live-chaos scenarios 25 (group commit under a leader kill), and 26 and 27 (a Kafka client follows a failover) (#832, #920); the engine crash sweep loses the engine's host and a standby recovers (#875).
+  - The recovery path's mutation score is gated per file, nightly (#900); the verify path and the file-continuity code join it (#922, #919).
+  - Benchmark harnesses for the cross-product comparisons: Vector and Kafka Connect S3 (#906, #925), aws-cli, rclone and s5cmd on a lossy link (#907), and Vector and Fluent Bit on a spool (#908). The measured runs are not in.
 
-- Find the CN of each certificate your `vtopctl` uses against the admin plane
-  (`openssl x509 -noout -subject -in operator.pem`), and add it:
-  `--set 'meta.adminAuthorization.operatorCommonNames={vtop-admin}'`.
-- Once the policy is on, other certificates the CA signed, data nodes' included,
-  can no longer run `meta init`, change membership or grant leases. A data
-  node keeps its own lease, version report and group cursors. From metadata
-  feature level 9 a data node's lease *release* at shutdown names its
-  holder, and the policy admits it from the node's own certificate (#850,
-  #870). Raise to level 9 after upgrading (every metadata voter and data node
-  first, then `vtopctl meta enable-features --level 9`), and releases are
-  immediate. Below level 9 a release names no holder, so the policy refuses
-  it as an operator's command and the lease lapses on its deadline (15 s by
-  default): a planned handover waits that long.
-- A cluster administered out of band can set `allowNoOperators: true` (nobody
-  may run cluster-scoped commands). A lab can opt out with `enabled: false`;
-  the install notes then print a WARNING. A plaintext admin plane
-  (`transport.admin: plaintext`) needs the opt-out.
-- Turning the policy on changes no on-disk or wire format and is not a
-  one-way step: setting `enabled: false` again removes it on the next
-  rollout.
+**Upgrading from v0.10.4.** Downgrade is not supported.
+
+- **Order.**
+  1. **Helm: name your operators before `helm upgrade` (#864).** See "Helm admin authorization is on by default" under the behaviour changes below; nothing is changed in the cluster if the render is refused.
+  2. **Every `vtop-node` TLS private key must be owner-only before its node restarts onto this release (#863).** There is no override.
+  3. **Upgrade every archive engine, metadata voter and data node.** Replace the binaries or the image in any order; below feature level 9 no wire frame, schema marker or on-disk format differs from v0.10.4's.
+  4. **Then raise the cluster feature level to 9**, only if you want the actor of a cluster command in the replicated log and a data node's immediate lease release under the admin policy (#850, #870): `vtopctl meta node-versions --level 9`, then `vtopctl meta enable-features --level 9`. The raise is refused, naming each node, until every metadata member and every counted data node reports it can run level 9.
+  5. **Then turn on the new settings below**, once every engine and data node runs this release.
+- **One-way changes.** Installing the binary takes none of them. Only an operator action does:
+  - **Raising the feature level to 9 (#850, #870)** is permanent; there is no lowering. Level 9 adds two metadata command kinds (40, `Attributed`, and 41, `ReleaseRangeLeaseAsHolder`), a key category (23) and a record value tag (26), none of which is written below it. A v0.10.4 metadata voter supports levels up to 8: it reads kind 40 or 41 as a newer format ("written by a newer release ... downgrade is not supported"), not as corruption, and cannot append past one, so raising the level while one remains stalls that voter exactly as every earlier level does. Raise only once every voter and data node runs this release.
+  - **`vtopctl tier copy` under `upload.object_lock` (#868).** Before, it refused an upload config that set `upload.object_lock`. It now writes the copy under the lock, so an object written with `mode: compliance` cannot be removed by anyone, the account root included, before its date. It refuses, with "nothing was copied", a bucket that does not have Object Lock enabled, a store that cannot write under the lock and a bucket whose configuration cannot be read; a copy whose stored retention is less than asked is refused and the objects already written stay.
+  - **No schema marker bump and no refusal to start in an older binary** comes from this release's ledger changes: PostgreSQL stays at marker 3 and SQLite at `user_version` 1. `vtopctl migrate` for SQLite now takes any one-way step the build lists, and this release lists none (#866); the next change that needs one will be taken by `vtopctl migrate` only, and an ordinary open will refuse the file naming that command.
+  - **No config key or default takes a one-way step.** `scripts/config-keys-since.py v0.10.4` lists the engine keys below.
+- **Older engines silently ignore these config keys; older nodes refuse them.**
+  - `sources.kafka.ssl_certificate_location`, `ssl_key_location`, `ssl_key_password_env` (#873): an older engine ignores them and connects without a client certificate, so a broker that requires one refuses the connection, and one that does not sees an unauthenticated client. Upgrade every engine before relying on them. The pair must be set together, only with `security_protocol` `SSL` or `SASL_SSL`.
+  - `max_peer_connections`, `max_admin_connections` (metadata node) and `max_replica_connections` (data node) (#862), the `group_commit:` section (#832), and `kafka.brokers` on a candidate (#860): the node configs reject unknown keys, so a v0.10.4 node **refuses to start** with any of them. Add them only after the node runs this release.
+  - New in the chart: `meta.adminAuthorization.allowNoOperators` (#864) and the `data.kafka` values (#920).
+  - The audit trail and OpenTelemetry settings are unchanged.
+- **Behaviour changes to check before upgrading.**
+  - **Helm admin authorization is on by default (#864).** `meta.adminAuthorization.enabled` now defaults to `true`. An existing install that never set it renders only when `meta.adminAuthorization.operatorCommonNames` names the Common Names of your operator certificates; otherwise `helm upgrade` stops at render with a message naming the three ways out, and nothing is changed in the cluster. Find the CN of each certificate your `vtopctl` uses against the admin plane (`openssl x509 -noout -subject -in operator.pem`) and set `--set 'meta.adminAuthorization.operatorCommonNames={vtop-admin}'`. Once the policy is on, other certificates the CA signed, data nodes' included, can no longer run `meta init`, change membership or grant leases; a data node keeps its own lease, version report and group cursors. A cluster administered out of band can set `allowNoOperators: true` (nobody may run cluster-scoped commands); a lab can opt out with `enabled: false`, and the install notes then print a WARNING. A plaintext admin plane (`transport.admin: plaintext`) needs the opt-out. Turning the policy on changes no on-disk or wire format and is not a one-way step: `enabled: false` removes it on the next rollout.
+  - **A data node's lease release under the policy (#850, #870).** `ReleaseRangeLease` names no holder, so an enforcing policy refuses it as an operator's command and the lease lapses on its deadline (15 s by default): a planned handover waits that long. From feature level 9 the release names its holder and the policy admits it from that node's own certificate, so releases are immediate. Raise to level 9 after upgrading every voter and data node.
+  - **A node refuses a TLS private key other users can read (#863).** `tls.key`, `replica_tls.key`, `native_tls.key`, `lease.tls.key`, `observability.tls.key` and a scenario client's `tls.key` are checked before they are read. A key group or other can write is refused outright; one they can read is refused unless its directory is closed (`0700`, owned by the node's user) or it is a read-only Kubernetes Secret mount (the chart mounts keys at `0440` with `fsGroup`, which is accepted). The message names the file, its mode and the `chmod` to run. A key made with `openssl` under the usual umask is `0644`. The engine already applies the same rule to its own secret files (#733; [Secrets](operate/secrets.md#upgrading-to-the-release-with-this-check)).
+  - **Connection caps (#862).** The metadata peer listener holds at most 256 connections, the admin listener 1024 and the replica listener 256, and a connection over the cap is closed at accept. A connection that sends no first request within 10 s of accept is closed. Both are counted in `vtop_listener_connections_refused_total{plane,reason}` and warned about at most once per 10 s per listener and reason. Raise a cap with its key if a healthy deployment reaches it.
+  - **Plaintext Kafka source link warning (#863).** A source with `security_protocol` unset, `plaintext` or `sasl_plaintext` and a bootstrap server that is not a loopback address is warned about on every start and by `vtopctl validate`. The engine connects anyway.
+  - **`report_version` on `--json` reports (#847).** Every `vtopctl --json` report that is an object gains `"report_version": 1`. The field is additive and a reader that ignores unknown fields needs no change. Output that is not an object (`discover`, `process-once`, `list-batches` and `segment verify` print arrays, `status` a map, `receipt` its stored records, `segment prove-chunk` a proof file) is not stamped.
+  - **A metadata directory above a binary's feature level is refused (#852).** From this release a binary refuses to open, to install a snapshot into, or to apply a raise in a directory recorded at a level above the one it supports, naming both levels, and changes nothing. v0.8.0 and v0.9.0 open a level-8 directory and take writes, so this protects only the direction from this release on ([Upgrades](operate/upgrades.md)).
+  - **Batches in flight across cycles (#892, #895).** Operators see these effects:
+    - The engine reads while batches upload, so it holds more bytes of sealed batches at once, up to `batching.max_concurrent_batches` times `batching.max_bytes` uncompressed (or `2 ×` the width in batches, for batches of empty records), and reads stop at that bound. CPU rises with throughput (the same work in less time).
+    - `vtop_sealed_batches_in_flight` is new and reports the queue.
+    - After a crash the ledger can hold several uncommitted rows of one unit, some `VERIFIED` and waiting; recovery already handled that (#552, #624, #639) and rewinds to the lowest start.
+    - `verify_ms` in the `batch_metrics` line counts the object check's whole duration once, though it now overlaps `manifest_upload_ms`.
+    - `process-once` and the shutdown flush still wait for every batch; dropping the engine aborts its batch tasks, and a restart recovers them as after a crash.
+    - On a long link, set `net.ipv4.tcp_slow_start_after_idle=0` on the engine's host; pipelined it is worth about 5 to 7%, not the 21 to 51% it was before ([A long link to the object store](deploy/single-node.md#a-long-link-to-the-object-store)).
+  - **A full read pass is read again at once (#896).** The run loop sleeps `idle_poll_interval_ms` only after two empty cycles in a row, and a Kafka record left over the budget no longer re-assigns every partition. An oversized record still does.
+  - **The Kafka gateway on a leased leader (#831).** Metadata carries the fencing epoch the node holds the range at instead of `0` (`-1` where the node has none), a leader whose lease is gone answers fetch and list-offsets `NOT_LEADER_OR_FOLLOWER` (it already refused Metadata and the group protocol), a request naming a leader epoch is held to it (`FENCED_LEADER_EPOCH`, `UNKNOWN_LEADER_EPOCH`), and `vtop_kafka_requests_refused_total` gains three series at zero.
+  - **A candidate serves the gateway (#860).** `kafka` is accepted on `role: candidate` and still refused on a static follower. A candidate must list every member in `kafka.brokers`, this node included, the same list on every member; a bad list is refused at startup, before a port is bound, with what to fix. A candidate takes neither `kafka.partitions` nor `kafka.topics`. While following, produce, fetch and list-offsets answer `NOT_LEADER_OR_FOLLOWER` and Metadata names the holder; consumer-group membership is in memory per gateway, so members rejoin after a failover, and committed offsets (on the metadata plane) survive. `vtop_kafka_gateway_serving` reports it.
+  - **gzip and zstd produce batches are accepted (#762).** They were refused with `UNSUPPORTED_COMPRESSION_TYPE`. The records are stored uncompressed, and Fetch serves uncompressed bytes where Kafka keeps the producer's compressed ones. The compressed batches of one Produce request may expand to 16 MiB in total; past that the partition is refused whole with `MESSAGE_TOO_LARGE`. A stream that does not decompress is `CORRUPT_MESSAGE`; snappy and lz4 stay `UNSUPPORTED_COMPRESSION_TYPE`. An old gateway still refuses what a new one accepts.
+  - **Group commit (#832) is off.** A config without the `group_commit:` section behaves as before. Turning it on is an operator's choice per node: leader, candidate or standalone only (a follower refuses an enabled section and accepts a disabled one). A node logs its settings at INFO when it is on, and refuses at startup a window of 1000 ms or more, a zero bound, a group the replica plane could not frame in one append, and the section enabled on a follower. The default turns on only after the single- and two-producer A/B shows no regression, so the gain for the Kafka comparison is unmeasured.
+  - **A broken epoch history survives a restart (#903).** When a write to a data node replica's fencing-epoch journal fails (a full disk, above all), the replica's history is marked broken: it answers every fence with no history and gets no replication session. The mark is now also written to disk as `fencing-epochs.broken` beside the journal, so a restart keeps refusing; before, a restart cleared it and offered the surviving history as if it were whole. `vtopctl node repair` clears it. **Before restarting each data node onto this release, check `vtop_broker_epoch_history_broken`:** a replica that broke under v0.10.4 has no mark on disk, so a restart onto any release forgets its break. Repair such a replica rather than restarting it. An older binary ignores the file, so downgrading drops the protection, not the data.
+  - **A restarted leader catches up its followers (#923).** The leader reads its own log from the follower's offset and sends it as replica appends, on a plaintext plane and on a v1 range. The wire is unchanged, so mixed versions work; a record no known producer accounts for is left where it was and the log names the offset. A follower whose log is longer than its leader's is not handled.
+  - **Applied audit records are delivered at least once (#767).** Each metadata replica keeps an audit frontier, `meta.audited` (a new file older releases ignore), saved only after its sinks accepted the records, so a crash or a refusing audit file re-delivers them, marked `replayed`, at the next apply, every 10 seconds and at restart. Entries a replica never applied one by one (a snapshot install, a log purged past a frontier that fell behind) get one `audit.gap` record naming the range. A data directory from before this release starts its trail at its applied index. An older `vtopctl audit list` prints an `audit.gap` record as stored, with a warning. The audit file is safe to share between processes now: each append takes an exclusive lock, and a writer from v0.10.1 or earlier takes none.
+  - **The actor of a cluster command in the log (#850), from level 9.** The serving leader wraps an audited command in a new command kind carrying the certificate identity it verified, the address the connection came from, its own node id and clock, so the actor and the command are one log entry. The last 1024 such entries are kept in the cluster state and travel in snapshots. A client cannot send an actor of its own: the admin endpoint refuses an already attributed command before authorization and audits the refusal. A data node's own lease release is machine traffic and is not wrapped. A certificate name over 128 bytes is refused before anything is proposed. Below level 9 nothing changes: the leader proposes the bare command, byte for byte as before, and says once per term that the actor is recorded at the admin endpoint only.
+  - **A SQLite one-way step is taken only by `vtopctl migrate` (#866).** `vtopctl migrate` now calls the same transaction an open runs, plus any pending one-way step, and logs a WARN per step taken. A new ledger is created at the newest version on open without a migrate. Nothing changes for an existing ledger today.
+  - **The container image's `vtopctl` opens a PostgreSQL state store (#867).** Images before this release give `postgres:// state store requires a build with --features postgres`. The release archives are still built with the default features.
+  - **Syslog spool markers carry times (#865).** `received_time_start` and `received_time_end` in the ledger and in a spool batch's manifest `source_progress` hold the earliest and latest time its lines start with, read from an RFC 3339 timestamp at the start of the line (after an optional `<PRI>`) or from an RFC 5424 header, in UTC. An RFC 3164 timestamp has no year or zone and is not read; a read whose lines name no instant gives `null`, as before.
+  - **A cluster-plane soak harness and chaos scenarios** are test and CI changes; no operator action.
+- **Not in this release.** Group commit on by default (#752, v0.12.0).
+- **Planned.** `0.4` becomes the default manifest writer at v0.12.0, announced in the v0.10.0 notes; `write_version: "0.3"` stays accepted through 1.x with a deprecation warning ([compatibility policy](reference/compatibility.md), #743). No deprecation notice starts in this release.
+- **Helm chart 0.7.0** (from 0.6.3; `appVersion` 0.11.0). A values-contract change, hence the minor bump: `meta.adminAuthorization.enabled` defaults to `true`, `operatorCommonNames` must name an operator unless `allowNoOperators` or the opt-out is set, `allowNoOperators` is new, and the `data.kafka` values are new (#864, #920). The CI values files name the smoke test's operator CN.
+- **Known open.**
+  - #751: a Kafka client follows a failover through a candidate (#860), and the live scenarios measure it (#920); the gateway's own Kafka-side authentication, TLS and ACLs (K2 of the threat map) are not built.
+  - #752: group commit is wired and off; its A/B gates have not run.
+  - #706: the applied records do not yet carry `requested_by`, bootstrap and membership requests have no request ids, and the tail cannot be read back with a command.
+  - #722: the S3 matrix runs in CI; the AWS S3 leg is the maintainer's to run. #721 is closed. #724 and #731 are closed with this release's pipeline changes: the attestations are verified from outside by `gh attestation verify`, and the archives built before the build-time pin (v0.10.4 and earlier) do not reproduce `vtopctl` bit for bit.
+  - #726: the 72 hour engine soak has not run; its harness and its disk-full fault are in. #727: the 7 day cluster-plane soak has not run; its harness is in. #728: the history checker covers four live-chaos scenarios (04, 09, 14, 23). #739: the engine host-loss leg is in the engine crash sweep and a single-replica deployment is documented; no pilot has run.
+  - #729: the mutation gates cover the commit path, the recovery path, the verify path and the file-continuity code; a nightly run must pass for each before the issue closes.
+  - #743: the tested downgrade matrix is not complete; the ledger and the data-node directory now have released-binary cells.
+  - #746, #747, #748: the comparison harnesses are in; the measured runs and reports are not.
+  - The threat map's open gaps, listed in [its gaps table](SECURITY_MODEL.md#179-gaps): among them, the Kafka gateway has no TLS, SASL or ACLs.
+  - #714: the bar for calling VTOP production-ready. VTOP remains a prototype.
+- **Downgrade** is supported only for what the [compatibility matrix](reference/compatibility.md#downgrade) records for the previous release: the state ledger, its prune digests and the audit trail. A metadata directory raised to level 9 cannot be opened by v0.10.4, and a replica whose epoch history this release marked broken is not protected by an older binary. Nothing else is promised.
+
+## v0.12.0 and beyond
+
+The theme is **the road to 1.0**: turn group commit on by default for the data
+node's quorum write (#752; it is wired and off until the A/B gates hold);
+finish the format inventory and the tested upgrade and downgrade matrix (#743),
+and make `0.4` the default manifest writer; and work the criteria in #714 that
+must be met before VTOP is called anything but a prototype (the 72 hour engine
+soak and the 7 day cluster-plane soak against a release candidate, real S3
+targets, the history checker's remaining scenarios, a pilot). Failover and
+crash-durability measurements against Apache Kafka stay open (#597, #599), as
+does the head-to-head throughput run (#596).
 
 ---
 

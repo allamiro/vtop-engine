@@ -113,7 +113,7 @@ opened 2026-11-15, #782). The criterion IDs (A1, B1 and so on) are those of
 
 - **Why:** `preview`: tested on one plaintext broker at a time across 3.7 to 4.4, not on a secured or multi-broker cluster; `production` at 1.0 for the tested configurations the page names.
 - **Tests and CI:** `crates/vtop-adapters/src/kafka_source.rs`; the live-broker suite `tests/integration_kafka_to_minio.rs` including the stale-commit and stall-recovery tests; `kafka matrix` nightly on every Apache Kafka line from 3.7 to 4.4, and on pull requests that change the Kafka path; `engine crash sweep` (Kafka is its source).
-- **Open criteria:** B2 (#721): SASL and TLS cases and a non-Apache broker are not tested; mutual TLS is not configurable; multi-broker clusters are not tested; Kafka fleet mode (several engines in one group) is not built. Two data-safety bugs (#614, #623).
+- **Open criteria:** B2 (#721): SASL and TLS cases and a non-Apache broker are not tested; mutual TLS to the broker is configured and tested on one `mtls` leg (#873); multi-broker clusters are not tested; Kafka fleet mode (several engines in one group) is not built. Two data-safety bugs (#614, #623).
 - **Docs:** `install/kafka.md` states exactly what is and is not tested.
 
 ### File source
@@ -127,7 +127,7 @@ opened 2026-11-15, #782). The criterion IDs (A1, B1 and so on) are those of
 
 - **Why:** `preview`: shares the file source's continuity code but has the thinnest evidence of the three sources.
 - **Tests and CI:** `crates/vtop-adapters/src/syslog_spool_source.rs`; the e2e smoke archives a seeded spool. No live test delivers through rsyslog or syslog-ng, and the crash sweep does not include it.
-- **Open criteria:** A2(a) for the spool (#725 follow-up); `received_time_*` is not extracted into the spool marker; shares #558 and #578 with the file source.
+- **Open criteria:** A2(a) for the spool (#725 follow-up); a line whose time is RFC 3164 (no year or zone) gives the marker no time; shares #558 and #578 with the file source.
 - **Docs:** `README.md` and `when-to-use.md` describe it as reading spool files a collector has written, and say data lost before the spool is out of reach.
 
 ### S3-compatible upload (`s3_native`)
@@ -160,9 +160,9 @@ opened 2026-11-15, #782). The criterion IDs (A1, B1 and so on) are those of
 
 ### PostgreSQL state store
 
-- **Why:** `preview`, `production` at 1.0: the best-matrixed backend (five majors nightly) but the release binaries and the container image are built without it.
+- **Why:** `preview`, `production` at 1.0: the best-matrixed backend (five majors nightly) and the container image has it from v0.11.0 (#867), but the release binaries are built without it.
 - **Tests and CI:** `crates/vtop-state/tests/pg_battery.rs`; `postgres_migrate_restore.rs`; the `postgres matrix` workflow on PostgreSQL 14 to 18 (14 and 18 on pull requests, all five nightly); an opt-in managed-service smoke job.
-- **Open criteria:** it needs `cargo build --features postgres` (container page: "no PostgreSQL"), so D6; managed services and `pg_upgrade` are outside the matrix; PostgreSQL 14 reached end of life on 2026-11-12 and is dropped at the next minor; E3 (#734); the crash sweep does not cover it (#725).
+- **Open criteria:** the release binaries need a source build with `--features postgres` for it (the image has it from v0.11.0), so D6 is half met; managed services and `pg_upgrade` are outside the matrix; PostgreSQL 14 reached end of life on 2026-11-12 and is dropped at the next minor; E3 (#734); the crash sweep does not cover it (#725).
 - **Docs:** `POSTGRES_DEPLOYMENT.md` is precise about versions; `when-to-use.md` offers PostgreSQL as an option without saying it is a source build.
 
 ### Manifests 0.1 to 0.3
@@ -190,7 +190,7 @@ opened 2026-11-15, #782). The criterion IDs (A1, B1 and so on) are those of
 
 - **Why:** `experimental`: proven against MinIO only, and a compliance-mode retention cannot be removed by anyone, so a wrong assumption about a provider is not recoverable.
 - **Tests and CI:** `crates/vtop-upload/tests/live_s3_object_lock.rs`, `multipart_object_lock.rs`, `object_lock_wire.rs`; `crates/vtop-cli/tests/live_s3_object_lock_engine.rs`, `object_lock.rs`.
-- **Open criteria:** B1 (#722) on AWS; cold-tier copies are not locked (`vtopctl tier copy` refuses the profile).
+- **Open criteria:** B1 (#722) on AWS; cold-tier copies are written under the lock and their retention is checked (#868).
 - **Docs:** `OBJECT_LOCK_DEPLOYMENT.md`; ROADMAP and `limitations.md` say MinIO only.
 
 ### Audit trail
@@ -225,7 +225,7 @@ opened 2026-11-15, #782). The criterion IDs (A1, B1 and so on) are those of
 
 - **Why:** `preview` at both stages: leases, fencing epochs and verified promotion are exercised, and promotion has had three data-safety bugs.
 - **Tests and CI:** `crates/vtop-node` unit and crash-sweep tests (`promotion_crash_sweep`); live-chaos scenarios 04, 09, 10, 12, 14, 23.
-- **Open criteria:** A3 (#727), A4 (#728); group commit is measured, not wired into the data node (#752); data-safety bugs #449, #611, #641.
+- **Open criteria:** A3 (#727), A4 (#728); group commit is wired into the data node and off by default until its A/B gates hold (#752); data-safety bugs #449, #611, #641.
 - **Docs:** `NATIVE_BROKER_ARCHITECTURE.md`, `NODE_OBSERVABILITY.md`.
 
 ### Replicated broker (`vtop-broker`)
