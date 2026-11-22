@@ -1,0 +1,28 @@
+name: s3-pins
+
+# Every S3 server image the compatibility matrix runs is pinned by digest
+# (#722, D7). A registry can delete a tag, or a whole repository: that is how
+# the lab lost its MinIO images (#507) and how the e2e smoke job went red with
+# the engine blamed for it. This job finds a vanished pin weekly, before a pull
+# request does.
+#
+# It fails unless every `image:` in docker/s3-servers/*/compose.yml carries
+# an `@sha256:` digest and `docker manifest inspect` resolves it.
+on:
+  schedule:
+    # Mondays 04:23 UTC: off the hour, as traffic.yml is.
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pins:
+    name: every S3 server image pin resolves
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Resolve every pinned image
+        run: scripts/s3-lab.sh pins
