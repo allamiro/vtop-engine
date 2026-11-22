@@ -3,6 +3,8 @@ vtop_audit_events_total counter action,outcome
 vtop_audit_write_failures_total counter sink
 vtop_batch_duration_seconds histogram format,source_type,tenant
 vtop_batches_total counter format,source_type,state,tenant
+vtop_bucket_versioning_paused gauge
+vtop_bucket_versioning_paused_batches_total counter format,source_type,tenant
 vtop_bytes_in_total counter format,source_type,tenant
 vtop_bytes_out_total counter format,source_type,tenant
 vtop_commits_total counter format,source_type,tenant
@@ -34,6 +36,7 @@ vtop_replay_rebuilds_total counter format,result,source_type,tenant
 vtop_replay_required_total counter format,source_type,tenant
 vtop_retention_lost_records_total counter source_type,tenant
 vtop_secret_file_permission_overrides_total counter
+vtop_server_side_encryption_mode gauge mode,tenant
 vtop_source_read_errors_total counter source_type,tenant
 vtop_source_replay_refused_total counter source_type,tenant
 vtop_stage_duration_seconds histogram format,source_type,stage,tenant

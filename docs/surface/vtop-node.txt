@@ -13,7 +13,9 @@ vtop-node produce --addr value=<ADDR> required
 vtop-node produce --batch value=<BATCH> default=128
 vtop-node produce --client-config value=<CLIENT_CONFIG> required
 vtop-node produce --durability value=<DURABILITY> default=quorum
+vtop-node produce --fenced-probe flag
 vtop-node produce --first-sequence value=<FIRST_SEQUENCE> default=0
+vtop-node produce --history value=<HISTORY>
 vtop-node produce --rate value=<RATE> default=0
 vtop-node produce --rate-anchor-unix-micros value=<RATE_ANCHOR_UNIX_MICROS>
 vtop-node produce --records value=<RECORDS> required
@@ -29,6 +31,7 @@ vtop-node verify
 vtop-node verify --addr value=<ADDR> required
 vtop-node verify --batch value=<BATCH> default=512
 vtop-node verify --client-config value=<CLIENT_CONFIG> required
+vtop-node verify --dump value=<DUMP>
 vtop-node verify --expect-at-least value=<EXPECT_AT_LEAST> default=0
 vtop-node verify --max-offset-gaps value=<MAX_OFFSET_GAPS> default=0
 vtop-node verify --value-bytes value=<VALUE_BYTES> default=128
