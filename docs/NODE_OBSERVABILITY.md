@@ -166,8 +166,10 @@ not keep publishing the follower lag it saw at the instant of the failover.
 | `vtop_broker_meta_fencing_epoch{topic,range}` | gauge | Latest metadata-committed epoch observed. |
 | `vtop_broker_lease_active{topic,range}` | gauge | 1 while *this* broker holds the live lease (metadata epoch equals its granted epoch), 0 once fenced or stolen. |
 | `vtop_broker_follower_durable_offset{follower}` | gauge | Per-follower acknowledged offset (leader only). |
+| `vtop_broker_follower_below_catch_up_horizon{follower}` | gauge | 1 while the follower is durable only below the leader's log start, so the leader cannot catch it up from its log and it needs a rebuild (leader only, #881). |
 | `vtop_broker_follower_lag_records{follower}` | gauge | Records each follower trails the leader by. |
 | `vtop_broker_follower_connected{follower}` | gauge | 1 while a live replication stream exists. |
+| `vtop_broker_epoch_history_broken{topic,range}` | gauge | 1 once a write to this replica's epoch journal failed (a full disk, say): it then answers every fence with no history and gets no replication session until `vtopctl node repair`. Exported by leaders, followers and candidates; the `VtopEpochHistoryBroken` alert pages on it (#881). |
 | `vtop_broker_follower_online{topic,range}` | gauge | Follower's own view of whether it accepts appends. |
 | `vtop_broker_retention_retained_bytes{topic,range}` | gauge | Content bytes the range holds after the latest retention pass (#561). Absent while retention is disabled or before the first pass. Every role exports it under the same name. |
 | `vtop_broker_retention_bound_bytes{topic,range}` | gauge | The range's retention bound. |

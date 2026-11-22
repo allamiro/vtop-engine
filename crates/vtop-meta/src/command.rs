@@ -3141,7 +3141,7 @@ fn decode_uuid_list(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn envelope(request: u128) -> CommandEnvelope {
@@ -3237,7 +3237,7 @@ mod tests {
         assert!(!within(i64::MIN, 15_000));
     }
 
-    fn every_command() -> Vec<MetadataCommand> {
+    pub(crate) fn every_command() -> Vec<MetadataCommand> {
         vec![
             MetadataCommand::RegisterNode {
                 env: envelope(1),
@@ -3685,7 +3685,7 @@ mod tests {
         ]
     }
 
-    fn every_response() -> Vec<MetadataResponse> {
+    pub(crate) fn every_response() -> Vec<MetadataResponse> {
         vec![
             MetadataResponse::Ack { generation: 3 },
             MetadataResponse::TopicCreated {

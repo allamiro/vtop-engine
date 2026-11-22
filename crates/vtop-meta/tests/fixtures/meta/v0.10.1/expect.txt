@@ -1,0 +1,8 @@
+cluster_id 11111111-2222-3333-4444-555555555555
+voters 1
+feature_level 8
+node_uuid cccccccc-0000-0000-0000-000000000001
+node_generation 5100
+node_addr 10.0.0.1:9200
+topic compat.v1
+last_applied_index 5107
