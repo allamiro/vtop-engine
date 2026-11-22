@@ -495,14 +495,19 @@ def check_commit_rule(samples: list[dict]) -> Criterion:
     )
 
 
+# The fewest samples with the engine's counters a disk-full window must hold
+# for its commit-rule check to count: one breach is two such samples in a row.
+ENOSPC_MIN_COUNTER_SAMPLES = 2
+
+
 def check_enospc(profile: dict, samples: list[dict], events: list[dict]) -> Criterion | None:
     """The disk-full fault, judged on what it did to the engine. The injector
     proves its own side (a write failed with ENOSPC, then worked again) and
     records it in a `fault_probe` event; this reads that record back, and
     reads the engine's side from the run's own evidence: its log showed the
     condition, nothing was committed beyond what was verified while the disk
-    was full or until the engine had recovered, and the
-    audit after the fault found no hole. None when the plan has no such
+    was full or until the engine had recovered (judged only on a window whose
+    samples carried the counters), and the audit after the fault found no hole. None when the plan has no such
     fault, so a profile without one is not asked for it."""
     plan = [f for f in soak_profile.build_plan(profile) if f.kind == "enospc"]
     if not plan:
@@ -529,7 +534,16 @@ def check_enospc(profile: dict, samples: list[dict], events: list[dict]) -> Crit
         if not probe.get("writes_resumed"):
             found.append("writes did not resume once space was freed")
         window = [s for s in samples if start["elapsed_s"] <= s["elapsed_s"] <= rec["elapsed_s"]]
-        breaches, _, _ = _commit_rule_breaches(window)  # verification failures are the commit_rule's alone
+        # Verification failures are the commit_rule's alone. A breach needs two
+        # samples in a row, so a window with fewer than two that carried the
+        # counters (a failed scrape all through the fault) shows nothing, and
+        # silence is no evidence the engine committed only what it verified.
+        breaches, _, counted = _commit_rule_breaches(window)
+        if counted < ENOSPC_MIN_COUNTER_SAMPLES:
+            found.append(
+                f"{counted} sample(s) in the fault window carried the engine's counters, "
+                f"{ENOSPC_MIN_COUNTER_SAMPLES} needed to judge the commit rule"
+            )
         if breaches:
             found.append(breaches[0])
         audit = audits.get(f"fault:{fault.id}")

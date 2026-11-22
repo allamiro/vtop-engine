@@ -68,7 +68,7 @@ A format is frozen at 1.0 when all six of these hold. The format registry
 | A new optional field in an unhashed JSON document (an audit record, a multipart session file, the effective-settings JSON) | Yes | Readers ignore unknown fields, and a new value of a closed set reads as unknown. |
 | A new field in a **hashed** JSON document (a manifest) | Only under the `0.4` canonical scheme | Manifests `0.1` to `0.3` hash the decoded document, so a reader drops an unknown field and reports the document as tampered. Such a field stays ledger-only until every supported reader uses the `0.4` scheme. |
 | A new nullable ledger column | Yes | Named in the column list, never written by N-1, never dropped, no schema-version or marker bump. |
-| A new ledger state or source type, or any change N-1 would misread | No; it needs a version bump | A one-way step: announced, operator-gated, with its refusal test. For SQLite that gate does not exist yet: the ledger migrates on every open, so a bump must first be made something only `vtopctl migrate` takes. |
+| A new ledger state or source type, or any change N-1 would misread | No; it needs a version bump | A one-way step: announced, operator-gated, with its refusal test. For PostgreSQL the gate is the schema marker `vtopctl migrate` writes. For SQLite it is a step in the ledger's list of one-way steps, which only `vtopctl migrate` takes on an existing ledger: an ordinary open refuses a ledger below it, names the command and changes nothing (a new ledger is created at the newest version). |
 | A new metadata command kind, snapshot category or value tag, or a changed apply behaviour | Yes, behind a feature level | The level gates it, voters are upgraded first, and an older reader classifies the new tag as *newer*. |
 | A new native protocol message kind | From 1.0, only with a `PROTOCOL_MINOR` bump and a sender that checks the peer's minor | Before 1.0, kinds are added under minor 0 and an N-1 peer rejects one as unknown, so a new kind is used only once every node runs N. |
 | A new config key | Yes | A safe default, so an older engine that ignores the key is harmless; otherwise the release notes say so. A key inside a section that refuses unknown keys (for example the cluster role configs, `manifest.mac`, `upload.object_lock`) makes an older node refuse the file: the notes say that too. |
@@ -187,11 +187,11 @@ to a pair once the matrix records a downgrade result for it.
   exits non-zero with a message that says the state is newer, and changes
   nothing.* It never misreads, never panics and never rewrites.
 - **A one-way step is always gated by an operator action:** raising a
-  feature level, running `vtopctl migrate` for a PostgreSQL marker bump,
+  feature level, running `vtopctl migrate` for a PostgreSQL marker bump
+  or a SQLite schema-version step,
   setting a write version. No binary takes one on its own on first open. A
   future exception needs a written sign-off in that release's notes. Each
-  one-way step is justified in its pull request and has a refusal test. (The
-  SQLite ledger has no such gate yet; see the change rules.)
+  one-way step is justified in its pull request and has a refusal test.
 - **After a feature level is raised,** the metadata tier can go back only by
   restoring a backup taken before the raise. The ledger's restore is
   documented and drilled
@@ -339,7 +339,7 @@ table differs from what the registry generates. Edit the registry and run
 | 15 | Metadata log chunk and entry frames | `VTOPMLG1`, `VTOPMLE1` | B | evolving | follows #740 |
 | 16 | Metadata command set | command kinds, feature levels 3 to 8 | B | evolving, level-gated | follows #740 |
 | 17 | Metadata snapshot and state encoding | `VTOPMSN1` v1 and v2, payload version `1` | B | evolving, level-gated | follows #740 |
-| 18 | Metadata hard state, applied, purged, membership log id | `VTOPMHS1`, `VTOPMAP1`, `VTOPMPG1`, `VTOPMML1` | B | evolving | follows #740 |
+| 18 | Metadata hard state, applied, purged, membership log id, audit frontier | `VTOPMHS1`, `VTOPMAP1`, `VTOPMPG1`, `VTOPMML1`, `VTOPMAU1` | B | evolving | follows #740 |
 | 19 | Native protocol | `VTPW`, major `1`, minor `0` | C | evolving | follows #740 |
 | 20 | Replica protocol negotiation | replica protocol `1` and `2` | C | evolving | follows #740 |
 | 21 | Metadata peer and admin transport | `VTPM`, version `1` | C | evolving | follows #740 |

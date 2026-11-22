@@ -410,7 +410,10 @@ def test_readme_chart_output_does_not_depend_on_the_environment(tmp_path):
     for index, extra in enumerate(ENVIRONMENTS):
         repo = tmp_path / f"repo{index}"
         repo.mkdir()
-        (repo / "benchmarks").symlink_to(os.path.join(regenerate.REPO, "benchmarks"))
+        # The charts read benchmarks/; the README's cards (#714) also read the README, the compose
+        # file, CI and the Cargo files.
+        for entry in ("benchmarks", "README.md", "docker-compose.yml", "Cargo.toml", "Cargo.lock", ".github", "tests"):
+            (repo / entry).symlink_to(os.path.join(regenerate.REPO, entry))
         cwd = tmp_path / f"cwd{index}"
         cwd.mkdir()
         code = "import sys; sys.path.insert(0, sys.argv[1]); import readme_charts; readme_charts.render(sys.argv[2])"
