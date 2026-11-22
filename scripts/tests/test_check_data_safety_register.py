@@ -43,12 +43,24 @@ def row(n: int, fixed: str = "#1 · v0.1.0 · 2026-01-02", found: str = "2026-01
     return f"| [#{n}]({url}) | lost range | engine | abc1234 | {found} | {fixed} | review | x |\n"
 
 
-def register(rows: str, considered: str = "") -> str:
-    return (
+def register(rows: str, considered: str = "", pr_rows: str | None = None) -> str:
+    text = (
         "# Data-safety register\n\nIntro.\n\n## Register\n\n" + HEADER + rows
         + "\n## Considered and not labelled\n\n| Issue | Why it is not labelled |\n|---|---|\n"
         + considered
     )
+    if pr_rows is not None:
+        text += (
+            "\n## Found and fixed in a pull request\n\n"
+            "| Pull request | Class | Component | Introduced | Found | Fixed | Found by | What happened |\n"
+            "|---|---|---|---|---|---|---|---|\n" + pr_rows
+        )
+    return text
+
+
+def pr_row(n: int, found: str = "2026-11-21") -> str:
+    url = f"https://github.com/allamiro/vtop-engine/pull/{n}"
+    return f"| [#{n}]({url}) | lost range | engine | abc1234 | {found} | #{n} · open | review | x |\n"
 
 
 def issue(n: int, state: str = "CLOSED", created: str = "2026-01-01T10:00:00Z") -> dict:
@@ -130,10 +142,54 @@ class CheckTests(unittest.TestCase):
             self.mod.parse_register(register(""))
 
 
+class PullRequestTableTests(unittest.TestCase):
+    """Data-safety bugs found while working and fixed in the pull request
+    that found them, with no issue filed."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = load()
+
+    def problems(self, text: str, issues: list[dict]) -> list[str]:
+        return self.mod.check(self.mod.parse_register(text), issues)
+
+    def test_a_consistent_pull_request_row_passes(self):
+        self.assertEqual(self.problems(register(row(5), pr_rows=pr_row(900)), [issue(5)]), [])
+
+    def test_a_duplicate_pull_request_row_fails(self):
+        problems = self.problems(register(row(5), pr_rows=pr_row(900) + pr_row(900)), [issue(5)])
+        self.assertTrue(any("#900 has more than one row" in p for p in problems), problems)
+
+    def test_pull_request_rows_out_of_order_fail(self):
+        problems = self.problems(register(row(5), pr_rows=pr_row(901) + pr_row(900)), [issue(5)])
+        self.assertTrue(any("#900 is out of order" in p for p in problems), problems)
+
+    def test_a_labelled_issue_in_the_pull_request_table_fails(self):
+        problems = self.problems(register(row(5), pr_rows=pr_row(5)), [issue(5)])
+        self.assertTrue(any("#5 is in the pull-request table but is a labelled issue" in p for p in problems), problems)
+
+    def test_a_found_cell_that_is_not_a_date_fails(self):
+        problems = self.problems(register(row(5), pr_rows=pr_row(900, found="soon")), [issue(5)])
+        self.assertTrue(any("#900's Found cell" in p for p in problems), problems)
+
+    def test_a_changed_pull_request_header_is_refused(self):
+        text = register(row(5), pr_rows=pr_row(900)).replace("| Pull request |", "| PR |")
+        with self.assertRaises(self.mod.RegisterError):
+            self.mod.parse_register(text)
+
+
 class QuietDaysTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.mod = load()
+
+    def test_a_pull_request_row_found_later_restarts_the_quiet_period(self):
+        issues = [issue(5, created="2026-11-11T02:16:18Z")]
+        reg = self.mod.parse_register(register(row(5), pr_rows=pr_row(900, found="2026-11-13")))
+        days, latest = self.mod.quiet_days(issues, datetime.date(2026, 11, 14), reg.pr_rows)
+        self.assertEqual(days, 1)
+        self.assertEqual(latest["number"], 900)
+        self.assertTrue(latest.get("pull_request"))
 
     def test_counts_from_the_most_recently_opened_issue(self):
         issues = [issue(5, created="2026-11-11T02:16:18Z"), issue(9, created="2026-10-01T00:00:00Z")]
