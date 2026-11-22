@@ -148,6 +148,44 @@ class Violations(unittest.TestCase):
         self.assertTrue(run(events)["valid"])
 
 
+class Stalled(unittest.TestCase):
+    """--stall-ms: a cluster that keeps granting the range and never serves (#640)."""
+
+    def stalled_history(self):
+        # A held epoch 1, died; the lease keeps being granted (2, 3, 4) to
+        # candidates whose promotions never succeed, so none acts.
+        return [
+            read(0, 1, A, expires=1000), node(10, "c1", A, True, 1),
+            read(2000, 2, B, expires=8000), read(9000, 3, C, expires=15000),
+            read(16000, 4, B, expires=22000), node(20000, "c2", B, False, 4),
+        ]
+
+    def test_off_by_default(self):
+        self.assertTrue(run(self.stalled_history())["valid"])
+
+    def test_a_cluster_that_stops_electing_is_stalled(self):
+        result = check_control.check(self.stalled_history(), stall_ms=10_000)
+        self.assertEqual(set(result["violations"]), {"stalled"})
+
+    def test_a_short_gap_is_not_a_stall(self):
+        self.assertTrue(check_control.check(self.stalled_history(), stall_ms=30_000)["valid"])
+
+    def test_a_cluster_that_ends_with_a_leader_is_not_stalled(self):
+        events = self.stalled_history() + [node(21000, "c3", C, True, 5), read(20500, 5, C, expires=30000)]
+        self.assertTrue(check_control.check(events, stall_ms=10_000)["valid"])
+
+    def test_the_flag_is_read_from_the_command_line(self):
+        handle = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False)
+        handle.write("".join(json.dumps(e) + "\n" for e in self.stalled_history()))
+        handle.close()
+        self.addCleanup(pathlib.Path(handle.name).unlink)
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            code = check_control.main(["check_control.py", "--stall-ms", "10000", handle.name])
+        self.assertEqual(code, 1, out.getvalue())
+        self.assertIn("stalled", json.loads(out.getvalue())["violations"])
+
+
 class Input(unittest.TestCase):
     def write(self, text: str) -> str:
         handle = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False)

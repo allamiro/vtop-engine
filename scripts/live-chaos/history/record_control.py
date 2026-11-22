@@ -13,8 +13,9 @@ instants the observation was asked for and answered (`invoke_ms`,
   lease_read   `vtopctl --json meta range-lease`, a linearizable read of the
                range's lease: the range's fencing epoch, the lease's holder,
                epoch and deadline, and the applied index it was served at.
-               Rotated over the metadata nodes, so a read through every node
-               is in the history
+               Each round starts at the next metadata node and asks the
+               others in turn until one answers (a follower refuses the
+               read); every attempt is recorded
   node_lease   one data node's /metrics: whether it is the authorized
                leaseholder (`vtop_broker_lease_active`), at which epoch
                (`vtop_broker_meta_fencing_epoch`, `vtop_broker_held_fencing_epoch`)
@@ -192,9 +193,18 @@ def main(argv: list[str]) -> int:
         turn = {"i": 0}
 
         def rotating_read() -> dict:
-            meta_id, config = metas[turn["i"] % len(metas)]
+            # Through each node in turn, starting one further on each round;
+            # a node that refuses (a follower does not serve the linearizable
+            # read) is recorded as failed and the next one is asked.
+            start = turn["i"]
             turn["i"] += 1
-            return lease_read(args.vtopctl, meta_id, config, args.topic, args.range_)
+            for k in range(len(metas)):
+                meta_id, config = metas[(start + k) % len(metas)]
+                event = lease_read(args.vtopctl, meta_id, config, args.topic, args.range_)
+                if event["ok"] or k == len(metas) - 1:
+                    return event
+                sink.write(event)
+            raise AssertionError("unreachable")
 
         threads.append(threading.Thread(target=poll, daemon=True, args=(args.lease_interval_ms, rotating_read, sink)))
     for name, addr, node_uuid in nodes:

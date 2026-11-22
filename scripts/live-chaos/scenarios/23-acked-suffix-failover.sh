@@ -170,6 +170,14 @@ await_acked_floor "$ACKED_FILE" "$SHARED"
 # included, where an epoch number would count lease grants (a refused grant
 # mints an epoch and appends nothing).
 PREFIX="$(cat "$ACKED_FILE")"
+# The gauge is refreshed only when a scrape gets the log's lock, and keeps
+# its last value when it does not, so one sample under load can trail the
+# log. Waited for, not sampled once: a single sample failed the scenario in
+# two of three runs while #728 was built ("221 committed entries under 240
+# acknowledged records").
+await_metric_at_least "$(data_metrics_addr $((L + 10)))" \
+  vtop_broker_local_committed_offset "$PREFIX" \
+  "the leader's committed offset must cover the $PREFIX-record acknowledged prefix"
 L_COMMITTED="$(sample_metric "$(data_metrics_addr $((L + 10)))" \
   vtop_broker_local_committed_offset)" \
   || fail "the leader's committed offset could not be read after the $PREFIX-record prefix"
@@ -276,18 +284,17 @@ PIDS[L]=$(start_candidate "$L" "$LEADER_ID")
 L_NEXT="$(sed -n 's/.*segment_recovered report=.*next_offset: \([0-9]*\).*/\1/p' \
   "$WORKDIR/logs/data-candidate-$L.log" | tail -1)"
 log "L=$L restarted holding ${L_NEXT:-?} records; R's tail at its promotion was ${R_NEXT:-?}"
+SHAPE_641=0
 if [[ -n "$L_NEXT" && -n "$R_NEXT" && "$L_NEXT" -gt "$R_NEXT" ]]; then
-  # #641, live: L returns unfenced with records past R's tail that nobody
+  # #641, live: L returns with records past R's tail that nobody
   # acknowledged. R's appends there meet a replica that reports holding
   # them, so R cannot reach a quorum with L, and C is behind (#341). The
-  # #611 claim above has been checked; the read-back cannot run without a
-  # published mark. Exit 77 is reported as SKIP by run-all.sh, never PASS.
-  log "RESULT seed=$SEED shared=$FROZEN_AT acked=$ACKED c=$C r=$R c_records=${C_RECORDS:-?} c_epoch=$C_EPOCH \
-c_refused_by_r=$REFUSED r_epoch=$R_EPOCH r_next=$R_NEXT l_next=$L_NEXT serving=none (#641)"
-  log "SKIP: L returned holding $((L_NEXT - R_NEXT)) unacknowledged record(s) past R's tail \
-and is never fenced (#641); no quorum can form until it is"
-  check_control_history
-  exit 77
+  # liveness wait below still runs: a build that let L acknowledge R's
+  # records over its own (#641 or #261 re-introduced, #728) reaches a quorum
+  # here, and the second failover then reads L's copy. When the wait runs
+  # out, the scenario exits 77, reported as SKIP by run-all.sh, never PASS.
+  SHAPE_641=1
+  log "L returned holding $((L_NEXT - R_NEXT)) unacknowledged record(s) past R's tail (#641)"
 fi
 
 # --- liveness: some candidate serves at a newer epoch -------------------------
@@ -309,6 +316,14 @@ while :; do
       break
     fi
   fi
+  if [[ $SECONDS -ge $deadline && "$SHAPE_641" == 1 ]]; then
+    log "RESULT seed=$SEED shared=$FROZEN_AT acked=$ACKED c=$C r=$R c_records=${C_RECORDS:-?} c_epoch=$C_EPOCH \
+c_refused_by_r=$REFUSED r_epoch=$R_EPOCH r_next=$R_NEXT l_next=$L_NEXT serving=none (#641)"
+    log "SKIP: L returned holding $((L_NEXT - R_NEXT)) unacknowledged record(s) past R's tail \
+and is never fenced (#641); no quorum can form until it is"
+    check_control_history
+    exit 77
+  fi
   [[ $SECONDS -lt $deadline ]] \
     || fail "no candidate served quorum produce after the failover (last holder \
 ${holder:-none}; see $WORKDIR/logs/produce-after.log)"
@@ -323,6 +338,52 @@ CHAOS_MAX_OFFSET_GAPS="$SERVING_EPOCH" CHAOS_READ_HISTORY="$(history_file read)"
 log "all $ACKED acknowledged records read back byte-exact from candidate $SERVING"
 check_history
 
+# --- a second failover (#728) --------------------------------------------------
+# The serving candidate dies too, and comes back from its own directory once
+# another holds the lease, so the log is served from another replica's copy.
+# A replica that acknowledged records it does not hold (#261, #641) would
+# serve its own records at those offsets now, and the history checker sees
+# it. Every acknowledged record must still read back from whoever serves.
+# CHAOS_611_SECOND_FAILOVER=0 stops after the first.
+if [[ "${CHAOS_611_SECOND_FAILOVER:-1}" == 1 ]]; then
+  read -r SERVING_UUID _ <<<"$(candidate_identity "$SERVING")"
+  kill9_pid "${PIDS[$SERVING]}"
+  log "the serving candidate $SERVING SIGKILLed; it returns once another holds the lease"
+  read -r HOLDER2 _ <<<"$(await_lease_holder_changed "$LEADER_ID" "$SERVING_UUID" \
+    $((2 * LEASE_DURATION_MS / 1000 + ELECTION_TIMEOUT_SECONDS)))"
+  PIDS[SERVING]=$(start_candidate "$SERVING" "$LEADER_ID")
+  log "candidate $(candidate_by_uuid "$HOLDER2") took the lease; candidate $SERVING is back"
+  deadline=$((SECONDS + 4 * LEASE_DURATION_MS / 1000 + ELECTION_TIMEOUT_SECONDS))
+  SERVING2="" SERVING2_EPOCH=""
+  while :; do
+    if holder="$(lease_field "$LEADER_ID" "d['lease']['holder_node_uuid'] if d.get('lease') else ''")" \
+      && [[ -n "$holder" ]] \
+      && epoch="$(lease_field "$LEADER_ID" "d['lease']['fencing_epoch']")" && [[ -n "$epoch" ]] \
+      && [[ "$epoch" -gt "$SERVING_EPOCH" ]]; then
+      n="$(candidate_by_uuid "$holder")"
+      if "$VTOP_NODE" produce --client-config "$(emit_client_config_at_epoch "$epoch" 3)" \
+        --addr "$(candidate_native_addr "$n")" --records "$BATCH" --batch "$BATCH" \
+        --durability quorum --acked-file "$WORKDIR/acked-after-2" \
+        --history "$(history_file produce-after-2)" \
+        > "$WORKDIR/logs/produce-after-2.log" 2>&1; then
+        SERVING2="$n" SERVING2_EPOCH="$epoch"
+        break
+      fi
+    fi
+    [[ $SECONDS -lt $deadline ]] \
+      || fail "no candidate served quorum produce after the second failover (last holder \
+${holder:-none}; see $WORKDIR/logs/produce-after-2.log)"
+    sleep 0.5
+  done
+  log "candidate $SERVING2 serves quorum produce at epoch $SERVING2_EPOCH after the second failover"
+  CHAOS_MAX_OFFSET_GAPS="$SERVING2_EPOCH" CHAOS_READ_HISTORY="$(history_file read)" \
+    await_verified_floor "$(emit_client_config_at_epoch "$SERVING2_EPOCH" 3)" \
+    "$(candidate_native_addr "$SERVING2")" "$ACKED" "$ACKED"
+  log "all $ACKED acknowledged records read back byte-exact from candidate $SERVING2"
+  check_history
+fi
+
 log "RESULT seed=$SEED shared=$FROZEN_AT acked=$ACKED c=$C r=$R c_records=${C_RECORDS:-?} c_epoch=$C_EPOCH \
 c_refused_by_r=$REFUSED r_epoch=$R_EPOCH r_next=${R_NEXT:-?} l_next=${L_NEXT:-?} \
-serving=$SERVING serving_epoch=$SERVING_EPOCH"
+serving=$SERVING serving_epoch=$SERVING_EPOCH serving2=${SERVING2:-skipped} \
+serving2_epoch=${SERVING2_EPOCH:-skipped}"

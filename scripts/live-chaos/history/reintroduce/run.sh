@@ -8,9 +8,9 @@
 # this directory that undoes the bug's fix, builds vtop-node and vtopctl from
 # the copy, and runs the scenarios that reach the bug's shape against that
 # build, with THIS tree's scenarios and checkers. After every run, pass or
-# fail, it runs check_history.py and check_control.py over what the run
-# recorded, so a scenario that stops at its own assertion is still judged by
-# the histories.
+# fail, it runs check_history.py and check_control.py (with --stall-ms) over
+# what the run recorded, so a scenario that stops at its own assertion is
+# still judged by the histories.
 #
 #   611  a fence discards a suffix the candidate merely lacks (undoes #616)
 #   641  a returning deposed leader's sessions open unfenced (undoes #649)
@@ -31,6 +31,10 @@
 #                           (default: <out>/target)
 #   REINTRODUCE_SEEDS       space-separated seeds, one per run (default: random)
 #   REINTRODUCE_SCENARIOS   override the scenarios run for the bug
+#   REINTRODUCE_STALL_MS    the control checker's --stall-ms (default 15000):
+#                           a run whose history ends with this long granted
+#                           and unserved is flagged `stalled`, which is how a
+#                           bug that stops the cluster (#640) shows
 #
 # Exit status: 0 the checkers flagged at least one run (DETECTED); 1 no run
 # was flagged (MISSED: the summary says what each run did); 2 the patch,
@@ -55,6 +59,8 @@ esac
 read -r -a SCENARIOS <<< "${REINTRODUCE_SCENARIOS:-$DEFAULT_SCENARIOS}"
 read -r -a SEEDS <<< "${REINTRODUCE_SEEDS:-}"
 PATCH="$HERE/$BUG.patch"
+STALL_MS="${REINTRODUCE_STALL_MS:-15000}"
+[[ "$STALL_MS" =~ ^[0-9]+$ ]] || { echo "REINTRODUCE_STALL_MS must be milliseconds, got '$STALL_MS'" >&2; exit 2; }
 
 OUT="${REINTRODUCE_OUT:-$(mktemp -d "${TMPDIR:-/tmp}/vtop-reintroduce-$BUG.XXXXXX")}"
 mkdir -p "$OUT"
@@ -69,10 +75,17 @@ setup_fail() { echo "[reintroduce/$BUG] SETUP FAILED: $*" >&2; exit 2; }
 # --- the copy: every tracked and untracked-but-not-ignored file --------------
 rm -rf "$SRC"
 mkdir -p "$SRC"
-(cd "$REPO_ROOT" && git ls-files --cached --others --exclude-standard -z \
-  | while IFS= read -r -d '' f; do if [[ -e "$f" ]]; then printf '%s\0' "$f"; fi; done \
-  | tar --null -T - -cf -) | tar -xf - -C "$SRC" \
-  || setup_fail "could not copy the tree"
+# Without git (a worktree mounted into a container whose .git points
+# elsewhere), everything but the build output and the repository metadata.
+if git -C "$REPO_ROOT" rev-parse --git-dir > /dev/null 2>&1; then
+  (cd "$REPO_ROOT" && git ls-files --cached --others --exclude-standard -z \
+    | while IFS= read -r -d '' f; do if [[ -e "$f" ]]; then printf '%s\0' "$f"; fi; done \
+    | tar --null -T - -cf -) | tar -xf - -C "$SRC" \
+    || setup_fail "could not copy the tree"
+else
+  (cd "$REPO_ROOT" && tar --exclude=./target --exclude=./.git --exclude=./site -cf - .) \
+    | tar -xf - -C "$SRC" || setup_fail "could not copy the tree"
+fi
 # patch(1), not git apply: the copy is no repository, and inside another one
 # git apply would read paths against that repository's root.
 (cd "$SRC" && patch -p1 --batch --forward --dry-run < "$PATCH" > /dev/null \
@@ -99,7 +112,8 @@ judge() { # <workdir> — prints "<data verdict> <control verdict> <kinds>"
   fi
   if [[ -e "${cfiles[0]}" ]]; then
     code=0
-    python3 "$CHAOS/history/check_control.py" "${cfiles[@]}" > "$wd/reintroduce-control.json" 2>&1 || code=$?
+    python3 "$CHAOS/history/check_control.py" --stall-ms "$STALL_MS" "${cfiles[@]}" \
+      > "$wd/reintroduce-control.json" 2>&1 || code=$?
     case "$code" in 0) control=valid ;; 1) control=VIOLATED ;; *) control=error ;; esac
   fi
   kinds="$(python3 - "$wd" << 'PY'
@@ -114,6 +128,9 @@ for name in ("reintroduce-history.json", "reintroduce-control.json"):
 print(",".join(kinds) or "-")
 PY
 )"
+  # A history with no completed read (the scenario stopped before it read)
+  # is reported as an `input` violation; it judged nothing.
+  [[ "$data" == VIOLATED && "$kinds" == input* && "$kinds" != *,* ]] && data=noread
   echo "$data $control $kinds"
 }
 

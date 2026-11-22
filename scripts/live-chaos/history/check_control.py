@@ -29,8 +29,13 @@ answered (`invoke_ms`, `complete_ms`). An observation that failed
                 the latest deadline any read reported for E. A lease with no
                 deadline (an operator's grant) is not held to this, and an
                 operator's revocation of a live lease is not modelled
+  stalled       (only with --stall-ms N) liveness, not safety: the history
+                ends with N ms or more in which metadata granted the range
+                and no data node acted as its leader. A bug that leaves no
+                provable quorum (#640) breaks no rule above; it stops the
+                cluster, and this is how a history shows it
 
-Usage: check_control.py HISTORY.jsonl [HISTORY.jsonl ...]
+Usage: check_control.py [--stall-ms N] HISTORY.jsonl [HISTORY.jsonl ...]
 Prints a JSON summary; exits 1 when any invariant is violated, 2 on bad input.
 A file whose last line is cut short (a recorder killed mid-write) has that
 line ignored and noted; a bad line anywhere else is bad input.
@@ -98,7 +103,7 @@ def _monotonic(reads: list[dict], field: str, kind: str, what: str, violations) 
             })
 
 
-def check(events: list[dict]) -> dict:
+def check(events: list[dict], stall_ms: int | None = None) -> dict:
     violations: dict[str, list] = defaultdict(list)
     ok = [e for e in events if e["ok"]]
     status = [e for e in ok if e["op"] == "meta_status"]
@@ -201,6 +206,21 @@ def check(events: list[dict]) -> dict:
                 "claim": c, "read": r,
             })
 
+    # stalled: the history's last stretch has grants and no acting leader.
+    if stall_ms is not None and events:
+        end = max(e["complete_ms"] for e in events)
+        last_claim = max((c["complete_ms"] for c in claims), default=None)
+        held = [r for r in reads if r.get("holder") is not None]
+        since = last_claim if last_claim is not None else min((r["invoke_ms"] for r in held), default=end)
+        granted_after = [r for r in held if r["invoke_ms"] >= since]
+        if granted_after and end - since >= stall_ms:
+            _add(violations, "stalled", {
+                "message": f"no data node acted as the leader for the last {end - since} ms of the history "
+                           f"(from {since} to {end}), while metadata granted the range "
+                           f"{len(granted_after)} time(s) (epochs "
+                           f"{sorted({r['lease_epoch'] for r in granted_after if r.get('lease_epoch') is not None})})",
+            })
+
     counts: dict[str, dict] = defaultdict(lambda: {"ok": 0, "failed": 0})
     for e in events:
         counts[e["op"]]["ok" if e["ok"] else "failed"] += 1
@@ -219,6 +239,12 @@ def check(events: list[dict]) -> dict:
 
 def main(argv: list[str]) -> int:
     paths = argv[1:]
+    stall_ms = None
+    if paths[:1] == ["--stall-ms"]:
+        if len(paths) < 2 or not paths[1].isdigit():
+            print("check_control: --stall-ms takes a number of milliseconds", file=sys.stderr)
+            return 2
+        stall_ms, paths = int(paths[1]), paths[2:]
     if not paths:
         print(__doc__, file=sys.stderr)
         return 2
@@ -231,7 +257,7 @@ def main(argv: list[str]) -> int:
     except (OSError, ValueError) as err:
         print(f"check_control: {err}", file=sys.stderr)
         return 2
-    result = check(events)
+    result = check(events, stall_ms)
     result["notes"] = notes
     print(json.dumps(result, indent=2))
     return 0 if result["valid"] else 1
