@@ -2069,7 +2069,8 @@ impl KafkaRefusalCollector {
                 "Kafka requests this node's gateway refused, by api and reason; \
                  no_offset_store is an OffsetCommit on a node with no metadata plane, \
                  unserved_api a request (CreateTopics, DescribeConfigs, ...) the gateway \
-                 does not serve",
+                 does not serve, not_leader a produce, fetch or list-offsets this node \
+                 answered NOT_LEADER_OR_FOLLOWER because it does not hold the range",
                 &["api", "reason"],
             )?,
         })
@@ -3025,13 +3026,23 @@ mod tests {
         for series in [
             r#"vtop_kafka_requests_refused_total{api="offset_commit",reason="no_offset_store"} 0"#,
             r#"vtop_kafka_requests_refused_total{api="unserved",reason="unserved_api"} 0"#,
+            r#"vtop_kafka_requests_refused_total{api="produce",reason="not_leader"} 0"#,
+            r#"vtop_kafka_requests_refused_total{api="fetch",reason="not_leader"} 0"#,
+            r#"vtop_kafka_requests_refused_total{api="list_offsets",reason="not_leader"} 0"#,
         ] {
             assert!(text.contains(series), "{series} missing: {text}");
         }
         refusals.count(vtop_kafka::Refusal::OffsetCommitWithoutStore);
         refusals.count(vtop_kafka::Refusal::OffsetCommitWithoutStore);
         refusals.count(vtop_kafka::Refusal::UnservedApi);
+        refusals.count(vtop_kafka::Refusal::FetchNotLeader);
         let text = scrape(&registry);
+        assert!(
+            text.contains(
+                r#"vtop_kafka_requests_refused_total{api="fetch",reason="not_leader"} 1"#
+            ),
+            "{text}"
+        );
         assert!(
             text.contains(
                 r#"vtop_kafka_requests_refused_total{api="offset_commit",reason="no_offset_store"} 2"#
