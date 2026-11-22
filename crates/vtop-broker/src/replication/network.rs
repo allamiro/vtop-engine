@@ -293,17 +293,24 @@ impl LeaderLineage for crate::LocalBroker {
         // oversized group no producer ever sent (#881 soak).
         // And one group must fit one segment: the follower rolls once for a
         // group that does not fit its tail, never splits it (review).
-        let (max_group_bytes, max_group_records) =
-            state
-                .segment
-                .active()
-                .config_v2()
-                .map_or((u64::MAX, u64::MAX), |config| {
-                    (
-                        config.max_group_bytes.min(config.max_segment_bytes),
-                        config.max_segment_records,
-                    )
-                });
+        // A v1 segment has the same three limits, in its own header: read
+        // through `config()` there, or a v1 range's consecutive produces are
+        // merged into one append no follower's append path accepts, and the
+        // catch-up is rebuilt the same way at every reconnect.
+        let active = state.segment.active();
+        let (max_group_bytes, max_group_records) = match active.config_v2() {
+            Some(config) => (
+                config.max_group_bytes.min(config.max_segment_bytes),
+                config.max_segment_records,
+            ),
+            None => {
+                let config = active.config();
+                (
+                    config.max_group_bytes.min(config.max_segment_bytes),
+                    config.max_segment_records,
+                )
+            }
+        };
         // A v1 frame stores the producer identity MERGED with its epoch, and
         // the merge is a hash, so the identity a replica append carries is
         // not in the log: it is recovered below from the producers this
@@ -4234,6 +4241,98 @@ mod tests {
         assert_eq!(
             broker.read_catch_up(3, CATCH_UP_MAX_BYTES),
             CatchUpRead::UpToDate
+        );
+    }
+
+    /// #923 review (P2): a v1 range's catch-up honours the range's group and
+    /// segment limits. The bounds were read through `config_v2()` only, which
+    /// is `None` for v1, so every consecutive produce of one producer was
+    /// merged into one append that no follower accepts, and the rebuilt
+    /// append was the same at every reconnect.
+    #[test]
+    fn a_v1_catch_up_splits_appends_at_the_ranges_group_and_record_limits() {
+        use vtop_protocol::{Durability, Message, Role, WireFrame};
+        let dir = tempfile::tempdir().unwrap();
+        let range = catch_up_range();
+        // Two records of this size fit one group, three do not (a v1 frame is
+        // two bytes smaller than the v2 frame the estimate is taken from).
+        let record_bytes = vtop_log::RECORD_FRAME_OVERHEAD_BYTES_V2 + 1 + 2;
+        let config = vtop_log::SegmentConfig {
+            max_record_bytes: 64,
+            max_group_bytes: 2 * record_bytes + 8,
+            max_segment_bytes: 1024 * 1024,
+            max_segment_records: 100,
+            index_stride: 2,
+        };
+        let segment = vtop_log::ActiveSegment::create(
+            dir.path().join("range.active"),
+            vtop_log::SegmentDescriptor {
+                segment_id: Uuid::from_u128(9),
+                topic: range.topic.clone(),
+                topic_epoch: range.topic_epoch,
+                lineage: vtop_log::RangeLineage {
+                    range_id: range.range_id,
+                    generation: range.range_generation,
+                    key_range: vtop_log::KeyRange::full(),
+                    parents: Vec::new(),
+                },
+                base_offset: 0,
+            },
+            config,
+        )
+        .unwrap();
+        let epochs = crate::ProducerEpochJournal::open(dir.path().join("epochs")).unwrap();
+        let broker = crate::LocalBroker::new(segment, epochs, range.clone(), 4).unwrap();
+        let producer = Uuid::from_u128(0xB1);
+        for sequence in 0..7_u64 {
+            let frame = WireFrame {
+                request_id: sequence + 1,
+                stream_id: 1,
+                message: Message::ProduceRequest(vtop_protocol::ProduceRequest {
+                    range: range.clone(),
+                    fencing_epoch: 4,
+                    producer_id: producer,
+                    producer_epoch: 1,
+                    first_sequence: sequence,
+                    durability: Durability::LocalFsync,
+                    records: vec![ProduceRecord {
+                        timestamp_millis: 1,
+                        key: b"k".to_vec(),
+                        value: format!("v{sequence}").into_bytes(),
+                    }],
+                }),
+            };
+            assert!(
+                matches!(
+                    broker.handle(Role::Producer, frame).message,
+                    Message::ProduceResponse(_)
+                ),
+                "produce {sequence} is acknowledged"
+            );
+        }
+
+        let CatchUpRead::Appends(appends) = broker.read_catch_up(0, CATCH_UP_MAX_BYTES) else {
+            panic!("a v1 range is caught up from its log")
+        };
+        assert_eq!(
+            appends.iter().map(|a| a.records.len()).sum::<usize>(),
+            7,
+            "every record is carried"
+        );
+        for append in &appends {
+            assert!(
+                append.records.len() <= 2,
+                "an append of {} records exceeds the range's max_group_bytes of {}: the \
+                 follower would refuse it for ever",
+                append.records.len(),
+                config.max_group_bytes
+            );
+            assert_eq!(append.producer_id, producer);
+            assert_eq!(append.producer_epoch, 1);
+        }
+        assert_eq!(
+            appends.iter().map(|a| a.records.len()).collect::<Vec<_>>(),
+            vec![2, 2, 2, 1]
         );
     }
 
