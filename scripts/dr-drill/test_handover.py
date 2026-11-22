@@ -334,8 +334,14 @@ class WiredIn(unittest.TestCase):
             with open(ctl, "w") as f:
                 f.write("#!/bin/sh\n")
             os.chmod(ctl, 0o755)
+            shim = os.path.join(tmp, "bin")
+            os.makedirs(shim)
+            with open(os.path.join(shim, "docker"), "w") as f:
+                f.write(DOCKER_SHIM)
+            os.chmod(os.path.join(shim, "docker"), 0o755)
             for drill in DRILLS:
-                env = dict(os.environ, DR_DRILL_WORKDIR=os.path.join(tmp, "absent-" + drill))
+                env = dict(os.environ, PATH=shim + os.pathsep + os.environ["PATH"], DOCKER_LOG=os.path.join(tmp, "d.log"),
+                           DR_DRILL_WORKDIR=os.path.join(tmp, "absent-" + drill))
                 out = subprocess.run([BASH, os.path.join(HERE, f"{drill}.sh"), ctl, "--check"],
                                      capture_output=True, text=True, env=env, timeout=60)
                 self.assertEqual(out.returncode, 2, f"{drill}: {out.stdout}{out.stderr}")
