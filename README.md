@@ -91,16 +91,14 @@ Method and every condition: [EGRESS_TRANSPORT_RESEARCH.md](docs/EGRESS_TRANSPORT
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/policed-uplink-dark.svg">
-  <img alt="Bar chart of objects committed at the shipped upload defaults. On a 10 Mbit/s policed uplink, 0 of 32 before the fix and 96 of 96 after. On clean and lossy 100 ms links, every object committed before and after." src="docs/assets/readme/policed-uplink-light.svg">
+  <img alt="Bar chart of objects committed at the shipped upload defaults. On a 10 Mbit/s policed uplink, 0 of 32 with a fixed request deadline and 96 of 96 with one that grows with the body. On clean and lossy 100 ms links, every object committed both ways." src="docs/assets/readme/policed-uplink-light.svg">
 </picture>
 
 On a 10 Mbit/s policed uplink, which drops what exceeds its rate instead of
-queueing it, the shipped defaults committed
-**0 of 32** objects. Every part upload hit a fixed 300 s deadline and was sent
-again from its first byte, so every object ended `failed` and no source
-position moved. Since [#666](https://github.com/allamiro/vtop-engine/pull/666),
-a request's deadline grows with the size of its body, and the same link
-committed **96 of 96**.
+queueing it, a fixed 300 s request deadline committed **0 of 32** objects:
+every part upload hit the deadline and was sent again from its first byte, so
+no source position moved. With a deadline that grows with the size of the
+request body, as shipped since v0.8.0, the same link committed **96 of 96**.
 Data: [`663-policed-uplink/runs.csv`](benchmarks/measurements/663-policed-uplink/runs.csv).
 
 ### Leader failover, against Apache Kafka
@@ -255,7 +253,7 @@ Kafka is an optional edge adapter; see
 The limits that matter most when evaluating it:
 
 - **A replay reuses the stored object only when it produces the same bytes.**
-  Objects are named by source, range and content digest (#626), so a replay of
+  Objects are named by source, range and content digest, so a replay of
   the same bytes reuses what is stored and never overwrites anything, and a
   replay is rebuilt as first cut. A replay that cannot be rebuilt as cut (the
   source rewrote or dropped the range), a replay of a row from before v0.10.0 in a later hour under
@@ -276,6 +274,11 @@ Data-safety bugs were still being found as late as November 2026; each one is
 in the [data-safety register](docs/reference/data-safety-register.md). Keep the
 source data until a scrub of the archive passes.
 
+Which parts are production, preview or experimental, and why, is in the
+[component status table](docs/reference/component-status.md). The maintainer
+confirmed its labels (#740). A label states what the evidence supports, not a
+promise of support.
+
 The full table, with what is done and what is planned, is in
 [limitations.md](docs/reference/limitations.md). Per-release limits are in
 [ROADMAP.md](docs/ROADMAP.md), and the engine's HA status is in
@@ -292,6 +295,7 @@ The full table, with what is done and what is planned, is in
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | crates, the engine's runtime flow, recovery, implementation status |
 | [Archive path reference](docs/reference/archive-path.md) | sources, formats, the manifest, verification, recovery, metrics |
 | [PRODUCTION_HA.md](docs/PRODUCTION_HA.md) | engine HA: status, design and phased roadmap |
+| [Component status](docs/reference/component-status.md) | production, preview or experimental for each component, with the evidence and the criteria still open |
 | [ROADMAP.md](docs/ROADMAP.md) | engine and cluster-plane releases, per-release limitations and upgrade notes |
 | [Compatibility policy](docs/reference/compatibility.md) | what each format promises, upgrade and downgrade rules, deprecation |
 | [SUPPORT.md](docs/SUPPORT.md) | versioning, which releases get fixes, and the 1.x support window |
@@ -324,7 +328,7 @@ If you use VTOP Engine in research, please cite it. GitHub's **Cite this reposit
   author  = {Suliman, Tamir},
   title   = {{VTOP Engine: Verified Telemetry Object Protocol Engine}},
   year    = {2026},
-  version = {0.10.2},
+  version = {0.10.3},
   url     = {https://github.com/allamiro/vtop-engine},
   license = {MIT}
 }
@@ -334,19 +338,15 @@ If you use VTOP Engine in research, please cite it. GitHub's **Cite this reposit
 
 ## License
 
-**[MIT](LICENSE) © 2026 Tamir Suliman** — and today that covers the entire
-engine.
+VTOP Engine is open source under the **[MIT License](LICENSE)**, © 2026 Tamir
+Suliman. All of the code in this repository is MIT.
 
-The repository is set up as **dual-licensed** so the boundary is written down
-before there is anything on the other side of it: directories named `ee/`, and
-files carrying the header `VTOP Engine Enterprise Edition`, fall under
-[LICENSE-EE](LICENSE-EE) instead, which permits evaluation, development and
-testing but requires a commercial subscription for production use. **No `ee/`
-directory exists yet**, so nothing in this repository is currently under those
-terms.
+| Edition | License | Use |
+|---|---|---|
+| **Core** (this repository) | [MIT](LICENSE) | Free for any use, including production and commercial use |
+| **Enterprise Edition** (code under `ee/`, or marked `VTOP Engine Enterprise Edition`) | [LICENSE-EE](LICENSE-EE) | Free to evaluate, develop and test; production use needs a commercial subscription |
 
-Three rules bound it, stated in [COMMERCIAL.md](COMMERCIAL.md): code that is
-MIT stays MIT, the core must build and pass CI with `ee/` deleted, and anything
-whose absence could lose or corrupt acknowledged data — durability, fencing,
-replication, failover, verification — stays in the core. Paying is for
-operating at scale, not for not losing data.
+Data safety is never part of the paid edition. Durability, fencing,
+replication, failover and verification stay in the MIT core, and the core
+builds and passes CI on its own. [COMMERCIAL.md](COMMERCIAL.md) sets out these
+rules and how to ask for commercial terms.

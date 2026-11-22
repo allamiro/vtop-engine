@@ -1932,11 +1932,14 @@ impl KafkaSource {
         let Some(consumer) = self.consumer.as_ref() else {
             return;
         };
+        // Resumed before the partitions are assigned again, not after: a
+        // resume sent after the assign can be discarded as outdated by the
+        // assign's fetch start (see the whole re-assign in the read pass).
         let result = result.and_then(|()| {
             consumer
-                .incremental_unassign(&plain)
+                .resume(&plain)
+                .and_then(|()| consumer.incremental_unassign(&plain))
                 .and_then(|()| consumer.incremental_assign(&at))
-                .and_then(|()| consumer.resume(&plain))
         });
         match result {
             Ok(()) => {
@@ -2257,6 +2260,16 @@ impl KafkaSource {
     #[doc(hidden)]
     pub fn hold_off_stall_check_for(&mut self, after: Duration) {
         self.liveness.stall_after = Some(after);
+    }
+
+    /// TEST SEAM: the offset this adapter expects the partition to deliver
+    /// next - where it was assigned, until it delivers - or `None` when it is
+    /// not assigned at a known offset. A live test reads it to tell a
+    /// partition assigned past records it never read (a skip) from one
+    /// assigned at them that has not delivered yet (slow).
+    #[doc(hidden)]
+    pub fn next_offset_expected(&self, topic: &str, partition: i32) -> Option<i64> {
+        self.delivered.get(&(topic.to_string(), partition)).copied()
     }
 
     /// TEST SEAM (#623): stop one partition's fetcher on the underlying
@@ -3268,23 +3281,39 @@ impl SourceAdapter for KafkaSource {
                 tpl.add_partition_offset(topic, *p, *off)
                     .map_err(|e| VtopError::Source(format!("assign tpl {topic}-{p}: {e}")))?;
             }
-            consumer.assign(&tpl).map_err(|e| {
-                VtopError::Source(format!("assign ({} topics): {e}", sources.len()))
-            })?;
-            // Defensively clear any pause state a retained toppar might carry
-            // across the re-assign; a silently-paused partition reads as an
-            // empty topic. A failure is logged, not discarded (#623), and does
-            // not fail the pass: the partitions it did resume are readable,
-            // and one left paused stops delivering, which the stall check
-            // re-assigns once records wait for it.
-            if let Err(e) = consumer.resume(&tpl) {
+            // Clear any pause state a retained partition carries BEFORE the
+            // re-assign, not after it. librdkafka versions each partition's
+            // operations, and the assign's fetch start takes a newer version
+            // than a resume sent once `assign` has returned; when the start
+            // is handled first, the resume is discarded as outdated and the
+            // partition stays paused under the new assignment, reading as an
+            // empty topic until the stall check rebuilds the consumer. Seen
+            // live: a partition this process had paused (a budget stop, or a
+            // test pausing it behind the adapter) delivered nothing after
+            // the renewal. `resume` waits until each partition has handled
+            // it, so the pause is gone before the assign stops and restarts
+            // the fetcher. Every partition of the old and the new assignment
+            // is resumed; one the consumer does not know is skipped by
+            // librdkafka. A failure is logged, not discarded (#623), and does
+            // not fail the pass: one left paused stops delivering, which the
+            // stall check re-assigns once records wait for it.
+            let mut resume = TopicPartitionList::new();
+            for (topic, p) in self.assigned.iter().chain(assignment_set.iter()) {
+                if resume.find_partition(topic, *p).is_none() {
+                    resume.add_partition(topic, *p);
+                }
+            }
+            if let Err(e) = consumer.resume(&resume) {
                 tracing::warn!(
                     error = %e,
-                    partitions = desired.len(),
-                    "kafka resume after assign failed: a partition left paused is re-assigned \
+                    partitions = resume.count(),
+                    "kafka resume before assign failed: a partition left paused is re-assigned \
                      by the stall check once records wait for it (#623)"
                 );
             }
+            consumer.assign(&tpl).map_err(|e| {
+                VtopError::Source(format!("assign ({} topics): {e}", sources.len()))
+            })?;
             self.liveness.on_assign(&assignment_set);
             // Under `latest`, where each partition assigned at
             // `Offset::Stored` started: any later assign must pin it there.
@@ -3805,6 +3834,30 @@ impl SourceAdapter for KafkaSource {
             .filter(|key| !self.known_committed.contains_key(key))
             .collect();
         let broker = self.group_committed_offsets(&partitions);
+        // Each marker sets its partition's resume position, so with two
+        // markers of one partition in a call the one applied last used to
+        // win: a higher start handed back after a lower one moved the cursor
+        // above the lower range, which was then never read again. Every
+        // marker of a partition lands at the LOWEST start the call names for
+        // it, whatever the order.
+        let mut lowest: HashMap<(String, i32), i64> = HashMap::new();
+        for marker in markers {
+            if self.foreign_group(marker).is_some() {
+                continue;
+            }
+            if let ProgressMarker::Kafka {
+                topic,
+                partition,
+                start_offset,
+                ..
+            } = marker
+            {
+                lowest
+                    .entry((topic.clone(), *partition))
+                    .and_modify(|low| *low = (*low).min(*start_offset))
+                    .or_insert(*start_offset);
+            }
+        }
         markers
             .iter()
             .map(|marker| {
@@ -3846,6 +3899,7 @@ impl SourceAdapter for KafkaSource {
                 // `rewind_frontier` for why it is the ledger's and not the
                 // broker's wherever the ledger knows the partition (#614).
                 let key = (topic.clone(), *partition);
+                let start_offset = &lowest.get(&key).copied().unwrap_or(*start_offset);
                 let in_memory = self.cursors.get(&key).and_then(|cur| cur.committed_offset);
                 let frontier = rewind_frontier(
                     self.known_committed.get(&key).copied(),
@@ -4538,6 +4592,35 @@ mod tests {
         src.cursors.clear();
         src.replay_from_marker(&marker(20)).await.unwrap();
         assert_eq!(src.read_position(&marker(20)), Some(20));
+    }
+
+    /// Two ranges of one partition handed back in one call, in either order,
+    /// resume the partition at the LOWER start. Applied in turn, the second
+    /// marker set the cursor: a higher start given last moved it above the
+    /// lower range, which was then never read again.
+    #[tokio::test]
+    async fn two_rewinds_of_one_partition_in_one_call_resume_at_the_lower_start() {
+        let marker = |start: i64| ProgressMarker::Kafka {
+            topic: "t".into(),
+            partition: 0,
+            start_offset: start,
+            end_offset: start + 9,
+            consumer_group: "vtop-engine".into(),
+            topic_id: None,
+        };
+        for order in [[30, 40], [40, 30]] {
+            let mut src = KafkaSource::new(cfg(), TelemetryFormat::Cef).unwrap();
+            src.known_committed.insert(("t".into(), 0), 20);
+            let markers: Vec<_> = order.iter().map(|&start| marker(start)).collect();
+            for result in src.replay_from_markers(&markers).await {
+                result.unwrap();
+            }
+            assert_eq!(
+                src.read_position(&marker(30)),
+                Some(30),
+                "rewinds handed back in the order {order:?} resume above the lower range"
+            );
+        }
     }
 
     /// #614, one engine on its own: a batch whose Kafka commit failed stays

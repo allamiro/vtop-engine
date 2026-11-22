@@ -43,11 +43,28 @@ Where it is configured: [Config basics](../configure/basics.md#secrets).
 
 Operated in [Scrub and coverage audit](../operate/scrub-and-audit.md).
 
+## Encryption at rest
+
+With `upload.server_side_encryption` (`s3_native` only), every object,
+manifest and verification receipt is written with S3 server-side encryption,
+`sse-s3` (AES256) or `sse-kms`, single-part and multipart. The store encrypts;
+VTOP asks on every write and then checks the store's `HeadObject`: an object
+reported as unencrypted, as another algorithm, or (with a named `kms_key_id`)
+as another key fails verification like a checksum mismatch, so a write that
+should be encrypted and is not is never committed. `sse-kms` with no
+`kms_key_id` sends no key and uses the store's default KMS key (on AWS, the
+account's AWS-managed `aws/s3` key). SSE-C is not supported. Keys, key policy
+and rotation stay with the store and KMS. Unset, VTOP asks for nothing and
+checks nothing. The startup summary and `vtop_server_side_encryption_mode`
+show the mode. Details and the permissions the identity needs:
+[security model §7.1](../SECURITY_MODEL.md#71-encryption-at-rest-uploadserver_side_encryption).
+
 ## Least privilege
 
 - **Object storage:** put, get and head, and list within the prefix. No
   delete unless a lifecycle policy needs it. `CreateBucket` only if you turn
-  on `upload.create_bucket`.
+  on `upload.create_bucket`. With `sse-kms`, `kms:GenerateDataKey` and
+  `kms:Decrypt` on the key.
 - **PostgreSQL:** a migration identity owns the schema and runs
   `vtopctl migrate`; the engine's identity gets `SELECT, INSERT, UPDATE` on
   the ledger and nothing more. Pruning runs under a third, maintenance
@@ -57,7 +74,8 @@ Operated in [Scrub and coverage audit](../operate/scrub-and-audit.md).
 
 ## Not provided by VTOP
 
-Encryption at rest (use the store's), creating a bucket with Object Lock and
+Encryption of the state ledger and work directory (use disk or volume encryption),
+keys for the store's encryption (the object store's own and KMS's), creating a bucket with Object Lock and
 its default retention (the engine writes each object under a lock with
 `upload.object_lock`, and checks it, but the bucket is yours; see
 [Object Lock](../OBJECT_LOCK_DEPLOYMENT.md)), access control between tenants (storage IAM), and public-key manifest

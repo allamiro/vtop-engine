@@ -27,7 +27,7 @@ use vtop_core::telemetry;
 use vtop_core::types::ChecksumAlgorithm;
 use vtop_state::VerificationClass;
 use vtop_upload::multipart::redact_urls;
-use vtop_upload::{ObjectChecksum, UploadBackend, VerificationMethod};
+use vtop_upload::{EncryptionCheck, ObjectChecksum, UploadBackend, VerificationMethod};
 
 use crate::engine::KeyNotices;
 
@@ -171,6 +171,24 @@ async fn store(
         .put_manifest(path, uri, checksum)
         .await
         .map_err(|e| redacted(&e))?;
+    // Under upload.server_side_encryption the receipt is checked like the
+    // manifest beside it: the version written, the encryption asked for. A
+    // failure is a failed receipt, never a failed batch (D6).
+    match backend
+        .check_encryption(uri, stored.version_id.as_deref())
+        .await
+    {
+        Ok(EncryptionCheck::Violation(why)) => {
+            return Err(format!("it is stored, but not encrypted as asked ({why})"))
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return Err(format!(
+                "it is stored, and its encryption could not be read ({})",
+                redacted(&e)
+            ))
+        }
+    }
     let Some(lock) = &config.upload.object_lock else {
         return Ok(());
     };
