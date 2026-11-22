@@ -23,6 +23,14 @@ sha256 against the seed's manifest, never a tool's exit code.
 | hosted runner | [`link-compare.yml`](../../.github/workflows/link-compare.yml): `smoke` nightly and on dispatch; `hosted` on dispatch (objects committed of 48 on the policed link, the one cell where the link, not the runner's CPU, decides). |
 | dedicated Linux host with `ifb` | `--plan full`: defaults, equal connections, the tuned grid, the neighbour. About 40 hours, mostly waiting on a 10 Mbit/s link, run in pieces. |
 
+## Lab notes
+
+Docker's own address pools run out on a busy host ("all predefined address pools have been fully subnetted"), so
+the lab pins both of its networks: the tools' network takes `LINK_LAB_SUBNET` (default `10.251.47.0/24`; set it to
+a range not in use on the host) and the shaped link uses `10.77.47.0/24`. This lab has no S3 tap: the tools dial
+the middlebox, which forwards to the store, so nothing here depends on the store's service name. (In the spool and
+archive labs, where a tap takes the alias `minio`, the store's own service must not be called `minio`.)
+
 ## Run it
 
 ```bash
