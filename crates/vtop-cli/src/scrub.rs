@@ -44,8 +44,8 @@ use vtop_core::state_machine::BatchState;
 use vtop_core::types::ChecksumAlgorithm;
 use vtop_state::BatchRecord;
 use vtop_upload::{
-    ObjectChecksum, ObjectLockMode, RetentionCheck, RetentionExpectation, UploadBackend,
-    VerificationMethod,
+    EncryptionCheck, ObjectChecksum, ObjectLockMode, RetentionCheck, RetentionExpectation,
+    UploadBackend, VerificationMethod,
 };
 
 /// What a check found. The `result` label of `vtop_scrub_objects_total`: a
@@ -306,6 +306,24 @@ async fn check_with_manifest(
             return (read_failure(&what, muri, &e), None);
         }
     };
+    // How the store keeps the manifest version being read, when the engine
+    // asks for encryption at rest. The object is judged by `verify_object`
+    // below; a manifest is only read, so without this a batch whose object is
+    // encrypted and whose manifest is not would pass here and in recovery's
+    // re-check, which is this same function.
+    match backend
+        .check_encryption(muri, rec.manifest_version_id.as_deref())
+        .await
+    {
+        Ok(EncryptionCheck::Violation(why)) => {
+            return (
+                BatchCheck::new(ScrubResult::Mismatched, format!("manifest {muri}: {why}")),
+                None,
+            )
+        }
+        Ok(_) => {}
+        Err(e) => return (read_failure("the encryption of manifest", muri, &e), None),
+    }
     let check = check_manifest_and_object(backend, keyring, rec, uri, muri, &bytes).await;
     (check, Some(bytes))
 }
@@ -469,7 +487,23 @@ async fn scrub_one(
         return check;
     };
     match backend.get_object_bounded(muri, MAX_MANIFEST_BYTES).await {
-        Ok(current) if current == pinned => check,
+        // The same bytes at the key a reader fetches: and kept the way the
+        // engine asked, which a re-put of identical bytes without the
+        // encryption would not be.
+        Ok(current) if current == pinned => match backend.check_encryption(muri, None).await {
+            Ok(EncryptionCheck::Violation(why)) => BatchCheck {
+                key: check.key,
+                ..BatchCheck::new(
+                    ScrubResult::Mismatched,
+                    format!("the current key of manifest {muri}: {why}"),
+                )
+            },
+            Ok(_) => check,
+            Err(e) => BatchCheck {
+                key: check.key,
+                ..read_failure("the encryption of the current key of manifest", muri, &e)
+            },
+        },
         Ok(_) => BatchCheck {
             key: check.key,
             ..BatchCheck::new(
@@ -872,6 +906,24 @@ async fn receipt_of(
             )
         }
     };
+    // A receipt is written with the encryption the engine asks for, and kept
+    // under it: one the store reports otherwise is a finding like a manifest.
+    match backend.check_encryption(&ruri, None).await {
+        Ok(EncryptionCheck::Violation(why)) => {
+            return mismatched(format!("verification receipt {ruri}: {why}"))
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return (
+                ReceiptResult::Unreadable,
+                format!(
+                    "the encryption of verification receipt {ruri} could not be read: {}",
+                    vtop_upload::multipart::redact_urls(&e.to_string())
+                ),
+                read,
+            )
+        }
+    }
     let receipt = match ParsedReceipt::from_slice(&bytes) {
         Ok(receipt) => receipt,
         Err(e) => {

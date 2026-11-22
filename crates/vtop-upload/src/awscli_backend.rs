@@ -134,6 +134,7 @@ impl UploadBackend for AwsCliBackend {
             // vtop-sha256 is uploader-controlled user metadata, not a digest
             // computed by S3 over the stored body.
             checksum_sha256: None,
+            encryption: None,
         })
     }
 

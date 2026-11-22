@@ -414,3 +414,121 @@ fn quorum_produce_rolls_on_leader_and_followers() {
         }
     }
 }
+
+/// A disk that fills while the tail rolls, at every storage operation of the
+/// roll (#881, finding 1). The cluster soak filled a data node's directory at
+/// a roll, and from then on every request to that node panicked — `/metrics`
+/// included — until it was restarted, even after the disk was freed.
+///
+/// The producer must get a storage error, never a panic; offsets, the
+/// retained bounds and fetches must keep answering while the disk is full;
+/// and once space is freed the same broker, with no restart, must take the
+/// retried record at the offset it was refused at and keep rolling.
+#[test]
+fn a_produce_whose_roll_hits_a_full_disk_is_refused_and_recovers_once_space_is_freed() {
+    use vtop_log::sim::{FaultPlan, SimStorage};
+
+    const ROOT: &str = "/range";
+    let range = range_identity();
+    let build = |sim: &SimStorage, dir: &TempDir| {
+        sim.create_dir_all(std::path::Path::new(ROOT));
+        let set = SegmentSet::create_in(
+            &sim.env(0x5eed_0881),
+            ROOT,
+            descriptor(0xD9, &range),
+            small_config(),
+        )
+        .unwrap();
+        let epochs = ProducerEpochJournal::open(dir.path().join("epochs")).unwrap();
+        LocalBroker::new(set, epochs, range.clone(), FENCING_EPOCH).unwrap()
+    };
+    let produce = |broker: &LocalBroker, sequence: u64, request_id: u64| {
+        broker.handle(
+            Role::Producer,
+            produce_frame(
+                &range,
+                WireDurability::LocalFsync,
+                sequence,
+                vec![value(sequence)],
+                request_id,
+            ),
+        )
+    };
+    let acked_offset = |response: WireFrame, context: &str| match response.message {
+        Message::ProduceResponse(ack) => ack.outcomes[0].offset,
+        other => panic!("expected an ack ({context}): {other:?}"),
+    };
+
+    // Clean run: the first produce whose append rolls, and its storage ops.
+    let (rolling_sequence, roll_start, roll_end) = {
+        let sim = SimStorage::new();
+        let dir = tempfile::tempdir().unwrap();
+        let broker = build(&sim, &dir);
+        let mut sequence = 0;
+        loop {
+            let sealed_before = broker.sealed_segment_handles().len();
+            let start = sim.op_count();
+            acked_offset(produce(&broker, sequence, sequence + 1), "clean run");
+            if broker.sealed_segment_handles().len() > sealed_before {
+                break (sequence, start, sim.op_count());
+            }
+            sequence += 1;
+        }
+    };
+
+    for op in roll_start..roll_end {
+        let context = format!("disk full from op={op}");
+        let sim = SimStorage::new();
+        let dir = tempfile::tempdir().unwrap();
+        let broker = build(&sim, &dir);
+        for sequence in 0..rolling_sequence {
+            acked_offset(produce(&broker, sequence, sequence + 1), &context);
+        }
+
+        sim.set_fault(FaultPlan::FailOpsFrom {
+            op,
+            kind: std::io::ErrorKind::StorageFull,
+        });
+        let acked = match produce(&broker, rolling_sequence, 1_000).message {
+            Message::ProduceResponse(_) => rolling_sequence + 1,
+            Message::Error(problem) => {
+                assert_eq!(problem.code, ErrorCode::Storage, "{context}");
+                rolling_sequence
+            }
+            other => panic!("unexpected response ({context}): {other:?}"),
+        };
+
+        // Still full: everything a status or metrics request reads answers.
+        assert_eq!(broker.local_offsets(), (acked, acked), "{context}");
+        assert_eq!(broker.retained_bounds().0, 0, "{context}");
+        let _ = broker.sealed_segment_handles();
+        let _ = broker.handle(Role::Consumer, fetch_frame(&range, 0, 1_001));
+        let Message::Error(problem) = produce(&broker, acked, 1_002).message else {
+            panic!("a produce to a full disk must be refused ({context})");
+        };
+        assert_eq!(problem.code, ErrorCode::Storage, "{context}");
+
+        // Space is freed. The same broker takes the retried record where it
+        // was refused, and keeps going through another roll.
+        sim.set_fault(FaultPlan::None);
+        let resumed_to = acked + 12;
+        for sequence in acked..resumed_to {
+            assert_eq!(
+                acked_offset(produce(&broker, sequence, 2_000 + sequence), &context),
+                sequence,
+                "{context}"
+            );
+        }
+        let Message::FetchResponse(batch) = broker
+            .handle(Role::Consumer, fetch_frame(&range, 0, 3_000))
+            .message
+        else {
+            panic!("the range must read once space is freed ({context})");
+        };
+        assert_eq!(batch.records.len() as u64, resumed_to, "{context}");
+        for (index, record) in batch.records.iter().enumerate() {
+            assert_eq!(record.offset, index as u64, "{context}");
+            assert_eq!(record.value, value(index as u64), "{context}");
+        }
+    }
+}
