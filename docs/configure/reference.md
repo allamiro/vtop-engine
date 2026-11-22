@@ -17,13 +17,16 @@ Default column means the key is unset unless you set it.
     refuse unknown keys, are `upload.transports.<name>`, `upload.object_lock`,
     `upload.server_side_encryption`,
     a stream's `checksum` block, and the `{ env: ... }` / `{ file: ... }` forms of
-    `engine.state_store`. Check what took effect with
+    `engine.state_store`. Find every ignored key with
+    `vtopctl validate --strict`, which fails and names each one (and the
+    nearest real key, when there is one). Check what took effect with
     `vtopctl validate --print-effective`.
 
 ## Top level
 
 | Key | Default | Meaning |
 |---|---|---|
+| `config_version` | - (read as `1`) | The version of this file's layout, a whole number. Only `1` exists, so setting it changes nothing today. A file that declares a version newer than the binary reads is refused, naming both, so it is never read as if it were current. An engine from before this key ignores it. |
 | `engine` | **Required** | Engine identity, ledger and working directory. |
 | `batching` | **Required** (may be `{}`) | When a batch is sealed, and how many are verified at once. |
 | `compression` | **Required** (may be `{}`) | Codec for sealed batches. |

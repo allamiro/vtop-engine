@@ -9,6 +9,10 @@ runs it.
 cargo run -p vtop-cli -- validate \
   --config examples/config.yaml
 
+# The same, and also fail on a key the engine would silently ignore.
+cargo run -p vtop-cli -- validate \
+  --config examples/config.yaml --strict
+
 cargo run -p vtop-cli -- run \
   --config examples/config.yaml
 

@@ -10,6 +10,7 @@ description = "Protocol-independent engine logic for the VTOP Engine (state mach
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+serde_ignored = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }
 blake3 = { workspace = true }

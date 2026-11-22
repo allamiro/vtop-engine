@@ -83,6 +83,11 @@ pub enum Command {
     Validate {
         #[arg(long)]
         config: PathBuf,
+        /// Also fail on every key the engine would silently ignore (a
+        /// misspelt or removed key), naming its path and the nearest known
+        /// key. Without it a config with such a key still passes.
+        #[arg(long)]
+        strict: bool,
         /// Explain effective per-stream settings and their origin, without
         /// resolving secrets or contacting any service.
         #[arg(long)]
@@ -315,6 +320,44 @@ fn load(config: &Path) -> Result<(VtopConfig, StreamsConfig), VtopError> {
     };
     streams.validate(&cfg)?;
     Ok((cfg, streams))
+}
+
+/// `validate --strict` (#743): every key of `config.yaml`, and of the
+/// `streams.yaml` beside it, that loading ignores, all at once. Run after
+/// [`load`], so a file that does not load reports that error instead.
+fn check_strict(config: &Path) -> Result<(), VtopError> {
+    let read = |path: &Path| {
+        std::fs::read_to_string(path)
+            .map_err(|e| VtopError::Config(format!("reading {}: {e}", path.display())))
+    };
+    let mut lines: Vec<String> = Vec::new();
+    let mut add = |file: &Path, keys: Vec<vtop_core::config_strict::UnknownKey>| {
+        let name = file.file_name().map_or_else(
+            || file.display().to_string(),
+            |n| n.to_string_lossy().into(),
+        );
+        lines.extend(keys.into_iter().map(|key| format!("  {name}: {key}")));
+    };
+    add(
+        config,
+        vtop_core::config_strict::unknown_config_keys(&read(config)?)?,
+    );
+    let streams_path = config.with_file_name("streams.yaml");
+    if streams_path.exists() {
+        add(
+            &streams_path,
+            vtop_core::config_strict::unknown_streams_keys(&read(&streams_path)?)?,
+        );
+    }
+    if lines.is_empty() {
+        return Ok(());
+    }
+    Err(VtopError::Config(format!(
+        "--strict: {} key(s) the engine would ignore:\n{}\nWithout --strict these load \
+         silently and take their default; fix or remove them.",
+        lines.len(),
+        lines.join("\n")
+    )))
 }
 
 /// The effective OpenTelemetry settings (#683), from the environment. Each
@@ -790,6 +833,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
         }
         Command::Validate {
             config,
+            strict,
             print_effective,
         } => {
             // `load` parses and validates both files; an error is the
@@ -797,6 +841,10 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             // documented opt-out, and refusing it here would only push
             // operators to skip the check.
             let (cfg, streams) = load(config)?;
+            // `--strict` (#743) also refuses the keys loading ignores.
+            if *strict {
+                check_strict(config)?;
+            }
             // The OpenTelemetry variables are part of the deployment's
             // configuration too (#683): one the engine would refuse at
             // startup fails the check here, naming the variable.
