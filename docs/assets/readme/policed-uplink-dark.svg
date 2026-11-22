@@ -922,7 +922,7 @@ L 544.32 115.110744
 L 544.32 103.953719 
 L 155.52 103.953719 
 z
-" clip-path="url(#p0c22f1138f)" style="fill: #3987e5"/>
+" clip-path="url(#p0c22f1138f)" style="fill: #d95926"/>
    </g>
    <g id="patch_5">
     <path d="M 155.52 139.656198 
@@ -938,7 +938,7 @@ L 544.32 152.300826
 L 544.32 141.143802 
 L 155.52 141.143802 
 z
-" clip-path="url(#p0c22f1138f)" style="fill: #3987e5"/>
+" clip-path="url(#p0c22f1138f)" style="fill: #d95926"/>
    </g>
    <g id="patch_7">
     <path d="M 155.52 176.846281 
@@ -954,7 +954,7 @@ L 544.32 189.490909
 L 544.32 178.333884 
 L 155.52 178.333884 
 z
-" clip-path="url(#p0c22f1138f)" style="fill: #3987e5"/>
+" clip-path="url(#p0c22f1138f)" style="fill: #d95926"/>
    </g>
    <g id="patch_9">
     <path d="M 155.52 194.4 
@@ -2414,7 +2414,7 @@ L 196.730531 69.770719
 L 196.730531 64.030719 
 L 186.890531 64.030719 
 z
-" style="fill: #3987e5; stroke: #3987e5; stroke-linejoin: miter"/>
+" style="fill: #d95926; stroke: #d95926; stroke-linejoin: miter"/>
    </g>
    <g id="text_20">
     <!-- deadline grows with the body (v0.8.0 and later) -->

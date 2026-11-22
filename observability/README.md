@@ -447,8 +447,11 @@ counters, on the engine's and every node's `/metrics`:
 
 | Metric | Labels | Meaning |
 |---|---|---|
-| `vtop_audit_events_total` | `action` (`ledger.prune`, `ledger.replay`, `ledger.migrate`, `scrub.cursor`, `cluster.*`, `node.repair`, `node.reconfigure_range`, `promotion.attest`, `native.session`), `outcome` (`attempt`, `success`, `failure`, `refused`) | Records written. |
+| `vtop_audit_events_total` | `action` (`ledger.prune`, `ledger.replay`, `ledger.migrate`, `scrub.cursor`, `cluster.*`, `node.repair`, `node.reconfigure_range`, `promotion.attest`, `native.session`, `audit.gap`), `outcome` (`attempt`, `success`, `failure`, `refused`) | Records written. |
 | `vtop_audit_write_failures_total` | `sink` (`log`, `file`, `ledger`) | Records a sink could not take. Any increase needs a look: a destructive ledger command was refused, or a record is in fewer places than configured. |
+| `vtop_audit_replayed_total` (metadata nodes) | `reason` (`restart`, `retry`, `snapshot`) | Applied records delivered again, marked `replayed` (#706): after a crash, a refusing sink, or from a snapshot's attributed tail. Readers dedupe on `engine` and `correlation.log_index`. |
+| `vtop_audit_gaps_total` (metadata nodes) | `reason` (`snapshot_install`, `log_purged`, `tail_evicted`) | `audit.gap` records: applied records this node could not re-derive. Copy the other replicas' audit files for the range the record names. |
+| `vtop_audit_delivery_lag_entries` (metadata nodes) | none | Applied entries whose audit records are not delivered yet. Above 0 for more than a minute: the audit sink is failing. |
 
 With JSON logs, the records in Loki (the lab's Alloy labels lines by
 `service`):

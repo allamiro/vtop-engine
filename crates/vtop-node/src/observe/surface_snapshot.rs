@@ -149,6 +149,12 @@ fn every_collector(dir: &std::path::Path) -> Vec<(&'static str, Box<dyn Collecto
         // MetaRaftCollector needs a running Raft core; what it describes and
         // emits is exactly its MetaRaftGauges', so the gauges stand in for it.
         ("MetaRaftGauges", Box::new(MetaRaftGauges::new().unwrap())),
+        // MetaAuditCollector needs a running Raft core as well; it describes
+        // and emits exactly its MetaAuditMetrics' families (#706).
+        (
+            "MetaAuditMetrics",
+            Box::new(MetaAuditMetrics::new().unwrap()),
+        ),
         (
             "KafkaGatewayServingCollector",
             Box::new(KafkaGatewayServingCollector::new(Arc::new(|| false)).unwrap()),
@@ -162,7 +168,10 @@ fn every_collector(dir: &std::path::Path) -> Vec<(&'static str, Box<dyn Collecto
 
 /// Collector types whose families reach the registry through another type
 /// in `every_collector`.
-const COVERED_BY_ANOTHER: [(&str, &str); 1] = [("MetaRaftCollector", "MetaRaftGauges")];
+const COVERED_BY_ANOTHER: [(&str, &str); 2] = [
+    ("MetaRaftCollector", "MetaRaftGauges"),
+    ("MetaAuditCollector", "MetaAuditMetrics"),
+];
 
 /// Every family a node can export. Each collector goes into a registry of
 /// its own: a leader's, a follower's and a candidate's collectors export the

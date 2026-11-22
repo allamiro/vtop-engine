@@ -1,5 +1,8 @@
 # Generated from the code by scripts/update-surface-snapshots.sh (#719); do not edit by hand. One item per line, sorted.
+vtop_audit_delivery_lag_entries gauge
 vtop_audit_events_total counter action,outcome
+vtop_audit_gaps_total counter reason
+vtop_audit_replayed_total counter reason
 vtop_audit_write_failures_total counter sink
 vtop_broker_backpressure_events_total counter
 vtop_broker_backpressure_nanoseconds_total counter

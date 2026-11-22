@@ -625,6 +625,8 @@ def run_soak(
         lab.prepare_data_dirs()
         lab.up("engine")
         lab.wait_ready(profile["recovery_timeout_s"])
+        if "enospc" in profile["fault_cycle"]:
+            soak_faults.preflight_enospc(driver.ctx)
         lab.start_producer()
         rec.restart_origin()
         started = True
