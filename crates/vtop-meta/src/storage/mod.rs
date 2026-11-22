@@ -9,6 +9,7 @@
 //! the commit frontier under consensus.
 
 pub mod applied;
+pub mod audited;
 pub mod hardstate;
 pub mod log;
 pub mod membership_log_id;
@@ -19,6 +20,7 @@ use crate::command::{MetadataResponse, SUPPORTED_FEATURE_LEVEL};
 use crate::state::MetaStateMachine;
 use crate::wire::CodecError;
 use applied::{AppliedFrontier, AppliedFrontierFile, APPLIED_FILE_NAME};
+use audited::{AuditedFrontierFile, AUDITED_FILE_NAME};
 use hardstate::{HardState, HardStateFile};
 use log::{MetaLog, MetaLogConfig, MetaLogEntry, MetaLogPayload, MetaMembership};
 use membership_log_id::{MembershipLogId, MembershipLogIdFile, MEMBERSHIP_LOG_ID_FILE_NAME};
@@ -135,10 +137,17 @@ pub(crate) fn refuse_newer_level(
 /// level, so it is the only one the apply and replay paths look for.
 pub(crate) fn first_raise_above(entries: &[MetaLogEntry], supported: u32) -> Option<(u64, u32)> {
     entries.iter().find_map(|entry| match &entry.payload {
-        MetaLogPayload::Normal(crate::command::MetadataCommand::SetFeatureLevel {
-            feature_level,
-            ..
-        }) if *feature_level > supported => Some((entry.index, *feature_level)),
+        // The subject, not the command: an operator's raise is logged
+        // wrapped in its attribution (#706), and must be refused as a newer
+        // release exactly as the bare one is, not applied as a rejection.
+        MetaLogPayload::Normal(command) => match command.subject() {
+            crate::command::MetadataCommand::SetFeatureLevel { feature_level, .. }
+                if *feature_level > supported =>
+            {
+                Some((entry.index, *feature_level))
+            }
+            _ => None,
+        },
         _ => None,
     })
 }
@@ -284,6 +293,7 @@ pub struct MetaStorage {
     data_dir: PathBuf,
     hardstate: HardStateFile,
     applied: AppliedFrontierFile,
+    audited: AuditedFrontierFile,
     purged: PurgedFrontierFile,
     membership_log_id: MembershipLogIdFile,
     log: MetaLog,
@@ -323,6 +333,7 @@ impl MetaStorage {
         let hardstate =
             HardStateFile::open_in(env, data_dir.join(hardstate::HARD_STATE_FILE_NAME))?;
         let applied = AppliedFrontierFile::open_in(env, data_dir.join(APPLIED_FILE_NAME))?;
+        let audited = AuditedFrontierFile::open_in(env, data_dir.join(AUDITED_FILE_NAME))?;
         let purged = PurgedFrontierFile::open_in(env, data_dir.join(PURGED_FILE_NAME))?;
         let membership_log_id =
             MembershipLogIdFile::open_in(env, data_dir.join(MEMBERSHIP_LOG_ID_FILE_NAME))?;
@@ -410,6 +421,7 @@ impl MetaStorage {
             data_dir: data_dir.to_path_buf(),
             hardstate,
             applied,
+            audited,
             purged,
             membership_log_id,
             log,
@@ -603,6 +615,51 @@ impl MetaStorage {
             index: self.last_applied_index,
             term: self.last_applied_term,
         })
+    }
+
+    /// The audit frontier (#706): every applied audit record this replica
+    /// owes at or below it has been accepted by its sink. `None` before it
+    /// is pinned (a store written by a release before #706).
+    pub fn audited_frontier(&self) -> Option<u64> {
+        self.audited.get()
+    }
+
+    /// Persist the audit frontier. Never above the applied frontier (a record
+    /// cannot be delivered for an entry not yet applied), and a value at or
+    /// below the stored one is a no-op.
+    pub fn save_audited(&mut self, index: u64) -> MetaStoreResult<()> {
+        if index > self.last_applied_index {
+            return Err(MetaStoreError::InvalidConfig(format!(
+                "the audit frontier cannot pass the applied frontier: {index} > {}",
+                self.last_applied_index
+            )));
+        }
+        self.audited.save(index)
+    }
+
+    /// The highest index a snapshot install brought this replica past: its
+    /// audit replay never reads the log at or below it (#706).
+    pub fn audited_floor(&self) -> u64 {
+        self.audited.floor()
+    }
+
+    /// Persist the install floor (never above the applied frontier).
+    pub fn save_audited_floor(&mut self, floor: u64) -> MetaStoreResult<()> {
+        if floor > self.last_applied_index {
+            return Err(MetaStoreError::InvalidConfig(format!(
+                "the audit install floor cannot pass the applied frontier: {floor} > {}",
+                self.last_applied_index
+            )));
+        }
+        self.audited.save_floor(floor)
+    }
+
+    /// Pin the audit frontier at the applied frontier when no file exists:
+    /// a store first opened by a release with #706 starts its audit trail
+    /// here, and replays nothing written before (#706). Its earlier records
+    /// were written, or lost, by the release that applied them.
+    pub fn ensure_audited_frontier(&mut self) -> MetaStoreResult<()> {
+        self.audited.pin(self.last_applied_index)
     }
 
     /// Whether a durable `meta.applied` file is present.
@@ -800,6 +857,28 @@ mod feature_level_refusal_tests {
         }
     }
 
+    /// A raise the way an operator's is logged (#706): the leader wraps it
+    /// in the attribution of the connection that proposed it.
+    fn attributed_raise(index: u64, level: u32) -> MetaLogEntry {
+        use crate::command::{Attribution, CommandActor};
+        let MetaLogPayload::Normal(subject) = raise(index, level).payload else {
+            unreachable!()
+        };
+        MetaLogEntry {
+            term: 1,
+            index,
+            payload: MetaLogPayload::Normal(MetadataCommand::Attributed {
+                attribution: Attribution {
+                    actor: CommandActor::Named("operator".to_owned()),
+                    peer: None,
+                    vouched_by: 1,
+                    recorded_at_ms: 1_750_000_000_000,
+                },
+                subject: Box::new(subject),
+            }),
+        }
+    }
+
     /// Publish a snapshot of a state recorded at `level` into `/n1`.
     fn publish_snapshot_at(env: &Env, level: u32) {
         let payload = MetaStateMachine::at_feature_level_for_test(level)
@@ -905,6 +984,52 @@ mod feature_level_refusal_tests {
         drop(storage);
         // The directory still refuses at the next open only if the raise was
         // applied before: it was not, so a reopen is at the old frontier.
+        let reopened = MetaStorage::open_in(&env, "/n1", cluster()).unwrap();
+        assert_eq!(reopened.last_applied(), 0);
+    }
+
+    /// #850 review: the storage guard looked only at a bare raise, so a raise
+    /// wrapped in its attribution got past it and was applied as a rejection.
+    #[test]
+    fn an_attributed_raise_above_this_builds_level_is_refused_when_replayed_at_open() {
+        let (_sim, env) = sim();
+        let mut log = MetaLog::open_in(&env, "/n1", cluster(), MetaLogConfig::default()).unwrap();
+        log.append(&[attributed_raise(1, ABOVE)]).unwrap();
+        drop(log);
+        let (level, supported, text) = refused(MetaStorage::open_in(&env, "/n1", cluster()));
+        assert_eq!((level, supported), (ABOVE, SUPPORTED_FEATURE_LEVEL));
+        assert!(text.contains("log entry at index 1"), "{text}");
+    }
+
+    #[test]
+    fn an_attributed_raise_above_this_builds_level_is_refused_when_applied_not_turned_into_a_rejection(
+    ) {
+        let (_sim, env) = sim();
+        let mut storage = MetaStorage::open_in(&env, "/n1", cluster()).unwrap();
+        storage.ensure_raft_applied_frontier().unwrap();
+        storage
+            .append(&[
+                raise(1, SUPPORTED_FEATURE_LEVEL),
+                attributed_raise(2, ABOVE),
+            ])
+            .unwrap();
+        let error = storage.apply_through(2).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MetaStoreError::NewerFeatureLevel {
+                    directory_level: ABOVE,
+                    supported: SUPPORTED_FEATURE_LEVEL,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        // Nothing applied and no rejection remembered: a build that supports
+        // the level applies the same entries.
+        assert_eq!(storage.last_applied(), 0);
+        assert_eq!(storage.state().feature_level(), BASELINE_FEATURE_LEVEL);
+        drop(storage);
         let reopened = MetaStorage::open_in(&env, "/n1", cluster()).unwrap();
         assert_eq!(reopened.last_applied(), 0);
     }

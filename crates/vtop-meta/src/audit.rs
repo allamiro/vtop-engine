@@ -21,11 +21,19 @@
 //! * at the **edge**, by the admin endpoint, which knows the caller's verified
 //!   certificate identity, the authorization decision and the outcome;
 //! * **applied**, by every replica's state-machine wrapper as it applies the
-//!   committed entry, with the log index (never from the pure `apply`, which
-//!   also runs when a log is replayed at open). Each replica writes one
-//!   after the entry is applied and its frontier saved, so a crash between
-//!   the two, or catching up by snapshot, leaves that replica without the
-//!   record; a reader dedupes on the log index and joins on the request id.
+//!   committed entry, with the log index and term and the entry's own
+//!   `issued_at_ms` (never from the pure `apply`, which also runs when a log
+//!   is replayed at open, and never from the replica's clock, so every
+//!   replica writes the same facts about one entry). Each replica keeps an
+//!   audit frontier, `meta.audited`, saved only after its sink accepted the
+//!   records (#706): a crash or a failed sink leaves the frontier behind,
+//!   and the records above it are delivered again - from the log, marked
+//!   `replayed` - at the next apply, by a retry every
+//!   [`AUDIT_RETRY_INTERVAL`], and at restart. Delivery is at least once; a
+//!   reader dedupes on the engine and the log index and joins on the
+//!   request id. What the log no longer holds (a snapshot install, a log
+//!   purged past a frontier that fell behind) cannot be re-derived on that
+//!   replica: one `audit.gap` record names the range instead.
 //!
 //! The actor is in the edge record only: making it durable in the
 //! replicated log is a format change of its own (a later issue).
@@ -53,7 +61,14 @@ pub enum AuditAction {
     ClusterCreateTopic,
     ClusterPropose,
     PromotionAttest,
+    /// Applied records this replica owes and cannot re-derive (#706).
+    AuditGap,
 }
+
+/// How often a node retries delivering applied records its sink refused
+/// (#706). Not a config key: the metadata role configs refuse unknown keys,
+/// and nothing about it is worth tuning.
+pub const AUDIT_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl AuditAction {
     pub fn as_str(self) -> &'static str {
@@ -64,6 +79,7 @@ impl AuditAction {
             AuditAction::ClusterCreateTopic => "cluster.create_topic",
             AuditAction::ClusterPropose => "cluster.propose",
             AuditAction::PromotionAttest => "promotion.attest",
+            AuditAction::AuditGap => "audit.gap",
         }
     }
 }
@@ -120,6 +136,17 @@ pub struct AuditRecord {
     pub request_id: Option<Uuid>,
     /// The metadata log index the entry was committed at.
     pub log_index: Option<u64>,
+    /// An applied record's entry term (#706): with the index, the entry's
+    /// identity, the same on every replica.
+    pub log_term: Option<u64>,
+    /// An applied record's entry time, as its proposer stamped it
+    /// (`issued_at_ms`), and the record's time (#706): never the replica's
+    /// clock, so every replica writes the same record. `None` for an entry
+    /// with no envelope (membership) and for records not about one entry.
+    pub issued_at_ms: Option<i64>,
+    /// Delivered again after a crash, a failed sink or a restart (#706): it
+    /// may duplicate a record this replica already wrote.
+    pub replayed: bool,
 }
 
 impl AuditRecord {
@@ -144,6 +171,38 @@ impl AuditRecord {
             reason: None,
             request_id: Some(command.envelope().request_id),
             log_index: None,
+            log_term: None,
+            issued_at_ms: None,
+            replayed: false,
+        }
+    }
+
+    /// The record of a range of applied records this replica owes and
+    /// cannot re-derive (#706): `from..=through`, and why.
+    pub fn gap(replica: Option<u64>, from: u64, through: u64, reason: GapReason) -> Self {
+        AuditRecord {
+            stage: AuditStage::Applied,
+            action: AuditAction::AuditGap,
+            actor: AuditActor::Replica(replica),
+            target_kind: "cluster",
+            target_id: None,
+            params: vec![
+                ("from_index", from.to_string()),
+                ("through_index", through.to_string()),
+                ("reason", reason.as_str().to_owned()),
+            ],
+            outcome: AuditOutcome::Failure,
+            reason: Some(format!(
+                "applied audit records for log indexes {from}..={through} may be missing on this \
+                 node ({}); the other replicas' audit files hold theirs: copy them and dedupe on \
+                 the log index",
+                reason.describe()
+            )),
+            request_id: None,
+            log_index: None,
+            log_term: None,
+            issued_at_ms: None,
+            replayed: false,
         }
     }
 
@@ -175,6 +234,9 @@ impl AuditRecord {
         if let Some(index) = self.log_index {
             line.push_str(&format!(" log_index={index}"));
         }
+        if self.replayed {
+            line.push_str(" replayed");
+        }
         if let Some(reason) = &self.reason {
             line.push_str(&format!(": {reason}"));
         }
@@ -182,11 +244,45 @@ impl AuditRecord {
     }
 }
 
+/// Why a range of applied records cannot be re-derived (#706). Closed: the
+/// `reason` label of `vtop_audit_gaps_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GapReason {
+    /// A snapshot install moved this replica past entries it never applied
+    /// one by one.
+    SnapshotInstall,
+    /// The audit frontier fell behind (a sink failing for long) and the log
+    /// was purged past it.
+    LogPurged,
+    /// Entries a snapshot brought that the attributed tail no longer holds.
+    TailEvicted,
+}
+
+impl GapReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GapReason::SnapshotInstall => "snapshot_install",
+            GapReason::LogPurged => "log_purged",
+            GapReason::TailEvicted => "tail_evicted",
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            GapReason::SnapshotInstall => "a snapshot install brought them",
+            GapReason::LogPurged => "the log was purged past them before they were delivered",
+            GapReason::TailEvicted => "the attributed tail no longer holds them",
+        }
+    }
+}
+
 /// The process's sink for cluster audit records.
 pub trait Auditor: Send + Sync {
-    /// Record it. Never blocks on the network and never fails the caller:
-    /// a sink that cannot write counts and reports that itself.
-    fn record(&self, record: &AuditRecord);
+    /// Record it. Never blocks on the network. `Err` says the record did not
+    /// reach every configured sink (an audit file that cannot be written):
+    /// an applied record is then delivered again later (#706), and an edge
+    /// record is left as the sink already reported it.
+    fn record(&self, record: &AuditRecord) -> Result<(), String>;
 }
 
 static AUDITOR: RwLock<Option<Arc<dyn Auditor>>> = RwLock::new(None);
@@ -196,12 +292,22 @@ pub fn install(auditor: Arc<dyn Auditor>) {
     *AUDITOR.write().unwrap_or_else(|e| e.into_inner()) = Some(auditor);
 }
 
-/// Hand `record` to the installed auditor, or print it on stderr.
+/// Hand `record` to the installed auditor, or print it on stderr. Best
+/// effort: a failing sink reports and counts itself.
 pub fn emit(record: &AuditRecord) {
+    let _ = deliver(record);
+}
+
+/// Hand `record` to the installed auditor (or stderr), saying whether every
+/// configured sink accepted it (#706).
+pub fn deliver(record: &AuditRecord) -> Result<(), String> {
     let auditor = AUDITOR.read().unwrap_or_else(|e| e.into_inner()).clone();
     match auditor {
         Some(auditor) => auditor.record(record),
-        None => eprintln!("{}", record.describe()),
+        None => {
+            eprintln!("{}", record.describe());
+            Ok(())
+        }
     }
 }
 
@@ -632,6 +738,9 @@ pub fn refusal(identity: &AdminIdentity, command: &MetadataCommand, reason: Stri
             reason: None,
             request_id: Some(command.envelope().request_id),
             log_index: None,
+            log_term: None,
+            issued_at_ms: None,
+            replayed: false,
         },
     };
     record.reason = Some(reason);
@@ -682,11 +791,12 @@ impl Recording {
 }
 
 impl Auditor for Recording {
-    fn record(&self, record: &AuditRecord) {
+    fn record(&self, record: &AuditRecord) -> Result<(), String> {
         self.0
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(record.clone());
+        Ok(())
     }
 }
 

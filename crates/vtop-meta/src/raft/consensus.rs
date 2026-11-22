@@ -536,6 +536,12 @@ impl OpenraftConsensus {
         &self.raft
     }
 
+    /// What this replica's applied-audit delivery has done (#706), for the
+    /// node's metrics. `None` on a façade built without applied state.
+    pub fn audit_progress(&self) -> Option<crate::raft::AuditProgressSnapshot> {
+        self.store.as_ref().map(MetaRaftStore::audit_progress)
+    }
+
     /// Where every consumer group's durable cursor stands (#571), from this
     /// node's APPLIED state, without waiting: `None` while the state machine
     /// is busy, or on a node built without applied state.

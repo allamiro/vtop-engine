@@ -300,11 +300,12 @@ jobs:
   # GATED where the maintainer's rule on #729 can be met: each file of a leg
   # with `gate` fails the job below its own threshold, which is the file's
   # measured score minus 5 points and never below 0.80 (scripts/mutants-gate.py
-  # --file-min-score). The recovery path in vtop-state is gated. REPORT ONLY
-  # where it cannot yet: vtop-upload and vtop-adapters measured 0.64 to 0.77
-  # over the nights of 2026-11-16 to 2026-11-21, under the 0.80 floor, so a
-  # gate there would fail every night until tests are added; their score is
-  # recorded in the step summary and joins the gate once it reaches 0.85.
+  # --file-min-score). The recovery path in vtop-state and the verify path in
+  # vtop-upload are gated. REPORT ONLY where it cannot yet: vtop-adapters
+  # measured 0.74 to 0.77 over the nights of 2026-11-16 to 2026-11-21, under
+  # the 0.80 floor, so a gate there would fail every night until tests are
+  # added; its score is recorded in the step summary and joins the gate once
+  # it reaches 0.85.
   #
   # The legs take up to two hours (vtop-adapters measured 110 minutes); the
   # budget leaves room for a slow runner, which the old 120 minutes did not:
@@ -319,10 +320,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Verification of an upload and the multipart resume checks.
+          # Verification of an upload and the multipart resume checks. Gated:
+          # each file's score after the tests of #729 (base.rs 107 of 109 =
+          # 0.982, multipart.rs 180 of 180 = 1.000), minus 5 points, rounded
+          # down. base.rs's two survivors are equivalent mutants (fuzz/README.md).
           - package: vtop-upload
             files: crates/vtop-upload/src/base.rs crates/vtop-upload/src/multipart.rs
-            gate: ""
+            gate: >-
+              crates/vtop-upload/src/base.rs=0.93
+              crates/vtop-upload/src/multipart.rs=0.95
           # File continuity: identity, rotation and resume across restarts.
           - package: vtop-adapters
             files: crates/vtop-adapters/src/continuity.rs crates/vtop-adapters/src/rotated.rs crates/vtop-adapters/src/file_source.rs
