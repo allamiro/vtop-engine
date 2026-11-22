@@ -451,7 +451,7 @@ leg reads one file written once.
 |---|---|---|
 | The commit rule at the source: the source's committed position never passes the end of the highest range the ledger records as VERIFIED | safety | Kafka: the group's committed offset, read from the broker (`kafka-consumer-groups.sh`), against the ledger, at the kill and again after the restart. "No committed offset" counts only when the broker said so (the offsets table without one, or the group not found); a query that failed or timed out, which the tool reports with exit status 0, is retried three times and then fails the check. File: the file's committed position is in the engine and the ledger is its durable record, so the position is the ledger's cursor (the highest SOURCE_COMMITTED end byte); that comparison cannot fail by itself, so the next two rows are what bites for a file |
 | The commit rule in the ledger: no SOURCE_COMMITTED row lacks what the VERIFIED write leaves (the verification class, which only `mark_verified` sets, the object and the manifest) | safety | the ledger read at the kill and after the restart: SQLite opened read-only, so the WAL the kill left is not checkpointed; PostgreSQL through `psql` in the server's container |
-| The order, whatever the source: at the kill the newest live ledger row is in the state the failpoint sits beside (the table above), so the engine reached the source commit only with the batch VERIFIED | safety | `KILL_STATE` in `sweep_checks.py`, a unit test holds it equal to the state table in `tests/failpoints.rs` and to the points the engine defines |
+| The order, whatever the source: at the kill a ledger row is in the state the failpoint sits beside (the table above), the newest live one when batches did not overlap, so the engine reached the source commit only with the batch VERIFIED | safety | `KILL_STATE` in `sweep_checks.py`, a unit test holds it equal to the state table in `tests/failpoints.rs` and to the points the engine defines |
 | No hole | safety | `vtopctl audit-coverage --check-storage` passes, `vtopctl scrub` is clean, and every produced record is found in the objects the store holds, copied out with `mc` and counted by the harness, not by the engine |
 | Duplicates only where the at-least-once window is open | safety | the extra copies are counted against the table below |
 | The restart commits every record and stops cleanly | liveness | bounded poll on the group's committed offset and the ledger, then `SIGTERM` and exit 0 |
@@ -461,8 +461,13 @@ leg reads one file written once.
 | `before_insert` to `after_ledger_checksummed`, and `mid_object_put` | 0 | no object of the batch is in the store yet; the replay builds it from the source |
 | every later point | one batch (`ENGINE_SWEEP_BATCH_RECORDS`, 20) | the store holds the batch's object while its range is uncommitted; a replay that cannot rebuild the same bytes writes a second object ([ARCHITECTURE](ARCHITECTURE.md) section 13, item 3) |
 
-The sweep runs one batch at a time (`batching.max_concurrent_batches: 1`), so
-the batch the kill interrupts is the only one in flight.
+The sweep runs one batch at a time through upload and verification
+(`batching.max_concurrent_batches: 1`). Batches stay in flight across cycles
+([ARCHITECTURE](ARCHITECTURE.md) section 5.2), so a batch read after the one
+the kill interrupts can already be VERIFIED and waiting for it to commit; the
+order check therefore accepts the failpoint's state on any row, not only the
+newest. Such a waiting row is committed by recovery, not replayed, so the
+extra copies allowed stay at one batch.
 
 **Running it.**
 
