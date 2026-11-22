@@ -557,7 +557,10 @@ class Runner:
             last = max(checker.parse_time(e["lastModified"]) for e in entries)
             window = max(last - started, 1e-3)
             source_bytes = result.present_unique * line_bytes
-            usage = cgroup.window(sampler.samples, started, ended)
+            # CPU and RSS over the window throughput is reported for (to the last object's LastModified), not
+            # to `ended`, which also holds the quiescence wait: a tool's idle polling after the last object
+            # would otherwise be ranked as drain cost (review of #908).
+            usage = cgroup.window(sampler.samples, started, usage_end(started, window, ended, sampler.interval))
             gib = source_bytes / 2**30
             counts = store.requests_by_method(before, after)
             counts = without_harness(counts, harness_requests)
@@ -589,6 +592,12 @@ class Runner:
             out["note"] = "; ".join(filter(None, (out.get("note"),
                 f"{len(sampler.errors)} cgroup samples failed: {sampler.errors[0][:120]}")))
         return out
+
+
+def usage_end(started: float, window: float, ended: float, interval: float) -> float:
+    """Where the drain cell's resource window ends: the throughput window's end, but never before two
+    samples can fit in it, and never after the run."""
+    return min(ended, started + max(window, 2 * interval))
 
 
 def without_harness(counts: dict[str, int], harness: dict[str, int]) -> dict[str, int]:

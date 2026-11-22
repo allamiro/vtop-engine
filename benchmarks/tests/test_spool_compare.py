@@ -385,6 +385,15 @@ def test_the_harness_polling_is_taken_out_of_the_tools_request_counts():
                                                     "DELETE": 0, "OTHER": 0}
 
 
+def test_the_drain_resource_window_ends_with_the_throughput_window_not_the_quiescence_wait():
+    # Review of #908: the run ends 75 s of idle polling after the last object; CPU and RSS are accounted to the
+    # last object, the window throughput is reported for.
+    assert run.usage_end(1000.0, 120.0, 1195.0, 0.5) == 1120.0
+    # A drain too short to hold two samples still gets two; and the window never outlasts the run.
+    assert run.usage_end(1000.0, 0.001, 1195.0, 0.5) == 1001.0
+    assert run.usage_end(1000.0, 500.0, 1195.0, 0.5) == 1195.0
+
+
 def test_a_live_run_that_lost_lines_did_not_sustain_its_rate():
     assert run.live_sustained(100.0, 100.0, 0)
     assert not run.live_sustained(100.0, 100.0, 9)  # every line accepted, nine never delivered
