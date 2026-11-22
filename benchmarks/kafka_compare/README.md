@@ -247,10 +247,10 @@ the in-sync replicas have it in their page cache. `crash.py` kills the whole rep
 acknowledged records that are missing afterwards, for Kafka as shipped, Kafka made to fsync, and VTOP.
 
 ```bash
-# The short profile: 2 crashes per cell, both modes, SIGKILL and power-loss, about 15 minutes on a 4-vCPU VM.
+# The short profile: 2 crashes per cell, both modes, SIGKILL and power-loss, about 20 minutes on a 4-vCPU VM.
 python3 benchmarks/kafka_compare/crash.py --smoke --setup-flakey 8192
 
-# The full run on a dedicated Linux host (see below): about 1 hour.
+# The full run on a dedicated Linux host (see below): 3 configurations x 14 power-loss crashes, projected at 0.97 h.
 python3 benchmarks/kafka_compare/crash.py --setup-flakey 10240 --teardown-flakey \
     --crashes 14 --modes flakey-drop --max-hours 1.5
 
@@ -259,6 +259,12 @@ python3 benchmarks/kafka_compare/crash.py --setup-flakey 10240 --teardown-flakey
 python3 benchmarks/kafka_compare/crash.py --check benchmarks/kafka_compare/results/<run-id>
 python3 benchmarks/kafka_compare/crash.py --resume <run-id> --crashes 14 --modes flakey-drop
 ```
+
+The projection (`crash_schema.projected_seconds`, checked against `--max-hours` before any container starts, and again
+before every crash) uses per-crash timings measured on the smoke run: a Kafka crash takes about 46 s and a VTOP crash
+about 21 s beyond its trigger (mean 40 s in the default window), so a crash index of the three configurations takes
+about 4 minutes and 14 of them about an hour; the full length was not run. The issue's 30 crashes per configuration
+are `--crashes 30` (2.1 h), and a `sigkill` control for them doubles that.
 
 **The host.** One Linux machine with Docker Engine (Compose v2), a user in the `docker` group with passwordless
 `sudo` (the harness runs only `crash/powercut.sh` through `sudo -n`; run it as root and git will want
@@ -291,8 +297,12 @@ configuration and mode sees the same schedule) write the unsynced canary and:
 4. read the canaries: the fsynced one must be whole; the unsynced one must be absent or short in `flakey-drop` and whole
    in `sigkill`, or the crash is a `refused` row (kept, with the reason) and not an `ok` one;
 5. `docker compose up`; wait until ListOffsets is served (the first served read); read the whole partition
-   (`read_missing_before_sentinel`); produce a **sentinel** record and wait for its acknowledgement; read the whole
-   partition again: that read decides the loss, `acked_lost`. `sentinel_needed` says the two differ.
+   (`read_missing_before_sentinel`); produce a **sentinel** record with `acks=all` and wait until the partition's end
+   offset has moved past what it was; read the whole partition again: that read decides the loss, `acked_lost`.
+   `sentinel_needed` says the two reads differ, that is, that records acknowledged before the crash were not served
+   until a new write was committed (a restarted leader serves what is cluster-committed, so a read straight after a
+   whole-set restart can be short without anything being lost on disk). `served_end_before_sentinel` and
+   `served_end_after_sentinel` are the end offsets ListOffsets reported.
 
 The client is the same for both systems: `kafka-verifiable-producer.sh` from the pinned apache/kafka image,
 `acks=all`, idempotence on, at a fixed offered rate (default 1,000 records/s), bootstrapped at all three Kafka brokers
@@ -322,6 +332,10 @@ The method is not the issue's first choice (`echo b > /proc/sysrq-trigger` in a 
 client outside it): that needs a second machine for the client, and the harness here is one process on one host. The
 two agree on what they simulate (the guest's page cache is lost and what an fsync returned for is kept); the issue's
 calibration of one against the other is not done here.
+
+**A restart that never serves is a row, not a stop.** If the cluster does not serve a write within 120 s of the
+restart (the sentinel's deadline), the crash is a `failed` row with `needed_manual_repair` true and the reason in
+`note`; the harness never repairs a cluster, and its node logs are kept under `logs/`. The run goes on.
 
 **A run that looks wrong stops.** If Kafka's defaults lose nothing in `--suspect-after` (5) `flakey-drop` crashes, the
 method is probably not dropping the page cache, and the run stops (exit 3) with that said, before any chart.

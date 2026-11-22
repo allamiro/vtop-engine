@@ -133,17 +133,18 @@ def expected_keys(matrix: dict[str, Any]) -> set[tuple[str, str, int]]:
 
 
 # Seconds per step of one crash, beyond the trigger. Measured on the smoke run (a 4-vCPU Linux VM, one CPU per
-# node): a Kafka crash took 45 s and a VTOP crash 20 s beyond its trigger; the figures here are rounded up and
-# carry the sentinel's producer and the end-offset polls, each a JVM start. `bring_up` is the fresh cluster and
-# the topic, `warm_up` the producer's start, `restore` the filesystem's drop and remount (power-loss mode only),
-# `restart` the cluster back after the crash, `readback` the reads of the partition, `teardown` the cluster's removal.
+# node): a Kafka crash took 46 s on average (51 at most) beyond its trigger, a VTOP crash that restarted 21 s; a
+# VTOP restart that never serves ends at the sentinel's 120 s deadline, which is why `restart` for VTOP carries
+# an allowance. `bring_up` is the fresh cluster and the topic, `warm_up` the producer's start, `restore` the
+# filesystem's drop and remount (power-loss mode only), `restart` the cluster back after the crash, `readback` the
+# reads of the partition, `teardown` the cluster's removal.
 DEFAULT_TIMING = {
-    "bring_up": {"kafka": 24.0, "vtop": 10.0},
+    "bring_up": {"kafka": 22.0, "vtop": 8.0},
     "warm_up": 4.0,
     "restore": {"sigkill": 1.0, "flakey-drop": 4.0},
-    "restart": {"kafka": 12.0, "vtop": 4.0},
-    "readback": {"kafka": 12.0, "vtop": 8.0},
-    "teardown": {"kafka": 6.0, "vtop": 4.0},
+    "restart": {"kafka": 8.0, "vtop": 3.0},
+    "readback": {"kafka": 10.0, "vtop": 4.0},
+    "teardown": {"kafka": 4.0, "vtop": 3.0},
 }
 
 
