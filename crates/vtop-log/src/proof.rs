@@ -75,6 +75,7 @@ pub fn tree_root(leaves: &[blake3::Hash]) -> blake3::Hash {
 
 /// Incrementally split a byte stream into `chunk_size` chunks and hash each
 /// chunk into a leaf. The final chunk may be short.
+#[derive(Clone)]
 pub struct ChunkTreeBuilder {
     chunk_size: usize,
     pending: Vec<u8>,

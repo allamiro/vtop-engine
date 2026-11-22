@@ -1,0 +1,17 @@
+# aws-cli for the link comparison (#747): the shared config file
+# (AWS_CONFIG_FILE). At the `defaults` cell nothing below changes a transfer
+# setting: max_concurrent_requests (10), multipart_threshold (8MB),
+# multipart_chunksize (8MB) and the retry mode stay the shipped ones
+# (https://awscli.amazonaws.com/v2/documentation/api/latest/topic/s3-config.html).
+# run.py appends an `s3 =` block for equal-conns and tuned cells; the values are
+# in the row's `settings` column.
+# telemetry: none to turn off. aws-cli v2 sends no usage reporting; the only
+# client identification is the User-Agent header every SDK sends.
+[default]
+# region: the lab MinIO ignores it; SigV4 needs one
+# (https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-files.html).
+region = us-east-1
+# s3.addressing_style path: MinIO serves path-style buckets
+# (https://awscli.amazonaws.com/v2/documentation/api/latest/topic/s3-config.html).
+s3 =
+  addressing_style = path

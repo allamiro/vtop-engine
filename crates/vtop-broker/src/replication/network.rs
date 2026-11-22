@@ -21,13 +21,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
-use tokio::time::{sleep, timeout};
+use tokio::time::{sleep, timeout, timeout_at};
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use uuid::Uuid;
 use vtop_meta::transport::{
-    judge_dialect, tls_handshake_hint, warn_rate_limited, with_tls_handshake_hint, DialectVerdict,
-    MaybeTls,
+    judge_dialect, tls_handshake_hint, warn_rate_limited, with_tls_handshake_hint, ConnectionLimit,
+    DialectVerdict, MaybeTls, DEFAULT_MAX_REPLICA_CONNECTIONS,
 };
 use vtop_protocol::{
     read_frame, write_frame, CommittedHwmUpdate, ErrorCode, ErrorResponse, Message, ProtocolError,
@@ -153,7 +153,51 @@ pub trait LeaderLineage: Send + Sync {
     /// `None` while this leader holds no live grant at the epoch it would
     /// fence at. May block briefly; the driver calls it off the runtime.
     fn leader_lineage(&self) -> Option<LeaderLineageSnapshot>;
+
+    /// Read this leader's own log from `from`, as appends a follower can
+    /// apply, for a follower whose gap the session's retransmission buffer
+    /// does not cover (#881). At most about `max_bytes` of record payload.
+    ///
+    /// The default reads nothing, which leaves such a follower exactly where
+    /// it was before log catch-up existed. May block briefly; the driver
+    /// calls it off the runtime.
+    fn read_catch_up(&self, from: u64, max_bytes: usize) -> CatchUpRead {
+        let _ = (from, max_bytes);
+        CatchUpRead::Unavailable("this leader cannot read its log for catch-up".to_owned())
+    }
 }
+
+/// What a leader's log holds for a follower behind it (#881). See
+/// [`LeaderLineage::read_catch_up`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CatchUpRead {
+    /// The next appends, contiguous from the offset asked for, at the
+    /// leader's current epoch.
+    Appends(Vec<ReplicaAppendRequest>),
+    /// The leader holds nothing at or above the offset asked for that is
+    /// not already durable on the follower.
+    UpToDate,
+    /// Retention reclaimed the offset asked for: the log starts at
+    /// `log_start`, so no append can close the gap. The follower needs a
+    /// rebuild (`vtopctl node repair`) — the catch-up horizon is this
+    /// leader's log start.
+    BelowLogStart { log_start: u64 },
+    /// Not readable now: no live grant at the epoch this leader serves, a
+    /// v1 range, or a storage error. The session goes on as it would have
+    /// without log catch-up.
+    Unavailable(String),
+}
+
+/// The most records one catch-up read returns, well inside one replica
+/// frame's record limit.
+const CATCH_UP_MAX_RECORDS: usize = 1_024;
+
+/// Payload bytes one catch-up read aims for, well inside one replica frame.
+const CATCH_UP_MAX_BYTES: usize = 1024 * 1024;
+
+/// The most one record read alone may take: what one replica frame carries,
+/// less room for the frame around it.
+const CATCH_UP_MAX_SINGLE_RECORD_BYTES: usize = DEFAULT_MAX_FRAME_BYTES as usize - 64 * 1024;
 
 impl LeaderLineage for crate::LocalBroker {
     fn leader_lineage(&self) -> Option<LeaderLineageSnapshot> {
@@ -187,6 +231,211 @@ impl LeaderLineage for crate::LocalBroker {
             epoch_starts: self.epoch_starts(),
         })
     }
+
+    fn read_catch_up(&self, from: u64, max_bytes: usize) -> CatchUpRead {
+        // A v1 frame stores the producer identity MERGED with its epoch, and
+        // the merge is a hash: the log no longer holds the identity a
+        // replica append must carry, so its records cannot be re-sent.
+        if self.segment_format() == crate::SegmentFormat::V1 {
+            return CatchUpRead::Unavailable(
+                "a v1 range stores producer identities merged with their epochs, so its records \
+                 cannot be re-sent as appends"
+                    .to_owned(),
+            );
+        }
+        // Lock order: the lease view, then the state, as on the produce
+        // path. Held through the read, so every record goes out under an
+        // epoch this broker served it under and no grant can move between
+        // the check and the read.
+        let meta = self.meta_fencing_epoch().lock();
+        let fencing_epoch = self.held_fencing_epoch();
+        if !meta.lease_active || meta.fencing_epoch != fencing_epoch {
+            return CatchUpRead::Unavailable(format!(
+                "this leader holds no live grant at epoch {fencing_epoch}"
+            ));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let log_start = state.segment.base_offset();
+        if from < log_start {
+            return CatchUpRead::BelowLogStart { log_start };
+        }
+        // Only what this leader holds durably: a follower is never handed a
+        // record its leader could still lose to a crash.
+        let committed = state.segment.committed_offset();
+        if from >= committed {
+            return CatchUpRead::UpToDate;
+        }
+        // A record larger than one read's target still goes, alone (review):
+        // the produce path admits any record one replica frame can carry,
+        // and a catch-up that could not pass one would strand the follower
+        // in front of it.
+        let fetched = state
+            .segment
+            .fetch_through(from, max_bytes.max(1), CATCH_UP_MAX_RECORDS, committed)
+            .and_then(|fetched| {
+                if fetched.records.is_empty() {
+                    state.segment.fetch_through(
+                        from,
+                        CATCH_UP_MAX_SINGLE_RECORD_BYTES,
+                        1,
+                        committed,
+                    )
+                } else {
+                    Ok(fetched)
+                }
+            });
+        let fetched = match fetched {
+            Ok(fetched) => fetched,
+            Err(vtop_log::LogError::OffsetBelowRange { earliest, .. }) => {
+                return CatchUpRead::BelowLogStart {
+                    log_start: earliest,
+                }
+            }
+            Err(problem) => {
+                return CatchUpRead::Unavailable(format!("reading the log failed: {problem}"))
+            }
+        };
+        // The group bound the range's appends were written under: a rebuilt
+        // append may not exceed it, or the follower refuses it as the
+        // oversized group no producer ever sent (#881 soak).
+        // And one group must fit one segment: the follower rolls once for a
+        // group that does not fit its tail, never splits it (review).
+        let (max_group_bytes, max_group_records) =
+            state
+                .segment
+                .active()
+                .config_v2()
+                .map_or((u64::MAX, u64::MAX), |config| {
+                    (
+                        config.max_group_bytes.min(config.max_segment_bytes),
+                        config.max_segment_records,
+                    )
+                });
+        drop(state);
+        drop(meta);
+        let appends = appends_from_log(
+            self.range(),
+            fencing_epoch,
+            self.node_id(),
+            from,
+            &fetched.records,
+            GroupBound {
+                bytes: max_group_bytes,
+                records: max_group_records,
+            },
+        );
+        if appends.is_empty() {
+            return CatchUpRead::Unavailable(format!(
+                "the record at offset {from} cannot be re-sent as a replica append"
+            ));
+        }
+        CatchUpRead::Appends(appends)
+    }
+}
+
+/// The most one rebuilt append may carry: what one group of the range may
+/// hold and one segment can take, by encoded bytes and by records.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GroupBound {
+    pub(crate) bytes: u64,
+    pub(crate) records: u64,
+}
+
+/// The part of `appends` below `end`, where the queued stream resumes
+/// (#881, review). An append straddling `end` is cut at it, not kept whole:
+/// kept whole it would carry the follower into the middle of the queued
+/// append, which the follower then refuses for ever (its base below the
+/// follower's tip, its end not yet durable there).
+pub(crate) fn appends_below(
+    appends: Vec<ReplicaAppendRequest>,
+    end: u64,
+) -> Vec<ReplicaAppendRequest> {
+    appends
+        .into_iter()
+        .filter_map(|mut append| {
+            let room = end.checked_sub(append.expected_base_offset)?;
+            if room == 0 {
+                return None;
+            }
+            append
+                .records
+                .truncate(usize::try_from(room).unwrap_or(usize::MAX));
+            Some(append)
+        })
+        .collect()
+}
+
+/// Group records read from a leader's log into the replica appends that
+/// wrote them: one request per run of records with the same producer, the
+/// same producer epoch, and consecutive sequences — the shape a produce
+/// replicates, so the follower validates them exactly as it validated the
+/// original (#881).
+///
+/// Stops at the first record no replica append can carry (a non-zero
+/// attribute byte: the wire record has none) or the first gap in offsets,
+/// so the result is always a contiguous run from `from`. A run is also cut
+/// where it would pass `bound`, the limits every group in the range was
+/// appended under: consecutive produces from one producer are one run in
+/// the log but were never one group.
+pub(crate) fn appends_from_log(
+    range: &RangeIdentity,
+    fencing_epoch: u64,
+    leader_node_id: Uuid,
+    from: u64,
+    records: &[vtop_log::FetchedRecord],
+    bound: GroupBound,
+) -> Vec<ReplicaAppendRequest> {
+    let mut appends: Vec<ReplicaAppendRequest> = Vec::new();
+    let mut group_bytes = 0_u64;
+    for (index, fetched) in records.iter().enumerate() {
+        let record = &fetched.record;
+        if Some(fetched.offset) != from.checked_add(index as u64) || record.attributes != 0 {
+            break;
+        }
+        let wire = vtop_protocol::ProduceRecord {
+            timestamp_millis: record.timestamp_millis,
+            key: record.key.clone(),
+            value: record.value.clone(),
+        };
+        let encoded = vtop_log::RECORD_FRAME_OVERHEAD_BYTES_V2
+            .saturating_add(record.key.len() as u64)
+            .saturating_add(record.value.len() as u64);
+        let extends = appends.last().is_some_and(|last| {
+            last.producer_id == record.producer_id
+                && last.producer_epoch == record.producer_epoch
+                && last
+                    .first_sequence
+                    .checked_add(last.records.len() as u64)
+                    .is_some_and(|next| next == record.sequence)
+        }) && group_bytes.saturating_add(encoded) <= bound.bytes
+            && appends
+                .last()
+                .is_some_and(|last| (last.records.len() as u64) < bound.records);
+        if extends {
+            group_bytes = group_bytes.saturating_add(encoded);
+            appends
+                .last_mut()
+                .expect("checked above")
+                .records
+                .push(wire);
+        } else {
+            group_bytes = encoded;
+            appends.push(ReplicaAppendRequest {
+                range: range.clone(),
+                fencing_epoch,
+                leader_node_id,
+                expected_base_offset: fetched.offset,
+                producer_id: record.producer_id,
+                producer_epoch: record.producer_epoch,
+                first_sequence: record.sequence,
+                records: vec![wire],
+            });
+        }
+    }
+    appends
 }
 
 /// Apply surface hosted by a follower peer server.
@@ -414,6 +663,9 @@ pub struct ReplicaPeerServer {
     /// The finalized level dialers are held to (#634); unknown until the
     /// node that owns this server reads one.
     cluster_level: super::version::ClusterFeatureLevel,
+    /// How many connections are served at once (#732, R7), as the native
+    /// plane caps its sessions.
+    limit: Arc<ConnectionLimit>,
 }
 
 impl ReplicaPeerServer {
@@ -428,6 +680,7 @@ impl ReplicaPeerServer {
             handler,
             exposure: PlaintextExposure::LoopbackOnly,
             cluster_level: super::version::ClusterFeatureLevel::unknown(),
+            limit: Arc::new(ConnectionLimit::replica(DEFAULT_MAX_REPLICA_CONNECTIONS)),
         })
     }
 
@@ -437,6 +690,31 @@ impl ReplicaPeerServer {
     pub fn with_cluster_level(mut self, level: super::version::ClusterFeatureLevel) -> Self {
         self.cluster_level = level;
         self
+    }
+
+    /// Serve at most `max` connections at once (#732, R7); the default is
+    /// [`DEFAULT_MAX_REPLICA_CONNECTIONS`]. A connection over the cap is
+    /// closed at accept and counted on [`ReplicaPeerServer::connection_limit`].
+    pub fn with_max_connections(mut self, max: usize) -> Self {
+        self.limit = Arc::new(
+            ConnectionLimit::replica(max).with_handshake_deadline(self.limit.handshake_deadline()),
+        );
+        self
+    }
+
+    /// Close a connection that has not sent its first frame within
+    /// `deadline` of accept (default
+    /// [`vtop_meta::transport::DEFAULT_HANDSHAKE_DEADLINE`]), so a silent
+    /// socket cannot hold a slot.
+    pub fn with_handshake_deadline(mut self, deadline: Duration) -> Self {
+        self.limit =
+            Arc::new(ConnectionLimit::replica(self.limit.max()).with_handshake_deadline(deadline));
+        self
+    }
+
+    /// The cap and its refusal count, for the node's metrics.
+    pub fn connection_limit(&self) -> Arc<ConnectionLimit> {
+        Arc::clone(&self.limit)
     }
 
     /// A replica endpoint with NO TLS, on loopback only (#294 slice 3).
@@ -493,6 +771,7 @@ impl ReplicaPeerServer {
             handler,
             exposure: PlaintextExposure::LoopbackOnly,
             cluster_level: super::version::ClusterFeatureLevel::unknown(),
+            limit: Arc::new(ConnectionLimit::replica(DEFAULT_MAX_REPLICA_CONNECTIONS)),
         }
     }
 
@@ -575,19 +854,29 @@ impl ReplicaPeerServer {
                             });
                         }
                     };
+                    // Over the cap: closed now, before the handshake, and
+                    // counted (#732, R7).
+                    let Some(slot) = self.limit.admit(peer) else {
+                        drop(tcp);
+                        continue;
+                    };
                     let acceptor = self.acceptor.clone();
                     let handler = Arc::clone(&self.handler);
                     let version = super::version::ReplicaVersionPolicy::new(
                         self.local_id,
                         self.cluster_level.clone(),
                     );
+                    let limit = Arc::clone(&self.limit);
                     connections.spawn(async move {
+                        let _slot = slot;
                         // A session that ends on a protocol refusal is SAID
                         // (#453): the leader on the other end sees only a
                         // missing ack, and without this line nobody sees why.
                         // Ordinary ends — a leader gone, a reset — stay quiet,
                         // as before.
-                        match serve_follower_connection(acceptor, tcp, handler, version).await {
+                        match serve_follower_connection(acceptor, tcp, handler, version, &limit, peer)
+                            .await
+                        {
                             // A leader gone, a reset: an ordinary end, quiet.
                             Ok(()) | Err(crate::BrokerError::Protocol(ProtocolError::Io(_))) => {}
                             Err(crate::BrokerError::Protocol(ProtocolError::Limit(what))) => {
@@ -635,32 +924,45 @@ async fn serve_follower_connection(
     tcp: TcpStream,
     handler: Arc<dyn ReplicaPeerHandler>,
     version: super::version::ReplicaVersionPolicy,
+    limit: &ConnectionLimit,
+    peer: SocketAddr,
 ) -> BrokerResult<()> {
-    // Judged before the handshake or the first frame (#294 slice 6): a peer
-    // speaking the other transport is refused by name instead of failing as
-    // a bad magic here and a reset there.
-    let verdict = judge_dialect(&tcp, "replica", "replica_transport", acceptor.is_some())
-        .await
-        .map_err(|source| crate::BrokerError::Io {
-            path: std::path::PathBuf::from("replica-peer-accept"),
-            source,
-        })?;
-    if let DialectVerdict::Refused(message) = verdict {
-        return Err(crate::BrokerError::CrossMode(message));
-    }
-    let mut stream = match acceptor {
-        Some(acceptor) => {
-            let tls = acceptor
-                .accept(tcp)
-                .await
-                .map_err(|source| crate::BrokerError::Io {
-                    path: std::path::PathBuf::from("replica-peer-accept"),
-                    source,
-                })?;
-            MaybeTls::Tls(Box::new(tls.into()))
+    // One deadline from accept to the first frame (#732): the connection
+    // holds a slot, and one that never speaks must not hold it forever.
+    let deadline = tokio::time::Instant::now() + limit.handshake_deadline();
+    let established = tokio::time::timeout_at(deadline, async {
+        // Judged before the handshake or the first frame (#294 slice 6): a
+        // peer speaking the other transport is refused by name instead of
+        // failing as a bad magic here and a reset there.
+        let verdict = judge_dialect(&tcp, "replica", "replica_transport", acceptor.is_some())
+            .await
+            .map_err(|source| crate::BrokerError::Io {
+                path: std::path::PathBuf::from("replica-peer-accept"),
+                source,
+            })?;
+        if let DialectVerdict::Refused(message) = verdict {
+            return Err(crate::BrokerError::CrossMode(message));
         }
-        None => MaybeTls::Plain(tcp),
+        Ok(match acceptor {
+            Some(acceptor) => {
+                let tls = acceptor
+                    .accept(tcp)
+                    .await
+                    .map_err(|source| crate::BrokerError::Io {
+                        path: std::path::PathBuf::from("replica-peer-accept"),
+                        source,
+                    })?;
+                MaybeTls::Tls(Box::new(tls.into()))
+            }
+            None => MaybeTls::Plain(tcp),
+        })
+    })
+    .await;
+    let Ok(established) = established else {
+        limit.handshake_expired(peer);
+        return Ok(());
     };
+    let mut stream = established?;
     // `None` here means the plane is plaintext and NO identity exists — not
     // that a certificate was unreadable, which stays an error. The two want
     // opposite treatment, and `dispatch_replica_frame` is where that is spent.
@@ -674,7 +976,11 @@ async fn serve_follower_connection(
     // `session` is the version the session runs at: what a later wire
     // change (one only a peer at a newer protocol may be sent) branches on,
     // and what every later frame is judged by.
-    let (mut first, session) = match read_frame(&mut stream, REPLICA_LIMITS).await {
+    let Ok(opening) = timeout_at(deadline, read_frame(&mut stream, REPLICA_LIMITS)).await else {
+        limit.handshake_expired(peer);
+        return Ok(());
+    };
+    let (mut first, session) = match opening {
         Ok(Some(frame)) => {
             match super::version::accept_session(&mut stream, frame, &version).await? {
                 super::version::Accepted::Hello(peer) => (None, peer),
@@ -1112,6 +1418,7 @@ impl NetworkedReplicaSet {
                 node_id: config.node_id,
                 durable_offset: AtomicU64::new(0),
                 connected: AtomicBool::new(false),
+                below_catch_up_horizon: AtomicBool::new(false),
                 protocol: AtomicU16::new(0),
                 cmd_tx,
                 hwm_tx,
@@ -1198,6 +1505,17 @@ impl NetworkedReplicaSet {
     /// The replica protocol `node_id`'s latest session negotiated (#634):
     /// [`vtop_protocol::REPLICA_PROTOCOL_LEGACY`] for a follower that
     /// predates the handshake, 0 before any session opened.
+    /// Whether this follower is behind the leader's catch-up horizon — durable
+    /// only below the leader's log start, where retention has reclaimed the
+    /// records it lacks and no append can catch it up (#881). `None` for a
+    /// node that is not one of this set's followers.
+    pub fn follower_below_catch_up_horizon(&self, node_id: Uuid) -> Option<bool> {
+        self.followers
+            .iter()
+            .find(|follower| follower.node_id == node_id)
+            .map(|follower| follower.below_catch_up_horizon.load(Ordering::SeqCst))
+    }
+
     pub fn follower_protocol(&self, node_id: Uuid) -> Option<u16> {
         self.followers
             .iter()
@@ -1305,6 +1623,10 @@ struct FollowerChannel {
     node_id: Uuid,
     durable_offset: AtomicU64,
     connected: AtomicBool,
+    /// Set when the follower is durable only below this leader's log start,
+    /// where no append can reach it (#881); cleared once a session catches
+    /// it up. Exported as `vtop_broker_follower_below_catch_up_horizon`.
+    below_catch_up_horizon: AtomicBool,
     /// The replica protocol the current session negotiated (#634); 0 before
     /// the first session.
     protocol: AtomicU16,
@@ -1787,6 +2109,25 @@ impl FollowerDriver {
                     // actually re-sent, so every byte is charged exactly once
                     // while it occupies the retransmission buffer.
                     drain_retransmission_to_pending(pending, retransmission, retransmission_bytes);
+                    // What the buffer cannot cover, the log can (#881) -
+                    // to a follower this session fenced, and only to one:
+                    // the fence is what reconciled its log against this
+                    // leader's (#641) and gave it the history the records
+                    // are filed under (#640). An unfenced (plaintext) session
+                    // keeps the buffer-only behaviour it had.
+                    if session_fence == SessionFence::Reconciled {
+                        if let Err(outcome) = self
+                            .catch_up_from_log(
+                                &mut stream,
+                                next_request_id,
+                                status.local_committed_offset,
+                                pending,
+                            )
+                            .await
+                        {
+                            return outcome;
+                        }
+                    }
                 }
                 _ => return SessionOutcome::Disconnected,
             }
@@ -2062,6 +2403,190 @@ impl FollowerDriver {
                 );
                 false
             }
+        }
+    }
+
+    /// Close the gap between where the follower is and where this session's
+    /// stream resumes, from this leader's own log (#881).
+    ///
+    /// The retransmission buffer holds only what THIS session's driver sent.
+    /// A follower missing records this leader never streamed to it — a
+    /// deposed leader that missed what its successor received while it was
+    /// itself a follower, or any follower behind a leader whose buffer was
+    /// born empty at its promotion or restart — had no way back: every
+    /// append failed the follower's base-offset check, the session
+    /// re-synchronised, and the status probe found nothing in the buffer to
+    /// resend, for ever. Under retention it then fell below every peer's log
+    /// start and the range ran a replica short.
+    ///
+    /// Runs only on a session this leader fenced, after the status probe, so
+    /// the follower has already reconciled against this leader (#641) and
+    /// taken its history (#640): the records sent here are filed under the epochs that wrote
+    /// them, exactly as retransmitted ones are, and a suffix it kept in
+    /// dispute (#611) is settled by the first append over it. Records go out
+    /// in order from the offset the follower reported, as appends at this
+    /// leader's epoch, each awaited before the next; the follower applies
+    /// them through its ordinary append path, so every check that path makes
+    /// still holds. Bounded by the follower's catch-up budget and by where
+    /// the queued stream begins, so it never resends what the stream will.
+    ///
+    /// A follower below this leader's log start cannot be caught up by any
+    /// append; it is flagged (`below_catch_up_horizon`) and needs a rebuild.
+    async fn catch_up_from_log(
+        &self,
+        stream: &mut MaybeTls<TcpStream>,
+        next_request_id: &mut u64,
+        follower_committed: u64,
+        pending: &VecDeque<FollowerCmd>,
+    ) -> Result<(), SessionOutcome> {
+        let Some(leader) = self.lineage.leader.get().and_then(std::sync::Weak::upgrade) else {
+            return Ok(());
+        };
+        // Where the queued stream resumes; everything below it is this
+        // read's to send, and nothing at or above it.
+        let resume_at = pending
+            .iter()
+            .filter_map(|cmd| match cmd {
+                FollowerCmd::Replicate { requests, .. } => {
+                    requests.first().map(|request| request.expected_base_offset)
+                }
+                FollowerCmd::DropConnection => None,
+            })
+            .min()
+            .unwrap_or(u64::MAX);
+        let mut from = follower_committed;
+        while from < resume_at {
+            let read = {
+                let leader = Arc::clone(&leader);
+                match timeout(
+                    self.flow.ack_timeout,
+                    tokio::task::spawn_blocking(move || {
+                        leader.read_catch_up(from, CATCH_UP_MAX_BYTES)
+                    }),
+                )
+                .await
+                {
+                    Ok(Ok(read)) => read,
+                    _ => return Ok(()),
+                }
+            };
+            let appends = match read {
+                CatchUpRead::Appends(appends) => appends,
+                CatchUpRead::UpToDate => break,
+                CatchUpRead::BelowLogStart { log_start } => {
+                    self.channel
+                        .below_catch_up_horizon
+                        .store(true, Ordering::SeqCst);
+                    warn_rate_limited(
+                        "replica-catch-up",
+                        &format!(
+                            "replica {} at {}: it is durable only through offset {from}, below \
+                             this leader's log start {log_start}; retention reclaimed the \
+                             records it lacks, so no append can catch it up and it stays out \
+                             of the quorum. Rebuild it from this leader (`vtopctl node \
+                             repair`); see the replica-below-catch-up-horizon runbook (#881)",
+                            self.channel.node_id, self.config.addr
+                        ),
+                    );
+                    return Ok(());
+                }
+                CatchUpRead::Unavailable(reason) => {
+                    warn_rate_limited(
+                        "replica-catch-up",
+                        &format!(
+                            "replica {} at {}: it is durable only through offset {from} and \
+                             this leader could not read its log to catch it up ({reason}); \
+                             retrying on the next session (#881)",
+                            self.channel.node_id, self.config.addr
+                        ),
+                    );
+                    return Ok(());
+                }
+            };
+            let mut appends = appends_below(appends, resume_at);
+            if appends.is_empty() {
+                break;
+            }
+            // Within the catch-up budget, shared with the retransmission
+            // buffer (review): a frame that does not fit sheds its last
+            // appends until it does, so a small budget means smaller steps,
+            // not a follower that can never be caught up. Only a single
+            // append larger than the whole budget waits for the next session.
+            let mut bytes = approx_batch_bytes(&appends);
+            while self.budget.try_charge_catch_up(bytes as u64).is_err() {
+                if appends.len() <= 1 {
+                    return Ok(());
+                }
+                appends.truncate(appends.len().div_ceil(2));
+                bytes = approx_batch_bytes(&appends);
+            }
+            let end = appends.last().map_or(from, |last| {
+                last.expected_base_offset + last.records.len() as u64
+            });
+            let outcome = self.send_catch_up(stream, next_request_id, appends).await;
+            self.budget.release_catch_up(bytes as u64);
+            let durable = outcome?;
+            self.channel
+                .durable_offset
+                .fetch_max(durable, Ordering::SeqCst);
+            if durable < end || durable <= from {
+                // Acked short of what was sent: the follower is not taking
+                // these, and resending them would only spin.
+                return Err(SessionOutcome::Disconnected);
+            }
+            from = durable;
+        }
+        self.channel
+            .below_catch_up_horizon
+            .store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// One catch-up frame, awaited: the follower's durable offset after it.
+    async fn send_catch_up(
+        &self,
+        stream: &mut MaybeTls<TcpStream>,
+        next_request_id: &mut u64,
+        appends: Vec<ReplicaAppendRequest>,
+    ) -> Result<u64, SessionOutcome> {
+        let request_id = *next_request_id;
+        *next_request_id = next_request_id.wrapping_add(1);
+        let message = if appends.len() == 1 {
+            Message::ReplicaAppendRequest(appends.into_iter().next().expect("one append"))
+        } else {
+            Message::ReplicaAppendBatchRequest(ReplicaAppendBatchRequest { requests: appends })
+        };
+        let frame = WireFrame {
+            request_id,
+            stream_id: 0,
+            message,
+        };
+        if write_frame(stream, &frame, REPLICA_LIMITS).await.is_err() {
+            return Err(SessionOutcome::Disconnected);
+        }
+        let reply = match timeout(self.flow.ack_timeout, read_frame(stream, REPLICA_LIMITS)).await {
+            Ok(Ok(Some(reply))) => reply,
+            _ => return Err(SessionOutcome::Disconnected),
+        };
+        if reply.request_id != request_id {
+            return Err(SessionOutcome::Disconnected);
+        }
+        match reply.message {
+            Message::ReplicaAppendResponse(ReplicaAppendResponse {
+                local_committed_offset,
+            }) => Ok(local_committed_offset),
+            Message::Error(ErrorResponse { code, message, .. }) => {
+                warn_rate_limited(
+                    "replica-catch-up",
+                    &format!(
+                        "replica {} at {}: it refused a catch-up append from this leader's \
+                         log ({code:?}: {message}); the session is retried (#881)",
+                        self.channel.node_id, self.config.addr
+                    ),
+                );
+                Err(SessionOutcome::Disconnected)
+            }
+            _ => Err(SessionOutcome::Disconnected),
         }
     }
 
@@ -2837,6 +3362,115 @@ mod tests {
     use crate::memory_budget::MemoryBudgetConfig;
     use vtop_protocol::{ProduceRecord, RangeIdentity};
 
+    /// #732 (R7): the replica plane serves at most `max_replica_connections`,
+    /// as the native plane caps its sessions. The connection over the cap is
+    /// closed at accept and counted, the open one is untouched, and a freed
+    /// slot is served again.
+    #[tokio::test]
+    async fn a_replica_connection_over_the_cap_is_closed_and_counted() {
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+        struct Silent;
+        impl ReplicaPeerHandler for Silent {
+            fn node_id(&self) -> Uuid {
+                Uuid::from_u128(1)
+            }
+            fn apply_append(
+                &self,
+                _: &ReplicaAppendRequest,
+            ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
+                unreachable!("no frame is sent")
+            }
+            fn apply_append_batch(
+                &self,
+                _: &[ReplicaAppendRequest],
+            ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
+                unreachable!("no frame is sent")
+            }
+            fn observe_hwm(&self, _: &CommittedHwmUpdate) -> Result<(), (ErrorCode, String)> {
+                unreachable!("no frame is sent")
+            }
+            fn status(
+                &self,
+                _: &RangeIdentity,
+            ) -> Result<ReplicaStatusResponse, (ErrorCode, String)> {
+                unreachable!("no frame is sent")
+            }
+        }
+        async fn eventually(what: &str, done: impl Fn() -> bool) {
+            for _ in 0..500 {
+                if done() {
+                    return;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+            panic!("timed out waiting until {what}");
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ReplicaPeerServer::plaintext(Uuid::from_u128(1), Arc::new(Silent))
+            .with_max_connections(1);
+        let limit = server.connection_limit();
+        assert_eq!(limit.label(), "replica");
+        let (stop, stopped) = oneshot::channel();
+        let task = tokio::spawn(server.serve(listener, stopped));
+
+        let held = TcpStream::connect(addr).await.unwrap();
+        eventually("the first connection holds the slot", || limit.open() == 1).await;
+        let mut over = TcpStream::connect(addr).await.unwrap();
+        let mut byte = [0_u8; 1];
+        assert!(
+            matches!(
+                timeout(Duration::from_secs(5), over.read(&mut byte)).await,
+                Ok(Ok(0)) | Ok(Err(_))
+            ),
+            "the connection over the cap was not closed"
+        );
+        assert_eq!(limit.refused_total(), 1);
+        assert_eq!(limit.open(), 1, "the held connection is untouched");
+        drop(held);
+        eventually("the first connection's slot is freed", || limit.open() == 0).await;
+        let _next = TcpStream::connect(addr).await.unwrap();
+        eventually("a new connection takes the freed slot", || {
+            limit.open() == 1
+        })
+        .await;
+        assert_eq!(limit.refused_total(), 1, "the freed slot was served");
+
+        stop.send(()).unwrap();
+        task.await.unwrap().unwrap();
+
+        // Review of #732: a connection that sends nothing loses its slot at
+        // the handshake deadline, so silent sockets cannot lock the plane out.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ReplicaPeerServer::plaintext(Uuid::from_u128(1), Arc::new(Silent))
+            .with_max_connections(1)
+            .with_handshake_deadline(Duration::from_millis(200));
+        let limit = server.connection_limit();
+        let (stop, stopped) = oneshot::channel();
+        let task = tokio::spawn(server.serve(listener, stopped));
+        let mut silent = TcpStream::connect(addr).await.unwrap();
+        eventually("the silent connection holds the slot", || limit.open() == 1).await;
+        assert!(
+            matches!(
+                timeout(Duration::from_secs(5), silent.read(&mut byte)).await,
+                Ok(Ok(0)) | Ok(Err(_))
+            ),
+            "the silent connection was not closed at its deadline"
+        );
+        assert_eq!(limit.handshake_timeouts_total(), 1);
+        eventually("the slot is freed", || limit.open() == 0).await;
+        let _next = TcpStream::connect(addr).await.unwrap();
+        eventually("a new connection takes the freed slot", || {
+            limit.open() == 1
+        })
+        .await;
+        assert_eq!(limit.refused_total(), 0);
+        stop.send(()).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
     /// #294 slice 6: a TLS hello on a plaintext replica plane is refused by
     /// name before the handler is asked anything.
     #[tokio::test]
@@ -2882,6 +3516,8 @@ mod tests {
             tcp,
             Arc::new(Unreached),
             super::super::version::ReplicaVersionPolicy::default(),
+            &ConnectionLimit::replica(1),
+            client.local_addr().unwrap(),
         )
         .await
         .unwrap_err();
@@ -3320,5 +3956,201 @@ mod tests {
             .await;
         assert_eq!(read.map(|lineage| lineage.fencing_epoch), Some(7));
         assert_eq!(leader.calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn catch_up_range() -> RangeIdentity {
+        RangeIdentity {
+            topic: "events.v1".to_owned(),
+            topic_epoch: 1,
+            range_id: Uuid::from_u128(0xC1),
+            range_generation: 0,
+        }
+    }
+
+    fn one_producer_append(base: u64, records: u64) -> ReplicaAppendRequest {
+        ReplicaAppendRequest {
+            range: catch_up_range(),
+            fencing_epoch: 4,
+            leader_node_id: Uuid::from_u128(0xA1),
+            expected_base_offset: base,
+            producer_id: Uuid::from_u128(0xB1),
+            producer_epoch: 1,
+            first_sequence: base,
+            records: (0..records)
+                .map(|index| ProduceRecord {
+                    timestamp_millis: 1,
+                    key: Vec::new(),
+                    value: format!("v{}", base + index).into_bytes(),
+                })
+                .collect(),
+        }
+    }
+
+    /// #881 review (P1): a catch-up read of 0..1024 while the queued stream
+    /// resumes at 1000 must stop at 1000. Sent whole, the append carried the
+    /// follower to 1024, into the middle of the queued append at 1000..1100,
+    /// which the follower then refused for ever.
+    #[test]
+    fn a_catch_up_append_straddling_the_queued_stream_is_cut_where_the_stream_resumes() {
+        let trimmed = appends_below(
+            vec![one_producer_append(0, 600), one_producer_append(600, 424)],
+            1_000,
+        );
+        assert_eq!(trimmed.len(), 2);
+        assert_eq!(trimmed[0].records.len(), 600);
+        assert_eq!(trimmed[1].expected_base_offset, 600);
+        assert_eq!(
+            trimmed[1].records.len(),
+            400,
+            "the append straddling the resume offset must end exactly there"
+        );
+        assert_eq!(trimmed[1].records.last().unwrap().value, b"v999");
+        // Nothing at or above the resume offset, and nothing when it is the start.
+        assert!(appends_below(vec![one_producer_append(1_000, 5)], 1_000).is_empty());
+        assert_eq!(
+            appends_below(vec![one_producer_append(0, 5)], u64::MAX)[0]
+                .records
+                .len(),
+            5
+        );
+    }
+
+    /// #881 soak: consecutive produces from one producer are one run in the
+    /// log but were separate groups, each within the range's group bound.
+    /// Rebuilt as one append, the run passed the follower's bound and every
+    /// catch-up was refused; it is cut where the bound would be passed.
+    #[test]
+    fn a_rebuilt_append_never_exceeds_the_ranges_group_bound() {
+        let records: Vec<vtop_log::FetchedRecord> = (0..10_u64)
+            .map(|offset| vtop_log::FetchedRecord {
+                offset,
+                record: vtop_log::LogRecord {
+                    producer_id: Uuid::from_u128(0xB1),
+                    producer_epoch: 1,
+                    sequence: offset,
+                    timestamp_millis: 1,
+                    attributes: 0,
+                    key: Vec::new(),
+                    value: vec![0; 100],
+                },
+            })
+            .collect();
+        let one = vtop_log::RECORD_FRAME_OVERHEAD_BYTES_V2 + 100;
+        let appends = appends_from_log(
+            &catch_up_range(),
+            4,
+            Uuid::from_u128(0xA1),
+            0,
+            &records,
+            GroupBound {
+                bytes: 3 * one,
+                records: u64::MAX,
+            },
+        );
+        assert_eq!(
+            appends
+                .iter()
+                .map(|append| append.records.len())
+                .collect::<Vec<_>>(),
+            vec![3, 3, 3, 1]
+        );
+        for append in &appends {
+            assert_eq!(append.first_sequence, append.expected_base_offset);
+        }
+        // Review: by records too, since one group must fit one segment.
+        let by_records = appends_from_log(
+            &catch_up_range(),
+            4,
+            Uuid::from_u128(0xA1),
+            0,
+            &records,
+            GroupBound {
+                bytes: u64::MAX,
+                records: 4,
+            },
+        );
+        assert_eq!(
+            by_records
+                .iter()
+                .map(|append| append.records.len())
+                .collect::<Vec<_>>(),
+            vec![4, 4, 2]
+        );
+    }
+
+    /// #881 review (P2): a record bigger than one catch-up read's target, but
+    /// one a replica frame carries, is still read and re-sent, alone. Before,
+    /// the read returned nothing for it and the follower stayed stranded in
+    /// front of it.
+    #[test]
+    fn a_record_larger_than_a_catch_up_read_is_still_caught_up_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let range = catch_up_range();
+        let mut segment = vtop_log::ActiveSegment::create_v2(
+            dir.path().join("range.active"),
+            vtop_log::SegmentDescriptorV2 {
+                segment_id: Uuid::from_u128(9),
+                topic: range.topic.clone(),
+                topic_epoch: range.topic_epoch,
+                lineage: vtop_log::RangeLineage {
+                    range_id: range.range_id,
+                    generation: range.range_generation,
+                    key_range: vtop_log::KeyRange::full(),
+                    parents: Vec::new(),
+                },
+                base_offset: 0,
+                segment_generation: 0,
+                creation_node_id: Uuid::from_u128(0xA1),
+                creation_fencing_epoch: 4,
+            },
+            vtop_log::SegmentConfigV2::default(),
+        )
+        .unwrap();
+        let big = vec![7_u8; 2 * 1024 * 1024];
+        for (sequence, value) in [b"small".to_vec(), big.clone(), b"after".to_vec()]
+            .into_iter()
+            .enumerate()
+        {
+            segment
+                .append(
+                    vtop_log::LogRecord {
+                        producer_id: Uuid::from_u128(0xB1),
+                        producer_epoch: 1,
+                        sequence: sequence as u64,
+                        timestamp_millis: 1,
+                        attributes: 0,
+                        key: Vec::new(),
+                        value,
+                    },
+                    vtop_log::Durability::Fsync,
+                )
+                .unwrap();
+        }
+        let epochs = crate::ProducerEpochJournal::open(dir.path().join("epochs")).unwrap();
+        let broker = crate::LocalBroker::new(segment, epochs, range, 4).unwrap();
+
+        let CatchUpRead::Appends(first) = broker.read_catch_up(0, CATCH_UP_MAX_BYTES) else {
+            panic!("the small record reads")
+        };
+        let end = first
+            .iter()
+            .map(|append| append.records.len() as u64)
+            .sum::<u64>();
+        assert_eq!(end, 1, "the read stops before the record it cannot fit");
+        let CatchUpRead::Appends(alone) = broker.read_catch_up(1, CATCH_UP_MAX_BYTES) else {
+            panic!("a record larger than the read's target must still be read, alone")
+        };
+        assert_eq!(alone.len(), 1);
+        assert_eq!(alone[0].expected_base_offset, 1);
+        assert_eq!(alone[0].records.len(), 1);
+        assert_eq!(alone[0].records[0].value, big);
+        assert!(matches!(
+            broker.read_catch_up(2, CATCH_UP_MAX_BYTES),
+            CatchUpRead::Appends(rest) if rest[0].expected_base_offset == 2
+        ));
+        assert_eq!(
+            broker.read_catch_up(3, CATCH_UP_MAX_BYTES),
+            CatchUpRead::UpToDate
+        );
     }
 }

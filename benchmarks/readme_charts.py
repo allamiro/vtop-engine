@@ -189,6 +189,9 @@ def failover(repo: str = REPO) -> dict[str, Any]:
 
 def throughput(repo: str = REPO) -> dict[str, Any]:
     run = schema.load_run(os.path.join(repo, THROUGHPUT_RUN))
+    # The same refusal the page's report makes (#596): a run this chart
+    # would pool across profiles or codecs is refused, not drawn.
+    report.check_drawable(run.rows, run.environment)
     sizes = run.environment["matrix"]["record_sizes"]
     cells = {}
     for size in sizes:
@@ -414,15 +417,16 @@ def policed_chart(plt, theme, data) -> Any:
     if len(per_run) != 1:
         raise Refused(f"{POLICED}: runs seeded {sorted(per_run)} objects; the axis label names one count")
     ax.set_xlabel(f"objects committed, of the {per_run.pop()} seeded per run")
-    handles = [plt.Rectangle((0, 0), 1, 1, color=colors["before"], label="before #666 (unchanged main)"),
+    handles = [plt.Rectangle((0, 0), 1, 1, color=colors["before"], label="fixed 300 s deadline (before v0.8.0)"),
                plt.Rectangle((0, 0), 1, 1, color=colors["after"],
-                             label="after #666 (the deadline grows with the body)")]
+                             label="deadline grows with the body (v0.8.0 and later)")]
     fig.legend(handles=handles, loc="upper left", ncol=2, fontsize=8.2, bbox_to_anchor=(0.005, 1 - 0.78 / height_in),
                handlelength=1.2, columnspacing=1.6)
     _header(fig, theme, height_in, "A policed uplink went from 0 committed objects to all of them",
-            "Objects committed at the shipped upload defaults, before and after #666. On the two 100 ms links, "
+            "Objects committed at the shipped upload defaults, with a fixed and a size-scaled request deadline. "
+            "On the two 100 ms links, "
             "every object committed both times.")
-    _footer(fig, theme, f"Data: {POLICED} (#663). Single host, Lima VM; per-run goodput and the cause capture "
+    _footer(fig, theme, f"Data: {POLICED}. Single host, Lima VM; per-run goodput and the cause capture "
             "are in the same directory.")
     return fig
 

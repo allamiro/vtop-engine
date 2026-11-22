@@ -54,6 +54,24 @@ The guides link here; these pages do not repeat the guides.
 
     [:octicons-arrow-right-24: Register](data-safety-register.md)
 
+-   **Component status**
+
+    ---
+
+    Production, preview or experimental for each component, with the
+    evidence and the criteria still open, as the maintainer confirmed them.
+
+    [:octicons-arrow-right-24: Component status](component-status.md)
+
+-   **1.0 release gate**
+
+    ---
+
+    Every criterion of the production-readiness bar, met, partial or not
+    met, with its evidence and the date it was checked.
+
+    [:octicons-arrow-right-24: Release gate](release-gate.md)
+
 -   **Tamper evidence**
 
     ---

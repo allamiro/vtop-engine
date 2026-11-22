@@ -169,10 +169,16 @@ misspelt `retain_day` is caught. The 3650-day cap is the engine's guard
 against a typo, not a limit of S3. A `compliance` retention cannot be taken
 back, so an extra digit would otherwise lock every object for a century.
 
-`vtopctl tier copy` refuses an `--upload-config` with the block. It would put
-the lock on cold-tier copies without ever checking it. Use a separate upload
-config for the tier, and a bucket default retention on the cold-tier bucket if
-its copies must be locked.
+`vtopctl tier copy` honours the block in its `--upload-config`, as the
+engine does. Before it writes, it checks that the backend writes under the
+lock and that the target bucket has Object Lock enabled. A bucket whose
+configuration cannot be read is refused too, where the engine would start
+and check again later. Nothing is written in either case. After the write,
+it reads the retention of the exact segment and manifest versions it wrote
+and judges them against what each write asked for. It proposes the tier
+evidence only if both are locked as configured; otherwise it says what it
+found and proposes nothing. The objects already written stay in the store,
+locked or not, as after any refused copy.
 
 ## What the engine says
 
@@ -191,6 +197,7 @@ Each refusal says what happened, what the engine did, and what to do:
 | First batch for a templated bucket without Object Lock (`object_lock_bucket_refused`, `result="bucket_not_locked"`) | the same, with `the batch was not uploaded and will be replayed` | As it says. Nothing was written to the bucket. |
 | Startup, a store that does not implement Object Lock (it answers `GetObjectLockConfiguration` with HTTP 501 `NotImplemented`) | `the store does not implement S3 Object Lock (it answered GetObjectLockConfiguration for bucket X with "not implemented"); the engine did not start. No bucket setting can change that: use a store that implements S3 Object Lock, or remove upload.object_lock` | As it says. A templated bucket on such a store fails its first batch with the same words (`result="store_unsupported"`). |
 | Startup, a literal bucket without versioning (the profile requires `upload.require_object_versioning`) | `bucket X does not have versioning enabled, so the store would not keep the manifest versions the hardened profile pins; the engine did not start. Enable versioning on the bucket (PutBucketVersioning with Status=Enabled; if the store cannot enable it, use a store that keeps object versions), or set upload.require_object_versioning: false` | A bucket created with Object Lock has versioning on, so this names a different bucket or a store that does not keep it. A store that answers `GetBucketVersioning` with 501 is refused with `the store does not implement S3 bucket versioning`. The Object Lock check runs first, so a store without either is refused for Object Lock. A versioning check the store could not answer is a WARN at startup (`the versioning of bucket X could not be read ...; the engine started anyway`), and an ERROR `bucket_versioning_refused` at a batch. |
+| A running engine, the bucket's versioning suspended or turned off (`upload.require_object_versioning`) | ERROR `bucket_versioning_paused`: `a manifest PUT to bucket X returned no object version to pin, so the bucket no longer keeps versions ...` (or `an object PUT ... returned no object version, and the store says the bucket's versioning is not enabled`, or, at the first upload to a bucket, `the store says bucket X does not have versioning enabled`) `...; upload.require_object_versioning is set, so the engine stopped writing to the bucket: nothing in it commits, each batch for it fails before writing anything and is replayed, and the bucket's versioning is checked again in 5s (then at most every 60s), and writing resumes once it is Enabled. To resume, re-enable versioning on bucket X (PutBucketVersioning with Status=Enabled), or set upload.require_object_versioning: false` | The bucket's state, not a transient failure: the batch in flight writes at most its object (or its object and manifest), and nothing more is written until a check finds versioning `Enabled` (INFO `bucket_versioning_resumed`). A check that finds it still off is the same ERROR at most once a minute per bucket, with a `suppressed` count. `vtop_bucket_versioning_paused` counts the paused buckets, and the alert `VtopBucketVersioningPaused` pages after 5 minutes. |
 | Bucket check could not be made | WARN at startup: `the Object Lock configuration of bucket X could not be read (...); the engine started anyway, and the bucket is checked again before the first upload to it`; at a batch, the same with `the batch was not uploaded and will be replayed` (`result="error"`) | Grant `s3:GetBucketObjectLockConfiguration`, or check the store's health. |
 | Startup, a backend that does not apply the lock | `upload.object_lock is set, but the X upload backend does not apply it ...` | Use `s3_native`. |
 | Written object or manifest without the lock (`object_lock_check_failed`, `result` = `missing`, `mode_mismatch`, `too_short` or `legal_hold_missing`) | `object X (version V) is not under the requested retention (expected governance until at least D, found ...); the batch was marked failed and will be replayed; check the bucket's Object Lock configuration and the credentials' s3:PutObjectRetention permission, and s3:GetObjectRetention, without which the store answers a HEAD with no lock at all` | Fix the store or the credentials. The replay writes the batch again. |
@@ -296,8 +303,6 @@ still reclaim them.
   relying on the setting, keep the bucket default retention as the floor, and
   run `scrub --check-retention` once they are gone. Downgrade is unsupported:
   a downgraded engine writes unlocked objects.
-- **The cluster plane's tier copies** (`vtopctl tier copy` refuses the
-  profile).
 - **Stores other than MinIO** have not been measured. The live tests run
   against the lab's MinIO, RELEASE.2025-09-07. It accepts locked writes for
   both checksum paths and for multipart, returns the lock headers on

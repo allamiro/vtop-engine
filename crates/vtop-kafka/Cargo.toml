@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
 description = "Kafka wire-compatibility gateway over the native VTOP broker (#225)."
 
 [features]
@@ -30,6 +31,9 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# A stock librdkafka client for the failover test (#751): the test that a
+# Kafka client follows a failover is only worth anything against a real one.
+rdkafka = { workspace = true }
 vtop-log = { workspace = true }
 tokio = { version = "1", default-features = false, features = [
     "io-util",

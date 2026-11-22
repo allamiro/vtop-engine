@@ -10,8 +10,8 @@ To run the engine, use the [container image](container.md).
 | Chart field | Value |
 |---|---|
 | Chart name | `vtop` |
-| Chart version | `0.6.1` |
-| `appVersion` (the default image tag) | `0.10.2` |
+| Chart version | `0.6.3` |
+| `appVersion` (the default image tag) | `0.10.4` |
 | Kubernetes | `>=1.25.0-0` |
 | Image | `ghcr.io/allamiro/vtop-engine`, tag defaults to `appVersion` |
 
@@ -24,7 +24,7 @@ The chart is not published to a chart repository. Install it from a checkout
 of the release you are deploying:
 
 ```bash
-git clone --branch v0.10.2 https://github.com/allamiro/vtop-engine.git
+git clone --branch v0.10.4 https://github.com/allamiro/vtop-engine.git
 cd vtop-engine
 ```
 
@@ -55,7 +55,9 @@ cluster.id is required: the cluster UUID shared by every node. The chart does no
 
 [`helm/vtop/ci/default-values.yaml`](../../helm/vtop/ci/default-values.yaml)
 is a complete example that renders; copy it and replace the identities with
-your own.
+your own. That includes `meta.adminAuthorization.operatorCommonNames`: admin
+authorization is on by default since v0.11.0, so name the Common Name of the
+certificate your `vtopctl` uses, or the chart refuses to render.
 
 ```bash
 helm lint helm/vtop -f my-values.yaml

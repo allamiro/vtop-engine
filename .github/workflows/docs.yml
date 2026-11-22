@@ -4,8 +4,11 @@
 #   pull_request        mkdocs build --strict (broken links, broken anchors,
 #                       pages missing from the nav all fail), plus the checks
 #                       that every config.yaml key has a reference row, that
-#                       SECURITY.md keeps the parts the policy needs, and that
-#                       every copied release version names Cargo.toml's.
+#                       SECURITY.md keeps the parts the policy needs, that
+#                       every copied release version names Cargo.toml's, and
+#                       that the README and the pages claim no more than the
+#                       component status table says, and that every piece of
+#                       evidence the 1.0 release gate names exists.
 #   push to main        the same build, then deploy to GitHub Pages.
 #   workflow_dispatch   rebuild and redeploy main by hand.
 #
@@ -20,6 +23,10 @@ on:
       - "docs/**"
       - "mkdocs.yml"
       - "README.md"
+      # Scanned by check-component-status.py (review of #826).
+      - "helm/vtop/README.md"
+      - "observability/README.md"
+      - "benchmarks/README.md"
       - "CONTRIBUTING.md"
       - "SECURITY.md"
       - ".github/ISSUE_TEMPLATE/**"
@@ -30,6 +37,12 @@ on:
       - "scripts/tests/test_check_security_policy.py"
       - "scripts/check-release-versions.py"
       - "scripts/tests/test_check_release_versions.py"
+      - "scripts/check-component-status.py"
+      - "scripts/tests/test_check_component_status.py"
+      - "scripts/check-release-gate.py"
+      - "scripts/tests/test_check_release_gate.py"
+      # check-release-gate.py resolves tests with the threat map's reader.
+      - "scripts/check-threat-map.py"
       - "CITATION.cff"
       - "helm/vtop/Chart.yaml"
       - "crates/vtop-core/src/config.rs"
@@ -41,6 +54,10 @@ on:
       - "docs/**"
       - "mkdocs.yml"
       - "README.md"
+      # Scanned by check-component-status.py (review of #826).
+      - "helm/vtop/README.md"
+      - "observability/README.md"
+      - "benchmarks/README.md"
       - "CONTRIBUTING.md"
       - "SECURITY.md"
       - ".github/ISSUE_TEMPLATE/**"
@@ -51,6 +68,12 @@ on:
       - "scripts/tests/test_check_security_policy.py"
       - "scripts/check-release-versions.py"
       - "scripts/tests/test_check_release_versions.py"
+      - "scripts/check-component-status.py"
+      - "scripts/tests/test_check_component_status.py"
+      - "scripts/check-release-gate.py"
+      - "scripts/tests/test_check_release_gate.py"
+      # check-release-gate.py resolves tests with the threat map's reader.
+      - "scripts/check-threat-map.py"
       - "CITATION.cff"
       - "helm/vtop/Chart.yaml"
       - "crates/vtop-core/src/config.rs"
@@ -70,8 +93,18 @@ jobs:
     name: build (mkdocs --strict)
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # The release gate check reads issues, pull requests and CI runs.
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The release gate check reads merged pull requests from the
+          # history (about 30 MB).
+          fetch-depth: 0
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -94,6 +127,22 @@ jobs:
         run: |
           python -m unittest discover -s scripts/tests -p 'test_check_release_versions.py' -v
           python scripts/check-release-versions.py
+
+      - name: The README and the docs claim no more than the component status table
+        run: |
+          python -m unittest discover -s scripts/tests -p 'test_check_component_status.py' -v
+          python scripts/check-component-status.py
+
+      # The 1.0 release gate (#741): every criterion of #714, its evidence and
+      # its status. A named file, test, CI job or merged pull request must
+      # exist; --online also checks the CI runs it links and the issues it
+      # names, and fails a row held open only by closed issues.
+      - name: Every piece of evidence the 1.0 release gate names exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python -m unittest discover -s scripts/tests -p 'test_check_release_gate.py' -v
+          python scripts/check-release-gate.py --online
 
       - name: mkdocs build --strict
         env:

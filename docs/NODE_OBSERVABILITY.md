@@ -126,6 +126,7 @@ each add the same delta and leave the export permanently above its source.
 | Metric | Type | Meaning |
 |---|---|---|
 | `vtop_node_info{role,node_id}` | gauge | Always 1; identifies the process. |
+| `vtop_listener_connections_refused_total{plane,reason}` | counter | Connections a capped listener closed (#732). `plane`: `meta_peer` (`max_peer_connections`, default 256) and `meta_admin` (`max_admin_connections`, default 1024) on a metadata node, `replica` (`max_replica_connections`, default 256) on a data node that serves the replica plane. `reason`: `capacity`, closed at accept because the cap was reached (open connections are not touched); `handshake_timeout`, closed because it sent no first request within 10 s of accept, so a silent socket cannot keep its slot. A rate-limited WARN names the peer and the key. |
 
 ### Metadata nodes
 
@@ -165,8 +166,10 @@ not keep publishing the follower lag it saw at the instant of the failover.
 | `vtop_broker_meta_fencing_epoch{topic,range}` | gauge | Latest metadata-committed epoch observed. |
 | `vtop_broker_lease_active{topic,range}` | gauge | 1 while *this* broker holds the live lease (metadata epoch equals its granted epoch), 0 once fenced or stolen. |
 | `vtop_broker_follower_durable_offset{follower}` | gauge | Per-follower acknowledged offset (leader only). |
+| `vtop_broker_follower_below_catch_up_horizon{follower}` | gauge | 1 while the follower is durable only below the leader's log start, so the leader cannot catch it up from its log and it needs a rebuild (leader only, #881). |
 | `vtop_broker_follower_lag_records{follower}` | gauge | Records each follower trails the leader by. |
 | `vtop_broker_follower_connected{follower}` | gauge | 1 while a live replication stream exists. |
+| `vtop_broker_epoch_history_broken{topic,range}` | gauge | 1 once a write to this replica's epoch journal failed (a full disk, say): it then answers every fence with no history and gets no replication session until `vtopctl node repair`. Exported by leaders, followers and candidates; the `VtopEpochHistoryBroken` alert pages on it (#881). |
 | `vtop_broker_follower_online{topic,range}` | gauge | Follower's own view of whether it accepts appends. |
 | `vtop_broker_retention_retained_bytes{topic,range}` | gauge | Content bytes the range holds after the latest retention pass (#561). Absent while retention is disabled or before the first pass. Every role exports it under the same name. |
 | `vtop_broker_retention_bound_bytes{topic,range}` | gauge | The range's retention bound. |
@@ -181,6 +184,8 @@ not keep publishing the follower lag it saw at the instant of the failover.
 | `vtop_broker_group_commit_sync_nanoseconds_total` | counter | Time spent flushing groups: the local fsync, the replication round and the commit **together**, not the fsync alone. Divided by `commits_total` it is the mean barrier per group; `vtop_broker_produce_phase_seconds_total` splits it. |
 | `vtop_broker_group_commit_queue_wait_nanoseconds_total` | counter | For each group, how long its longest-waiting request waited to join, summed over groups: one wait per group, not a sum over requests. |
 | `vtop_broker_group_commit_last_batch_records` / `_bytes` | gauge | Size of the most recent group. |
+| `vtop_broker_group_commit_overloaded_total` | counter | Produce requests answered `Overloaded` (retryable, nothing appended) because `group_commit.max_pending_requests` requests were already queued. A rate above zero means the range receives more than one barrier can drain; the node also logs a rate-limited WARN. |
+| `vtop_broker_group_commit_split_groups_total` | counter | Groups the log refused as a whole for something one member caused (a sequence, fencing or size refusal) and re-ran request by request, so only that member failed (#752). A steady rate means a client keeps sending a request the log refuses. |
 | `vtop_broker_requests_total{kind,outcome}` | counter | Requests answered, by kind (`produce`, `fetch`, `commit_cursor`, `fetch_cursor`, `replica_append`, `other`) and whether the broker served or refused. A refusal is often the system working — a fencing rejection is correct behaviour — so it is counted apart from a success rather than folded into one error rate. |
 | `vtop_broker_request_duration_seconds{kind}` | histogram | Time the broker held a request. **Measured around its own work, not the socket write**, so a slow consumer's TCP backpressure cannot be mistaken for a slow log. Buckets run 50µs–1s, dense where an fsync and a quorum round-trip live. |
 | `vtop_broker_produced_records_total` / `_bytes_total` | counter | Volume accepted by *successful* produce requests; a refused append is not throughput. |

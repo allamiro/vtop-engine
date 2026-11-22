@@ -25,9 +25,12 @@
 
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
-    Registry, TextEncoder,
+    TextEncoder,
 };
 use std::sync::OnceLock;
+// prometheus's own registry cannot list what is in it; this one can, so the
+// surface snapshot (#719) sees every family registered below.
+use vtop_surface::Registry;
 
 /// Pipeline stages, used as a bounded `stage` label.
 pub const STAGES: [&str; 7] = [
@@ -151,6 +154,10 @@ pub const RECOVERY_HOLD_REASONS: [&str; 2] = ["ledger_write_failed", "newer_mani
 /// The values of `mode` on `vtop_object_lock_mode` (#684).
 pub const OBJECT_LOCK_MODES: [&str; 3] = ["off", "governance", "compliance"];
 
+/// The values of `mode` on `vtop_server_side_encryption_mode`: the spellings
+/// of `upload.server_side_encryption.mode`.
+pub const SERVER_SIDE_ENCRYPTION_MODES: [&str; 3] = ["none", "sse-s3", "sse-kms"];
+
 /// The values of `outcome` on `vtop_file_delete_decisions_total` (#619):
 /// `deleted`, `deleted_unchecked` (deleted under `delete_without_open_check`
 /// with no lease to prove no process had it open), or why
@@ -218,6 +225,14 @@ pub struct Metrics {
     /// is set, 1 for `mode="off"` otherwise; the other values read 0. Set
     /// once at startup, like `verification_mode`.
     pub object_lock_mode: IntGaugeVec,
+
+    /// The server-side encryption this engine writes under, set once at
+    /// startup like `verification_mode`: 1 for the configured
+    /// `upload.server_side_encryption.mode` (`none`, `sse-s3`, `sse-kms`),
+    /// 0 for the others. A batch whose stored object does not report the
+    /// encryption asked for fails verification and counts in
+    /// `vtop_verification_failures_total`.
+    pub server_side_encryption_mode: IntGaugeVec,
     /// Object Lock checks by `result` (#684), the bounded set
     /// [`OBJECT_LOCK_CHECK_RESULTS`]: one per object and per manifest a
     /// batch wrote or reused under the profile, plus `bucket_not_locked`
@@ -288,10 +303,25 @@ pub struct Metrics {
     /// Batches accumulated but not yet sealed. A gauge that climbs without
     /// bound means sealing has stalled.
     pub inflight_batches: IntGauge,
+    /// Batches sealed and on their way to VERIFIED and their source commit,
+    /// across source types: uploading, verifying, or verified and waiting
+    /// for a batch sealed before them. Bounded by the upload width and the
+    /// in-flight byte budget; one that stays at its ceiling while commits
+    /// stop is a store that does not answer.
+    pub sealed_batches_in_flight: IntGauge,
     /// Uploads the engine keeps in flight this cycle (#102): the configured
     /// width, or the adaptive controller's current one. Read beside
     /// `upload_throttled_total`: a width that fell is a store that asked.
     pub upload_width: IntGauge,
+    /// Buckets the engine stopped writing to because they no longer keep
+    /// object versions while `upload.require_object_versioning` is set: a
+    /// PUT returned no version to pin, or the store said versioning is not
+    /// enabled. Nothing in such a bucket commits until its versioning is
+    /// enabled again. Non-zero is an operator action.
+    pub bucket_versioning_paused: IntGauge,
+    /// Batches that failed without writing anything because writes to their
+    /// bucket were paused (see `bucket_versioning_paused`); each is replayed.
+    pub bucket_versioning_paused_batches_total: IntCounterVec,
     /// Cycles where a source read failed and was skipped (the engine retries
     /// next cycle). A steady rate means a source is unhealthy.
     ///
@@ -511,6 +541,14 @@ impl Metrics {
             &["tenant", "mode"],
         )?;
         registry.register(Box::new(object_lock_mode.clone()))?;
+        let server_side_encryption_mode = IntGaugeVec::new(
+            Opts::new(
+                "server_side_encryption_mode",
+                "1 for the server-side encryption mode this engine writes under (none, sse-s3, sse-kms), from upload.server_side_encryption.mode",
+            ),
+            &["tenant", "mode"],
+        )?;
+        registry.register(Box::new(server_side_encryption_mode.clone()))?;
         let object_lock_checks_total = cv(
             "object_lock_checks_total",
             "S3 Object Lock checks of written or reused objects and manifests, by result (ok, missing, mode_mismatch, too_short, legal_hold_missing, error) and bucket_not_locked or store_unsupported for a batch refused at its bucket's preflight; anything but ok failed the batch, which is replayed",
@@ -701,11 +739,26 @@ impl Metrics {
             "Batches accumulated in memory but not yet sealed",
         ))?;
         registry.register(Box::new(inflight_batches.clone()))?;
+        let sealed_batches_in_flight = IntGauge::with_opts(Opts::new(
+            "sealed_batches_in_flight",
+            "Batches sealed and not yet settled: uploading, verifying, or verified and waiting for a batch sealed before them",
+        ))?;
+        registry.register(Box::new(sealed_batches_in_flight.clone()))?;
         let upload_width = IntGauge::with_opts(Opts::new(
             "upload_width",
             "Uploads kept in flight this cycle: the configured width, or the adaptive controller's current width when batching.adaptive_width is enabled",
         ))?;
         registry.register(Box::new(upload_width.clone()))?;
+        let bucket_versioning_paused = IntGauge::with_opts(Opts::new(
+            "bucket_versioning_paused",
+            "Buckets the engine stopped writing to under upload.require_object_versioning because they no longer keep object versions (a PUT returned no version to pin, or the store said versioning is not enabled); nothing in them commits until versioning is enabled again, and the engine checks on a backoff of at most 60 s",
+        ))?;
+        registry.register(Box::new(bucket_versioning_paused.clone()))?;
+        let bucket_versioning_paused_batches_total = cv(
+            "bucket_versioning_paused_batches_total",
+            "Batches that failed without writing anything because writes to their bucket were paused (see vtop_bucket_versioning_paused); each is replayed",
+            labels3(),
+        )?;
 
         Ok(Self {
             registry,
@@ -716,6 +769,7 @@ impl Metrics {
             verification_backend_limited_total,
             verification_mode,
             object_lock_mode,
+            server_side_encryption_mode,
             object_lock_checks_total,
             replay_required_total,
             failed_total,
@@ -733,7 +787,10 @@ impl Metrics {
             batch_duration_seconds,
             compression_ratio,
             inflight_batches,
+            sealed_batches_in_flight,
             upload_width,
+            bucket_versioning_paused,
+            bucket_versioning_paused_batches_total,
             source_read_errors_total,
             retention_lost_records_total,
             source_replay_refused_total,
