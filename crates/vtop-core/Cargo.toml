@@ -21,6 +21,7 @@ zstd = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 prometheus = { workspace = true }
+vtop-surface = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 # `process` for geteuid: a secret file's directory is closed only when the
