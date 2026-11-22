@@ -1364,8 +1364,23 @@ impl UploadBackend for S3NativeBackend {
         let version = version_id.map(str::to_owned);
         // Unlike a HEAD, these requests answer a caller without the
         // permission with AccessDenied, and an object that has no lock with
-        // NoSuchObjectLockConfiguration (#709).
-        let absent = |code: Option<&str>| code == Some("NoSuchObjectLockConfiguration");
+        // NoSuchObjectLockConfiguration (#709). SeaweedFS (#722, its live
+        // run) spells the same answer differently: a 404
+        // ObjectLockConfigurationNotFoundError for a retention, and a 404
+        // NoSuchObjectLegalHold for a hold. Each says the object has no such
+        // lock. None is a refusal, and a refused permission is still
+        // AccessDenied, so accepting them cannot read a lost permission as an
+        // absent lock.
+        let absent = |code: Option<&str>| {
+            matches!(
+                code,
+                Some(
+                    "NoSuchObjectLockConfiguration"
+                        | "ObjectLockConfigurationNotFoundError"
+                        | "NoSuchObjectLegalHold"
+                )
+            )
+        };
         match part {
             crate::base::LockPart::Retention => match self
                 .client
