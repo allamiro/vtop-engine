@@ -186,6 +186,36 @@ class Stalled(unittest.TestCase):
         self.assertIn("stalled", json.loads(out.getvalue())["violations"])
 
 
+class Coverage(unittest.TestCase):
+    """--require-observations: a recorder that saw nothing checked nothing (review of #904)."""
+
+    def test_off_by_default_an_empty_history_is_valid(self):
+        self.assertTrue(run([])["valid"])
+
+    def test_an_empty_history_fails_when_observations_are_required(self):
+        result = check_control.check([], require_observations=True)
+        self.assertEqual(set(result["violations"]), {"coverage"})
+        self.assertEqual(result["violations"]["coverage"]["count"], 3)
+
+    def test_only_failed_observations_fail_when_required(self):
+        events = [status(0, 1, 1, ok=False), read(0, 1, A, ok=False), node(0, "c1", A, True, 1, ok=False)]
+        self.assertEqual(set(check_control.check(events, require_observations=True)["violations"]), {"coverage"})
+
+    def test_one_answered_observation_of_each_kind_is_enough(self):
+        self.assertTrue(check_control.check(clean_failover(), require_observations=True)["valid"])
+
+    def test_the_flags_combine_on_the_command_line(self):
+        handle = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False)
+        handle.write(json.dumps(read(0, 1, A, ok=False)) + "\n")
+        handle.close()
+        self.addCleanup(pathlib.Path(handle.name).unlink)
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            code = check_control.main(["check_control.py", "--stall-ms", "5", "--require-observations", handle.name])
+        self.assertEqual(code, 1, out.getvalue())
+        self.assertIn("coverage", json.loads(out.getvalue())["violations"])
+
+
 class Input(unittest.TestCase):
     def write(self, text: str) -> str:
         handle = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False)

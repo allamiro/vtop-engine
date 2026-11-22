@@ -295,6 +295,7 @@ and `check_history` runs `check_control.py` over what it has written so far
 | `epoch_leader` | two data nodes acting as the leaseholder of one epoch, or a node acting as the leaseholder of an epoch metadata granted to another |
 | `unknown_grant` | a node acting on an epoch that a lease read begun afterwards does not reach: a grant metadata never made, or lost |
 | `stale_leader` | a deposed leader still acting at its epoch after a read that ended earlier reported a newer one, past the latest deadline any read reported for its lease |
+| `coverage` | a scenario that started the recorder ends up with no answered observation of one kind (Raft status, lease read, data node), or the recorder stopped early: a recorder that saw nothing checked nothing |
 
 Its limits: it sees what it polls, by default every 400 ms for a data node,
 500 ms for a lease read and 2 s for a node's Raft status

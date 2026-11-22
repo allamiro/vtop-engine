@@ -1140,6 +1140,7 @@ record_read() {
 # deposed leader stopping by its lease's deadline. The files live under
 # history/control/, apart from the data-plane files check_history.py reads.
 CONTROL_RECORDER_PID=""
+CONTROL_RECORDER_STARTED=0
 
 # control_history_start <meta-ids...> [-- <name>=<metrics-addr>=<node-uuid> ...]
 # Starts the recorder in the background; check_history checks what it has
@@ -1166,6 +1167,7 @@ control_history_start() {
     --node-interval-ms "${CHAOS_CONTROL_NODE_MS:-400}" \
     "${args[@]}" > "$WORKDIR/logs/control-recorder.log" 2>&1 &
   CONTROL_RECORDER_PID=$!
+  CONTROL_RECORDER_STARTED=1
   echo "$CONTROL_RECORDER_PID" >> "$WORKDIR/pids"
 }
 
@@ -1180,12 +1182,25 @@ control_history_stop() {
 # check_control_history — check what the recorder has written so far. The
 # recorder keeps running, so a scenario that goes on (scenario 23's second
 # failover) is recorded and checked again; a line it is writing at that
-# moment is ignored as cut short. The summary is kept in
+# moment is ignored as cut short. A scenario that started the recorder is
+# held to it (review of #904): the recorder must still be running, and the
+# history must hold an answered observation of every kind, or a recorder that
+# failed or saw nothing would pass as a clean history. The summary is kept in
 # logs/control-check.json either way.
 check_control_history() {
   local files=("$WORKDIR"/history/control/*.jsonl) report="$WORKDIR/logs/control-check.json"
+  local -a require=()
+  if [[ "$CONTROL_RECORDER_STARTED" == 1 ]]; then
+    [[ -e "${files[0]}" ]] \
+      || fail "the control recorder wrote nothing (see $WORKDIR/logs/control-recorder.log)"
+    if [[ -n "$CONTROL_RECORDER_PID" ]] && ! kill -0 "$CONTROL_RECORDER_PID" 2>/dev/null; then
+      fail "the control recorder stopped before the history was checked (see $WORKDIR/logs/control-recorder.log)"
+    fi
+    require=(--require-observations)
+  fi
   [[ -e "${files[0]}" ]] || return 0
-  if ! python3 "$SCRIPT_DIR/history/check_control.py" "${files[@]}" > "$report" 2>&1; then
+  if ! python3 "$SCRIPT_DIR/history/check_control.py" ${require[@]+"${require[@]}"} "${files[@]}" \
+    > "$report" 2>&1; then
     cat "$report" >&2
     fail "the control-plane history breaks a leadership promise (see $report)"
   fi

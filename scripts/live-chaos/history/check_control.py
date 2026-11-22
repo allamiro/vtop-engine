@@ -35,7 +35,12 @@ answered (`invoke_ms`, `complete_ms`). An observation that failed
                 provable quorum (#640) breaks no rule above; it stops the
                 cluster, and this is how a history shows it
 
-Usage: check_control.py [--stall-ms N] HISTORY.jsonl [HISTORY.jsonl ...]
+  coverage      (only with --require-observations) the history holds no
+                answered observation of one kind (Raft status, lease read,
+                data node): a recorder that ran and saw nothing checked
+                nothing, and must not pass as a clean history
+
+Usage: check_control.py [--stall-ms N] [--require-observations] HISTORY.jsonl ...
 Prints a JSON summary; exits 1 when any invariant is violated, 2 on bad input.
 A file whose last line is cut short (a recorder killed mid-write) has that
 line ignored and noted; a bad line anywhere else is bad input.
@@ -103,7 +108,7 @@ def _monotonic(reads: list[dict], field: str, kind: str, what: str, violations) 
             })
 
 
-def check(events: list[dict], stall_ms: int | None = None) -> dict:
+def check(events: list[dict], stall_ms: int | None = None, require_observations: bool = False) -> dict:
     violations: dict[str, list] = defaultdict(list)
     ok = [e for e in events if e["ok"]]
     status = [e for e in ok if e["op"] == "meta_status"]
@@ -224,6 +229,13 @@ def check(events: list[dict], stall_ms: int | None = None) -> dict:
     counts: dict[str, dict] = defaultdict(lambda: {"ok": 0, "failed": 0})
     for e in events:
         counts[e["op"]]["ok" if e["ok"] else "failed"] += 1
+    if require_observations:
+        for op in OPS:
+            if counts[op]["ok"] == 0:
+                _add(violations, "coverage", {
+                    "message": f"no answered {op} observation in the history "
+                               f"({counts[op]['failed']} failed): the recorder checked nothing of that kind",
+                })
     return {
         "valid": not violations,
         "observations": dict(counts),
@@ -240,7 +252,11 @@ def check(events: list[dict], stall_ms: int | None = None) -> dict:
 def main(argv: list[str]) -> int:
     paths = argv[1:]
     stall_ms = None
-    if paths[:1] == ["--stall-ms"]:
+    require_observations = False
+    while paths[:1] in (["--stall-ms"], ["--require-observations"]):
+        if paths[0] == "--require-observations":
+            require_observations, paths = True, paths[1:]
+            continue
         if len(paths) < 2 or not paths[1].isdigit():
             print("check_control: --stall-ms takes a number of milliseconds", file=sys.stderr)
             return 2
@@ -257,7 +273,7 @@ def main(argv: list[str]) -> int:
     except (OSError, ValueError) as err:
         print(f"check_control: {err}", file=sys.stderr)
         return 2
-    result = check(events, stall_ms)
+    result = check(events, stall_ms, require_observations)
     result["notes"] = notes
     print(json.dumps(result, indent=2))
     return 0 if result["valid"] else 1
