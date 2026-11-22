@@ -1072,6 +1072,33 @@ where
     status == Some(501) || code == Some("NotImplemented")
 }
 
+/// True for a body read the SDK stopped because the bytes did not match the
+/// checksum the store sent with them (#735). The SDK validates every GET body
+/// against `x-amz-checksum-*` while it streams and fails the read with an I/O
+/// error that wraps `ChecksumMismatch`. That is the store answering with other
+/// bytes than it holds, which is what a failed verification is; a read that
+/// failed for any other reason (a reset, a timeout) says nothing about the
+/// object and stays an error.
+fn response_failed_its_checksum(error: &VtopError) -> bool {
+    match error {
+        VtopError::Io(io) => io.get_ref().is_some_and(|inner| {
+            format!("{inner:?}")
+                .to_ascii_lowercase()
+                .contains("checksum")
+        }),
+        _ => false,
+    }
+}
+
+/// The verdict for a read-back that [`response_failed_its_checksum`]: a failed
+/// verification, so the engine marks the batch FAILED and counts it, as for any
+/// other mismatch.
+fn read_back_failed_its_checksum(error: &VtopError) -> VerificationResult {
+    VerificationResult::failed(format!(
+        "stored content failed the checksum the store sent with it while it was read back: {error}"
+    ))
+}
+
 /// The engine's error for a failed SDK call, telling a throttle apart (#102).
 ///
 /// The SDK has already retried a throttle with its own backoff by the time
@@ -1516,9 +1543,16 @@ impl UploadBackend for S3NativeBackend {
                 // strong evidence the BLAKE3 arm has always used, at the
                 // cost of a GET the measurement half of #482 publishes.
                 // Which path ran stays observable in the message.
-                let (actual, bytes_read) = self
+                let (actual, bytes_read) = match self
                     .digest_stored_body(object_uri, algo, expected_size.saturating_add(1))
-                    .await?;
+                    .await
+                {
+                    Ok(read) => read,
+                    Err(e) if response_failed_its_checksum(&e) => {
+                        return Ok(read_back_failed_its_checksum(&e));
+                    }
+                    Err(e) => return Err(e),
+                };
                 if bytes_read != expected_size {
                     return Ok(VerificationResult::failed(format!(
                         "size mismatch: expected {expected_size}, read {bytes_read} stored bytes"
@@ -1537,9 +1571,16 @@ impl UploadBackend for S3NativeBackend {
                 }
             }
             ChecksumAlgorithm::Blake3 => {
-                let (actual, bytes_read) = self
+                let (actual, bytes_read) = match self
                     .digest_stored_body(object_uri, algo, expected_size.saturating_add(1))
-                    .await?;
+                    .await
+                {
+                    Ok(read) => read,
+                    Err(e) if response_failed_its_checksum(&e) => {
+                        return Ok(read_back_failed_its_checksum(&e));
+                    }
+                    Err(e) => return Err(e),
+                };
                 if bytes_read != expected_size {
                     return Ok(VerificationResult::failed(format!(
                         "size mismatch: expected {expected_size}, read {bytes_read} stored bytes"
