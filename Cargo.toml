@@ -8,11 +8,13 @@ members = [
   "crates/vtop-node",
   "crates/vtop-meta",
   "crates/vtop-observe",
+  "crates/vtop-surface",
   "crates/vtop-adapters",
   "crates/vtop-upload",
   "crates/vtop-state",
   "crates/vtop-cli",
   "crates/vtop-kafka",
+  "crates/vtop-s3-testkit",
 ]
 
 [workspace.package]
@@ -26,7 +28,6 @@ edition = "2021"
 rust-version = "1.94.1"
 license = "MIT"
 authors = ["VTOP Engine contributors"]
-description = "Verified Telemetry Object Protocol Engine — a replay-safe, manifest-driven telemetry object transfer engine (prototype / reference implementation)."
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -87,7 +88,6 @@ tracing-opentelemetry = { version = "0.34", default-features = false }
 # crypto provider is rustls's `ring`, chosen explicitly as everywhere else.
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "tls12"] }
 thiserror = "2"
-anyhow = "1"
 async-trait = "0.1"
 sha2 = "0.11"
 blake3 = "1"
@@ -111,7 +111,6 @@ flate2 = "1"
 zstd = "0.14"
 sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "chrono", "uuid"] }
 glob = "0.3"
-notify = "8"
 tempfile = "3"
 proptest = "1"
 insta = { version = "1", features = ["json"] }
@@ -140,10 +139,15 @@ vtop-protocol = { path = "crates/vtop-protocol", version = "0.10.4" }
 vtop-broker = { path = "crates/vtop-broker", version = "0.10.4" }
 vtop-meta = { path = "crates/vtop-meta", version = "0.10.4" }
 vtop-observe = { path = "crates/vtop-observe", version = "0.10.4" }
+vtop-surface = { path = "crates/vtop-surface", version = "0.10.4" }
 vtop-kafka = { path = "crates/vtop-kafka", version = "0.10.4" }
 vtop-adapters = { path = "crates/vtop-adapters", version = "0.10.4", default-features = false }
 vtop-upload = { path = "crates/vtop-upload", version = "0.10.4" }
 vtop-state = { path = "crates/vtop-state", version = "0.10.4" }
+# Test support for the live S3 tests (#722), a dev-dependency only and never
+# published. The version is cargo-deny's: a path dependency without one is a
+# wildcard, which `bans` refuses.
+vtop-s3-testkit = { path = "crates/vtop-s3-testkit", version = "0.10.4" }
 
 [profile.release]
 opt-level = 3

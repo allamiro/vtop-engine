@@ -765,6 +765,77 @@ pub struct KafkaSourceConfig {
     pub sasl_password_env: Option<String>,
     #[serde(default)]
     pub ssl_ca_location: Option<String>,
+    /// Mutual TLS (#721): the PEM client certificate the engine presents to
+    /// the broker (librdkafka `ssl.certificate.location`). Set together with
+    /// `ssl_key_location`, and only over `SSL` or `SASL_SSL`.
+    #[serde(default)]
+    pub ssl_certificate_location: Option<String>,
+    /// The PEM private key of `ssl_certificate_location`
+    /// (`ssl.key.location`).
+    #[serde(default)]
+    pub ssl_key_location: Option<String>,
+    /// Env var *name* holding the passphrase of an encrypted
+    /// `ssl_key_location` (`ssl.key.password`; never the secret itself).
+    #[serde(default)]
+    pub ssl_key_password_env: Option<String>,
+}
+
+impl KafkaSourceConfig {
+    /// The mutual-TLS settings make sense together or not at all (#721): a
+    /// certificate without its key (or the reverse) would connect without a
+    /// client certificate, which a broker requiring one refuses with a TLS
+    /// error that does not name the setting; over a protocol without TLS the
+    /// certificate would never be sent; and a key passphrase with no key is
+    /// a typo. Each is refused at config load, naming the keys.
+    pub fn validate_mutual_tls(&self) -> Result<(), VtopError> {
+        let blank = |v: &Option<String>| v.as_deref().is_some_and(|s| s.trim().is_empty());
+        for (key, value) in [
+            ("ssl_certificate_location", &self.ssl_certificate_location),
+            ("ssl_key_location", &self.ssl_key_location),
+            ("ssl_key_password_env", &self.ssl_key_password_env),
+        ] {
+            if blank(value) {
+                return Err(VtopError::Config(format!(
+                    "sources.kafka.{key} is set but empty; give a value or remove the key"
+                )));
+            }
+        }
+        match (&self.ssl_certificate_location, &self.ssl_key_location) {
+            (None, None) => {
+                if self.ssl_key_password_env.is_some() {
+                    return Err(VtopError::Config(
+                        "sources.kafka.ssl_key_password_env is set without ssl_key_location; \
+                         the passphrase belongs to the client key mutual TLS presents"
+                            .into(),
+                    ));
+                }
+                return Ok(());
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(VtopError::Config(
+                    "sources.kafka.ssl_certificate_location and ssl_key_location are set \
+                     together or not at all: mutual TLS presents the certificate with its key"
+                        .into(),
+                ));
+            }
+            (Some(_), Some(_)) => {}
+        }
+        let tls = self
+            .security_protocol
+            .as_deref()
+            .is_some_and(|p| p.eq_ignore_ascii_case("ssl") || p.eq_ignore_ascii_case("sasl_ssl"));
+        if !tls {
+            return Err(VtopError::Config(format!(
+                "sources.kafka.ssl_certificate_location is set, but security_protocol is {}; \
+                 a client certificate is sent only over TLS: set security_protocol to SSL or \
+                 SASL_SSL",
+                self.security_protocol
+                    .as_deref()
+                    .map_or("not set (PLAINTEXT)".to_owned(), |p| format!("{p:?}"))
+            )));
+        }
+        Ok(())
+    }
 }
 
 fn default_group() -> String {
@@ -1798,6 +1869,71 @@ pub const DELETE_WITHOUT_OPEN_CHECK_WARNING: &str =
      a fully archived file on delete_quiet_seconds alone, and a writer that still holds it \
      open loses every line it writes after. Set it to false to keep such files instead";
 
+/// Whether a `bootstrap.servers` entry names a loopback host: `localhost`,
+/// or a loopback IP literal, with an optional `scheme://` and `:port`. A
+/// hostname that merely resolves to loopback is not recognised, so a link to
+/// it is warned about: the warning errs towards being said.
+fn is_loopback_bootstrap(server: &str) -> bool {
+    let server = server.trim();
+    let server = server.split_once("://").map_or(server, |(_, rest)| rest);
+    let host = if let Some(rest) = server.strip_prefix('[') {
+        rest.split_once(']').map_or(rest, |(host, _)| host)
+    } else if server.matches(':').count() > 1 {
+        // A bare IPv6 literal: its colons are not a port separator.
+        server
+    } else {
+        server.split_once(':').map_or(server, |(host, _)| host)
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// The warning for a Kafka source link that crosses the network unencrypted
+/// (#732, A2): `security_protocol` unset (librdkafka's default is plaintext),
+/// `plaintext` or `sasl_plaintext`, with a bootstrap server off loopback. A
+/// link on loopback alone stays quiet: nothing crosses a network.
+pub fn kafka_plaintext_warning(kafka: &KafkaSourceConfig) -> Option<String> {
+    if !kafka.enabled {
+        return None;
+    }
+    let protocol = kafka
+        .security_protocol
+        .as_deref()
+        .map(|protocol| protocol.trim().to_ascii_lowercase());
+    let (named, sasl) = match protocol.as_deref() {
+        None => ("unset, so librdkafka's default `plaintext`", false),
+        Some("plaintext") => ("`plaintext`", false),
+        Some("sasl_plaintext") => ("`sasl_plaintext`", true),
+        // `ssl`, `sasl_ssl`, and anything librdkafka will refuse itself.
+        Some(_) => return None,
+    };
+    let remote: Vec<&str> = kafka
+        .bootstrap_servers
+        .iter()
+        .map(String::as_str)
+        .filter(|server| !is_loopback_bootstrap(server))
+        .collect();
+    if remote.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "sources.kafka.security_protocol is {named}, and bootstrap server(s) {servers} are not \
+         on loopback: the records the engine reads{sasl} cross the network unencrypted, and \
+         the broker is not authenticated. The engine connects anyway. Set \
+         sources.kafka.security_protocol to {fix} and ssl_ca_location to the CA that signed \
+         the brokers' certificates",
+        servers = remote.join(", "),
+        sasl = if sasl { ", and the SASL exchange," } else { "" },
+        fix = if sasl {
+            "`sasl_ssl`"
+        } else {
+            "`ssl` (`sasl_ssl` with SASL)"
+        },
+    ))
+}
+
 impl VtopConfig {
     /// Settings that are valid but unsafe enough to say so on every start
     /// and in `vtopctl validate` (#629). Never a reason to refuse: each one
@@ -1819,6 +1955,14 @@ impl VtopConfig {
             file.enabled && file.delete_after_commit && file.delete_without_open_check
         }) {
             warnings.push(DELETE_WITHOUT_OPEN_CHECK_WARNING.to_string());
+        }
+        if let Some(warning) = self
+            .sources
+            .kafka
+            .as_ref()
+            .and_then(kafka_plaintext_warning)
+        {
+            warnings.push(warning);
         }
         warnings
     }
@@ -1944,6 +2088,7 @@ impl VtopConfig {
                     "kafka.bootstrap_servers must not be empty when kafka is enabled".into(),
                 ));
             }
+            k.validate_mutual_tls()?;
         }
         if self.upload.bucket.trim().is_empty() {
             return Err(VtopError::Config("upload.bucket must not be empty".into()));
@@ -2654,6 +2799,67 @@ upload:
         let cfg: VtopConfig = serde_yaml::from_str(yaml).unwrap();
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, VtopError::Config(_)));
+    }
+
+    /// #721: mutual TLS to the broker is a certificate and its key, over
+    /// TLS; anything else is refused at load, naming the keys.
+    #[test]
+    fn kafka_mutual_tls_is_a_certificate_and_its_key_over_tls() {
+        let load = |extra: &str| {
+            let yaml = format!(
+                "engine:\n  name: e\n  state_store: \"sqlite::memory:\"\n  work_dir: /tmp/w\n\
+                 batching: {{}}\ncompression: {{}}\nsources:\n  kafka:\n    enabled: true\n\
+                 \x20   bootstrap_servers: [\"kafka:9093\"]\n{extra}upload:\n  bucket: b\n"
+            );
+            let cfg: VtopConfig = serde_yaml::from_str(&yaml).unwrap();
+            cfg.validate().map_err(|e| e.to_string())
+        };
+        // Config lines, named by what they set (the case label is what a
+        // failure prints).
+        let crt_line = "    ssl_certificate_location: /etc/vtop/kafka/client.pem\n";
+        let key_line = "    ssl_key_location: /etc/vtop/kafka/client.key\n";
+        let ssl = "    security_protocol: SSL\n";
+        load(&format!("{ssl}{crt_line}{key_line}")).expect("a certificate and key over SSL");
+        load(&format!(
+            "    security_protocol: SASL_SSL\n{crt_line}{key_line}    ssl_key_password_env: KAFKA_KEY_PW\n"
+        ))
+        .expect("over SASL_SSL, with a key passphrase");
+        load("").expect("no mutual TLS at all");
+        for (case, extra, says) in [
+            (
+                "certificate only",
+                format!("{ssl}{crt_line}"),
+                "together or not at all",
+            ),
+            (
+                "key only",
+                format!("{ssl}{key_line}"),
+                "together or not at all",
+            ),
+            (
+                "no protocol",
+                format!("{crt_line}{key_line}"),
+                "not set (PLAINTEXT)",
+            ),
+            (
+                "SASL_PLAINTEXT",
+                format!("    security_protocol: SASL_PLAINTEXT\n{crt_line}{key_line}"),
+                "set security_protocol to SSL or SASL_SSL",
+            ),
+            (
+                "passphrase without a key",
+                format!("{ssl}    ssl_key_password_env: KAFKA_KEY_PW\n"),
+                "without ssl_key_location",
+            ),
+            (
+                "empty key path",
+                format!("{ssl}{crt_line}    ssl_key_location: \"\"\n"),
+                "ssl_key_location is set but empty",
+            ),
+        ] {
+            let err = load(&extra).expect_err(case);
+            assert!(err.contains(says), "{case}: {says:?} not in the refusal");
+        }
     }
 
     #[test]
@@ -4390,5 +4596,99 @@ streams:
         let m = s.lookup("app_events").unwrap();
         assert_eq!(m.source_type, SourceType::Kafka);
         assert_eq!(m.s3_source_name.as_deref(), Some("app"));
+    }
+
+    /// #732 (A2): a Kafka source link that crosses the network unencrypted
+    /// is said on every start and in `vtopctl validate`; TLS, a link on
+    /// loopback alone, or a disabled source stays quiet.
+    #[test]
+    fn a_plaintext_kafka_source_off_loopback_is_warned_about() {
+        fn kafka(protocol: Option<&str>, servers: &[&str]) -> KafkaSourceConfig {
+            KafkaSourceConfig {
+                enabled: true,
+                bootstrap_servers: servers.iter().map(|s| (*s).to_owned()).collect(),
+                consumer_group: default_group(),
+                topic_include_regex: default_include(),
+                topic_exclude_regex: default_exclude(),
+                auto_offset_reset: default_offset_reset(),
+                enable_auto_commit: false,
+                security_protocol: protocol.map(str::to_owned),
+                sasl_mechanism: None,
+                sasl_username: None,
+                sasl_password_env: None,
+                ssl_ca_location: None,
+                ssl_certificate_location: None,
+                ssl_key_location: None,
+                ssl_key_password_env: None,
+            }
+        }
+        let unset = kafka_plaintext_warning(&kafka(None, &["kafka-1:9092", "localhost:9092"]))
+            .expect("unset is librdkafka's plaintext");
+        assert!(
+            unset.contains("unset, so librdkafka's default `plaintext`")
+                && unset.contains("kafka-1:9092")
+                && !unset.contains("localhost:9092")
+                && unset.contains("unencrypted")
+                && unset.contains("The engine connects anyway")
+                && unset.contains("`ssl`"),
+            "{unset}"
+        );
+        let sasl = kafka_plaintext_warning(&kafka(Some("SASL_PLAINTEXT"), &["10.0.0.5:9092"]))
+            .expect("SASL over plaintext");
+        assert!(
+            sasl.contains("`sasl_plaintext`")
+                && sasl.contains("the SASL exchange")
+                && sasl.contains("`sasl_ssl`"),
+            "{sasl}"
+        );
+        assert!(kafka_plaintext_warning(&kafka(Some("plaintext"), &["broker:9092"])).is_some());
+
+        for quiet in [
+            kafka(Some("ssl"), &["kafka-1:9093"]),
+            kafka(Some("SASL_SSL"), &["kafka-1:9093"]),
+            kafka(
+                None,
+                &[
+                    "localhost:9092",
+                    "127.0.0.1:9092",
+                    "[::1]:9092",
+                    "::1",
+                    "PLAINTEXT://127.0.0.2:9092",
+                ],
+            ),
+            KafkaSourceConfig {
+                enabled: false,
+                ..kafka(None, &["kafka-1:9092"])
+            },
+        ] {
+            assert_eq!(kafka_plaintext_warning(&quiet), None, "{quiet:?}");
+        }
+
+        let mut cfg: VtopConfig = serde_yaml::from_str(
+            r#"
+engine:
+  name: vtop-engine
+  state_store: "sqlite::memory:"
+  work_dir: /tmp/work
+batching: {}
+compression: {}
+sources:
+  kafka:
+    enabled: true
+    bootstrap_servers: ["kafka:9092"]
+upload:
+  bucket: telemetry-data
+"#,
+        )
+        .unwrap();
+        assert!(
+            cfg.warnings()
+                .iter()
+                .any(|w| w.starts_with("sources.kafka.security_protocol is unset")),
+            "{:?}",
+            cfg.warnings()
+        );
+        cfg.sources.kafka.as_mut().unwrap().security_protocol = Some("ssl".to_owned());
+        assert!(cfg.warnings().is_empty(), "{:?}", cfg.warnings());
     }
 }

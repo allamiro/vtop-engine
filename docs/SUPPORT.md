@@ -49,9 +49,14 @@ such change and every one-way step. The
   rolling upgrade; two minors apart is not supported. Before 1.0 a new
   native message kind is used only once every node runs the new release
   ([before 1.0](reference/compatibility.md#config-json-output-and-the-wire-before-10)).
-- **Downgrade is not supported and not tested.** A newer release may write
-  data an older one cannot read. Going back means a fresh directory, or a
-  verified backup taken before the upgrade ([Upgrades](operate/upgrades.md)).
+- **Downgrade is not supported, except for what the compatibility matrix
+  records.** A newer release may write data an older one cannot read. For
+  the previous release the matrix records that the ledger (SQLite, and
+  PostgreSQL nightly), its prune digests and the audit trail either keep
+  working or are refused with a message and left unchanged
+  ([downgrade](reference/compatibility.md#downgrade)). Nothing else is
+  tested. Going back otherwise means a fresh directory, or a verified backup
+  taken before the upgrade ([Upgrades](operate/upgrades.md)).
 - **To 1.0 through the bridge release**, the last 0.x minor: upgrade to it
   first ([upgrade](reference/compatibility.md#upgrade)).
 
