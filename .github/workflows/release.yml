@@ -54,8 +54,10 @@ jobs:
       prerelease: ${{ steps.meta.outputs.prerelease }}
       latest: ${{ steps.meta.outputs.latest }}
       # The commit this job checked out and tested. Every later job checks
-      # out this SHA, not the input again: a branch can move during the run,
-      # and the archives must be built from the commit that was verified.
+      # out the same ref from the event (not this output: a checkout taken
+      # from a job output is untrusted code to CodeQL's cache-poisoning
+      # check) and fails unless it got this SHA: a branch can move during the
+      # run, and the archives must be built from the commit that was verified.
       sha: ${{ steps.meta.outputs.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -237,9 +239,22 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          # The commit `verify` checked out and tested (the tag's, or on a
-          # dispatch the input's), never the input resolved again.
-          ref: ${{ needs.verify.outputs.sha }}
+          # The ref `verify` checked out (the tag, or on a dispatch the
+          # input), resolved here from the event, never from a job output; the
+          # next step requires it to be the commit `verify` tested.
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: The checkout is the commit verify tested
+        shell: bash
+        env:
+          VERIFIED: ${{ needs.verify.outputs.sha }}
+        run: |
+          # A branch that moved after verify ran fails here, rather than
+          # building a commit that was not tested.
+          head=$(git rev-parse HEAD)
+          if [ "$head" != "$VERIFIED" ]; then
+            echo "::error::checked out $head, but verify tested $VERIFIED (the ref moved during the run); dispatch again"
+            exit 1
+          fi
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -861,7 +876,21 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ needs.verify.outputs.sha }}
+          # The ref `verify` checked out, resolved from the event; the next
+          # step requires it to be the commit `verify` tested.
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: The checkout is the commit verify tested
+        shell: bash
+        env:
+          VERIFIED: ${{ needs.verify.outputs.sha }}
+        run: |
+          # A branch that moved after verify ran fails here, rather than
+          # building a commit that was not tested.
+          head=$(git rev-parse HEAD)
+          if [ "$head" != "$VERIFIED" ]; then
+            echo "::error::checked out $head, but verify tested $VERIFIED (the ref moved during the run); dispatch again"
+            exit 1
+          fi
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -1118,9 +1147,22 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          # The commit `verify` checked out and tested (the tag's, or on a
-          # dispatch the input's), never the input resolved again.
-          ref: ${{ needs.verify.outputs.sha }}
+          # The ref `verify` checked out (the tag, or on a dispatch the
+          # input), resolved here from the event, never from a job output; the
+          # next step requires it to be the commit `verify` tested.
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: The checkout is the commit verify tested
+        shell: bash
+        env:
+          VERIFIED: ${{ needs.verify.outputs.sha }}
+        run: |
+          # A branch that moved after verify ran fails here, rather than
+          # building a commit that was not tested.
+          head=$(git rev-parse HEAD)
+          if [ "$head" != "$VERIFIED" ]; then
+            echo "::error::checked out $head, but verify tested $VERIFIED (the ref moved during the run); dispatch again"
+            exit 1
+          fi
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
@@ -1367,9 +1409,22 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          # The commit `verify` checked out and tested (the tag's, or on a
-          # dispatch the input's), never the input resolved again.
-          ref: ${{ needs.verify.outputs.sha }}
+          # The ref `verify` checked out (the tag, or on a dispatch the
+          # input), resolved here from the event, never from a job output; the
+          # next step requires it to be the commit `verify` tested.
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: The checkout is the commit verify tested
+        shell: bash
+        env:
+          VERIFIED: ${{ needs.verify.outputs.sha }}
+        run: |
+          # A branch that moved after verify ran fails here, rather than
+          # building a commit that was not tested.
+          head=$(git rev-parse HEAD)
+          if [ "$head" != "$VERIFIED" ]; then
+            echo "::error::checked out $head, but verify tested $VERIFIED (the ref moved during the run); dispatch again"
+            exit 1
+          fi
       - name: Generate SBOM
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
@@ -1400,15 +1455,28 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          # The commit `verify` checked out and tested (the tag's, or on a
-          # dispatch the input's), never the input resolved again.
-          ref: ${{ needs.verify.outputs.sha }}
+          # The ref `verify` checked out (the tag, or on a dispatch the
+          # input), resolved here from the event, never from a job output; the
+          # next step requires it to be the commit `verify` tested.
+          ref: ${{ github.event.inputs.tag || github.ref }}
           # FULL history, not the default shallow clone. The changelog is
           # computed from `git log <previous-tag>..<tag>`, and a depth-1
           # checkout has no commits in that range — v0.2.0 published with a
           # single entry (its own release commit) instead of the twelve pull
           # requests it actually contained.
           fetch-depth: 0
+      - name: The checkout is the commit verify tested
+        shell: bash
+        env:
+          VERIFIED: ${{ needs.verify.outputs.sha }}
+        run: |
+          # A branch that moved after verify ran fails here, rather than
+          # building a commit that was not tested.
+          head=$(git rev-parse HEAD)
+          if [ "$head" != "$VERIFIED" ]; then
+            echo "::error::checked out $head, but verify tested $VERIFIED (the ref moved during the run); dispatch again"
+            exit 1
+          fi
 
       # Only pull the artifacts we intend to publish. build-push-action uploads a
       # `*.dockerbuild` build record by default, and an unfiltered download would
