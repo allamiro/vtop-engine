@@ -141,7 +141,8 @@
             "operatorCommonNames": {
               "type": "array",
               "items": { "type": "string", "minLength": 1 }
-            }
+            },
+            "allowNoOperators": { "type": "boolean" }
           }
         },
         "transitionMacKey": {

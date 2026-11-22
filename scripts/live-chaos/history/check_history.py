@@ -29,11 +29,16 @@ A scenario records what its clients did and saw, as JSON lines that
                    sequences from `first_sequence`; `values_match` says every
                    value is the producer's value for its sequence
            unkeyed a visible record whose key is not a producer sequence
-           end     the read's committed high watermark
+           end     the read's committed high watermark, and `start_offset`,
+                   the offset it read from (0 unless retention had reclaimed
+                   a prefix: `verify --from-offset`)
 
 Each `verify --dump` is one read, ordered by its `end` event's time. The
 history is checked against the last read; earlier reads are checked against
-it too. The invariants:
+it too. Below the last read's `start_offset` (a prefix retention reclaimed,
+in a long run such as the cluster soak, #727) the latest earlier read that
+held an offset stands for it, so a record reclaimed before any read saw it
+is unproven, and counted lost. The invariants:
 
   lost          every acknowledged record is visible at its acknowledged
                 offset, with its own key and value
@@ -48,11 +53,13 @@ it too. The invariants:
   phantom       every visible record is an acknowledged one, or a whole
                 indeterminate batch; a refused batch (`fail`) is never visible,
                 which is what a fenced leader's records would be
-  rewritten     a record an earlier read saw below the later read's high
-                watermark is the same record in the later read
-  missed        an earlier read holds every record the last read holds below
-                the earlier read's high watermark: a committed record is
-                visible to every read that covers it
+  rewritten     a record an earlier read saw is the same record in every
+                later read that covers its offset (from the later read's
+                start offset to its high watermark)
+  missed        a read holds every record a later read holds inside the
+                earlier read's window (its start offset to its high
+                watermark): a committed record is visible to every read that
+                covers it
   hwm           the committed high watermark never goes backwards across reads
   unkeyed       no visible record lacks a producer key (with --allow-unkeyed,
                 such records are reported and not counted as violations)
@@ -127,8 +134,25 @@ class Read:
     process: str
     end_time_us: int = 0
     high_watermark: int | None = None
-    # offset -> (sequence or None for unkeyed, values_match)
-    records: dict[int, tuple[int | None, bool]] = field(default_factory=dict)
+    # The offset the read started at: below it, retention had reclaimed the
+    # records, and the read says nothing about them.
+    start_offset: int = 0
+    # As recorded: runs of (offset, first sequence, count, values_match), and
+    # the offsets of unkeyed records. A week-long history holds hundreds of
+    # reads (the cluster soak, #727), so a read is expanded to one entry per
+    # offset only while it is being checked.
+    runs: list[tuple[int, int, int, bool]] = field(default_factory=list)
+    unkeyed: list[int] = field(default_factory=list)
+
+    def records(self) -> dict[int, tuple[int | None, bool]]:
+        """offset -> (sequence, or None for an unkeyed record; values_match)"""
+        out: dict[int, tuple[int | None, bool]] = {}
+        for offset, first, count, values_match in self.runs:
+            for i in range(count):
+                out[offset + i] = (first + i, values_match)
+        for offset in self.unkeyed:
+            out[offset] = (None, False)
+        return out
 
 
 def load(lines: list[str]) -> tuple[list[Batch], list[Read]]:
@@ -182,16 +206,15 @@ def load(lines: list[str]) -> tuple[list[Batch], list[Read]]:
         elif op == "read":
             read = reads.setdefault(process, Read(process=process))
             if kind == "records":
-                for i in range(event["count"]):
-                    read.records[event["offset"] + i] = (
-                        event["first_sequence"] + i,
-                        bool(event["values_match"]),
-                    )
+                read.runs.append(
+                    (event["offset"], event["first_sequence"], event["count"], bool(event["values_match"]))
+                )
             elif kind == "unkeyed":
-                read.records[event["offset"]] = (None, False)
+                read.unkeyed.append(event["offset"])
             elif kind == "end":
                 read.high_watermark = event["high_watermark"]
                 read.end_time_us = event.get("time_us", 0)
+                read.start_offset = event.get("start_offset", 0)
                 # An `end` closes the read: a later read under the same name
                 # (a reused pid, in a run of days) is a read of its own
                 # (review of #881).
@@ -211,7 +234,52 @@ def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) 
         violations["input"].append("the history holds no completed read")
         return summarize(batches, reads, violations, notes)
     last = reads[-1]
-    visible = last.records
+    # Reads in order: each record must be what every earlier read saw at its
+    # offset, and an offset an earlier read held must still be there in a later
+    # read that covers it. `latest` is the newest record seen at each offset.
+    latest: dict[int, tuple[tuple[int | None, bool], Read]] = {}
+    for before, after in zip(reads, reads[1:]):
+        if after.high_watermark < before.high_watermark:
+            violations["hwm"].append(
+                f"the committed high watermark went back from {before.high_watermark} "
+                f"({before.process}) to {after.high_watermark} ({after.process})"
+            )
+    # Offsets a read covered and did not see: a later read that holds a
+    # record there shows the earlier one missed a committed record. Promotion
+    # markers are holes in every read, and never filled.
+    holes: dict[int, Read] = {}
+    # The record each offset holds and when a read first showed it so.
+    shown: dict[int, tuple[tuple[int | None, bool], int]] = {}
+    records: dict[int, tuple[int | None, bool]] = {}
+    for read in reads:
+        records = read.records()
+        for offset in range(read.start_offset, read.high_watermark):
+            now = records.get(offset)
+            if now is None:
+                holes.setdefault(offset, read)
+            seen = latest.get(offset)
+            if seen is not None and now != seen[0]:
+                violations["rewritten"].append(
+                    f"offset {offset} held {seen[0]} in {seen[1].process} and holds {now} "
+                    f"in {read.process}"
+                )
+        for offset, record in records.items():
+            hole = holes.pop(offset, None)
+            if hole is not None:
+                violations["missed"].append(
+                    f"offset {offset} holds {record} in {read.process} but {hole.process} did not "
+                    f"see it below its high watermark {hole.high_watermark}"
+                )
+            if offset not in shown or shown[offset][0] != record:
+                shown[offset] = (record, read.end_time_us)
+            latest[offset] = (record, read)
+    # What the history shows at each offset: the last read, and below its start
+    # offset whatever the newest earlier read saw there.
+    visible = records
+    if last.start_offset > 0:
+        for offset, (record, _) in latest.items():
+            if offset < last.start_offset:
+                visible[offset] = record
 
     # Acknowledged batches: each record at its acknowledged offset. One offset
     # may be acknowledged again for the same logical record (the broker
@@ -244,7 +312,14 @@ def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) 
             if seen is None:
                 violations["lost"].append(
                     f"acknowledged record {sequence} of {batch.name()} is not visible at its "
-                    f"acknowledged offset {offset} (high watermark {last.high_watermark})"
+                    f"acknowledged offset {offset} (high watermark {last.high_watermark}"
+                    + (
+                        f"; no read saw it before retention reclaimed offsets below "
+                        f"{last.start_offset}"
+                        if offset < last.start_offset
+                        else ""
+                    )
+                    + ")"
                 )
             elif seen[0] != sequence or not seen[1]:
                 violations["lost"].append(
@@ -307,11 +382,9 @@ def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) 
 
     order = Order(placed)
     # The end of the first read that showed each visible record as it is now.
-    first_seen_us: dict[int, int] = {}
-    for read in reads:
-        for offset, record in read.records.items():
-            if offset not in first_seen_us and visible.get(offset) == record:
-                first_seen_us[offset] = read.end_time_us
+    first_seen_us: dict[int, int] = {
+        offset: when for offset, (record, when) in shown.items() if visible.get(offset) == record
+    }
     # An acknowledgement accounts for a record only if some batch that
     # claims it there was sent before a read first showed it (review of
     # #878): a later write cannot explain a copy already visible.
@@ -398,30 +471,6 @@ def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) 
                 "are visible, and no acknowledged or indeterminate batch accounts for them"
             )
 
-    # Earlier reads: the high watermark never regresses, and what they saw
-    # below the later read's mark is what the later read holds.
-    for before, after in zip(reads, reads[1:]):
-        if after.high_watermark < before.high_watermark:
-            violations["hwm"].append(
-                f"the committed high watermark went back from {before.high_watermark} "
-                f"({before.process}) to {after.high_watermark} ({after.process})"
-            )
-    for earlier in reads[:-1]:
-        absent = sorted(o for o in visible if o < earlier.high_watermark and o not in earlier.records)
-        for offset in absent:
-            violations["missed"].append(
-                f"offset {offset} holds {visible[offset]} in {last.process} but {earlier.process} "
-                f"did not see it below its high watermark {earlier.high_watermark}"
-            )
-        for offset, record in sorted(earlier.records.items()):
-            if offset >= last.high_watermark:
-                continue
-            later = visible.get(offset)
-            if later != record:
-                violations["rewritten"].append(
-                    f"offset {offset} held {record} in {earlier.process} and holds {later} "
-                    f"in {last.process}"
-                )
     return summarize(batches, reads, violations, notes)
 
 
@@ -651,7 +700,7 @@ def summarize(batches, reads, violations, notes) -> dict:
         "acknowledged_records": sum(b.count for b in batches if b.outcome == "ok"),
         "reads": len(reads),
         "high_watermark": reads[-1].high_watermark if reads else None,
-        "visible_records": len(reads[-1].records) if reads else 0,
+        "visible_records": len(reads[-1].records()) if reads else 0,
         "violations": {
             kind: {"count": len(items), "first": items[:LISTED]}
             for kind, items in sorted(violations.items())
