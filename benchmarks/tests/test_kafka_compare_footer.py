@@ -152,7 +152,7 @@ def test_the_footer_wraps_between_fields():
 # --------------------------------------------------- recording the host disk
 
 
-def test_a_new_environment_records_the_host_disk_under_schema_2(monkeypatch):
+def test_a_new_environment_records_the_host_disk_under_the_current_schema(monkeypatch):
     def fake_sh(args, **_kwargs):
         if args[:2] == ["docker", "info"]:
             return subprocess.CompletedProcess(args, 0, '{"NCPU": 8}', "")
@@ -166,7 +166,7 @@ def test_a_new_environment_records_the_host_disk_under_schema_2(monkeypatch):
 
     monkeypatch.setattr(run, "sh", fake_sh)
     env = run.capture_environment("r", {}, "vtop-bench:x", {"cpus": "2"}, "Test SSD, SSD, NVMe, ext4")
-    assert env["schema_version"] == schema.SCHEMA_VERSION == 2
+    assert env["schema_version"] == schema.SCHEMA_VERSION == 3
     assert env["kind"] == "throughput"
     assert env["comparable"]["host_disk"] == "Test SSD, SSD, NVMe, ext4"
 
@@ -313,8 +313,8 @@ def test_a_schema_2_run_with_a_host_disk_loads(tmp_path, kind):
 @pytest.mark.parametrize("kind", sorted(LOADERS))
 def test_a_run_from_a_newer_harness_is_refused(tmp_path, kind):
     build, load = LOADERS[kind]
-    with pytest.raises(schema.ReportRefused, match="schema_version 3"):
-        load(build(tmp_path, lambda env: env.update(schema_version=3)))
+    with pytest.raises(schema.ReportRefused, match="schema_version 4"):
+        load(build(tmp_path, lambda env: env.update(schema_version=4)))
 
 
 @pytest.mark.parametrize("kind", sorted(LOADERS))
@@ -337,4 +337,4 @@ def test_a_newer_run_that_did_not_finish_is_called_newer(tmp_path, kind):
     # The version is read first: an unfinished run from a newer harness is a newer run.
     build, load = LOADERS[kind]
     with pytest.raises(schema.ReportRefused, match="newer harness"):
-        load(build(tmp_path, lambda env: env.update(schema_version=3, run_state="running")))
+        load(build(tmp_path, lambda env: env.update(schema_version=4, run_state="running")))
