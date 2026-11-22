@@ -4,8 +4,10 @@
 #   pull_request        mkdocs build --strict (broken links, broken anchors,
 #                       pages missing from the nav all fail), plus the checks
 #                       that every config.yaml key has a reference row, that
-#                       SECURITY.md keeps the parts the policy needs, and that
-#                       every copied release version names Cargo.toml's.
+#                       SECURITY.md keeps the parts the policy needs, that
+#                       every copied release version names Cargo.toml's, and
+#                       that the README and the pages claim no more than the
+#                       component status table says.
 #   push to main        the same build, then deploy to GitHub Pages.
 #   workflow_dispatch   rebuild and redeploy main by hand.
 #
@@ -20,6 +22,10 @@ on:
       - "docs/**"
       - "mkdocs.yml"
       - "README.md"
+      # Scanned by check-component-status.py (review of #826).
+      - "helm/vtop/README.md"
+      - "observability/README.md"
+      - "benchmarks/README.md"
       - "CONTRIBUTING.md"
       - "SECURITY.md"
       - ".github/ISSUE_TEMPLATE/**"
@@ -30,6 +36,8 @@ on:
       - "scripts/tests/test_check_security_policy.py"
       - "scripts/check-release-versions.py"
       - "scripts/tests/test_check_release_versions.py"
+      - "scripts/check-component-status.py"
+      - "scripts/tests/test_check_component_status.py"
       - "CITATION.cff"
       - "helm/vtop/Chart.yaml"
       - "crates/vtop-core/src/config.rs"
@@ -41,6 +49,10 @@ on:
       - "docs/**"
       - "mkdocs.yml"
       - "README.md"
+      # Scanned by check-component-status.py (review of #826).
+      - "helm/vtop/README.md"
+      - "observability/README.md"
+      - "benchmarks/README.md"
       - "CONTRIBUTING.md"
       - "SECURITY.md"
       - ".github/ISSUE_TEMPLATE/**"
@@ -51,6 +63,8 @@ on:
       - "scripts/tests/test_check_security_policy.py"
       - "scripts/check-release-versions.py"
       - "scripts/tests/test_check_release_versions.py"
+      - "scripts/check-component-status.py"
+      - "scripts/tests/test_check_component_status.py"
       - "CITATION.cff"
       - "helm/vtop/Chart.yaml"
       - "crates/vtop-core/src/config.rs"
@@ -94,6 +108,11 @@ jobs:
         run: |
           python -m unittest discover -s scripts/tests -p 'test_check_release_versions.py' -v
           python scripts/check-release-versions.py
+
+      - name: The README and the docs claim no more than the component status table
+        run: |
+          python -m unittest discover -s scripts/tests -p 'test_check_component_status.py' -v
+          python scripts/check-component-status.py
 
       - name: mkdocs build --strict
         env:

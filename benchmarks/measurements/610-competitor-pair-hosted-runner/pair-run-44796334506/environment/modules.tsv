@@ -1,0 +1,6 @@
+ifb	/lib/modules/7.0.0-1016-aws/kernel/drivers/net/ifb.ko.zst
+sch_netem	/lib/modules/7.0.0-1016-aws/kernel/net/sched/sch_netem.ko.zst
+sch_tbf	/lib/modules/7.0.0-1016-aws/kernel/net/sched/sch_tbf.ko.zst
+sch_ingress	/lib/modules/7.0.0-1016-aws/kernel/net/sched/sch_ingress.ko.zst
+cls_u32	/lib/modules/7.0.0-1016-aws/kernel/net/sched/cls_u32.ko.zst
+act_mirred	/lib/modules/7.0.0-1016-aws/kernel/net/sched/act_mirred.ko.zst

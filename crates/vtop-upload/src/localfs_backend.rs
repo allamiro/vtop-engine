@@ -7,17 +7,184 @@
 //! for air-gapped / offline archival and for benchmarking the pipeline with
 //! real disk I/O but no object-storage service. `s3://bucket/key` URIs are
 //! mapped onto the local tree.
+//!
+//! A write is durable before it is reported done (the commit rule needs it:
+//! verification reads the bytes back, and a page-cache read passes for an
+//! object a power loss would then take). The staging file is synced, renamed
+//! onto the key, and then the directory holding the key is synced, as is every
+//! directory the write created and the parent each of those hangs from.
 
 use crate::base::{
     parse_s3_uri, read_bounded, verify_file_content, ObjectChecksum, ObjectHead, StoredManifest,
     StoredObject, UploadBackend, VerificationResult,
 };
 use async_trait::async_trait;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use vtop_core::errors::VtopError;
+
+/// The two durability calls a write makes. They sit behind a trait so a test
+/// can see that each write makes them, and in what order relative to the
+/// rename; a power loss cannot be unit-tested, a missing call can.
+pub(crate) trait DurabilitySync: Send + Sync {
+    /// Flush the file's data and metadata to stable storage. The handle is
+    /// the one the file was written through, so a file whose copied mode is
+    /// read-only (a read-only source) is synced without reopening it.
+    fn sync_file(&self, file: &std::fs::File, path: &Path) -> std::io::Result<()>;
+    /// Flush a directory's entries (a create, a rename) to stable storage.
+    fn sync_dir(&self, path: &Path) -> std::io::Result<()>;
+}
+
+/// The real calls: `fsync` the file, `fsync` the directory (a no-op where the
+/// platform cannot open a directory, as on Windows).
+struct OsSync;
+
+impl DurabilitySync for OsSync {
+    fn sync_file(&self, file: &std::fs::File, _path: &Path) -> std::io::Result<()> {
+        file.sync_all()
+    }
+
+    fn sync_dir(&self, path: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::fs::File::open(path)?.sync_all()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Ok(())
+        }
+    }
+}
 
 pub struct LocalFsBackend {
     root: PathBuf,
+    sync: Arc<dyn DurabilitySync>,
+    /// Directories this backend created whose own sync and whose parent's sync
+    /// have not both succeeded yet. A directory that exists is not a directory
+    /// that is durable: a sync that failed, or a concurrent writer still
+    /// creating the tree, leaves it visible to the next put, which must finish
+    /// the job rather than trust that it exists.
+    unsynced_dirs: Arc<Mutex<HashSet<PathBuf>>>,
+}
+
+/// `create_dir_all`, then sync what it created: each new directory and the
+/// parent that holds its entry. Without this a new bucket or partition
+/// directory, and every object under it, can vanish after a power loss even
+/// though the file inside was synced. A directory counts as done only once
+/// both syncs succeeded (see `LocalFsBackend::unsynced_dirs`), so a retry after
+/// a failed sync, or a put racing the writer that is creating the tree, syncs
+/// the ancestors it finds already present.
+fn create_dirs_durably(
+    dir: &Path,
+    sync: &dyn DurabilitySync,
+    unsynced: &Mutex<HashSet<PathBuf>>,
+) -> std::io::Result<()> {
+    let mut todo = Vec::new();
+    {
+        let mut pending = unsynced.lock().unwrap_or_else(|p| p.into_inner());
+        let mut at = Some(dir);
+        while let Some(d) = at {
+            if d.as_os_str().is_empty() {
+                break;
+            }
+            if !d.exists() {
+                pending.insert(d.to_path_buf());
+            } else if !pending.contains(d) {
+                break;
+            }
+            todo.push(d.to_path_buf());
+            at = d.parent();
+        }
+    }
+    std::fs::create_dir_all(dir)?;
+    // Deepest first: a directory is synced before the entry that names it.
+    for d in &todo {
+        sync.sync_dir(d)?;
+        // The parent of a relative top directory is the working directory
+        // (`Path::parent` says "" for it), whose entry for `d` is the one
+        // that makes a new relative root survive.
+        if let Some(parent) = d.parent() {
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            sync.sync_dir(parent)?;
+        }
+        unsynced.lock().unwrap_or_else(|p| p.into_inner()).remove(d);
+    }
+    Ok(())
+}
+
+/// Copy `local_path` beside `dest`, sync it, rename it onto `dest`, sync the
+/// directory, then write the checksum sidecar (or remove a stale one) and sync
+/// the directory again. Nothing is reported done before the syncs return.
+fn store_blocking(
+    sync: &dyn DurabilitySync,
+    unsynced: &Mutex<HashSet<PathBuf>>,
+    local_path: &Path,
+    dest: &Path,
+    checksum: Option<&str>,
+) -> std::io::Result<()> {
+    let parent = dest.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        create_dirs_durably(parent, sync, unsynced)?;
+    }
+    // Copy beside the key, then rename onto it (review of #626): a
+    // derived key can have a second writer of the same bytes, and a copy
+    // straight onto the key truncates it first, so a crash mid-copy left
+    // a verified object torn. The rename replaces the key whole.
+    let mut staging = dest.as_os_str().to_owned();
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    staging.push(format!(".{}-{n}.partial", std::process::id()));
+    let staging = PathBuf::from(staging);
+    let publish = || -> std::io::Result<()> {
+        use std::io::Write;
+        let mut src = std::fs::File::open(local_path)?;
+        let mode = src.metadata()?.permissions();
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // Owner-only from the first byte: the source's own mode is applied
+        // after the copy, and until then a umask-default 0644 file would let
+        // another user read a 0600 object as it is written.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut out = options.open(&staging)?;
+        std::io::copy(&mut src, &mut out)?;
+        out.flush()?;
+        // The source's mode, as a copy keeps it, set through the handle so a
+        // read-only source leaves a staging file this handle can still sync.
+        out.set_permissions(mode)?;
+        // The data before the rename, so the key never names unwritten bytes.
+        sync.sync_file(&out, &staging)?;
+        drop(out);
+        std::fs::rename(&staging, dest)
+    };
+    if let Err(e) = publish() {
+        let _ = std::fs::remove_file(&staging);
+        return Err(e);
+    }
+    let sidecar = LocalFsBackend::checksum_sidecar(dest);
+    match checksum {
+        Some(c) => {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&sidecar)?;
+            f.write_all(c.as_bytes())?;
+            sync.sync_file(&f, &sidecar)?;
+        }
+        None => {
+            let _ = std::fs::remove_file(&sidecar);
+        }
+    }
+    // The directory after the rename (and the sidecar change), so the new
+    // name itself survives a power loss.
+    if let Some(parent) = parent {
+        sync.sync_dir(parent)?;
+    }
+    Ok(())
 }
 
 /// A read that failed: [`VtopError::NotFound`] only when the file is absent.
@@ -34,7 +201,20 @@ fn read_error(object_uri: &str, error: std::io::Error) -> VtopError {
 
 impl LocalFsBackend {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            sync: Arc::new(OsSync),
+            unsynced_dirs: Arc::default(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_sync(root: impl Into<PathBuf>, sync: Arc<dyn DurabilitySync>) -> Self {
+        Self {
+            root: root.into(),
+            sync,
+            unsynced_dirs: Arc::default(),
+        }
     }
 
     fn object_path(&self, uri: &str) -> Result<PathBuf, VtopError> {
@@ -70,33 +250,22 @@ impl LocalFsBackend {
         checksum: Option<&str>,
     ) -> Result<(), VtopError> {
         let dest = self.object_path(uri)?;
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        // Copy beside the key, then rename onto it (review of #626): a
-        // derived key can have a second writer of the same bytes, and a copy
-        // straight onto the key truncates it first, so a crash mid-copy left
-        // a verified object torn. The rename replaces the key whole.
-        let mut staging = dest.as_os_str().to_owned();
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        staging.push(format!(".{}-{n}.partial", std::process::id()));
-        let staging = PathBuf::from(staging);
-        if let Err(e) = tokio::fs::copy(local_path, &staging).await {
-            let _ = tokio::fs::remove_file(&staging).await;
-            return Err(e.into());
-        }
-        if let Err(e) = tokio::fs::rename(&staging, &dest).await {
-            let _ = tokio::fs::remove_file(&staging).await;
-            return Err(e.into());
-        }
-        let sidecar = Self::checksum_sidecar(&dest);
-        match checksum {
-            Some(c) => tokio::fs::write(&sidecar, c).await?,
-            None => {
-                let _ = tokio::fs::remove_file(&sidecar).await;
-            }
-        }
+        let sync = Arc::clone(&self.sync);
+        let unsynced = Arc::clone(&self.unsynced_dirs);
+        let local_path = local_path.to_path_buf();
+        let checksum = checksum.map(str::to_owned);
+        let target = dest.clone();
+        tokio::task::spawn_blocking(move || {
+            store_blocking(
+                sync.as_ref(),
+                &unsynced,
+                &local_path,
+                &target,
+                checksum.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| VtopError::Upload(format!("localfs write task: {e}")))??;
         tracing::info!(uri, path = %dest.display(), "object written via localfs");
         Ok(())
     }
@@ -158,6 +327,7 @@ impl UploadBackend for LocalFsBackend {
             // The .vtopck file is written by this engine. It is useful as an
             // inventory hint, but cannot prove what bytes are in `path`.
             checksum_sha256: None,
+            encryption: None,
         })
     }
 
@@ -179,7 +349,12 @@ impl UploadBackend for LocalFsBackend {
     }
 
     async fn ensure_bucket(&self, bucket: &str) -> Result<(), VtopError> {
-        tokio::fs::create_dir_all(self.root.join(bucket)).await?;
+        let dir = self.root.join(bucket);
+        let sync = Arc::clone(&self.sync);
+        let unsynced = Arc::clone(&self.unsynced_dirs);
+        tokio::task::spawn_blocking(move || create_dirs_durably(&dir, sync.as_ref(), &unsynced))
+            .await
+            .map_err(|e| VtopError::Upload(format!("localfs mkdir task: {e}")))??;
         Ok(())
     }
 
@@ -299,5 +474,595 @@ mod tests {
         b.put_object(f.path(), uri, None).await.unwrap();
         let res = b.verify_object(uri, 3, None).await.unwrap();
         assert!(res.passed && res.backend_limited);
+    }
+
+    /// Records every durability call with what the tree looked like at that
+    /// moment, then performs it for real.
+    #[derive(Default)]
+    struct Recorder {
+        events: std::sync::Mutex<Vec<String>>,
+        watch: std::sync::Mutex<Option<PathBuf>>,
+    }
+
+    impl Recorder {
+        fn log(&self, kind: &str, path: &Path) {
+            let published = self
+                .watch
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|d| d.exists())
+                .unwrap_or(false);
+            let name = path.to_string_lossy().into_owned();
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("{kind} {name} key_exists={published}"));
+        }
+        fn events(&self) -> Vec<String> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl DurabilitySync for Recorder {
+        fn sync_file(&self, file: &std::fs::File, path: &Path) -> std::io::Result<()> {
+            self.log("file", path);
+            OsSync.sync_file(file, path)
+        }
+        fn sync_dir(&self, path: &Path) -> std::io::Result<()> {
+            self.log("dir", path);
+            OsSync.sync_dir(path)
+        }
+    }
+
+    fn recording(root: &Path) -> (LocalFsBackend, Arc<Recorder>) {
+        let rec = Arc::new(Recorder::default());
+        (LocalFsBackend::with_sync(root, rec.clone()), rec)
+    }
+
+    /// An object, a manifest and every directory they create are synced
+    /// before the put returns: the staging file while the key is still
+    /// absent (so the key never names unwritten bytes), then the key's
+    /// directory after the rename, then each created directory and its
+    /// parent. Before the fix none of these calls were made, and a power loss
+    /// after SOURCE_COMMITTED could take an object the ledger counted as
+    /// archived.
+    #[tokio::test]
+    async fn a_write_syncs_the_file_then_the_directory_before_it_returns() {
+        for manifest in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (b, rec) = recording(root.path());
+            let uri = "s3://bkt/y=2026/m=11/obj.cef.gz";
+            let dest = b.object_path(uri).unwrap();
+            *rec.watch.lock().unwrap() = Some(dest.clone());
+            let f = tmp(b"payload");
+            let digest = vtop_core::checksum::sha256_bytes(b"payload");
+            let ck = ObjectChecksum::new("sha256", &digest);
+            if manifest {
+                b.put_manifest(f.path(), uri, Some(ck)).await.unwrap();
+            } else {
+                b.put_object(f.path(), uri, Some(ck)).await.unwrap();
+            }
+            let ev = rec.events();
+            let dir = dest.parent().unwrap().to_string_lossy().into_owned();
+
+            // The staging file was synced while the key did not yet exist.
+            let staged = ev
+                .iter()
+                .position(|e| e.starts_with("file ") && e.contains(".partial"))
+                .unwrap_or_else(|| panic!("staging file never synced: {ev:?}"));
+            assert!(ev[staged].ends_with("key_exists=false"), "{ev:?}");
+            // The key's directory was synced after the rename, last of all.
+            let last = ev.last().unwrap();
+            assert!(
+                last.starts_with(&format!("dir {dir} ")) && last.ends_with("key_exists=true"),
+                "the key's directory is not synced after the rename: {ev:?}"
+            );
+            // The sidecar is synced too.
+            assert!(ev.iter().any(|e| e.contains(".vtopck")), "{ev:?}");
+            // Every directory the write created, and the root it hangs from.
+            for d in [
+                root.path().join("bkt"),
+                root.path().join("bkt/y=2026"),
+                root.path().join("bkt/y=2026/m=11"),
+                root.path().to_path_buf(),
+            ] {
+                let want = format!("dir {} ", d.display());
+                assert!(
+                    ev.iter().any(|e| e.starts_with(&want)),
+                    "{} not synced: {ev:?}",
+                    d.display()
+                );
+            }
+        }
+    }
+
+    /// A failing sync is a failing write: nothing is reported done past an
+    /// fsync that did not succeed.
+    #[tokio::test]
+    async fn a_failed_sync_fails_the_write() {
+        struct Failing;
+        impl DurabilitySync for Failing {
+            fn sync_file(&self, _: &std::fs::File, _: &Path) -> std::io::Result<()> {
+                Err(std::io::Error::other("fsync failed"))
+            }
+            fn sync_dir(&self, _: &Path) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let b = LocalFsBackend::with_sync(root.path(), Arc::new(Failing));
+        let f = tmp(b"payload");
+        let uri = "s3://bkt/obj.gz";
+        assert!(b.put_object(f.path(), uri, None).await.is_err());
+        // Neither the key nor a staging file is left behind.
+        assert!(!b.object_path(uri).unwrap().exists());
+        let left: Vec<_> = std::fs::read_dir(root.path().join("bkt"))
+            .unwrap()
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// `ensure_bucket` syncs the directory it creates and the parent.
+    #[tokio::test]
+    async fn ensure_bucket_syncs_what_it_creates() {
+        let root = tempfile::tempdir().unwrap();
+        let (b, rec) = recording(root.path());
+        b.ensure_bucket("fresh").await.unwrap();
+        let ev = rec.events();
+        for d in [root.path().join("fresh"), root.path().to_path_buf()] {
+            let want = format!("dir {} ", d.display());
+            assert!(ev.iter().any(|e| e.starts_with(&want)), "{ev:?}");
+        }
+    }
+
+    /// A directory that exists is not a directory that is durable. When the
+    /// first put's directory sync fails, the directories it created stay
+    /// visible, so the retry must still sync them and the parents that name
+    /// them, not stop at the first ancestor that exists.
+    #[tokio::test]
+    async fn a_retry_after_a_failed_directory_sync_still_syncs_the_ancestors() {
+        struct FailsOnce {
+            failed: std::sync::atomic::AtomicBool,
+            dirs: Mutex<Vec<PathBuf>>,
+        }
+        impl DurabilitySync for FailsOnce {
+            fn sync_file(&self, file: &std::fs::File, _: &Path) -> std::io::Result<()> {
+                file.sync_all()
+            }
+            fn sync_dir(&self, path: &Path) -> std::io::Result<()> {
+                if !self.failed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    return Err(std::io::Error::other("dir fsync failed"));
+                }
+                self.dirs.lock().unwrap().push(path.to_path_buf());
+                Ok(())
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let sync = Arc::new(FailsOnce {
+            failed: Default::default(),
+            dirs: Default::default(),
+        });
+        let b = LocalFsBackend::with_sync(root.path(), sync.clone());
+        let f = tmp(b"payload");
+        let uri = "s3://bkt/y=2026/obj.gz";
+        assert!(b.put_object(f.path(), uri, None).await.is_err());
+        b.put_object(f.path(), uri, None).await.unwrap();
+        let dirs = sync.dirs.lock().unwrap().clone();
+        for d in [
+            root.path().join("bkt/y=2026"),
+            root.path().join("bkt"),
+            root.path().to_path_buf(),
+        ] {
+            assert!(
+                dirs.contains(&d),
+                "{} not synced on retry: {dirs:?}",
+                d.display()
+            );
+        }
+    }
+
+    /// A read-only source leaves a read-only staging file, as a copy keeps the
+    /// mode. The put still works and syncs it (the sync goes through the
+    /// handle the file was written with, not a reopen for writing).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_read_only_source_is_still_uploaded_and_synced() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let (b, rec) = recording(root.path());
+        let f = tmp(b"payload");
+        std::fs::set_permissions(f.path(), std::fs::Permissions::from_mode(0o444)).unwrap();
+        let uri = "s3://bkt/ro.gz";
+        b.put_object(f.path(), uri, None).await.unwrap();
+        assert_eq!(
+            std::fs::read(b.object_path(uri).unwrap()).unwrap(),
+            b"payload"
+        );
+        assert!(rec.events().iter().any(|e| e.starts_with("file ")));
+    }
+
+    /// The stored object has the source's mode, as a copy keeps it (the
+    /// staging file starts owner-only and takes the source's mode through its
+    /// handle, so a 0600 source is never exposed as a 0644 file mid-copy).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_stored_object_keeps_the_source_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        for mode in [0o600, 0o640, 0o444] {
+            let root = tempfile::tempdir().unwrap();
+            let b = LocalFsBackend::new(root.path());
+            let f = tmp(b"payload");
+            std::fs::set_permissions(f.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+            let uri = "s3://bkt/mode.gz";
+            b.put_object(f.path(), uri, None).await.unwrap();
+            let got = std::fs::metadata(b.object_path(uri).unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(got, mode);
+        }
+    }
+
+    /// A new relative root (`upload.local_path: archive`) is named by an entry
+    /// in the working directory; that directory is synced too, not skipped
+    /// because `Path::parent` of `archive` is empty.
+    #[tokio::test]
+    async fn a_new_relative_root_syncs_the_working_directory() {
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let name = PathBuf::from(format!("vtop-relroot-test-{}", std::process::id()));
+        let _cleanup = Cleanup(name.clone());
+        let rec = Recorder::default();
+        let unsynced = Mutex::default();
+        create_dirs_durably(&name.join("bkt"), &rec, &unsynced).unwrap();
+        let ev = rec.events();
+        for want in [format!("dir {} ", name.display()), "dir . ".to_string()] {
+            assert!(
+                ev.iter().any(|e| e.starts_with(&want)),
+                "{want:?} not in {ev:?}"
+            );
+        }
+    }
+}
+
+/// A power-loss test of the localfs backend, against a model of what a power
+/// loss keeps.
+///
+/// **Why not kill a process.** A killed process loses nothing the kernel has
+/// accepted: every completed `write`, `rename` and `mkdir` stays in the page
+/// cache, and the next process sees it whether or not anything was synced. So
+/// a test that kills a writer at an injected point after the rename and before
+/// the directory sync passes with every sync call removed: it cannot fail for
+/// the bug it would be written to catch. Losing unsynced state takes a lost
+/// page cache, which a test can get only from a virtual machine, a
+/// device-mapper target or a FUSE filesystem that drops unsynced writes, none
+/// of which this repository's test runners have.
+///
+/// **The model.** The worst case POSIX allows. After a power loss, a file
+/// holds the bytes it held at its last `fsync`, or none if it was never
+/// synced, and a directory holds the entries it held at its last `fsync`, or
+/// (for one that existed before the write) the entries it held then. Each
+/// sync the backend makes is recorded with a snapshot of what that sync makes
+/// durable (the file's bytes; the directory's names and the inodes they point
+/// at), taken from the real filesystem at the moment of the call. A power
+/// loss after the `k`th sync keeps the tree as it was before the write plus
+/// the first `k` snapshots. Each crash point is also read with every
+/// directory change made so far already written, as background writeback may
+/// have done on its own, and file bytes still only as synced: a rename that
+/// reached the disk before the bytes it names is a torn object. Filesystems
+/// that keep more (ext4 `data=ordered`) keep a superset of this.
+///
+/// **The invariants**, at every crash point, read both ways:
+/// - the key never names bytes that are not durable (a torn object);
+/// - the key holds the object it held before the write, or the new one, never
+///   neither, when it held one before;
+/// - once the put has returned, which is when the engine may verify and
+///   commit it, the key holds the new object in full.
+#[cfg(all(test, unix))]
+mod power_loss {
+    use super::*;
+    use std::collections::HashMap;
+    use std::ffi::OsString;
+    use std::os::unix::fs::{DirEntryExt, MetadataExt};
+
+    /// What one sync makes durable.
+    #[derive(Debug, Clone)]
+    enum Synced {
+        File {
+            ino: u64,
+            bytes: Vec<u8>,
+        },
+        Dir {
+            ino: u64,
+            entries: HashMap<OsString, u64>,
+        },
+    }
+
+    fn snapshot_dir(path: &Path) -> std::io::Result<Synced> {
+        let ino = std::fs::metadata(path)?.ino();
+        let mut entries = HashMap::new();
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            entries.insert(entry.file_name(), entry.ino());
+        }
+        Ok(Synced::Dir { ino, entries })
+    }
+
+    /// Makes the real syncs and records what each made durable. `skip_dirs`
+    /// stands for a backend that does not sync directories (the code before
+    /// #827): the call is neither made nor recorded.
+    #[derive(Default)]
+    struct Snapshots {
+        log: Mutex<Vec<Synced>>,
+        skip_dirs: bool,
+        /// The key's path, and the inode its name points at, live, as each
+        /// sync starts and after the put: what a filesystem that had already
+        /// written every directory change made so far would show.
+        key: Mutex<Option<PathBuf>>,
+        live: Mutex<Vec<Option<u64>>>,
+    }
+
+    impl Snapshots {
+        fn note_live(&self) {
+            if let Some(key) = self.key.lock().unwrap().as_ref() {
+                let ino = std::fs::symlink_metadata(key).ok().map(|m| m.ino());
+                self.live.lock().unwrap().push(ino);
+            }
+        }
+    }
+
+    impl DurabilitySync for Snapshots {
+        fn sync_file(&self, file: &std::fs::File, path: &Path) -> std::io::Result<()> {
+            self.note_live();
+            OsSync.sync_file(file, path)?;
+            let ino = file.metadata()?.ino();
+            let bytes = std::fs::read(path)?;
+            self.log.lock().unwrap().push(Synced::File { ino, bytes });
+            Ok(())
+        }
+        fn sync_dir(&self, path: &Path) -> std::io::Result<()> {
+            if self.skip_dirs {
+                return Ok(());
+            }
+            self.note_live();
+            OsSync.sync_dir(path)?;
+            let snapshot = snapshot_dir(path)?;
+            self.log.lock().unwrap().push(snapshot);
+            Ok(())
+        }
+    }
+
+    /// The tree under `root` as it is now: taken as durable, as a tree that
+    /// was there before the write and has long been flushed. Each file is
+    /// held open in `held` until the write is done: the model names a file by
+    /// its inode, and a file the write replaces would otherwise free its
+    /// inode for the next file the write creates (the sidecar), which the
+    /// model would then read as the replaced object's bytes.
+    fn durable_tree(root: &Path, out: &mut Vec<Synced>, held: &mut Vec<std::fs::File>) {
+        out.push(snapshot_dir(root).unwrap());
+        for entry in std::fs::read_dir(root).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                durable_tree(&path, out, held);
+            } else {
+                held.push(std::fs::File::open(&path).unwrap());
+                out.push(Synced::File {
+                    ino: entry.ino(),
+                    bytes: std::fs::read(&path).unwrap(),
+                });
+            }
+        }
+    }
+
+    /// What a power loss keeps: later snapshots replace earlier ones.
+    #[derive(Default)]
+    struct Image {
+        files: HashMap<u64, Vec<u8>>,
+        dirs: HashMap<u64, HashMap<OsString, u64>>,
+    }
+
+    impl Image {
+        fn of(snapshots: &[Synced]) -> Self {
+            let mut image = Self::default();
+            for s in snapshots {
+                match s {
+                    Synced::File { ino, bytes } => {
+                        image.files.insert(*ino, bytes.clone());
+                    }
+                    Synced::Dir { ino, entries } => {
+                        image.dirs.insert(*ino, entries.clone());
+                    }
+                }
+            }
+            image
+        }
+
+        /// The bytes of the file `ino` names, as synced.
+        fn file(&self, ino: u64) -> Survivor {
+            match self.files.get(&ino) {
+                Some(bytes) => Survivor::Bytes(bytes.clone()),
+                None => Survivor::Torn,
+            }
+        }
+
+        /// What the key under `root_ino` reads as, with directories as synced.
+        fn read(&self, root_ino: u64, components: &[OsString]) -> Survivor {
+            let mut at = root_ino;
+            let (name, dirs) = components.split_last().expect("a key");
+            for dir in dirs {
+                match self.dirs.get(&at).and_then(|entries| entries.get(dir)) {
+                    Some(ino) => at = *ino,
+                    None => return Survivor::Absent,
+                }
+            }
+            match self.dirs.get(&at).and_then(|entries| entries.get(name)) {
+                Some(ino) => self.file(*ino),
+                None => Survivor::Absent,
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Survivor {
+        Absent,
+        /// The key names a file whose bytes were never synced.
+        Torn,
+        Bytes(Vec<u8>),
+    }
+
+    /// A power loss after `k` syncs, read with the directories as synced,
+    /// and with every directory change made so far already written.
+    #[derive(Debug)]
+    struct CrashPoint {
+        synced: Survivor,
+        eager: Survivor,
+    }
+
+    /// Put `bytes` at `uri` through `sync`, with the tree under `root` taken
+    /// as durable before it, and say what a power loss after each of the
+    /// write's syncs leaves at the key: the first entry is a power loss
+    /// before any of them, the last one after the put returned.
+    async fn crash_points(
+        root: &Path,
+        uri: &str,
+        bytes: &[u8],
+        sync: Arc<Snapshots>,
+    ) -> Vec<CrashPoint> {
+        let mut before = Vec::new();
+        let mut held = Vec::new();
+        durable_tree(root, &mut before, &mut held);
+        let root_ino = std::fs::metadata(root).unwrap().ino();
+        let backend = LocalFsBackend::with_sync(root, sync.clone());
+        *sync.key.lock().unwrap() = Some(backend.object_path(uri).unwrap());
+        let source = tests_support::tmp(bytes);
+        let digest = vtop_core::checksum::sha256_bytes(bytes);
+        backend
+            .put_object(
+                source.path(),
+                uri,
+                Some(ObjectChecksum::new("sha256", &digest)),
+            )
+            .await
+            .unwrap();
+        sync.note_live();
+        drop(held);
+        let (bucket, key) = parse_s3_uri(uri).unwrap();
+        let components: Vec<OsString> = std::iter::once(bucket.as_str())
+            .chain(key.split('/'))
+            .map(OsString::from)
+            .collect();
+        let log = sync.log.lock().unwrap().clone();
+        let live = sync.live.lock().unwrap().clone();
+        assert_eq!(live.len(), log.len() + 1, "{live:?}");
+        (0..=log.len())
+            .map(|k| {
+                let mut kept = before.clone();
+                kept.extend_from_slice(&log[..k]);
+                let image = Image::of(&kept);
+                CrashPoint {
+                    synced: image.read(root_ino, &components),
+                    eager: live[k].map_or(Survivor::Absent, |ino| image.file(ino)),
+                }
+            })
+            .collect()
+    }
+
+    /// A new object under directories the write creates (a new bucket and
+    /// new partition directories): absent until its directory entries are
+    /// durable, never torn, and whole once the put has returned.
+    #[tokio::test]
+    async fn a_new_object_survives_a_power_loss_once_the_put_returns() {
+        let root = tempfile::tempdir().unwrap();
+        let got = crash_points(
+            root.path(),
+            "s3://bkt/tenant=t/year=2026/obj.cef.gz",
+            b"new object",
+            Arc::new(Snapshots::default()),
+        )
+        .await;
+        assert!(got.len() > 1, "the write made no syncs: {got:?}");
+        let new = Survivor::Bytes(b"new object".to_vec());
+        for (k, point) in got.iter().enumerate() {
+            for survivor in [&point.synced, &point.eager] {
+                assert!(
+                    *survivor == Survivor::Absent || *survivor == new,
+                    "a power loss after sync {k} leaves {point:?}"
+                );
+            }
+        }
+        assert_eq!(
+            got.last().unwrap().synced,
+            new,
+            "an object the put reported done is lost to a power loss: {got:?}"
+        );
+    }
+
+    /// An object replaced at its key (a replay writing the same derived key,
+    /// #626): at every crash point the key holds the old object or the new
+    /// one, whole, and the new one once the put has returned.
+    #[tokio::test]
+    async fn a_replaced_object_is_old_or_new_at_every_crash_point() {
+        let root = tempfile::tempdir().unwrap();
+        let uri = "s3://bkt/p/obj.cef.gz";
+        LocalFsBackend::new(root.path())
+            .put_object(tests_support::tmp(b"old object").path(), uri, None)
+            .await
+            .unwrap();
+        let got = crash_points(
+            root.path(),
+            uri,
+            b"new object, longer",
+            Arc::new(Snapshots::default()),
+        )
+        .await;
+        let old = Survivor::Bytes(b"old object".to_vec());
+        let new = Survivor::Bytes(b"new object, longer".to_vec());
+        for (k, point) in got.iter().enumerate() {
+            for survivor in [&point.synced, &point.eager] {
+                assert!(
+                    *survivor == old || *survivor == new,
+                    "a power loss after sync {k} leaves {point:?}"
+                );
+            }
+        }
+        assert_eq!(got[0].synced, old);
+        assert_eq!(got.last().unwrap().synced, new);
+    }
+
+    /// The model can fail: without the directory syncs (the backend before
+    /// #827) an object the put reported done is not in the surviving tree.
+    #[tokio::test]
+    async fn without_directory_syncs_the_model_loses_the_object() {
+        let root = tempfile::tempdir().unwrap();
+        let got = crash_points(
+            root.path(),
+            "s3://bkt/p/obj.cef.gz",
+            b"new object",
+            Arc::new(Snapshots {
+                skip_dirs: true,
+                ..Snapshots::default()
+            }),
+        )
+        .await;
+        assert_eq!(got.last().unwrap().synced, Survivor::Absent, "{got:?}");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests_support {
+    use std::io::Write;
+
+    pub(super) fn tmp(data: &[u8]) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(data).unwrap();
+        f.flush().unwrap();
+        f
     }
 }

@@ -940,6 +940,128 @@ fn end_of_log_starts_each(
         .collect()
 }
 
+/// One answer of the ledger about where a Kafka partition resumes (#614), as
+/// `vtop-state`'s `committed_kafka_offsets` gives it: one per (topic,
+/// partition, consumer group, topic id) the ledger holds committed rows of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerResume<'a> {
+    pub topic: &'a str,
+    pub partition: i32,
+    pub consumer_group: &'a str,
+    /// The topic id of the rows, or `None` for rows written before it was
+    /// recorded.
+    pub topic_id: Option<&'a str>,
+    /// For a known id the highest committed end of its rows; for no id the
+    /// newest row's end.
+    pub end_offset: i64,
+    /// The end of the newest-created committed row of the partition, on the
+    /// answer whose rows include it, and `None` on the others.
+    pub newest_end: Option<i64>,
+}
+
+/// The last committed offset to resume a partition after, among the ledger's
+/// `answers` for it, given the id of the topic as it is now (`current`); `None`
+/// when the ledger's rows do not belong to the topic that exists.
+///
+/// - The id is known: the answer of that id. If there is none but rows of no
+///   id exist and no row of ANY known id does, those rows are all the ledger
+///   has and keep the rule they were written under (resume after the newest
+///   one, which the store already answered). If rows of another known id
+///   exist and none of this one, the topic is a new incarnation: `None`, so
+///   the partition does not resume at an old log's offset. Rows of no id are
+///   never used then either: they predate the rows of the known ids, so they
+///   are older still.
+/// - The id is unknown (a broker with no topic ids, or one that did not
+///   answer): the ledger's rule before ids, the end of the newest committed
+///   row itself - not the highest end of the id that holds it, which a
+///   topic recreated while this process still held the old id can put above
+///   it. Never a maximum across answers.
+///
+/// A maximum across an unknown and a known id is never taken, and nor is one
+/// across two known ids: their offsets are of different logs.
+pub(crate) fn resume_end(answers: &[LedgerResume<'_>], current: Option<&str>) -> Option<i64> {
+    match current {
+        Some(id) => {
+            if let Some(known) = answers.iter().find(|a| a.topic_id == Some(id)) {
+                return Some(known.end_offset);
+            }
+            if answers.iter().any(|a| a.topic_id.is_some()) {
+                return None;
+            }
+            answers
+                .iter()
+                .find(|a| a.topic_id.is_none())
+                .map(|a| a.end_offset)
+        }
+        None => answers.iter().find_map(|a| a.newest_end),
+    }
+}
+
+/// How long a topic id this process holds is believed before it is asked for
+/// again. A recreated topic gets a new id; the next ask finds it, and the
+/// ranges read from then on carry it. Ranges read in between carry the old
+/// one: a restart then finds no row of the current id for them and follows
+/// the group's offset, which resumes at a position the broker holds for the
+/// new log - a re-read, never a skip.
+const TOPIC_ID_REFRESH: Duration = Duration::from_secs(60);
+
+/// How long after a failed ask the next one waits, so a broker that does not
+/// answer DescribeTopics (an older one, or one the principal may not describe
+/// topics on) is not asked on every pass.
+const TOPIC_ID_RETRY: Duration = Duration::from_secs(30);
+
+/// The id of each topic this process has read or seeded, as the broker last
+/// said (`None`: the broker has none for it). See [`crate::kafka_topic_id`].
+#[derive(Debug, Default)]
+struct TopicIds {
+    ids: HashMap<String, Option<String>>,
+    asked: Option<Instant>,
+    failed: Option<Instant>,
+}
+
+impl TopicIds {
+    /// Whether an ask for `topics` is due at `now`.
+    fn due(&self, topics: &[String], now: Instant) -> bool {
+        if self
+            .failed
+            .is_some_and(|at| now.duration_since(at) < TOPIC_ID_RETRY)
+        {
+            return false;
+        }
+        topics.iter().any(|t| !self.ids.contains_key(t))
+            || self
+                .asked
+                .is_none_or(|at| now.duration_since(at) >= TOPIC_ID_REFRESH)
+    }
+
+    /// Take the broker's answers to an ask for `asked`. Returns the topics
+    /// whose id CHANGED from one the process held to another: deleted and
+    /// recreated. A topic the broker gave no answer for keeps the id it had,
+    /// else has none until the next ask, so it is not asked for on every pass.
+    fn record(
+        &mut self,
+        asked: &[String],
+        answers: HashMap<String, Option<String>>,
+        now: Instant,
+    ) -> Vec<(String, String, Option<String>)> {
+        let mut changed = Vec::new();
+        for (topic, id) in answers {
+            if let Some(Some(was)) = self.ids.get(&topic) {
+                if id.as_ref() != Some(was) {
+                    changed.push((topic.clone(), was.clone(), id.clone()));
+                }
+            }
+            self.ids.insert(topic, id);
+        }
+        for topic in asked {
+            self.ids.entry(topic.clone()).or_insert(None);
+        }
+        self.asked = Some(now);
+        self.failed = None;
+        changed
+    }
+}
+
 pub struct KafkaSource {
     cfg: KafkaSourceConfig,
     format: TelemetryFormat,
@@ -954,6 +1076,9 @@ pub struct KafkaSource {
     /// makes (#614). A partition in here never asks the broker for its
     /// frontier (see `rewind_frontier`).
     known_committed: HashMap<(String, i32), i64>,
+    /// The topic ids the markers of this process's reads carry, and the
+    /// ledger's rows are matched against (`seed_committed_from_ledger`).
+    topic_ids: TopicIds,
     /// The consumer group's committed offset as this process last read it
     /// from the broker or wrote it there. Only used to put the group's offset
     /// back in step with the ledger, for lag monitoring (#614); nothing here
@@ -1089,6 +1214,7 @@ impl KafkaSource {
             consumer: None,
             cursors: HashMap::new(),
             known_committed: HashMap::new(),
+            topic_ids: TopicIds::default(),
             group_at: HashMap::new(),
             assigned: Vec::new(),
             delivered: HashMap::new(),
@@ -1340,13 +1466,81 @@ impl KafkaSource {
             .collect()
     }
 
+    /// The id the broker last gave `topic`, if it gave one.
+    fn topic_id_of(&self, topic: &str) -> Option<String> {
+        self.topic_ids.ids.get(topic).cloned().flatten()
+    }
+
+    /// Ask the broker for the ids of `topics` when they are not held or are
+    /// due again, and say so when one changed. Never fails the caller: a
+    /// topic whose id is unknown is archived with none, as before ids
+    /// existed, and asked again after [`TOPIC_ID_RETRY`].
+    fn refresh_topic_ids(&mut self, topics: &[String]) {
+        let now = Instant::now();
+        if topics.is_empty() || !self.topic_ids.due(topics, now) {
+            return;
+        }
+        // The topics already held are asked again with the new ones, so one
+        // call per round refreshes them all.
+        let mut ask: Vec<String> = self.topic_ids.ids.keys().cloned().collect();
+        for topic in topics {
+            if !ask.contains(topic) {
+                ask.push(topic.clone());
+            }
+        }
+        let answered = self.consumer().map_err(|e| e.to_string()).and_then(|c| {
+            crate::kafka_topic_id::describe(
+                c,
+                &ask,
+                std::time::Duration::from_secs(WATERMARK_TIMEOUT_SECONDS),
+            )
+        });
+        match answered {
+            Ok(answers) => {
+                for (topic, was, now_id) in self.topic_ids.record(&ask, answers, now) {
+                    count_partition_event("recreated_or_truncated");
+                    tracing::warn!(
+                        topic = %topic,
+                        was = %was,
+                        now = now_id.as_deref().unwrap_or("none"),
+                        "the kafka topic's id changed: it was deleted and recreated. Ranges read \
+                         from now on are recorded under the new id, and a restart resumes each id \
+                         from its own committed rows"
+                    );
+                }
+            }
+            Err(e) => {
+                self.topic_ids.failed = Some(now);
+                if let Some(suppressed) = self.warnings.allow("topic-ids", now) {
+                    tracing::warn!(
+                        error = %e,
+                        suppressed,
+                        "could not ask the broker for topic ids: ranges are recorded without one \
+                         and a restart resumes them by the ledger's older rule (the newest \
+                         committed row), which cannot tell a deleted and recreated topic from \
+                         the old one. Asked again shortly"
+                    );
+                }
+            }
+        }
+    }
+
     /// Resume each partition where the LEDGER says it was committed, not where
     /// the consumer group's committed offset on the broker says (#614).
     ///
-    /// `committed` is the ledger's newest committed batch per (topic,
-    /// partition, consumer group), as `(topic, partition, consumer_group,
-    /// end_offset)`. Rows of another consumer group are ignored: this group
-    /// resumes from its own progress, as `foreign_group` requires (#563).
+    /// `committed` is the ledger's resume answers, one per (topic, partition,
+    /// consumer group, topic id) - see [`LedgerResume`]. Rows of another
+    /// consumer group are ignored: this group resumes from its own progress,
+    /// as `foreign_group` requires (#563).
+    ///
+    /// Which answer of a partition applies is decided by the topic's id, which
+    /// this asks the broker for ([`resume_end`]): the answer of the topic's
+    /// CURRENT id, never the highest end across ids - a deleted and recreated
+    /// topic numbers its offsets from zero, and the old log's end would skip
+    /// the new log's first records. A partition whose ledger rows are all of
+    /// another id is a new incarnation and is not seeded: it follows the
+    /// group's committed offset, else `auto.offset.reset`, as a partition the
+    /// ledger does not know does.
     ///
     /// Why not the group's committed offset: the adapter reads with
     /// `assign()`, so it is never a group member and its commits carry no
@@ -1363,8 +1557,8 @@ impl KafkaSource {
     /// The ledger is NOT trusted for a partition whose group has no committed
     /// offset at all (or when the broker cannot be asked): that partition
     /// follows `auto.offset.reset`, exactly as before. Deleting a topic
-    /// deletes its group offsets, and the ledger, which names topics and not
-    /// topic ids, cannot tell a recreated topic from the old one - its
+    /// deletes its group offsets, and a ledger row written before topic ids
+    /// were recorded cannot tell a recreated topic from the old one - its
     /// offset would skip the new topic's first records. A stale commit cannot
     /// cause this case: it would create an offset, not remove one.
     ///
@@ -1372,13 +1566,44 @@ impl KafkaSource {
     /// committed keeps its in-memory position.
     pub fn seed_committed_from_ledger<'a>(
         &mut self,
-        committed: impl IntoIterator<Item = (&'a str, i32, &'a str, i64)>,
+        committed: impl IntoIterator<Item = LedgerResume<'a>>,
     ) {
-        let own: Vec<((String, i32), i64)> = committed
+        let mut by_partition: BTreeMap<(String, i32), Vec<LedgerResume<'a>>> = BTreeMap::new();
+        for answer in committed {
+            if answer.consumer_group == self.cfg.consumer_group {
+                by_partition
+                    .entry((answer.topic.to_owned(), answer.partition))
+                    .or_default()
+                    .push(answer);
+            }
+        }
+        if by_partition.is_empty() {
+            return;
+        }
+        let topics: Vec<String> = by_partition
+            .keys()
+            .map(|(topic, _)| topic.clone())
+            .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
-            .filter(|(_, _, group, _)| *group == self.cfg.consumer_group)
-            .map(|(topic, partition, _, end)| ((topic.to_owned(), partition), end))
             .collect();
+        self.refresh_topic_ids(&topics);
+        let mut own: Vec<((String, i32), i64)> = Vec::new();
+        for ((topic, partition), answers) in by_partition {
+            let current = self.topic_id_of(&topic);
+            match resume_end(&answers, current.as_deref()) {
+                Some(end) => own.push(((topic, partition), end)),
+                None => tracing::warn!(
+                    topic = %topic,
+                    partition,
+                    topic_id = current.as_deref().unwrap_or("unknown"),
+                    group = %self.cfg.consumer_group,
+                    "the ledger holds committed ranges for this partition, but of another topic \
+                     id: the topic was deleted and recreated since. Its offsets start again, so \
+                     the old topic's resume point does not apply; the partition follows the \
+                     consumer group's committed offset, else auto.offset.reset"
+                ),
+            }
+        }
         if own.is_empty() {
             return;
         }
@@ -1396,7 +1621,8 @@ impl KafkaSource {
                     "the ledger has a resume point for this partition, but the consumer group has \
                      no committed offset for it (or the broker could not be asked): following \
                      auto.offset.reset, because a deleted and recreated topic looks exactly like \
-                     this and the ledger's offset would skip its first records"
+                     this and, for a range recorded without a topic id, the ledger's offset \
+                     would skip its first records"
                 );
                 continue;
             };
@@ -1706,11 +1932,14 @@ impl KafkaSource {
         let Some(consumer) = self.consumer.as_ref() else {
             return;
         };
+        // Resumed before the partitions are assigned again, not after: a
+        // resume sent after the assign can be discarded as outdated by the
+        // assign's fetch start (see the whole re-assign in the read pass).
         let result = result.and_then(|()| {
             consumer
-                .incremental_unassign(&plain)
+                .resume(&plain)
+                .and_then(|()| consumer.incremental_unassign(&plain))
                 .and_then(|()| consumer.incremental_assign(&at))
-                .and_then(|()| consumer.resume(&plain))
         });
         match result {
             Ok(()) => {
@@ -2031,6 +2260,16 @@ impl KafkaSource {
     #[doc(hidden)]
     pub fn hold_off_stall_check_for(&mut self, after: Duration) {
         self.liveness.stall_after = Some(after);
+    }
+
+    /// TEST SEAM: the offset this adapter expects the partition to deliver
+    /// next - where it was assigned, until it delivers - or `None` when it is
+    /// not assigned at a known offset. A live test reads it to tell a
+    /// partition assigned past records it never read (a skip) from one
+    /// assigned at them that has not delivered yet (slow).
+    #[doc(hidden)]
+    pub fn next_offset_expected(&self, topic: &str, partition: i32) -> Option<i64> {
+        self.delivered.get(&(topic.to_string(), partition)).copied()
     }
 
     /// TEST SEAM (#623): stop one partition's fetcher on the underlying
@@ -2842,6 +3081,10 @@ impl SourceAdapter for KafkaSource {
         // the exact start offset per partition.
         self.consumer()?;
         self.recheck_partition_counts();
+        // The ids of the topics this pass reads are what its markers carry
+        // (so a restart can tell a recreated topic from the old one).
+        let pass_topics: Vec<String> = sources.iter().map(|s| s.source_name.clone()).collect();
+        self.refresh_topic_ids(&pass_topics);
         // A metadata failure for ONE topic must not abort the pass for the
         // others — the serial loop isolated it per source, and so does this:
         // the failing topic is skipped and its outcome carries the error.
@@ -3038,23 +3281,39 @@ impl SourceAdapter for KafkaSource {
                 tpl.add_partition_offset(topic, *p, *off)
                     .map_err(|e| VtopError::Source(format!("assign tpl {topic}-{p}: {e}")))?;
             }
-            consumer.assign(&tpl).map_err(|e| {
-                VtopError::Source(format!("assign ({} topics): {e}", sources.len()))
-            })?;
-            // Defensively clear any pause state a retained toppar might carry
-            // across the re-assign; a silently-paused partition reads as an
-            // empty topic. A failure is logged, not discarded (#623), and does
-            // not fail the pass: the partitions it did resume are readable,
-            // and one left paused stops delivering, which the stall check
-            // re-assigns once records wait for it.
-            if let Err(e) = consumer.resume(&tpl) {
+            // Clear any pause state a retained partition carries BEFORE the
+            // re-assign, not after it. librdkafka versions each partition's
+            // operations, and the assign's fetch start takes a newer version
+            // than a resume sent once `assign` has returned; when the start
+            // is handled first, the resume is discarded as outdated and the
+            // partition stays paused under the new assignment, reading as an
+            // empty topic until the stall check rebuilds the consumer. Seen
+            // live: a partition this process had paused (a budget stop, or a
+            // test pausing it behind the adapter) delivered nothing after
+            // the renewal. `resume` waits until each partition has handled
+            // it, so the pause is gone before the assign stops and restarts
+            // the fetcher. Every partition of the old and the new assignment
+            // is resumed; one the consumer does not know is skipped by
+            // librdkafka. A failure is logged, not discarded (#623), and does
+            // not fail the pass: one left paused stops delivering, which the
+            // stall check re-assigns once records wait for it.
+            let mut resume = TopicPartitionList::new();
+            for (topic, p) in self.assigned.iter().chain(assignment_set.iter()) {
+                if resume.find_partition(topic, *p).is_none() {
+                    resume.add_partition(topic, *p);
+                }
+            }
+            if let Err(e) = consumer.resume(&resume) {
                 tracing::warn!(
                     error = %e,
-                    partitions = desired.len(),
-                    "kafka resume after assign failed: a partition left paused is re-assigned \
+                    partitions = resume.count(),
+                    "kafka resume before assign failed: a partition left paused is re-assigned \
                      by the stall check once records wait for it (#623)"
                 );
             }
+            consumer.assign(&tpl).map_err(|e| {
+                VtopError::Source(format!("assign ({} topics): {e}", sources.len()))
+            })?;
             self.liveness.on_assign(&assignment_set);
             // Under `latest`, where each partition assigned at
             // `Offset::Stored` started: any later assign must pin it there.
@@ -3356,6 +3615,7 @@ impl SourceAdapter for KafkaSource {
         }
         for (idx, p, part) in acc.into_sorted() {
             let topic = &sources[idx].source_name;
+            let topic_id = self.topic_id_of(topic);
             let cur = self.cursors.entry((topic.clone(), p)).or_default();
             if !part.records.is_empty() {
                 cur.last_read_offset = Some(part.end_offset);
@@ -3366,6 +3626,7 @@ impl SourceAdapter for KafkaSource {
                 start_offset: s,
                 end_offset: e,
                 consumer_group: group.clone(),
+                topic_id: topic_id.clone(),
             };
             per_source[idx].push(ReadResult {
                 progress_start: mk(part.start_offset, part.start_offset),
@@ -3573,6 +3834,30 @@ impl SourceAdapter for KafkaSource {
             .filter(|key| !self.known_committed.contains_key(key))
             .collect();
         let broker = self.group_committed_offsets(&partitions);
+        // Each marker sets its partition's resume position, so with two
+        // markers of one partition in a call the one applied last used to
+        // win: a higher start handed back after a lower one moved the cursor
+        // above the lower range, which was then never read again. Every
+        // marker of a partition lands at the LOWEST start the call names for
+        // it, whatever the order.
+        let mut lowest: HashMap<(String, i32), i64> = HashMap::new();
+        for marker in markers {
+            if self.foreign_group(marker).is_some() {
+                continue;
+            }
+            if let ProgressMarker::Kafka {
+                topic,
+                partition,
+                start_offset,
+                ..
+            } = marker
+            {
+                lowest
+                    .entry((topic.clone(), *partition))
+                    .and_modify(|low| *low = (*low).min(*start_offset))
+                    .or_insert(*start_offset);
+            }
+        }
         markers
             .iter()
             .map(|marker| {
@@ -3614,6 +3899,7 @@ impl SourceAdapter for KafkaSource {
                 // `rewind_frontier` for why it is the ledger's and not the
                 // broker's wherever the ledger knows the partition (#614).
                 let key = (topic.clone(), *partition);
+                let start_offset = &lowest.get(&key).copied().unwrap_or(*start_offset);
                 let in_memory = self.cursors.get(&key).and_then(|cur| cur.committed_offset);
                 let frontier = rewind_frontier(
                     self.known_committed.get(&key).copied(),
@@ -3661,8 +3947,9 @@ impl SourceAdapter for KafkaSource {
             .map(i128::from)
     }
 
-    /// The known frontier (`known_committed`): the ledger's newest committed
-    /// row for this partition and group, or what this process committed
+    /// The known frontier (`known_committed`): the ledger's highest committed
+    /// end for this partition and group among the rows of the topic's current
+    /// id (`seed_committed_from_ledger`), or what this process committed
     /// since. Never a rewind's landing, and never the broker's group offset,
     /// which an engine whose claim moved on can still write (#614). Another
     /// group's range is not answered: this group's frontier says nothing
@@ -4296,6 +4583,7 @@ mod tests {
             start_offset: start,
             end_offset: start + 9,
             consumer_group: "vtop-engine".into(),
+            topic_id: None,
         };
         // A superseded row below the ledger's frontier: already archived.
         src.replay_from_marker(&marker(0)).await.unwrap();
@@ -4304,6 +4592,35 @@ mod tests {
         src.cursors.clear();
         src.replay_from_marker(&marker(20)).await.unwrap();
         assert_eq!(src.read_position(&marker(20)), Some(20));
+    }
+
+    /// Two ranges of one partition handed back in one call, in either order,
+    /// resume the partition at the LOWER start. Applied in turn, the second
+    /// marker set the cursor: a higher start given last moved it above the
+    /// lower range, which was then never read again.
+    #[tokio::test]
+    async fn two_rewinds_of_one_partition_in_one_call_resume_at_the_lower_start() {
+        let marker = |start: i64| ProgressMarker::Kafka {
+            topic: "t".into(),
+            partition: 0,
+            start_offset: start,
+            end_offset: start + 9,
+            consumer_group: "vtop-engine".into(),
+            topic_id: None,
+        };
+        for order in [[30, 40], [40, 30]] {
+            let mut src = KafkaSource::new(cfg(), TelemetryFormat::Cef).unwrap();
+            src.known_committed.insert(("t".into(), 0), 20);
+            let markers: Vec<_> = order.iter().map(|&start| marker(start)).collect();
+            for result in src.replay_from_markers(&markers).await {
+                result.unwrap();
+            }
+            assert_eq!(
+                src.read_position(&marker(30)),
+                Some(30),
+                "rewinds handed back in the order {order:?} resume above the lower range"
+            );
+        }
     }
 
     /// #614, one engine on its own: a batch whose Kafka commit failed stays
@@ -4321,6 +4638,7 @@ mod tests {
             start_offset: 0,
             end_offset: 9,
             consumer_group: "vtop-engine".into(),
+            topic_id: None,
         };
         src.commit_progress(&older)
             .await
@@ -4348,6 +4666,7 @@ mod tests {
             start_offset: 0,
             end_offset: 9,
             consumer_group: group.into(),
+            topic_id: None,
         };
         assert_eq!(src.committed_through(&range("vtop-engine")), None);
         // A rewind's landing is not a commit.
@@ -4366,7 +4685,7 @@ mod tests {
     #[test]
     fn another_groups_ledger_rows_never_seed_this_groups_position() {
         let mut src = KafkaSource::new(cfg(), TelemetryFormat::Cef).unwrap();
-        src.seed_committed_from_ledger([("t", 0, "vtop-engine-old", 700)]);
+        src.seed_committed_from_ledger([answer("t", 0, "vtop-engine-old", None, 700, Some(700))]);
         assert!(src.known_committed.is_empty());
         assert!(src.cursors.is_empty());
         assert!(
@@ -4383,7 +4702,7 @@ mod tests {
     #[test]
     fn a_ledger_position_is_not_trusted_when_the_group_offset_cannot_be_read() {
         let mut src = KafkaSource::new(cfg(), TelemetryFormat::Cef).unwrap();
-        src.seed_committed_from_ledger([("t", 0, "vtop-engine", 19)]);
+        src.seed_committed_from_ledger([answer("t", 0, "vtop-engine", None, 19, Some(19))]);
         assert!(src.known_committed.is_empty());
         assert_eq!(
             src.cursors
@@ -4391,6 +4710,138 @@ mod tests {
                 .and_then(|c| c.committed_offset),
             None
         );
+    }
+
+    fn answer<'a>(
+        topic: &'a str,
+        partition: i32,
+        group: &'a str,
+        topic_id: Option<&'a str>,
+        end_offset: i64,
+        newest_end: Option<i64>,
+    ) -> LedgerResume<'a> {
+        LedgerResume {
+            topic,
+            partition,
+            consumer_group: group,
+            topic_id,
+            end_offset,
+            newest_end,
+        }
+    }
+
+    /// The ledger's answers of one partition, as the store gives them.
+    fn rows<'a>(rows: &[(Option<&'a str>, i64, Option<i64>)]) -> Vec<LedgerResume<'a>> {
+        rows.iter()
+            .map(|&(id, end, newest_end)| answer("t", 0, "g", id, end, newest_end))
+            .collect()
+    }
+
+    /// The A, B, C sequence: one topic id, a range committed at a higher end
+    /// created earlier than one committed at a lower end. The store answers
+    /// the highest end of the id, and the partition resumes after it.
+    #[test]
+    fn a_partition_resumes_after_the_highest_end_of_the_current_topic_id() {
+        // B (end 19) was created before C (end 9): the newest row's end is 9.
+        let ledger = rows(&[(Some("inc-1"), 19, Some(9))]);
+        assert_eq!(resume_end(&ledger, Some("inc-1")), Some(19));
+        // The id cannot be learned: the ledger's rule before ids, the newest
+        // row's own end (the duplicate this change removes where it can).
+        assert_eq!(resume_end(&ledger, None), Some(9));
+    }
+
+    /// A topic deleted and created again: the old log's rows end high, the
+    /// new log has archived a little. The partition follows the new log and
+    /// skips nothing: resuming at the old log's 501 would skip the new log's
+    /// records 8 to 500.
+    #[test]
+    fn a_recreated_topic_resumes_from_the_new_log_and_skips_nothing() {
+        let ledger = rows(&[(Some("inc-old"), 500, None), (Some("inc-new"), 7, Some(7))]);
+        assert_eq!(resume_end(&ledger, Some("inc-new")), Some(7));
+        // The old incarnation is still the current one, as long as its id is.
+        assert_eq!(resume_end(&ledger, Some("inc-old")), Some(500));
+    }
+
+    /// The topic was recreated and has no committed range yet: every row the
+    /// ledger holds is of the old log. Nothing resumes at the old log's end;
+    /// the partition follows the group's offset, else `auto.offset.reset`,
+    /// like a partition the ledger does not know.
+    #[test]
+    fn a_topic_with_a_new_id_and_no_rows_of_its_own_is_not_resumed_at_the_old_end() {
+        let ledger = rows(&[(Some("inc-old"), 500, Some(500))]);
+        assert_eq!(resume_end(&ledger, Some("inc-new")), None);
+        // Rows of no id predate every row of a known id: older still.
+        let mixed = rows(&[(None, 900, None), (Some("inc-old"), 500, Some(500))]);
+        assert_eq!(resume_end(&mixed, Some("inc-new")), None);
+    }
+
+    /// Rows written before ids were recorded keep the rule they were written
+    /// under: the newest row's end, whatever the topic's id is now, and never
+    /// a maximum across them and a known id.
+    #[test]
+    fn rows_with_no_topic_id_keep_the_old_rule() {
+        let legacy = rows(&[(None, 310, Some(310))]);
+        assert_eq!(resume_end(&legacy, Some("inc-1")), Some(310));
+        assert_eq!(resume_end(&legacy, None), Some(310));
+        // Upgraded, with rows of both kinds: the current id's own answer, not
+        // the larger end of the rows of no id (nor the other way round).
+        let mixed = rows(&[(None, 310, None), (Some("inc-1"), 9, Some(9))]);
+        assert_eq!(resume_end(&mixed, Some("inc-1")), Some(9));
+        // The id cannot be learned: the answer holding the newest row.
+        assert_eq!(resume_end(&mixed, None), Some(9));
+        assert_eq!(resume_end(&[], Some("inc-1")), None);
+    }
+
+    /// The topic id is cached for up to a minute, so ranges read just after a
+    /// recreate can carry the OLD id: an older row ending at 500 and a newer
+    /// one ending at 7 share it. When the id then cannot be learned at a
+    /// restart, the partition resumes after the NEWEST row's end (7), as the
+    /// ledger always did - not after the id's highest end (500), which would
+    /// skip the new log's records 8 to 500.
+    #[test]
+    fn without_an_id_a_newest_row_below_an_older_one_of_its_id_resumes_at_the_newest() {
+        let ledger = rows(&[(Some("inc-old"), 500, Some(7))]);
+        assert_eq!(resume_end(&ledger, None), Some(7));
+    }
+
+    /// An id is asked for when a topic has none held, or when the held ids
+    /// are old; a failed ask waits before the next. A changed id is reported,
+    /// a topic the broker gave no answer for keeps what it had.
+    #[test]
+    fn topic_ids_are_asked_for_when_missing_or_old_and_a_change_is_reported() {
+        let t0 = Instant::now();
+        let mut ids = TopicIds::default();
+        let topics = vec!["t".to_string()];
+        assert!(ids.due(&topics, t0), "nothing held yet");
+        let answers = HashMap::from([("t".to_string(), Some("inc-1".to_string()))]);
+        assert!(ids.record(&topics, answers, t0).is_empty());
+        assert!(!ids.due(&topics, t0 + TOPIC_ID_REFRESH / 2));
+        assert!(ids.due(&topics, t0 + TOPIC_ID_REFRESH), "old");
+        assert!(
+            ids.due(&["new".to_string()], t0),
+            "a topic with no id held is asked for at once"
+        );
+        // Recreated: a different id for a topic whose id was held.
+        let answers = HashMap::from([("t".to_string(), Some("inc-2".to_string()))]);
+        assert_eq!(
+            ids.record(&topics, answers, t0),
+            vec![(
+                "t".to_string(),
+                "inc-1".to_string(),
+                Some("inc-2".to_string())
+            )]
+        );
+        // No answer for a topic: its id stays; a topic never answered for has
+        // none and is not asked for on every pass.
+        let both = vec!["t".to_string(), "gone".to_string()];
+        assert!(ids.record(&both, HashMap::new(), t0).is_empty());
+        assert_eq!(ids.ids.get("t"), Some(&Some("inc-2".to_string())));
+        assert_eq!(ids.ids.get("gone"), Some(&None));
+        assert!(!ids.due(&both, t0 + Duration::from_secs(1)));
+        // A failed ask is not repeated at once.
+        ids.failed = Some(t0 + TOPIC_ID_REFRESH);
+        assert!(!ids.due(&both, t0 + TOPIC_ID_REFRESH + Duration::from_secs(1)));
+        assert!(ids.due(&both, t0 + TOPIC_ID_REFRESH + TOPIC_ID_RETRY));
     }
 
     fn cfg() -> KafkaSourceConfig {
@@ -4527,6 +4978,7 @@ mod tests {
             start_offset: start,
             end_offset: start + 9,
             consumer_group: group.into(),
+            topic_id: None,
         };
         let old = marker("vtop-engine-old", 700);
 
