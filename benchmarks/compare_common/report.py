@@ -129,12 +129,23 @@ def value(rows: Sequence[dict[str, str]], kind: schema.Kind, metric: Metric, gro
     return Value(stats.summarize(usable), None, len(selected))
 
 
+def secondary_columns(rows: Sequence[dict[str, str]], systems: Sequence[str],
+                      profiles: dict[str, str]) -> list[tuple[str, str]]:
+    """(system, profile) for each profile a system ran besides its primary one: charts and rankings stay
+    primary-only, and the tables show these as columns of their own (review of #906)."""
+    return [(s, p) for s in systems for p in sorted({r["profile"] for r in rows if r["system"] == s})
+            if p != profiles[s]]
+
+
 def table(rows, kind, metric, systems, profiles, group_label) -> list[list[str]]:
     out = []
+    extra = secondary_columns(rows, systems, profiles)
     for group in groups(rows, kind, metric):
         line = [group_label(group[0], dict(zip(kind.variant_columns, group[1])))]
         for system in systems:
             line.append(format_value(value(rows, kind, metric, group, system, profiles[system]), metric))
+        for system, profile in extra:
+            line.append(format_value(value(rows, kind, metric, group, system, profile), metric))
         out.append(line)
     return out
 
@@ -384,6 +395,8 @@ def build(run_dir: str, spec: Report, repo: str, *, doc_path: str | None = None,
     written = []
     doc_dir = os.path.dirname(doc_path)
     sections = []
+    extra = secondary_columns(rows, systems, profiles)
+    header = ["cell"] + [names[s] for s in systems] + [f"{names[s]} {p} (secondary)" for s, p in extra]
     for chart in spec.charts:
         written += draw_chart(plt, chart, rows, kind, systems, profiles, names, spec.group_label, footer, img_dir)
         image = os.path.relpath(os.path.join(img_dir, f"{chart.name}.png"), doc_dir)
@@ -391,7 +404,7 @@ def build(run_dir: str, spec: Report, repo: str, *, doc_path: str | None = None,
         for metric in chart.metrics:
             body = table(rows, kind, metric, systems, profiles, spec.group_label)
             sections.append(f"**{metric.label}** ({'sum over' if metric.reduce == 'sum' else 'median, min-max of'} "
-                            "the repetitions)\n\n" + md_table(["cell"] + [names[s] for s in systems], body) + "\n")
+                            "the repetitions)\n\n" + md_table(header, body) + "\n")
     rel_csv = os.path.relpath(os.path.join(run_dir, f"{kind.name}.csv"), doc_dir)
     rel_env = os.path.relpath(os.path.join(run_dir, "environment.json"), doc_dir)
     score_rows = [[s.metric.label, s.group, names.get(s.best, "none") if s.best else "none",
@@ -419,7 +432,8 @@ def build(run_dir: str, spec: Report, repo: str, *, doc_path: str | None = None,
         "## Scoreboard",
         "",
         "Each system in its primary profile: " + ", ".join(f"{names[s]} `{profiles[s]}`" for s in systems) + "."
-        + (" Other profiles (" + ", ".join(secondary) + ") are in the CSV and are not ranked." if secondary else ""),
+        + (" Other profiles (" + ", ".join(secondary) + ") are in the tables as secondary columns and in the "
+           "CSV, and are not charted or ranked." if secondary else ""),
         "",
         md_table(["metric", "cell", "best", "best value", "VTOP", "VTOP / best", "VTOP is"], score_rows),
         "",
