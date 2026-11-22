@@ -1487,6 +1487,10 @@ jobs:
         run: python -m unittest discover -s scripts/tests -p 'test_check_threat_map.py' -v
       - name: threat map (every named control and test exists)
         run: python scripts/check-threat-map.py
+      # The release workflow restores no build cache and interpolates no
+      # outside text into a script (the review under #730).
+      - name: the release workflow keeps caches out and untrusted text in env
+        run: python -m unittest discover -s scripts/tests -p 'test_release_workflow_hardening.py' -v
       # The 1.0 release gate (#741) names tests and CI jobs too, so a rename
       # fails here for the same reason. This checkout is shallow, so the
       # merged pull requests, runs and issues are checked by the docs
