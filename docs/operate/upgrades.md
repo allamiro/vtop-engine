@@ -34,8 +34,7 @@ in the roadmap.
   failed start and the lower range was never archived. To check a ledger
   those releases wrote, run `vtopctl audit-coverage` (with `--check-storage`
   to also probe the objects) and look for a unit with an unarchived range
-  below a later commit. A Kafka partition's gap is reported without failing
-  the command, so read the report, not only the exit status. See
+  below a later commit. A range the bug lost still has its FAILED or SUPERSEDED row (or a prune digest of one), so it is reported as a failed hole and the command fails, for Kafka partitions as for files; a Kafka gap that no failed row explains is reported without failing, so read the report as well as the exit status. See
   [Scrub and coverage audit](scrub-and-audit.md#coverage-audit).
 - **With `upload.require_object_versioning` set, a bucket whose versioning
   is suspended is no longer written to until it is re-enabled (#883).** The
