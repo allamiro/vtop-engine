@@ -310,6 +310,15 @@ pub struct Metrics {
     /// width, or the adaptive controller's current one. Read beside
     /// `upload_throttled_total`: a width that fell is a store that asked.
     pub upload_width: IntGauge,
+    /// Buckets the engine stopped writing to because they no longer keep
+    /// object versions while `upload.require_object_versioning` is set: a
+    /// PUT returned no version to pin, or the store said versioning is not
+    /// enabled. Nothing in such a bucket commits until its versioning is
+    /// enabled again. Non-zero is an operator action.
+    pub bucket_versioning_paused: IntGauge,
+    /// Batches that failed without writing anything because writes to their
+    /// bucket were paused (see `bucket_versioning_paused`); each is replayed.
+    pub bucket_versioning_paused_batches_total: IntCounterVec,
     /// Cycles where a source read failed and was skipped (the engine retries
     /// next cycle). A steady rate means a source is unhealthy.
     ///
@@ -737,6 +746,16 @@ impl Metrics {
             "Uploads kept in flight this cycle: the configured width, or the adaptive controller's current width when batching.adaptive_width is enabled",
         ))?;
         registry.register(Box::new(upload_width.clone()))?;
+        let bucket_versioning_paused = IntGauge::with_opts(Opts::new(
+            "bucket_versioning_paused",
+            "Buckets the engine stopped writing to under upload.require_object_versioning because they no longer keep object versions (a PUT returned no version to pin, or the store said versioning is not enabled); nothing in them commits until versioning is enabled again, and the engine checks on a backoff of at most 60 s",
+        ))?;
+        registry.register(Box::new(bucket_versioning_paused.clone()))?;
+        let bucket_versioning_paused_batches_total = cv(
+            "bucket_versioning_paused_batches_total",
+            "Batches that failed without writing anything because writes to their bucket were paused (see vtop_bucket_versioning_paused); each is replayed",
+            labels3(),
+        )?;
 
         Ok(Self {
             registry,
@@ -767,6 +786,8 @@ impl Metrics {
             inflight_batches,
             sealed_batches_in_flight,
             upload_width,
+            bucket_versioning_paused,
+            bucket_versioning_paused_batches_total,
             source_read_errors_total,
             retention_lost_records_total,
             source_replay_refused_total,

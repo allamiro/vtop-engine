@@ -95,6 +95,8 @@ GET /readyz    readiness
 | `vtop_kafka_partition_events_total{event}` | counter | Kafka partition-list changes seen while reading, and what the source did (#675): `no_partitions` (asked again next pass), `lookup_failed` (last known list served), `grew`, `new_partition_from_beginning`, `start_deferred` (asked again; counted per attempt, at most once per partition every 10s), `pinned_before_renewal`, and `recreated_or_truncated`. **Alert on `recreated_or_truncated`**: the ledger cannot tell a recreated topic from the old one, so an operator must check what was archived. The topic and partition are in the log line beside it. |
 | `vtop_upload_throttled_total{stage}` | counter | The store asking for less concurrency, not more retries (#102) |
 | `vtop_upload_width` | gauge | Uploads in flight this cycle: the configured width, or the adaptive controller's (#102) |
+| `vtop_bucket_versioning_paused` | gauge | Buckets the engine stopped writing to because they no longer keep object versions while `upload.require_object_versioning` is set: a PUT returned no version to pin, or the store said versioning is not enabled (suspended under a running engine). Nothing in such a bucket commits; the engine checks its versioning 5 s later, then on a backoff doubling to 60 s, and resumes when it is enabled. The bucket is in the ERROR `bucket_versioning_paused` line. The shipped rule `VtopBucketVersioningPaused` pages when it stays above zero for 5 minutes. |
+| `vtop_bucket_versioning_paused_batches_total{tenant,source_type,format}` | counter | Batches that failed without writing anything because writes to their bucket were paused (above); each is replayed. |
 | `vtop_multipart_parts_total{result}` | counter | Multipart parts (#668), by `result`: `uploaded` (sent in this upload call; a call that restarts on a new upload counts what it sent to each, since both crossed the link), `reused` (kept from an earlier call, matched against the local bytes and not sent again), `retried` (one per extra attempt at a part), `failed` (the part's last attempt in the call failed). Throttled part requests are also in `vtop_upload_throttled_total{stage="object_upload"}`. |
 | `vtop_multipart_sessions_total{outcome}` | counter | Multipart sessions (#668), by `outcome`: `completed`, `resumed` (a replay adopted the session a failed attempt kept), `restarted` (the store could not continue the upload, `NoSuchUpload` or `InvalidPart` on complete; it was abandoned and a new one started; `resumed` stays counted if it had been resumed), `kept_after_failure` (an upload failed and its session and parts were kept for the replay), `swept` (an abandoned session's upload was aborted). **Alert when `kept_after_failure` grows while `resumed` and `swept` do not**: incomplete uploads are piling up in the bucket, where their parts are billed (see `docs/PRODUCTION_HA.md` §7.6). `resumed`, `restarted`, `kept_after_failure` and `swept` are also `multipart_*` log events (`multipart_session_resumed`, `multipart_session_restarted`, `multipart_session_kept`, `multipart_sweep`) with the object `key`; a part retry is a `multipart_part_retry` event, at most one a minute per object with a `suppressed` count. |
 | `vtop_multipart_bytes_reused_total` | counter | Bytes of kept parts a resumed upload did not send again (#668): what keeping sessions saved. |
@@ -168,7 +170,24 @@ Rules on metrics the nodes already exported, which nothing watched:
 | Follower lag growing | `deriv(vtop_broker_follower_lag_records[10m])` stays positive | 15 min |
 | Fencing epoch churn | more than 3 `vtop_broker_meta_fencing_epoch` changes in 30 min | — |
 | Promotion boundary stuck | `vtop_broker_boundary_pending` stays 1 (fetch is refused meanwhile) | 2 min |
+| Follower below the catch-up horizon | `vtop_broker_follower_below_catch_up_horizon` is 1 | 5 min |
 | Metadata leader lost its quorum | `vtop_meta_raft_millis_since_quorum_ack` above 10 s | 1 min |
+
+A leader catches a follower up from its own log when the follower is behind
+what the replication stream still holds (#881): after the session's fence, it
+re-sends what the follower lacks, from the offset the follower reports. That
+reaches no further back than the leader's log start. A follower durable only
+below it - down while retention reclaimed the records it lacks - cannot be
+caught up by any append, and **Follower below the catch-up horizon** fires.
+The range runs one replica short until the follower is rebuilt:
+
+1. Confirm it: the leader's WARN line names the follower, its durable offset
+   and the leader's log start (`vtop_broker_log_start_offset`).
+2. Stop the follower and rebuild its range directory from the leader with
+   `vtopctl node repair` (docs/PRODUCTION_HA.md), then start it.
+   It rejoins through the ordinary session and catches up from the log.
+3. If this recurs, retention is shorter than the longest outage a follower is
+   expected to ride out: raise the range's retention bound.
 
 The follower series come from a leader's collector; a candidate deployment
 exports the range and retention gauges but not per-follower ones, so those two
