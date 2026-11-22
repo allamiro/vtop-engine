@@ -1,0 +1,76 @@
+{
+ "rows": [
+  {
+   "run_id": "competing-flow-bulk-capped-20261111T030315Z-z42d9q",
+   "phase": "alone-before",
+   "sender_measured_intervals": 120,
+   "sender_first_interval": {
+    "start": 0.000111,
+    "end": 1.000121,
+    "seconds": 1.0002319812774658
+   },
+   "sender_last_interval_end": 119.999692,
+   "sum_sent_seconds": 119.999692,
+   "sum_received_seconds": 120.190495,
+   "streams0_receiver_seconds": 119.999692,
+   "receiver_minus_sender_seconds": 0.190803,
+   "sum_sent_bytes": 143130624,
+   "sum_received_bytes": 143523840,
+   "server_first_measured_line": "[  5]   0.00-1.00   sec  1.12 MBytes  9.43 Mbits/sec"
+  },
+  {
+   "run_id": "competing-flow-bulk-capped-20261111T030315Z-z42d9q",
+   "phase": "with-vtop",
+   "sender_measured_intervals": 120,
+   "sender_first_interval": {
+    "start": 0.000165,
+    "end": 1.000532,
+    "seconds": 1.0006970167160034
+   },
+   "sender_last_interval_end": 120.000653,
+   "sum_sent_seconds": 120.000653,
+   "sum_received_seconds": 120.144036,
+   "streams0_receiver_seconds": 120.000653,
+   "receiver_minus_sender_seconds": 0.143383,
+   "sum_sent_bytes": 112066560,
+   "sum_received_bytes": 112066560,
+   "server_first_measured_line": "[  5]   1.00-1.00   sec   896 KBytes  3.67 Mbits/sec"
+  },
+  {
+   "run_id": "competing-flow-bulk-capped-20261111T031037Z-5cpiq6",
+   "phase": "alone-before",
+   "sender_measured_intervals": 120,
+   "sender_first_interval": {
+    "start": 0.000108,
+    "end": 1.000258,
+    "seconds": 1.000365972518921
+   },
+   "sender_last_interval_end": 120.000342,
+   "sum_sent_seconds": 120.000342,
+   "sum_received_seconds": 120.170116,
+   "streams0_receiver_seconds": 120.000342,
+   "receiver_minus_sender_seconds": 0.169774,
+   "sum_sent_bytes": 143392768,
+   "sum_received_bytes": 143523840,
+   "server_first_measured_line": "[  5]   0.00-1.00   sec  1.12 MBytes  9.43 Mbits/sec"
+  },
+  {
+   "run_id": "competing-flow-bulk-capped-20261111T031037Z-5cpiq6",
+   "phase": "with-vtop",
+   "sender_measured_intervals": 120,
+   "sender_first_interval": {
+    "start": 8.3e-05,
+    "end": 1.00022,
+    "seconds": 1.000303030014038
+   },
+   "sender_last_interval_end": 120.00043,
+   "sum_sent_seconds": 120.00043,
+   "sum_received_seconds": 120.149861,
+   "streams0_receiver_seconds": 120.00043,
+   "receiver_minus_sender_seconds": 0.149431,
+   "sum_sent_bytes": 111673344,
+   "sum_received_bytes": 111804416,
+   "server_first_measured_line": "[  5]   0.00-1.00   sec   896 KBytes  7.34 Mbits/sec"
+  }
+ ]
+}

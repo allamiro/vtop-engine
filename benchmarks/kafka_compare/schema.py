@@ -5,6 +5,14 @@ environment set of rows or raises `ReportRefused` naming what is wrong. The
 report never draws from anything else, so a chart cannot quietly have a hole
 where a row is missing - a cell that did not run is a ROW saying so (status
 `failed` or `refused`), and the chart shows that gap by name.
+
+There are two layouts (#596). Schema 2 (`COLUMNS`) adds compression, the load
+basis, the latency basis, the end-to-end mode, the measurement window and
+`same_config_as`, and it moves `profile` from the run-constant set into the
+row key. Schema 1 (`COLUMNS_V1`, phase 1's committed run) still loads. Its rows
+are read as schema 2 with compression `none`, load basis `kafka` on fixed-rate
+rows and latency basis `single`, which is what that run did, so its report is
+unchanged byte for byte.
 """
 from __future__ import annotations
 
@@ -16,11 +24,17 @@ import re
 from collections.abc import Iterable
 from typing import Any, NamedTuple
 
-SYSTEMS = ("kafka", "vtop")
-STATUSES = ("ok", "failed", "refused")
-MODES = ("saturation", "fixed_rate", "consume")
+from kafka_compare import plan
 
-COLUMNS = (
+SYSTEMS = plan.SYSTEMS
+STATUSES = ("ok", "failed", "refused")
+MODES = ("saturation", "fixed_rate", "consume", "e2e")
+COMPRESSIONS = plan.COMPRESSIONS
+ACKS = plan.ACKS
+PROFILES = plan.PROFILES
+LOAD_BASES = plan.LOAD_BASES
+
+COLUMNS_V1 = (
     "run_id",
     "env_fingerprint",
     "vtop_commit",
@@ -52,16 +66,78 @@ COLUMNS = (
     "note",
 )
 
-# Columns that must be the same on every row of one run: a chart that mixed
-# them would compare two environments as if they were one (rule 9).
-RUN_CONSTANT = ("run_id", "env_fingerprint", "vtop_commit", "kafka_image", "client", "profile")
+COLUMNS = (
+    "run_id",
+    "env_fingerprint",
+    "vtop_commit",
+    "kafka_image",
+    "client",
+    "system",
+    "mode",
+    "record_size",
+    "partitions",
+    "producers",
+    "compression",
+    "acks",
+    "profile",
+    # The profile whose measurement this row repeats (#596 decision 2). VTOP's
+    # node configuration is the same under both profiles, so it runs once per
+    # cell and its rows are recorded under each profile; a copy names the
+    # profile it was measured under. Blank on every row measured as itself.
+    "same_config_as",
+    "repetition",
+    "load_basis",
+    "load_pct",
+    "offered_rate",
+    "status",
+    "sustained",
+    "records",
+    "records_produced",
+    "records_per_sec",
+    "mib_per_sec",
+    "lat_avg_ms",
+    "lat_max_ms",
+    "lat_p50_ms",
+    "lat_p95_ms",
+    "lat_p99_ms",
+    "lat_p999_ms",
+    "lat_basis",
+    "started_at",
+    "window_start_ms",
+    "window_end_ms",
+    "wall_seconds",
+    "note",
+)
 
+# Columns that must be the same on every row of one run: a chart that mixed
+# them would compare two environments as if they were one (rule 9). Schema 1
+# also held `profile` constant; schema 2 makes it a key.
+RUN_CONSTANT = ("run_id", "env_fingerprint", "vtop_commit", "kafka_image", "client")
+RUN_CONSTANT_V1 = RUN_CONSTANT + ("profile",)
+
+# The row key: completeness and duplicates are judged on it.
+KEY = ("system", "mode", "record_size", "partitions", "producers", "compression", "acks", "profile",
+       "repetition", "load_basis", "load_pct")
+
+_LATENCY = ("lat_p50_ms", "lat_p95_ms", "lat_p99_ms", "lat_p999_ms")
 _NUMERIC_OK = {
     "saturation": ("records", "records_per_sec", "mib_per_sec"),
-    "fixed_rate": ("records", "records_per_sec", "mib_per_sec", "lat_p50_ms", "lat_p95_ms",
-                   "lat_p99_ms", "lat_p999_ms"),
+    "fixed_rate": ("records", "records_per_sec", "mib_per_sec") + _LATENCY,
     "consume": ("records", "records_per_sec", "mib_per_sec"),
+    "e2e": ("records", "records_produced") + _LATENCY,
 }
+# Modes whose ok rows carry percentiles, and so say how they were combined.
+_HAS_LATENCY = ("saturation", "fixed_rate", "e2e")
+# Measurement columns a repeated row (`same_config_as`) must carry
+# unchanged from the row it repeats.
+_MEASURED = ("status", "sustained", "records", "records_per_sec", "mib_per_sec", "lat_avg_ms", "lat_max_ms",
+             "lat_p50_ms", "lat_p95_ms", "lat_p99_ms", "lat_p999_ms", "lat_basis", "started_at",
+             "window_start_ms", "window_end_ms", "wall_seconds", "note")
+
+
+def expected_lat_basis(producers: str) -> str:
+    """`single` for one producer; the worst of N producers' percentiles for N."""
+    return "single" if producers == "1" else f"worst-of-{producers}"
 
 
 class ReportRefused(Exception):
@@ -126,19 +202,19 @@ def format_value(value: Any) -> str:
     return str(value)
 
 
-def write_header(path: str) -> None:
+def write_header(path: str, columns: tuple[str, ...] = COLUMNS) -> None:
     with open(path, "w", newline="") as handle:
-        csv.writer(handle).writerow(COLUMNS)
+        csv.writer(handle).writerow(columns)
 
 
-def append_row(path: str, row: dict[str, Any]) -> None:
+def append_row(path: str, row: dict[str, Any], columns: tuple[str, ...] = COLUMNS) -> None:
     """Append one row, flushed and fsynced, so an interrupted run keeps every
     row it measured (and the report then refuses it as partial)."""
-    unknown = set(row) - set(COLUMNS)
+    unknown = set(row) - set(columns)
     if unknown:
         raise ValueError(f"unknown result columns: {sorted(unknown)}")
     with open(path, "a", newline="") as handle:
-        csv.writer(handle).writerow([format_value(row.get(column)) for column in COLUMNS])
+        csv.writer(handle).writerow([format_value(row.get(column)) for column in columns])
         handle.flush()
         os.fsync(handle.fileno())
 
@@ -172,35 +248,107 @@ def _key_int(row: dict[str, str], column: str, line: int) -> int:
     return int(text)
 
 
-def read_rows(csv_path: str) -> list[dict[str, str]]:
+def _upgrade_v1(row: dict[str, str]) -> dict[str, str]:
+    """A schema-1 row read as schema 2: what phase 1 did, said in the new
+    columns. A short row is left as it is, so `validate_rows` refuses it by
+    line."""
+    if None in row or any(value is None for value in row.values()):
+        return row
+    out = dict(row)
+    out["compression"] = "none"
+    out["same_config_as"] = ""
+    out["load_basis"] = "kafka" if row["mode"] == "fixed_rate" else ""
+    out["lat_basis"] = "single" if row["status"] == "ok" and row["mode"] in _HAS_LATENCY else ""
+    for column in ("records_produced", "window_start_ms", "window_end_ms"):
+        out[column] = ""
+    return out
+
+
+def read_rows(csv_path: str, *, allow_empty: bool = False) -> tuple[list[dict[str, str]], int]:
+    """The rows, as schema 2, and the schema the file was written in."""
     if not os.path.isfile(csv_path):
         raise ReportRefused(f"no results CSV at {csv_path}")
     with open(csv_path, newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
-        if tuple(reader.fieldnames or ()) != COLUMNS:
+        header = tuple(reader.fieldnames or ())
+        if header == COLUMNS:
+            version = 2
+        elif header == COLUMNS_V1:
+            version = 1
+        else:
             raise ReportRefused(
-                f"{csv_path} has columns {reader.fieldnames}, expected {list(COLUMNS)}"
+                f"{csv_path} has columns {reader.fieldnames}, expected schema 2 {list(COLUMNS)} "
+                f"or schema 1 {list(COLUMNS_V1)}"
             )
         rows = list(reader)
-    if not rows:
+    if not rows and not allow_empty:
         raise ReportRefused(f"{csv_path} has a header and no rows")
-    return rows
+    if version == 1:
+        rows = [_upgrade_v1(row) for row in rows]
+    return rows, version
 
 
-def validate_rows(rows: list[dict[str, str]]) -> None:
+def _whole_or_blank(row: dict[str, str], column: str, line: int) -> int | None:
+    text = row[column]
+    if text == "":
+        return None
+    if not (text == "0" or _CANONICAL_INT.match(text)):
+        raise ReportRefused(f"results.csv line {line}: {column} is {text!r}, not a whole number")
+    return int(text)
+
+
+def _validate_v2_columns(row: dict[str, str], line: int) -> None:
+    """The schema-2 columns of one row (a schema-1 row has them filled in)."""
+    if row["compression"] not in COMPRESSIONS:
+        raise ReportRefused(f"results.csv line {line}: unknown compression {row['compression']!r}")
+    if row["acks"] not in ACKS:
+        raise ReportRefused(f"results.csv line {line}: acks is {row['acks']!r}, not one of {list(ACKS)}")
+    if row["profile"] not in PROFILES:
+        raise ReportRefused(f"results.csv line {line}: unknown profile {row['profile']!r}")
+    same = row["same_config_as"]
+    if same:
+        if same not in PROFILES or same == row["profile"]:
+            raise ReportRefused(f"results.csv line {line}: same_config_as is {same!r} on a {row['profile']!r} "
+                                "row; it must name the other profile the row was measured under")
+        if row["system"] != "vtop":
+            raise ReportRefused(f"results.csv line {line}: a {row['system']} row repeats another profile's "
+                                "measurement; only VTOP, whose configuration the profiles do not change, may")
+        if row["mode"] not in ("saturation", "consume"):
+            # A rated row's offered rate is a share of THAT profile's
+            # saturation, so it cannot be another profile's measurement.
+            raise ReportRefused(f"results.csv line {line}: a {row['mode']} row repeats another profile's "
+                                "measurement; only saturation and consume rows may, rated rows are run per profile")
+    basis = row["load_basis"]
+    if row["mode"] in ("fixed_rate", "e2e") and basis not in LOAD_BASES:
+        raise ReportRefused(f"results.csv line {line}: a {row['mode']} row has load_basis {basis!r}")
+    if row["mode"] in ("saturation", "consume") and basis:
+        raise ReportRefused(f"results.csv line {line}: a {row['mode']} row has load_basis {basis!r}")
+    if row["mode"] != "e2e" and row["records_produced"]:
+        raise ReportRefused(f"results.csv line {line}: records_produced is for e2e rows only")
+    if row["mode"] not in _HAS_LATENCY and row["lat_basis"]:
+        raise ReportRefused(f"results.csv line {line}: a {row['mode']} row has lat_basis {row['lat_basis']!r}")
+    start = _whole_or_blank(row, "window_start_ms", line)
+    end = _whole_or_blank(row, "window_end_ms", line)
+    if (start is None) != (end is None) or (start is not None and end < start):
+        raise ReportRefused(f"results.csv line {line}: the window {row['window_start_ms']!r}.."
+                            f"{row['window_end_ms']!r} is not a start and an end at or after it")
+
+
+def validate_rows(rows: list[dict[str, str]], version: int = 2) -> None:
     """Every row well-formed, every run-constant column identical across rows."""
     for line, row in enumerate(rows, start=2):
         if None in row or any(value is None for value in row.values()):
             raise ReportRefused(f"results.csv line {line} has the wrong number of fields")
-        if row["system"] not in SYSTEMS:
-            raise ReportRefused(f"results.csv line {line}: unknown system {row['system']!r}")
         if row["mode"] not in MODES:
             raise ReportRefused(f"results.csv line {line}: unknown mode {row['mode']!r}")
+        if row["system"] not in SYSTEMS:
+            raise ReportRefused(f"results.csv line {line}: unknown system {row['system']!r}")
+        _validate_v2_columns(row, line)
         if row["status"] not in STATUSES:
             raise ReportRefused(f"results.csv line {line}: unknown status {row['status']!r}")
         for column in KEY_COLUMNS:
             _key_int(row, column, line)
-        if row["mode"] == "fixed_rate":
+        if row["mode"] in ("fixed_rate", "e2e"):
             if not 0 < _key_int(row, "load_pct", line) < 100:
                 raise ReportRefused(f"results.csv line {line}: load_pct is {row['load_pct']!r}")
             # The report reads the offered rate from any row of the cell, ok or
@@ -212,14 +360,24 @@ def validate_rows(rows: list[dict[str, str]]) -> None:
         if row["status"] == "ok":
             for column in _NUMERIC_OK[row["mode"]]:
                 _number(row, column, line)
-            if row["mode"] == "fixed_rate":
+            if row["mode"] in ("fixed_rate", "e2e"):
                 if row["sustained"] not in ("true", "false"):
                     raise ReportRefused(f"results.csv line {line}: sustained is {row['sustained']!r}")
+            if row["mode"] in _HAS_LATENCY and row["lat_basis"] != expected_lat_basis(row["producers"]):
+                raise ReportRefused(f"results.csv line {line}: lat_basis is {row['lat_basis']!r} with "
+                                    f"{row['producers']} producer(s); it must be "
+                                    f"{expected_lat_basis(row['producers'])!r}")
+            if row["mode"] == "e2e" and row["records"] != row["records_produced"]:
+                # Fewer consumed than produced is a gap the CDF would hide: the
+                # run writes such a row as failed, saying how many are missing.
+                raise ReportRefused(f"results.csv line {line}: an ok e2e row consumed {row['records']} of "
+                                    f"{row['records_produced']} records produced")
         elif not row["note"].strip():
             raise ReportRefused(
                 f"results.csv line {line}: a {row['status']} row must say why in `note`"
             )
-    for column in RUN_CONSTANT:
+    check_repeats(rows)
+    for column in (RUN_CONSTANT_V1 if version == 1 else RUN_CONSTANT):
         values = sorted({row[column] for row in rows})
         if len(values) != 1:
             raise ReportRefused(
@@ -228,35 +386,51 @@ def validate_rows(rows: list[dict[str, str]]) -> None:
             )
 
 
+def check_repeats(rows: list[dict[str, str]]) -> None:
+    """Every row that repeats another profile's measurement (`same_config_as`)
+    has that measured row, itself measured rather than repeated, and carries
+    its measurement unchanged (review)."""
+    by_key = {}
+    for row in rows:
+        by_key.setdefault(_text_key(row), row)
+    for line, row in enumerate(rows, start=2):
+        if not row["same_config_as"]:
+            continue
+        source = by_key.get(_text_key({**row, "profile": row["same_config_as"]}))
+        if source is None or source["same_config_as"]:
+            raise ReportRefused(f"results.csv line {line}: it repeats a {row['same_config_as']} measurement "
+                                "that is not in the run as a measured row")
+        changed = [c for c in _MEASURED if row[c] != source[c]]
+        if changed:
+            raise ReportRefused(f"results.csv line {line}: it repeats a {row['same_config_as']} measurement but "
+                                f"differs from it in {', '.join(changed)}")
+
+
+def _text_key(row: dict[str, str]) -> tuple:
+    return tuple(row[column] for column in KEY)
+
+
 def expected_keys(matrix: dict[str, Any]) -> set[tuple]:
-    """Every (system, mode, record_size, partitions, producers, repetition, load_pct)
-    a complete run of `matrix` writes a row for."""
-    keys = set()
-    reps = int(matrix["repetitions"])
-    for size in matrix["record_sizes"]:
-        for partitions in matrix["partitions"]:
-            for producers in matrix["producers"]:
-                for system in SYSTEMS:
-                    for rep in range(1, reps + 1):
-                        keys.add((system, "saturation", size, partitions, producers, rep, ""))
-                        for pct in matrix["load_pcts"]:
-                            keys.add((system, "fixed_rate", size, partitions, producers, rep, str(pct)))
-                        if matrix.get("consume"):
-                            keys.add((system, "consume", size, partitions, producers, rep, ""))
-    return keys
+    """Every row key (see `KEY`) a complete run of `matrix` writes. There is
+    one definition, in `plan`, for the runner and the report."""
+    return plan.expected_keys(matrix)
 
 
 def row_key(row: dict[str, str]) -> tuple:
-    """The row's matrix key. `validate_rows` has already required every key
-    column to be a canonical integer, so the key is the same text the report
-    selects cells by."""
+    """The row's matrix key, in `KEY` order. `validate_rows` has already
+    required every integer key column to be canonical, so the key is the same
+    text the report selects cells by."""
     return (
         row["system"],
         row["mode"],
         int(row["record_size"]),
         int(row["partitions"]),
         int(row["producers"]),
+        row["compression"],
+        row["acks"],
+        row["profile"],
         int(row["repetition"]),
+        row["load_basis"],
         row["load_pct"],
     )
 
@@ -287,9 +461,13 @@ def check_matrix(matrix: dict[str, Any]) -> None:
         raise ReportRefused(f"environment.json: matrix.acks is {acks!r}, not a list of acknowledgement modes")
     if not isinstance(matrix.get("consume"), bool):
         raise ReportRefused(f"environment.json: matrix.consume is {matrix.get('consume')!r}, not true or false")
+    try:
+        plan.check_matrix(matrix)
+    except plan.PlanRefused as exc:
+        raise ReportRefused(f"environment.json: {exc}") from exc
 
 
-def check_identity(rows: list[dict[str, str]], environment: dict[str, Any]) -> None:
+def check_identity(rows: list[dict[str, str]], environment: dict[str, Any], version: int = 2) -> None:
     """Bind the CSV's identity columns to the run environment.json records.
 
     The fingerprint covers `comparable` only, while every row carries its own
@@ -303,34 +481,48 @@ def check_identity(rows: list[dict[str, str]], environment: dict[str, Any]) -> N
         "vtop_commit": comparable.get("vtop_commit"),
         "kafka_image": comparable.get("kafka_image"),
         "client": comparable.get("client"),
-        "profile": comparable.get("profile"),
     }
+    if version == 1:
+        # One profile per schema-1 run, recorded in the environment.
+        recorded["profile"] = comparable.get("profile")
     for column, value in recorded.items():
         if rows[0][column] != value:
             raise ReportRefused(f"results.csv has {column}={rows[0][column]!r}, but environment.json records {value!r}")
-    acks = environment["matrix"]["acks"]
+    acks = list(environment["matrix"]["acks"])
+    acks += [extra["acks"] for extra in environment["matrix"].get("acks_slice") or [] if extra["acks"] not in acks]
     for line, row in enumerate(rows, start=2):
         if row["acks"] not in acks:
             raise ReportRefused(f"results.csv line {line}: acks={row['acks']!r}, but the recorded matrix ran {acks}")
 
 
-def check_complete(rows: list[dict[str, str]], matrix: dict[str, Any]) -> None:
-    """Refuse a partial run: every expected row present exactly once, nothing extra."""
+class Completeness(NamedTuple):
+    expected: set[tuple]
+    missing: list[tuple]
+    duplicates: list[tuple]
+    extra: list[tuple]
+
+
+def completeness(rows: list[dict[str, str]], matrix: dict[str, Any]) -> Completeness:
+    """What `rows` lack, repeat or add against what `matrix` owes."""
     seen: dict[tuple, int] = {}
     for row in rows:
         key = row_key(row)
         seen[key] = seen.get(key, 0) + 1
-    duplicates = sorted(key for key, count in seen.items() if count > 1)
+    expected = expected_keys(matrix)
+    return Completeness(expected, sorted(expected - set(seen)),
+                        sorted(key for key, count in seen.items() if count > 1), sorted(set(seen) - expected))
+
+
+def check_complete(rows: list[dict[str, str]], matrix: dict[str, Any]) -> None:
+    """Refuse a partial run: every expected row present exactly once, nothing extra."""
+    expected, missing, duplicates, extra = completeness(rows, matrix)
     if duplicates:
         raise ReportRefused(f"results.csv has duplicate rows for {duplicates[:3]}")
-    expected = expected_keys(matrix)
-    missing = sorted(expected - set(seen))
     if missing:
         raise ReportRefused(
             f"results.csv is partial: {len(missing)} of {len(expected)} expected rows are missing, "
             f"first {missing[:3]}"
         )
-    extra = sorted(set(seen) - expected)
     if extra:
         raise ReportRefused(f"results.csv has rows outside the recorded matrix: {extra[:3]}")
 
@@ -339,10 +531,10 @@ class Run(NamedTuple):
     rows: list[dict[str, str]]
     environment: dict[str, Any]
     run_dir: str
+    version: int = 2
 
 
-def load_run(run_dir: str) -> Run:
-    """The rows and environment of one complete run, or ReportRefused."""
+def _load_environment(run_dir: str) -> tuple[str, dict[str, Any]]:
     env_path = os.path.join(run_dir, "environment.json")
     if not os.path.isfile(env_path):
         raise ReportRefused(f"no environment.json in {run_dir}")
@@ -354,6 +546,32 @@ def load_run(run_dir: str) -> Run:
     if not isinstance(environment, dict):
         raise ReportRefused(f"{env_path} holds a JSON {type(environment).__name__}, not an object")
     check_schema_version(environment, env_path)
+    return env_path, environment
+
+
+def check_run(run_dir: str) -> Completeness:
+    """What a run directory still lacks, whatever its run_state: the runner's
+    `--check`. The rows present must be well formed and name this run's
+    environment; the only thing tolerated is that some are missing."""
+    env_path, environment = _load_environment(run_dir)
+    matrix = environment.get("matrix")
+    if not isinstance(matrix, dict):
+        raise ReportRefused(f"{env_path} records no matrix to check the CSV against")
+    check_matrix(matrix)
+    rows, version = read_rows(os.path.join(run_dir, "results.csv"), allow_empty=True)
+    if rows:
+        validate_rows(rows, version)
+        expected_fp = fingerprint(environment)
+        if rows[0]["env_fingerprint"] != expected_fp:
+            raise ReportRefused(f"results.csv was written under environment {rows[0]['env_fingerprint']}, "
+                                f"but environment.json fingerprints to {expected_fp}")
+        check_identity(rows, environment, version)
+    return completeness(rows, matrix)
+
+
+def load_run(run_dir: str) -> Run:
+    """The rows and environment of one complete run, or ReportRefused."""
+    env_path, environment = _load_environment(run_dir)
     if environment.get("run_state") != "complete":
         raise ReportRefused(
             f"{env_path} says run_state={environment.get('run_state')!r}: the run did not finish"
@@ -362,17 +580,17 @@ def load_run(run_dir: str) -> Run:
     if not isinstance(matrix, dict):
         raise ReportRefused(f"{env_path} records no matrix to check the CSV against")
     check_matrix(matrix)
-    rows = read_rows(os.path.join(run_dir, "results.csv"))
-    validate_rows(rows)
+    rows, version = read_rows(os.path.join(run_dir, "results.csv"))
+    validate_rows(rows, version)
     expected_fp = fingerprint(environment)
     if rows[0]["env_fingerprint"] != expected_fp:
         raise ReportRefused(
             f"results.csv was written under environment {rows[0]['env_fingerprint']}, "
             f"but environment.json fingerprints to {expected_fp}"
         )
-    check_identity(rows, environment)
+    check_identity(rows, environment, version)
     check_complete(rows, matrix)
-    return Run(rows, environment, run_dir)
+    return Run(rows, environment, run_dir, version)
 
 
 def select(rows: Iterable[dict[str, str]], **criteria: Any) -> list[dict[str, str]]:

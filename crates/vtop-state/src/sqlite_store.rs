@@ -156,6 +156,39 @@ CREATE INDEX IF NOT EXISTS idx_batches_commit_newest ON batches(
     created_at,
     batch_id
 );
+-- Bounds the Kafka branches of the prune predicate: a Kafka row of a known
+-- topic id is deletable once a row of its (topic, partition, consumer group,
+-- topic id) ends HIGHER, and that probe seeks to the rows above this one's end
+-- offset, and a row of no id seeks the group's rows of no id. Partial, so a file
+-- or spool ledger pays nothing for it. The expressions must stay textually
+-- identical to the ones in prune_predicate_sql.
+CREATE INDEX IF NOT EXISTS idx_batches_kafka_max_end ON batches(
+    state,
+    json_extract(progress_end_json, '$.topic'),
+    json_extract(progress_end_json, '$.partition'),
+    json_extract(progress_end_json, '$.consumer_group'),
+    json_extract(progress_end_json, '$.topic_id'),
+    CAST(json_extract(progress_end_json, '$.end_offset') AS INTEGER),
+    created_at,
+    batch_id
+) WHERE source_type = 'kafka';
+-- Bounds the lookup of an incarnation's newest row (the unresolved test in
+-- the prune predicate) and the probe for a newer row of no topic id (a NULL
+-- id is one more incarnation here): the
+-- unit's identity and the topic id, then (created_at, batch_id), so the
+-- newest row is the last entry of one index range. Without the topic id
+-- ahead of the creation time, an old incarnation's lookup walks the newer
+-- incarnation's rows. The expressions must stay textually identical to the
+-- ones in prune_predicate_sql.
+CREATE INDEX IF NOT EXISTS idx_batches_kafka_id_newest ON batches(
+    state,
+    json_extract(progress_end_json, '$.topic'),
+    json_extract(progress_end_json, '$.partition'),
+    json_extract(progress_end_json, '$.consumer_group'),
+    json_extract(progress_end_json, '$.topic_id'),
+    created_at,
+    batch_id
+) WHERE source_type = 'kafka';
 -- The audit trail (#694): one row per audit record, append only, chained
 -- (see crate::audit). A new table: an older release opening this file never
 -- reads it, so the schema version is unchanged. AUTOINCREMENT, so a deleted
@@ -178,39 +211,155 @@ CREATE INDEX IF NOT EXISTS idx_audit_events_time ON audit_events(time);
 "#;
 
 /// Prune predicate shared between the store method and the plan-shape test.
-/// A row is deletable only when a NEWER committed row - ordered by
-/// (created_at, batch_id), the order `committed_cursors` reads - exists for
-/// the same source path (source_name when the marker has no path). Exactly
-/// one row per path group has no successor, and it is the one the restart
-/// cursor is seeded from. Ordering by end_byte, as this did, kept the highest
-/// offset instead, and after a rotation or a copytruncate that is the old
-/// content's row: pruning deleted the restart cursor (review of #564).
+/// A row is deletable only when a BETTER committed row exists for its unit, so
+/// that the row the restart reads from always survives. Exactly one row per
+/// unit has no better row, and what "better" means depends on the source:
 ///
-/// A Kafka row's successor must also be of its partition and consumer group:
-/// those rows are where the partition resumes (#614), and a topic's newest
-/// row on another partition says nothing about this one. Neither field exists
-/// on a file or spool marker, and `IS` compares the two NULLs as equal, so
-/// those rows are grouped by path alone, as before. The two comparisons
-/// filter the rows the index range seek finds; they do not replace it.
+/// - A file or spool row: a NEWER row - ordered by (created_at, batch_id), the
+///   order `committed_cursors` reads - for the same source path (source_name
+///   when the marker has no path). Ordering by end_byte, as this once did,
+///   kept the highest offset instead, and after a rotation or a copytruncate
+///   that is the old content's row: pruning deleted the restart cursor
+///   (review of #564).
+/// - A Kafka row of a known topic id: a row of its (topic, partition,
+///   consumer group, topic id) that ENDS HIGHER, ties broken by (created_at,
+///   batch_id) - the row `committed_kafka_offsets` resumes from for that
+///   incarnation of the topic. The newest-created row is not it: recovery can
+///   commit a window created earlier above one created later, when a damaged
+///   range is re-read as a new row while the window above it waits (#614),
+///   and pruning by creation order deleted the row the restart resumes from.
+///   Each incarnation keeps its own highest row: the offsets of a topic that
+///   was deleted and created again start from zero, so one incarnation's end
+///   says nothing about another's.
+/// - A Kafka row with no topic id (written before the id was recorded): a
+///   NEWER row of its (topic, partition, consumer group) that has no id
+///   either - the order, and the rule, the ledger resumed by before. A row
+///   of no id is never ranked against a row of a known one.
+///
+///   A row whose end offset or identity is missing compares as NULL and has
+///   no better row, so it is kept.
+///
+///   A row of a known id is also kept while the id is UNRESOLVED: its
+///   highest end is above its newest row's end (a window committed above a
+///   later one, or a log truncated by an unclean leader election, whose
+///   replacement rows overlap earlier ones). `committed_kafka_offsets` reads
+///   the overlap between rows to tell the two apart, and so needs the rows
+///   that overlap kept until the newest row has caught up with the highest.
+///
+///   Together these keep the unit's newest-created row, which the adapter
+///   falls back to when it cannot learn the topic's id: if its id is
+///   unresolved every row of it stays, and if it is resolved the newest row
+///   ends at the id's highest end and is the row kept for the id (a row of no
+///   id: the newest of those).
+///
+/// A Kafka row of a known id is "better" than another when its end is higher,
+/// or equal and it is newer: two probes joined by OR, not one row-value
+/// comparison on (end, created_at, batch_id), because SQLite does not serve a
+/// row value over expression-index columns as a range, so the single probe
+/// scanned the rows of the id below the candidate's end for every candidate
+/// (quadratic in a large prune). Each probe is an equality or a range seek.
 ///
 /// "Newer" is a row-value comparison on `(created_at, batch_id)`: the same
 /// order as `created_at >, or equal and batch_id >`, written so the planner
 /// can serve it as a range on the index's last two columns. With the OR form,
-/// adding the two comparisons above tipped SQLite onto
+/// adding the partition and group comparisons tipped SQLite onto
 /// `idx_batches_commit_cursor`, which seeks on the path only, and the plan
-/// test below caught it.
+/// test below caught it. Neither the partition nor the group exists on a file
+/// or spool marker, and `IS` compares the two NULLs as equal, so those rows
+/// are grouped by path alone. The comparisons filter the rows the index range
+/// seek finds; they do not replace it.
 ///
-/// The successor probe expressions must stay textually identical to the
-/// `idx_batches_commit_newest` expressions above: SQLite matches expression
-/// indexes structurally, and without the index every candidate row rescans
-/// the entire committed set (quadratic on the engine's idle-cycle pass).
+/// The probe expressions must stay textually identical to the
+/// `idx_batches_commit_newest`, `idx_batches_kafka_max_end` and
+/// `idx_batches_kafka_id_newest` expressions
+/// above: SQLite matches expression indexes structurally, and without the
+/// index every candidate row rescans the entire committed set (quadratic on
+/// the engine's idle-cycle pass). The Kafka literal is `'kafka'`, not a
+/// parameter, because a partial index is used only when the query's own text
+/// implies its WHERE clause.
+///
+/// The lookup of an incarnation's newest row names its index (`INDEXED BY`),
+/// so no plan can walk a newer incarnation's rows for an old one's lookup
+/// (quadratic in the history). Every connection creates the index, so it
+/// exists.
 ///
 /// A SUPERSEDED row (?4, #567) is deletable on age alone: it is never the
 /// row a restart cursor is read from, so nothing has to survive it.
 macro_rules! prune_predicate_sql {
     () => {
         "b.updated_at < ?2 AND (b.state = ?4 OR (b.state = ?1 \
-              AND EXISTS ( \
+              AND CASE \
+              WHEN b.source_type = 'kafka' \
+               AND json_extract(b.progress_end_json, '$.topic_id') IS NOT NULL THEN (EXISTS ( \
+                SELECT 1 FROM batches n \
+                WHERE n.state = ?1 \
+                  AND n.source_type = 'kafka' \
+                  AND json_extract(n.progress_end_json, '$.topic') \
+                      = json_extract(b.progress_end_json, '$.topic') \
+                  AND json_extract(n.progress_end_json, '$.partition') \
+                      = json_extract(b.progress_end_json, '$.partition') \
+                  AND json_extract(n.progress_end_json, '$.consumer_group') \
+                      = json_extract(b.progress_end_json, '$.consumer_group') \
+                  AND json_extract(n.progress_end_json, '$.topic_id') \
+                      = json_extract(b.progress_end_json, '$.topic_id') \
+                  AND CAST(json_extract(n.progress_end_json, '$.end_offset') AS INTEGER) \
+                    > CAST(json_extract(b.progress_end_json, '$.end_offset') AS INTEGER) \
+              ) OR EXISTS ( \
+                SELECT 1 FROM batches n \
+                WHERE n.state = ?1 \
+                  AND n.source_type = 'kafka' \
+                  AND json_extract(n.progress_end_json, '$.topic') \
+                      = json_extract(b.progress_end_json, '$.topic') \
+                  AND json_extract(n.progress_end_json, '$.partition') \
+                      = json_extract(b.progress_end_json, '$.partition') \
+                  AND json_extract(n.progress_end_json, '$.consumer_group') \
+                      = json_extract(b.progress_end_json, '$.consumer_group') \
+                  AND json_extract(n.progress_end_json, '$.topic_id') \
+                      = json_extract(b.progress_end_json, '$.topic_id') \
+                  AND CAST(json_extract(n.progress_end_json, '$.end_offset') AS INTEGER) \
+                    = CAST(json_extract(b.progress_end_json, '$.end_offset') AS INTEGER) \
+                  AND (n.created_at, n.batch_id) > (b.created_at, b.batch_id) \
+              )) \
+              AND (SELECT MAX(CAST(json_extract(m.progress_end_json, '$.end_offset') AS INTEGER)) \
+                   FROM batches m \
+                   WHERE m.state = ?1 \
+                     AND m.source_type = 'kafka' \
+                     AND json_extract(m.progress_end_json, '$.topic') \
+                       = json_extract(b.progress_end_json, '$.topic') \
+                     AND json_extract(m.progress_end_json, '$.partition') \
+                       = json_extract(b.progress_end_json, '$.partition') \
+                     AND json_extract(m.progress_end_json, '$.consumer_group') \
+                       = json_extract(b.progress_end_json, '$.consumer_group') \
+                     AND json_extract(m.progress_end_json, '$.topic_id') \
+                       = json_extract(b.progress_end_json, '$.topic_id') \
+                  ) \
+                <= (SELECT CAST(json_extract(w.progress_end_json, '$.end_offset') AS INTEGER) \
+                    FROM batches w INDEXED BY idx_batches_kafka_id_newest \
+                    WHERE w.state = ?1 \
+                      AND w.source_type = 'kafka' \
+                      AND json_extract(w.progress_end_json, '$.topic') \
+                        = json_extract(b.progress_end_json, '$.topic') \
+                      AND json_extract(w.progress_end_json, '$.partition') \
+                        = json_extract(b.progress_end_json, '$.partition') \
+                      AND json_extract(w.progress_end_json, '$.consumer_group') \
+                        = json_extract(b.progress_end_json, '$.consumer_group') \
+                      AND json_extract(w.progress_end_json, '$.topic_id') \
+                        = json_extract(b.progress_end_json, '$.topic_id') \
+                    ORDER BY w.created_at DESC, w.batch_id DESC LIMIT 1) \
+              WHEN b.source_type = 'kafka' THEN EXISTS ( \
+                SELECT 1 FROM batches n \
+                WHERE n.state = ?1 \
+                  AND n.source_type = 'kafka' \
+                  AND json_extract(n.progress_end_json, '$.topic') \
+                      = json_extract(b.progress_end_json, '$.topic') \
+                  AND json_extract(n.progress_end_json, '$.partition') \
+                      = json_extract(b.progress_end_json, '$.partition') \
+                  AND json_extract(n.progress_end_json, '$.consumer_group') \
+                      = json_extract(b.progress_end_json, '$.consumer_group') \
+                  AND json_extract(n.progress_end_json, '$.topic_id') IS NULL \
+                  AND (n.created_at, n.batch_id) > (b.created_at, b.batch_id) \
+              ) \
+              ELSE EXISTS ( \
                 SELECT 1 FROM batches n \
                 WHERE n.state = ?1 \
                   AND n.source_type = b.source_type \
@@ -221,7 +370,7 @@ macro_rules! prune_predicate_sql {
                   AND json_extract(n.progress_end_json, '$.consumer_group') \
                       IS json_extract(b.progress_end_json, '$.consumer_group') \
                   AND (n.created_at, n.batch_id) > (b.created_at, b.batch_id) \
-              )))"
+              ) END))"
     };
 }
 
@@ -468,6 +617,56 @@ impl SqliteStateStore {
     }
 }
 
+/// The resume answers of `committed_kafka_offsets`; see the method.
+const COMMITTED_KAFKA_OFFSETS_SQL: &str =
+    "WITH committed AS ( \
+                 SELECT json_extract(progress_end_json, '$.topic') AS topic, \
+                        CAST(json_extract(progress_end_json, '$.partition') AS INTEGER) AS part, \
+                        json_extract(progress_end_json, '$.consumer_group') AS grp, \
+                        json_extract(progress_end_json, '$.topic_id') AS tid, \
+                        COALESCE( \
+                            CAST(json_extract(progress_start_json, '$.start_offset') AS INTEGER), \
+                            CAST(json_extract(progress_end_json, '$.start_offset') AS INTEGER)) \
+                            AS start_offset, \
+                        CAST(json_extract(progress_end_json, '$.end_offset') AS INTEGER) AS end_offset, \
+                        created_at, batch_id \
+                 FROM batches WHERE state = ? AND source_type = ? \
+             ), ordered AS ( \
+                 SELECT topic, part, grp, tid, start_offset, \
+                        MAX(end_offset) OVER ( \
+                            PARTITION BY topic, part, grp, tid \
+                            ORDER BY start_offset, end_offset, batch_id \
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prior_max \
+                 FROM committed WHERE tid IS NOT NULL \
+             ), broken AS ( \
+                 SELECT DISTINCT topic, part, grp, tid FROM ordered \
+                 WHERE prior_max >= start_offset \
+             ), ranked AS ( \
+                 SELECT topic, part, grp, tid, end_offset, \
+                        ROW_NUMBER() OVER ( \
+                            PARTITION BY topic, part, grp, tid \
+                            ORDER BY CASE WHEN tid IS NULL THEN 0 ELSE end_offset END DESC, \
+                                     created_at DESC, batch_id DESC) AS rn, \
+                        FIRST_VALUE(end_offset) OVER ( \
+                            PARTITION BY topic, part, grp, tid \
+                            ORDER BY created_at DESC, batch_id DESC) AS id_newest_end, \
+                        FIRST_VALUE(tid) OVER ( \
+                            PARTITION BY topic, part, grp \
+                            ORDER BY created_at DESC, batch_id DESC) AS newest_tid, \
+                        FIRST_VALUE(end_offset) OVER ( \
+                            PARTITION BY topic, part, grp \
+                            ORDER BY created_at DESC, batch_id DESC) AS newest_end \
+                 FROM committed \
+             ) \
+             SELECT r.topic, r.part, r.grp, r.tid, \
+                    CASE WHEN b.tid IS NOT NULL THEN r.id_newest_end ELSE r.end_offset END \
+                        AS end_offset, \
+                    CASE WHEN r.tid IS r.newest_tid THEN r.newest_end END AS newest_end \
+             FROM ranked r \
+             LEFT JOIN broken b ON b.topic = r.topic AND b.part = r.part AND b.grp = r.grp \
+                               AND b.tid = r.tid \
+             WHERE r.rn = 1";
+
 #[async_trait]
 impl StateStore for SqliteStateStore {
     /// Insert a new batch. Plain INSERT (not INSERT OR REPLACE): a `batch_id` is
@@ -615,42 +814,57 @@ impl StateStore for SqliteStateStore {
     }
 
     async fn committed_kafka_offsets(&self) -> Result<Vec<CommittedKafkaOffset>, VtopError> {
-        // Aggregated in SQL (#77): per (topic, partition, consumer group), the
-        // NEWEST committed row's end offset, in the order `committed_cursors`
-        // and pruning use - so the row read here always survives a prune.
-        let rows = sqlx::query(
-            "WITH committed AS ( \
-                 SELECT json_extract(progress_end_json, '$.topic') AS topic, \
-                        CAST(json_extract(progress_end_json, '$.partition') AS INTEGER) AS part, \
-                        json_extract(progress_end_json, '$.consumer_group') AS grp, \
-                        CAST(json_extract(progress_end_json, '$.end_offset') AS INTEGER) AS end_offset, \
-                        created_at, batch_id \
-                 FROM batches WHERE state = ? AND source_type = ? \
-             ), latest AS ( \
-                 SELECT topic, part, grp, end_offset, ROW_NUMBER() OVER ( \
-                            PARTITION BY topic, part, grp \
-                            ORDER BY created_at DESC, batch_id DESC) AS rn \
-                 FROM committed \
-             ) \
-             SELECT topic, part, grp, end_offset FROM latest WHERE rn = 1",
-        )
-        .bind(BatchState::SourceCommitted.as_str())
-        .bind(SourceType::Kafka.as_str())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(map_sqlx)?;
+        // Aggregated in SQL (#77): per (topic, partition, consumer group,
+        // topic id), one answer. For a known id it is the HIGHEST end offset
+        // any committed row of that id reached: not the newest-created row's,
+        // because a window created earlier can be committed above one created
+        // later (a damaged range re-read as a new row while the window above
+        // it waited, then both committed by recovery), and resuming from the
+        // newer, lower row re-archives the range between. For rows of no id it
+        // is the NEWEST row's end, the rule before the id existed: such rows
+        // may be of different incarnations of the topic, whose offsets are
+        // unrelated, so no maximum is taken across them - and none across an
+        // unknown and a known id, which are separate answers.
+        //
+        // A known id's maximum is also not taken when its log was truncated:
+        // an unclean leader election keeps the topic id and reuses offsets, so
+        // two committed rows of the same id whose ranges OVERLAP archived
+        // offsets a second time. Such an
+        // id (`broken`) answers with its NEWEST row's end, as rows of no id
+        // do: a re-read of the replacement records, never a skip of them. The
+        // A, B, C sequence does not overlap (C fills the hole below B), so it
+        // keeps the maximum. Two overlapping rows have one created before the
+        // other, so an id is broken when ANY two of its committed rows
+        // overlap, found by one sweep in start order (a row that starts at or
+        // below the highest end before it, `prior_max`), not a pairwise scan,
+        // which was quadratic in the retained history. Pruning keeps what this
+        // reads (`prune_predicate_sql`).
+        //
+        // `newest_end` is the newest-created row's own end, on the answer of
+        // the id that holds that row, for an adapter that cannot learn the
+        // current id.
+        let rows = sqlx::query(COMMITTED_KAFKA_OFFSETS_SQL)
+            .bind(BatchState::SourceCommitted.as_str())
+            .bind(SourceType::Kafka.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
         Ok(rows
             .into_iter()
             .filter_map(|r| {
                 let topic: Option<String> = r.get("topic");
                 let partition: Option<i64> = r.get("part");
                 let group: Option<String> = r.get("grp");
+                let topic_id: Option<String> = r.get("tid");
                 let end: Option<i64> = r.get("end_offset");
+                let newest_end: Option<i64> = r.get("newest_end");
                 Some(CommittedKafkaOffset {
                     topic: topic?,
                     partition: i32::try_from(partition?).ok()?,
                     consumer_group: group?,
+                    topic_id,
                     end_offset: end?,
+                    newest_end,
                 })
             })
             .collect())
@@ -2262,6 +2476,100 @@ mod tests {
         assert!(
             plan.contains("idx_batches_commit_newest"),
             "successor probe no longer uses idx_batches_commit_newest:\n{plan}"
+        );
+        // The probes for a row of a known topic id that ends higher - a range
+        // on the end offset, and equal with a later creation time - are
+        // bounded by the (identity, topic id, end offset, created_at) partial
+        // index. Naming an index is not enough: a probe whose range column
+        // comes after columns it does not constrain rescans the earlier rows
+        // for every candidate, which made a large prune quadratic.
+        let probes =
+            |index: &str| -> Vec<&str> { plan.lines().filter(|l| l.contains(index)).collect() };
+        let max_end = probes("idx_batches_kafka_max_end");
+        assert!(
+            max_end.iter().any(|l| l.contains("<expr>>?")),
+            "no known-id probe seeks the end offset above the candidate's:\n{plan}"
+        );
+        assert!(
+            max_end.iter().any(|l| l.contains("created_at>?")),
+            "no known-id probe seeks a later creation time at an equal end:\n{plan}"
+        );
+        // The unresolved test reads an incarnation's newest row from the
+        // index that puts the topic id ahead of the creation time, so an old
+        // incarnation's lookup does not walk a newer one's rows (it did, with
+        // two incarnations of 4,000 rows each taking 22 s).
+        let id_newest = probes("idx_batches_kafka_id_newest");
+        assert!(
+            id_newest.iter().any(|l| l.contains("<expr>=?")),
+            "the newest-row-of-an-id lookup no longer uses idx_batches_kafka_id_newest:\n{plan}"
+        );
+        // The probe for a newer row of no topic id seeks by creation time in
+        // the same index.
+        assert!(
+            id_newest.iter().any(|l| l.contains("created_at>?")),
+            "the rows-of-no-id probe no longer seeks by creation time:\n{plan}"
+        );
+    }
+
+    /// An old incarnation's rows find their incarnation's newest row (the
+    /// unresolved test of the prune predicate) in one index range. Through an
+    /// index that did not put the topic id ahead of the creation time, each
+    /// old row walked the replacement's rows backwards: two incarnations of
+    /// 4,000 rows took 22 s. The bound is generous so a slow machine does not
+    /// fail it.
+    #[tokio::test]
+    async fn the_prune_predicate_stays_linear_across_two_incarnations() {
+        let store = SqliteStateStore::connect("sqlite::memory:").await.unwrap();
+        let n = 3000u32;
+        for i in 0..2 * n {
+            let (id, k) = if i < n { ("old", i) } else { ("new", i - n) };
+            let m = format!(
+                r#"{{"source_type":"kafka","topic":"t","partition":0,"start_offset":{},"end_offset":{},"consumer_group":"g","topic_id":"{id}"}}"#,
+                k * 10,
+                k * 10 + 9
+            );
+            sqlx::query(
+                "INSERT INTO batches (batch_id, tenant, source_type, source_name, format, \
+                 state, progress_start_json, progress_end_json, created_at, updated_at, \
+                 claim_gen) VALUES (?, 'd', 'kafka', 't', 'raw', 'batching', ?, ?, ?, \
+                 '2020-01-01T00:00:00Z', 0)",
+            )
+            .bind(format!("b{i:06}"))
+            .bind(&m)
+            .bind(&m)
+            .bind(format!(
+                "2030-01-01T{:02}:{:02}:{:02}.000Z",
+                (i / 3600) % 24,
+                (i / 60) % 60,
+                i % 60
+            ))
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("UPDATE batches SET state = 'source_committed'")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let rows = sqlx::query(concat!(
+            "SELECT b.batch_id FROM batches b WHERE ",
+            prune_predicate_sql!()
+        ))
+        .bind(BatchState::SourceCommitted.as_str())
+        .bind("2031-01-01T00:00:00Z")
+        .bind(0)
+        .bind(BatchState::Superseded.as_str())
+        .fetch_all(&store.pool)
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+        // Each incarnation keeps its highest row: all but two are candidates.
+        assert_eq!(rows.len(), 2 * n as usize - 2);
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "{} rows over two incarnations took {elapsed:?}: the prune predicate is not linear",
+            2 * n
         );
     }
 }
