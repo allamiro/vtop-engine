@@ -1,0 +1,202 @@
+# The engine soak's lab (#726): Kafka -> engine -> MinIO, with a producer for
+# the load and a toxiproxy between the engine and the other two.
+#
+# Not started by hand: benchmarks/soak/soak_driver.py brings it up with a
+# project name, run directory and data locations in the environment (every
+# ${SOAK_*} below), and drives the faults. See docs/SOAK_VALIDATION.md.
+#
+# Where the data lives: each SOAK_*_DATA / SOAK_ENGINE_* variable is either a
+# Docker volume name (the default) or an absolute host path (the driver's
+# --data-dir), which Compose treats as a bind mount. A 72 hour run keeps its
+# data on a disk with the profile's free space, so it passes --data-dir.
+#
+# SOAK_CPUS_<SERVICE> (kafka, minio, producer, engine) cap a container's CPUs;
+# unset, none is capped, which is how the 72 hour run goes.
+#
+# Nothing here is published to the host except toxiproxy's admin API on
+# loopback. The engine reaches Kafka and MinIO ONLY through toxiproxy, which
+# is how a partition or a store outage is made without touching either of
+# them; the producer reaches Kafka on its own listener, so the load goes on
+# while the engine is cut off, as it would in production.
+
+services:
+  kafka:
+    image: apache/kafka:4.3.1
+    container_name: ${SOAK_PROJECT:-vtop-soak}-kafka
+    hostname: kafka
+    mem_limit: 3g
+    cpus: ${SOAK_CPUS_KAFKA:-0}
+    pids_limit: 1024
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    networks: [soak]
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      # INTERNAL is the broker's own name for the producer and the driver's
+      # tools; PROXIED is what the engine is told, and it is the proxy's
+      # address, so a client that follows the broker's advertisement stays
+      # behind the proxy.
+      KAFKA_LISTENERS: "INTERNAL://:9092,CONTROLLER://:9093,PROXIED://:9094"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka:9092,PROXIED://toxiproxy:19094"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,PROXIED:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+      # Retention is checked often enough that a topic's retention.ms (set by
+      # the driver) bounds the disk the broker uses.
+      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: "60000"
+      KAFKA_HEAP_OPTS: "-Xms1g -Xmx1g"
+    volumes:
+      - ${SOAK_KAFKA_DATA:-kafka-data}:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 15s
+      retries: 18
+      start_period: 20s
+    logging: &log-bounded
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # The lab's own MinIO, built from source: no registry serves its images any
+  # more (docker-compose.yml explains). The same tag, so a lab that already
+  # built it builds nothing here.
+  minio:
+    build:
+      context: ../../docker/minio
+    image: vtop-minio:RELEASE.2025-09-07T16-13-09Z
+    pull_policy: never
+    container_name: ${SOAK_PROJECT:-vtop-soak}-minio
+    hostname: minio
+    command: server /data --console-address ":9001"
+    mem_limit: 2g
+    cpus: ${SOAK_CPUS_MINIO:-0}
+    pids_limit: 512
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: [/tmp]
+    networks: [soak]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - ${SOAK_MINIO_DATA:-minio-data}:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging: *log-bounded
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.13.0
+    container_name: ${SOAK_PROJECT:-vtop-soak}-toxiproxy
+    hostname: toxiproxy
+    command: ["-host=0.0.0.0", "-config=/etc/toxiproxy/proxies.json"]
+    ports:
+      - "127.0.0.1:${SOAK_TOXIPROXY_PORT:-18474}:8474"
+    mem_limit: 256m
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    read_only: true
+    networks: [soak]
+    volumes:
+      - ./toxiproxy.json:/etc/toxiproxy/proxies.json:ro
+    logging: *log-bounded
+
+  # The load: Kafka's own producer performance tool, throttled to the
+  # profile's rate, records of the profile's size. It runs until stopped, and
+  # the driver restarts it if a broker restart ends it.
+  producer:
+    image: apache/kafka:4.3.1
+    container_name: ${SOAK_PROJECT:-vtop-soak}-producer
+    entrypoint: ["/opt/kafka/bin/kafka-producer-perf-test.sh"]
+    command:
+      - "--topic"
+      - "${SOAK_TOPIC:-soak-topic}"
+      - "--num-records"
+      - "2000000000"
+      - "--throughput"
+      - "${SOAK_RATE:-1000}"
+      - "--record-size"
+      - "${SOAK_RECORD_BYTES:-700}"
+      - "--producer-props"
+      - "bootstrap.servers=kafka:9092"
+      - "acks=all"
+      - "linger.ms=20"
+      - "retries=2147483647"
+      - "delivery.timeout.ms=300000"
+      - "request.timeout.ms=30000"
+    mem_limit: 1g
+    cpus: ${SOAK_CPUS_PRODUCER:-0}
+    pids_limit: 512
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    networks: [soak]
+    environment:
+      KAFKA_HEAP_OPTS: "-Xms128m -Xmx256m"
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  # The engine under test. `restart: "no"`: when it exits, the driver decides
+  # whether a fault did it, so a crash nobody injected is not hidden by a
+  # restart policy.
+  engine:
+    image: ${SOAK_ENGINE_IMAGE:-vtop-engine:soak}
+    container_name: ${SOAK_PROJECT:-vtop-soak}-engine
+    entrypoint: ["/usr/local/bin/soak-entrypoint.sh"]
+    command: ["run"]
+    restart: "no"
+    mem_limit: ${SOAK_ENGINE_MEM:-4g}
+    cpus: ${SOAK_CPUS_ENGINE:-0}
+    pids_limit: 512
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: [/tmp]
+    networks: [soak]
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      AWS_REGION: us-east-1
+      VTOP_CONFIG: /soak/config/config.yaml
+      VTOP_METRICS_ADDR: "0.0.0.0:9090"
+      VTOP_LOG_FORMAT: json
+      RUST_LOG: info
+    volumes:
+      - ${SOAK_RUN_DIR:?the driver sets SOAK_RUN_DIR}/config:/soak/config:ro
+      - ${SOAK_RUN_DIR}/ctl:/soak/ctl
+      - ${SOAK_ENGINE_STATE:-engine-state}:/data/state
+      - ${SOAK_ENGINE_WORK:-engine-work}:/data/work
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "20"
+
+networks:
+  soak:
+
+volumes:
+  kafka-data:
+  minio-data:
+  engine-state:
+  engine-work:

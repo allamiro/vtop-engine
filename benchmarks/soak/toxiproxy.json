@@ -1,0 +1,14 @@
+[
+  {
+    "name": "kafka",
+    "listen": "0.0.0.0:19094",
+    "upstream": "kafka:9094",
+    "enabled": true
+  },
+  {
+    "name": "minio",
+    "listen": "0.0.0.0:19000",
+    "upstream": "minio:9000",
+    "enabled": true
+  }
+]
