@@ -15,6 +15,8 @@ fails when:
 * the highest tag of a listed tag set (command kinds, snapshot value tags,
   key categories) differs from the registry's;
 * the registry names something the sources no longer hold;
+* an entry names a compatibility cell that scripts/compat/expected.yaml does
+  not list, or that file lists a cell no entry names;
 * a format constant, or a tag, is declared twice in one file (in two
   modules): the registry names a constant by file and name, so it could not
   tell which declaration it records;
@@ -47,6 +49,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 REGISTRY = pathlib.Path("scripts/compat/formats.yaml")
+EXPECTED = pathlib.Path("scripts/compat/expected.yaml")
 PAGE = pathlib.Path("docs/reference/compatibility.md")
 BEGIN = "<!-- inventory:begin -->"
 END = "<!-- inventory:end -->"
@@ -274,6 +277,14 @@ def check_source(root: pathlib.Path, registry: dict) -> list[str]:
     claimed_constants: dict[tuple[str, str], str] = {}
     claimed_magics: set[tuple[str, str]] = set()
     seen_ids = set()
+    named_cells: set[str] = set()
+    expected_path = root / EXPECTED
+    matrix_cells: set[str] = set()
+    if expected_path.is_file():
+        import yaml  # PyYAML, pinned in scripts/compat/requirements.txt
+
+        with open(expected_path, encoding="utf-8") as handle:
+            matrix_cells = set((yaml.safe_load(handle) or {}).get("cells") or {})
     for entry in registry.get("formats") or []:
         label = f"format {entry.get('id')} ({entry.get('name')})"
         for key in ("id", "name", "class", "marker", "status", "at_1_0"):
@@ -332,6 +343,18 @@ def check_source(root: pathlib.Path, registry: dict) -> list[str]:
         for target in entry.get("fuzz") or []:
             if not (root / "fuzz/fuzz_targets" / f"{target}.rs").is_file():
                 problems.append(f"{label}: fuzz target {target} does not exist")
+        for cell in entry.get("cells") or []:
+            named_cells.add(cell)
+            if cell not in matrix_cells:
+                problems.append(
+                    f"{label}: cell {cell} is not a cell of {EXPECTED} (scripts/compat/cell.sh runs "
+                    "the cells that file lists)"
+                )
+    for cell in sorted(matrix_cells - named_cells):
+        problems.append(
+            f"{EXPECTED}: cell {cell} is named by no entry of {REGISTRY}: a compatibility cell "
+            "belongs to the format it records"
+        )
     for item in registry.get("not_formats") or []:
         if not item.get("why"):
             problems.append(f"not_formats {item.get('name')}: needs a why")
