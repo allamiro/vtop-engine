@@ -469,9 +469,14 @@ async fn export_on_sends_traces_and_metrics_and_says_so() {
 /// failed and that batches are unaffected, and the flush says what it dropped.
 #[tokio::test]
 async fn an_unreachable_collector_warns_and_the_batch_still_commits() {
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}", closed.local_addr().unwrap());
-    drop(closed);
+    // A port nothing listens on and nothing in this process can be handed:
+    // the tests beside this one start collectors on port 0, which the kernel
+    // answers from its ephemeral range, and a port bound and released here
+    // can be given to one of them before the child connects. That collector
+    // then answers the export this test expects to fail (seen in CI: no
+    // warning here, and a request without its header at the other test).
+    // Port 1 is below that range and refuses at once.
+    let url = "http://127.0.0.1:1".to_string();
     let dir = tempfile::tempdir().unwrap();
     let (out, took) = vtopctl(
         &["process-once", "--source", "file"],

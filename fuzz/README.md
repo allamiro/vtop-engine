@@ -157,15 +157,24 @@ The nightly workflow mutates the verify, recovery and file-continuity code in
 |---|---|---|---|
 | `vtop-state` (recovery: claims, fences, the ledger) | `store.rs`, `fence.rs`, `sqlite_store.rs` | 0.786, 0.763, 0.831, then 0.929, 0.947, 0.944 | **gated** at 0.87, 0.89, 0.89 |
 | `vtop-upload` (verify) | `base.rs`, `multipart.rs` | 0.641, 0.708, then 0.982, 1.000 | **gated** at 0.93, 0.95 |
-| `vtop-adapters` (file continuity) | `continuity.rs`, `rotated.rs`, `file_source.rs` | 0.759, 0.765, 0.741 | report only |
+| `vtop-adapters` (file continuity) | `continuity.rs`, `rotated.rs`, `file_source.rs` | 0.759, 0.765, 0.741, then 0.963, 0.971, 0.975 | **gated** at 0.91, 0.92, 0.92 |
 
 A gated leg fails the nightly run when any of its files scores below its own
 threshold (`scripts/mutants-gate.py --file-min-score FILE=SCORE`), and lists
-every mutant the tests missed. The report-only leg (`vtop-adapters`) is below
-the 0.80 floor, so a gate there would fail every night; it joins the gate when
-tests bring it to 0.85, at its measured score minus 5 points. A pull request
-that changes the nightly workflow runs the gated legs in full and lists the
-others.
+every mutant the tests missed. A pull request that changes the nightly
+workflow runs every gated leg in full.
+
+The `vtop-adapters` mutants still alive after the tests (17 of 626 in the
+last full run, none excluded) are ones no test can tell from the original:
+a bound on an elapsed time (`<` for `<=`), a value assigned that was already
+there, a buffer size, a guard that only skips a re-read of the same bytes, a
+fallback that fails with the same error as the check it follows, an error
+only a signal (`EINTR`) or a filesystem without a no-replace rename
+produces, and a search whose candidates are proven again afterwards. Three
+more fail an open of a file the tests run as root can always open; they are
+caught when the job runs as the runner's own user. An exclusion would hide
+them from the next change that makes one of them matter, so each threshold's
+5 points leave room for them instead.
 
 `base.rs` has two surviving mutants that no test can kill, because they do
 not change behaviour, and they stay in the score rather than being excluded:
