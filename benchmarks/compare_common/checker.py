@@ -87,10 +87,20 @@ def decode(body: bytes) -> bytes | None:
     return body
 
 
+def _json_line(line: bytes) -> bool:
+    try:
+        json.loads(line)
+    except ValueError:
+        return False
+    return True
+
+
 def ids_in(text: bytes, run_tag: str) -> tuple[list[int], list[int], bool]:
     """(this run's sequences, other ids' sequences, torn) from an object's decoded text.
 
-    Torn: a non-empty line with no id token, or with more than one."""
+    Torn: a non-empty line with no id token, or with more than one, or a JSON line that does not parse (a record
+    cut after its id token). Other formats (syslog) are not framing-checked: a line cut after its id token
+    counts as present, a known limit of an id-based checker."""
     ours, foreign, torn = [], [], False
     tag = run_tag.encode()
     for line in text.split(b"\n"):
@@ -98,6 +108,9 @@ def ids_in(text: bytes, run_tag: str) -> tuple[list[int], list[int], bool]:
             continue
         found = ID_TOKEN.findall(line)
         if len(found) != 1:
+            torn = True
+        elif line.lstrip().startswith(b"{") and not _json_line(line):
+            # A JSON record cut after its id token still has the token (review of #906).
             torn = True
         for found_tag, seq in found:
             (ours if found_tag == tag else foreign).append(int(seq))
