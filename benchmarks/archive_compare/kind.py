@@ -20,8 +20,12 @@ a crash or fault cell); Vector `acks` (sink acknowledgements, memory buffer,
 """
 from __future__ import annotations
 
+import json
+import os
+
 from compare_common import schema
 
+HERE = os.path.dirname(os.path.abspath(__file__))
 CRASH_CELLS = ("crash-K1", "crash-K2", "crash-K3")
 CELLS = {
     "smoke": "correctness",
@@ -32,11 +36,16 @@ CELLS = {
     "crash-K3": "correctness",
     "verify-fault": "correctness",
 }
-PROFILES = {
-    "connect-lenses": ("exactly-once",),
-    "vtop": ("strong", "verify-off"),
-    "vector": ("acks", "disk-buffer"),
-}
+
+
+def load_tools(path: str = os.path.join(HERE, "tools.json")) -> dict:
+    """tools.json's systems: the one place a tool or a profile is added (see its `_comment`)."""
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)["systems"]
+
+
+TOOLS = load_tools()
+PROFILES = {system: tuple(spec["profiles"]) for system, spec in TOOLS.items()}
 
 CHECK_COLUMNS = ("records_expected", "records_present", "gaps", "duplicates", "torn_objects", "orphan_objects",
                  "unexpected")
