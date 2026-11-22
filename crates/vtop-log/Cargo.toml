@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
 description = "Kafka-independent, single-node segmented log storage for the native VTOP broker."
 
 [dependencies]

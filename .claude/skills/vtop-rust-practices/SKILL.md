@@ -1,11 +1,11 @@
 ---
 name: vtop-rust-practices
-description: Rust conventions and review checklist tuned to vtop-engine — edition 2021 with an MSRV floor, clippy -D warnings, unsafe policy, error handling split (thiserror in libraries, anyhow in the CLI), async hygiene (bounded work, no locks across await, deadlines, shutdown), test hygiene, and verification tools the repo does not use yet (loom/shuttle, turmoil, miri). Use when writing or reviewing any Rust in this workspace.
+description: Rust conventions and review checklist tuned to vtop-engine — edition 2021 with an MSRV floor, clippy -D warnings, unsafe policy, error handling (thiserror in libraries), async hygiene (bounded work, no locks across await, deadlines, shutdown), test hygiene, and verification tools the repo does not use yet (loom/shuttle, turmoil, miri). Use when writing or reviewing any Rust in this workspace.
 ---
 
 # Rust practices for vtop-engine
 
-Ground truth for this repo, checked against the tree: workspace `edition = "2021"`, `rust-version = "1.94.1"` (a CI job builds on exactly that toolchain), CI runs `cargo clippy --workspace --all-targets --locked -- -D warnings`, `thiserror` in library crates and `anyhow` only in `vtop-cli`, `proptest` in `vtop-core`, `cargo-mutants` (gated on `state_machine.rs` and `replay.rs` since #729, report-only elsewhere), a fuzz smoke on every PR and nightly fuzzing with a persisted corpus (`fuzz/README.md`). Complements `vtop-contributing` (process) and the `ddia-*` skills (design). Part of the checklist is adapted from the ideas in the MIT-licensed `rust-systems` skill in [iliaal/ai-skills](https://github.com/iliaal/ai-skills), rewritten for this codebase.
+Ground truth for this repo, checked against the tree: workspace `edition = "2021"`, `rust-version = "1.94.1"` (a CI job builds on exactly that toolchain), CI runs `cargo clippy --workspace --all-targets --locked -- -D warnings`, `thiserror` in library crates (no crate depends on `anyhow`), `proptest` in `vtop-core`, `cargo-mutants` (gated on `state_machine.rs` and `replay.rs` since #729, report-only elsewhere), a fuzz smoke on every PR and nightly fuzzing with a persisted corpus (`fuzz/README.md`). Complements `vtop-contributing` (process) and the `ddia-*` skills (design). Part of the checklist is adapted from the ideas in the MIT-licensed `rust-systems` skill in [iliaal/ai-skills](https://github.com/iliaal/ai-skills), rewritten for this codebase.
 
 ## Toolchain: two compilers, one tree
 
@@ -39,7 +39,7 @@ A default build must not depend on what the host happens to have installed, and 
 
 ## Errors
 
-- Libraries return typed errors (`thiserror`), preserving variants; add operational context at application boundaries (`vtop-cli` with `anyhow`).
+- Libraries return typed errors (`thiserror`), preserving variants; add operational context at application boundaries (`vtop-cli`).
 - A failure message names its cause: what was observed, how many times, what was expected. "timed out" alone is not an error message.
 - Distinguish "config missing" from "config unreadable/invalid" before writing a replacement; never swallow with `let _ =` where the result decides a safety property (replay rewinds, commits, fsyncs).
 - Beware panicking guards: `bool::then_some(expr)` evaluates `expr` eagerly — `(len >= 19).then_some(&v[..19])` panics on short input. Use `then(|| ...)`. A fixed-width slice is not a parse: it panics mid-character on non-ASCII; parse and normalise or reject.
