@@ -29,8 +29,8 @@ component is production, preview or experimental; the
 | Item | Value |
 |---|---|
 | Evaluated | 2026-11-22 |
-| Met | 14 |
-| Partial | 11 |
+| Met | 15 |
+| Partial | 10 |
 | Not met | 5 |
 | 1.0.0-rc.1 may be cut | no |
 | 1.0.0 may be cut | no |
@@ -58,7 +58,7 @@ only for a met row.
 | B1 | AWS S3 and one other S3 provider | not met | MinIO only in CI (`.github/workflows/ci.yml::minio-integration`; `crates/vtop-upload/tests/live_s3_verification.rs`). The live S3 tests run against a named server and its capability file (`crates/vtop-s3-testkit`; #764), but no other server and no AWS run is in CI. A store without Object Lock or versioning is refused at startup (#770). | #722 | 2026-11-22 |
 | B2 | Real Kafka versions | met | `.github/workflows/kafka-matrix.yml::kafka` (Apache Kafka 3.7 to 4.4, TLS and SASL listeners, Redpanda; #834); `.github/workflows/kafka-cluster.yml::cluster` (three brokers, a leader stopped mid-read; #874). The [nightly of 2026-11-20](https://github.com/allamiro/vtop-engine/actions/runs/44730486247) passed; the nightly of 2026-11-21 failed one leg on a paused-partition race that #877 fixed the same day. | none | 2026-11-22 |
 | B3 | State store versions | met | `.github/workflows/postgres-matrix.yml::postgres` on PostgreSQL 14 to 18 (#761; [nightly of 2026-11-21](https://github.com/allamiro/vtop-engine/actions/runs/44881713701)); `crates/vtop-state/tests/pg_battery.rs`. | none | 2026-11-22 |
-| B4 | Platforms | partial | Release archives smoked on every Linux, with a glibc 2.17 and a static musl build (`.github/workflows/release.yml::binaries`; #842); the workspace's tests on macOS arm64, macOS x86_64 and aarch64 Linux nightly (`.github/workflows/platform-tests.yml::test`; #876). | #724 | 2026-11-22 |
+| B4 | Platforms | met | Release archives smoked on every Linux, with a glibc 2.17 and a static musl build, and each Linux archive run against a live Kafka broker before publishing; the dry run builds the commit about to be tagged (`.github/workflows/release.yml::binaries`; #842, #901); the workspace's tests on macOS arm64, macOS x86_64 and aarch64 Linux nightly (`.github/workflows/platform-tests.yml::test`; #876). The minimum glibc and macOS versions are stated in `docs/install/binaries.md`. Its issue is closed. | none | 2026-11-22 |
 | C1 | Persisted and wire formats inventoried and frozen | partial | `scripts/compat/formats.yaml` and `scripts/check-format-registry.py` (#783); `docs/reference/compatibility.md`; `.github/workflows/compat.yml::cell` (#846); the state ledger, its digests and the audit trail against released binaries, both ways (#833). The 1.0 freeze is not declared. | #743 | 2026-11-22 |
 | C2 | Config keys | partial | `scripts/check-config-reference.py`; `scripts/config-keys-since.py` lists the keys an older engine ignores (#858). Config carries no version and has no strict mode. | #743 | 2026-11-22 |
 | C3 | CLI and metric names | met | `crates/vtop-cli/tests/surface_snapshot.rs` compares the `vtopctl` command and flag tree and every engine metric name with its labels against `docs/surface/`, and `vtop-node` does the same for its tree and metrics; a removal or rename with no entry in `docs/deprecations.md` fails `scripts/check-surface-deprecations.py` in `.github/workflows/ci.yml::claims` (#839). | none | 2026-11-22 |
