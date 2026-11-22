@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 26 — a whole replica set killed at once, restarted with the leader holding
+# 29 — a whole replica set killed at once, restarted with the leader holding
 # records both followers lack (#599).
 #
 # A leader's retransmission buffer dies with it, so after a restart the only
