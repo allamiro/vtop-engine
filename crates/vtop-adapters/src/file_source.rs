@@ -11907,13 +11907,37 @@ mod tests {
         whole_file: bool,
         cut: Option<u64>,
     ) -> Result<SliceRead, VtopError> {
+        read_opened_bytes_at(
+            "/opened",
+            bytes,
+            start,
+            max_records,
+            max_bytes,
+            whole_file,
+            cut,
+        )
+        .await
+    }
+
+    /// [`read_opened_bytes`] under a path of the caller's: a test that sets a
+    /// read hook names a path no other test reads, so tests running at the
+    /// same time cannot take each other's hook.
+    async fn read_opened_bytes_at(
+        path: &str,
+        bytes: &[u8],
+        start: u64,
+        max_records: usize,
+        max_bytes: usize,
+        whole_file: bool,
+        cut: Option<u64>,
+    ) -> Result<SliceRead, VtopError> {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(bytes).unwrap();
         file.flush().unwrap();
         let open = tokio::fs::File::open(file.path()).await.unwrap();
         FileSource::read_opened(
             open,
-            "/opened",
+            path,
             start,
             max_records,
             max_bytes,
@@ -12014,10 +12038,10 @@ mod tests {
             .unwrap()
             .get_or_insert_with(HashMap::new)
             .insert(
-                "/opened".to_owned(),
+                "/opened-read-hook".to_owned(),
                 Box::new(move || flag.store(true, std::sync::atomic::Ordering::SeqCst)),
             );
-        read_opened_bytes(b"only\n", 0, 10, 100, false, None)
+        read_opened_bytes_at("/opened-read-hook", b"only\n", 0, 10, 100, false, None)
             .await
             .unwrap();
         assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
