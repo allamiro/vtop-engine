@@ -330,9 +330,24 @@ script runs the build they make.
 | #261 | #263: a diverged replica is not reconciled at the fence, and acks the new leader's records over its own | 23 |
 | #640 | #648: a follower files caught-up records under its own adopted epoch | 14, 23 |
 
-What the runs showed is recorded below with the date and the build.
+What the runs showed, on 2026-11-22 (debug builds of this branch, in a
+two-CPU Linux container): **no run reached a bug's shape, so the checkers
+have not yet been shown to fail on a live run with a bug re-introduced.**
+That part of #728 stays open.
 
-RESULTS_PLACEHOLDER
+| Bug | Runs | What happened |
+|---|---|---|
+| #611 | 13 of scenario 23 | 11 passed; 2 stopped at the producer's 30-second wait for a long suffix, before any read. The #611 window is an acknowledged record above the surviving follower's known high-water mark, and in every run R had learned the mark of every acknowledged record before L died, so the patched fence discarded nothing acknowledged. |
+| #641 | 12 of scenario 23 | Every run passed. The shape needs L to return holding records past R's tail; in these runs L's tail equalled R's every time, so there was nothing for an unfenced session to keep. (An unpatched run that day did reach it, with seed 604: L 20 records past R, and the scenario skipped as #641's guard requires.) |
+| #261 | 12 of scenario 23 | As #641: the diverged suffix the patch leaves unreconciled never existed. |
+| #640 | 3 each of scenarios 14 and 23 | Every run passed. The shape needs a follower to catch up records an older epoch wrote after adopting a newer one, then a second failover; neither scenario produces that sequence. With `--stall-ms`, the control checker would report the stall it causes. |
+
+What would close it: a scenario that holds a follower's commit marks back
+while the leader acknowledges (a delivery shim on the replica plane, for
+#611), one that returns the deposed leader with an in-flight suffix on
+purpose rather than by timing (#641, #261), and two failovers around a
+catch-up (#640); or many runs of the existing ones, which the campaign
+workflow's `reintroduce` input runs.
 
 ### The long campaign
 
