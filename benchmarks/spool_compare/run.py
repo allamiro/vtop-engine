@@ -143,9 +143,18 @@ class Lab:
                     "DOCKER_SOCKET": "/var/run/docker.sock", "HARNESS_IMAGE": lab.HARNESS_IMAGE}
         self.profiles = ["--profile", system] + (["--profile", "tap"] if tap else [])
         self.ports: dict[str, int] = {}
+        self.files = [COMPOSE]
+        subnet = os.environ.get("VTOP_LAB_SUBNET")
+        if subnet:
+            # A host whose Docker address pools are used up (many projects' networks) can still give
+            # the lab an explicit subnet. One project runs at a time, so one subnet is enough.
+            override = os.path.join(logs, "compose.subnet.yml")
+            with open(override, "w", encoding="utf-8") as handle:
+                handle.write(f"networks:\n  lab:\n    ipam:\n      config:\n        - subnet: \"{subnet}\"\n")
+            self.files.append(override)
 
     def compose(self, *args: str, timeout: float = 600, check: bool = True):
-        return lab.compose(self.project, [COMPOSE], *self.profiles, *args, env=self.env, timeout=timeout,
+        return lab.compose(self.project, self.files, *self.profiles, *args, env=self.env, timeout=timeout,
                            check=check)
 
     def port(self, service: str, inner: int) -> int:
@@ -385,6 +394,8 @@ class Runner:
         finally:
             try:
                 tool.save_logs(logs)
+            except (OSError, RuntimeError) as exc:  # best effort: never hide the run's own error
+                log(f"could not save the logs of {project}: {exc}")
             finally:
                 tool.down()
 

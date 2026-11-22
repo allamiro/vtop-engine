@@ -75,6 +75,10 @@ python3 benchmarks/spool_compare/report.py benchmarks/spool_compare/results/spoo
 python3 benchmarks/compare_common/regenerate.py      # every committed run, as CI's drift check does
 ```
 
+On a host whose Docker address pools are used up by other projects' networks ("all predefined address
+pools have been fully subnetted"), set `VTOP_LAB_SUBNET` (for example `10.207.48.0/24`, one not in use)
+and each run's lab network takes that subnet.
+
 The correctness plans also run on a GitHub-hosted runner:
 [`spool-compare.yml`](../../.github/workflows/spool-compare.yml) (`workflow_dispatch` with
 `plan` = `smoke`, `hosted-crash` or `hosted-rotation`; `smoke` nightly). The run directory is uploaded as
