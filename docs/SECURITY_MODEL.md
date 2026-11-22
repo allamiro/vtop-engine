@@ -75,6 +75,14 @@ Every boundary above, and the cluster planes and the Kafka gateway the table onl
 ### TLS for Kafka
 
 - Connections to Kafka brokers **SHOULD** use TLS.
+- When `sources.kafka.security_protocol` is unset (librdkafka's default is
+  plaintext), `plaintext` or `sasl_plaintext`, and a bootstrap server is not a
+  loopback address, the engine warns on every start and `vtopctl validate`
+  reports it (#732): the records, and any SASL exchange, cross the network
+  unencrypted and the broker is not authenticated. The engine still connects;
+  set `security_protocol: ssl` or `sasl_ssl` with `ssl_ca_location`. A
+  hostname that resolves to loopback is not recognised as loopback, so it is
+  warned about.
 - Certificate validation **SHOULD** be enabled; disabling validation **MUST** be an explicit, logged, non-default configuration.
 
 ### TLS for S3-compatible endpoints
@@ -186,6 +194,13 @@ with an endpoint set.
   anything that can reach the port and knows that UUID may produce and
   consume); a plaintext admin plane refuses an enforcing
   `admin_authorization`, since there is no CN to match.
+- The Helm chart renders `admin_authorization` by default (#732): only the
+  certificate CNs in `meta.adminAuthorization.operatorCommonNames` may run
+  cluster-scoped admin commands, and the chart refuses to render with the
+  policy on and no operator named rather than fall back to an open admin
+  plane. `meta.adminAuthorization.enabled: false` is the lab opt-out, warned
+  about in the install notes; a hand-written node config without the block is
+  still authenticate-only and warns at startup.
 - Certificate validity alone does not grant a role. The embedding deployment
   **MUST** supply a `SessionAuthorizer` that binds the peer certificate chain,
   declared principal ID, and requested producer/consumer role. Produce requests
@@ -218,6 +233,24 @@ with an endpoint set.
   authentication, confidentiality, and active-tamper protection.
 - Session count, global in-flight work, negotiated record/frame limits, idle
   timeouts, and fetch-response byte credit are explicit resource boundaries.
+- Every cluster listener caps its concurrent connections (#732). The native
+  plane caps sessions; the metadata peer and admin listeners and the replica
+  listener cap connections with `max_peer_connections` (default 256),
+  `max_admin_connections` (default 1024) and `max_replica_connections`
+  (default 256) in the node config. A connection over the cap is closed at
+  accept, before its TLS handshake, so a client holding a CA-signed
+  certificate (or anything that reaches a plaintext plane) cannot open
+  connections until the node runs out of descriptors or memory. A connection
+  holds its slot from accept, so it has 10 s from accept to its first request
+  (dialect check, TLS handshake and first frame); one that misses that is
+  closed, and a client with no certificate cannot keep slots by opening
+  sockets and sending nothing. Each refusal is counted in
+  `vtop_listener_connections_refused_total{plane,reason}` (`capacity` or
+  `handshake_timeout`) and named in a rate-limited WARN. A cap bounds how many
+  connections there are, not who holds them: a flood can still take every
+  slot and keep legitimate peers out while it lasts, and an authenticated
+  client that sends its first request may hold its slot while it stays
+  connected. The counter and the WARN make both visible.
 - The observability endpoint (`/metrics`, `/healthz`, `/readyz`) **MAY** be
   served over TLS 1.3 (#294 slice 4): `observability.tls` in a node config, or
   `VTOP_METRICS_TLS_CERT`/`_KEY` for the engine. Server-only by default so
@@ -394,7 +427,8 @@ Additional guidance:
 - On Unix, the engine **MUST** refuse, before reading it, a secret or ledger file that group or other can write: a manifest MAC key file (`manifest.mac.keys[].file`), the `engine.state_store` secret file, the SQLite ledger and its `-wal` and `-shm` files, and the `VTOP_AUDIT_LOG` file (#733). No setting accepts such a file.
 - The engine **MUST** refuse such a file that other users can read, unless the directory holding it is owned by the engine's user and closed to group and other, or (for group read only) the file is a read-only Kubernetes Secret mount: reached through the kubelet's `..data` layout, on `tmpfs`, and not writable by the engine. The audit file may be group-readable. `security.allow_loose_secret_permissions: true` accepts the readable cases only; each file accepted that way **MUST** be announced by a WARN, `vtop_secret_file_permission_overrides_total` and an audit record (§10). `vtopctl validate` reports every such file at once. Recipes for external secret managers: [Secret files and their permissions](operate/secrets.md).
 - New SQLite ledgers and audit files are created with mode `0600`; the engine never changes the mode of an existing file.
-- Not yet checked: TLS private keys, and the files `vtop-node` reads. On platforms without Unix permission bits nothing is checked.
+- `vtop-node` **MUST** refuse, before reading it, a TLS private key named in its config (`tls.key`, `replica_tls.key`, `native_tls.key`, `lease.tls.key`, `observability.tls.key`, and a scenario client's `tls.key`) by the same rule (#732). A node reads no engine config, so no setting accepts a loose key. The Helm chart mounts keys at `0440` with `fsGroup`, which the Kubernetes Secret rule accepts.
+- Not yet checked: the other files `vtop-node` reads, and the engine's `VTOP_METRICS_TLS_KEY` and `vtopctl`'s `client_key`. On platforms without Unix permission bits nothing is checked.
 - Credentials **SHOULD NOT** be passed as plaintext command-line arguments where avoidable, since arguments may be visible to other processes.
 - The engine **SHOULD** support loading credentials from external secret managers without persisting them to disk.
 - Inline SQLite paths remain valid. PostgreSQL URLs **MUST** be referenced as `engine.state_store: { env: VTOP_STATE_STORE }` or `engine.state_store: { file: /run/secrets/vtop-state-store }`; inline PostgreSQL URLs are rejected before startup.
@@ -424,6 +458,7 @@ The PostgreSQL state store follows the same rule (#694): the engine's runtime ro
 | `s3_native` | `PutObject`, `GetObject`/`HeadObject` (verify), `ListBucket` within prefix | SHA-256 uses a service-computed checksum; BLAKE3 requires read-back. |
 | `awscli` / `s3cmd` / `minio mc` | Same as above | Strong verification downloads and hashes the stored body. |
 | LocalFS | Filesystem write/read on the object tree only | The object tree directory **SHOULD** have restrictive permissions; the engine **SHOULD NOT** require broader filesystem access. |
+| `s3_native` with `upload.server_side_encryption` | The `s3_native` row. With `mode: sse-kms` the runtime identity also needs `kms:GenerateDataKey` and `kms:Decrypt` on the key (the AWS-managed `aws/s3` key when `kms_key_id` is unset), and the `s3:PutObject` that sends the encryption header | A read-back (BLAKE3, or the SHA-256 of a multipart object) decrypts the object, so without `kms:Decrypt` those batches fail. A bucket policy that denies `PutObject` without the header makes a misconfigured engine fail loudly instead of writing plaintext. |
 | `s3_native` with `upload.object_lock` (#684) | The `s3_native` row, plus `s3:PutObjectRetention`, `s3:GetObjectRetention`, `s3:GetBucketObjectLockConfiguration`, `s3:GetObjectVersion`, `s3:GetBucketVersioning`; with `legal_hold: true` also `s3:PutObjectLegalHold` and `s3:GetObjectLegalHold` | S3 returns the lock headers on `HeadObject` only to a caller holding `s3:GetObjectRetention` (`s3:GetObjectLegalHold` for the legal hold), so without it every batch fails its retention check. The runtime identity **SHOULD NOT** hold `s3:BypassGovernanceRetention`. See [OBJECT_LOCK_DEPLOYMENT.md](OBJECT_LOCK_DEPLOYMENT.md). |
 
 Command compatibility backends (`awscli`, `s3cmd`, `minio mc`) **MUST** use an
@@ -477,7 +512,34 @@ Per-format buckets (e.g. `telemetry-{format}`) with optional on-demand creation 
 - The engine does **not** create a locked bucket, set a bucket default retention, or remove a lock. Object Lock is enabled when a bucket is created, and a bucket default retention **SHOULD** be set as the floor: an engine older than v0.10.0 ignores `upload.object_lock` and writes unlocked objects, which only a bucket default retention locks.
 - Where the backend supports it (e.g., S3 Object Lock / WORM), telemetry objects and manifests **SHOULD** be written as immutable for the configured retention period.
 - Immutability complements verification: verification detects tampering, immutability prevents post-write tampering or accidental overwrite.
-- At-rest encryption (server-side or bucket-default) **MAY** be enabled at the storage layer; it is orthogonal to VTOP's integrity guarantees.
+- At-rest encryption **MAY** also be enabled at the storage layer, by a bucket default or a store setting; it is orthogonal to VTOP's integrity guarantees. With `upload.server_side_encryption` unset VTOP asks for none and checks none, so an object is encrypted only if the bucket's default says so.
+
+### 7.1 Encryption at rest (`upload.server_side_encryption`)
+
+With `upload.server_side_encryption.mode` set to `sse-s3` or `sse-kms` (`s3_native` only; any other backend refuses a mode but `none` at config load, because it would write plaintext), VTOP asks the store to encrypt what it writes and then checks that the store did:
+
+- **Every write carries it.** Every object PUT, manifest PUT and verification-receipt PUT (a receipt goes through the manifest write path) and every `CreateMultipartUpload` carries `x-amz-server-side-encryption` (`AES256` for `sse-s3`, `aws:kms` for `sse-kms`). `UploadPart` and `CompleteMultipartUpload` carry none: for SSE-S3 and SSE-KMS S3 takes the encryption from the create.
+- **`sse-kms` and the key.** With `kms_key_id` set, `x-amz-server-side-encryption-aws-kms-key-id` carries it, and `bucket_key: true` adds `x-amz-server-side-encryption-bucket-key-enabled`. With `kms_key_id` **unset**, the request carries `aws:kms` and **no key id**, so the store uses its default KMS key: on AWS, the account's AWS-managed `aws/s3` key, which has no monthly charge.
+- **Verification fails closed.** Before a batch may reach `VERIFIED`, the `HeadObject` of the object and manifest it wrote (the same call that reads the size and the store-computed SHA-256) must report the encryption that was asked for. A store that reports **none**, **another algorithm**, or, when `kms_key_id` is set, **another key** fails the verification the way a checksum mismatch does (`FAILED` then `REPLAY_REQUIRED`, source progress not committed, counted in `vtop_verification_failures_total`), whatever the size and the checksum say: a write that should be encrypted and is not is never committed. The failure message names which of the three it was. An object a replay finds already stored under its key (#626) is judged the same way, so an unencrypted one is never reused. `vtopctl tier copy` reads the setting from its `--upload-config` file and applies it to the segment and the manifest it writes, and verifies both before it returns tier evidence: a segment or a manifest the store reports unencrypted refuses the copy. A verification receipt carries the header too and is checked after it is written, but it is evidence and never holds a batch back (§8.4): one the store reports unencrypted is a failed receipt (a WARN and `vtop_verification_receipts_total{result="failed"}`), not a failed batch.
+- **Every path that touches a stored object judges it.** The backend judges the store's report (`HeadObject`, of the exact version where one is pinned) in two places, which share one rule: `verify_object` for an object and for a manifest a batch writes, and `check_encryption` for a read that has no verification of its own.
+
+  | Path | How it judges encryption |
+  |---|---|
+  | Object and manifest write, single-part and multipart, and a lock-fallback object | The headers on the write; `verify_object` on the object and on the manifest before `VERIFIED` |
+  | An object a replay finds stored under its key (#626), and an earlier attempt's recorded object a batch would adopt (#773) | `verify_object` before it is reused or adopted; an unencrypted one is left as it is and the batch is written under its own key. (Adoption is for backends that cannot tell a missing key from a refused request, which the command backends are, and they refuse this setting; the call is the same `verify_object`.) |
+  | Recovery's re-check of a `VERIFIED` row | The same `check_stored_batch` as the scrub: `verify_object` on the object, `check_encryption` on the pinned manifest version |
+  | `vtopctl scrub` | `verify_object` on the object, `check_encryption` on the pinned manifest version and on the manifest's current key, and on each receipt it reads, each a `mismatched` finding when the store reports otherwise |
+  | `vtopctl tier copy` | The segment and the manifest each through `verify_object` before evidence is returned |
+  | Verification receipt write | `check_encryption` on the version written; a failure is a failed receipt |
+  | `vtopctl verify` | `check_encryption` on the manifest and the object, reported on an `encryption` line and failing the verdict; no line when the backend asked for none |
+  | Manifest write after a batch is already written | None exists: a manifest is written once per attempt, by the path in the first row |
+  - With `kms_key_id` **unset**, an `aws:kms` object passes whichever key the store reports; the check is the algorithm. VTOP does not check that the key is the account's `aws/s3` key.
+  - With `kms_key_id` **set** to a key id or a key ARN, the key the store reports must match it by key id or by key ARN (a store reports the key's ARN). A store that reports `aws:kms` and no key id cannot be used with a named key.
+  - With `kms_key_id` set to an **alias**, only the algorithm is checked, because a store reports the key's ARN and never the alias. The engine logs a WARN at startup saying so. Name the key by id or ARN to have it checked.
+- **Checksums are unchanged.** SSE-S3 and SSE-KMS change neither the store-computed `x-amz-checksum-sha256` nor the read-back: S3 computes and returns the checksum over the plaintext, and a `GetObject` of an encrypted object returns plaintext. The live MinIO test (`live_s3_sse`) verifies a SHA-256 object, a BLAKE3 object and a multipart object under each mode.
+- **Not covered.** SSE-C, DSSE-KMS (`aws:kms:dsse`) and client-side encryption are not supported. A bucket default encryption is the operator's and is not read or changed. Objects written before the mode was set stay as they were, and `vtopctl scrub` reports each as a mismatch (the store reports no encryption), which is accurate: re-encrypt them with a store-side copy. A multipart session begun before the mode was set completes into an unencrypted object, which then fails verification and is replayed under the new setting.
+- **Observability.** The startup summary logs the mode and what a mismatch does, and `vtop_server_side_encryption_mode{tenant,mode}` reads 1 for the configured mode (`none`, `sse-s3`, `sse-kms`), set once at startup by `run`. Alert on `vtop_server_side_encryption_mode{mode="none"} == 1` for a fleet that must encrypt.
+- **Keys are the store's.** VTOP never sees an object key, a data key or a KMS key's material. Who may use the KMS key, rotation and key deletion are KMS policy. A KMS key that is disabled or deleted makes the archive unreadable.
 
 ## 8. Manifest authentication
 
@@ -654,6 +716,38 @@ query string, fragment or user info; the writer refuses such a URI rather
 than record it. The warning for a receipt that could not be written strips
 URL query strings and user info from the store's error.
 
+### 8.5 A manifest is bound to its key (`verify-manifest`)
+
+A genuine manifest copied over another batch's manifest key is intact: its
+self-hash, its MAC, its object and its ledger row all check out. The scrub
+and recovery catch the copy through the ledger, which records which manifest
+belongs at which key (`is batch X's, not Y`). `vtopctl verify-manifest` may
+run with no ledger that knows the batch, so it binds the manifest to its key
+itself: every manifest names the key it was written to, in `manifest.uri`,
+and the check **MUST** find that name equal to the URI it read the manifest
+from, exactly. Otherwise it fails, naming both keys and the batch whose
+manifest it is (`manifest key : FAILED`, `"manifest_key_ok": false`).
+
+What is bound, by manifest version:
+
+| Version | `manifest.uri` present | Covered by the self-hash | Covered by the MAC |
+|---|---|---|---|
+| 0.1 | yes | yes | no MAC exists in 0.1; with a key configured, an unsigned manifest is refused anyway (§8) |
+| 0.2, 0.3 | yes | yes (the re-encoded fields) | yes, when the manifest is signed and a key is configured |
+| 0.4 | yes | yes (the stored document) | yes, when a key is configured |
+
+- **With a key configured**, the binding is authenticated: the MAC covers
+  `manifest.uri` and `batch_id` together, so the key and the batch a manifest
+  names are its signer's statement, and editing either fails the MAC.
+- **Without a key**, the self-hash makes the binding corruption detection
+  only, like every other field: someone who can write the bucket can rewrite
+  `manifest.uri` and recompute the hash. A copied manifest left as it is
+  fails.
+- **Not derived from other fields.** The check does not rebuild the key from
+  the batch id and the partition template: not every writer names a
+  manifest that way (`vtopctl tier` writes `<object>.manifest.json`), and
+  under the MAC the name the manifest carries is already authenticated.
+
 ## 9. Resource exhaustion controls
 
 Resource exhaustion controls are part of the security boundary:
@@ -663,6 +757,10 @@ Resource exhaustion controls are part of the security boundary:
   exceed it fail without advancing source progress.
 - Compression streams directly to the staging file instead of holding both an
   uncompressed aggregate and compressed aggregate in memory.
+- The metadata peer and admin listeners and the replica listener hold at
+  most `max_peer_connections`, `max_admin_connections` and
+  `max_replica_connections` connections at once (#732); the native plane
+  caps its sessions. See "Native broker transport" in §2.
 - Successfully processed staging objects/manifests are removed immediately.
   Crash-left VTOP artifacts are removed after `engine.work_retention_seconds`,
   with `engine.work_max_bytes` enforcing an oldest-first aggregate ceiling on
@@ -771,8 +869,8 @@ Removing an ignore removes it from both files and this table together.
 | Transport confidentiality | Configurable (native broker: TLS 1.3 mTLS on every plane whose transport knob is left at its default; a plane switched to plaintext has none) / Configurable (Kafka, S3, PostgreSQL) | The native broker is TLS 1.3 mTLS on every plane whose transport is left at its default. Five node config knobs choose (#294 slice 5). Four are listeners — `peer_transport`, `admin_transport`, `replica_transport`, `native_transport` — each `tls` unless set to `plaintext` (loopback only) or `plaintext-on-any-interface` (spelled out deliberately); the fifth, `lease.transport`, is a dial with `tls` or `plaintext` only, and its loopback bound comes from the admin listener it dials, not from the dial. A plane on any plaintext setting has no transport confidentiality, so a security review of a hand-written node config reads all five. No `vtopctl` flag or Helm value sets them, so chart-rendered deployments are TLS throughout. A plaintext replica plane refuses the verbs whose authorization depends on a client certificate, and a plaintext native plane admits the configured principal on its declaration alone. Kafka/S3/PostgreSQL confidentiality is configured on those clients, not implemented in core. |
 | PostgreSQL transport authentication | Yes for remote hosts | Non-loopback connections require `sslmode=verify-full`; loopback/socket plaintext is limited to local operation. |
 | Backend-limited verification disclosure | Yes | Size-only mode is labeled and rejected by default. |
-| Data-at-rest encryption | Not by VTOP | Delegated to storage layer (SSE/bucket default). |
-| Object immutability (WORM) | Yes, with `upload.object_lock` on `s3_native` | Objects and manifests written under an S3 Object Lock retention, the bucket's Object Lock checked first, and the stored retention of the exact versions verified before `VERIFIED` (§7, #684). The bucket's Object Lock and its default retention are created by the operator; `vtopctl tier copy` refuses the profile. |
+| Data-at-rest encryption | Yes, with `upload.server_side_encryption` on `s3_native` (SSE-S3 or SSE-KMS); otherwise not by VTOP | The store encrypts every object, manifest and receipt; VTOP asks for it on every write and fails a batch whose stored object is not reported as encrypted the way it was asked for (§7.1). Keys and key policy are the store's and KMS's. SSE-C, client-side encryption and an encrypted ledger or work directory are not provided; without the setting, encryption is delegated to the storage layer (bucket default). |
+| Object immutability (WORM) | Yes, with `upload.object_lock` on `s3_native` | Objects and manifests written under an S3 Object Lock retention, the bucket's Object Lock checked first, and the stored retention of the exact versions verified before `VERIFIED` (§7, #684). The bucket's Object Lock and its default retention are created by the operator. `vtopctl tier copy` writes cold-tier copies under the same profile and checks their retention before it proposes the tier evidence. |
 | MAC key rotation | Yes | Key ids in version 0.4 manifests and a keyring (§8.3). |
 | Public-key manifest signing | Not yet | MAC keys are shared secrets: an auditor needs the key to verify. |
 | Multipart upload integrity for very large objects | Yes, on `s3_native` | Above `upload.multipart_threshold_bytes` the engine uploads in parts (#482); a failed part is retried alone and the replay of the same bytes resumes the session (#668). Part ETags are never evidence: the whole stored object is verified before `VERIFIED`, as for a single-part upload. The command backends (`awscli`, `s3cmd`, `minio`) hand the whole object to their tool, which may split it internally but cannot resume a failed upload; `localfs` writes one file. |
@@ -811,6 +909,7 @@ engine host, a leaked MAC key, encryption at rest).
 | Object Lock retention on versioned manifest buckets | **SHOULD** |
 | With `upload.object_lock`: bucket Object Lock preflight, lock headers on every write, stored retention verified before `VERIFIED` | **MUST** |
 | Bucket default retention as the floor under `upload.object_lock` | **SHOULD** (operator) |
+| With `upload.server_side_encryption`: encryption headers on every write, the store's reported encryption verified before `VERIFIED` | **MUST** |
 | Secret redaction in logs | **MUST** |
 | Refuse a key, state-store, ledger or audit file group or other can write (no override) | **MUST** |
 | Refuse such a file other users can read, outside a closed directory or a read-only Kubernetes Secret mount, unless the documented override is set, and announce and audit each override | **MUST** |
@@ -874,8 +973,10 @@ exchange) and rotate any password set before the switch to
 `password_encryption = scram-sha-256` — that setting governs only how
 NEW passwords are stored, so a legacy MD5 verifier keeps the legacy
 exchange alive until its password is reset. A FIPS-shaped deployment
-does both, and only then can the MD5 path never be offered. At-rest
-encryption is delegated to the storage layer (§7).
+does both, and only then can the MD5 path never be offered. Archive
+objects are encrypted at rest by the store when `upload.server_side_encryption`
+is set (§7.1); otherwise at-rest encryption is delegated to the storage layer
+(§7).
 
 ### 16.3 The questions this inventory exists to ask
 
@@ -953,7 +1054,7 @@ the rows in §17.7 that say "every plane" apply to all four.
 | ID | Threat | Control | Test or CI check | Residual risk |
 |----|--------|---------|------------------|---------------|
 | A1 | A network attacker downgrades the Kafka source's SASL login to an unauthenticated session | `crates/vtop-adapters/src/kafka_source.rs::build_client_config` passes the TLS and SASL settings through and refuses to start when a named password variable is unset | `crates/vtop-adapters/src/kafka_source.rs::missing_password_env_is_a_config_error_not_a_silent_downgrade` | The test covers the silent downgrade only. Whether the link is encrypted is A2. |
-| A2 | The Kafka source link runs in plaintext because nothing requires TLS | GAP: `security_protocol` is optional; unset is librdkafka's default, which is plaintext, and the engine neither requires TLS nor warns. In review, PR #863: a WARN on every start and in `vtopctl validate` when the source is unset, `plaintext` or `sasl_plaintext` with a bootstrap server off loopback | The Kafka matrix runs the whole Kafka source suite over an SSL listener and a SASL_SSL listener (`.github/workflows/kafka-matrix.yml`, the `tls` and `sasl-ssl` legs, with `tests/kafka_broker_env.rs::apply` setting `security_protocol`), and its TLS refusal tests in `tests/integration_kafka_auth.rs` (`tls_a_client_without_the_ca_refuses_the_broker`, `tls_a_client_given_another_ca_refuses_the_broker`; ignored by default, run by the matrix with `--ignored`) check the source verifies the broker | Source records and the SASL exchange cross the network unprotected until the operator sets `security_protocol` (§2 says SHOULD). The matrix runs nightly, on dispatch and on pull requests that touch its paths. |
+| A2 | The Kafka source link runs in plaintext because nothing requires TLS | `crates/vtop-core/src/config.rs::kafka_plaintext_warning`: `security_protocol` is still optional and unset is librdkafka's plaintext, but when it is unset, `plaintext` or `sasl_plaintext` and a bootstrap server is not a loopback address, the engine warns on every start and `vtopctl validate` reports it (the config's warnings). It warns and does not refuse; a hostname that resolves to loopback is warned about | `crates/vtop-core/src/config.rs::a_plaintext_kafka_source_off_loopback_is_warned_about`. The Kafka matrix runs the whole Kafka source suite over an SSL listener and a SASL_SSL listener (`.github/workflows/kafka-matrix.yml`, the `tls` and `sasl-ssl` legs, with `tests/kafka_broker_env.rs::apply` setting `security_protocol`), and its TLS refusal tests in `tests/integration_kafka_auth.rs` (`tls_a_client_without_the_ca_refuses_the_broker`, `tls_a_client_given_another_ca_refuses_the_broker`; ignored by default, run by the matrix with `--ignored`) check the source verifies the broker | Source records and the SASL exchange cross the network unprotected until the operator sets `security_protocol` (§2 says SHOULD). The matrix runs nightly, on dispatch and on pull requests that touch its paths. |
 | A3 | A network attacker, or a stray configuration, sends object and manifest traffic to the store over plaintext `http://` | `crates/vtop-upload/src/s3_native.rs::refuse_plaintext_uri` reads the URI of every request before it is sent; `crates/vtop-upload/src/s3_native.rs::validate_every_endpoint_source` refuses it at construction | `crates/vtop-upload/src/s3_native.rs::plaintext_is_refused_on_every_endpoint_source_for_every_transport`, `crates/vtop-upload/src/s3_native.rs::a_plaintext_request_is_refused_at_the_moment_it_would_be_transmitted`, `crates/vtop-upload/src/s3_native.rs::the_constructor_itself_refuses_a_plaintext_endpoint` | `verify_tls: false` is a deliberate, warned lab opt-in. The policy is in the `s3_native` backend: the `awscli`, `s3cmd` and `mc` backends apply no scheme check of their own. |
 | A4 | A remote PostgreSQL connection is made without a verified server identity | `crates/vtop-state/src/pg_store.rs::enforce_tls_policy` | `crates/vtop-state/src/pg_store.rs::remote_postgres_requires_hostname_verified_tls` | Loopback and Unix-socket connections may be plaintext. The database's own access control is out of scope. |
 | A5 | A storage tamperer alters an object after upload | The stored object is verified against the manifest before `VERIFIED`: `crates/vtop-upload/src/s3_native.rs::verify_object` (size and the service-computed checksum) and `crates/vtop-upload/src/base.rs::verify_file_content` (read-back hash) | `crates/vtop-upload/src/mock.rs::same_size_corruption_fails_with_uploader_metadata_unchanged`, `crates/vtop-cli/tests/integration_scrub.rs::a_corrupted_object_byte_is_reported_as_mismatched` | Verification detects. It does not prevent: tampering after `VERIFIED` is found by the scrub, and prevented only by A11. `require_strong_verification: false` accepts same-size corruption and says so (§6). |
@@ -966,7 +1067,7 @@ the rows in §17.7 that say "every plane" apply to all four.
 | A12 | Source progress is committed for data that was never verified, so a corrupted or tampered object loses records for good | `crates/vtop-core/src/state_machine.rs::can_transition` allows `SOURCE_COMMITTED` only from `VERIFIED`; PostgreSQL repeats the rule in the trigger `vtop_enforce_commit_after_verify` (`crates/vtop-state/migrations/postgres/0001_state_store.sql`) | `crates/vtop-core/tests/prop_state_machine.rs::commit_is_reachable_only_from_verified`, `crates/vtop-core/src/state_machine.rs::test_cannot_commit_from_manifest_uploaded`, `crates/vtop-state/tests/pg_battery.rs::postgres_backend_passes_battery_and_enforces_invariant_at_db` | SQLite's only database-side rule is that a row is inserted as `batching`: the rest is the state machine and the store's write path. Anyone with write access to the ledger file defeats it (A15 limits who has). |
 | A13 | The engine's own database role holds more than it needs, so a bug or a stolen credential can delete ledger or audit rows | The documented runtime grants in `docs/POSTGRES_DEPLOYMENT.md::GRANT SELECT, INSERT ON TABLE public.audit_events` give `SELECT, INSERT, UPDATE` on `batches` and no `DELETE` or `TRUNCATE` | `crates/vtop-state/tests/pg_battery.rs::postgres_backend_passes_battery_and_enforces_invariant_at_db` connects as that role and asserts CREATE, ALTER, DELETE, TRUNCATE and audit-table writes are denied | The operator applies the grants; the engine cannot see a role's scope on a database it was not given a privileged connection to. |
 | A14 | An over-broad object-store credential lets the engine, or anyone holding its key, read, list or delete more than the archive needs | GAP: §5 lists the minimum permissions per backend; nothing in the engine can see a credential's scope, and A11 is the only engine-side control that limits a deleter | GAP: no test or check exercises the permissions the engine actually needs | Credential scope is storage-side IAM (§14: "Authorization / multi-tenant isolation: Not by VTOP"). |
-| A15 | Another local user reads or edits a MAC key file, the state-store secret, the SQLite ledger or the audit file | `crates/vtop-core/src/secret_file.rs::judge` refuses a file group or other can write, or other users can read, before it is read; an accepted loose file is announced and audited | `crates/vtop-cli/tests/secret_file_permissions.rs::startup_refuses_a_key_file_other_users_can_reach`, `crates/vtop-cli/tests/secret_file_permissions.rs::the_override_starts_announced_and_audited_but_never_for_a_writable_file` | Unix only. TLS private keys and the files `vtop-node` reads are not checked (S1; in review, PR #863). |
+| A15 | Another local user reads or edits a MAC key file, the state-store secret, the SQLite ledger or the audit file | `crates/vtop-core/src/secret_file.rs::judge` refuses a file group or other can write, or other users can read, before it is read; an accepted loose file is announced and audited | `crates/vtop-cli/tests/secret_file_permissions.rs::startup_refuses_a_key_file_other_users_can_reach`, `crates/vtop-cli/tests/secret_file_permissions.rs::the_override_starts_announced_and_audited_but_never_for_a_writable_file` | Unix only. `vtop-node` checks its TLS private keys (S1), not the other files it reads. |
 | A16 | A hostile or runaway source exhausts the engine's memory | The source readers stop at `batching.max_bytes` and fail without advancing progress: `crates/vtop-adapters/src/file_source.rs::exceeds max_bytes`, `crates/vtop-adapters/src/syslog_spool_source.rs::exceeds max_bytes`, `crates/vtop-adapters/src/kafka_source.rs::MultiTopicAcc` | `crates/vtop-adapters/src/file_source.rs::rejects_a_line_before_it_can_exceed_the_memory_budget`, `crates/vtop-adapters/src/syslog_spool_source.rs::rejects_an_oversized_spool_record_without_advancing`, `crates/vtop-adapters/src/kafka_source.rs::multi_topic_acc_enforces_byte_budget_per_topic` | The ceiling bounds one batch. Total memory is that ceiling times the sources the operator configures. |
 | A17 | A local attacker swaps a staging file for a symlink so the engine's cleanup deletes something else | `crates/vtop-core/src/work_dir.rs::cleanup_work_dir` never follows symlinks and revalidates the entry just before it unlinks | `crates/vtop-core/src/work_dir.rs::never_follows_or_removes_symlinks`, `crates/vtop-core/src/work_dir.rs::skips_an_entry_swapped_to_a_symlink_after_enumeration` | Unix only for the anchored delete. |
 | A18 | An object key from a manifest or source escapes the local object tree | `crates/vtop-upload/src/localfs_backend.rs::refusing path-traversal segment` | `crates/vtop-upload/src/localfs_backend.rs::rejects_path_traversal` | Applies to the `localfs` backend only. |
@@ -994,11 +1095,11 @@ the rows in §17.7 that say "every plane" apply to all four.
 | ID | Threat | Control | Test or CI check | Residual risk |
 |----|--------|---------|------------------|---------------|
 | M1 | A host with a certificate joins the Raft group as another node, or spoofs a vote or a version request | `crates/vtop-meta/src/transport/tls.rs::assert_peer_identity` binds the certificate's CN to the claimed sender | `crates/vtop-meta/src/transport/peer.rs::mtls_rejects_wrong_peer_cn`, `crates/vtop-meta/src/transport/peer.rs::mtls_rejects_vote_sender_spoof`, `crates/vtop-meta/src/transport/peer.rs::mtls_refuses_a_version_request_from_a_spoofed_sender` | Every node's certificate comes from one CA: a compromised CA key, or a stolen node key, is a node. |
-| M2 | A certificate-holding data node, or any client, rewrites cluster membership or grants a range lease to an arbitrary holder | `crates/vtop-meta/src/transport/authz.rs::AdminAuthorizer`: reads for any authenticated client, a node's own lease commands for that node, everything cluster-scoped for named operators | `crates/vtop-meta/src/transport/admin.rs::a_node_may_not_change_membership_over_the_wire`, `crates/vtop-meta/src/transport/admin.rs::a_node_may_not_drive_another_nodes_lease_over_the_wire`, `scripts/live-chaos/scenarios/11-admin-authorization.sh` | Opt-in. Without `admin_authorization` every certificate the CA signed is an operator and the node only warns at startup (test `an_unconfigured_endpoint_still_permits_everything` documents it). The Helm chart renders the policy only when `meta.adminAuthorization.enabled` is true, and it defaults to false (`helm/vtop/values.yaml::adminAuthorization`). In review, PR #864: the chart turns the policy on by default and refuses to render with no operator named; PR #870 (on #850's feature level 9) lets a data node release its own lease under the policy, which today it cannot, so its lease lapses on its deadline. |
+| M2 | A certificate-holding data node, or any client, rewrites cluster membership or grants a range lease to an arbitrary holder | `crates/vtop-meta/src/transport/authz.rs::AdminAuthorizer`: reads for any authenticated client, a node's own lease commands for that node, everything cluster-scoped for named operators | `crates/vtop-meta/src/transport/admin.rs::a_node_may_not_change_membership_over_the_wire`, `crates/vtop-meta/src/transport/admin.rs::a_node_may_not_drive_another_nodes_lease_over_the_wire`, `scripts/live-chaos/scenarios/11-admin-authorization.sh` | On by default in the Helm chart only. A hand-written node config without `admin_authorization` makes every certificate the CA signed an operator, and the node only warns at startup (test `an_unconfigured_endpoint_still_permits_everything` documents it). The chart renders the policy unless `meta.adminAuthorization.enabled` is false, the lab opt-out, and refuses to render with the policy on and no operator named (`helm/vtop/values.yaml::adminAuthorization`, #864). A data node releases its own lease under the policy only from metadata feature level 9 (#870); below it the release is refused and the lease lapses on its deadline. |
 | M3 | A plaintext admin plane is reachable, so anyone who reaches it runs `meta init`, membership and lease commands | `crates/vtop-meta/src/transport/admin.rs::plaintext_on_any_interface` is the only way off loopback; an enforcing policy on plaintext is refused because no CN exists to match | `crates/vtop-meta/src/transport/admin.rs::a_plaintext_admin_endpoint_refuses_a_routable_address`, `crates/vtop-meta/src/transport/admin.rs::a_plaintext_admin_endpoint_refuses_a_policy_it_could_not_enforce` | On loopback, or after the named opt-in, plaintext admin is unauthenticated: the node warns every start. |
 | M4 | A plaintext peer plane lets any host that can reach it join the Raft group as any node id | `crates/vtop-meta/src/transport/peer.rs::plaintext_on_any_interface` is the only way off loopback | `crates/vtop-meta/src/transport/peer.rs::plaintext_refuses_a_non_loopback_bind`, `crates/vtop-meta/src/transport/peer.rs::plaintext_cannot_detect_a_spoofed_vote_sender` | The second test records the limit: on a plaintext peer plane the sender is self-asserted and membership rests on network isolation. |
 | M5 | A malformed or oversized admin or peer frame exhausts or crashes a metadata node | `crates/vtop-meta/src/transport/wire.rs::MAX_FRAME_BYTES` and the per-field bounds in the same file | `crates/vtop-meta/src/transport/wire.rs::a_placement_response_claiming_an_absurd_replica_count_is_refused`, `crates/vtop-meta/src/transport/wire.rs::the_committed_fuzz_seeds_decode`, `fuzz/fuzz_targets/vtpm_frame.rs`, `.github/workflows/ci.yml::fuzz smoke (every target)` | The bounds are per frame. Concurrent connections are M6. |
-| M6 | A client with a valid certificate opens connections to the peer or admin plane without limit | GAP: neither plane's server (`crates/vtop-meta/src/transport/peer.rs`, `crates/vtop-meta/src/transport/admin.rs`) caps concurrent connections. In review, PR #862: a cap per listener (`max_peer_connections`, default 256; `max_admin_connections`, default 1024), closing the connection over it at accept, plus a 10 s deadline from accept to the first request so silent sockets cannot hold the slots; both counted on `vtop_listener_connections_refused_total` | GAP: nothing tests a connection flood on these planes. In review, PR #862: a cap-of-one test and a silent-connection test on each server | Each connection is a task; the handshake and frame bounds limit what one connection costs, not how many there are. With PR #862, a flood can still take every slot while it lasts, and an authenticated client that sends its first request may hold a slot while connected. |
+| M6 | A client with a valid certificate opens connections to the peer or admin plane without limit | `crates/vtop-meta/src/transport/limit.rs::ConnectionLimit` caps each listener (`max_peer_connections`, default 256; `max_admin_connections`, default 1024; `crates/vtop-node/src/config.rs::check_connection_cap`), closes the connection over the cap at accept, before its TLS handshake, and closes one that sends no request within 10 s of accept (`DEFAULT_HANDSHAKE_DEADLINE`); both are counted on `vtop_listener_connections_refused_total{plane,reason}` (`crates/vtop-node/src/observe.rs::ConnectionLimitCollector`) and named in a rate-limited WARN | `crates/vtop-meta/src/transport/peer.rs::a_peer_connection_over_the_cap_is_closed_and_counted`, `crates/vtop-meta/src/transport/peer.rs::a_silent_peer_connection_is_closed_at_the_handshake_deadline`, `crates/vtop-meta/src/transport/admin.rs::an_admin_connection_over_the_cap_is_closed_and_counted`, `crates/vtop-meta/src/transport/admin.rs::a_silent_admin_connection_is_closed_at_the_handshake_deadline`, `crates/vtop-meta/src/transport/limit.rs::the_connection_over_the_cap_is_refused_and_counted_and_a_freed_slot_is_reused` | A cap bounds how many connections there are, not who holds them: a flood can still take every slot while it lasts, and an authenticated client that sends its first request may hold a slot while connected. The counter and the WARN make both visible. |
 
 ### 17.4 Cluster plane: replica plane
 
@@ -1010,7 +1111,7 @@ the rows in §17.7 that say "every plane" apply to all four.
 | R4 | A peer fences a replica to an epoch metadata never granted, parking it in permanent refusal | `crates/vtop-broker/src/replication/mod.rs::fn fence` refuses an epoch above the granted one | `crates/vtop-broker/tests/replica_fencing.rs::a_fence_above_the_granted_epoch_is_refused` | Needs a reachable replica port and a certificate (or a plaintext plane, R1). |
 | R5 | A frame is corrupted or forged in flight, or announces a length that exhausts memory before it is read | `crates/vtop-protocol/src/lib.rs::decode_frame` checks the BLAKE3 checksum and the length bound before allocating | `crates/vtop-protocol/src/lib.rs::rejects_corruption_trailing_bytes_and_oversized_lengths_before_allocation`, `fuzz/fuzz_targets/protocol_frame.rs`, `.github/workflows/ci.yml::fuzz smoke (every target)` | The checksum is unkeyed framing integrity. Authenticity is TLS's; a plaintext plane has none. |
 | R6 | A slow or flooding replica holds leader memory | `crates/vtop-broker/src/memory_budget.rs::MemoryBudgetPool` bounds in-flight and catch-up bytes per follower | `crates/vtop-broker/tests/memory_budget.rs::follower_budget_bounds_slow_replica_inflight`, `crates/vtop-broker/tests/memory_budget.rs::producer_flood_stays_bounded_and_rejects_retryably` | A budget refusal is retryable. The bound is on memory held, not on how many peers connect (R7). |
-| R7 | A peer with a valid certificate opens connections to the replica plane without limit | GAP: `crates/vtop-broker/src/replication/network.rs` caps neither sessions nor connections, unlike the native plane's `max_sessions`. In review, PR #862: `max_replica_connections` (default 256) and the same handshake deadline, counted on `vtop_listener_connections_refused_total` | GAP: nothing tests a connection flood on the replica plane. In review, PR #862: a cap-of-one test and a silent-connection test on the replica server | As M6. |
+| R7 | A peer with a valid certificate opens connections to the replica plane without limit | `crates/vtop-meta/src/transport/limit.rs::ConnectionLimit` on the replica listener (`crates/vtop-broker/src/replication/network.rs::with_max_connections`; `max_replica_connections`, default 256), with the same accept-time refusal and 10 s handshake deadline, counted on `vtop_listener_connections_refused_total` | `crates/vtop-broker/src/replication/network.rs::a_replica_connection_over_the_cap_is_closed_and_counted` (the cap of one, then a silent connection closed at its deadline) | As M6. |
 
 ### 17.5 Cluster plane: native produce and fetch
 
@@ -1054,7 +1155,7 @@ The gateway is a `kafka:` block in a data node's config (`docs/deploy/cluster-pl
 
 | ID | Threat | Control | Test or CI check | Residual risk |
 |----|--------|---------|------------------|---------------|
-| S1 | Another local user reads a node's TLS private key | GAP: the permission check covers the engine's secret and ledger files (A15) and not TLS keys or the files `vtop-node` reads (§3). In review, PR #863: `vtop-node` refuses every TLS private key its config names, before reading it, by the A15 rule (no override) | GAP: no test, because the check does not exist. In review, PR #863: tests that a 0644 or 0660 key is refused before it is read and a 0600 key is read | A readable key is a node's identity on every plane, and the CA signs for the whole cluster. |
+| S1 | Another local user reads a node's TLS private key | `crates/vtop-node/src/tls.rs::check_private_key` refuses every TLS private key the node's config names (`tls.key`, `replica_tls.key`, `native_tls.key`, `lease.tls.key`, `observability.tls.key`, a scenario client's `tls.key`) before reading it, by the A15 rule, with no override | `crates/vtop-node/src/tls.rs::a_tls_private_key_other_users_can_read_is_refused_before_it_is_read`, `crates/vtop-node/src/tls.rs::a_tls_private_key_other_users_can_write_is_refused`, `crates/vtop-node/src/tls.rs::an_owner_only_tls_private_key_is_read` | A readable key is a node's identity on every plane, and the CA signs for the whole cluster. |
 | S2 | An attacker with write access to a node's log or metadata directory forges records or Raft state | GAP: segment and record checksums (`crates/vtop-log/src/codec.rs::record_content_hash`) are unkeyed, so they detect damage, not forgery | GAP: the crash sweeps and fuzz targets test damage and torn writes, not an adversarial rewrite | Host compromise is outside what the cluster defends. Disk encryption and host hardening are the operator's. |
 
 ### 17.9 Gaps
@@ -1063,18 +1164,14 @@ Each row below is a cell marked GAP above. Closing one means adding the control 
 
 | ID | Missing | What closes it |
 |----|---------|----------------|
-| A2 | control | A refusal or a warning when `security_protocol` is plaintext. In review, PR #863. |
 | A14 | both | A startup probe or a documented least-privilege policy test against the engine's actual calls; today the scope is storage-side IAM. |
 | A23 | test | A check that every `uses:` in `.github/workflows` carries a 40-character SHA. |
 | A24 | test | A chart test that renders the pod and asserts the non-root, read-only and capability settings. |
-| M6 | both | A connection cap on the peer and admin servers, with a test that the connection over the cap is refused and counted. In review, PR #862. |
 | R2 | test | A `vtop-node` test that a TLS peer outside the followers and `transfer_peers` is refused a transfer. |
-| R7 | both | A session cap on the replica server, as the native plane has, with a test. In review, PR #862. |
 | N5 | test | A broker test that opens `max_sessions + 1` sessions and sees the last refused and counted. |
 | K2 | both | A Kafka-side authentication and authorization design (TLS, SASL, ACLs) for the gateway; until then the control is the loopback default and a network policy. |
 | K5 | test | A gateway test with a short `idle_timeout` and a silent session. |
 | K8 | both | TLS and SASL settings for the remote bridge, with a test against a broker that requires them. |
 | K9 | test | A gateway test that a Metadata request repeating one name returns one entry. |
 | T1 | test | A test on each of the metadata and replica planes that a client with no certificate, and one from another CA, is refused (the native plane has them, #854). |
-| S1 | both | Extend the secret-file permission check to the TLS keys named in a node's config, with a test. In review, PR #863. |
 | S2 | both | Not a cluster control today; it needs an integrity design for data at rest (a keyed checksum or storage-layer controls) before it can have a test. |

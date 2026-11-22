@@ -1349,9 +1349,9 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "form_urlencoded"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
+checksum = "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
 dependencies = [
  "percent-encoding",
 ]
@@ -3905,9 +3905,9 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "url"
-version = "2.5.8"
+version = "2.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
+checksum = "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a"
 dependencies = [
  "form_urlencoded",
  "idna",
@@ -3987,7 +3987,7 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
 name = "vtop-adapters"
-version = "0.10.2"
+version = "0.10.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4008,7 +4008,7 @@ dependencies = [
 
 [[package]]
 name = "vtop-broker"
-version = "0.10.2"
+version = "0.10.4"
 dependencies = [
  "blake3",
  "loom",
@@ -4027,9 +4027,8 @@ dependencies = [
 
 [[package]]
 name = "vtop-cli"
-version = "0.10.2"
+version = "0.10.4"
 dependencies = [
- "anyhow",
  "async-trait",
  "aws-sdk-s3",
  "blake3",
@@ -4061,12 +4060,13 @@ dependencies = [
  "vtop-protocol",
  "vtop-s3-testkit",
  "vtop-state",
+ "vtop-surface",
  "vtop-upload",
 ]
 
 [[package]]
 name = "vtop-core"
-version = "0.10.2"
+version = "0.10.4"
 dependencies = [
  "blake3",
  "chrono",
@@ -4085,14 +4085,16 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "vtop-surface",
  "zstd",
 ]
 
 [[package]]
 name = "vtop-kafka"
-version = "0.10.2"
+version = "0.10.4"
 dependencies = [
  "async-trait",
+ "rdkafka",
  "sha2 0.11.1",
  "tempfile",
  "thiserror 2.0.21",
@@ -4107,7 +4109,7 @@ dependencies = [
 
 [[package]]
 name = "vtop-log"
-version = "0.10.2"
+version = "0.10.4"
 dependencies = [
  "blake3",
  "libc",
@@ -4120,7 +4122,7 @@ dependencies = [
 
 [[package]]
 name = "vtop-meta"
-version = "0.10.2"
+version = "0.10.4"
 dependencies = [
  "async-trait",
  "blake3",
@@ -4141,7 +4143,7 @@ dependencies = [
 
 [[package]]
 name = "vtop-node"
-version = "0.10.2"
+version = "0.10.4"
 dependencies = [
  "async-trait",
  "clap",
@@ -4150,6 +4152,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "serde",
+ "serde_json",
  "serde_yaml",
  "tempfile",
  "tokio",
@@ -4158,16 +4161,18 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "vtop-broker",
+ "vtop-core",
  "vtop-kafka",
  "vtop-log",
  "vtop-meta",
  "vtop-observe",
  "vtop-protocol",
+ "vtop-surface",
 ]
 
 [[package]]
 name = "vtop-observe"
-version = "0.10.2"
+version = "0.10.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4195,11 +4200,12 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
+ "vtop-surface",
 ]
 
 [[package]]
 name = "vtop-protocol"
-version = "0.10.2"
+version = "0.10.4"
 dependencies = [
  "blake3",
  "thiserror 2.0.21",
@@ -4209,7 +4215,7 @@ dependencies = [
 
 [[package]]
 name = "vtop-s3-testkit"
-version = "0.10.2"
+version = "0.10.4"
 dependencies = [
  "futures",
  "serde",
@@ -4221,7 +4227,7 @@ dependencies = [
 
 [[package]]
 name = "vtop-state"
-version = "0.10.2"
+version = "0.10.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4237,8 +4243,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vtop-surface"
+version = "0.10.4"
+dependencies = [
+ "clap",
+ "prometheus",
+]
+
+[[package]]
 name = "vtop-upload"
-version = "0.10.2"
+version = "0.10.4"
 dependencies = [
  "async-trait",
  "aws-config",

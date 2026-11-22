@@ -774,7 +774,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             )
             .await?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&report.json)?);
+                println!("{}", crate::report::pretty(&report.json)?);
             } else {
                 for line in &report.lines {
                     println!("{line}");
@@ -853,7 +853,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             if cli.json {
                 println!(
                     "{}",
-                    serde_json::json!({"status": "ok", "warnings": warnings})
+                    crate::report::report_json!({"status": "ok", "warnings": warnings})
                 );
             } else {
                 for warning in &warnings {
@@ -928,7 +928,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 if cli.json {
                     println!(
                         "{}",
-                        serde_json::json!({"status": "ok", "backend": backend, "audit_id": done.audit_id})
+                        crate::report::report_json!({"status": "ok", "backend": backend, "audit_id": done.audit_id})
                     );
                 } else {
                     println!(
@@ -994,7 +994,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 )?;
             }
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                println!("{}", crate::report::pretty(&report)?);
             } else {
                 for line in report.lines() {
                     println!("{line}");
@@ -1109,7 +1109,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 // The report first, so the findings reach stdout whatever happens
                 // to the metrics file.
                 if cli.json {
-                    println!("{}", serde_json::to_string_pretty(&report)?);
+                    println!("{}", crate::report::pretty(&report)?);
                 } else {
                     for line in report.lines() {
                         println!("{line}");
@@ -1265,7 +1265,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 if cli.json {
                     println!(
                         "{}",
-                        serde_json::json!({"status": "ok", "deleted": deleted, "digest": digest, "audit_id": done.audit_id})
+                        crate::report::report_json!({"status": "ok", "deleted": deleted, "digest": digest, "audit_id": done.audit_id})
                     );
                 } else {
                     match digest {
@@ -1351,6 +1351,28 @@ pub async fn verify_manifest_deep(
         manifest_bytes.len(),
         parsed.fields().batch_id
     ));
+
+    // 1b. The key: is this the manifest that was written HERE? Every check
+    // below is about the manifest's own content, which another batch's
+    // genuine manifest copied over this key passes, so on its own the
+    // report would vouch for the wrong batch at this URI. A manifest names
+    // the key it was written to (`manifest.uri`, in every version from 0.1),
+    // and its self-hash covers that name, and so does its MAC, together with
+    // the batch id: with a key configured the binding is authenticated. The
+    // comparison is exact, as the scrub's binding to the ledger is.
+    let names_uri = parsed.fields().manifest.uri.as_str();
+    let key_ok = names_uri == manifest_uri;
+    failed |= !key_ok;
+    let key_status = if key_ok {
+        "OK (the manifest names the key it was read from)".to_string()
+    } else {
+        format!(
+            "FAILED (read from {manifest_uri}, but it is the manifest written to {names_uri}, \
+             batch {}'s: not the manifest written at this key)",
+            parsed.fields().batch_id
+        )
+    };
+    lines.push(format!("manifest key    : {key_status}"));
 
     // 2. Self-hash: is the manifest itself intact?
     let self_hash_ok = parsed.verify_self_hash().is_ok();
@@ -1460,6 +1482,45 @@ pub async fn verify_manifest_deep(
     };
     lines.push(format!("object content  : {checksum_status}"));
 
+    // 3b. How the store keeps the manifest and the object, when the backend
+    // was configured to ask for encryption at rest: said only then.
+    // The JSON report carries every result, `not_requested` included, so a
+    // consumer of `--json` can name the object that failed and why.
+    let mut encryption = Vec::new();
+    let mut encryption_json = Vec::new();
+    for (what, uri) in [
+        ("manifest", manifest_uri),
+        ("object", parsed.fields().object.uri.as_str()),
+    ] {
+        let (state, reason) = match backend.check_encryption(uri, None).await {
+            Ok(vtop_upload::EncryptionCheck::NotRequested) => ("not_requested", None),
+            Ok(vtop_upload::EncryptionCheck::Encrypted) => {
+                encryption.push(format!("{what} OK"));
+                ("encrypted", None)
+            }
+            Ok(vtop_upload::EncryptionCheck::Violation(why)) => {
+                failed = true;
+                encryption.push(format!("{what} FAILED ({why})"));
+                ("violation", Some(why))
+            }
+            Err(e) => {
+                failed = true;
+                let why = format!("could not be checked: {e}");
+                encryption.push(format!("{what} FAILED ({why})"));
+                ("unchecked", Some(why))
+            }
+        };
+        encryption_json.push(serde_json::json!({
+            "target": what,
+            "uri": uri,
+            "state": state,
+            "reason": reason,
+        }));
+    }
+    if !encryption.is_empty() {
+        lines.push(format!("encryption      : {}", encryption.join("; ")));
+    }
+
     // 4. Ledger reconciliation.
     let row = store.get_batch(&parsed.fields().batch_id).await?;
     let ledger_status = match &row {
@@ -1495,12 +1556,16 @@ pub async fn verify_manifest_deep(
         "manifest": manifest_uri,
         "batch_id": parsed.fields().batch_id,
         "object_uri": parsed.fields().object.uri,
+        "manifest_key_ok": key_ok,
+        "manifest_key": key_status,
+        "manifest_names_uri": names_uri,
         "self_hash_ok": self_hash_ok,
         "manifest_authentication": authentication_status,
         "manifest_authentication_required": keyring.is_configured(),
         "manifest_verified_with_key": verified_with,
         "object_size_ok": size_ok,
         "object_content": checksum_status,
+        "encryption": encryption_json,
         "ledger": ledger_status,
         "backend": backend.backend_name(),
         "passed": !failed,

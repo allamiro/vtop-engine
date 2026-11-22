@@ -65,6 +65,7 @@ async fn backend(lock: Option<ObjectLockPolicy>) -> S3NativeBackend {
         request_timeout_seconds: 300,
         request_min_bytes_per_second: 4 * 1024,
         object_lock: lock,
+        server_side_encryption: None,
     })
     .await
     .unwrap()

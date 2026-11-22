@@ -765,6 +765,77 @@ pub struct KafkaSourceConfig {
     pub sasl_password_env: Option<String>,
     #[serde(default)]
     pub ssl_ca_location: Option<String>,
+    /// Mutual TLS (#721): the PEM client certificate the engine presents to
+    /// the broker (librdkafka `ssl.certificate.location`). Set together with
+    /// `ssl_key_location`, and only over `SSL` or `SASL_SSL`.
+    #[serde(default)]
+    pub ssl_certificate_location: Option<String>,
+    /// The PEM private key of `ssl_certificate_location`
+    /// (`ssl.key.location`).
+    #[serde(default)]
+    pub ssl_key_location: Option<String>,
+    /// Env var *name* holding the passphrase of an encrypted
+    /// `ssl_key_location` (`ssl.key.password`; never the secret itself).
+    #[serde(default)]
+    pub ssl_key_password_env: Option<String>,
+}
+
+impl KafkaSourceConfig {
+    /// The mutual-TLS settings make sense together or not at all (#721): a
+    /// certificate without its key (or the reverse) would connect without a
+    /// client certificate, which a broker requiring one refuses with a TLS
+    /// error that does not name the setting; over a protocol without TLS the
+    /// certificate would never be sent; and a key passphrase with no key is
+    /// a typo. Each is refused at config load, naming the keys.
+    pub fn validate_mutual_tls(&self) -> Result<(), VtopError> {
+        let blank = |v: &Option<String>| v.as_deref().is_some_and(|s| s.trim().is_empty());
+        for (key, value) in [
+            ("ssl_certificate_location", &self.ssl_certificate_location),
+            ("ssl_key_location", &self.ssl_key_location),
+            ("ssl_key_password_env", &self.ssl_key_password_env),
+        ] {
+            if blank(value) {
+                return Err(VtopError::Config(format!(
+                    "sources.kafka.{key} is set but empty; give a value or remove the key"
+                )));
+            }
+        }
+        match (&self.ssl_certificate_location, &self.ssl_key_location) {
+            (None, None) => {
+                if self.ssl_key_password_env.is_some() {
+                    return Err(VtopError::Config(
+                        "sources.kafka.ssl_key_password_env is set without ssl_key_location; \
+                         the passphrase belongs to the client key mutual TLS presents"
+                            .into(),
+                    ));
+                }
+                return Ok(());
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(VtopError::Config(
+                    "sources.kafka.ssl_certificate_location and ssl_key_location are set \
+                     together or not at all: mutual TLS presents the certificate with its key"
+                        .into(),
+                ));
+            }
+            (Some(_), Some(_)) => {}
+        }
+        let tls = self
+            .security_protocol
+            .as_deref()
+            .is_some_and(|p| p.eq_ignore_ascii_case("ssl") || p.eq_ignore_ascii_case("sasl_ssl"));
+        if !tls {
+            return Err(VtopError::Config(format!(
+                "sources.kafka.ssl_certificate_location is set, but security_protocol is {}; \
+                 a client certificate is sent only over TLS: set security_protocol to SSL or \
+                 SASL_SSL",
+                self.security_protocol
+                    .as_deref()
+                    .map_or("not set (PLAINTEXT)".to_owned(), |p| format!("{p:?}"))
+            )));
+        }
+        Ok(())
+    }
 }
 
 fn default_group() -> String {
@@ -981,6 +1052,13 @@ pub struct UploadConfig {
     /// floor and drain older engines first (docs/OBJECT_LOCK_DEPLOYMENT.md).
     #[serde(default)]
     pub object_lock: Option<ObjectLockConfig>,
+    /// Server-side encryption at rest for every object, manifest and receipt
+    /// write (`s3_native` only; any other backend is refused at load when a
+    /// mode other than `none` is set). `none`, the default, sends no
+    /// encryption header and checks nothing, exactly as before the key
+    /// existed. See [`ServerSideEncryptionConfig`].
+    #[serde(default)]
+    pub server_side_encryption: ServerSideEncryptionConfig,
     /// Byte size of each multipart part (except possibly the last). Used by
     /// resumable uploads for large sealed segments (#191). Default 8 MiB.
     /// Real S3 requires at least 5 MiB for non-final parts; mock/local tests
@@ -1117,6 +1195,119 @@ pub struct ObjectLockConfig {
     /// `s3:PutObjectLegalHold` removes it. Default false.
     #[serde(default)]
     pub legal_hold: bool,
+}
+
+/// How `upload.server_side_encryption` asks the store to encrypt what it
+/// writes. SSE-C (a key the client supplies on every request) is not a mode:
+/// VTOP never holds an object key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum ServerSideEncryptionMode {
+    /// No encryption header; nothing is checked. The default.
+    #[default]
+    #[serde(rename = "none")]
+    None,
+    /// `x-amz-server-side-encryption: AES256`, with keys the store manages.
+    #[serde(rename = "sse-s3")]
+    SseS3,
+    /// `x-amz-server-side-encryption: aws:kms`, optionally with a key id.
+    #[serde(rename = "sse-kms")]
+    SseKms,
+}
+
+impl ServerSideEncryptionMode {
+    /// The config spelling, and the `mode` label of
+    /// `vtop_server_side_encryption_mode`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::SseS3 => "sse-s3",
+            Self::SseKms => "sse-kms",
+        }
+    }
+
+    /// The value S3 uses on the wire (`x-amz-server-side-encryption`), and
+    /// reports back on a HEAD; `None` for `none`.
+    pub fn as_s3(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::SseS3 => Some("AES256"),
+            Self::SseKms => Some("aws:kms"),
+        }
+    }
+}
+
+impl fmt::Display for ServerSideEncryptionMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The most characters `upload.server_side_encryption.kms_key_id` accepts.
+/// A key ARN is well under this; the bound only refuses a pasted blob.
+pub const MAX_KMS_KEY_ID_LEN: usize = 2048;
+
+/// `upload.server_side_encryption`. Unknown keys are refused: a misspelled
+/// key in an encryption policy must not fall back to "not encrypted".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ServerSideEncryptionConfig {
+    /// `none` (default), `sse-s3` or `sse-kms`.
+    #[serde(default)]
+    pub mode: ServerSideEncryptionMode,
+    /// `sse-kms` only, optional: the KMS key (id, key ARN, alias or alias
+    /// ARN). Absent, the request names no key and the store uses its default
+    /// KMS key (on AWS, the account's AWS-managed `aws/s3` key).
+    #[serde(default)]
+    pub kms_key_id: Option<String>,
+    /// `sse-kms` only: ask S3 to use an S3 Bucket Key, which cuts the KMS
+    /// request cost of a busy bucket. Default false.
+    #[serde(default)]
+    pub bucket_key: bool,
+}
+
+impl ServerSideEncryptionConfig {
+    /// Whether any encryption is asked for.
+    pub fn is_requested(&self) -> bool {
+        self.mode != ServerSideEncryptionMode::None
+    }
+
+    /// The block's own rules, independent of the backend. Each refusal names
+    /// the keys involved.
+    pub fn validate(&self) -> Result<(), VtopError> {
+        match self.mode {
+            ServerSideEncryptionMode::None | ServerSideEncryptionMode::SseS3 => {
+                if self.kms_key_id.is_some() || self.bucket_key {
+                    let key = if self.kms_key_id.is_some() {
+                        "upload.server_side_encryption.kms_key_id"
+                    } else {
+                        "upload.server_side_encryption.bucket_key"
+                    };
+                    return Err(VtopError::Config(format!(
+                        "{key} is set, but upload.server_side_encryption.mode is \"{}\": \
+                         a KMS key and a bucket key apply to \"sse-kms\" only. Set \
+                         mode: sse-kms or remove the key",
+                        self.mode
+                    )));
+                }
+            }
+            ServerSideEncryptionMode::SseKms => {
+                if let Some(id) = &self.kms_key_id {
+                    if id.is_empty()
+                        || id.len() > MAX_KMS_KEY_ID_LEN
+                        || id.chars().any(|c| c.is_whitespace() || c.is_control())
+                    {
+                        return Err(VtopError::Config(format!(
+                            "upload.server_side_encryption.kms_key_id is empty, longer than \
+                             {MAX_KMS_KEY_ID_LEN} characters, or contains whitespace: give a \
+                             KMS key id, key ARN or alias, or remove the key to use the \
+                             store's default KMS key"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Redundancy / forward-error-correction policy for an egress path (#480).
@@ -1295,6 +1486,39 @@ impl UploadConfig {
         } else {
             EgressTuning::default()
         }
+    }
+
+    /// `upload.server_side_encryption`'s rules, on `UploadConfig` and called
+    /// from `build_backend` as well as [`VtopConfig::validate`], for the
+    /// reason [`Self::validate_object_lock`] is. A mode other than `none` is
+    /// refused on every backend but `s3_native`, which is the only one that
+    /// puts the encryption headers on each write and reads the store's answer
+    /// back; the others would write plaintext while the config says
+    /// otherwise. An unknown backend name is left to `build_backend`.
+    pub fn validate_server_side_encryption(&self) -> Result<(), VtopError> {
+        let sse = &self.server_side_encryption;
+        sse.validate()?;
+        if !sse.is_requested() {
+            return Ok(());
+        }
+        let why = match self.backend.as_str() {
+            "s3cmd" | "awscli" | "minio" => Some(
+                "it shells out to an external CLI, which sends the request itself; VTOP cannot \
+                 add the encryption headers to it or read back how the object was stored",
+            ),
+            "localfs" => Some("it writes plain files to a local directory"),
+            "mock" | "mock_fail" | "mock_limited" => Some("it keeps objects in memory"),
+            _ => None,
+        };
+        if let Some(why) = why {
+            return Err(VtopError::Config(format!(
+                "upload.server_side_encryption.mode is \"{}\", but the {} backend cannot \
+                 write an encrypted object: {why}. Nothing was built. Only s3_native supports \
+                 it; use s3_native or set mode: none",
+                sse.mode, self.backend
+            )));
+        }
+        Ok(())
     }
 
     /// The S3 Object Lock profile's own rules (#684), on `UploadConfig` and
@@ -1645,6 +1869,71 @@ pub const DELETE_WITHOUT_OPEN_CHECK_WARNING: &str =
      a fully archived file on delete_quiet_seconds alone, and a writer that still holds it \
      open loses every line it writes after. Set it to false to keep such files instead";
 
+/// Whether a `bootstrap.servers` entry names a loopback host: `localhost`,
+/// or a loopback IP literal, with an optional `scheme://` and `:port`. A
+/// hostname that merely resolves to loopback is not recognised, so a link to
+/// it is warned about: the warning errs towards being said.
+fn is_loopback_bootstrap(server: &str) -> bool {
+    let server = server.trim();
+    let server = server.split_once("://").map_or(server, |(_, rest)| rest);
+    let host = if let Some(rest) = server.strip_prefix('[') {
+        rest.split_once(']').map_or(rest, |(host, _)| host)
+    } else if server.matches(':').count() > 1 {
+        // A bare IPv6 literal: its colons are not a port separator.
+        server
+    } else {
+        server.split_once(':').map_or(server, |(host, _)| host)
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// The warning for a Kafka source link that crosses the network unencrypted
+/// (#732, A2): `security_protocol` unset (librdkafka's default is plaintext),
+/// `plaintext` or `sasl_plaintext`, with a bootstrap server off loopback. A
+/// link on loopback alone stays quiet: nothing crosses a network.
+pub fn kafka_plaintext_warning(kafka: &KafkaSourceConfig) -> Option<String> {
+    if !kafka.enabled {
+        return None;
+    }
+    let protocol = kafka
+        .security_protocol
+        .as_deref()
+        .map(|protocol| protocol.trim().to_ascii_lowercase());
+    let (named, sasl) = match protocol.as_deref() {
+        None => ("unset, so librdkafka's default `plaintext`", false),
+        Some("plaintext") => ("`plaintext`", false),
+        Some("sasl_plaintext") => ("`sasl_plaintext`", true),
+        // `ssl`, `sasl_ssl`, and anything librdkafka will refuse itself.
+        Some(_) => return None,
+    };
+    let remote: Vec<&str> = kafka
+        .bootstrap_servers
+        .iter()
+        .map(String::as_str)
+        .filter(|server| !is_loopback_bootstrap(server))
+        .collect();
+    if remote.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "sources.kafka.security_protocol is {named}, and bootstrap server(s) {servers} are not \
+         on loopback: the records the engine reads{sasl} cross the network unencrypted, and \
+         the broker is not authenticated. The engine connects anyway. Set \
+         sources.kafka.security_protocol to {fix} and ssl_ca_location to the CA that signed \
+         the brokers' certificates",
+        servers = remote.join(", "),
+        sasl = if sasl { ", and the SASL exchange," } else { "" },
+        fix = if sasl {
+            "`sasl_ssl`"
+        } else {
+            "`ssl` (`sasl_ssl` with SASL)"
+        },
+    ))
+}
+
 impl VtopConfig {
     /// Settings that are valid but unsafe enough to say so on every start
     /// and in `vtopctl validate` (#629). Never a reason to refuse: each one
@@ -1666,6 +1955,14 @@ impl VtopConfig {
             file.enabled && file.delete_after_commit && file.delete_without_open_check
         }) {
             warnings.push(DELETE_WITHOUT_OPEN_CHECK_WARNING.to_string());
+        }
+        if let Some(warning) = self
+            .sources
+            .kafka
+            .as_ref()
+            .and_then(kafka_plaintext_warning)
+        {
+            warnings.push(warning);
         }
         warnings
     }
@@ -1791,6 +2088,7 @@ impl VtopConfig {
                     "kafka.bootstrap_servers must not be empty when kafka is enabled".into(),
                 ));
             }
+            k.validate_mutual_tls()?;
         }
         if self.upload.bucket.trim().is_empty() {
             return Err(VtopError::Config("upload.bucket must not be empty".into()));
@@ -1821,6 +2119,7 @@ impl VtopConfig {
         // UploadConfig itself and every consumer runs them.
         self.upload.validate_transports()?;
         self.upload.validate_object_lock()?;
+        self.upload.validate_server_side_encryption()?;
         if self.upload.multipart_part_size_bytes == 0 {
             return Err(VtopError::Config(
                 "upload.multipart_part_size_bytes must be > 0".into(),
@@ -2500,6 +2799,67 @@ upload:
         let cfg: VtopConfig = serde_yaml::from_str(yaml).unwrap();
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, VtopError::Config(_)));
+    }
+
+    /// #721: mutual TLS to the broker is a certificate and its key, over
+    /// TLS; anything else is refused at load, naming the keys.
+    #[test]
+    fn kafka_mutual_tls_is_a_certificate_and_its_key_over_tls() {
+        let load = |extra: &str| {
+            let yaml = format!(
+                "engine:\n  name: e\n  state_store: \"sqlite::memory:\"\n  work_dir: /tmp/w\n\
+                 batching: {{}}\ncompression: {{}}\nsources:\n  kafka:\n    enabled: true\n\
+                 \x20   bootstrap_servers: [\"kafka:9093\"]\n{extra}upload:\n  bucket: b\n"
+            );
+            let cfg: VtopConfig = serde_yaml::from_str(&yaml).unwrap();
+            cfg.validate().map_err(|e| e.to_string())
+        };
+        // Config lines, named by what they set (the case label is what a
+        // failure prints).
+        let crt_line = "    ssl_certificate_location: /etc/vtop/kafka/client.pem\n";
+        let key_line = "    ssl_key_location: /etc/vtop/kafka/client.key\n";
+        let ssl = "    security_protocol: SSL\n";
+        load(&format!("{ssl}{crt_line}{key_line}")).expect("a certificate and key over SSL");
+        load(&format!(
+            "    security_protocol: SASL_SSL\n{crt_line}{key_line}    ssl_key_password_env: KAFKA_KEY_PW\n"
+        ))
+        .expect("over SASL_SSL, with a key passphrase");
+        load("").expect("no mutual TLS at all");
+        for (case, extra, says) in [
+            (
+                "certificate only",
+                format!("{ssl}{crt_line}"),
+                "together or not at all",
+            ),
+            (
+                "key only",
+                format!("{ssl}{key_line}"),
+                "together or not at all",
+            ),
+            (
+                "no protocol",
+                format!("{crt_line}{key_line}"),
+                "not set (PLAINTEXT)",
+            ),
+            (
+                "SASL_PLAINTEXT",
+                format!("    security_protocol: SASL_PLAINTEXT\n{crt_line}{key_line}"),
+                "set security_protocol to SSL or SASL_SSL",
+            ),
+            (
+                "passphrase without a key",
+                format!("{ssl}    ssl_key_password_env: KAFKA_KEY_PW\n"),
+                "without ssl_key_location",
+            ),
+            (
+                "empty key path",
+                format!("{ssl}{crt_line}    ssl_key_location: \"\"\n"),
+                "ssl_key_location is set but empty",
+            ),
+        ] {
+            let err = load(&extra).expect_err(case);
+            assert!(err.contains(says), "{case}: {says:?} not in the refusal");
+        }
     }
 
     #[test]
@@ -4127,6 +4487,101 @@ upload:
     }
 
     #[test]
+    fn a_server_side_encryption_block_parses_every_mode_and_refuses_the_rest() {
+        let default = object_lock_config("  create_bucket: true\n").expect("valid as before");
+        assert_eq!(
+            default.upload.server_side_encryption.mode,
+            ServerSideEncryptionMode::None,
+            "no block is no encryption"
+        );
+        assert!(!default.upload.server_side_encryption.is_requested());
+
+        for (block, mode, key, bucket_key) in [
+            ("mode: none", ServerSideEncryptionMode::None, None, false),
+            ("mode: sse-s3", ServerSideEncryptionMode::SseS3, None, false),
+            // No key id is a mode of its own: the store's default KMS key.
+            ("mode: sse-kms", ServerSideEncryptionMode::SseKms, None, false),
+            (
+                "mode: sse-kms\n    kms_key_id: arn:aws:kms:eu-west-1:111122223333:key/abc\n    bucket_key: true",
+                ServerSideEncryptionMode::SseKms,
+                Some("arn:aws:kms:eu-west-1:111122223333:key/abc"),
+                true,
+            ),
+        ] {
+            let cfg = object_lock_config(&format!("  server_side_encryption:\n    {block}\n"))
+                .unwrap_or_else(|e| panic!("{block}: {e}"));
+            let sse = &cfg.upload.server_side_encryption;
+            assert_eq!(sse.mode, mode, "{block}");
+            assert_eq!(sse.kms_key_id.as_deref(), key, "{block}");
+            assert_eq!(sse.bucket_key, bucket_key, "{block}");
+        }
+
+        for (block, names) in [
+            ("mode: sse-c", "sse-c"),
+            (
+                "mode: sse-s3\n    kms_key_id: k",
+                "upload.server_side_encryption.kms_key_id",
+            ),
+            (
+                "mode: sse-s3\n    bucket_key: true",
+                "upload.server_side_encryption.bucket_key",
+            ),
+            ("kms_key_id: k", "upload.server_side_encryption.kms_key_id"),
+            (
+                "mode: sse-kms\n    kms_key_id: \"\"",
+                "upload.server_side_encryption.kms_key_id",
+            ),
+            (
+                "mode: sse-kms\n    kms_key_id: \"a b\"",
+                "upload.server_side_encryption.kms_key_id",
+            ),
+            ("mode: sse-kms\n    kms_key: k", "kms_key"),
+        ] {
+            let msg = object_lock_config(&format!("  server_side_encryption:\n    {block}\n"))
+                .expect_err(block);
+            assert!(msg.contains(names), "{block}: {msg}");
+        }
+    }
+
+    #[test]
+    fn server_side_encryption_is_refused_at_load_on_every_backend_but_s3_native() {
+        for backend in [
+            "localfs",
+            "s3cmd",
+            "awscli",
+            "minio",
+            "mock",
+            "mock_fail",
+            "mock_limited",
+        ] {
+            for mode in ["sse-s3", "sse-kms"] {
+                let msg = object_lock_config(&format!(
+                    "  backend: {backend}\n  local_path: /tmp/x\n  server_side_encryption:\n    mode: {mode}\n"
+                ))
+                .expect_err(backend);
+                assert!(
+                    msg.contains("upload.server_side_encryption")
+                        && msg.contains(backend)
+                        && msg.contains("s3_native"),
+                    "[{backend} {mode}] {msg}"
+                );
+            }
+            // The default is not a request: `none` is accepted anywhere. (The
+            // block's own rule, not a whole config: a command backend also
+            // needs a binary path, which is not what is under test.)
+            let upload: UploadConfig = serde_yaml::from_str(&format!(
+                "bucket: b\nbackend: {backend}\nserver_side_encryption:\n  mode: none\n"
+            ))
+            .unwrap();
+            upload
+                .validate_server_side_encryption()
+                .unwrap_or_else(|e| panic!("[{backend}] mode none is accepted: {e}"));
+        }
+        object_lock_config("  backend: s3_native\n  server_side_encryption:\n    mode: sse-s3\n")
+            .expect("s3_native honours it");
+    }
+
+    #[test]
     fn parses_streams() {
         let yaml = r#"
 streams:
@@ -4141,5 +4596,99 @@ streams:
         let m = s.lookup("app_events").unwrap();
         assert_eq!(m.source_type, SourceType::Kafka);
         assert_eq!(m.s3_source_name.as_deref(), Some("app"));
+    }
+
+    /// #732 (A2): a Kafka source link that crosses the network unencrypted
+    /// is said on every start and in `vtopctl validate`; TLS, a link on
+    /// loopback alone, or a disabled source stays quiet.
+    #[test]
+    fn a_plaintext_kafka_source_off_loopback_is_warned_about() {
+        fn kafka(protocol: Option<&str>, servers: &[&str]) -> KafkaSourceConfig {
+            KafkaSourceConfig {
+                enabled: true,
+                bootstrap_servers: servers.iter().map(|s| (*s).to_owned()).collect(),
+                consumer_group: default_group(),
+                topic_include_regex: default_include(),
+                topic_exclude_regex: default_exclude(),
+                auto_offset_reset: default_offset_reset(),
+                enable_auto_commit: false,
+                security_protocol: protocol.map(str::to_owned),
+                sasl_mechanism: None,
+                sasl_username: None,
+                sasl_password_env: None,
+                ssl_ca_location: None,
+                ssl_certificate_location: None,
+                ssl_key_location: None,
+                ssl_key_password_env: None,
+            }
+        }
+        let unset = kafka_plaintext_warning(&kafka(None, &["kafka-1:9092", "localhost:9092"]))
+            .expect("unset is librdkafka's plaintext");
+        assert!(
+            unset.contains("unset, so librdkafka's default `plaintext`")
+                && unset.contains("kafka-1:9092")
+                && !unset.contains("localhost:9092")
+                && unset.contains("unencrypted")
+                && unset.contains("The engine connects anyway")
+                && unset.contains("`ssl`"),
+            "{unset}"
+        );
+        let sasl = kafka_plaintext_warning(&kafka(Some("SASL_PLAINTEXT"), &["10.0.0.5:9092"]))
+            .expect("SASL over plaintext");
+        assert!(
+            sasl.contains("`sasl_plaintext`")
+                && sasl.contains("the SASL exchange")
+                && sasl.contains("`sasl_ssl`"),
+            "{sasl}"
+        );
+        assert!(kafka_plaintext_warning(&kafka(Some("plaintext"), &["broker:9092"])).is_some());
+
+        for quiet in [
+            kafka(Some("ssl"), &["kafka-1:9093"]),
+            kafka(Some("SASL_SSL"), &["kafka-1:9093"]),
+            kafka(
+                None,
+                &[
+                    "localhost:9092",
+                    "127.0.0.1:9092",
+                    "[::1]:9092",
+                    "::1",
+                    "PLAINTEXT://127.0.0.2:9092",
+                ],
+            ),
+            KafkaSourceConfig {
+                enabled: false,
+                ..kafka(None, &["kafka-1:9092"])
+            },
+        ] {
+            assert_eq!(kafka_plaintext_warning(&quiet), None, "{quiet:?}");
+        }
+
+        let mut cfg: VtopConfig = serde_yaml::from_str(
+            r#"
+engine:
+  name: vtop-engine
+  state_store: "sqlite::memory:"
+  work_dir: /tmp/work
+batching: {}
+compression: {}
+sources:
+  kafka:
+    enabled: true
+    bootstrap_servers: ["kafka:9092"]
+upload:
+  bucket: telemetry-data
+"#,
+        )
+        .unwrap();
+        assert!(
+            cfg.warnings()
+                .iter()
+                .any(|w| w.starts_with("sources.kafka.security_protocol is unset")),
+            "{:?}",
+            cfg.warnings()
+        );
+        cfg.sources.kafka.as_mut().unwrap().security_protocol = Some("ssl".to_owned());
+        assert!(cfg.warnings().is_empty(), "{:?}", cfg.warnings());
     }
 }

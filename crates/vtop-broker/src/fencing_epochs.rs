@@ -105,6 +105,306 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use vtop_log::env::{Env, OpenMode, StorageFile};
 
+/// Whether a replica's epoch history is broken, and why (#881).
+///
+/// Broken means a write to the epoch journal failed, so the vector this
+/// replica would offer may have a hole: it must not be reconciled against,
+/// and the replica answers every fence and promotion probe with no history
+/// at all. The first failure prints one ERROR line naming the replica, what
+/// failed, what the replica now does, and what an operator must do; the
+/// reason is kept for the exporter's `vtop_broker_epoch_history_broken`
+/// gauge and for anyone who asks.
+///
+/// THE MARK IS DURABLE. It is written beside the journal
+/// ([`BreakMarker`], `fencing-epochs.broken`), atomically and fsynced as the
+/// journal's own sidecars are, and read back when the journal is attached
+/// at the next open: a restart keeps refusing. Before this, the mark lived
+/// in memory only, and a restart reopened the journal without the failed
+/// write and offered the surviving entries as if they were whole - the one
+/// way a broken history could be served again. Only `vtopctl node repair`,
+/// which rebuilds the directory, clears it.
+///
+/// A full disk can refuse the mark's own write. The mark then stays
+/// pending, and every later consultation of the history and every append
+/// tries again (at most once a second), so it is on disk before the replica
+/// can have appended anything after its break: an append needs the space the
+/// mark does. A crash before it lands leaves no mark - and no record
+/// appended after the failed write either, which is the state ordinary
+/// journal recovery already handles; see
+/// docs/EPOCH_HISTORY_AFTER_A_FAILED_WRITE.md.
+#[derive(Debug, Default)]
+pub struct EpochHistoryHealth {
+    broken: std::sync::atomic::AtomicBool,
+    reason: std::sync::Mutex<Option<String>>,
+    /// Where the mark is persisted, once a journal is attached.
+    marker: std::sync::Mutex<Option<BreakMarker>>,
+    /// Whether the mark is on disk.
+    durable: std::sync::atomic::AtomicBool,
+    /// When a pending mark was last tried, so a full disk is not hammered.
+    last_attempt: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+/// How often a pending mark is retried.
+const MARK_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
+impl EpochHistoryHealth {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the history is broken. A broken history whose mark is not on
+    /// disk yet tries to put it there (rate-limited).
+    pub fn is_broken(&self) -> bool {
+        let broken = self.broken.load(std::sync::atomic::Ordering::SeqCst);
+        if broken {
+            self.persist_pending();
+        }
+        broken
+    }
+
+    /// Whether the mark is on disk; `false` while it is healthy.
+    pub fn mark_is_durable(&self) -> bool {
+        self.durable.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The operator message the break was reported with, if it is broken.
+    pub fn reason(&self) -> Option<String> {
+        self.reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Attach the journal's mark: a mark an earlier run persisted breaks the
+    /// history now, and a break already noted in memory is persisted. A
+    /// directory without a mark changes nothing.
+    pub(crate) fn attach(&self, marker: BreakMarker, replica: &ReplicaName<'_>) {
+        let persisted = marker.read();
+        *self
+            .marker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(marker);
+        if let Some(earlier) = persisted {
+            self.durable
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if !self.broken.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let message = format!(
+                    "replica {} of range {}/{}: its epoch history was marked broken in an \
+                     earlier run and is still refused; nothing has repaired it. The mark said: \
+                     {earlier}",
+                    replica.node_id, replica.topic, replica.range_id
+                );
+                eprintln!("error: {message}");
+                *self
+                    .reason
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(earlier);
+            }
+            return;
+        }
+        if self.broken.load(std::sync::atomic::Ordering::SeqCst) {
+            self.persist_now();
+        }
+    }
+
+    /// Mark the history broken because `what` failed, with `error` if the
+    /// failure carried one, and persist the mark. Idempotent; only the first
+    /// break is reported, so a replica that keeps failing does not repeat
+    /// itself.
+    pub(crate) fn mark(
+        &self,
+        replica: &ReplicaName<'_>,
+        what: &str,
+        error: Option<&dyn std::fmt::Display>,
+    ) {
+        if self.broken.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let cause = match error {
+            Some(error) => format!("{what}: {error}"),
+            None => what.to_owned(),
+        };
+        let message = format!(
+            "replica {} of range {}/{}: its epoch history could not be written ({cause}). \
+             The history may now have a hole, so this replica answers every fence and \
+             promotion probe with no history: no leader gives it a replication session and no \
+             promotion counts its offset, and it stays out of the range until it is repaired. \
+             The mark is kept beside the journal (fencing-epochs.broken), so a restart keeps \
+             refusing. Free space on its data directory (or fix the storage fault), then stop \
+             it and run `vtopctl node repair` against a replica whose history is intact (#881)",
+            replica.node_id, replica.topic, replica.range_id
+        );
+        eprintln!("error: {message}");
+        *self
+            .reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(message);
+        self.persist_now();
+    }
+
+    /// Persist a pending mark, at most once per [`MARK_RETRY`]. Cheap when
+    /// there is nothing pending: one atomic load.
+    pub(crate) fn persist_pending(&self) {
+        if self.durable.load(std::sync::atomic::Ordering::SeqCst)
+            || !self.broken.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        {
+            let mut last = self
+                .last_attempt
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let now = std::time::Instant::now();
+            if last.is_some_and(|at| now.saturating_duration_since(at) < MARK_RETRY) {
+                return;
+            }
+            *last = Some(now);
+        }
+        self.persist_now();
+    }
+
+    fn persist_now(&self) {
+        let Some(reason) = self.reason() else {
+            return;
+        };
+        let marker = self
+            .marker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(marker) = marker else {
+            // No journal attached yet: attaching one persists it.
+            return;
+        };
+        match marker.write(&reason) {
+            Ok(()) => {
+                if !self.durable.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    eprintln!(
+                        "warning: the broken-history mark is on disk at {}; a restart keeps \
+                         refusing this replica until it is repaired (#881)",
+                        marker.path.display()
+                    );
+                }
+            }
+            Err(error) => {
+                let _ = vtop_meta::transport::warn_rate_limited(
+                    "epoch-history-mark-pending",
+                    &format!(
+                    "the broken-history mark could not be written to {} ({error}); it is retried \
+                     on every fence and append. Until it is on disk a restart would forget the \
+                     break: free space and leave the replica running until this clears (#881)",
+                    marker.path.display()
+                ),
+                );
+            }
+        }
+    }
+}
+
+/// The persisted form of a broken epoch history (#881): a sidecar beside the
+/// journal holding the operator message, written the way the journal's other
+/// sidecars are (staged, fsynced, renamed over, the directory fsynced), so a
+/// reader sees the whole mark or none.
+#[derive(Clone)]
+pub struct BreakMarker {
+    env: Env,
+    path: PathBuf,
+}
+
+impl std::fmt::Debug for BreakMarker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BreakMarker")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BreakMarker {
+    /// The mark beside the journal at `journal_path`.
+    pub fn beside(env: &Env, journal_path: impl AsRef<Path>) -> Self {
+        Self {
+            env: env.clone(),
+            path: break_path(journal_path.as_ref()),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The persisted message, if a mark is on disk. A mark that exists but
+    /// cannot be read still counts - the safe reading of a mark is "broken".
+    pub fn read(&self) -> Option<String> {
+        match self.env.storage.exists(&self.path) {
+            Ok(false) => None,
+            Ok(true) => Some(match self.env.storage.read(&self.path) {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(error) => format!(
+                    "(the mark at {} exists but could not be read: {error})",
+                    self.path.display()
+                ),
+            }),
+            Err(error) => Some(format!(
+                "(whether a mark exists at {} could not be read: {error})",
+                self.path.display()
+            )),
+        }
+    }
+
+    fn write(&self, reason: &str) -> BrokerResult<()> {
+        let scratch = rewrite_path(&self.path);
+        self.env
+            .storage
+            .open(&scratch, OpenMode::CreateAppend)
+            .and_then(|mut file| {
+                file.set_len(0)?;
+                file.seek(SeekFrom::Start(0))?;
+                file.write_all(reason.as_bytes())?;
+                file.sync_data()
+            })
+            .and_then(|()| self.env.storage.rename(&scratch, &self.path))
+            .map_err(|source| FencingEpochJournal::io(&self.path, source))?;
+        FencingEpochJournal::sync_parent(&self.env, &self.path)
+    }
+
+    /// Remove the mark, durably. Only a repair, which rebuilds the
+    /// directory's history from an intact replica, may call this.
+    pub fn clear(&self) -> BrokerResult<()> {
+        if !self
+            .env
+            .storage
+            .exists(&self.path)
+            .map_err(|source| FencingEpochJournal::io(&self.path, source))?
+        {
+            return Ok(());
+        }
+        self.env
+            .storage
+            .remove_file(&self.path)
+            .map_err(|source| FencingEpochJournal::io(&self.path, source))?;
+        FencingEpochJournal::sync_parent(&self.env, &self.path)
+    }
+}
+
+/// Where the broken-history mark of the journal at `path` lives.
+fn break_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(".broken");
+    path.with_file_name(name)
+}
+
+/// Which replica an [`EpochHistoryHealth`] message is about.
+pub(crate) struct ReplicaName<'a> {
+    pub(crate) node_id: uuid::Uuid,
+    pub(crate) topic: &'a str,
+    pub(crate) range_id: uuid::Uuid,
+}
+
 const MAGIC: &[u8; 8] = b"VTOPFNC1";
 const VERSION: u16 = 1;
 /// The same layout as [`VERSION`], with a kept dispute recorded beside the
@@ -450,13 +750,14 @@ impl FencingEpochJournal {
     /// record, the seed is lineage nobody authorized.
     pub(crate) fn seed_attested_history_in(
         journal: &std::sync::Mutex<Option<FencingEpochJournal>>,
-        broken: &std::sync::atomic::AtomicBool,
+        broken: &EpochHistoryHealth,
+        replica: &ReplicaName<'_>,
         epoch: u64,
     ) -> BrokerResult<bool> {
         let mut guard = journal
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if broken.load(std::sync::atomic::Ordering::SeqCst) {
+        if broken.is_broken() {
             return Err(BrokerError::EpochJournalCorrupt(
                 "this replica's epoch history is broken; an attested history cannot be written \
                  over it"
@@ -468,8 +769,8 @@ impl FencingEpochJournal {
                 "no epoch journal is attached to this replica".to_owned(),
             ));
         };
-        journal.seed_attested_history(epoch).inspect_err(|_| {
-            broken.store(true, std::sync::atomic::Ordering::SeqCst);
+        journal.seed_attested_history(epoch).inspect_err(|error| {
+            broken.mark(replica, "writing an attested history", Some(error));
         })
     }
 
@@ -1099,6 +1400,11 @@ impl FencingEpochJournal {
         &self.entries
     }
 
+    /// The broken-history mark beside this journal (#881).
+    pub fn break_marker(&self) -> BreakMarker {
+        BreakMarker::beside(&self.env, &self.path)
+    }
+
     /// The kept dispute recorded beside this journal, if any (#635). Read
     /// back at open; whether it still describes the log is the replica's
     /// call, since the replica holds the log.
@@ -1671,6 +1977,11 @@ pub fn install_transferred_history(
     for entry in &incoming[existing.len()..] {
         journal.record(entry.epoch, entry.start_offset)?;
     }
+    // A repair installs the source's history, so a break an earlier run of
+    // this directory recorded no longer describes it (#881). The mark goes
+    // last: a refused source, a failed journal write or a crash on the way
+    // leaves the directory refusing, as before the repair (review of #903).
+    journal.break_marker().clear()?;
     Ok(incoming.len())
 }
 
@@ -1734,13 +2045,19 @@ mod tests {
     /// missing journal are refused and write nothing.
     #[test]
     fn the_guarded_attested_seed_refuses_a_broken_or_missing_journal() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Mutex;
 
+        let name = ReplicaName {
+            node_id: uuid::Uuid::from_u128(1),
+            topic: "events.v1",
+            range_id: uuid::Uuid::from_u128(2),
+        };
         let dir = TempDir::new().unwrap();
         let attached = Mutex::new(Some(journal(&dir)));
-        let healthy = AtomicBool::new(false);
-        assert!(FencingEpochJournal::seed_attested_history_in(&attached, &healthy, 9).unwrap());
+        let healthy = EpochHistoryHealth::new();
+        assert!(
+            FencingEpochJournal::seed_attested_history_in(&attached, &healthy, &name, 9).unwrap()
+        );
         assert_eq!(
             attached.lock().unwrap().as_ref().unwrap().entries(),
             starts(&[(9, 0)]).as_slice()
@@ -1748,9 +2065,10 @@ mod tests {
 
         let other = TempDir::new().unwrap();
         let broken_journal = Mutex::new(Some(journal(&other)));
-        let broken = AtomicBool::new(true);
+        let broken = EpochHistoryHealth::new();
+        broken.mark(&name, "a test", None);
         assert!(matches!(
-            FencingEpochJournal::seed_attested_history_in(&broken_journal, &broken, 9),
+            FencingEpochJournal::seed_attested_history_in(&broken_journal, &broken, &name, 9),
             Err(BrokerError::EpochJournalCorrupt(_))
         ));
         assert!(broken_journal
@@ -1760,13 +2078,95 @@ mod tests {
             .unwrap()
             .entries()
             .is_empty());
-        assert!(broken.load(Ordering::SeqCst));
+        assert!(broken.is_broken());
 
         let none: Mutex<Option<FencingEpochJournal>> = Mutex::new(None);
         assert!(matches!(
-            FencingEpochJournal::seed_attested_history_in(&none, &AtomicBool::new(false), 9),
+            FencingEpochJournal::seed_attested_history_in(
+                &none,
+                &EpochHistoryHealth::new(),
+                &name,
+                9
+            ),
             Err(BrokerError::EpochJournalCorrupt(_))
         ));
+    }
+
+    /// #881 follow-up: a directory with no mark attaches exactly as before;
+    /// a mark written for a break is read back by the next attach, which
+    /// breaks the history with the earlier reason; clearing removes it.
+    #[test]
+    fn a_break_mark_round_trips_and_a_healthy_directory_has_none() {
+        let name = ReplicaName {
+            node_id: uuid::Uuid::from_u128(0xA1),
+            topic: "events.v1",
+            range_id: uuid::Uuid::from_u128(0xC1),
+        };
+        let dir = TempDir::new().unwrap();
+        let journal = journal(&dir);
+        let marker = journal.break_marker();
+        assert_eq!(marker.path(), dir.path().join("fencing-epochs.broken"));
+        assert_eq!(marker.read(), None);
+
+        let healthy = EpochHistoryHealth::new();
+        healthy.attach(marker.clone(), &name);
+        assert!(!healthy.is_broken());
+        assert!(!healthy.mark_is_durable());
+        assert!(
+            !marker.path().exists(),
+            "attaching a healthy history writes nothing"
+        );
+
+        healthy.mark(&name, "a test", None);
+        assert!(healthy.mark_is_durable());
+        let written = marker.read().expect("the mark is on disk");
+        assert_eq!(Some(written.clone()), healthy.reason());
+
+        let restarted = EpochHistoryHealth::new();
+        restarted.attach(journal.break_marker(), &name);
+        assert!(restarted.is_broken());
+        assert_eq!(restarted.reason(), Some(written));
+
+        marker.clear().unwrap();
+        assert_eq!(marker.read(), None);
+        let repaired = EpochHistoryHealth::new();
+        repaired.attach(journal.break_marker(), &name);
+        assert!(!repaired.is_broken());
+    }
+
+    /// #881: only the first break is reported, with what to do, and the
+    /// message names the replica.
+    #[test]
+    fn a_history_break_is_reported_once_with_the_remedy() {
+        let name = ReplicaName {
+            node_id: uuid::Uuid::from_u128(0xA1),
+            topic: "events.v1",
+            range_id: uuid::Uuid::from_u128(0xC1),
+        };
+        let health = EpochHistoryHealth::new();
+        assert!(!health.is_broken());
+        assert_eq!(health.reason(), None);
+        health.mark(
+            &name,
+            "recording an adopted epoch",
+            Some(&"No space left on device"),
+        );
+        let first = health.reason().unwrap();
+        assert!(
+            first.contains("00000000-0000-0000-0000-0000000000a1"),
+            "{first}"
+        );
+        assert!(
+            first.contains("recording an adopted epoch: No space left on device"),
+            "{first}"
+        );
+        assert!(first.contains("vtopctl node repair"), "{first}");
+        health.mark(&name, "a later failure", None);
+        assert_eq!(
+            health.reason().unwrap(),
+            first,
+            "only the first break is reported"
+        );
     }
 
     fn header_version(dir: &TempDir) -> u16 {
@@ -1976,6 +2376,33 @@ mod tests {
         assert_eq!(second, 2);
         let reopened = FencingEpochJournal::open(&path).expect("reopen");
         assert_eq!(reopened.entries(), &entries[..]);
+    }
+
+    /// #881, review of #903: an install that is refused leaves the broken
+    /// mark in place, and one that completes clears it.
+    #[test]
+    fn a_refused_install_keeps_the_broken_mark_and_a_complete_one_clears_it() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fencing-epochs");
+        install_transferred_history(&Env::real(), &path, &starts(&[(1, 0), (2, 250)]), 500)
+            .expect("first install");
+        let marker = FencingEpochJournal::open_in(&Env::real(), &path)
+            .unwrap()
+            .break_marker();
+        marker.write("a test break").unwrap();
+
+        let refused =
+            install_transferred_history(&Env::real(), &path, &starts(&[(1, 0), (2, 300)]), 500);
+        assert!(refused.is_err());
+        assert_eq!(
+            marker.read().as_deref(),
+            Some("a test break"),
+            "a refused source does not repair the directory"
+        );
+
+        install_transferred_history(&Env::real(), &path, &starts(&[(1, 0), (2, 250)]), 500)
+            .expect("the same history installs");
+        assert_eq!(marker.read(), None, "a complete install clears the mark");
     }
 
     /// A conflicting prior install — same epoch, different start — must fail

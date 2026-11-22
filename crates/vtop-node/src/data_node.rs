@@ -10,7 +10,7 @@
 //! of the same directory), not failover.
 
 use crate::config::{
-    check_plaintext_bound, check_plaintext_exposure, kafka_producer_id,
+    check_plaintext_bound, check_plaintext_exposure, kafka_producer_id, refuse_group_commit_misuse,
     refuse_kafka_gateway_misuse, refuse_plaintext_promotion, PlaneTransport,
 };
 use crate::config::{DataNodeConfig, DataRole};
@@ -642,6 +642,7 @@ fn replica_server(
     config: &DataNodeConfig,
     handler: Arc<dyn ReplicaPeerHandler>,
 ) -> Result<ReplicaPeerServer, String> {
+    crate::config::check_connection_cap("max_replica_connections", config.max_replica_connections)?;
     Ok(match config.replica_transport {
         PlaneTransport::Tls => ReplicaPeerServer::new(
             tls::replica_material(config.replica_tls_paths()?)?,
@@ -655,7 +656,15 @@ fn replica_server(
         }
     }
     // Dialers are held to the level this node read (#634).
-    .with_cluster_level(crate::version_report::cluster_level_for(config.node_uuid)))
+    .with_cluster_level(crate::version_report::cluster_level_for(config.node_uuid))
+    // At most this many connections at once (#732, R7).
+    .with_max_connections(config.max_replica_connections))
+}
+
+/// The replica listener's refusals over its cap, on the node's metrics
+/// (#732), beside whichever replica server this role built.
+fn register_replica_limit(observability: &NodeObservability, server: &ReplicaPeerServer) {
+    observability.watch_connection_limit(server.connection_limit());
 }
 
 /// A replica-status client dialing the replica plane the way this node
@@ -800,6 +809,11 @@ pub async fn run(
         config.replica_transport,
     )?;
     refuse_kafka_gateway_misuse(config.role, config.kafka.as_ref())?;
+    refuse_group_commit_misuse(
+        config.role,
+        &config.range.identity(),
+        config.group_commit.as_ref(),
+    )?;
     // Before the observability listener, not after it (review): `serve`
     // validates too, for callers that enter there, but by then this function
     // has spawned a detached accept loop and returning an error would leave
@@ -858,6 +872,13 @@ pub async fn serve(
         crate::config::kafka_partitions(kafka)?;
         crate::config::kafka_topics(kafka)?;
     }
+    // And the group commit section (#752), for the same reason: a caller
+    // that enters here skips `run`'s refusal.
+    refuse_group_commit_misuse(
+        config.role,
+        &config.range.identity(),
+        config.group_commit.as_ref(),
+    )?;
     std::fs::create_dir_all(&config.data_dir)
         .map_err(|error| format!("create {}: {error}", config.data_dir.display()))?;
     let range = config.range.identity();
@@ -1013,6 +1034,7 @@ async fn run_follower(
     metrics_addr: Option<std::net::SocketAddr>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
+    note_group_commit_ignored(&config);
     let listen = config
         .replica_listen
         .as_ref()
@@ -1108,6 +1130,7 @@ async fn run_follower(
         Arc::clone(&follower) as Arc<dyn ReplicaPeerHandler>,
     )
     .map_err(|error| error.to_string())?;
+    register_replica_limit(observability, &server);
     let listener = TcpListener::bind(listen)
         .await
         .map_err(|error| format!("bind {listen}: {error}"))?;
@@ -1326,7 +1349,7 @@ async fn run_leader(
             .map_err(|error| error.to_string())?
     };
 
-    let broker = Arc::new(broker);
+    let broker = Arc::new(with_configured_group_commit(broker, &config)?);
     // The status server BUILT here (review), before the lease agent exists:
     // its constructor resolves the replica plane's TLS material, and a
     // certificate that plane cannot read must fail the process before this
@@ -1354,6 +1377,9 @@ async fn run_leader(
         )),
         None => None,
     };
+    if let Some((_, server)) = &status_server {
+        register_replica_limit(observability, server);
+    }
     // Same epoch history a follower keeps (#240). A leader needs its own: the
     // range's history is the union of what each replica recorded, and a leader
     // that could not say which epoch wrote its tail is exactly the replica a
@@ -2043,6 +2069,7 @@ async fn run_candidate(
         Arc::clone(&switching) as Arc<dyn ReplicaPeerHandler>,
     )
     .map_err(|error| error.to_string())?;
+    register_replica_limit(observability, &replica_server);
     let replica_listener = TcpListener::bind(replica_listen)
         .await
         .map_err(|error| format!("bind {replica_listen}: {error}"))?;
@@ -3180,6 +3207,78 @@ struct BuiltLeader {
     replicas: Arc<NetworkedReplicaSet>,
 }
 
+/// Say, at INFO, that a follower ignores a `group_commit:` section (#752). A
+/// disabled section is accepted on a follower so one config can be shared
+/// across roles; an enabled one never reaches here, it was refused at startup.
+fn note_group_commit_ignored(config: &DataNodeConfig) {
+    if config.group_commit.is_some() {
+        tracing::info!(
+            range = %config.range.range_id,
+            "this follower ignores its `group_commit` section: a follower never takes a \
+             produce request, so group commit applies only on the node that leads range {}. \
+             Nothing is needed; the section is kept so one config can be shared across roles",
+            config.range.range_id
+        );
+    }
+}
+
+/// Attach the group commit the node's `group_commit:` section asks for to a
+/// leader's broker (#752), and say so at INFO: whether concurrent produce
+/// requests share a barrier changes what an operator sees in latency and in
+/// the `vtop_broker_group_commit_*` series. Called by every place a leader's
+/// broker is built (`run_leader`, both branches, and a candidate's
+/// `build_leader_phase`), so a promoted candidate batches exactly as a
+/// configured leader does. A section the config refused never reaches here
+/// (`refuse_group_commit_misuse` runs before a port is bound); a refusal from
+/// the broker anyway is a startup error, not a node that serves without it.
+fn with_configured_group_commit(
+    broker: LocalBroker,
+    config: &DataNodeConfig,
+) -> Result<LocalBroker, String> {
+    let Some(settings) = crate::config::group_commit_in_force(config.group_commit.as_ref()) else {
+        // Off is the default, and the only thing worth saying is a section
+        // that was tuned and then left off, which would otherwise read as a
+        // node that ignores its config.
+        if config.group_commit.as_ref().is_some_and(|section| {
+            *section
+                != crate::config::GroupCommitSection {
+                    enabled: false,
+                    ..Default::default()
+                }
+        }) {
+            tracing::warn!(
+                range = %config.range.range_id,
+                "group commit is off for range {} although `group_commit` sets other values: \
+                 `group_commit.enabled` is false, so every produce request keeps its own fsync \
+                 and replication round and those values are not used. Set \
+                 `group_commit.enabled: true` to use them, or remove them",
+                config.range.range_id
+            );
+        }
+        return Ok(broker);
+    };
+    let broker = broker
+        .with_group_commit(settings.clone())
+        .map_err(|error| format!("group_commit: {error}. The node did not start"))?;
+    tracing::info!(
+        range = %config.range.range_id,
+        max_delay_ms = settings.max_delay.as_millis() as u64,
+        max_records = settings.max_records,
+        max_bytes = settings.max_bytes,
+        max_pending_requests = settings.max_pending_requests,
+        "group commit on for range {}: window {} ms, up to {} records or {} bytes per group, \
+         at most {} queued. Concurrent produce requests share one fsync and one replication \
+         round; each is still acknowledged only after both. Set `group_commit.enabled: false` \
+         to return to one barrier per request",
+        config.range.range_id,
+        settings.max_delay.as_millis(),
+        settings.max_records,
+        settings.max_bytes,
+        settings.max_pending_requests,
+    );
+    Ok(broker)
+}
+
 /// Build the leader half of a candidate: replica set from peers minus
 /// self, broker over the reopened range, transfer surface. PURE
 /// CONSTRUCTION — the promotion completes in the supervisor, after it has
@@ -3223,19 +3322,18 @@ async fn build_leader_phase(
     })
     .await;
     report_stream_wait(range.range_id, fencing_epoch, &wait, &peer_addrs);
-    let broker = Arc::new(
-        LocalBroker::with_replication(
-            set,
-            epochs,
-            range.clone(),
-            config.fencing_epoch,
-            meta.clone(),
-            config.node_uuid,
-            Some(leader_cluster_cell(&config.data_dir)),
-            Some(Arc::clone(&replicas) as Arc<dyn ReplicaSet>),
-        )
-        .map_err(|error| error.to_string())?,
-    );
+    let broker = LocalBroker::with_replication(
+        set,
+        epochs,
+        range.clone(),
+        config.fencing_epoch,
+        meta.clone(),
+        config.node_uuid,
+        Some(leader_cluster_cell(&config.data_dir)),
+        Some(Arc::clone(&replicas) as Arc<dyn ReplicaSet>),
+    )
+    .map_err(|error| error.to_string())?;
+    let broker = Arc::new(with_configured_group_commit(broker, config)?);
     broker.set_fencing_epoch_journal(
         vtop_broker::fencing_epochs::FencingEpochJournal::open(
             config.data_dir.join("fencing-epochs"),
@@ -3631,6 +3729,14 @@ impl crate::observe::ReplicaObservation for SwitchingLocalView {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .map_or(crate::observe::LogStart::NoRole, |view| view.log_start())
+    }
+
+    fn epoch_history_broken(&self) -> Option<bool> {
+        self.delegate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|view| view.epoch_history_broken())
     }
 
     /// ONE acquisition for the whole reading, which is the point of it
@@ -4565,13 +4671,13 @@ mod stream_wait_tests {
     use super::*;
     use std::time::Instant;
 
-    const EPOCH: u64 = 3;
-    const SELF: Uuid = Uuid::from_u128(0x5E1F);
-    const LIVE_PEER: Uuid = Uuid::from_u128(0xA11E);
-    const DEAD_PEER: Uuid = Uuid::from_u128(0xDEAD);
+    pub(super) const EPOCH: u64 = 3;
+    pub(super) const SELF: Uuid = Uuid::from_u128(0x5E1F);
+    pub(super) const LIVE_PEER: Uuid = Uuid::from_u128(0xA11E);
+    pub(super) const DEAD_PEER: Uuid = Uuid::from_u128(0xDEAD);
     const OTHER_DEAD_PEER: Uuid = Uuid::from_u128(0xDEAE);
 
-    fn range() -> RangeIdentity {
+    pub(super) fn range() -> RangeIdentity {
         RangeIdentity {
             topic: "events.v1".to_owned(),
             topic_epoch: 1,
@@ -4580,7 +4686,7 @@ mod stream_wait_tests {
         }
     }
 
-    fn roll() -> SegmentRoll {
+    pub(super) fn roll() -> SegmentRoll {
         SegmentRoll {
             max_bytes: crate::config::default_max_segment_bytes(),
             max_records: crate::config::default_max_segment_records(),
@@ -4589,7 +4695,7 @@ mod stream_wait_tests {
         }
     }
 
-    fn creation(node: Uuid) -> RangeCreation {
+    pub(super) fn creation(node: Uuid) -> RangeCreation {
         RangeCreation {
             format: crate::config::SegmentFormatConfig::V1,
             node_uuid: node,
@@ -4600,6 +4706,11 @@ mod stream_wait_tests {
     /// A plaintext candidate over `dir`: the plane the build dials on is the
     /// only part of the config the wait reads.
     fn candidate_config(dir: &Path) -> DataNodeConfig {
+        candidate_config_with(dir, "")
+    }
+
+    /// The same candidate with extra top-level YAML (a `group_commit:` section).
+    pub(super) fn candidate_config_with(dir: &Path, extra: &str) -> DataNodeConfig {
         serde_yaml::from_str(&format!(
             "role: candidate\n\
              node_uuid: {SELF}\n\
@@ -4609,14 +4720,18 @@ mod stream_wait_tests {
              range: {{ topic: events.v1, topic_epoch: 1, range_id: {}, range_generation: 0 }}\n\
              segment_id: aaaaaaaa-0000-0000-0000-0000000000e0\n\
              replica_transport: plaintext\n\
-             native_transport: plaintext\n",
+             native_transport: plaintext\n\
+             {extra}",
             dir.display(),
             Uuid::from_u128(0xC1),
         ))
         .expect("the test's candidate config parses")
     }
 
-    fn peer(node: Uuid, addr: std::net::SocketAddr) -> crate::config::FollowerPeerConfig {
+    pub(super) fn peer(
+        node: Uuid,
+        addr: std::net::SocketAddr,
+    ) -> crate::config::FollowerPeerConfig {
         crate::config::FollowerPeerConfig {
             node_uuid: node,
             addr: addr.to_string(),
@@ -4626,7 +4741,7 @@ mod stream_wait_tests {
 
     /// An address nothing listens on: bound, read, and released, so a dial
     /// is refused at once — a peer that is down, not one that is slow.
-    async fn closed_port() -> std::net::SocketAddr {
+    pub(super) async fn closed_port() -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
@@ -4635,7 +4750,9 @@ mod stream_wait_tests {
 
     /// A real follower on the replica plane: the stream to it connects the
     /// way a surviving peer's does after a failover.
-    async fn live_follower(dir: &Path) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
+    pub(super) async fn live_follower(
+        dir: &Path,
+    ) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
         let (set, _) = open_range(
             dir,
             Uuid::from_u128(0xE1),
@@ -4707,7 +4824,7 @@ mod stream_wait_tests {
 
     /// Logs written while `run` executes on this thread, as JSON lines at
     /// INFO and above: the format and filter the binary ships.
-    fn capture_logs<T>(run: impl FnOnce() -> T) -> (T, String) {
+    pub(super) fn capture_logs<T>(run: impl FnOnce() -> T) -> (T, String) {
         #[derive(Clone, Default)]
         struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Captured {
@@ -5022,5 +5139,295 @@ mod stream_wait_tests {
         ] {
             assert!(warn.contains(part), "missing {part:?} in {warn}");
         }
+    }
+}
+
+/// Group commit, wired into the leader a node builds (#752). The coordinator
+/// itself is tested in `vtop-broker`; these tests prove the NODE builds the
+/// leader with it, in the way and with the settings its config names, and
+/// that a produce through the promoted leader's broker is shared and
+/// counted.
+#[cfg(test)]
+mod group_commit_wiring_tests {
+    use super::stream_wait_tests::{
+        candidate_config_with, capture_logs, live_follower, peer, range, roll, EPOCH, LIVE_PEER,
+    };
+    use super::*;
+    use prometheus::{Encoder, Registry, TextEncoder};
+    use vtop_protocol::{Durability as WireDurability, Message, ProduceRecord, ProduceRequest};
+
+    const ON: &str = "group_commit: { enabled: true, max_delay_ms: 40, max_records: 512, \
+                      max_bytes: 262144, max_pending_requests: 32 }\n";
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    async fn build(config: &DataNodeConfig, live: std::net::SocketAddr) -> BuiltLeader {
+        build_leader_phase(
+            config,
+            &range(),
+            &[peer(LIVE_PEER, live)],
+            roll(),
+            &MetaFencingEpoch::new(EPOCH),
+            EPOCH,
+        )
+        .await
+        .expect("the leader builds against one live peer")
+    }
+
+    fn produce(
+        broker: &LocalBroker,
+        producer: u128,
+        durability: WireDurability,
+    ) -> vtop_protocol::WireFrame {
+        broker.handle(
+            vtop_protocol::Role::Producer,
+            vtop_protocol::WireFrame {
+                request_id: producer as u64,
+                stream_id: producer as u64,
+                message: Message::ProduceRequest(ProduceRequest {
+                    range: range(),
+                    fencing_epoch: EPOCH,
+                    producer_id: Uuid::from_u128(producer),
+                    producer_epoch: 1,
+                    first_sequence: 0,
+                    durability,
+                    records: vec![ProduceRecord {
+                        timestamp_millis: 1_000,
+                        key: format!("k{producer}").into_bytes(),
+                        value: format!("v{producer}").into_bytes(),
+                    }],
+                }),
+            },
+        )
+    }
+
+    /// Red on main: a leader built from a config with the section had no
+    /// coordinator, whatever the config said (`broker.group_commit()` was
+    /// always `None` in a running node).
+    #[test]
+    fn the_broker_a_leader_builds_has_a_coordinator() {
+        let runtime = runtime();
+        let follower_dir = tempfile::tempdir().unwrap();
+        let (live, _stop) = runtime.block_on(live_follower(follower_dir.path()));
+
+        let on_dir = tempfile::tempdir().unwrap();
+        let on_config = candidate_config_with(on_dir.path(), ON);
+        let (built, logs) = capture_logs(|| runtime.block_on(build(&on_config, live)));
+        let coordinator = built
+            .broker
+            .group_commit()
+            .expect("a leader built from `group_commit: {enabled: true}` has a coordinator");
+        assert_eq!(
+            coordinator.config().max_delay,
+            Duration::from_millis(40),
+            "the section's window reaches the coordinator"
+        );
+        assert_eq!(coordinator.config().max_records, 512);
+        assert_eq!(coordinator.config().max_bytes, 262_144);
+        assert_eq!(coordinator.config().max_pending_requests, 32);
+        // The startup line says what is on and how to turn it off (#752 section 7).
+        let info = logs
+            .lines()
+            .find(|line| line.contains("group commit on for range"))
+            .unwrap_or_else(|| panic!("a leader with group commit on says so at INFO:\n{logs}"));
+        for part in [
+            "\"level\":\"INFO\"",
+            "window 40 ms, up to 512 records or 262144 bytes per group, at most 32 queued",
+            "each is still acknowledged only after both",
+            "group_commit.enabled: false",
+            "\"max_delay_ms\":40",
+        ] {
+            assert!(info.contains(part), "missing {part:?} in {info}");
+        }
+        drop(built);
+
+        let off_dir = tempfile::tempdir().unwrap();
+        let off_config = candidate_config_with(off_dir.path(), "");
+        let (built, logs) = capture_logs(|| runtime.block_on(build(&off_config, live)));
+        assert!(
+            built.broker.group_commit().is_none(),
+            "the default stays off until the evidence gates hold"
+        );
+        assert!(
+            !logs.contains("group commit on for range"),
+            "an off node does not announce group commit:\n{logs}"
+        );
+        drop(built);
+        runtime.shutdown_timeout(Duration::from_secs(5));
+    }
+
+    /// A follower given a (disabled) section says it ignores it, so the
+    /// operator sees the section was read and is not in use.
+    #[test]
+    fn a_follower_says_it_ignores_a_disabled_group_commit_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = candidate_config_with(dir.path(), "group_commit: { enabled: false }\n");
+        let ((), logs) = capture_logs(|| note_group_commit_ignored(&config));
+        let info = logs
+            .lines()
+            .find(|line| line.contains("ignores its `group_commit` section"))
+            .unwrap_or_else(|| panic!("a follower with the section says so at INFO:\n{logs}"));
+        for part in [
+            "\"level\":\"INFO\"",
+            "a follower never takes a produce request",
+            "Nothing is needed",
+        ] {
+            assert!(info.contains(part), "missing {part:?} in {info}");
+        }
+        let bare = candidate_config_with(dir.path(), "");
+        let ((), logs) = capture_logs(|| note_group_commit_ignored(&bare));
+        assert!(logs.is_empty(), "no section, nothing said:\n{logs}");
+    }
+
+    /// A section tuned and then left off is a node that looks as if it
+    /// ignores its config; it says so (three parts) and runs without.
+    #[test]
+    fn a_tuned_section_left_off_warns_and_runs_without_group_commit() {
+        let runtime = runtime();
+        let follower_dir = tempfile::tempdir().unwrap();
+        let (live, _stop) = runtime.block_on(live_follower(follower_dir.path()));
+        let dir = tempfile::tempdir().unwrap();
+        let config = candidate_config_with(
+            dir.path(),
+            "group_commit: { enabled: false, max_delay_ms: 5 }\n",
+        );
+        let (built, logs) = capture_logs(|| runtime.block_on(build(&config, live)));
+        assert!(built.broker.group_commit().is_none());
+        let warn = logs
+            .lines()
+            .find(|line| line.contains("group commit is off for range"))
+            .unwrap_or_else(|| panic!("a tuned but disabled section warns:\n{logs}"));
+        for part in [
+            "\"level\":\"WARN\"",
+            "`group_commit.enabled` is false",
+            "every produce request keeps its own fsync and replication round",
+            "Set `group_commit.enabled: true`",
+        ] {
+            assert!(warn.contains(part), "missing {part:?} in {warn}");
+        }
+        drop(built);
+        runtime.shutdown_timeout(Duration::from_secs(5));
+    }
+
+    /// Red on main: `vtop_broker_group_commits_total` was never emitted by a
+    /// node. Here eight producers write through the promoted leader at once
+    /// over a real replica stream; the window holds the first group open long
+    /// enough for the others to join it, every one is acknowledged, they
+    /// share barriers (fewer groups than requests), and the node's own
+    /// collector exports the counters.
+    #[test]
+    fn concurrent_quorum_produces_through_a_node_share_barriers_and_are_exported() {
+        const PRODUCERS: u128 = 8;
+        let runtime = runtime();
+        let follower_dir = tempfile::tempdir().unwrap();
+        let (live, _stop) = runtime.block_on(live_follower(follower_dir.path()));
+        let dir = tempfile::tempdir().unwrap();
+        let config = candidate_config_with(dir.path(), ON);
+        let built = runtime.block_on(build(&config, live));
+        let broker = Arc::clone(&built.broker);
+
+        let registry = Registry::new_custom(Some("vtop".into()), None).unwrap();
+        registry
+            .register(Box::new(
+                BrokerCollector::new(
+                    Arc::clone(&broker),
+                    Some(Arc::clone(&built.replicas)),
+                    vec![LIVE_PEER],
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let scrape = |registry: &Registry| {
+            let mut buf = Vec::new();
+            TextEncoder::new()
+                .encode(&registry.gather(), &mut buf)
+                .unwrap();
+            String::from_utf8(buf).unwrap()
+        };
+        let sample = |text: &str, series: &str| -> Option<f64> {
+            text.lines()
+                .find_map(|line| line.strip_prefix(series)?.strip_prefix(' '))
+                .map(|value| value.parse().unwrap())
+        };
+        // Wait for the replica stream to come up: until it does a quorum
+        // write is refused "quorum not reached" and is not a fair subject.
+        let warmed = runtime.block_on(async {
+            let broker = Arc::clone(&broker);
+            tokio::task::spawn_blocking(move || produce(&broker, 0xF00, WireDurability::Quorum))
+                .await
+                .unwrap()
+        });
+        assert!(
+            matches!(warmed.message, Message::ProduceResponse(_)),
+            "the warm-up quorum produce was not acknowledged: {warmed:?}"
+        );
+        let before = scrape(&registry);
+        let requests_before = sample(&before, "vtop_broker_group_commit_requests_total")
+            .expect("the group-commit series exist once it is on");
+        let commits_before = sample(&before, "vtop_broker_group_commits_total").unwrap();
+        assert_eq!(
+            sample(&before, "vtop_broker_group_commit_enabled"),
+            Some(1.0),
+            "{before}"
+        );
+
+        let barrier = Arc::new(std::sync::Barrier::new(PRODUCERS as usize));
+        let threads: Vec<_> = (1..=PRODUCERS)
+            .map(|producer| {
+                let broker = Arc::clone(&broker);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    produce(&broker, producer, WireDurability::Quorum)
+                })
+            })
+            .collect();
+        for thread in threads {
+            let frame = thread.join().unwrap();
+            assert!(
+                matches!(frame.message, Message::ProduceResponse(_)),
+                "every concurrent produce is acknowledged: {frame:?}"
+            );
+        }
+
+        let after = scrape(&registry);
+        let requests =
+            sample(&after, "vtop_broker_group_commit_requests_total").unwrap() - requests_before;
+        let commits = sample(&after, "vtop_broker_group_commits_total").unwrap() - commits_before;
+        assert_eq!(requests, PRODUCERS as f64, "{after}");
+        assert!(
+            commits >= 1.0 && commits < requests,
+            "{PRODUCERS} concurrent requests must share barriers: {requests} requests in \
+             {commits} groups\n{after}"
+        );
+        for series in [
+            "vtop_broker_group_commit_overloaded_total",
+            "vtop_broker_group_commit_split_groups_total",
+        ] {
+            assert_eq!(
+                sample(&after, series),
+                Some(0.0),
+                "{series} is exported from the first scrape, at zero when nothing overflowed \
+                 or split:\n{after}"
+            );
+        }
+        // The replicate phase ran: the group was a quorum write, not a local one.
+        assert!(
+            sample(
+                &after,
+                "vtop_broker_produce_phase_seconds_total{phase=\"replicate\"}"
+            )
+            .unwrap()
+                > 0.0,
+            "{after}"
+        );
+        drop(built);
+        runtime.shutdown_timeout(Duration::from_secs(5));
     }
 }

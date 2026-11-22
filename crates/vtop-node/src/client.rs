@@ -16,9 +16,9 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use uuid::Uuid;
 use vtop_protocol::{
-    read_frame, write_frame, ClientHello, Durability, ErrorResponse, FetchRequest, Message,
-    ProduceRecord, ProduceRequest, ProtocolLimits, ReplicaStatusRequest, Role, WindowUpdate,
-    WireFrame, PROTOCOL_MAJOR,
+    read_frame, write_frame, ClientHello, Durability, ErrorCode, ErrorResponse, FetchRequest,
+    Message, ProduceRecord, ProduceRequest, ProtocolLimits, ReplicaStatusRequest, Role,
+    WindowUpdate, WireFrame, PROTOCOL_MAJOR,
 };
 
 const LIMITS: ProtocolLimits = ProtocolLimits {
@@ -187,6 +187,64 @@ pub fn record_value(sequence: u64, value_bytes: usize) -> Vec<u8> {
         .collect()
 }
 
+/// The operation history a live-chaos scenario records for the history
+/// checker (#728, `scripts/live-chaos/history/check_history.py`): one JSON
+/// object per line, appended and flushed as each event happens, so a process
+/// killed mid-run leaves every event it got to.
+///
+/// Produce: an `invoke` before a batch goes out, then exactly one of `ok`
+/// (acknowledged, with the committed next offset after it and the offsets the
+/// broker answered with: `first_offset`, plus `offsets` when they are not
+/// consecutive),
+/// `fail` (refused before anything was appended, see [`refusal_is_definite`]:
+/// the records must never be visible) or `info` (no answer, or one that does
+/// not settle it: indeterminate, the records may or may not be visible).
+/// Read: one line per run of visible records at consecutive offsets whose
+/// keys carry consecutive producer sequences, and a final line with the high
+/// watermark.
+pub struct History {
+    file: std::fs::File,
+    process: String,
+}
+
+impl History {
+    pub fn open(path: &std::path::Path, process: &str) -> Result<Self, String> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|error| format!("history {}: {error}", path.display()))?;
+        Ok(Self {
+            file,
+            process: process.to_owned(),
+        })
+    }
+
+    fn event(
+        &mut self,
+        mut fields: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), String> {
+        fields.insert("process".into(), self.process.clone().into());
+        fields.insert("time_us".into(), unix_micros()?.into());
+        let mut line = serde_json::Value::Object(fields).to_string();
+        line.push('\n');
+        self.file
+            .write_all(line.as_bytes())
+            .and_then(|()| self.file.flush())
+            .map_err(|error| format!("history: {error}"))
+    }
+}
+
+/// A JSON object from `(key, value)` pairs.
+fn fields<const N: usize>(
+    pairs: [(&str, serde_json::Value); N],
+) -> serde_json::Map<String, serde_json::Value> {
+    pairs
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value))
+        .collect()
+}
+
 fn persist_acked(path: Option<&PathBuf>, acked: u64) -> Result<(), String> {
     let Some(path) = path else { return Ok(()) };
     let tmp = path.with_extension("tmp");
@@ -215,6 +273,12 @@ pub struct ProduceArgs {
     pub ack_log: Option<PathBuf>,
     /// A batch unanswered this long is an interruption; 0 waits forever.
     pub request_timeout_ms: u64,
+    /// Record every batch's invocation and outcome here (#728).
+    pub history: Option<PathBuf>,
+    /// The produce targets a leader the caller has fenced: whatever it
+    /// answers short of an acknowledgement, its records must never become
+    /// visible, so the history records them as refused (`fail`).
+    pub fenced_probe: bool,
 }
 
 /// When record number `index` of the schedule is due, at `rate` records per
@@ -267,6 +331,41 @@ fn ack_line(unix_micros: u128, acked_total: u64, latency: std::time::Duration) -
 enum ProduceBatchError {
     Interrupted(String),
     Failed(String),
+    /// Acknowledged, at an offset other than the one expected: the batch is
+    /// committed (recorded as such), and the run fails.
+    AckedOutOfPlace {
+        committed_next_offset: u64,
+        offsets: Vec<u64>,
+        message: String,
+    },
+    /// The broker answered with an error. Whether the records can still
+    /// become visible depends on the code: see [`refusal_is_definite`].
+    Refused {
+        code: ErrorCode,
+        message: String,
+    },
+}
+
+/// Whether a produce refused with `code` was refused before anything was
+/// appended, so its records can never become visible (a history's `fail`).
+/// Anything else is indeterminate (`info`): `Overloaded` is how a leader
+/// reports a quorum wait that expired after it appended and fsynced the batch
+/// itself, `Storage` can fail part way through an append, and `Fenced` comes
+/// both from the lease check at admission and from the one the broker repeats
+/// after appending and replicating, before it publishes the commit, with the
+/// same message either way.
+fn refusal_is_definite(code: ErrorCode) -> bool {
+    matches!(
+        code,
+        ErrorCode::InvalidRequest
+            | ErrorCode::UnsupportedVersion
+            | ErrorCode::Unauthorized
+            | ErrorCode::WrongCluster
+            | ErrorCode::WrongRange
+            | ErrorCode::SequenceConflict
+            | ErrorCode::ProtocolViolation
+            | ErrorCode::WrongLineage
+    )
 }
 
 /// Produce with per-batch acks. Exit contract for scripts:
@@ -292,6 +391,22 @@ pub async fn produce(config: &ClientConfig, args: ProduceArgs) -> Result<i32, St
     // without assuming the range started empty or that this producer owns it.
     let mut expected_next_offset: Option<u64> = None;
     persist_acked(args.acked_file.as_ref(), args.first_sequence)?;
+    let mut history = match args.history.as_ref() {
+        Some(path) => Some(History::open(
+            path,
+            // The start time with the pid: a pid can come round again under
+            // the same producer id and epoch, and each invocation numbers its
+            // batches from 1 (review of #878).
+            &format!(
+                "produce:{}:{}:{}:{}",
+                config.producer_id,
+                config.producer_epoch,
+                std::process::id(),
+                unix_micros()?
+            ),
+        )?),
+        None => None,
+    };
     let mut ack_log = match args.ack_log.as_ref() {
         Some(path) => Some(
             std::fs::OpenOptions::new()
@@ -328,6 +443,19 @@ pub async fn produce(config: &ClientConfig, args: ProduceArgs) -> Result<i32, St
             .collect();
         request_id += 1;
         let expected_offset = expected_next_offset.map(|next| next + count);
+        if let Some(history) = history.as_mut() {
+            history.event(fields([
+                ("op", "produce".into()),
+                ("type", "invoke".into()),
+                ("batch", request_id.into()),
+                ("addr", args.addr.clone().into()),
+                ("fencing_epoch", config.fencing_epoch.into()),
+                ("producer_epoch", config.producer_epoch.into()),
+                ("first_sequence", first.into()),
+                ("count", count.into()),
+                ("value_bytes", args.value_bytes.into()),
+            ]))?;
+        }
         let sent_at = Instant::now();
         let exchange = async {
             write_frame(
@@ -357,26 +485,31 @@ pub async fn produce(config: &ClientConfig, args: ProduceArgs) -> Result<i32, St
                 })?;
             match reply.message {
                 Message::ProduceResponse(response) => {
+                    let offsets: Vec<u64> = response.outcomes.iter().map(|o| o.offset).collect();
                     if let Some(expected) = expected_offset {
                         if response.committed_next_offset != expected {
-                            return Err(ProduceBatchError::Failed(format!(
-                                "committed_next_offset {} after acking {count} records; \
-                                 expected {expected}",
-                                response.committed_next_offset
-                            )));
+                            return Err(ProduceBatchError::AckedOutOfPlace {
+                                committed_next_offset: response.committed_next_offset,
+                                offsets,
+                                message: format!(
+                                    "committed_next_offset {} after acking {count} records; \
+                                     expected {expected}",
+                                    response.committed_next_offset
+                                ),
+                            });
                         }
                     }
-                    Ok(response.committed_next_offset)
+                    Ok((response.committed_next_offset, offsets))
                 }
-                Message::Error(ErrorResponse { code, message, .. }) => Err(
-                    ProduceBatchError::Failed(format!("produce rejected: {code:?} {message}")),
-                ),
+                Message::Error(ErrorResponse { code, message, .. }) => {
+                    Err(ProduceBatchError::Refused { code, message })
+                }
                 other => Err(ProduceBatchError::Failed(format!(
                     "unexpected produce reply: {other:?}"
                 ))),
             }
         };
-        let outcome: Result<u64, ProduceBatchError> = if args.request_timeout_ms == 0 {
+        let outcome: Result<(u64, Vec<u64>), ProduceBatchError> = if args.request_timeout_ms == 0 {
             exchange.await
         } else {
             let limit = std::time::Duration::from_millis(args.request_timeout_ms);
@@ -388,8 +521,68 @@ pub async fn produce(config: &ClientConfig, args: ProduceArgs) -> Result<i32, St
                 ))),
             }
         };
+        if let Some(history) = history.as_mut() {
+            let (mut kind, offset, offsets, error) = match &outcome {
+                Ok((next, offsets)) => ("ok", Some(*next), Some(offsets.as_slice()), None),
+                Err(ProduceBatchError::AckedOutOfPlace {
+                    committed_next_offset,
+                    offsets,
+                    message,
+                }) => (
+                    "ok",
+                    Some(*committed_next_offset),
+                    Some(offsets.as_slice()),
+                    Some(message.clone()),
+                ),
+                Err(ProduceBatchError::Refused { code, message }) => (
+                    if refusal_is_definite(*code) {
+                        "fail"
+                    } else {
+                        "info"
+                    },
+                    None,
+                    None,
+                    Some(format!("{code:?} {message}")),
+                ),
+                // A reply this client did not expect: what the broker did
+                // with the batch is unknown.
+                Err(ProduceBatchError::Failed(error)) => ("info", None, None, Some(error.clone())),
+                Err(ProduceBatchError::Interrupted(error)) => {
+                    ("info", None, None, Some(error.clone()))
+                }
+            };
+            if args.fenced_probe && kind == "info" {
+                kind = "fail";
+            }
+            let mut event = fields([
+                ("op", "produce".into()),
+                ("type", kind.into()),
+                ("batch", request_id.into()),
+                ("first_sequence", first.into()),
+                ("count", count.into()),
+            ]);
+            if let Some(offset) = offset {
+                event.insert("committed_next_offset".into(), offset.into());
+            }
+            // Where the broker placed each record. A resent batch it already
+            // holds is answered with its ORIGINAL offsets under the range's
+            // current watermark, so the watermark alone would misplace it
+            // (review of #878).
+            if let Some(offsets) = offsets.filter(|o| o.len() as u64 == count) {
+                if let Some(&first_offset) = offsets.first() {
+                    event.insert("first_offset".into(), first_offset.into());
+                }
+                if !offsets_are_consecutive(offsets) {
+                    event.insert("offsets".into(), offsets.to_vec().into());
+                }
+            }
+            if let Some(error) = error {
+                event.insert("error".into(), error.into());
+            }
+            history.event(event)?;
+        }
         match outcome {
-            Ok(committed_next_offset) => {
+            Ok((committed_next_offset, _)) => {
                 let latency = sent_at.elapsed();
                 // Stamped on the answer, before the floor's fsync below: the
                 // ack log is the benchmark's acknowledgement time, and local
@@ -423,6 +616,10 @@ pub async fn produce(config: &ClientConfig, args: ProduceArgs) -> Result<i32, St
                 return Ok(3);
             }
             Err(ProduceBatchError::Failed(error)) => return Err(error),
+            Err(ProduceBatchError::AckedOutOfPlace { message, .. }) => return Err(message),
+            Err(ProduceBatchError::Refused { code, message }) => {
+                return Err(format!("produce rejected: {code:?} {message}"))
+            }
         }
     }
     println!(
@@ -459,9 +656,39 @@ pub struct VerifyArgs {
     pub max_offset_gaps: u64,
     pub batch: u32,
     pub value_bytes: usize,
+    /// Append the visible records and the high watermark here, as the read
+    /// half of a history (#728). Every visible record is listed, beyond
+    /// `verify_content_through` too.
+    pub dump: Option<PathBuf>,
+    /// The first offset fetched: 0 for a whole range, or the log start of a
+    /// range whose retention (#290) has reclaimed a prefix. A history read
+    /// records it, so the checker does not expect the reclaimed records in
+    /// this read.
+    pub from_offset: u64,
 }
 
-/// Fetch offset 0 → committed HWM, checking offset monotonicity and
+/// A run of visible records at consecutive offsets whose keys carry
+/// consecutive producer sequences, for the read half of a history.
+struct ReadRun {
+    offset: u64,
+    sequence: u64,
+    count: u64,
+    /// Every value in the run is the producer's value for its key's sequence.
+    values_match: bool,
+}
+
+/// Whether `offsets` run one after another, so the first names them all.
+fn offsets_are_consecutive(offsets: &[u64]) -> bool {
+    offsets.windows(2).all(|pair| pair[1] == pair[0] + 1)
+}
+
+/// The producer sequence a record's key carries, when it is one.
+fn key_sequence(key: &[u8]) -> Option<u64> {
+    <[u8; 8]>::try_from(key).ok().map(u64::from_be_bytes)
+}
+
+/// Fetch `from_offset` (0 unless retention reclaimed a prefix) → committed
+/// HWM, checking offset monotonicity and
 /// byte-verifying content for the first `verify_content_through` visible
 /// records. The cursor honors `FetchResponse.next_offset`, which is what
 /// makes the wire gap-tolerant; the `max_offset_gaps` budget is what keeps
@@ -472,9 +699,11 @@ pub struct VerifyArgs {
 pub async fn verify(config: &ClientConfig, args: VerifyArgs) -> Result<i32, String> {
     let mut session = connect(config, &args.addr, Role::Consumer).await?;
     let mut request_id: u64 = 0;
-    let mut next_offset: u64 = 0;
+    let mut next_offset: u64 = args.from_offset;
     let mut records_seen: u64 = 0;
     let mut gaps: u64 = 0;
+    let mut runs: Vec<ReadRun> = Vec::new();
+    let mut unkeyed: Vec<u64> = Vec::new();
     let high_watermark;
     loop {
         request_id += 1;
@@ -541,6 +770,29 @@ pub async fn verify(config: &ClientConfig, args: VerifyArgs) -> Result<i32, Stri
                 ));
             }
             gaps += record.offset - next_offset;
+            if args.dump.is_some() {
+                match key_sequence(&record.key) {
+                    Some(sequence) => {
+                        let matches = record.value == record_value(sequence, args.value_bytes);
+                        match runs.last_mut() {
+                            Some(run)
+                                if run.offset + run.count == record.offset
+                                    && run.sequence + run.count == sequence
+                                    && run.values_match == matches =>
+                            {
+                                run.count += 1;
+                            }
+                            _ => runs.push(ReadRun {
+                                offset: record.offset,
+                                sequence,
+                                count: 1,
+                                values_match: matches,
+                            }),
+                        }
+                    }
+                    None => unkeyed.push(record.offset),
+                }
+            }
             if records_seen < args.verify_content_through {
                 // The expected record is named by its POSITION among the
                 // visible records, not by its offset: the producer's records
@@ -595,6 +847,38 @@ pub async fn verify(config: &ClientConfig, args: VerifyArgs) -> Result<i32, Stri
         "verify_done records={records_seen} next_offset={next_offset} gaps={gaps} \
          high_watermark={high_watermark}"
     );
+    if let Some(path) = args.dump.as_ref() {
+        // The pid alone can come round again in a run of days (the cluster
+        // soak, #727); the start time makes the read's name its own.
+        let mut history = History::open(
+            path,
+            &format!("read:{}:{}", std::process::id(), unix_micros()?),
+        )?;
+        for run in &runs {
+            history.event(fields([
+                ("op", "read".into()),
+                ("type", "records".into()),
+                ("offset", run.offset.into()),
+                ("first_sequence", run.sequence.into()),
+                ("count", run.count.into()),
+                ("values_match", run.values_match.into()),
+            ]))?;
+        }
+        for offset in unkeyed {
+            history.event(fields([
+                ("op", "read".into()),
+                ("type", "unkeyed".into()),
+                ("offset", offset.into()),
+            ]))?;
+        }
+        history.event(fields([
+            ("op", "read".into()),
+            ("type", "end".into()),
+            ("high_watermark", high_watermark.into()),
+            ("records", records_seen.into()),
+            ("start_offset", args.from_offset.into()),
+        ]))?;
+    }
     if high_watermark < args.expect_at_least {
         return Err(format!(
             "high watermark {high_watermark} is below the acknowledged floor {}",
@@ -791,5 +1075,50 @@ mod dial_tests {
             refused.contains("replica_transport") && refused.contains("`tls`"),
             "{refused}"
         );
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    /// #728: a refusal is recorded as definite (`fail`, the records must
+    /// never surface) only when the broker refuses before it appends. A
+    /// quorum wait that expired is `Overloaded` after the leader's own
+    /// append, so calling it definite would make the checker report the
+    /// retried batch's records as phantoms.
+    #[test]
+    fn only_a_refusal_made_before_the_append_is_definite() {
+        for code in [
+            ErrorCode::WrongRange,
+            ErrorCode::WrongCluster,
+            ErrorCode::Unauthorized,
+            ErrorCode::SequenceConflict,
+        ] {
+            assert!(refusal_is_definite(code), "{code:?}");
+        }
+        // `Fenced` too can come after the append: the broker checks the lease
+        // again before it publishes a replicated batch's commit.
+        for code in [ErrorCode::Overloaded, ErrorCode::Storage, ErrorCode::Fenced] {
+            assert!(!refusal_is_definite(code), "{code:?}");
+        }
+    }
+
+    /// The read dump's runs are keyed by the producer's sequence, which
+    /// `produce` writes as the key: eight big-endian bytes, nothing else.
+    #[test]
+    fn a_batch_is_named_by_its_first_offset_only_when_its_offsets_are_consecutive() {
+        assert!(offsets_are_consecutive(&[4, 5, 6]));
+        assert!(offsets_are_consecutive(&[9]));
+        assert!(offsets_are_consecutive(&[]));
+        assert!(!offsets_are_consecutive(&[4, 6, 7]));
+        assert!(!offsets_are_consecutive(&[5, 4]));
+    }
+
+    #[test]
+    fn a_key_is_a_producer_sequence_only_at_eight_bytes() {
+        assert_eq!(key_sequence(&42u64.to_be_bytes()), Some(42));
+        assert_eq!(key_sequence(b"k"), None);
+        assert_eq!(key_sequence(&[0u8; 9]), None);
     }
 }

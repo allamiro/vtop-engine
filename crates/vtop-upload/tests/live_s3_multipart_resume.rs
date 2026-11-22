@@ -220,6 +220,7 @@ async fn backend(s: &S3Settings, endpoint: &str) -> S3NativeBackend {
         request_timeout_seconds: 300,
         request_min_bytes_per_second: 4 * 1024,
         object_lock: None,
+        server_side_encryption: None,
     })
     .await
     .unwrap()

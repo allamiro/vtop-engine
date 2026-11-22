@@ -31,6 +31,11 @@ services:
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
+      # A single static KMS key, so the server-side encryption tests (SSE-S3,
+      # and SSE-KMS under the key name `vtop-lab-key`) can run. LAB-ONLY
+      # constant, `<name>:<base64 of 32 bytes>`, the same as the compose
+      # lab's: it protects nothing.
+      MINIO_KMS_SECRET_KEY: vtop-lab-key:dnRvcC1sYWItb25seS1rbXMta2V5LTAxMjM0NTY3ODk=
     volumes:
       - data:/data
 

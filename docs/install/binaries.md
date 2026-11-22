@@ -33,6 +33,11 @@ glibc builds, while the musl archives are checked by the release smoke run
 described below and nothing more. They use musl's own memory allocator,
 whose performance under load has not been measured here.
 
+On the musl builds, name a Kafka broker by an address it listens on, or by a
+name that resolves to one. musl resolves `localhost` to `::1` only (the glibc
+builds try `127.0.0.1` as well), so `bootstrap_servers: ["localhost:9092"]`
+does not reach a broker that listens on IPv4 alone; `127.0.0.1:9092` does.
+
 ### glibc floor
 
 The `-linux-gnu` binaries of v0.10.2 and later need glibc 2.17. They are built
@@ -72,6 +77,33 @@ The macOS archives run the same round trip on the macOS runners (macOS 15,
 arm64 and x86_64). The other distributions and macOS releases named above are
 expected to work by the same symbol versions and deployment target, but are
 not run.
+
+Each Linux archive also runs against a live broker on its own runner (Ubuntu
+24.04, x86_64 or aarch64): its `vtopctl` reads 200 records from a
+single-node Kafka 4.3.1, archives them, and the consumer group's committed
+offset must then be the end of the topic. The engine commits an offset only
+after the batch is verified, so this is the archive running the Kafka path
+end to end, the path `scripts/e2e-smoke.sh` checks in the container image;
+the coverage audit and a scrub follow. The macOS runners have no Docker, so
+the macOS archives run the file round trip only.
+
+All of this runs in the release workflow: on the tag, before anything is
+published (a failure stops the release), and in a dry run, a manual dispatch
+that builds and checks the archives and publishes nothing. A dry run takes a
+tag, or a branch or commit, so the commit about to be tagged can be checked
+before the tag exists. A dry run only reads the build caches (cargo's and
+Docker's layers) and never writes them, so a build of a commit nobody has
+tagged cannot leave anything for a later tag build to restore.
+
+### The test suite on each platform
+
+Besides the archives, the workspace's test suite (`cargo test --workspace`,
+the tests that need no broker or store) runs nightly on each CPU and operating
+system the archives target: macOS 15 on Apple silicon and on Intel, and Linux
+on aarch64 (Ubuntu 24.04), in the
+[platform tests](https://github.com/allamiro/vtop-engine/blob/main/.github/workflows/platform-tests.yml)
+workflow. Every other test job runs on x86_64 Linux. The live tests, against
+Kafka, MinIO and PostgreSQL, run on x86_64 Linux only.
 
 ### Earlier releases
 

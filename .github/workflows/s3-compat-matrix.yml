@@ -168,16 +168,22 @@ jobs:
           done
           ls -la "$out"
           test "$(find "$out" -type f | wc -l)" -eq 7
-          # The anti-tamper suite (docs/reference/tamper-evidence.md) is not
-          # a capability case: it needs the lab's MinIO, its root credentials
-          # and its Object Lock bucket, so it is kept apart from the binaries
-          # every leg runs and only the minio leg runs it.
+          # The anti-tamper suite (docs/reference/tamper-evidence.md) and the
+          # server-side encryption suite (live_s3_sse) are not capability
+          # cases: they need the lab's MinIO, its root credentials, its Object
+          # Lock bucket and, for SSE-KMS, its static KMS key, so they are kept
+          # apart from the binaries every leg runs and only the minio leg
+          # runs them.
           lab="$RUNNER_TEMP/s3-tamper-bin"
           mkdir -p "$lab"
-          build -p vtop-cli --test live_s3_tamper | while read -r name exe; do
+          {
+            build -p vtop-cli --test live_s3_tamper
+            build -p vtop-upload --test live_s3_sse
+          } | while read -r name exe; do
             cp "$exe" "$lab/$name"
           done
           test -x "$lab/live_s3_tamper"
+          test -x "$lab/live_s3_sse"
 
       - name: Save the build cache (main only)
         if: github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true'
@@ -293,6 +299,21 @@ jobs:
           export AWS_REGION=us-east-1
           chmod +x "$RUNNER_TEMP/s3-tamper-bin/live_s3_tamper"
           "$RUNNER_TEMP/s3-tamper-bin/live_s3_tamper" --ignored --test-threads=1
+
+      # Server-side encryption (SSE-S3, SSE-KMS, encrypted multipart and the
+      # verification of encrypted objects), which the single MinIO job this
+      # matrix replaced ran. MinIO only: it needs the lab's static KMS key
+      # (MINIO_KMS_SECRET_KEY in docker/s3-servers/minio/compose.yml).
+      - name: Run the server-side encryption suite (minio only)
+        if: matrix.server == 'minio'
+        run: |
+          set -euo pipefail
+          set -a
+          . docker/s3-servers/minio/server.env
+          set +a
+          export AWS_REGION=us-east-1
+          chmod +x "$RUNNER_TEMP/s3-tamper-bin/live_s3_sse"
+          "$RUNNER_TEMP/s3-tamper-bin/live_s3_sse" --ignored --test-threads=1
 
       - name: Summarise the results
         if: always()

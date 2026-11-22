@@ -343,6 +343,34 @@ pub struct ObjectHead {
     /// Engine-written user metadata and local sidecars MUST NOT populate this
     /// field: they describe what the uploader claimed, not what is stored.
     pub checksum_sha256: Option<String>,
+    /// How the store reports the object is encrypted at rest, from the
+    /// response's `x-amz-server-side-encryption` headers; `None` when it
+    /// reports none, and for a backend that cannot read them.
+    pub encryption: Option<StoredEncryption>,
+}
+
+/// What [`UploadBackend::check_encryption`] found for one stored object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EncryptionCheck {
+    /// The backend asked for no encryption (the default, and every backend
+    /// but `s3_native`), so nothing was checked.
+    NotRequested,
+    /// The store reports the object encrypted the way the backend asked.
+    Encrypted,
+    /// The store reports it otherwise. The operator-facing reason, naming
+    /// what was asked for and what the store says.
+    Violation(String),
+}
+
+/// The server-side encryption a store reports for a stored object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredEncryption {
+    /// `x-amz-server-side-encryption` as the store spelled it: `AES256`,
+    /// `aws:kms`, `aws:kms:dsse`.
+    pub algorithm: String,
+    /// `x-amz-server-side-encryption-aws-kms-key-id`: S3 reports the key's
+    /// ARN, never the alias a request named; other stores may report less.
+    pub kms_key_id: Option<String>,
 }
 
 /// Outcome of an object verification attempt.
@@ -1093,6 +1121,25 @@ pub trait UploadBackend: Send + Sync {
 
     /// HEAD/stat an object.
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError>;
+
+    /// Whether the store reports this object (the exact version, when one is
+    /// given) encrypted the way this backend was configured to ask, for the
+    /// reads that do not go through [`verify_object`](Self::verify_object):
+    /// a manifest read by its pinned version, a receipt, the current key of a
+    /// manifest. `verify_object` judges the same thing for the object and
+    /// manifest a batch writes; this is the same judgement for the rest.
+    ///
+    /// The default asks for nothing and answers
+    /// [`EncryptionCheck::NotRequested`], which is right for every backend
+    /// that cannot request encryption (config load refuses the setting on
+    /// them). An `Err` is a check that could not be made.
+    async fn check_encryption(
+        &self,
+        _object_uri: &str,
+        _version_id: Option<&str>,
+    ) -> Result<EncryptionCheck, VtopError> {
+        Ok(EncryptionCheck::NotRequested)
+    }
 
     /// Whether [`head_object`](Self::head_object) answers an absent object
     /// with [`VtopError::NotFound`], and answers it with that ONLY when the

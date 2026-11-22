@@ -370,6 +370,86 @@ mod tests {
         );
     }
 
+    /// A parked token that is claimed again is active, and gives back its
+    /// parked slot: kept, the count would reach the bound early and evict
+    /// tokens that are still within it (#729, a surviving mutant).
+    #[test]
+    fn a_parked_token_claimed_again_gives_back_its_slot() {
+        let fence = ClaimFence::default();
+        fence.claimed("b", 1);
+        fence.lost("b", 1);
+        assert_eq!(fence.lock().parked, 1);
+        fence.claimed("b", 2);
+        assert_eq!(fence.lock().parked, 0, "the re-claimed token still counts");
+        for i in 0..MAX_PARKED {
+            let id = format!("p{i}");
+            fence.claimed(&id, 1);
+            fence.lost(&id, 1);
+        }
+        assert_eq!(fence.lock().parked, MAX_PARKED);
+        assert_eq!(
+            fence.held("p0"),
+            Some(1),
+            "a token within the bound was evicted"
+        );
+    }
+
+    /// Each park is queued under a new seq. A token parked, re-claimed and
+    /// parked again has a stale entry at the front of the queue and a live
+    /// one behind a token parked in between; the eviction skips the stale
+    /// entry and takes the token parked in between, which is older (#729).
+    #[test]
+    fn a_token_parked_twice_is_evicted_by_its_latest_park_not_its_first() {
+        let fence = ClaimFence::default();
+        fence.claimed("twice", 1);
+        fence.lost("twice", 1);
+        fence.claimed("twice", 2);
+        fence.claimed("between", 1);
+        fence.lost("between", 1);
+        fence.lost("twice", 2);
+        for i in 0..(MAX_PARKED - 1) {
+            let id = format!("p{i}");
+            fence.claimed(&id, 1);
+            fence.lost(&id, 1);
+        }
+        assert_eq!(fence.lock().parked, MAX_PARKED);
+        assert_eq!(fence.held("between"), None, "the oldest live park went");
+        assert_eq!(
+            fence.held("twice"),
+            Some(2),
+            "evicted through the entry of its first park"
+        );
+    }
+
+    /// The queue is compacted exactly when its stale entries pass the slack
+    /// of 1024 over twice the parked count: not earlier (each compaction is
+    /// a pass over the queue) and not later (#729).
+    #[test]
+    fn the_queue_is_compacted_once_stale_entries_pass_the_slack() {
+        let fence = ClaimFence::default();
+        let cycle = |i: usize| {
+            let id = format!("c{i}");
+            fence.created(&id);
+            fence.wrote(&id, BatchState::Failed, 0);
+            fence.wrote(&id, BatchState::ReplayRequired, 0);
+        };
+        for i in 0..1024 {
+            cycle(i);
+        }
+        assert_eq!(fence.lock().parked, 0);
+        assert_eq!(
+            fence.lock().parked_order.len(),
+            1024,
+            "compacted before the slack was used"
+        );
+        cycle(1024);
+        assert_eq!(
+            fence.lock().parked_order.len(),
+            0,
+            "not compacted once the stale entries passed the slack"
+        );
+    }
+
     #[test]
     fn the_refusals_name_the_batch() {
         let message = claim_lost("batch-1", 2, 5).to_string();

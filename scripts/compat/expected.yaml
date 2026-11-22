@@ -1,0 +1,120 @@
+# The compatibility matrix (#743, docs/reference/compatibility.md).
+#
+# A cell is one format, one released tag and one direction:
+#   upgrade  the released binary writes, this build reads;
+#   forward  this build writes, the released binary reads.
+# Releases are the repository's final tags, the newest patch of each minor,
+# from each cell's `since` (scripts/compat/select_cells.py). The released
+# binaries are the published assets, checked by scripts/compat/fetch-release.sh
+# (SHA256SUMS, the Sigstore bundle, the archive's contents), never rebuilds.
+#
+# A cell with `only_newest: true` runs the newest release alone.
+#
+# Every cell is expected to `pass` unless an exception below says otherwise.
+# A cell that refuses or fails with no row here fails the build, so adding a
+# one-way step means editing this reviewed file. Each exception gives:
+#   cell, direction, and `tags: [...]` or `older_than: vX.Y.Z`;
+#   expect: refuse (with `message`, what the older binary prints) or
+#           hash-failure (a manifest reader before the 0.4 scheme);
+#   why: the reason, in a sentence.
+
+cells:
+  # This build writes a signed 0.4 archive with verification receipts; the
+  # released vtopctl runs verify-manifest on it, and `validate` on its config
+  # where it has that command (scripts/manifest-compat.sh). v0.7.0 is the last
+  # release before the 0.4 reader.
+  manifest:
+    since: v0.7.0
+    directions: [forward]
+
+  # The SQLite ledger (scripts/compat/cells/ledger-sqlite.sh).
+  #   upgrade  the release writes it with scripts/compat/ledger-scenario.sh
+  #            and this build opens, audits, scrubs and extends it;
+  #   forward  this build writes it, and the release runs status, list-batches
+  #            and process-once on it, then scripts/ledger-compat.sh checks the
+  #            column rules (#626): the first downgrade the matrix records.
+  #            Only the previous release (N-1) may share a ledger with this
+  #            build; the older ones are run too and recorded as they behave,
+  #            which is how the refusal below is exercised on every pull
+  #            request.
+  ledger-sqlite:
+    since: v0.7.0
+    directions: [upgrade, forward]
+
+  # The prune digest and the audit trail (cells/digests-audit.sh): a digest is
+  # a copy of the ledger's schema that outlives the ledger, and the audit
+  # chain is read back by the release that did not write it.
+  digests-audit:
+    since: v0.7.0
+    directions: [upgrade, forward]
+
+  # A data node's directory (scripts/compat/cells/segments.sh, which runs
+  # scripts/upgrade-compat.sh): the release's vtop-node writes it (the single
+  # `range.active` before v0.3.0, sealed segments from v0.3.0, segment format
+  # v2 from v0.5.0) and this build must open it, quarantine nothing, serve
+  # every record byte for byte and again after a restart. Upgrade only:
+  # downgrade of a data directory is neither tested nor supported.
+  segments:
+    since: v0.2.0
+    directions: [upgrade]
+
+  # A metadata voter's directory (scripts/compat/cells/meta.sh): the Raft log,
+  # the snapshot, and the applied, purged and hard-state files.
+  #   upgrade  the release's vtop-node writes it with
+  #            scripts/compat/meta-scenario.sh, raised to the highest feature
+  #            level it accepts, and this build opens it, answers a
+  #            compare-and-swap only the replayed state satisfies, raises the
+  #            level and comes back after a SIGKILL;
+  #   forward  this build writes it, at its baseline level and raised to its
+  #            highest, and the release opens each, takes a write and comes
+  #            back after a SIGKILL. A release below the raised level opens
+  #            it and reports a lower level (it applies the raise as a
+  #            rejection): silent, not refused, which the compatibility page
+  #            records. v0.7.0 has no `node-versions` to read the level with.
+  meta:
+    since: v0.8.0
+    directions: [upgrade, forward]
+
+  # The PostgreSQL ledger (cells/ledger-postgres.sh). The published archives
+  # have no `postgres` feature, so the release is built from its tag with it,
+  # and a throwaway server runs beside it: nightly and on demand only.
+  ledger-postgres:
+    since: v0.9.0
+    directions: [upgrade, forward]
+    only_newest: [forward]
+    source: build
+    nightly_only: true
+
+# Tags whose published assets cannot be checked by fetch-release.sh. No
+# released-binary cell runs them; the run's summary lists them as built from
+# source. Every final tag from v0.1.0 to v0.9.0 verified on all four targets
+# when this file was written, so the list is empty.
+built_from_source: []
+
+exceptions:
+  - cell: manifest
+    direction: forward
+    older_than: v0.8.0
+    expect: hash-failure
+    why: >-
+      Releases before v0.8.0 re-encode a 0.4 manifest without the fields they
+      do not know, so its self-hash fails: the documented cutoff.
+  # Releases before v0.8.0 do not know the SUPERSEDED state (#567): this
+  # build retires a handed-back range into it, and they stop on the first
+  # row they cannot read. Read-only: the ledger is as this build left it.
+  - cell: ledger-sqlite
+    direction: forward
+    older_than: v0.8.0
+    expect: refuse
+    message: unknown batch state
+    why: >-
+      A release before v0.8.0 fails closed on a ledger row in the superseded
+      state, on first read.
+  - cell: digests-audit
+    direction: forward
+    older_than: v0.8.0
+    expect: refuse
+    message: unknown batch state
+    why: >-
+      audit-coverage reads the ledger beside the digest, and a release before
+      v0.8.0 fails closed on its superseded rows.

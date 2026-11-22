@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
 
 [[bin]]
 name = "vtop-node"
@@ -18,18 +19,25 @@ prometheus = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tokio-rustls = { workspace = true }
 uuid = { workspace = true }
 vtop-broker = { workspace = true }
+# The secret-file permission rule (#733), applied to the TLS private keys a
+# node config names (#732, S1): one rule for the engine and the node.
+vtop-core = { workspace = true }
 vtop-log = { workspace = true }
 vtop-meta = { workspace = true }
 vtop-observe = { workspace = true }
 vtop-kafka = { workspace = true }
 vtop-protocol = { workspace = true }
+vtop-surface = { workspace = true }
 
 [dev-dependencies]
+# The command-tree half of the surface snapshot (#719).
+vtop-surface = { workspace = true, features = ["clap"] }
 tempfile = { workspace = true }
 # Only for the promotion-probe test: building a ReplicaStatusClient needs real
 # TLS material even when the point of the test is that the connection fails.

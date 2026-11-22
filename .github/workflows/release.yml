@@ -25,7 +25,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build (dry-run; no release is published)"
+        description: "Tag, branch or commit to build (dry-run; no release is published). A branch or commit builds the workspace version, so the commit about to be tagged can be checked first."
         required: true
 
 env:
@@ -53,6 +53,12 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
       latest: ${{ steps.meta.outputs.latest }}
+      # The commit this job checked out and tested. Every later job checks
+      # out the same ref from the event (not this output: a checkout taken
+      # from a job output is untrusted code to CodeQL's cache-poisoning
+      # check) and fails unless it got this SHA: a branch can move during the
+      # run, and the archives must be built from the commit that was verified.
+      sha: ${{ steps.meta.outputs.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -66,7 +72,22 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # A dispatch builds a commit the dispatcher chose, so it only reads the
+      # cache: what a dispatched build writes would be restored by the next tag
+      # build (cache poisoning). A tag push restores and saves as before.
+      - name: Restore the build cache, read only (dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Restore and save the build cache
+        if: github.event_name != 'workflow_dispatch'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -98,17 +119,35 @@ jobs:
         env:
           INPUT_TAG: ${{ github.event.inputs.tag }}
           REF_NAME: ${{ github.ref_name }}
+          EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
           ref="${INPUT_TAG:-$REF_NAME}"
-          version="${ref#v}"
-          # Cross-check the tag against the workspace version so a mistagged
-          # release fails loudly instead of shipping mislabeled artifacts.
           cargo_version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
-          if [ "$version" != "$cargo_version" ]; then
-            echo "::error::tag version ($version) != workspace Cargo.toml version ($cargo_version)"
-            exit 1
-          fi
+          case "$ref" in
+            v[0-9]*)
+              version="${ref#v}"
+              # Cross-check the tag against the workspace version so a
+              # mistagged release fails loudly instead of shipping
+              # mislabeled artifacts.
+              if [ "$version" != "$cargo_version" ]; then
+                echo "::error::tag version ($version) != workspace Cargo.toml version ($cargo_version)"
+                exit 1
+              fi
+              ;;
+            *)
+              # A dry run of a branch or commit, before its tag exists
+              # (#724): every check of the archives runs on the commit that
+              # is about to be tagged. It is labelled with the workspace
+              # version; a dispatch publishes nothing.
+              if [ "$EVENT" != workflow_dispatch ]; then
+                echo "::error::$ref is not a v* tag"
+                exit 1
+              fi
+              version="$cargo_version"
+              echo "dry run of $ref (not a tag): building workspace version $version"
+              ;;
+          esac
           # A pre-release SUFFIX (-alpha, -rc.1, ...) publishes as a GitHub
           # pre-release. A 0.x major does NOT.
           #
@@ -128,8 +167,11 @@ jobs:
           else
             prerelease=false
           fi
-          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          {
+            echo "prerelease=$prerelease"
+            echo "version=$version"
+            echo "sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
           # `latest` (the image tag, and GitHub's "Latest release") names the
           # NEWEST final release, not the one tagged most recently: a 0.9.1
           # fix cut after 0.10.0 must not pull `latest` back to the older
@@ -197,9 +239,33 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          # On workflow_dispatch, build the requested tag rather than the
-          # default branch, so a dry-run validates the real release ref.
+          # The ref `verify` checked out (the tag, or on a dispatch the
+          # input), resolved here from the event, never from a job output; the
+          # next step requires it to be the commit `verify` tested.
           ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: The checkout is the commit verify tested
+        shell: bash
+        env:
+          VERIFIED: ${{ needs.verify.outputs.sha }}
+        run: |
+          # A branch that moved after verify ran fails here, rather than
+          # building a commit that was not tested.
+          head=$(git rev-parse HEAD)
+          if [ "$head" != "$VERIFIED" ]; then
+            echo "::error::checked out $head, but verify tested $VERIFIED (the ref moved during the run); dispatch again"
+            exit 1
+          fi
+
+      # The build time a build records is the tagged commit's time, not the
+      # clock's (#731). The vendored OpenSSL in vtopctl stores a "built on"
+      # date; with the clock's, every build of one tag differed (the v0.10.3
+      # dry run: vtop-node identical on all six targets, vtopctl different on
+      # each, by that date and the build id and string layout that follow
+      # from it). SOURCE_DATE_EPOCH is what OpenSSL's build reads instead.
+      # The `reproduce` job below sets it the same way; change both together.
+      - name: Pin the recorded build time to the commit
+        shell: bash
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -258,7 +324,7 @@ jobs:
         run: |
           set -euo pipefail
           docker run --rm \
-            -e TARGET -e CARGO_TERM_COLOR -e RUST_BACKTRACE -e CARGO_INCREMENTAL \
+            -e TARGET -e CARGO_TERM_COLOR -e RUST_BACKTRACE -e CARGO_INCREMENTAL -e SOURCE_DATE_EPOCH \
             -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
             -e CARGO_HOME=/cargo -e RUSTUP_HOME=/rustup \
             -v "${CARGO_HOME:-$HOME/.cargo}:/cargo" \
@@ -312,7 +378,7 @@ jobs:
           # The exact version the toolchain step resolved for the other legs.
           rust_version="$(rustc --version | awk '{ print $2 }')"
           docker run --rm \
-            -e TARGET -e CARGO_TERM_COLOR -e RUST_BACKTRACE -e CARGO_INCREMENTAL \
+            -e TARGET -e CARGO_TERM_COLOR -e RUST_BACKTRACE -e CARGO_INCREMENTAL -e SOURCE_DATE_EPOCH \
             -e RUST_VERSION="$rust_version" -e LIBZ_SYS_STATIC=1 \
             -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
             -v "$GITHUB_WORKSPACE:/src" -w /src \
@@ -625,11 +691,448 @@ jobs:
             docker run --rm -e EXPECTED_VERSION -v "$dir:/a:ro" -v "$smoke:/smoke.sh:ro" "$image" sh /smoke.sh
           done
 
+      # The archive against a live broker (#724). The round trip above never
+      # touches Kafka, and the Kafka source is the path scripts/e2e-smoke.sh
+      # exists for: its ingestion once shipped broken with every test green,
+      # because nothing ran the built engine against a broker. This runs the
+      # ARCHIVE's vtopctl on this runner (x86_64 or aarch64, glibc or musl)
+      # against a single-node Kafka: 200 records in, archived to a local
+      # directory, and then the consumer group's committed offset must be the
+      # end of the topic. The engine commits an offset only after the batch is
+      # VERIFIED, so a group at 200 is the proof the whole path ran; the
+      # coverage audit and the scrub then check the ledger and every object.
+      # Linux only: the macOS runners have no Docker. Inline, not a script, so
+      # a dispatch dry-run of an older tag runs it too.
+      - name: Smoke the archive against Kafka (Linux, #724)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          ARCHIVE: ${{ steps.pkg.outputs.artifact }}
+          # The broker the kafka-integration job runs; a multi-arch index,
+          # pinned by digest.
+          KAFKA_IMAGE: apache/kafka:4.3.1@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837
+        run: |
+          set -euo pipefail
+          x="$RUNNER_TEMP/kafka-smoke"
+          rm -rf "$x" && mkdir -p "$x/archive" "$x/out" "$x/work"
+          tar -xzf "$ARCHIVE" -C "$x/archive"
+          A="$x/archive/$(basename "$ARCHIVE" .tar.gz)"
+          docker run -d --name vtop-smoke-kafka -p 127.0.0.1:9092:9092 \
+            -e KAFKA_NODE_ID=1 \
+            -e KAFKA_PROCESS_ROLES=broker,controller \
+            -e KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
+            -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://127.0.0.1:9092 \
+            -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
+            -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+            -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+            -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+            -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
+            -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
+            -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
+            "$KAFKA_IMAGE" >/dev/null
+          trap 'docker rm -f vtop-smoke-kafka >/dev/null 2>&1 || true' EXIT
+          k() { docker exec -i vtop-smoke-kafka "$@"; }
+          bin=/opt/kafka/bin
+          up=false
+          for _ in $(seq 1 60); do
+            if k "$bin/kafka-topics.sh" --bootstrap-server localhost:9092 --list >/dev/null 2>&1; then
+              up=true
+              break
+            fi
+            sleep 2
+          done
+          "$up" || { echo "::error::the broker did not come up"; docker logs --tail 50 vtop-smoke-kafka; exit 1; }
+          k "$bin/kafka-topics.sh" --bootstrap-server localhost:9092 --create \
+            --topic smoke_events --partitions 1 --replication-factor 1
+          i=1
+          while [ "$i" -le 200 ]; do
+            printf 'CEF:0|VTOP|smoke|1.0|100|event %d|3|src=10.0.0.1 cnt=%d\n' "$i" "$i"
+            i=$((i + 1))
+          done >"$x/events.cef"
+          k "$bin/kafka-console-producer.sh" --bootstrap-server localhost:9092 \
+            --topic smoke_events <"$x/events.cef"
+          # A fresh broker creates the group coordinator lazily, and until it
+          # exists a consumer gets NotCoordinator (see ci.yml's kafka
+          # integration job); one read under a throwaway group creates it.
+          k "$bin/kafka-console-consumer.sh" --bootstrap-server localhost:9092 \
+            --topic smoke_events --group smoke-warmup --from-beginning \
+            --max-messages 1 --timeout-ms 30000 >/dev/null
+          cat >"$x/config.yaml" <<CONFIG
+          engine:
+            name: smoke
+            tenant: default
+            state_store: "sqlite://$x/state.db"
+            work_dir: $x/work
+            log_level: warn
+          batching:
+            max_records: 1000
+            max_bytes: 1048576
+            max_batch_age_seconds: 1
+          compression:
+            type: gzip
+            level: 6
+          checksum:
+            algorithm: sha256
+          sources:
+            kafka:
+              enabled: true
+              # An address, not the name localhost: the static musl builds
+              # resolve localhost to ::1 only, and the broker is published on
+              # IPv4 (127.0.0.1:9092), so a musl engine never reached it.
+              bootstrap_servers: ["127.0.0.1:9092"]
+              consumer_group: vtop-smoke
+              topic_include_regex: "^smoke_events$"
+              topic_exclude_regex: "^__.*"
+              auto_offset_reset: earliest
+              enable_auto_commit: false
+          upload:
+            backend: localfs
+            local_path: $x/out
+            bucket: smoke
+            prefix: ""
+          CONFIG
+          "$A/vtopctl" --version
+          "$A/vtopctl" validate --config "$x/config.yaml"
+          # One cycle may end before the batch seals or the group settles;
+          # a few cycles drain the topic.
+          offset=none
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            "$A/vtopctl" process-once --source kafka --config "$x/config.yaml" \
+              || echo "process-once cycle $attempt failed; running another"
+            offset="$(k "$bin/kafka-consumer-groups.sh" --bootstrap-server localhost:9092 \
+              --describe --group vtop-smoke 2>/dev/null | awk '$2 == "smoke_events" {print $4}')"
+            [ "$offset" = 200 ] && break
+            sleep 2
+          done
+          [ "$offset" = 200 ] || { echo "::error::the group's committed offset is ${offset:-none}, not 200"; exit 1; }
+          echo "consumer group vtop-smoke committed offset 200 of 200"
+          "$A/vtopctl" audit-coverage --check-storage --config "$x/config.yaml"
+          "$A/vtopctl" scrub --config "$x/config.yaml"
+          # Every record is in an archived object, once: the objects the
+          # ledger names, unpacked, hold the 200 input lines (sorted, since
+          # several cycles may have made several batches).
+          uris="$("$A/vtopctl" list-batches --json --config "$x/config.yaml" \
+            | sed -n 's|^ *"object_uri": "s3://\(.*\)",\{0,1\}$|\1|p')"
+          [ -n "$uris" ] || { echo "::error::the ledger names no archived object"; exit 1; }
+          while IFS= read -r uri; do
+            gzip -dc "$x/out/$uri"
+          done <<<"$uris" | sort >"$x/archived.sorted"
+          sort "$x/events.cef" | cmp -s - "$x/archived.sorted" \
+            || { echo "::error::the archived objects do not hold the 200 records exactly once"; exit 1; }
+          echo "the archived objects hold the 200 records, each once"
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ env.BUNDLE_NAME }}-${{ matrix.target }}
           path: ${{ steps.pkg.outputs.artifact }}
           if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Reproducibility check (#731). REPORT ONLY: it never gates a release.
+  #
+  # Rebuilds each target from the same tag on a second, clean runner and
+  # compares the binaries with the ones inside the archive the `binaries` job
+  # built, by SHA-256. It is not a `needs` of `release`, `continue-on-error`
+  # keeps a difference from turning the run red, and its uploads are named
+  # `repro-*` so the release job's `vtop-engine-*` download never sweeps them
+  # into the published assets.
+  #
+  # What is compared: the two binaries. The tarball itself is not, because
+  # `tar` and `gzip` write file times and a gzip header time, so two correct
+  # builds of one tree give two different archive hashes; the archive's
+  # integrity is what SHA256SUMS and the attestation are for.
+  #
+  # Known drift, by design not pinned yet (a difference below is expected to
+  # come from one of these; the job prints each one's version so a run can be
+  # read without rebuilding):
+  #   - the Rust toolchain: `stable` moves every six weeks;
+  #   - the distribution packages installed into the build image (manylinux2014:
+  #     perl-core and libcurl-devel from CentOS 7's vault; Alpine: build-base,
+  #     cmake, perl, linux-headers and curl-dev; both images are pinned by
+  #     digest, the packages are whatever the mirrors serve that day);
+  #   - macOS: the runner image's Xcode and SDK, and Homebrew's cmake.
+  # If a run shows drift, pin the input in this file (the `binaries` job and
+  # this one together), never repository-wide.
+  #
+  # The build time is pinned (SOURCE_DATE_EPOCH, the commit's time): the
+  # first run (v0.10.3's dry run) found every vtopctl different only by the
+  # date its vendored OpenSSL records, and every vtop-node identical.
+  #
+  # The build recipes below (macOS, Linux glibc inside manylinux2014, Linux
+  # musl inside Alpine, and every matrix `build_image`) are copies of the
+  # `binaries` job's, apart from the lines that record the inputs: a change to
+  # one must be made in the other, or this job compares unlike builds.
+  # ---------------------------------------------------------------------------
+  reproduce:
+    name: reproduce ${{ matrix.target }} (report only)
+    needs: [verify, binaries]
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The same six legs and the same build images (digests included) as
+          # the `binaries` job's matrix.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            build_image: quay.io/pypa/manylinux2014_x86_64@sha256:e6a785657009c612fe2a85fa933051d03a50ba62b1c5e47d62abcab546a2e423
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            build_image: quay.io/pypa/manylinux2014_aarch64@sha256:c2995cae5e2d433fbe757d1466486727b3edd68ba644cd60df253365f35fda9e
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            build_image: rust:1-alpine@sha256:8d0e82abfdf9a38071e07cabc5afba4ddbe077631a80e4e742a760c38beadc33
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            build_image: rust:1-alpine@sha256:8d0e82abfdf9a38071e07cabc5afba4ddbe077631a80e4e742a760c38beadc33
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The ref `verify` checked out, resolved from the event; the next
+          # step requires it to be the commit `verify` tested.
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: The checkout is the commit verify tested
+        shell: bash
+        env:
+          VERIFIED: ${{ needs.verify.outputs.sha }}
+        run: |
+          # A branch that moved after verify ran fails here, rather than
+          # building a commit that was not tested.
+          head=$(git rev-parse HEAD)
+          if [ "$head" != "$VERIFIED" ]; then
+            echo "::error::checked out $head, but verify tested $VERIFIED (the ref moved during the run); dispatch again"
+            exit 1
+          fi
+
+      # As in the `binaries` job: the recorded build time is the commit's.
+      - name: Pin the recorded build time to the commit
+        shell: bash
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ env.BUNDLE_NAME }}-${{ matrix.target }}
+          path: original
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          brew untap aws/tap 2>/dev/null || true
+          brew install cmake
+          echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          cargo build --release --bin vtop-node --bin vtopctl --target ${{ matrix.target }} --locked
+          mkdir -p repro
+          {
+            echo "SOURCE_DATE_EPOCH: $SOURCE_DATE_EPOCH"
+            echo "rustc: $(rustc --version)"
+            echo "cargo: $(cargo --version)"
+            echo "macOS: $(sw_vers -productVersion), $(clang --version | head -1)"
+            echo "sdk: $(xcrun --show-sdk-version)"
+            echo "cmake: $(brew list --versions cmake)"
+          } | tee repro/inputs.txt
+
+      # The `binaries` job's Linux glibc recipe: the same image, mounts, packages
+      # and build command. Only the `repro/inputs.txt` lines record the inputs.
+      - name: Build (Linux glibc, inside manylinux2014)
+        if: endsWith(matrix.target, '-linux-gnu')
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          BUILD_IMAGE: ${{ matrix.build_image }}
+        run: |
+          set -euo pipefail
+          mkdir -p repro
+          echo "image: $BUILD_IMAGE" > repro/inputs.txt
+          echo "SOURCE_DATE_EPOCH: $SOURCE_DATE_EPOCH" >> repro/inputs.txt
+          docker run --rm \
+            -e TARGET -e CARGO_TERM_COLOR -e RUST_BACKTRACE -e CARGO_INCREMENTAL -e SOURCE_DATE_EPOCH \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            -e CARGO_HOME=/cargo -e RUSTUP_HOME=/rustup \
+            -v "${CARGO_HOME:-$HOME/.cargo}:/cargo" \
+            -v "${RUSTUP_HOME:-$HOME/.rustup}:/rustup" \
+            -v "$GITHUB_WORKSPACE:/src" -w /src \
+            "$BUILD_IMAGE" bash -c '
+              set -euo pipefail
+              for i in 1 2 3; do
+                yum -y -q install perl-core libcurl-devel && break
+                [ "$i" = 3 ] && { echo "yum install failed 3 times" >&2; exit 1; }
+                sleep 15
+              done
+              trap "chown -R \"\$HOST_UID:\$HOST_GID\" /src/target /src/repro /cargo/registry /cargo/git 2>/dev/null || true" EXIT
+              export PATH="/cargo/bin:$PATH"
+              echo "$(getconf GNU_LIBC_VERSION), gcc $(gcc -dumpfullversion), $(cmake --version | head -n1)"
+              cargo --version
+              cargo build --release --bin vtop-node --bin vtopctl --target "$TARGET" --locked
+              {
+                echo "rustc: $(rustc --version)"
+                echo "cargo: $(cargo --version)"
+                echo "glibc: $(getconf GNU_LIBC_VERSION), gcc $(gcc -dumpfullversion)"
+                echo "cmake: $(cmake --version | head -n1)"
+                rpm -q perl-core libcurl-devel
+              } | tee -a /src/repro/inputs.txt
+            '
+
+      # The `binaries` job's Linux musl recipe: the same image, packages,
+      # toolchain install and build command. Only the `repro/inputs.txt` lines
+      # record the inputs.
+      - name: Build (Linux musl, static, inside Alpine)
+        if: endsWith(matrix.target, '-linux-musl')
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          BUILD_IMAGE: ${{ matrix.build_image }}
+        run: |
+          set -euo pipefail
+          mkdir -p repro
+          echo "image: $BUILD_IMAGE" > repro/inputs.txt
+          echo "SOURCE_DATE_EPOCH: $SOURCE_DATE_EPOCH" >> repro/inputs.txt
+          # The exact version the toolchain step resolved for the other legs.
+          rust_version="$(rustc --version | awk '{ print $2 }')"
+          docker run --rm \
+            -e TARGET -e CARGO_TERM_COLOR -e RUST_BACKTRACE -e CARGO_INCREMENTAL -e SOURCE_DATE_EPOCH \
+            -e RUST_VERSION="$rust_version" -e LIBZ_SYS_STATIC=1 \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            -v "$GITHUB_WORKSPACE:/src" -w /src \
+            "$BUILD_IMAGE" sh -c '
+              set -eu
+              i=1
+              until apk add --no-cache -q build-base cmake perl linux-headers curl-dev; do
+                [ "$i" = 3 ] && { echo "apk add failed 3 times" >&2; exit 1; }
+                i=$((i + 1)); sleep 15
+              done
+              trap "chown -R \"\$HOST_UID:\$HOST_GID\" /src/target /src/repro 2>/dev/null || true" EXIT
+              rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
+              echo "Alpine $(cat /etc/alpine-release), musl $(apk info -e -v musl | sed "s/^musl-//"), gcc $(gcc -dumpfullversion), $(cmake --version | head -n1)"
+              cargo +"$RUST_VERSION" --version
+              cargo +"$RUST_VERSION" build --release --bin vtop-node --bin vtopctl --target "$TARGET" --locked
+              {
+                echo "rustc: $(rustc +"$RUST_VERSION" --version)"
+                echo "cargo: $(cargo +"$RUST_VERSION" --version)"
+                echo "Alpine $(cat /etc/alpine-release), musl $(apk info -e -v musl | sed "s/^musl-//"), gcc $(gcc -dumpfullversion)"
+                echo "cmake: $(cmake --version | head -n1)"
+                apk info -v build-base cmake perl linux-headers curl-dev
+              } | tee -a /src/repro/inputs.txt
+            '
+
+      # Reads the original binaries back out of the archive the `binaries` job
+      # built, so it judges exactly what would ship. Exits non-zero on any
+      # difference: that shows as a red job here and nowhere else.
+      - name: Compare with the archive the release job would publish
+        id: compare
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          sha() { if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
+          # The first "rustc version ..." string in a binary, if it has one.
+          # No `grep -m1` / `head` after `strings`: under pipefail an early
+          # exit would turn the SIGPIPE into a failure.
+          rustc_in() {
+            local v
+            v="$(strings -a "$1" | grep -E '^rustc version ' || true)"
+            printf '%s\n' "${v%%$'\n'*}"
+          }
+          archive="original/${BUNDLE_NAME}-${VERSION}-${TARGET}.tar.gz"
+          [ -f "$archive" ] || { echo "::error::$archive is not in the downloaded artifact"; ls -la original; exit 1; }
+          mkdir -p repro/original
+          tar -xzf "$archive" -C repro/original
+          orig="repro/original/${BUNDLE_NAME}-${VERSION}-${TARGET}"
+          differ=0
+          {
+            echo "### reproduce \`$TARGET\` ($VERSION)"
+            echo
+            echo "| binary | original build | rebuild | |"
+            echo "|---|---|---|---|"
+          } > repro/report.md
+          for bin in vtop-node vtopctl; do
+            o="$orig/$bin"
+            r="target/$TARGET/release/$bin"
+            so="$(sha "$o")"; sr="$(sha "$r")"
+            if [ "$so" = "$sr" ]; then
+              verdict="identical"
+            else
+              verdict="DIFFERENT"
+              differ=1
+              {
+                echo "$bin differs: original $(wc -c <"$o" | tr -d ' ') bytes, rebuild $(wc -c <"$r" | tr -d ' ') bytes, $(cmp -l "$o" "$r" 2>/dev/null | wc -l | tr -d ' ' || true) differing byte positions"
+                # A Linux Rust binary carries its compiler version, which says
+                # at once whether the toolchain moved between the two builds.
+                # (A macOS binary has no such string; the inputs list does.)
+                echo "  original: $(rustc_in "$o")"
+                echo "  rebuild:  $(rustc_in "$r")"
+              } >> repro/differences.txt
+            fi
+            echo "| \`$bin\` | \`$so\` | \`$sr\` | $verdict |" >> repro/report.md
+          done
+          {
+            echo
+            echo "Archive \`$(basename "$archive")\` (not compared: tar and gzip headers carry file times): \`$(sha "$archive")\`"
+            echo
+            echo "Inputs of the rebuild (compare with the log of the \`build $TARGET\` job):"
+            echo
+            echo '```'
+            cat repro/inputs.txt
+            echo '```'
+            if [ "$differ" = 1 ]; then
+              echo
+              echo "**Drift.** The rebuild differs. Unpinned inputs that can cause it: the Rust toolchain (\`stable\`), the distribution packages installed into the build image (manylinux2014 or Alpine), and the macOS runner image with Homebrew's cmake. Details:"
+              echo
+              echo '```'
+              cat repro/differences.txt
+              echo '```'
+            fi
+          } >> repro/report.md
+          cat repro/report.md >> "$GITHUB_STEP_SUMMARY"
+          if [ "$differ" = 1 ]; then
+            echo "::warning::$TARGET did not reproduce; see the job summary. Report only: the release is not affected."
+          fi
+          exit "$differ"
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: repro-report-${{ matrix.target }}
+          path: |
+            repro/report.md
+            repro/inputs.txt
+            repro/differences.txt
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # The rebuilt binaries, kept only when they differ, so the difference can
+      # be taken apart later (diffoscope, objdump) without another rebuild.
+      - name: Upload the rebuilt binaries (only on a difference)
+        if: failure() && steps.compare.outcome == 'failure'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: repro-binaries-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/vtop-node
+            target/${{ matrix.target }}/release/vtopctl
+          if-no-files-found: ignore
+          retention-days: 14
 
   # ---------------------------------------------------------------------------
   # Multi-arch container image -> GHCR, with build-time SBOM + provenance
@@ -670,9 +1173,22 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          # On workflow_dispatch, build the requested tag rather than the
-          # default branch, so a dry-run validates the real release ref.
+          # The ref `verify` checked out (the tag, or on a dispatch the
+          # input), resolved here from the event, never from a job output; the
+          # next step requires it to be the commit `verify` tested.
           ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: The checkout is the commit verify tested
+        shell: bash
+        env:
+          VERIFIED: ${{ needs.verify.outputs.sha }}
+        run: |
+          # A branch that moved after verify ran fails here, rather than
+          # building a commit that was not tested.
+          head=$(git rev-parse HEAD)
+          if [ "$head" != "$VERIFIED" ]; then
+            echo "::error::checked out $head, but verify tested $VERIFIED (the ref moved during the run); dispatch again"
+            exit 1
+          fi
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
@@ -704,7 +1220,9 @@ jobs:
           provenance: mode=max
           # Per-arch cache scopes so the two builds stop evicting each other.
           cache-from: type=gha,scope=docker-${{ matrix.platform }}
-          cache-to: type=gha,mode=max,scope=docker-${{ matrix.platform }}
+          # Not exported on a dispatch: the layers of a commit the dispatcher
+          # chose must not be restored by a later tag build.
+          cache-to: ${{ github.event_name != 'workflow_dispatch' && format('type=gha,mode=max,scope=docker-{0}', matrix.platform) || '' }}
 
       - name: Export digest
         if: github.event_name != 'workflow_dispatch'
@@ -917,9 +1435,22 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          # On workflow_dispatch, build the requested tag rather than the
-          # default branch, so a dry-run validates the real release ref.
+          # The ref `verify` checked out (the tag, or on a dispatch the
+          # input), resolved here from the event, never from a job output; the
+          # next step requires it to be the commit `verify` tested.
           ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: The checkout is the commit verify tested
+        shell: bash
+        env:
+          VERIFIED: ${{ needs.verify.outputs.sha }}
+        run: |
+          # A branch that moved after verify ran fails here, rather than
+          # building a commit that was not tested.
+          head=$(git rev-parse HEAD)
+          if [ "$head" != "$VERIFIED" ]; then
+            echo "::error::checked out $head, but verify tested $VERIFIED (the ref moved during the run); dispatch again"
+            exit 1
+          fi
       - name: Generate SBOM
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
@@ -950,8 +1481,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          # On workflow_dispatch, build the requested tag rather than the
-          # default branch, so a dry-run validates the real release ref.
+          # The ref `verify` checked out (the tag, or on a dispatch the
+          # input), resolved here from the event, never from a job output; the
+          # next step requires it to be the commit `verify` tested.
           ref: ${{ github.event.inputs.tag || github.ref }}
           # FULL history, not the default shallow clone. The changelog is
           # computed from `git log <previous-tag>..<tag>`, and a depth-1
@@ -959,6 +1491,18 @@ jobs:
           # single entry (its own release commit) instead of the twelve pull
           # requests it actually contained.
           fetch-depth: 0
+      - name: The checkout is the commit verify tested
+        shell: bash
+        env:
+          VERIFIED: ${{ needs.verify.outputs.sha }}
+        run: |
+          # A branch that moved after verify ran fails here, rather than
+          # building a commit that was not tested.
+          head=$(git rev-parse HEAD)
+          if [ "$head" != "$VERIFIED" ]; then
+            echo "::error::checked out $head, but verify tested $VERIFIED (the ref moved during the run); dispatch again"
+            exit 1
+          fi
 
       # Only pull the artifacts we intend to publish. build-push-action uploads a
       # `*.dockerbuild` build record by default, and an unfiltered download would

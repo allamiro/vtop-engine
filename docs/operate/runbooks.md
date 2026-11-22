@@ -332,3 +332,115 @@ abandon window, as a backstop.
 
 **When it is safe to ignore.** When the bucket's lifecycle rule is known to
 clean up incomplete uploads and the cost of a day's parts is acceptable.
+
+## VtopBucketVersioningPaused
+
+**What it means.** With `upload.require_object_versioning` set, a bucket
+stopped keeping object versions under a running engine: an object or
+manifest PUT returned no version to pin, or the store answered
+GetBucketVersioning that versioning is not enabled. Someone suspended (or
+never enabled) the bucket's versioning. A manifest the bucket does not keep a
+version of cannot be pinned, so nothing in that bucket can commit.
+
+**What the engine already did.** It stopped writing to the bucket. Each batch
+for it fails before its first PUT and is replayed
+(`vtop_bucket_versioning_paused_batches_total`), so the bucket does not grow
+with a new manifest per retry. The batches that were already uploading when
+versioning was turned off wrote at most one object or manifest each, and
+committed nothing. The engine asks the store for the bucket's versioning 5 s
+after it stopped, then on a backoff doubling to 60 s, and resumes writing when
+the answer is `Enabled`: an INFO `bucket_versioning_resumed` line, and the
+gauge drops. The ERROR `bucket_versioning_paused` line names the bucket, the
+cause, and repeats at most once a minute per bucket while it stays off.
+
+**What to check.** Who changed the bucket's versioning, and whether on
+purpose: an unexpected change to versioning is a tampering signal (see
+[Tamper evidence](../reference/tamper-evidence.md)). `GetBucketVersioning` on
+the bucket named in the ERROR line.
+
+**What to do.** Re-enable versioning on the bucket (PutBucketVersioning with
+Status=Enabled). The engine resumes within about two minutes (its next
+check comes at most 60 s after the last, and the batch that makes it at most
+60 s after that) and replays what failed meanwhile; nothing to restart. If the bucket is meant to run without
+versioning, set `upload.require_object_versioning: false` and restart, which
+gives up version pinning ([Security model](../SECURITY_MODEL.md) §8.1).
+
+**When it is safe to ignore.** Never: the engine archives nothing into that
+bucket until it is fixed, and the sources keep the data only as long as their
+retention does.
+
+## VtopStateStoreWritesSlow
+
+**What it means.** For 15 minutes on end, more than 5% of the batches the
+engine committed in the last 15 minutes spent more than a second in their
+ledger writes (`vtop_stage_duration_seconds{stage="state_write"}`, the time of
+every state-store write a batch made, about eight, two of them synced to
+disk). Each batch waits for its writes before its next stage, so the engine
+archives more slowly than its sources write, and the backlog grows. No data is
+at risk: a write that is slow is still a write, and a write that fails fails
+the batch, which is replayed.
+
+**What the engine already did.** Nothing different: it waits for each write,
+up to `engine.state_store_timeout_seconds` (default 30), and a write that
+takes longer fails its batch. The per-batch total is in each committed
+batch's `batch_metrics` log line (`state_write_ms`).
+
+**What to check.**
+
+- For a SQLite ledger: the disk that holds it. Its latency, how full it is,
+  and whether something else on it is syncing heavily (a backup, another
+  database).
+- For PostgreSQL: the server's load, lock waits on `batches`, replication
+  waits if the server waits for a synchronous standby, and the network
+  round trip from the engine.
+- The engine dashboard's "Per-stage p95" panel (the `state_write` line),
+  against the batch rate: a rise that follows the batch rate is load; one
+  that does not is the store.
+
+**What to do.** Fix what slows the store: move the SQLite ledger to a faster
+local disk, or relieve the PostgreSQL server. Larger batches (`batching.
+max_records`, `batching.max_bytes`) make fewer ledger writes for the same
+data. Pruning the ledger (`vtopctl prune-ledger`) keeps its indexes small.
+
+**When it is safe to ignore.** On a store known to be slow, when the engine
+still keeps up with its sources (no `VtopSourceLagGrowing`, no
+`VtopNoCommits`): raise the second, or the 5%, in the rule to what that store
+does.
+
+## VtopEpochHistoryBroken
+
+**What it means.** A write to a data node replica's epoch journal failed,
+usually because its data directory filled up. The journal records which
+fencing epoch wrote each stretch of the replica's log; with a write missing,
+that record may have a hole, and a replica reconciled against a history with
+a hole could be told to keep or discard the wrong records.
+
+**What the node already did.** It marked the history broken and logged one
+ERROR line naming the replica, the range and the write that failed. From then
+on it answers every fence and promotion probe with no history, so no leader
+gives it a replication session and no promotion counts its offset. The range
+runs with one replica fewer than configured. Nothing is lost by this, but the
+next failure of another replica can leave the range without a quorum.
+The mark is kept on disk beside the journal, as `fencing-epochs.broken` in
+the replica's data directory, so neither freeing space nor a restart clears
+it: a restarted node logs the ERROR again ("marked broken in an earlier run")
+and keeps refusing. If the disk was too full to take the mark either, the node
+says so in a warning, retries on every fence and append, and writes it as soon
+as space is back. Do not restart it before that warning stops.
+
+**What to check.** The ERROR line on that node (`its epoch history could not
+be written`), its free disk space, and `vtop_broker_follower_connected` on the
+leader, which shows the replica without a session.
+
+**What to do.** Free space on the replica's data directory, or fix the storage
+fault. Then stop it and rebuild its range from a replica whose history is
+intact with `vtopctl node repair` (see the repair procedure in
+[`PRODUCTION_HA.md`](../PRODUCTION_HA.md)), and start it against the repaired
+directory. The repaired directory carries the source's history and no mark;
+the replica rejoins through an ordinary session and catches up. Do not delete
+`fencing-epochs.broken` by hand to bring the old directory back: the history
+beside it may have the hole the mark is there to refuse.
+
+**When it is safe to ignore.** Never while the range is meant to run at its
+full replication factor. Why the node does not repair itself once space is
+back is in [the design note](../EPOCH_HISTORY_AFTER_A_FAILED_WRITE.md).

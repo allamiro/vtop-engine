@@ -114,6 +114,7 @@ impl UploadBackend for MinioBackend {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
             checksum_sha256: None,
+            encryption: None,
         })
     }
 
