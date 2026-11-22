@@ -53,6 +53,10 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
       latest: ${{ steps.meta.outputs.latest }}
+      # The commit this job checked out and tested. Every later job checks
+      # out this SHA, not the input again: a branch can move during the run,
+      # and the archives must be built from the commit that was verified.
+      sha: ${{ steps.meta.outputs.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -146,8 +150,11 @@ jobs:
           else
             prerelease=false
           fi
-          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          {
+            echo "prerelease=$prerelease"
+            echo "version=$version"
+            echo "sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
           # `latest` (the image tag, and GitHub's "Latest release") names the
           # NEWEST final release, not the one tagged most recently: a 0.9.1
           # fix cut after 0.10.0 must not pull `latest` back to the older
@@ -215,9 +222,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          # On workflow_dispatch, build the requested tag rather than the
-          # default branch, so a dry-run validates the real release ref.
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          # The commit `verify` checked out and tested (the tag's, or on a
+          # dispatch the input's), never the input resolved again.
+          ref: ${{ needs.verify.outputs.sha }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -839,7 +846,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ needs.verify.outputs.sha }}
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -1096,9 +1103,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          # On workflow_dispatch, build the requested tag rather than the
-          # default branch, so a dry-run validates the real release ref.
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          # The commit `verify` checked out and tested (the tag's, or on a
+          # dispatch the input's), never the input resolved again.
+          ref: ${{ needs.verify.outputs.sha }}
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
@@ -1343,9 +1350,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          # On workflow_dispatch, build the requested tag rather than the
-          # default branch, so a dry-run validates the real release ref.
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          # The commit `verify` checked out and tested (the tag's, or on a
+          # dispatch the input's), never the input resolved again.
+          ref: ${{ needs.verify.outputs.sha }}
       - name: Generate SBOM
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
@@ -1376,9 +1383,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          # On workflow_dispatch, build the requested tag rather than the
-          # default branch, so a dry-run validates the real release ref.
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          # The commit `verify` checked out and tested (the tag's, or on a
+          # dispatch the input's), never the input resolved again.
+          ref: ${{ needs.verify.outputs.sha }}
           # FULL history, not the default shallow clone. The changelog is
           # computed from `git log <previous-tag>..<tag>`, and a depth-1
           # checkout has no commits in that range — v0.2.0 published with a
