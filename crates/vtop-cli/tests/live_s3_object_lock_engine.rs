@@ -537,11 +537,16 @@ fn tier_request(
 /// The tier's upload config, as `vtopctl tier copy --upload-config` reads
 /// it, with the Object Lock block.
 async fn tier_backend(bucket: &str) -> std::sync::Arc<dyn vtop_upload::UploadBackend> {
+    let s = settings();
+    let endpoint = s
+        .endpoint
+        .map(|e| format!("endpoint_url: {e}\n"))
+        .unwrap_or_default();
     let upload: vtop_core::config::UploadConfig = serde_yaml::from_str(&format!(
-        "backend: s3_native\nbucket: {bucket}\nendpoint_url: {}\nforce_path_style: true\n\
-         verify_tls: false\nrequire_object_versioning: true\n\
+        "backend: s3_native\nbucket: {bucket}\n{endpoint}region: {}\n\
+         force_path_style: {}\nverify_tls: {}\nrequire_object_versioning: true\n\
          object_lock:\n  mode: governance\n  retain_days: 1\n",
-        endpoint()
+        s.region, s.force_path_style, s.verify_tls
     ))
     .unwrap();
     vtop_upload::build_backend(&upload).await.unwrap()
