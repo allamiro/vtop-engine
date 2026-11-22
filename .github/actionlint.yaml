@@ -1,0 +1,6 @@
+# Labels of self-hosted runners the workflows name. actionlint rejects a
+# runs-on label it does not know, and the 72 hour soak (soak.yml, #726) runs on
+# a machine a maintainer registers with this one.
+self-hosted-runner:
+  labels:
+    - vtop-soak
