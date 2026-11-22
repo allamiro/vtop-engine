@@ -471,3 +471,11 @@ def test_a_crash_run_with_fewer_kills_than_planned_is_left_out_of_the_totals(tmp
     assert "incomplete kill schedule" in partial.stub
     victim["kills"] = "4"
     assert any("4 kills of 3 planned" in problem for problem in KIND.check_row(victim))
+
+
+def test_a_setup_request_cannot_name_a_path_outside_the_spool_root():
+    assert generator.source_directory("file") == "file"
+    assert generator.source_directory("syslog-spool") == "syslog-spool"
+    for bad in ("../etc", "/etc", "file/../../x", "", None):
+        with pytest.raises(ValueError, match="is not one of"):
+            generator.source_directory(bad)

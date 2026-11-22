@@ -45,6 +45,7 @@ from typing import Any
 
 ACTIVE = "app.log"
 STYLES = ("rename", "copytruncate")
+SOURCES = ("file", "syslog-spool")
 APPS = ("sshd", "nginx", "kernel", "cron", "postfix", "sudo")
 HOSTS = ("edge-1", "edge-2", "core-1", "core-2")
 FILLER = "abcdefghijklmnopqrstuvwxyz0123456789" * 64
@@ -77,6 +78,15 @@ def line(seed: int, tag: str, seq: int, size: int = 200) -> str:
         raise ValueError(f"a {size}-byte line cannot hold the {len(head)}-byte header")
     offset = (x >> 40) % (len(FILLER) // 2)
     return head + FILLER[offset:offset + size - len(head)]
+
+
+def source_directory(requested: Any) -> str:
+    """The directory name for a requested source: one of SOURCES, taken from the list itself, never the
+    request's own text, so a request cannot name a path (CodeQL, review of #908)."""
+    for source in SOURCES:
+        if requested == source:
+            return source
+    raise ValueError(f"source {requested!r} is not one of {SOURCES}")
 
 
 class Spool:
@@ -211,7 +221,7 @@ def _handler(state: _State):
             try:
                 spec = json.loads(self.rfile.read(length) or b"{}")
                 if self.path == "/setup":
-                    directory = os.path.join(state.root, spec["source"])
+                    directory = os.path.join(state.root, source_directory(spec["source"]))
                     state.spool = Spool(directory, spec["rotation"], seed=int(spec["seed"]), tag=spec["tag"],
                                         line_bytes=int(spec.get("line_bytes", 200)),
                                         rotate_bytes=int(spec.get("rotate_bytes", 64 * 2**20)))
