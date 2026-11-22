@@ -11,14 +11,16 @@ SBOM. Pick the form that matches where you will run them.
 | Run on a Linux or macOS host | [Release binaries](binaries.md) | Linux x86_64 and aarch64 (glibc 2.17 or newer, or a static musl build for any Linux), macOS 11 or newer on arm64 and x86_64. Windows is not built. |
 | Run in Docker or another container runtime | [Container image](container.md) | `ghcr.io/allamiro/vtop-engine`, `linux/amd64` and `linux/arm64`. |
 | Run the cluster plane on Kubernetes | [Helm chart](helm.md) | Deploys `vtop-node`, not the archive engine. |
-| Use PostgreSQL, Kerberos, or change the build | [Build from source](from-source.md) | The published binaries and image do not include the `postgres` feature. |
+| Use PostgreSQL, Kerberos, or change the build | [Container image](container.md) or [Build from source](from-source.md) | The container image includes the `postgres` feature from the release after v0.10.2; the release binaries do not. Kerberos needs a source build. |
 
-!!! warning "PostgreSQL needs a source build"
+!!! warning "PostgreSQL: the container image, or a source build"
 
-    The release binaries and the container image are built with the default
-    features only, and a `postgres://` state store fails at startup with
-    `postgres:// state store requires a build with --features postgres`. Build
-    `vtopctl` with `--features postgres` for a PostgreSQL ledger.
+    The container image is built with the `postgres` feature from the release
+    after v0.10.2 (v0.10.2 and earlier images are not). The release binaries
+    are built with the default features only, and with them a `postgres://`
+    state store fails at startup with `postgres:// state store requires a
+    build with --features postgres`. For a PostgreSQL ledger, run the image,
+    or build `vtopctl` with `--features postgres`.
 
 <div class="grid cards" markdown>
 
