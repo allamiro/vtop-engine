@@ -167,6 +167,42 @@ Cargo dependencies are not on this list: `--locked` builds use the versions in
 `Cargo.lock`. If a run shows drift, the fix is to pin the input in
 `release.yml`, for both the `binaries` job and the `reproduce` job.
 
+### What the first run found
+
+The first run of the job, the dry run of v0.10.3 on 2026-11-22
+([run 44967350117](https://github.com/allamiro/vtop-engine/actions/runs/44967350117)),
+found one difference, and it came from none of the inputs above:
+
+| Target | `vtop-node` | `vtopctl` |
+|---|---|---|
+| `x86_64-unknown-linux-gnu` | identical | same size, 106,850 bytes differ |
+| `aarch64-unknown-linux-gnu` | identical | same size, 25 bytes differ |
+| `x86_64-unknown-linux-musl` | identical | same size, 25 bytes differ |
+| `aarch64-unknown-linux-musl` | identical | same size, 25 bytes differ |
+| `x86_64-apple-darwin` | identical | same size, 21 bytes differ |
+| `aarch64-apple-darwin` | identical | same size, 82 bytes differ |
+
+Both builds of each target used the same compiler (`rustc 1.100.0`), image
+and packages. `vtop-node` came out byte for byte the same everywhere. Every
+`vtopctl` differed in the same place: the OpenSSL it builds from source
+(`ssl-vendored`, for the Kafka client) records the time it was compiled, as
+`built on: <date> UTC`, and the two builds ran minutes apart. `strings` over
+the two copies of each target differs in that one line and nowhere else. The
+other differing bytes are the GNU build id or the Mach-O `LC_UUID` and code
+signature, which are hashes of the contents, and, on
+`x86_64-unknown-linux-gnu` only, about 4,000 pointers into the read-only data
+that moved by a few bytes without changing the file's size: data laid out
+differently around the one string that changed.
+
+Since #731, both jobs set `SOURCE_DATE_EPOCH` to the tagged commit's time,
+and OpenSSL's build records that instead of the clock, so a rebuild of the
+tag gives the same `vtopctl`. Archives built before that change (v0.10.4 and
+earlier) carry the build's own date in that string: their `vtopctl` does not
+reproduce bit for bit, while their `vtop-node` does.
+
+The archives themselves still differ between two builds, by the file times
+`tar` and `gzip` record. Compare the binaries inside, as above.
+
 ## Maturity
 
 VTOP is a **prototype / reference implementation**. Each release is signed,
