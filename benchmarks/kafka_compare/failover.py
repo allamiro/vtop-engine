@@ -750,15 +750,38 @@ def run_rep(ctx: dict, system: str, fault: str, rep: int) -> None:
 
 
 def key_mode() -> int:
-    """The mode a private key needs for the containers (user vtop, uid 10001) to read it.
+    """The mode of a private key: owner-only, everywhere.
 
-    Docker Desktop's file sharing presents a bind-mounted file as owned by the
-    user reading it, so an owner-only key is readable in the container (checked
-    with a uid-10001 container on Docker Desktop 4.99). A native Linux daemon
-    keeps the host owner, so there the key must be world-readable; the per-run
-    work directory (mkdtemp, 0700) is what keeps other host users out.
+    vtop-node refuses a TLS private key that other users can read (#732), and
+    the container's /etc/vtop/tls is not a directory closed to them, so a
+    world-readable key no longer starts a node. Docker Desktop's file sharing
+    presents a bind-mounted file as owned by the user reading it, so an
+    owner-only key is readable in the container (checked with a uid-10001
+    container on Docker Desktop 4.99). A native Linux daemon keeps the host
+    owner, so there the keys are handed to the container user instead
+    (`give_keys_to_container_user`).
     """
-    return 0o644 if platform.system() == "Linux" else 0o600
+    return 0o600
+
+
+CONTAINER_UID = 10001
+
+
+def give_keys_to_container_user(directory: str, image: str) -> None:
+    """On a native Linux daemon, make the private keys owner-only for the
+    containers' user (vtop, uid 10001), so a node and vtopctl can read them and
+    nobody else can.
+
+    Done by a root container from the image under test, since the host user
+    cannot chown to another uid. Docker Desktop needs none of this (`key_mode`).
+    The host user can still remove the files with the work directory, which it
+    owns.
+    """
+    if platform.system() != "Linux":
+        return
+    keys = sorted(name for name in os.listdir(directory) if name.endswith("-key.pem"))
+    sh(["docker", "run", "--rm", "--user", "0", "-v", f"{directory}:/certs", "--entrypoint", "sh", image, "-c",
+        f"cd /certs && chown {CONTAINER_UID}:{CONTAINER_UID} {' '.join(keys)} && chmod 0400 {' '.join(keys)}"])
 
 
 NOISE_INTERVAL_S = 30
@@ -781,13 +804,14 @@ def record_host_noise(env: dict, ctx: dict, sampler: host_noise.Sampler, path: s
     }
 
 
-def mint_certs(directory: str) -> None:
+def mint_certs(directory: str, image: str) -> None:
     sh(["bash", os.path.join(REPO, "scripts", "live-chaos", "gen-certs.sh"), directory, "1", "2", "3", "--",
         NODE_UUID[1], NODE_UUID[2], NODE_UUID[3]], env={"NATIVE_CLIENT_CN": PRINCIPAL_UUID})
     # The CA key signs nothing after minting; removed, no container can see it.
     os.remove(os.path.join(directory, "ca-key.pem"))
     for name in os.listdir(directory):
         os.chmod(os.path.join(directory, name), key_mode() if name.endswith("-key.pem") else 0o644)
+    give_keys_to_container_user(directory, image)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -829,7 +853,7 @@ def main(argv: list[str] | None = None) -> int:
     work = args.work_dir or tempfile.mkdtemp(prefix="kc-failover-")
     os.makedirs(work, exist_ok=True)
     certs = os.path.join(work, "certs")
-    mint_certs(certs)
+    mint_certs(certs, vtop_image)
     total = args.rate * (WARMUP_S + PRE_S + POST_S)
     matrix = {"systems": systems, "faults": faults, "repetitions": args.reps, "offered_rate": args.rate,
               "records_per_repetition": total, "warmup_s": WARMUP_S, "pre_s": PRE_S, "post_s": POST_S,

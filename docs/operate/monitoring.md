@@ -52,6 +52,7 @@ These carry the commit rule:
 | `vtop_replay_required_total`, `vtop_failed_total` | Work repeated, batches failed. |
 | `vtop_stage_duration_seconds{stage}`, `vtop_batch_duration_seconds` | Where time goes, per stage and end to end. |
 | `vtop_upload_throttled_total`, `vtop_upload_width` | The object store asking for less concurrency, and the width in flight. |
+| `vtop_sealed_batches_in_flight` | Batches sealed and not yet settled: uploading, verifying, or verified and waiting for a batch sealed before them to settle. It stays at or below the upload width plus the windows one pass seals; pinned there while `vtop_commits_total` stops rising is a store that does not answer. |
 
 Counters are per process: a restart starts them again from zero. Labels are
 bounded (`tenant`, `source_type`, `format`, `stage`, `state`); batch ids and

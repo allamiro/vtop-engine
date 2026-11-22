@@ -24,9 +24,12 @@ failure logs with the batch id beside it, for example
 and the stage timings `compress_ms`, `checksum_ms`, `object_upload_ms`,
 `manifest_upload_ms`, `verify_ms`, `commit_ms` (the source commit) and
 `state_write_ms` (all ledger writes of the batch), in whole milliseconds, so a
-stage faster than 1 ms reads `0`. `object_reused=true` means the object was
-already archived and verified, so `object_upload_ms` is `0` and nothing was
-uploaded. The same stage timings feed `vtop_stage_duration_seconds{stage}` on
+stage faster than 1 ms reads `0`. The object's check is sent as soon as the
+object is uploaded and runs while the manifest is written, so `verify_ms`
+(the whole object check plus the manifest's) overlaps `manifest_upload_ms`,
+and the stage timings can add up to more than `total_ms`. `object_reused=true`
+means the object was already archived and verified, so `object_upload_ms` is
+`0` and nothing was uploaded. The same stage timings feed `vtop_stage_duration_seconds{stage}` on
 the [metrics endpoint](monitoring.md), which only `run` serves. A batch whose
 source commit failed or is held back logs no `batch_metrics`; it stays
 `VERIFIED` and logs why.

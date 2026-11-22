@@ -16,9 +16,16 @@ has been verified.
 [![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org)
 [![Status: prototype](https://img.shields.io/badge/status-prototype-blue.svg)](#status-and-limits)
 
-[The rule](#the-one-rule) · [Evidence](#evidence) · [Quick start](#quick-start) · [How it works](#how-it-works) · [Documentation](#documentation)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/card-hero-dark.svg">
+  <img alt="Prototype, 0.x. Source progress moves only after the stored object is verified. The rule: SOURCE_COMMITTED is forbidden until VERIFIED is true. Measured, not claimed (single host, indicative, not a production benchmark). Acknowledged records lost or duplicated, VTOP: 0 lost, 0 duplicated. 15 leader failovers, 7,125,000 records read back, through VTOP's native client. Kafka resumed sooner after a kill -9 of the leader: 10.2 s for Kafka, 25.7 s for VTOP. Share of a lossy 100 ms link carried: 0.967. The shipped default, median of 5 runs. One upload at a time carried 0.25. Objects committed on a policed uplink: 96 of 96. 0 of 32 before the fix in #666, which lets a request's deadline grow with its body. Kafka's produce rate over VTOP's Kafka gateway: 12.0x to 13.9x (Behind). Records per second at saturation, same JVM producer, 2 CPUs per node. Here VTOP is behind." src="docs/assets/readme/card-hero-light.svg" width="600">
+</picture>
+
+[Site](https://allamiro.github.io/vtop-engine/) · [The rule](#the-one-rule) · [Evidence](#evidence) · [Quick start](#quick-start) · [How it works](#how-it-works) · [Documentation](#documentation)
 
 </div>
+
+The documentation site is [allamiro.github.io/vtop-engine](https://allamiro.github.io/vtop-engine/).
 
 ---
 
@@ -64,6 +71,31 @@ commit from any state other than `VERIFIED` returns `CommitBeforeVerified`,
 and a unit test asserts that for each pipeline state before it. `SUPERSEDED` retires
 a failed batch whose range the source has since committed past. The normative
 text is [protocol §13](docs/VTOP_PROTOCOL_DRAFT.md#13-commit-rule).
+
+---
+
+## At a glance
+
+On a long, lossy link, VTOP's uploads fill the link only when several run at
+once; the shipped default does.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/card-link-share-dark.svg">
+  <img alt="Bar list. Share of the link carried, by uploads in flight. Lossy 100 ms link: 10 Mbit/s, 1% burst loss. One part in flight per object; median of 2 runs per row. 1 upload at a time 0.25, 2 at once 0.45, 4 at once 0.82, 8 at once 0.92, 16 at once 1.00. Shipped default: 0.967, at its own part settings, median of 5 runs, against the whole link at 1.0." src="docs/assets/readme/card-link-share-light.svg" width="600">
+</picture>
+
+Where VTOP is behind: through the same producer, Apache Kafka carries an order
+of magnitude more records per second than VTOP's Kafka gateway.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/card-throughput-dark.svg">
+  <img alt="Column chart. Produce throughput at saturation, MiB/s. 100 B records: Apache Kafka 27.95, VTOP (Kafka gateway) 2.33. 1 KiB records: Apache Kafka 32.19, VTOP (Kafka gateway) 2.32. Kafka carries 12.0x to 13.9x VTOP's records per second." src="docs/assets/readme/card-throughput-light.svg" width="600">
+</picture>
+
+The cards above are drawn by
+[`benchmarks/readme_cards.py`](benchmarks/readme_cards.py) from the same files
+as the charts below, through
+[`benchmarks/site_facts.py`](benchmarks/site_facts.py).
 
 ---
 
@@ -136,6 +168,15 @@ Data, latency and consume results: [kafka-comparison.md](docs/benchmarks/kafka-c
 
 ---
 
+## Tested against
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/card-tested-dark.svg">
+  <img alt="Tested against: Apache Kafka 3.7.2 to 4.4.0 (8 releases, live-broker tests, nightly); Apache Kafka 4.3.2 (benchmarks); Apache Kafka 4.3.1 (Docker lab and live-broker tests in CI); Kafka JVM client 4.3.2 (benchmarks); librdkafka 2.12.1 (the engine's Kafka source); PostgreSQL 14 to 18 (5 majors, state-store tests, nightly); MinIO RELEASE.2025-09-07T16-13-09Z (Docker lab and live S3 tests in CI). More S3 servers: when the matrix is published (#722)." src="docs/assets/readme/card-tested-light.svg" width="600">
+</picture>
+
+---
+
 ## Quick start
 
 The Docker lab runs Kafka, MinIO, seeded telemetry and the engine, with every
@@ -166,6 +207,9 @@ cargo build --release --locked
 | [Building from source](docs/install/from-source.md) | prerequisites per platform, optional builds, troubleshooting |
 | [Release binaries](docs/install/binaries.md) | downloads, run-time libraries, checking signatures |
 | [The CLI](docs/reference/cli.md) | every `vtopctl` command, and how the engine stops |
+
+The same quick start, on the documentation site:
+[allamiro.github.io/vtop-engine/getting-started/quickstart](https://allamiro.github.io/vtop-engine/getting-started/quickstart/).
 
 ---
 
@@ -277,7 +321,9 @@ source data until a scrub of the archive passes.
 Which parts are production, preview or experimental, and why, is in the
 [component status table](docs/reference/component-status.md). The maintainer
 confirmed its labels (#740). A label states what the evidence supports, not a
-promise of support.
+promise of support. Where each criterion of the 1.0 bar stands, with its
+evidence and the date it was checked, is in the
+[1.0 release gate](docs/reference/release-gate.md).
 
 The full table, with what is done and what is planned, is in
 [limitations.md](docs/reference/limitations.md). Per-release limits are in
@@ -288,6 +334,10 @@ The full table, with what is done and what is planned, is in
 
 ## Documentation
 
+Everything below is also on the documentation site,
+[allamiro.github.io/vtop-engine](https://allamiro.github.io/vtop-engine/),
+with search and a reading order.
+
 | Document | What it covers |
 |---|---|
 | [docs/README.md](docs/README.md) | the documentation index and reading order |
@@ -296,6 +346,7 @@ The full table, with what is done and what is planned, is in
 | [Archive path reference](docs/reference/archive-path.md) | sources, formats, the manifest, verification, recovery, metrics |
 | [PRODUCTION_HA.md](docs/PRODUCTION_HA.md) | engine HA: status, design and phased roadmap |
 | [Component status](docs/reference/component-status.md) | production, preview or experimental for each component, with the evidence and the criteria still open |
+| [1.0 release gate](docs/reference/release-gate.md) | every criterion of the 1.0 bar: met, partial or not met, its evidence and the date checked |
 | [ROADMAP.md](docs/ROADMAP.md) | engine and cluster-plane releases, per-release limitations and upgrade notes |
 | [Compatibility policy](docs/reference/compatibility.md) | what each format promises, upgrade and downgrade rules, deprecation |
 | [SUPPORT.md](docs/SUPPORT.md) | versioning, which releases get fixes, and the 1.x support window |

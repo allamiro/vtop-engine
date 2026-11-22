@@ -265,6 +265,22 @@ class RegistryCheck(unittest.TestCase):
         self.assertNotIn("cell ledger is named by no entry", joined)
 
 
+    def test_a_fuzz_target_no_format_names_fails_unless_it_says_why(self):
+        (self.root / "fuzz/fuzz_targets").mkdir(parents=True)
+        (self.root / "fuzz/fuzz_targets/stray.rs").write_text("// a target\n")
+        self.assertIn("fuzz target stray is named by no format", " ".join(self.problems()))
+        (self.root / "scripts/compat/formats.yaml").write_text(
+            REGISTRY.replace("    tag_sets:", "    fuzz: [stray]\n    tag_sets:")
+        )
+        self.assertNotIn("stray", " ".join(self.problems()))
+        (self.root / "scripts/compat/formats.yaml").write_text(
+            REGISTRY + "fuzz_other:\n  stray: not a format decoder\n"
+        )
+        self.assertNotIn("stray", " ".join(self.problems()))
+        (self.root / "scripts/compat/formats.yaml").write_text(REGISTRY + "fuzz_other:\n  stray: ''\n")
+        self.assertIn("fuzz_other stray: needs a why", " ".join(self.problems()))
+
+
 class TheRepository(unittest.TestCase):
     def test_registry_names_every_format(self):
         self.assertEqual(registry_check.check_source(ROOT, registry_check.load(ROOT)), [])

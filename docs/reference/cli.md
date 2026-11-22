@@ -87,3 +87,15 @@ PostgreSQL schema changes are never run by normal engine startup. Use a
 separate migration identity for `vtopctl migrate`, then give the runtime role
 only schema `USAGE` and `SELECT, INSERT, UPDATE` on `batches`. See
 [PostgreSQL deployment](../POSTGRES_DEPLOYMENT.md).
+
+## SQLite migrations
+
+The engine creates a new SQLite ledger, and brings an existing one up to date
+when it opens it, with changes older releases can still read (a nullable
+column, a new table). A change an older release could misread is a one-way
+step: the release that brings one says so in its notes, and only
+`vtopctl migrate --config <path>` takes it. Until then the engine refuses to
+start on that ledger, names the command, and changes nothing. After the step,
+an older release refuses the file, so back the ledger up first: going back
+means restoring that backup. No release has taken a one-way step on the
+SQLite ledger yet; its schema version is 1 (`PRAGMA user_version`).

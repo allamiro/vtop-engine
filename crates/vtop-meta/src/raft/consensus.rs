@@ -441,6 +441,12 @@ impl OpenraftConsensus {
         &self.raft
     }
 
+    /// What this replica's applied-audit delivery has done (#706), for the
+    /// node's metrics. `None` on a façade built without applied state.
+    pub fn audit_progress(&self) -> Option<crate::raft::AuditProgressSnapshot> {
+        self.store.as_ref().map(MetaRaftStore::audit_progress)
+    }
+
     /// Where every consumer group's durable cursor stands (#571), from this
     /// node's APPLIED state, without waiting: `None` while the state machine
     /// is busy, or on a node built without applied state.
@@ -1108,6 +1114,19 @@ impl Consensus for OpenraftConsensus {
         // A raise the metadata members must all implement is judged on
         // their own answers first (#706).
         if let MetadataCommand::SetFeatureLevel { feature_level, .. } = &command {
+            // A level above this build's is never proposed (#743). In the
+            // log it would be applied by this leader as a refusal to
+            // continue: the entry would stop this node's own Raft engine,
+            // and every voter on this release with it.
+            if *feature_level > crate::command::SUPPORTED_FEATURE_LEVEL {
+                return Err(ConsensusError::Refused(format!(
+                    "feature level {feature_level} is above the highest level this node \
+                     supports ({}); nothing was proposed and the log is unchanged. Run \
+                     the metadata tier on a release that supports level {feature_level}, \
+                     then raise it",
+                    crate::command::SUPPORTED_FEATURE_LEVEL
+                )));
+            }
             self.judge_members_for(*feature_level).await?;
         }
         // The feature gate (#554), judged before the command is replicated.
