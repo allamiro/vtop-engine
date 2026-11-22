@@ -32,6 +32,14 @@ without them.
 [`ci/replicated-values.yaml`](../../helm/vtop/ci/replicated-values.yaml) is a
 complete example.
 
+A replicated range can also serve Kafka clients from every pod, so a client
+follows a failover with no restart: set `data.kafka.enabled: true` and
+`data.kafka.acknowledgeUnauthenticated: true`
+([`ci/replicated-kafka-values.yaml`](../../helm/vtop/ci/replicated-kafka-values.yaml)
+is the overlay). The gateway has no identity check, so restrict its port
+(`ports.kafka`, 9092) with `networkPolicy.clientFrom` or the mesh. See
+[Helm: the Kafka gateway on a replicated range](../install/helm.md#the-kafka-gateway-on-a-replicated-range).
+
 ### TLS Secrets
 
 Two Secrets (they may be the same Secret) in the release namespace, each

@@ -96,7 +96,7 @@ helm template vtop helm/vtop \
 What a client sees through a failover, and the measured times, are in
 [Live chaos validation](../LIVE_CHAOS_VALIDATION.md#kafka-clients-and-a-failover-751).
 The values are in the
-[chart README](../../helm/vtop/README.md#the-kafka-gateway-on-a-replicated-range).
+[chart README](../../helm/vtop/README.md#the-kafka-gateway-on-a-replicated-range-751).
 
 Every value, its default and its meaning is in the
 [chart README](../../helm/vtop/README.md#values).

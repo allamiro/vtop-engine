@@ -13,16 +13,18 @@
 # names it as the partition's leader; the stream carries on.
 #
 # What it proves, in order:
-#   1. a gateway on a candidate that does NOT hold the range answers
-#      NOT_LEADER_OR_FOLLOWER to a produce and names the holder in Metadata
-#      (the gauge vtop_kafka_gateway_serving is 1 on exactly one candidate);
+#   1. a gateway on a candidate that does NOT hold the range lists all three
+#      brokers and names the holder as the partition's leader in Metadata,
+#      which is how a client that asked the wrong member is redirected (the
+#      gauge vtop_kafka_gateway_serving is 1 on exactly one candidate);
 #   2. the client's acknowledgements keep coming after the kill, from the
 #      same process, with no failed delivery and no fatal idempotence error;
 #   3. every record the client was acknowledged for reads back through the
-#      new leader byte-exact, in produced order, and once: a retry after the
-#      failover that reached a log which already held it was deduplicated;
-#   4. the survivors changed role in place (a role-change line, not a start),
-#      and the gateway of the one that took the range says it is serving;
+#      new leader byte-exact, in produced order, and once (a retry that
+#      reaches a log already holding the record is deduplicated; whether one
+#      does depends on the timing of the kill, so the count is reported);
+#   4. the survivor that took the range changed role in place (a role-change line,
+#      not a start), and its gateway says it is serving;
 #   5. the time from the kill to the first acknowledgement after it is
 #      measured and printed (the outage the client saw), and bounded by
 #      CHAOS_KAFKA_FAILOVER_LIMIT_SECONDS.
@@ -99,32 +101,35 @@ awk -v n="$RECORDS" 'BEGIN {
   for (i = 1; i <= n; i++) printf "k%06d:v%06d-%08x\n", i, i, int(rand() * 4294967295)
 }' > "$INPUT"
 
-ACKS="$WORKDIR/acks.txt"
+# librdkafka prints one "Message delivered" line per acknowledged record at
+# verbosity 3 (kcat -v -v), on stderr; each is stamped as it arrives, which is
+# when the client learned of the acknowledgement. Failures are logged at
+# verbosity 1, so the same file carries them.
+ACKS="$WORKDIR/logs/kcat-produce.log"
 : > "$ACKS"
 # Stock settings except the two the scenario is about: acks=all and
 # idempotence. Not shortened timeouts, not a tuned retry count: what a client
 # does with no operator, which is what the number measures.
 KCAT_DEBUG=()
 [[ -n "${CHAOS_KCAT_DEBUG:-}" ]] && KCAT_DEBUG=(-d "$CHAOS_KCAT_DEBUG")
-"$KCAT" -P -b "$KAFKA_BOOTSTRAP" -t "$TOPIC" -p 0 -K: -O \
+"$KCAT" -P -b "$KAFKA_BOOTSTRAP" -t "$TOPIC" -p 0 -K: -v -v \
   -X acks=all -X enable.idempotence=true \
   ${KCAT_DEBUG[@]+"${KCAT_DEBUG[@]}"} \
   < <(awk -v every="$PACE_EVERY" -v pause="$PACE_SLEEP" \
     '{ print; fflush(); if (NR % every == 0) system("sleep " pause) }' "$INPUT") \
-  > >(stamp_stdin_ms > "$ACKS") \
-  2> "$WORKDIR/logs/kcat-produce.log" &
+  2> >(stamp_stdin_ms > "$ACKS") &
 PRODUCER=$!
 echo "$PRODUCER" >> "$WORKDIR/pids"
 log "one idempotent producer (pid $PRODUCER) streaming $RECORDS records, bootstrapped from $KAFKA_BOOTSTRAP"
 
-acked_count() { wc -l < "$ACKS" | tr -d ' '; }
+acked_count() { grep -c 'Message delivered' "$ACKS" || true; }
 
 deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS))
 until [[ "$(acked_count)" -ge "$KILL_AFTER_ACKS" ]]; do
   kill -0 "$PRODUCER" 2>/dev/null \
-    || fail "the producer ended before $KILL_AFTER_ACKS acknowledgements: $(tail -3 "$WORKDIR/logs/kcat-produce.log")"
+    || fail "the producer ended before $KILL_AFTER_ACKS acknowledgements: $(tail -3 "$ACKS")"
   [[ $SECONDS -lt $deadline ]] \
-    || fail "the producer reached only $(acked_count) acknowledgements in ${PROGRESS_TIMEOUT_SECONDS}s: $(tail -3 "$WORKDIR/logs/kcat-produce.log")"
+    || fail "the producer reached only $(acked_count) acknowledgements in ${PROGRESS_TIMEOUT_SECONDS}s: $(tail -3 "$ACKS")"
   sleep 0.1
 done
 log "$(acked_count) acknowledgements through candidate $WINNER; the stream has $((RECORDS - $(acked_count))) records to go"
@@ -161,7 +166,7 @@ done
 finish_deadline=$((SECONDS + FAILOVER_LIMIT_SECONDS + RECORDS * 3 / 100 + PROGRESS_TIMEOUT_SECONDS))
 while kill -0 "$PRODUCER" 2>/dev/null; do
   [[ $SECONDS -lt $finish_deadline ]] \
-    || fail "the producer had not finished $RECORDS records $((finish_deadline - SECONDS + FAILOVER_LIMIT_SECONDS))s after the kill, with $(acked_count) acknowledged: $(tail -3 "$WORKDIR/logs/kcat-produce.log")"
+    || fail "the producer had not finished $RECORDS records $((finish_deadline - SECONDS + FAILOVER_LIMIT_SECONDS))s after the kill, with $(acked_count) acknowledged: $(tail -3 "$ACKS")"
   sleep 0.2
 done
 set +e
@@ -174,11 +179,11 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 [[ $PRODUCER_EXIT -eq 0 ]] \
-  || fail "the producer exited $PRODUCER_EXIT after the failover: $(tail -3 "$WORKDIR/logs/kcat-produce.log")"
-! grep -q 'Delivery failed' "$WORKDIR/logs/kcat-produce.log" \
-  || fail "a delivery failed across the failover: $(grep -m 3 'Delivery failed' "$WORKDIR/logs/kcat-produce.log")"
-! grep -qi 'fatal' "$WORKDIR/logs/kcat-produce.log" \
-  || fail "the idempotent producer hit a fatal error: $(grep -im 3 'fatal' "$WORKDIR/logs/kcat-produce.log")"
+  || fail "the producer exited $PRODUCER_EXIT after the failover: $(tail -3 "$ACKS")"
+! grep -q 'Delivery failed' "$ACKS" \
+  || fail "a delivery failed across the failover: $(grep -m 3 'Delivery failed' "$ACKS")"
+! grep -qi 'fatal' "$ACKS" \
+  || fail "the idempotent producer hit a fatal error: $(grep -im 3 'fatal' "$ACKS")"
 [[ "$(acked_count)" -eq "$RECORDS" ]] \
   || fail "$(acked_count) of $RECORDS records were acknowledged"
 log "the same producer finished all $RECORDS records across the failover with no failed delivery"
@@ -188,7 +193,7 @@ log "the same producer finished all $RECORDS records across the failover with no
 # after the kill can be a straggler the dead leader sent just before it died,
 # so the headline is the end of the longest silence that ENDS after the kill:
 # the gap the client lived through.
-read -r FIRST_ACK_MS RESUME_MS GAP_MS < <(ack_outage_report "$ACKS" "$KILL_MS")
+read -r FIRST_ACK_MS RESUME_MS GAP_MS < <(ack_outage_report "$ACKS" "$KILL_MS" 'Message delivered')
 LIMIT_MS=$((FAILOVER_LIMIT_SECONDS * 1000))
 log "kill to first acknowledgement after it: ${FIRST_ACK_MS} ms; kill to the end of the outage the client saw: ${RESUME_MS} ms (longest silence ${GAP_MS} ms)"
 [[ "$RESUME_MS" -le "$LIMIT_MS" ]] \
@@ -215,17 +220,30 @@ cmp -s "$INPUT" "$OUTPUT" \
   || { diff "$INPUT" "$OUTPUT" | head -5 >&2; fail "the bytes read back differ from the bytes produced"; }
 log "all $RECORDS acknowledged records read back through candidate $NEW_LEADER byte-exact, in order, once each"
 
-# The watermark is the count of records, not of attempts, and the retry the
-# client made after the kill met the log's duplicate check where it needed to.
+# The watermark counts records, not attempts: every offset below it is one of
+# the records or one of the boundary markers a v2 range holds (one per epoch,
+# which Kafka does not show), so a retry that had been appended twice would
+# push it past that.
 WATERMARK="$("$KCAT" -Q -b "$KAFKA_BOOTSTRAP" -t "$TOPIC:0:-1" 2>/dev/null | awk '{ print $NF }')"
-log "high watermark through Kafka: $WATERMARK (the v2 range also holds one boundary marker per epoch, which Kafka does not show)"
-[[ "$WATERMARK" -ge "$RECORDS" ]] || fail "the high watermark is $WATERMARK, below the $RECORDS acknowledged records"
+log "high watermark through Kafka: $WATERMARK ($RECORDS records and up to $NEW_EPOCH boundary markers)"
+[[ "$WATERMARK" -ge "$RECORDS" && "$WATERMARK" -le $((RECORDS + NEW_EPOCH)) ]] \
+  || fail "the high watermark is $WATERMARK, outside $RECORDS to $((RECORDS + NEW_EPOCH)): a retry appended twice, or a record never landed"
 
-# --- the survivors changed role in place -------------------------------------
+# What the new leader's log says about the client's retries. Informational:
+# whether a batch was in flight and already held at a quorum when the leader
+# died is the timing of the kill, so a zero here is not a failure.
+RETRIES="$(grep -c 'idempotent retry acknowledged with its original offset' "$WORKDIR/logs/data-candidate-$NEW_LEADER.log" || true)"
+log "retried sets the new leader acknowledged with their original offsets: $RETRIES"
+
+# --- the survivors changed role in place, or stayed followers ----------------
 for n in 1 2 3; do
   [[ "$n" == "$WINNER" ]] && continue
   kill -0 "${CAND_PIDS[$n]}" 2>/dev/null || fail "candidate $n is not running: a survivor must outlive the failover"
-  grep -q "data_node_role_changed" "$WORKDIR/logs/data-candidate-$n.log" \
-    || fail "candidate $n's log has no role change"
+done
+for n in 1 2 3; do
+  [[ "$n" == "$WINNER" || "$n" == "$NEW_LEADER" ]] && continue
+  await_metric_equals "$(data_metrics_addr "$((n + 10))")" \
+    vtop_kafka_gateway_serving 0 \
+    "candidate $n still follows, so its Kafka gateway must not claim to serve"
 done
 log "PASS"

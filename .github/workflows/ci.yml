@@ -1831,14 +1831,13 @@ jobs:
       # distribution is copied out of the apache/kafka image pinned below (the
       # 4.4.0 line of kafka-matrix.yml, by the same digest) and run on the
       # runner's JVM, once per metadata.recovery.strategy, each a full
-      # failover. About four minutes and an image pull, so a pull request does
-      # not pay for it: the variable is empty there and the scenario SKIPS
-      # (exit 77), and a push to main sets it. Scenario 26 (librdkafka, the
-      # kafkacat above) is a minute and runs everywhere.
+      # failover. Measured at 75 s for both on two CPUs with debug binaries,
+      # plus the image pull; scenario 26 (librdkafka, the kafkacat above) 43 s.
+      # Without the variable the scenario SKIPS (exit 77).
       - name: Run the live chaos suite
         id: chaos
         env:
-          CHAOS_KAFKA_IMAGE: ${{ github.event_name == 'push' && 'apache/kafka@sha256:833b867a9585a141da455dc2b57431c65cbccb27f11c91f694444cca9f777e0f' || '' }}
+          CHAOS_KAFKA_IMAGE: apache/kafka@sha256:833b867a9585a141da455dc2b57431c65cbccb27f11c91f694444cca9f777e0f
         run: CHAOS_PROFILE=debug CHAOS_WORKDIR="$RUNNER_TEMP/chaos" scripts/live-chaos/run-all.sh
 
       # A failing scenario names a log file; without this the reason dies with

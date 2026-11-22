@@ -105,6 +105,10 @@ run_variant() {
   local props="$WORKDIR/producer.properties" out="$WORKDIR/producer-out.txt"
   {
     echo "enable.idempotence=true"
+    # The tool sends with no retries unless told; an idempotent producer is
+    # refused with none, and it is the retries that carry a send across a
+    # failover. The client default (the delivery timeout is what bounds them).
+    echo "retries=2147483647"
     echo "metadata.recovery.strategy=$strategy"
   } > "$props"
   : > "$out"
@@ -178,11 +182,17 @@ run_variant() {
   # readback prints each record's offset and value, so each acknowledged
   # record can be looked up where it was acknowledged: present, at that
   # offset, once, with the values in produced order.
-  local readback="$WORKDIR/readback.txt"
+  local readback="$WORKDIR/readback.txt" formatter_option=--property
+  # Newer distributions name the formatter's option differently and print a
+  # deprecation notice on stdout for the old one.
+  # (A herestring, not a pipe: grep -q closing early would fail the pipeline.)
+  local consumer_help
+  consumer_help="$("$KAFKA_HOME/bin/kafka-console-consumer.sh" --help 2>&1 || true)"
+  [[ "$consumer_help" == *--formatter-property* ]] && formatter_option=--formatter-property
   "$KAFKA_HOME/bin/kafka-console-consumer.sh" \
     --bootstrap-server "$KAFKA_BOOTSTRAP" --topic "$TOPIC" --partition 0 --offset earliest \
     --max-messages "$RECORDS" --timeout-ms 60000 \
-    --property print.offset=true --property print.value=true \
+    "$formatter_option" print.offset=true "$formatter_option" print.value=true \
     > "$readback" 2> "$WORKDIR/logs/jvm-consumer.err" \
     || fail "the readback failed: $(tail -3 "$WORKDIR/logs/jvm-consumer.err")"
   python3 -c '
