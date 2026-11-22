@@ -14,7 +14,8 @@
 //!  AWS_SECRET_ACCESS_KEY=minioadmin cargo test -p vtop-cli
 //!  --test live_s3_verification_receipts -- --ignored --test-threads=1`
 //! It deletes every object it writes. CI runs it in the `minio-integration`
-//! job.
+//! job. `VTOP_TEST_S3_SERVER` names the server and its capability file
+//! (#722).
 #![cfg(unix)]
 
 use std::io::Write;
@@ -28,8 +29,9 @@ use vtop_core::config::{StreamsConfig, VtopConfig};
 use vtop_core::manifest::{ManifestWriteVersion, ParsedManifest, ParsedReceipt};
 use vtop_core::partitioning::receipt_uri;
 use vtop_core::types::{CompressionType, SourceType};
+use vtop_s3_testkit::{record_method, Capability, LiveS3, S3Settings};
 
-fn config(dir: &Path, prefix: &str, bytes: usize) -> VtopConfig {
+fn config(s: &S3Settings, dir: &Path, prefix: &str, bytes: usize) -> VtopConfig {
     let input = dir.join("app.log");
     let mut f = std::fs::File::create(&input).unwrap();
     let line = "receipt record payload abcdefghijklmnopqrstuvwxyz0123456789\n";
@@ -42,15 +44,12 @@ fn config(dir: &Path, prefix: &str, bytes: usize) -> VtopConfig {
         vec![input.to_string_lossy().into_owned()],
         "s3_native",
     );
-    cfg.upload.bucket =
-        std::env::var("VTOP_TEST_S3_BUCKET").unwrap_or_else(|_| "telemetry-raw".into());
+    cfg.upload.bucket = s.bucket.clone();
     cfg.upload.prefix = prefix.into();
-    cfg.upload.endpoint_url = Some(
-        std::env::var("VTOP_TEST_S3_ENDPOINT")
-            .expect("VTOP_TEST_S3_ENDPOINT must name the live endpoint"),
-    );
-    cfg.upload.force_path_style = true;
-    cfg.upload.verify_tls = false;
+    cfg.upload.endpoint_url = s.endpoint.clone();
+    cfg.upload.region = s.region.clone();
+    cfg.upload.force_path_style = s.force_path_style;
+    cfg.upload.verify_tls = s.verify_tls;
     cfg.upload.require_strong_verification = true;
     cfg.compression.kind = CompressionType::None;
     // One batch for the whole file (the default 10,000 records would cut a
@@ -67,86 +66,105 @@ fn config(dir: &Path, prefix: &str, bytes: usize) -> VtopConfig {
 #[tokio::test]
 #[ignore = "requires an S3-compatible endpoint"]
 async fn live_a_receipt_names_the_check_the_store_ran() {
+    let live = LiveS3::from_env();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    for (case, bytes, expected) in [
-        ("single put", 4 * 1024, "store_checksum"),
-        ("multipart", 6 * 1024 * 1024, "read_back"),
-    ] {
-        let dir = tempfile::tempdir().unwrap();
-        let prefix = format!("vtop-it-671-receipts-{nanos}-{}", bytes);
-        let mut engine = Engine::new(
-            config(dir.path(), &prefix, bytes),
-            StreamsConfig { streams: vec![] },
-        )
-        .await
-        .unwrap();
-        let out = engine.process_once(SourceType::File).await.unwrap();
-        assert_eq!(out.len(), 1, "{case}: {out:?}");
-        assert!(out[0].committed, "{case}: {out:?}");
-        let row = engine
-            .store
-            .get_batch(&out[0].batch_id)
-            .await
-            .unwrap()
-            .unwrap();
-        let manifest_uri = row.manifest_uri.clone().unwrap();
-        let receipt_uri = receipt_uri(&manifest_uri).unwrap();
-
-        let manifest = engine
-            .backend
-            .get_object_bounded(&manifest_uri, 1 << 20)
-            .await
-            .unwrap();
-        let manifest = ParsedManifest::from_slice(&manifest).unwrap();
-        assert_eq!(
-            manifest.fields().verification_plan.as_ref().unwrap().method,
+    for (case, name, needs, bytes, expected) in [
+        (
+            "single put",
+            "receipts.a_single_put_names_store_checksum",
+            &[Capability::PutGetHead, Capability::ChecksumSha256Returned][..],
+            4 * 1024,
             "store_checksum",
-            "{case}: the configured plan"
-        );
-        let receipt = engine
-            .backend
-            .get_object_bounded(&receipt_uri, 1 << 16)
-            .await
-            .unwrap();
-        let receipt = ParsedReceipt::from_slice(&receipt).unwrap();
-        assert!(receipt.authenticate(&Default::default()).is_ok(), "{case}");
-        assert_eq!(receipt.fields().verification.method, expected, "{case}");
-        assert_eq!(receipt.fields().verification.class, "strong", "{case}");
-        assert_eq!(
-            Some(receipt.fields().manifest.sha256.as_str()),
-            row.manifest_sha256.as_deref(),
-            "{case}"
-        );
-
-        let rows =
-            vtop_cli::scrub::committed_rows(engine.store.list_batches().await.unwrap(), Vec::new());
-        let report = engine
-            .scrub(
-                rows,
-                &ScrubOptions {
-                    check_receipts: true,
-                    require_receipts: true,
-                    ..ScrubOptions::default()
-                },
+        ),
+        (
+            "multipart",
+            "receipts.a_multipart_object_names_read_back",
+            &[Capability::Multipart][..],
+            6 * 1024 * 1024,
+            "read_back",
+        ),
+    ] {
+        live.case(name, needs, || async {
+            let dir = tempfile::tempdir().unwrap();
+            let prefix = format!("vtop-it-671-receipts-{nanos}-{}", bytes);
+            let mut engine = Engine::new(
+                config(&live.settings, dir.path(), &prefix, bytes),
+                StreamsConfig { streams: vec![] },
             )
             .await
             .unwrap();
-        assert!(report.passed, "{case}: {report:#?}");
-        assert_eq!(
-            report.receipts.get(ReceiptResult::Ok.as_str()),
-            Some(&1),
-            "{case}: {report:#?}"
-        );
-
-        for uri in [row.object_uri.clone().unwrap(), manifest_uri, receipt_uri] {
-            engine
-                .backend
-                .delete_object(&uri)
+            let out = engine.process_once(SourceType::File).await.unwrap();
+            assert_eq!(out.len(), 1, "{case}: {out:?}");
+            assert!(out[0].committed, "{case}: {out:?}");
+            let row = engine
+                .store
+                .get_batch(&out[0].batch_id)
                 .await
-                .unwrap_or_else(|e| panic!("cleaning up {uri}: {e:?}"));
-        }
+                .unwrap()
+                .unwrap();
+            let manifest_uri = row.manifest_uri.clone().unwrap();
+            let receipt_uri = receipt_uri(&manifest_uri).unwrap();
+
+            let manifest = engine
+                .backend
+                .get_object_bounded(&manifest_uri, 1 << 20)
+                .await
+                .unwrap();
+            let manifest = ParsedManifest::from_slice(&manifest).unwrap();
+            assert_eq!(
+                manifest.fields().verification_plan.as_ref().unwrap().method,
+                "store_checksum",
+                "{case}: the configured plan"
+            );
+            let receipt = engine
+                .backend
+                .get_object_bounded(&receipt_uri, 1 << 16)
+                .await
+                .unwrap();
+            let receipt = ParsedReceipt::from_slice(&receipt).unwrap();
+            record_method(&receipt.fields().verification.method);
+            assert!(receipt.authenticate(&Default::default()).is_ok(), "{case}");
+            assert_eq!(receipt.fields().verification.method, expected, "{case}");
+            assert_eq!(receipt.fields().verification.class, "strong", "{case}");
+            assert_eq!(
+                Some(receipt.fields().manifest.sha256.as_str()),
+                row.manifest_sha256.as_deref(),
+                "{case}"
+            );
+
+            let rows = vtop_cli::scrub::committed_rows(
+                engine.store.list_batches().await.unwrap(),
+                Vec::new(),
+            );
+            let report = engine
+                .scrub(
+                    rows,
+                    &ScrubOptions {
+                        check_receipts: true,
+                        require_receipts: true,
+                        ..ScrubOptions::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(report.passed, "{case}: {report:#?}");
+            assert_eq!(
+                report.receipts.get(ReceiptResult::Ok.as_str()),
+                Some(&1),
+                "{case}: {report:#?}"
+            );
+
+            for uri in [row.object_uri.clone().unwrap(), manifest_uri, receipt_uri] {
+                engine
+                    .backend
+                    .delete_object(&uri)
+                    .await
+                    .unwrap_or_else(|e| panic!("cleaning up {uri}: {e:?}"));
+            }
+        })
+        .await;
     }
 }

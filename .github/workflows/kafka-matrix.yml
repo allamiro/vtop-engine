@@ -32,11 +32,13 @@ name: kafka matrix
 # - Nightly (03:17 UTC) and on dispatch it runs all of them, over whatever
 #   main holds, so a change outside the PR filter is still tested on every
 #   release and listener within a day.
-# - A pull request that changes this file or the broker script runs all of
-#   them on its own head: the schedule and dispatch run only from main, so
-#   this is the one way a new pin is proven before it merges. ci.yml's `kafka`
-#   filter leaves both files out, so such a pull request does not also run
-#   3.7.2 a second time through the call.
+# - A pull request that changes this file or the broker script runs, on its
+#   own head, every broker's plain variant (the schedule and dispatch run only
+#   from main, so this is the one way a new pin is proven before it merges) and
+#   the oldest and newest Apache release through every listener. The rest of
+#   the listeners wait for the nightly: all of them on every PR was 31 legs, and
+#   the runners are shared. ci.yml's `kafka` filter leaves both files out, so
+#   such a pull request does not also run 3.7.2 a second time through the call.
 #
 # The test binaries are built once and each leg runs them against its own
 # broker, so a leg needs no Rust toolchain and the matrix costs one build. The
@@ -102,6 +104,10 @@ jobs:
         env:
           REQUESTED: ${{ inputs.brokers }}
           REQUESTED_VARIANTS: ${{ inputs.variants }}
+          # A pull request that runs this workflow directly, because it changed
+          # the workflow or the broker script (ci.yml's call always names its
+          # brokers): a smaller set than the nightly's, see the header.
+          PR_PROOF: ${{ github.event_name == 'pull_request' && inputs.brokers == '' && inputs.variants == '' }}
           # One line per broker: the name a leg and the docs know it by, the
           # image pinned by digest, and the version `kafka-broker.sh version`
           # must print for it. The Apache lines are the multi-arch index of
@@ -172,13 +178,16 @@ jobs:
           pins_json=$(printf '%s\n' "$pinned" | jq -R 'split(" ") | map(select(. != "")) | {id: .[0], image: .[1], reported: .[2]}' | jq -cs .)
           variants_json=$(printf '%s\n' "$variants" | jq -R 'split(" ") | map(select(. != "")) | {name: .[0], mode: .[1], mechanism: .[2], scope: .[3]}' | jq -cs .)
           include=$(jq -cn --argjson pins "$pins_json" --argjson variants "$variants_json" \
-            --argjson wantb "$want_brokers" --argjson wantv "$want_variants" '
+            --argjson wantb "$want_brokers" --argjson wantv "$want_variants" \
+            --argjson pr "${PR_PROOF:-false}" '
             ($pins | map(select(.id | startswith("redpanda") | not))) as $apache
             | [ $pins[] | select(.id as $i | $wantb | index($i)) | . as $p
                 | ($p.id | startswith("redpanda")) as $redpanda
+                | ($p.id == $apache[0].id or $p.id == $apache[-1].id) as $edge
                 | $variants[] | select(.name as $n | $wantv | index($n))
                 | select(if $redpanda then .name == "plain"
-                         else (.scope == "all" or $p.id == $apache[0].id or $p.id == $apache[-1].id) end)
+                         elif $pr then (.name == "plain" or $edge)
+                         else (.scope == "all" or $edge) end)
                 | {kafka: $p.id, image: $p.image, reported: $p.reported,
                    variant: .name, mode: .mode, mechanism: .mechanism,
                    suite: (if $redpanda then "smoke" else "full" end)} ]')
