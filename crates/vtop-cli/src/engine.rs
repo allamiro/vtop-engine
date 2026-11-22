@@ -12,7 +12,7 @@
 //! only after the batch reaches `VERIFIED`.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -180,14 +180,59 @@ pub struct Pipeline<'a> {
     /// like `key_notices`.
     pub lock_fallbacks: Arc<LockFallbacks>,
     /// Object keys a multipart upload is in progress for, in this process
-    /// (review of #895). Batches now upload while the run loop goes on, so
-    /// the abandoned-session sweep can run beside a live upload; it skips
-    /// these, whatever their session's age.
+    /// (review of #895), and the keys the abandoned-session sweep is working
+    /// on. Batches now upload while the run loop goes on, so the sweep can
+    /// run beside a live upload; it skips these, whatever their session's
+    /// age, and an upload waits for a key the sweep holds.
     pub active_multipart: ActiveMultipart,
 }
 
 /// See [`Pipeline::active_multipart`].
-pub type ActiveMultipart = Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
+pub type ActiveMultipart = Arc<std::sync::Mutex<ActiveKeys>>;
+
+/// The keys of [`ActiveMultipart`]: uploads in progress, and the keys the
+/// sweep holds while it aborts their sessions. Both are decided under one
+/// lock, so a key is never both.
+#[derive(Debug, Default)]
+pub struct ActiveKeys {
+    live: std::collections::HashMap<String, usize>,
+    sweeping: std::collections::HashSet<String>,
+}
+
+/// Take up to `most` of the permits owed to a narrower width off `debt`, and
+/// say how many were taken.
+fn repay_slot_debt(debt: &AtomicUsize, most: usize) -> usize {
+    let mut owed = debt.load(Ordering::Acquire);
+    loop {
+        let take = owed.min(most);
+        if take == 0 {
+            return 0;
+        }
+        match debt.compare_exchange(owed, owed - take, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return take,
+            Err(now) => owed = now,
+        }
+    }
+}
+
+/// Wait for an upload slot. A permit that comes back while the width is
+/// narrower than the permits in existence goes to the first task waiting for
+/// one, and `forget_permits` cannot take it back from there: so the task
+/// withdraws it itself, and waits again, until the permits left match the
+/// width (review of #895).
+async fn acquire_upload_slot(
+    slots: &Arc<tokio::sync::Semaphore>,
+    debt: &AtomicUsize,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    loop {
+        let permit = Arc::clone(slots).acquire_owned().await.ok()?;
+        if repay_slot_debt(debt, 1) == 1 {
+            permit.forget();
+            continue;
+        }
+        return Some(permit);
+    }
+}
 
 /// Marks one object key's multipart upload as live until dropped, however
 /// the upload ends.
@@ -197,8 +242,19 @@ struct LiveMultipart {
 }
 
 impl LiveMultipart {
-    fn start(keys: &ActiveMultipart, key: &str) -> Self {
-        keys.lock().unwrap().insert(key.to_owned());
+    /// Marks `key` live, once the sweep is not working on it. The sweep holds
+    /// a key for one abort request, so the wait is short.
+    async fn start(keys: &ActiveMultipart, key: &str) -> Self {
+        loop {
+            {
+                let mut active = keys.lock().unwrap();
+                if !active.sweeping.contains(key) {
+                    *active.live.entry(key.to_owned()).or_default() += 1;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         Self {
             keys: Arc::clone(keys),
             key: key.to_owned(),
@@ -208,7 +264,41 @@ impl LiveMultipart {
 
 impl Drop for LiveMultipart {
     fn drop(&mut self) {
-        self.keys.lock().unwrap().remove(&self.key);
+        let mut active = self.keys.lock().unwrap();
+        if let Some(count) = active.live.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                active.live.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// What the sweep holds on a key while it aborts the key's session: no upload
+/// of the key starts until it is dropped.
+struct SweepingKey {
+    keys: ActiveMultipart,
+    key: String,
+}
+
+impl SweepingKey {
+    /// `None` when an upload of `key` is live.
+    fn claim(keys: &ActiveMultipart, key: &str) -> Option<Self> {
+        let mut active = keys.lock().unwrap();
+        if active.live.contains_key(key) {
+            return None;
+        }
+        active.sweeping.insert(key.to_owned());
+        Some(Self {
+            keys: Arc::clone(keys),
+            key: key.to_owned(),
+        })
+    }
+}
+
+impl Drop for SweepingKey {
+    fn drop(&mut self) {
+        self.keys.lock().unwrap().sweeping.remove(&self.key);
     }
 }
 
@@ -731,7 +821,7 @@ impl<'a> Pipeline<'a> {
         stream: Option<&StreamConfig>,
     ) -> Result<BatchOutcome, VtopError> {
         match self
-            .process_until_verified(source, read, stream, Utc::now(), None)
+            .process_until_verified(source, read, stream, Utc::now(), Utc::now(), None)
             .await?
         {
             VerifyStep::Finished(outcome) => Ok(outcome),
@@ -759,12 +849,19 @@ impl<'a> Pipeline<'a> {
     /// attempt's instant, so the window is filed under the same hour and
     /// names the same key; what the rebuild came to is counted once its key
     /// is decided.
+    ///
+    /// `queued_at` is when the window was handed to the pipeline, in the order
+    /// the windows were sealed. It is the ledger row's `created_at`, which a
+    /// restart's cursor lookups sort by: taken here, after the batch has
+    /// waited for an upload slot, two windows of one unit could be stamped in
+    /// the reverse of their seal order (review of #895).
     async fn process_until_verified(
         &self,
         source: &DiscoveredSource,
         read: ReadResult,
         stream: Option<&StreamConfig>,
         sealed_at: chrono::DateTime<Utc>,
+        queued_at: chrono::DateTime<Utc>,
         rebuild: Option<RecordedWindow>,
     ) -> Result<VerifyStep, VtopError> {
         if read.is_empty() {
@@ -792,7 +889,7 @@ impl<'a> Pipeline<'a> {
         // otherwise carry it in its own future, on the stack of whoever polls
         // it (see `commands::dispatch`).
         Box::pin(
-            self.verify_traced(trace, source, read, stream, sealed_at, rebuild)
+            self.verify_traced(trace, source, read, stream, (sealed_at, queued_at), rebuild)
                 .instrument(span),
         )
         .await
@@ -805,7 +902,7 @@ impl<'a> Pipeline<'a> {
         source: &DiscoveredSource,
         read: ReadResult,
         stream: Option<&StreamConfig>,
-        sealed_at: chrono::DateTime<Utc>,
+        (sealed_at, queued_at): (chrono::DateTime<Utc>, chrono::DateTime<Utc>),
         rebuild: Option<RecordedWindow>,
     ) -> Result<VerifyStep, VtopError> {
         let started = Instant::now();
@@ -838,7 +935,7 @@ impl<'a> Pipeline<'a> {
         // The ledger and the adapter commit keep `read.progress_end` as it is.
         let window = window_marker(&read);
         let batch_id = vtop_core::batch::build_batch_id(&source.source_name, &window);
-        let now = Utc::now().to_rfc3339();
+        let now = queued_at.to_rfc3339();
         trace.record("batch_id", batch_id.as_str());
         trace.record("tenant", tenant.as_str());
         trace.record("format", format.as_str());
@@ -1854,7 +1951,7 @@ impl<'a> Pipeline<'a> {
         let upload_result = if reused {
             None
         } else if multipart_used {
-            let _live = LiveMultipart::start(&self.active_multipart, &object_uri);
+            let _live = LiveMultipart::start(&self.active_multipart, &object_uri).await;
             let result = multipart::upload_resumable_with_report(
                 self.backend.as_ref(),
                 &mp_cfg,
@@ -3199,8 +3296,10 @@ pub struct Engine {
     /// Requests and throttles the width controller last saw (#102).
     width_seen: (u64, u64),
     /// Permits still to be withdrawn after the width narrowed while they
-    /// were in use.
-    upload_slots_debt: usize,
+    /// were in use. Shared with the batch tasks: a permit handed to a waiting
+    /// task is withdrawn there, so a narrower width holds for the batches
+    /// already queued behind the slots as well as for the next ones.
+    upload_slots_debt: Arc<AtomicUsize>,
     /// Exclusive work-dir lock held for the engine's lifetime (#66).
     /// Held only by [`Engine::new_exclusive`] instances; empty for read-only
     /// construction (#66).
@@ -3677,7 +3776,7 @@ impl Engine {
             upload_slots,
             upload_slots_size,
             width_seen: (0, 0),
-            upload_slots_debt: 0,
+            upload_slots_debt: Arc::new(AtomicUsize::new(0)),
             _instance_locks: Vec::new(),
         })
     }
@@ -4105,6 +4204,10 @@ impl Engine {
         if !force_flush && self.inflight_is_full(source_type) {
             self.wait_for_inflight(source_type, Wait::Any(None)).await;
             self.observe_width();
+            // A narrower width is withdrawn from the slots here too, not only
+            // once reading starts again.
+            let limit = self.upload_width();
+            self.resize_upload_slots(limit);
             return self.settle_inflight(adapter, source_type).await;
         }
         let sources = adapter.discover_sources().await?;
@@ -4498,6 +4601,9 @@ impl Engine {
             let owned = self.owned_pipeline();
             let queue = self.inflight.entry(source_type.clone()).or_default();
             for (source, read, stream, sealed_at, rebuild) in work {
+                // Stamped here, in seal order: a task that starts after a
+                // later window's must not file its row after it.
+                let queued_at = Utc::now();
                 let window = Box::new(RecordedWindow {
                     start: read.progress_start.clone(),
                     end: read.progress_end.clone(),
@@ -4511,11 +4617,12 @@ impl Engine {
                 let bytes = read.records.iter().map(Vec::len).sum();
                 let owned = owned.clone();
                 let slots = Arc::clone(&self.upload_slots);
+                let slot_debt = Arc::clone(&self.upload_slots_debt);
                 // The task carries the cycle's span and subscriber, as the
                 // future polled inside the cycle did.
                 let task = tokio::spawn(
                     async move {
-                        let _slot = slots.acquire_owned().await;
+                        let _slot = acquire_upload_slot(&slots, &slot_debt).await;
                         let pipeline = owned.pipeline();
                         let step = pipeline
                             .process_until_verified(
@@ -4523,6 +4630,7 @@ impl Engine {
                                 read,
                                 stream.as_ref(),
                                 sealed_at,
+                                queued_at,
                                 rebuild,
                             )
                             .await;
@@ -4631,18 +4739,24 @@ impl Engine {
     fn resize_upload_slots(&mut self, width: usize) {
         let width = width.max(1);
         if width > self.upload_slots_size {
-            let mut grow = width - self.upload_slots_size;
-            let repaid = grow.min(self.upload_slots_debt);
-            self.upload_slots_debt -= repaid;
-            grow -= repaid;
-            self.upload_slots.add_permits(grow);
+            let grow = width - self.upload_slots_size;
+            let repaid = repay_slot_debt(&self.upload_slots_debt, grow);
+            self.upload_slots.add_permits(grow - repaid);
         } else if width < self.upload_slots_size {
-            self.upload_slots_debt += self.upload_slots_size - width;
+            self.upload_slots_debt
+                .fetch_add(self.upload_slots_size - width, Ordering::AcqRel);
         }
         self.upload_slots_size = width;
-        if self.upload_slots_debt > 0 {
-            let taken = self.upload_slots.forget_permits(self.upload_slots_debt);
-            self.upload_slots_debt -= taken;
+        // The free permits go now; the ones in use, and the ones a waiting
+        // task is about to be handed, are withdrawn by the task that takes
+        // them (`acquire_upload_slot`). The debt is claimed before the
+        // permits are forgotten, so a task repaying it meanwhile cannot make
+        // more be withdrawn than were owed.
+        let owed = repay_slot_debt(&self.upload_slots_debt, usize::MAX);
+        if owed > 0 {
+            let taken = self.upload_slots.forget_permits(owed);
+            self.upload_slots_debt
+                .fetch_add(owed - taken, Ordering::AcqRel);
         }
     }
 
@@ -6152,9 +6266,11 @@ impl Engine {
             &self.config.upload,
             std::path::PathBuf::from(&self.config.engine.work_dir),
         );
-        let live = Arc::clone(&self.active_multipart);
-        let is_live = move |key: &str| live.lock().unwrap().contains(key);
-        match multipart::cleanup_abandoned_except(self.backend.as_ref(), &mp_cfg, &is_live).await {
+        let keys = Arc::clone(&self.active_multipart);
+        let claim = move |key: &str| {
+            SweepingKey::claim(&keys, key).map(|held| Box::new(held) as multipart::SweepClaim)
+        };
+        match multipart::cleanup_abandoned_except(self.backend.as_ref(), &mp_cfg, &claim).await {
             Ok(0) => 0,
             Ok(aborted) => {
                 if let Some(mx) = telemetry::metrics() {
@@ -7770,7 +7886,7 @@ mod tests {
             .with_timezone(&Utc);
         let step = engine
             .pipeline()
-            .process_until_verified(&source, read, None, drained, None)
+            .process_until_verified(&source, read, None, drained, Utc::now(), None)
             .await
             .unwrap();
         let VerifyStep::Verified(verified) = step else {
@@ -7783,6 +7899,96 @@ mod tests {
             "filed under the hour processing reached it, not the hour it was \
              drained in (2020-01-02 03:59:59.900): {}",
             verified.object_uri
+        );
+    }
+
+    /// Review of #895: a window's ledger row is stamped with the instant it
+    /// was handed to the pipeline, not the instant its task won an upload
+    /// slot. Tasks start in any order, and a restart's cursor lookups sort
+    /// rows by `created_at`: two windows of one file, the later one's task
+    /// running first, must still be filed in the order they were sealed.
+    #[tokio::test]
+    async fn a_window_is_filed_when_it_was_queued_not_when_its_task_ran() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "one\ntwo\n").unwrap();
+        let cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        let engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let source = DiscoveredSource {
+            source_type: SourceType::File,
+            source_name: "in".into(),
+            format: vtop_core::types::TelemetryFormat::Raw,
+        };
+        let window = |start: u64, end: u64, line: &[u8]| {
+            let marker = |at: u64| ProgressMarker::File {
+                path: input.to_string_lossy().into_owned(),
+                inode: None,
+                start_byte: at,
+                end_byte: end,
+                file_size: 8,
+                mtime: String::new(),
+                content_fingerprint: None,
+                tail_fingerprint: None,
+                ctime: None,
+            };
+            ReadResult {
+                records: vec![line.to_vec()],
+                progress_start: marker(start),
+                progress_end: marker(start),
+                first_timestamp: None,
+                last_timestamp: None,
+                verbatim: false,
+            }
+        };
+        let queued = |at: &str| {
+            chrono::DateTime::parse_from_rfc3339(at)
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        let (first_at, second_at) = (
+            queued("2026-03-04T05:00:00.000000000Z"),
+            queued("2026-03-04T05:00:00.000000100Z"),
+        );
+        // The later window's task runs first.
+        for (read, at) in [
+            (window(4, 8, b"two"), second_at),
+            (window(0, 4, b"one"), first_at),
+        ] {
+            engine
+                .pipeline()
+                .process_until_verified(&source, read, None, at, at, None)
+                .await
+                .unwrap();
+        }
+        let mut rows = engine.store.list_batches().await.unwrap();
+        rows.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        let order: Vec<_> = rows
+            .iter()
+            .map(|r| (r.created_at.clone(), r.progress_start.range_token()))
+            .collect();
+        assert_eq!(rows.len(), 2, "{order:?}");
+        // The store keeps a fixed-width spelling of the instant.
+        let stamped = |row: &BatchRecord| {
+            chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        assert_eq!(stamped(&rows[0]), first_at, "{order:?}");
+        assert_eq!(stamped(&rows[1]), second_at, "{order:?}");
+        assert!(
+            rows[0].progress_start.range_token() != rows[1].progress_start.range_token(),
+            "{order:?}"
+        );
+        assert!(
+            start_position(&rows[0].progress_start) < start_position(&rows[1].progress_start),
+            "the earlier window is filed first: {order:?}"
         );
     }
 
@@ -8799,7 +9005,7 @@ mod tests {
         multipart::save_session(&path, &session).unwrap();
 
         // As old as a session gets, but its upload is live in this process.
-        let live = LiveMultipart::start(&engine.active_multipart, &uri);
+        let live = LiveMultipart::start(&engine.active_multipart, &uri).await;
         assert_eq!(engine.sweep_abandoned_multipart().await, 0);
         assert!(path.exists(), "a live upload's session was swept");
         assert!(backend.has_pending_multipart(&session.object_uri, &session.upload_id));
@@ -8810,6 +9016,42 @@ mod tests {
             !path.exists(),
             "an abandoned session was kept once its upload ended"
         );
+    }
+
+    /// Review of #895: the sweep holds a key from the moment it finds it not
+    /// live until its session is aborted and deleted. An upload of that key
+    /// waits for it rather than resuming the session under the abort, and a
+    /// live upload is never claimed.
+    #[tokio::test]
+    async fn an_upload_waits_for_a_key_the_sweep_holds() {
+        let keys = ActiveMultipart::default();
+        let uri = "s3://bucket/key.segment";
+
+        let live = LiveMultipart::start(&keys, uri).await;
+        assert!(
+            SweepingKey::claim(&keys, uri).is_none(),
+            "a live upload's key was claimed by the sweep"
+        );
+        drop(live);
+
+        let held = SweepingKey::claim(&keys, uri).expect("a key no upload holds");
+        let waiting = {
+            let keys = Arc::clone(&keys);
+            tokio::spawn(async move {
+                let _live = LiveMultipart::start(&keys, uri).await;
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !waiting.is_finished(),
+            "an upload started on a key the sweep was aborting"
+        );
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the upload went on once the sweep let go")
+            .unwrap();
+        assert!(keys.lock().unwrap().live.is_empty());
     }
 
     /// The upload slots follow the width the controller chooses (#102). A
@@ -8851,6 +9093,57 @@ mod tests {
         assert_eq!(slots.available_permits(), 5);
         engine.resize_upload_slots(1);
         assert_eq!(slots.available_permits(), 1);
+    }
+
+    /// Review of #895: permits that come back while batches are queued behind
+    /// the slots go to the waiting tasks, so a narrower width has to be
+    /// enforced where they take them. Four batches hold the slots and four
+    /// wait; the width drops to one; as the four finish, one waiting batch
+    /// runs at a time, not four.
+    #[tokio::test]
+    async fn a_narrower_width_holds_for_batches_already_waiting_for_a_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "").unwrap();
+        let mut cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.max_concurrent_batches = 4;
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let slots = Arc::clone(&engine.upload_slots);
+        let debt = Arc::clone(&engine.upload_slots_debt);
+        let held = Arc::clone(&slots).acquire_many_owned(4).await.unwrap();
+        let running = Arc::new(AtomicUsize::new(0));
+        let mut waiting = Vec::new();
+        for _ in 0..4 {
+            let (slots, debt, running) =
+                (Arc::clone(&slots), Arc::clone(&debt), Arc::clone(&running));
+            waiting.push(tokio::spawn(async move {
+                let _slot = acquire_upload_slot(&slots, &debt).await;
+                running.fetch_add(1, Ordering::SeqCst);
+                // Holds its slot until the test ends.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(running.load(Ordering::SeqCst), 0);
+
+        engine.resize_upload_slots(1);
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            running.load(Ordering::SeqCst),
+            1,
+            "the queued batches ran at the old width"
+        );
+        for task in waiting {
+            task.abort();
+        }
     }
 
     /// A batch task does not outlive its engine: dropping the engine (a test,
