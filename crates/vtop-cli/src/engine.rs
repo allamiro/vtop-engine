@@ -3280,6 +3280,9 @@ struct OwnedPipeline {
     config: Arc<VtopConfig>,
     manifest_keyring: Arc<ManifestKeyring>,
     versioned_buckets: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// The engine's bucket-versioning pauses (#883), shared, so a batch task
+    /// and the engine see one pause per bucket.
+    versioning_pauses: Arc<crate::bucket_versioning::VersioningPauses>,
     throttles: Arc<AtomicU64>,
     attempts: Arc<AtomicU64>,
     provisioned_buckets: ProvisionedBuckets,
@@ -3297,6 +3300,7 @@ impl OwnedPipeline {
             config: &self.config,
             manifest_keyring: Arc::clone(&self.manifest_keyring),
             versioned_buckets: Arc::clone(&self.versioned_buckets),
+            versioning_pauses: Arc::clone(&self.versioning_pauses),
             throttles: Arc::clone(&self.throttles),
             attempts: Arc::clone(&self.attempts),
             provisioned_buckets: Arc::clone(&self.provisioned_buckets),
@@ -3743,6 +3747,7 @@ impl Engine {
             config: Arc::new(self.config.clone()),
             manifest_keyring: Arc::clone(&self.manifest_keyring),
             versioned_buckets: Arc::clone(&self.versioned_buckets),
+            versioning_pauses: Arc::clone(&self.versioning_pauses),
             throttles: Arc::clone(&self.throttles),
             attempts: Arc::clone(&self.attempts),
             provisioned_buckets: Arc::clone(&self.provisioned_buckets),
