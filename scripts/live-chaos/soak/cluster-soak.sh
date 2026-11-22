@@ -361,6 +361,9 @@ producer_loop() {
       # A new producer epoch per session: sequences restart at 0 and the
       # previous session is fenced (emit_client_config_at_epoch).
       cfg="$(emit_client_config_at_epoch "$epoch" "$session")"
+      # The stop request can arrive while the lease was being read: launch
+      # nothing once it is there (review of #881).
+      [[ -e "$RUN_DIR/stop-producer" ]] && break
       event produce_session "session=$session" "node=data-$n" "epoch=$epoch"
       "$VTOP_NODE" produce --client-config "$cfg" --addr "$(candidate_native_addr "$n")" \
         --records 1000000000000 --batch "$BATCH" --value-bytes "$VALUE_BYTES" --rate "$RATE" \
@@ -369,6 +372,9 @@ producer_loop() {
         >> "$WORKDIR/logs/produce.log" 2>&1 &
       pid=$!
       echo "$pid" > "$WORKDIR/producer.pid"
+      # The stop file is written before the shutdown reads producer.pid, so
+      # either that read sees this pid or this check sees the file.
+      [[ -e "$RUN_DIR/stop-producer" ]] && kill "$pid" 2> /dev/null
       code=0
       wait "$pid" || code=$?
       event produce_session_end "session=$session" "exit_code=$code" \
@@ -597,7 +603,8 @@ event load_start
 "${SOAK_PY[@]}" sampler "$RUN_DIR" "$WORKDIR" "$SAMPLE_INTERVAL" 2> "$WORKDIR/logs/sampler.log" &
 echo $! >> "$WORKDIR/pids"
 producer_loop &
-echo $! >> "$WORKDIR/pids"
+PRODUCER_LOOP_PID=$!
+echo "$PRODUCER_LOOP_PID" >> "$WORKDIR/pids"
 reader_loop &
 echo $! >> "$WORKDIR/pids"
 
@@ -627,11 +634,31 @@ done
 while (( $(elapsed) < DURATION )); do watch_nodes; sleep 1; done
 
 # --- the end: stop the load, read once more, verify every replica --------------------
-touch "$RUN_DIR/stop-producer" "$RUN_DIR/stop-reader"
-kill "$(cat "$WORKDIR/producer.pid" 2> /dev/null)" 2> /dev/null || true
+# stop_producer LOOP_PID — ask the producer loop to stop, end the producer it
+# is running right now (the loop's own child, not whatever producer.pid last
+# named), and return 0 only once the loop and its producer have exited, so the
+# final read never overlaps production (review of #881).
+stop_producer() {
+  local loop_pid=$1 deadline=$((SECONDS + 60))
+  touch "$RUN_DIR/stop-producer"
+  while (( SECONDS < deadline )) && kill -0 "$loop_pid" 2> /dev/null; do
+    pkill -TERM -P "$loop_pid" 2> /dev/null || true
+    sleep 1
+  done
+  if kill -0 "$loop_pid" 2> /dev/null; then
+    pkill -KILL -P "$loop_pid" 2> /dev/null || true
+    kill -KILL "$loop_pid" 2> /dev/null || true
+    sleep 1
+  fi
+  wait "$loop_pid" 2> /dev/null || true
+  ! kill -0 "$loop_pid" 2> /dev/null && ! pgrep -f "vtop-node produce" > /dev/null
+}
+touch "$RUN_DIR/stop-reader"
+if stop_producer "$PRODUCER_LOOP_PID"; then producer_exited=true; else producer_exited=false; fi
 wait_for_loops() { local deadline=$((SECONDS + 60)); while (( SECONDS < deadline )) && pgrep -f "vtop-node (produce|verify)" > /dev/null; do sleep 1; done; }
 wait_for_loops
-event producer_stopped "acked=$(acked_total)"
+event producer_stopped "acked=$(acked_total)" "exited=$producer_exited"
+[[ "$producer_exited" == true ]] || fail "the producer did not exit within 60 s of the stop; the final read would overlap production"
 final_ok=false
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   if read_once; then final_ok=true; break; fi

@@ -9,6 +9,9 @@ import contextlib
 import copy
 import io
 import json
+import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -282,6 +285,49 @@ class Evaluator(unittest.TestCase):
             (run_dir / "events.jsonl").write_text("not json\n")
             with contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(ce.main(["--profile", "smoke", "--run-dir", str(run_dir)]), 2)
+
+
+def shell_function(script, name):
+    """The text of `name() { ... }` in the shell script (it ends at a line that is just `}`)."""
+    found = re.search(r"^%s\(\) \{\n.*?^\}\n" % re.escape(name), script, re.S | re.M)
+    assert found, name
+    return found.group(0)
+
+
+@unittest.skipUnless(shutil.which("bash") and shutil.which("pkill") and shutil.which("pgrep"), "needs bash, pkill, pgrep")
+class ProducerShutdown(unittest.TestCase):
+    """The end of the soak stops the producer the loop is starting, not only the last one (review of #881)."""
+
+    def test_a_stop_during_the_lease_lookup_launches_no_producer(self):
+        script = (Path(__file__).resolve().parent / "cluster-soak.sh").read_text()
+        functions = shell_function(script, "producer_loop") + shell_function(script, "stop_producer")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / "bin").mkdir()
+            fake = tmp / "bin" / "vtop-node"
+            fake.write_text("#!/bin/sh\necho launched >> \"$LAUNCHED\"\nwhile :; do sleep 1; done\n")
+            fake.chmod(0o755)
+            harness = tmp / "harness.sh"
+            harness.write_text(
+                "RUN_DIR=%(t)s/run; WORKDIR=%(t)s/work; VTOP_NODE=%(t)s/bin/vtop-node\n"
+                "LAUNCHED=%(t)s/launched; export LAUNCHED\n"
+                "BATCH=1 VALUE_BYTES=1 RATE=1; mkdir -p \"$RUN_DIR\" \"$WORKDIR/logs\"\n"
+                "event() { :; }\ncandidate_by_uuid() { echo 1; }\n"
+                "emit_client_config_at_epoch() { echo cfg; }\ncandidate_native_addr() { echo addr; }\n"
+                # The stop request arrives while the lease is being read.
+                "current_lease() { touch \"$RUN_DIR/stop-producer\"; echo 'holder 1'; }\n"
+                "%(f)s\nproducer_loop &\nloop=$!\nsleep 0.5\n"
+                "stop_producer \"$loop\"; rc=$?\necho \"rc=$rc\"\n"
+                "pgrep -f \"%(t)s/bin/vtop-node\" > /dev/null && echo STILL_RUNNING\n"
+                "[ -e \"$LAUNCHED\" ] && echo LAUNCHED; exit 0\n" % {"t": tmp, "f": functions}
+            )
+            try:
+                out = subprocess.run(["bash", str(harness)], capture_output=True, text=True, timeout=90).stdout
+            finally:
+                subprocess.run(["pkill", "-KILL", "-f", str(tmp / "bin" / "vtop-node")], check=False)
+            self.assertIn("rc=0", out)
+            self.assertNotIn("LAUNCHED", out)
+            self.assertNotIn("STILL_RUNNING", out)
 
 
 if __name__ == "__main__":
