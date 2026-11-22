@@ -1,0 +1,205 @@
+# The archive comparison's lab (#746): one Compose project per tool run, fresh volumes each time.
+#
+#   run.py drives it; by hand (the tool's profile name is the service name):
+#   TOOL_CONFIG=$PWD/benchmarks/archive_compare/tools/vector/acks.yaml \
+#     docker compose -p vtop746-try -f benchmarks/archive_compare/compose.yml --profile vector \
+#     up -d kafka store commits vector
+#
+# Every tool runs in the same limit class (#744 rule 12): TOOL_CPUS (2; 1 on a
+# hosted runner), TOOL_MEMORY (2g), no swap. A test reads these limits from this
+# file and fails if any tool differs. The source (one Apache Kafka node, KRaft,
+# RF=1) is not under test and is identical for every tool: it gets its own
+# limits (KAFKA_CPUS, KAFKA_MEMORY). Each tool's state is its own named volume.
+# In crash and fault cells STORE_ALIAS=minio-real and the S3 tap takes the name
+# `minio`, so every tool reaches the store through it unchanged.
+
+x-tool-env: &tool-env
+  AWS_ACCESS_KEY_ID: minioadmin
+  AWS_SECRET_ACCESS_KEY: minioadmin
+  AWS_REGION: us-east-1
+  OTEL_SDK_DISABLED: "true"
+
+x-kafka-image: &kafka-image
+  image: ${KAFKA_IMAGE:-apache/kafka:4.3.2@sha256:852a0d49fc4e656b022e7f23785411802c9a088c78a7c5e39f33969de9c227a7}
+  pull_policy: never
+
+services:
+  # The source: one KRaft node, RF=1. Auto-created topics are off: the benchmark topic is
+  # created explicitly, with its partitions, by `topic-init`.
+  kafka:
+    <<: *kafka-image
+    hostname: kafka
+    cpus: ${KAFKA_CPUS:-2}
+    mem_limit: ${KAFKA_MEMORY:-3g}
+    memswap_limit: ${KAFKA_MEMORY:-3g}
+    environment:
+      CLUSTER_ID: "a2NvbXBhcmUtcGhhc2UtMQ"
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: "1"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      # A consumer group forms at once, for every tool alike (the broker default is 3 s).
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_HEAP_OPTS: "-Xms1g -Xmx1g"
+    volumes: ["kafka-data:/var/lib/kafka/data"]
+    networks: [lab]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 3s
+      timeout: 20s
+      retries: 40
+      start_period: 5s
+
+  topic-init:
+    <<: *kafka-image
+    profiles: ["init"]
+    depends_on:
+      kafka: {condition: service_healthy}
+    environment:
+      KAFKA_HEAP_OPTS: "-Xmx256m"
+    command: ["/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "kafka:9092", "--create", "--topic", "${TOPIC:-bench}",
+              "--partitions", "${PARTITIONS:-3}", "--replication-factor", "1"]
+    networks: [lab]
+
+  # Writes every offset commit of every group, as it happens, to /logs/commits.jsonl: the offset sampler
+  # (commits.py) turns it into time to source-committed and the group's lag. The broker stamps each commit.
+  commits:
+    <<: *kafka-image
+    cpus: 1
+    environment:
+      KAFKA_HEAP_OPTS: "-Xmx256m"
+    entrypoint: ["sh", "-c", "exec /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:9092 --topic __consumer_offsets --from-beginning --formatter org.apache.kafka.tools.consumer.OffsetsMessageFormatter > /logs/commits.jsonl 2>/logs/commits.err"]
+    volumes:
+      - ${RUN_LOGS:-/tmp}:/logs
+    networks: [lab]
+
+  # The store's service name is not `minio`: the name tools dial is an alias, so the S3 tap can take
+  # it in crash cells (a service name is a DNS name too, and would answer beside the tap's alias).
+  store:
+    image: vtop-minio:RELEASE.2025-09-07T16-13-09Z
+    pull_policy: never
+    command: ["server", "/data"]
+    cpus: 1
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      # The harness reads minio_s3_requests_total without a token (compare_common/store.py).
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+      MC_HOST_lab: http://minioadmin:minioadmin@127.0.0.1:9000
+    ports: ["127.0.0.1::9000"]
+    volumes: [minio-data:/data]
+    networks:
+      lab:
+        aliases: ["${STORE_ALIAS:-minio}"]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  tap:
+    image: ${HARNESS_IMAGE:-python:3.12.16-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b}
+    profiles: ["tap"]
+    working_dir: /bench
+    # FAULT_ARGS is empty except in verify-fault ("--fault-seed N --fault-one-in M").
+    command: ["sh", "-c", "exec python -m compare_common.tap --listen 0.0.0.0:9000 --upstream minio-real:9000 --control 0.0.0.0:9300 --trace /logs/tap.csv $${FAULT_ARGS}"]
+    environment:
+      FAULT_ARGS: ${FAULT_ARGS:-}
+    ports: ["127.0.0.1::9300"]
+    volumes:
+      - ${BENCH_DIR:-..}:/bench:ro
+      - ${RUN_LOGS:-/tmp}:/logs
+      # The tap kills the tool through the Docker Engine API (compare_common/docker_api.py).
+      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+    networks:
+      lab:
+        aliases: ["minio"]
+
+  # The seeded producer (producer.py) writes `key|value` lines to its stdout; the harness pipes them into
+  # `kafka-console-producer.sh` in the source container (acks=all). It runs in the lab so that its clock is
+  # the store's clock.
+  producer:
+    image: ${HARNESS_IMAGE:-python:3.12.16-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b}
+    profiles: ["producer"]
+    working_dir: /bench
+    cpus: 1
+    volumes:
+      - ${BENCH_DIR:-..}:/bench:ro
+      - ${RUN_LOGS:-/tmp}:/logs
+    networks: [lab]
+
+  # Makes the tools' state volumes writable by their users (VTOP runs as uid 10001).
+  volume-init:
+    image: ${HARNESS_IMAGE:-python:3.12.16-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b}
+    command: ["sh", "-c", "mkdir -p /vtop/state /vtop/work && chown -R 10001:10001 /vtop && chmod 0777 /connect"]
+    volumes:
+      - vtop-data:/vtop
+      - connect-data:/connect
+    networks: [lab]
+
+  vtop:
+    image: ${VTOP_IMAGE:-vtop-compare:missing}
+    pull_policy: never
+    profiles: ["vtop"]
+    environment:
+      <<: *tool-env
+      VTOP_CONFIG: /etc/vtop/config.yaml
+    volumes:
+      - ${TOOL_CONFIG:-/dev/null}:/etc/vtop/config.yaml:ro
+      - vtop-data:/data
+    cpus: ${TOOL_CPUS:-2}
+    mem_limit: ${TOOL_MEMORY:-2g}
+    memswap_limit: ${TOOL_MEMORY:-2g}
+    networks: [lab]
+
+  vector:
+    image: timberio/vector:0.61.0-debian@sha256:f6c23b5a7e16fb2838d33619ef7acf4bad2289a7cf22bc90efc2371f520c4ea2
+    profiles: ["vector"]
+    command: ["--config", "/etc/vector/vector.yaml"]
+    environment: *tool-env
+    volumes:
+      - ${TOOL_CONFIG:-/dev/null}:/etc/vector/vector.yaml:ro
+      - vector-data:/var/lib/vector
+    cpus: ${TOOL_CPUS:-2}
+    mem_limit: ${TOOL_MEMORY:-2g}
+    memswap_limit: ${TOOL_MEMORY:-2g}
+    networks: [lab]
+
+  # Kafka Connect (standalone: one worker, no internal topics) with the Lenses S3 sink, on the Connect
+  # runtime of the source's image (tools/connect-lenses/Dockerfile). The JVM's heap is capped at -Xmx1g.
+  # A second Connect entry (the Aiven sink, see README.md) is another service here and a line in run.py's TOOLS.
+  connect-lenses:
+    image: vtop-connect-lenses:12.1.2
+    pull_policy: never
+    profiles: ["connect-lenses"]
+    environment:
+      KAFKA_HEAP_OPTS: "-Xmx1g"
+    entrypoint: ["/opt/kafka/bin/connect-standalone.sh", "/etc/connect/worker.properties", "/etc/connect/connector.properties"]
+    volumes:
+      - ${TOOL_CONFIG:-/dev/null}:/etc/connect/connector.properties:ro
+      - ${WORKER_CONFIG:-/dev/null}:/etc/connect/worker.properties:ro
+      - connect-data:/data
+    cpus: ${TOOL_CPUS:-2}
+    mem_limit: ${TOOL_MEMORY:-2g}
+    memswap_limit: ${TOOL_MEMORY:-2g}
+    networks: [lab]
+
+volumes:
+  kafka-data:
+  minio-data:
+  vtop-data:
+  vector-data:
+  connect-data:
+
+networks:
+  lab:
