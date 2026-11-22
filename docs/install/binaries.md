@@ -84,7 +84,9 @@ the macOS archives run the file round trip only.
 
 All of this runs in the release workflow: on the tag, before anything is
 published (a failure stops the release), and in a dry run, a manual dispatch
-that builds and checks the archives and publishes nothing.
+that builds and checks the archives and publishes nothing. A dry run takes a
+tag, or a branch or commit, so the commit about to be tagged can be checked
+before the tag exists.
 
 ### The test suite on each platform
 

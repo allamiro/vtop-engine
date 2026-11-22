@@ -25,7 +25,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build (dry-run; no release is published)"
+        description: "Tag, branch or commit to build (dry-run; no release is published). A branch or commit builds the workspace version, so the commit about to be tagged can be checked first."
         required: true
 
 env:
@@ -98,17 +98,35 @@ jobs:
         env:
           INPUT_TAG: ${{ github.event.inputs.tag }}
           REF_NAME: ${{ github.ref_name }}
+          EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
           ref="${INPUT_TAG:-$REF_NAME}"
-          version="${ref#v}"
-          # Cross-check the tag against the workspace version so a mistagged
-          # release fails loudly instead of shipping mislabeled artifacts.
           cargo_version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
-          if [ "$version" != "$cargo_version" ]; then
-            echo "::error::tag version ($version) != workspace Cargo.toml version ($cargo_version)"
-            exit 1
-          fi
+          case "$ref" in
+            v[0-9]*)
+              version="${ref#v}"
+              # Cross-check the tag against the workspace version so a
+              # mistagged release fails loudly instead of shipping
+              # mislabeled artifacts.
+              if [ "$version" != "$cargo_version" ]; then
+                echo "::error::tag version ($version) != workspace Cargo.toml version ($cargo_version)"
+                exit 1
+              fi
+              ;;
+            *)
+              # A dry run of a branch or commit, before its tag exists
+              # (#724): every check of the archives runs on the commit that
+              # is about to be tagged. It is labelled with the workspace
+              # version; a dispatch publishes nothing.
+              if [ "$EVENT" != workflow_dispatch ]; then
+                echo "::error::$ref is not a v* tag"
+                exit 1
+              fi
+              version="$cargo_version"
+              echo "dry run of $ref (not a tag): building workspace version $version"
+              ;;
+          esac
           # A pre-release SUFFIX (-alpha, -rc.1, ...) publishes as a GitHub
           # pre-release. A 0.x major does NOT.
           #
