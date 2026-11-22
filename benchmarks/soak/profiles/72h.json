@@ -1,0 +1,59 @@
+{
+  "name": "72h",
+  "description": "The release-candidate soak (#726): Kafka to S3 for 72 hours at 1,000 records/s of about 700 B, one fault every 30 minutes, every fault kind in turn.",
+  "duration_s": 259200,
+  "rate_records_per_s": 1000,
+  "record_bytes": 700,
+  "partitions": 3,
+  "sample_interval_s": 30,
+  "lag_interval_s": 60,
+  "raw_snapshot_interval_s": 3600,
+  "prune_interval_s": 3600,
+  "scrub_interval_s": 21600,
+  "scrub_sample_batches": 200,
+  "fault_interval_s": 1800,
+  "first_fault_after_s": 1800,
+  "quiet_tail_s": 3600,
+  "fault_cycle": ["kill9", "broker_restart", "partition", "store_outage", "clock_step"],
+  "fault_hold_s": {
+    "kill9": 0,
+    "broker_restart": 0,
+    "partition": 180,
+    "store_outage": 300,
+    "clock_step": 180
+  },
+  "clock_step_seconds": [3600, -3600],
+  "recovery_timeout_s": 900,
+  "drain_timeout_s": 7200,
+  "check_timeout_s": 14400,
+  "min_free_gib": 180,
+  "kafka_retention_hours": 6,
+  "engine": {
+    "max_records": 20000,
+    "max_bytes": 67108864,
+    "max_batch_age_seconds": 30,
+    "max_concurrent_batches": 2,
+    "compression": "gzip",
+    "compression_level": 1,
+    "memory_limit": "4g"
+  },
+  "criteria": {
+    "trend_window_fraction": 0.8,
+    "trend_min_pairs": 200,
+    "trend": {
+      "rss_bytes": {"max_growth_pct": 5, "min_abs_growth": 33554432},
+      "open_fds": {"max_growth_pct": 5, "min_abs_growth": 16},
+      "ledger_bytes": {"max_growth_pct": 5, "min_abs_growth": 8388608},
+      "work_dir_bytes": {"max_growth_pct": 10, "min_abs_growth": 134217728},
+      "batch_seconds": {"max_growth_pct": 25, "min_abs_growth": 0.5},
+      "lag_seconds": {"max_growth_pct": 10, "min_abs_growth": 10}
+    },
+    "min_rate_fraction": 0.9,
+    "max_steady_lag_p95_s": 180,
+    "min_samples_fraction": 0.9,
+    "max_sample_gap_s": 300,
+    "min_free_gib_floor": 5,
+    "min_scrub_batches": 1000,
+    "min_prune_fraction": 0.9
+  }
+}

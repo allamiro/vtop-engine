@@ -73,6 +73,16 @@ arm64 and x86_64). The other distributions and macOS releases named above are
 expected to work by the same symbol versions and deployment target, but are
 not run.
 
+### The test suite on each platform
+
+Besides the archives, the workspace's test suite (`cargo test --workspace`,
+the tests that need no broker or store) runs nightly on each CPU and operating
+system the archives target: macOS 15 on Apple silicon and on Intel, and Linux
+on aarch64 (Ubuntu 24.04), in the
+[platform tests](https://github.com/allamiro/vtop-engine/blob/main/.github/workflows/platform-tests.yml)
+workflow. Every other test job runs on x86_64 Linux. The live tests, against
+Kafka, MinIO and PostgreSQL, run on x86_64 Linux only.
+
 ### Earlier releases
 
 - v0.10.1's Linux archives were built inside AlmaLinux 8 and need glibc 2.28,
