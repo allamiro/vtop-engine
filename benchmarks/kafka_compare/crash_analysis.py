@@ -49,7 +49,6 @@ CONFIGS = {
 }
 VALUE_SEP = "."
 CANARY_BYTES = 1048576
-MIN_RECORD_SIZE = 64
 
 
 class ParseError(ValueError):
@@ -59,20 +58,16 @@ class ParseError(ValueError):
 # ------------------------------------------------------------------------ the records
 
 
-def value_prefix(record_size: int, crash: int) -> str:
+def value_prefix(crash: int) -> str:
     """The prefix every record of one crash carries: the value is `<prefix>.<n>`.
 
-    `kafka-verifiable-producer.sh` sends the counter as the value and has no
-    record-size flag, only `--value-prefix`, so the size is set through the prefix.
-    The counter adds a dot and up to 6 digits, so a record is `record_size` bytes
-    minus at most 6.
+    `kafka-verifiable-producer.sh` sends the counter as the value, and its only `--value-prefix` is an
+    INTEGER (4.3.2: `could not convert ... to Integer`), so the crash number is the prefix and a record
+    is a few bytes of text, not the 1 KiB of #599's plan: this client has no record-size flag.
     """
-    head = f"kc599-c{crash:03d}-"
-    length = record_size - 1 - 6
-    if record_size < MIN_RECORD_SIZE:
-        raise ValueError(f"record size {record_size} is below the {MIN_RECORD_SIZE} bytes the crash id and "
-                         "counter need")
-    return (head + "x" * length)[:length]
+    if crash < 1:
+        raise ValueError(f"crash number {crash} must be 1 or more")
+    return str(crash)
 
 
 def sentinel_value(crash: int) -> str:

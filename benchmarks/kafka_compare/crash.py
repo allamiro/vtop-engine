@@ -111,7 +111,6 @@ class CapReached(Exception):
 
 class Params(NamedTuple):
     rate: int
-    record_size: int
     seed: int
     idempotent: bool = True
     sustain_floor: float = SUSTAIN_FLOOR
@@ -178,13 +177,13 @@ def verify_flush(config: str, described: str) -> None:
 def run_crash(b: Any, p: Params, config: str, mode: str, crash: int, trigger_after_s: float) -> dict[str, Any]:
     """One crash on backend `b`; returns its crash.csv row (without the run-constant columns)."""
     system, profile = ca.CONFIGS[config]
-    prefix = ca.value_prefix(p.record_size, crash)
+    prefix = ca.value_prefix(crash)
     started_at = utc_now()
     began = time.monotonic()
     row: dict[str, Any] = {
         "system": system, "config": config, "profile": profile, "crash_mode": mode, "crash": crash,
         "seed": p.seed, "trigger_after_s": trigger_after_s, "trigger_method": ca.CRASH_MODE_LABELS[mode],
-        "offered_rate": p.rate, "record_size": p.record_size, "client": "kafka-verifiable-producer",
+        "offered_rate": p.rate, "client": "kafka-verifiable-producer",
         "idempotent": p.idempotent, "started_at": started_at, "needed_manual_repair": False, "note": "",
     }
     b.begin(config, mode, crash)
@@ -680,7 +679,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--configs", default=",".join(ca.CONFIGS), help="comma-separated; default all three")
     parser.add_argument("--modes", default=None, help="comma-separated of sigkill, flakey-drop; default flakey-drop")
     parser.add_argument("--rate", type=int, default=1000, help="records per second offered (fixed, open loop)")
-    parser.add_argument("--record-size", type=int, default=1024)
     parser.add_argument("--trigger-window", default=None,
                         help="LOW,HIGH seconds after the producer starts; the crash time is drawn from it per "
                              "crash number, identically for every configuration (default 25,55)")
@@ -724,7 +722,7 @@ def build_matrix(args: argparse.Namespace) -> dict[str, Any]:
     except ValueError:
         raise SystemExit(f"--trigger-window {window!r}: two comma-separated seconds, LOW,HIGH") from None
     return {"configs": [c for c in args.configs.split(",") if c], "crash_modes": [m for m in modes.split(",") if m],
-            "crashes": crashes, "rate": args.rate, "record_size": args.record_size, "seed": args.seed,
+            "crashes": crashes, "rate": args.rate, "seed": args.seed,
             "trigger_window_s": [low, high], "smoke": bool(args.smoke)}
 
 
@@ -741,7 +739,6 @@ def check_args(args: argparse.Namespace, matrix: dict[str, Any]) -> float:
         raise SystemExit(f"--suspect-after {args.suspect_after}: at least one crash")
     try:
         cs.check_matrix(matrix)
-        ca.value_prefix(matrix["record_size"], 1)
         hours = cs.check_budget(matrix, args.max_hours)
     except (cs.PlanRefused, ValueError) as exc:
         raise SystemExit(f"refused before any Docker work: {exc}") from None
@@ -809,7 +806,7 @@ def main(argv: list[str] | None = None) -> int:
         cs.write_header(os.path.join(run_dir, "crash.csv"))
     env["run_state"] = "running"
     phase1.save_environment(run_dir, env)
-    params = Params(rate=args.rate, record_size=args.record_size, seed=args.seed)
+    params = Params(rate=args.rate, seed=args.seed)
     ctx = {"run_dir": run_dir, "env": env, "host": host, "vtop_image": vtop_image, "data_root": args.data_root,
            "node_cpus": args.node_cpus, "client_cpus": args.client_cpus, "client_memory": args.client_memory,
            "params": params, "save_env": lambda: phase1.save_environment(run_dir, env)}

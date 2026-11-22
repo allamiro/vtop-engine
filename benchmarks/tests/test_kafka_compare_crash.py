@@ -16,7 +16,7 @@ from kafka_compare import crash_analysis as ca
 from kafka_compare import crash_schema as cs
 from kafka_compare import schema
 
-PREFIX = "kc599-" + "x" * 20
+PREFIX = "7"
 
 # ------------------------------------------------------------------------ parsing
 
@@ -49,18 +49,11 @@ def test_an_ack_for_a_value_this_crash_did_not_send_is_refused():
         ca.parse_acks(lines, PREFIX)
 
 
-def test_the_value_prefix_gives_the_requested_record_size_within_the_digits_of_the_counter():
-    prefix = ca.value_prefix(1024, crash=7)
-    sizes = {len(f"{prefix}.{n}") for n in (0, 9, 999_999)}
-    assert max(sizes) <= 1024 and min(sizes) >= 1024 - 6
-    assert prefix.startswith("kc599-c007-")
-    assert ca.value_prefix(1024, crash=7) == prefix  # reproducible
-    assert ca.value_prefix(1024, crash=8) != prefix
-
-
-def test_a_tiny_record_size_is_refused():
-    with pytest.raises(ValueError, match="record size"):
-        ca.value_prefix(20, crash=1)
+def test_the_value_prefix_is_the_crash_number_the_only_prefix_the_client_accepts():
+    # kafka-verifiable-producer.sh's --value-prefix is an Integer; the value is "<prefix>.<n>"
+    assert ca.value_prefix(7) == "7" and ca.value_prefix(30) == "30"
+    with pytest.raises(ValueError, match="crash number"):
+        ca.value_prefix(0)
 
 
 def consumed_text(*values, start=0):
@@ -226,7 +219,7 @@ def test_a_run_where_kafka_defaults_loses_nothing_in_every_crash_is_flagged_as_a
 
 def matrix(crashes=3):
     return {"configs": ["kafka-defaults", "kafka-fsync-parity", "vtop-shipped"], "crash_modes": ["flakey-drop"],
-            "crashes": crashes, "rate": 1000, "record_size": 1024, "seed": 599, "trigger_window_s": [25.0, 55.0]}
+            "crashes": crashes, "rate": 1000, "seed": 599, "trigger_window_s": [25.0, 55.0]}
 
 
 def environment(m=None):
@@ -245,7 +238,7 @@ def good_row(env, config="kafka-defaults", mode="flakey-drop", crash=1, **over):
            "profile": "fsync-parity" if config == "kafka-fsync-parity" else "defaults", "crash_mode": mode,
            "crash": crash, "status": "ok", "seed": 599, "trigger_after_s": 30.0,
            "trigger_method": "dm-flakey drop_writes after SIGKILL of all three", "offered_rate": 1000,
-           "record_size": 1024, "client": "kafka-verifiable-producer", "idempotent": True, "send_errors": 0,
+           "client": "kafka-verifiable-producer", "idempotent": True, "send_errors": 0,
            "acked": 39990, "acked_last_seq": 39989, "acked_in_last_10s": 9990, "read_records": 39000,
            "read_missing_before_sentinel": 990, "acked_lost": 990, "lost_first_seq": 39000,
            "lost_last_seq": 39989, "lost_runs": 1, "lost_window_s": 10.5, "present_unacked": 0,
@@ -372,7 +365,7 @@ def test_a_sigkill_row_must_say_both_canaries_survived(tmp_path):
 def test_the_matrix_is_checked_before_any_docker_work():
     cs.check_matrix(matrix())
     for bad in ({"crashes": 0}, {"configs": []}, {"crash_modes": ["power"]}, {"configs": ["nope"]}, {"rate": 0},
-                {"record_size": 10}, {"trigger_window_s": [30.0, 10.0]}, {"seed": "x"}):
+                {"trigger_window_s": [30.0, 10.0]}, {"seed": "x"}):
         with pytest.raises(cs.PlanRefused):
             cs.check_matrix(dict(matrix(), **bad))
 

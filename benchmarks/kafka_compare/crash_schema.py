@@ -41,7 +41,6 @@ COLUMNS = (
     "trigger_after_s",
     "trigger_method",
     "offered_rate",
-    "record_size",
     "client",
     "idempotent",
     "send_errors",
@@ -74,7 +73,7 @@ COLUMNS = (
 RUN_CONSTANT = ("run_id", "env_fingerprint", "vtop_commit", "kafka_image")
 
 # An ok row carries every one of these as a number (kill_to_drop_ms only in a power-loss mode).
-_NUMERIC_OK = ("seed", "trigger_after_s", "offered_rate", "record_size", "send_errors", "acked", "read_records",
+_NUMERIC_OK = ("seed", "trigger_after_s", "offered_rate", "send_errors", "acked", "read_records",
                "read_missing_before_sentinel", "acked_lost", "lost_runs", "present_unacked", "duplicates",
                "reordered", "offset_mismatch", "unexpected", "recovery_seconds", "wall_seconds")
 
@@ -112,7 +111,7 @@ def check_matrix(matrix: dict[str, Any]) -> None:
     for mode in modes:
         if mode not in CRASH_MODES:
             raise PlanRefused(f"unknown crash mode {mode!r}; the choices are {', '.join(CRASH_MODES)}")
-    for key, floor in (("crashes", 1), ("rate", 1), ("record_size", 64)):
+    for key, floor in (("crashes", 1), ("rate", 1)):
         value = matrix.get(key)
         if not _is_int(value) or value < floor:
             raise PlanRefused(f"matrix.{key} is {value!r}: a whole number of at least {floor} is needed")

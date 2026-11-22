@@ -167,7 +167,7 @@ class FakeBackend:
 
 
 def params(**over):
-    base = {"rate": 1000, "record_size": 1024, "seed": 599, "idempotent": True, "sustain_floor": 0.85}
+    base = {"rate": 1000, "seed": 599, "idempotent": True, "sustain_floor": 0.85}
     base.update(over)
     return crash.Params(**base)
 
@@ -308,7 +308,7 @@ def test_the_logs_are_saved_even_when_the_read_back_raises():
 
 def small_matrix(crashes=2, modes=("flakey-drop",), configs=("kafka-defaults", "kafka-fsync-parity", "vtop-shipped")):
     return {"configs": list(configs), "crash_modes": list(modes), "crashes": crashes, "rate": 1000,
-            "record_size": 1024, "seed": 599, "trigger_window_s": [10.0, 20.0]}
+            "seed": 599, "trigger_window_s": [10.0, 20.0]}
 
 
 class RecordingBackend(FakeBackend):
@@ -437,7 +437,7 @@ def test_the_smoke_profile_is_small_and_covers_every_configuration_in_both_modes
 def test_the_full_profile_defaults_to_the_issues_30_crashes_in_power_loss_mode():
     matrix = crash.build_matrix(crash.parse_args([]))
     assert matrix["crashes"] == 30 and matrix["crash_modes"] == ["flakey-drop"]
-    assert matrix["rate"] == 1000 and matrix["record_size"] == 1024 and matrix["trigger_window_s"] == [25.0, 55.0]
+    assert matrix["rate"] == 1000 and matrix["trigger_window_s"] == [25.0, 55.0]
 
 
 def test_a_matrix_over_max_hours_is_refused_before_any_docker_work(monkeypatch):
