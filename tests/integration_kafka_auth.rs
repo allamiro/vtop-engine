@@ -17,7 +17,9 @@
 //!
 //! Test names say which listener they need: `sasl_*` tests need a SASL
 //! listener (`SASL_PLAINTEXT` or `SASL_SSL`), `tls_*` tests a TLS one (`SSL`
-//! or `SASL_SSL`). A leg runs the prefixes its listener has
+//! or `SASL_SSL`), `client_cert_*` tests a TLS listener that requires a
+//! client certificate (no prefix contains another: the test filter matches
+//! substrings). A leg runs the prefixes its listener has
 //! (`.github/workflows/kafka-matrix.yml`), and a test whose environment is
 //! missing panics instead of passing, so a leg configured wrongly fails.
 //!
@@ -27,6 +29,8 @@
 //! set -a; eval "$(scripts/kafka-broker.sh client-env SCRAM-SHA-512)"; set +a
 //! cargo test -p vtop-cli --test integration_kafka_auth -- --ignored sasl_
 //! cargo test -p vtop-cli --test integration_kafka_auth -- --ignored tls_
+//! # mutual TLS: `up ... mtls`, then
+//! cargo test -p vtop-cli --test integration_kafka_auth -- --ignored client_cert_
 //! ```
 
 use std::time::{Duration, Instant};
@@ -68,6 +72,9 @@ fn good_cfg() -> KafkaSourceConfig {
         sasl_username: None,
         sasl_password_env: None,
         ssl_ca_location: None,
+        ssl_certificate_location: None,
+        ssl_key_location: None,
+        ssl_key_password_env: None,
     };
     broker_env::apply(&mut cfg);
     cfg
@@ -249,8 +256,9 @@ async fn sasl_a_client_that_does_not_speak_sasl_is_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// TLS: the client verifies the broker. Nothing here is about a client
-// certificate, which the config cannot carry.
+// TLS: the client verifies the broker. On a listener that requires a client
+// certificate the good config carries one; these tests leave it in place, so
+// what they change is the only thing wrong.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -297,6 +305,50 @@ async fn tls_a_plaintext_client_is_refused() {
     cfg.sasl_username = None;
     cfg.sasl_password_env = None;
     cfg.ssl_ca_location = None;
+    cfg.ssl_certificate_location = None;
+    cfg.ssl_key_location = None;
+    cfg.ssl_key_password_env = None;
     assert_refused("a plaintext client", cfg.clone(), &[]).await;
     assert_reads_nothing("a plaintext client", cfg).await;
+}
+
+// ---------------------------------------------------------------------------
+// Mutual TLS: the broker verifies the client (#721).
+// ---------------------------------------------------------------------------
+
+fn uses_mtls(cfg: &KafkaSourceConfig) -> bool {
+    uses_tls(cfg) && cfg.ssl_certificate_location.is_some()
+}
+
+#[tokio::test]
+#[ignore = "requires a running Kafka broker whose TLS listener requires a client certificate"]
+async fn client_cert_a_client_without_one_is_refused() {
+    let good = good_cfg();
+    assert!(
+        uses_mtls(&good),
+        "this test needs a mutual-TLS listener and VTOP_TEST_KAFKA_SSL_CERT and _KEY"
+    );
+    assert_the_right_credentials_work().await;
+    // It trusts the broker (the CA is set), but presents nothing.
+    let mut cfg = good_cfg();
+    cfg.ssl_certificate_location = None;
+    cfg.ssl_key_location = None;
+    assert_refused("a client without a certificate", cfg.clone(), &[]).await;
+    assert_reads_nothing("a client without a certificate", cfg).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a running Kafka broker whose TLS listener requires a client certificate"]
+async fn client_cert_another_ca_signed_is_refused() {
+    let good = good_cfg();
+    assert!(uses_mtls(&good), "this test needs a mutual-TLS listener");
+    assert_the_right_credentials_work().await;
+    // A well-formed client certificate and its key, signed by a CA the broker
+    // does not trust.
+    let mut cfg = good_cfg();
+    cfg.ssl_certificate_location = Some(require("VTOP_TEST_KAFKA_SSL_OTHER_CERT"));
+    cfg.ssl_key_location = Some(require("VTOP_TEST_KAFKA_SSL_OTHER_KEY"));
+    assert_ne!(cfg.ssl_certificate_location, good.ssl_certificate_location);
+    assert_refused("a certificate another CA signed", cfg.clone(), &[]).await;
+    assert_reads_nothing("a certificate another CA signed", cfg).await;
 }

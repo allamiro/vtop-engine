@@ -351,14 +351,20 @@ make_bins() {
     make_bins
     run bash "${BATS_TEST_DIRNAME}/../compat/cell.sh" ledger-sqlite v0.9.0 forward hash-failure "$WORK/released" "$WORK/head"
     [ "$status" -eq 1 ]
-    [[ "$output" == *"the ledger cell expects pass"* ]]
+    [[ "$output" == *"the ledger cell expects pass or refuse"* ]]
 }
 
-@test "a ledger cell runs the ledger check, which fails on binaries that do not archive" {
+@test "a ledger cell fails on binaries that archive nothing, in each direction" {
     make_bins
     run bash "${BATS_TEST_DIRNAME}/../compat/cell.sh" ledger-sqlite v0.9.0 forward pass "$WORK/released" "$WORK/head"
     [ "$status" -ne 0 ]
-    [[ "$output" == *"ledger-compat/v0.9.0"* ]]
+    [[ "$output" == *"[compat/ledger-sqlite/forward/v0.9.0] FAIL: this build wrote no ledger"* ]]
+    run bash "${BATS_TEST_DIRNAME}/../compat/cell.sh" ledger-sqlite v0.9.0 upgrade pass "$WORK/released" "$WORK/head"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"[compat/ledger-sqlite/upgrade/v0.9.0] FAIL: the released v0.9.0 wrote no ledger"* ]]
+    run bash "${BATS_TEST_DIRNAME}/../compat/cell.sh" digests-audit v0.9.0 forward pass "$WORK/released" "$WORK/head"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"[compat/digests-audit/forward/v0.9.0] FAIL: the writer wrote no ledger"* ]]
 }
 
 @test "a released binary that is missing fails before anything runs" {

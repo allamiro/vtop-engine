@@ -214,6 +214,91 @@ class ReportOnlyTest(unittest.TestCase):
         self.assertIn("score 0.000", run.summary)
 
 
+FENCE = "crates/vtop-state/src/fence.rs"
+STORE = "crates/vtop-state/src/store.rs"
+
+
+class FileThresholdTest(unittest.TestCase):
+    """--file-min-score: each file of the recovery path is gated on its own
+    measured score (the maintainer's rule on #729), not on the total, so a
+    well-tested file cannot carry one that is not."""
+
+    def three_of_four(self, path):
+        return [mutant(path, n, "CaughtMutant") for n in range(3)] + [mutant(path, 9, "MissedMutant")]
+
+    def test_every_file_at_or_above_its_threshold_passes(self):
+        run = GateRun(
+            outcomes(baseline(), *self.three_of_four(FENCE), mutant(STORE, 1, "CaughtMutant")),
+            "--file-min-score", f"{FENCE}=0.75",
+            "--file-min-score", f"{STORE}=1.0",
+        )
+        self.assertEqual(run.code, 0, run.out)
+        self.assertRegex(run.out, r"fence\.rs\s+3 caught\s+1 missed.*score 0\.750\s+\(threshold 0\.750\)")
+
+    def test_one_file_below_its_threshold_fails_although_the_total_passes(self):
+        caught = [mutant(STORE, n, "CaughtMutant") for n in range(20)]
+        run = GateRun(
+            outcomes(baseline(), *self.three_of_four(FENCE), *caught),
+            "--min-score", "0.90",
+            "--file-min-score", f"{FENCE}=0.80",
+            "--file-min-score", f"{STORE}=0.80",
+        )
+        self.assertEqual(run.code, 1, run.out)
+        self.assertIn(f"{FENCE} scores 0.750, below its threshold 0.800", run.out)
+        self.assertNotIn(f"{STORE} scores", run.out)
+        self.assertIn("score 0.958", run.out)
+
+    def test_a_timeout_counts_against_the_file(self):
+        run = GateRun(
+            outcomes(baseline(), mutant(FENCE, 1, "CaughtMutant"), mutant(FENCE, 2, "Timeout")),
+            "--file-min-score", f"{FENCE}=0.80",
+        )
+        self.assertEqual(run.code, 1, run.out)
+        self.assertIn("scores 0.500", run.out)
+
+    def test_unviable_mutants_do_not_count_for_the_file(self):
+        unviable = [mutant(FENCE, n, "Unviable") for n in range(10)]
+        run = GateRun(
+            outcomes(baseline(), mutant(FENCE, 1, "CaughtMutant"), *unviable),
+            "--file-min-score", f"{FENCE}=1.0",
+        )
+        self.assertEqual(run.code, 0, run.out)
+
+    def test_a_gated_file_with_no_viable_mutant_is_refused(self):
+        run = GateRun(
+            outcomes(baseline(), mutant(STORE, 1, "CaughtMutant"), mutant(FENCE, 2, "Unviable")),
+            "--file-min-score", f"{FENCE}=0.80",
+        )
+        self.assertEqual(run.code, 2, run.out)
+        self.assertIn(f"{FENCE} has no viable mutant", run.out)
+
+    def test_a_malformed_file_threshold_is_refused(self):
+        document = outcomes(baseline(), mutant(FENCE, 1, "CaughtMutant"))
+        for bad in [FENCE, f"{FENCE}=", f"{FENCE}=high", f"{FENCE}=80", f"=0.8"]:
+            with self.subTest(bad=bad):
+                self.assertEqual(GateRun(document, "--file-min-score", bad).code, 2)
+
+    def test_a_file_named_twice_is_refused(self):
+        run = GateRun(
+            outcomes(baseline(), mutant(FENCE, 1, "CaughtMutant")),
+            "--file-min-score", f"{FENCE}=0.80",
+            "--file-min-score", f"{FENCE}=0.90",
+        )
+        self.assertEqual(run.code, 2, run.out)
+
+    def test_no_threshold_at_all_is_refused(self):
+        run = GateRun(outcomes(baseline(), mutant(FENCE, 1, "CaughtMutant")))
+        self.assertEqual(run.code, 2, run.out)
+
+    def test_report_only_ignores_the_file_thresholds(self):
+        run = GateRun(
+            outcomes(baseline(), mutant(FENCE, 1, "MissedMutant")),
+            "--report-only",
+            "--file-min-score", f"{FENCE}=0.80",
+        )
+        self.assertEqual(run.code, 0, run.out)
+
+
 class LibraryTest(unittest.TestCase):
     def test_score_helper(self):
         self.assertEqual(gate.score(9, 1, 0), 0.9)

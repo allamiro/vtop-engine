@@ -36,15 +36,27 @@ fn require_password_env(
     env_name: &str,
     looked_up: Result<String, std::env::VarError>,
 ) -> Result<String, VtopError> {
+    require_secret_env("sasl_password_env", "the password", env_name, looked_up)
+}
+
+/// [`require_password_env`] for any setting that names a secret's variable
+/// (`setting`), the secret described as `what` ("the password").
+fn require_secret_env(
+    setting: &str,
+    what: &str,
+    env_name: &str,
+    looked_up: Result<String, std::env::VarError>,
+) -> Result<String, VtopError> {
     match looked_up {
         Ok(pw) => Ok(pw),
         Err(std::env::VarError::NotPresent) => Err(VtopError::Config(format!(
-            "sasl_password_env names ${env_name}, but that environment variable is not set; \
-             refusing to connect without the password"
+            "{setting} names ${env_name}, but that environment variable is not set; \
+             refusing to connect without {what}"
         ))),
         Err(std::env::VarError::NotUnicode(_)) => Err(VtopError::Config(format!(
-            "sasl_password_env names ${env_name}, but its value is not valid Unicode; \
-             refusing to connect without a usable password"
+            "{setting} names ${env_name}, but its value is not valid Unicode; \
+             refusing to connect without a usable {}",
+            what.trim_start_matches("the ")
         ))),
     }
 }
@@ -256,6 +268,25 @@ pub fn build_client_config(cfg: &KafkaSourceConfig) -> Result<ClientConfig, Vtop
     }
     if let Some(ca) = &cfg.ssl_ca_location {
         cc.set("ssl.ca.location", ca);
+    }
+    // Mutual TLS (#721): the client certificate and its key, checked as a
+    // pair over TLS here too, for a caller that did not load the config
+    // through `VtopConfig::validate`.
+    cfg.validate_mutual_tls()?;
+    if let Some(cert) = &cfg.ssl_certificate_location {
+        cc.set("ssl.certificate.location", cert);
+    }
+    if let Some(key) = &cfg.ssl_key_location {
+        cc.set("ssl.key.location", key);
+    }
+    if let Some(env_name) = &cfg.ssl_key_password_env {
+        let pw = require_secret_env(
+            "ssl_key_password_env",
+            "the client key's passphrase",
+            env_name,
+            std::env::var(env_name),
+        )?;
+        cc.set("ssl.key.password", pw); // value never logged
     }
     Ok(cc)
 }
@@ -4878,6 +4909,9 @@ mod tests {
             sasl_username: None,
             sasl_password_env: None,
             ssl_ca_location: None,
+            ssl_certificate_location: None,
+            ssl_key_location: None,
+            ssl_key_password_env: None,
         }
     }
 
@@ -5635,6 +5669,40 @@ mod tests {
             "the drain empties the accumulator, so a second successful pass \
              delivers nothing — anything else double-counts the same loss"
         );
+    }
+
+    /// #721: the client certificate and key reach librdkafka as its own
+    /// settings, and a half-configured pair is refused before a connection.
+    #[test]
+    fn mutual_tls_settings_reach_the_client() {
+        let mut c = cfg();
+        c.security_protocol = Some("SSL".into());
+        c.ssl_ca_location = Some("/etc/kafka/ca.pem".into());
+        c.ssl_certificate_location = Some("/etc/kafka/client.pem".into());
+        c.ssl_key_location = Some("/etc/kafka/client.key".into());
+        let cc = build_client_config(&c).unwrap();
+        assert_eq!(
+            cc.get("ssl.certificate.location"),
+            Some("/etc/kafka/client.pem")
+        );
+        assert_eq!(cc.get("ssl.key.location"), Some("/etc/kafka/client.key"));
+        assert_eq!(cc.get("ssl.key.password"), None);
+        assert_eq!(cc.get("security.protocol"), Some("SSL"));
+        c.ssl_key_location = None;
+        assert!(
+            build_client_config(&c).is_err(),
+            "a certificate without its key"
+        );
+        let err = require_secret_env(
+            "ssl_key_password_env",
+            "the client key's passphrase",
+            "KEY_PW",
+            Err(std::env::VarError::NotPresent),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("ssl_key_password_env names $KEY_PW"), "{err}");
+        assert!(err.contains("without the client key's passphrase"), "{err}");
     }
 
     #[test]

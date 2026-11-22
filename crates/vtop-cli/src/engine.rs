@@ -183,7 +183,10 @@ pub struct Pipeline<'a> {
     /// (review of #895), and the keys the abandoned-session sweep is working
     /// on. Batches now upload while the run loop goes on, so the sweep can
     /// run beside a live upload; it skips these, whatever their session's
-    /// age, and an upload waits for a key the sweep holds.
+    /// age, and an upload waits for a key the sweep holds. A key has one
+    /// owner at a time: an upload of a key another upload holds waits for it
+    /// too (a superseded window still uploading, and the replay of its range
+    /// that names the same key).
     pub active_multipart: ActiveMultipart,
 }
 
@@ -192,10 +195,10 @@ pub type ActiveMultipart = Arc<std::sync::Mutex<ActiveKeys>>;
 
 /// The keys of [`ActiveMultipart`]: uploads in progress, and the keys the
 /// sweep holds while it aborts their sessions. Both are decided under one
-/// lock, so a key is never both.
+/// lock, so a key is never both, and neither holds a key twice.
 #[derive(Debug, Default)]
 pub struct ActiveKeys {
-    live: std::collections::HashMap<String, usize>,
+    live: std::collections::HashSet<String>,
     sweeping: std::collections::HashSet<String>,
 }
 
@@ -234,22 +237,31 @@ async fn acquire_upload_slot(
     }
 }
 
-/// Marks one object key's multipart upload as live until dropped, however
-/// the upload ends.
+/// Owns one object key's multipart session until dropped, however the upload
+/// ends: the session file, the upload id and what is done with them after a
+/// failure are one writer's at a time.
+///
+/// Two uploads of a key can be live at once: a window is superseded while it
+/// is still uploading, its range is read again, and the replacement names the
+/// same derived key (same source, range and bytes, filed under the same hour)
+/// and so the same session file. The second waits here for the first to end,
+/// failure settling included, and then finds the object (probe) or the
+/// session the first left (resume).
 struct LiveMultipart {
     keys: ActiveMultipart,
     key: String,
 }
 
 impl LiveMultipart {
-    /// Marks `key` live, once the sweep is not working on it. The sweep holds
-    /// a key for one abort request, so the wait is short.
+    /// Takes `key`, once no other upload owns it and the sweep is not working
+    /// on it. The sweep holds a key for one abort request, so that wait is
+    /// short; an upload holds it for as long as the upload takes.
     async fn start(keys: &ActiveMultipart, key: &str) -> Self {
         loop {
             {
                 let mut active = keys.lock().unwrap();
-                if !active.sweeping.contains(key) {
-                    *active.live.entry(key.to_owned()).or_default() += 1;
+                if !active.sweeping.contains(key) && !active.live.contains(key) {
+                    active.live.insert(key.to_owned());
                     break;
                 }
             }
@@ -264,13 +276,7 @@ impl LiveMultipart {
 
 impl Drop for LiveMultipart {
     fn drop(&mut self) {
-        let mut active = self.keys.lock().unwrap();
-        if let Some(count) = active.live.get_mut(&self.key) {
-            *count -= 1;
-            if *count == 0 {
-                active.live.remove(&self.key);
-            }
-        }
+        self.keys.lock().unwrap().live.remove(&self.key);
     }
 }
 
@@ -285,7 +291,7 @@ impl SweepingKey {
     /// `None` when an upload of `key` is live.
     fn claim(keys: &ActiveMultipart, key: &str) -> Option<Self> {
         let mut active = keys.lock().unwrap();
-        if active.live.contains_key(key) {
+        if active.live.contains(key) {
             return None;
         }
         active.sweeping.insert(key.to_owned());
@@ -1499,6 +1505,20 @@ impl<'a> Pipeline<'a> {
                     .inc();
             }
         };
+        // A derived key has one uploader at a time. A window superseded while
+        // it uploads goes on uploading, and the replay of its range names the
+        // same derived key (same source, range, bytes and hour), so the same
+        // multipart session file. The key is taken before the check below, so
+        // the replay waits for that upload to end and then finds its object
+        // (reuse) or the session it left (resume); it never writes the
+        // session beside it, or deletes it under it.
+        let mp_cfg = MultipartUploadConfig::from_upload(&self.config.upload, work_dir.clone());
+        let mut owned_key: Option<LiveMultipart> = None;
+        if let Ok(derived) = &derived_object_uri {
+            if mp_cfg.should_multipart(self.backend.as_ref(), compressed.size_bytes) {
+                owned_key = Some(LiveMultipart::start(&self.active_multipart, derived).await);
+            }
+        }
         // Whether the object is the one an earlier attempt recorded and this
         // replay adopted (#773), not one the key names.
         let mut adopted = false;
@@ -1907,6 +1927,12 @@ impl<'a> Pipeline<'a> {
             },
         };
         metrics.object_reused = reused;
+        // Held only for the key the bytes are sent under: an object that is
+        // already there sends nothing, and an attempt key is named by this
+        // batch alone (taken below, once it is known to be sent).
+        if reused || owned_key.as_ref().is_some_and(|k| k.key != object_uri) {
+            owned_key = None;
+        }
 
         // ONE PUT, OR RESUMABLE MULTIPART above the threshold (#482). The
         // retransmission unit for a single put is the whole batch — a lost
@@ -1921,14 +1947,15 @@ impl<'a> Pipeline<'a> {
         // resumed for THIS object identity carries THIS content — the
         // resume re-checks every kept part against the local bytes, so a
         // re-derived batch (a new digest) never adopts a stale session. It
-        // does NOT fence against a concurrent writer to the same object
-        // key. An attempt key has one writer by construction; a derived key
-        // is named by its content digest, so two writers of it write the
-        // same bytes (#626), which is the property that stands in for the
-        // lease `tier` holds. A replay of the same bytes after a failed
+        // does NOT fence against a writer in another process. An attempt
+        // key has one writer by construction; a derived key is named by its
+        // content digest, so two writers of it write the same bytes (#626),
+        // which is the property that stands in for the lease `tier` holds.
+        // Within this process a key has one uploader at a time (see
+        // `LiveMultipart`), so a superseded window's upload and the replay of
+        // its range never share a session file. A replay of the same bytes after a failed
         // attempt or a crash resumes the session that attempt left under the
         // derived key (#668), and sends only the parts it is missing.
-        let mp_cfg = MultipartUploadConfig::from_upload(&self.config.upload, work_dir.clone());
         let t = Instant::now();
         let multipart_used =
             !reused && mp_cfg.should_multipart(self.backend.as_ref(), compressed.size_bytes);
@@ -1951,7 +1978,9 @@ impl<'a> Pipeline<'a> {
         let upload_result = if reused {
             None
         } else if multipart_used {
-            let _live = LiveMultipart::start(&self.active_multipart, &object_uri).await;
+            if owned_key.is_none() {
+                owned_key = Some(LiveMultipart::start(&self.active_multipart, &object_uri).await);
+            }
             let result = multipart::upload_resumable_with_report(
                 self.backend.as_ref(),
                 &mp_cfg,
@@ -2003,6 +2032,9 @@ impl<'a> Pipeline<'a> {
             }
             fail!(format!("object upload failed: {e}"));
         }
+        // The session is settled (completed, kept or aborted): the key is
+        // free for the next upload of it.
+        drop(owned_key);
         // The hardened profile: an object PUT that returned no version is
         // the first sign of a bucket whose versioning was suspended under
         // the running engine. A multipart upload recovered after its
@@ -2899,7 +2931,14 @@ impl PendingBuffer {
             vtop_core::event_time::earliest(self.first_timestamp.take(), read.first_timestamp);
         self.last_timestamp =
             vtop_core::event_time::latest(self.last_timestamp.take(), read.last_timestamp);
-        self.latest_end = Some(read.progress_end);
+        // A spool marker's received-time range likewise covers every read of
+        // the window, not only the last one's lines. The times are not part
+        // of the range the adapter settles a commit by.
+        let mut end = read.progress_end;
+        if let Some(prev) = &self.latest_end {
+            end.widen_received_times(prev);
+        }
+        self.latest_end = Some(end);
         if self
             .rebuild_end
             .is_some_and(|end| self.end_position() > Some(end))
@@ -7492,6 +7531,7 @@ mod tests {
     use super::*;
     use crate::testkit::file_config;
     use std::io::Write;
+    use std::sync::atomic::AtomicBool;
     use vtop_core::config::StreamsConfig;
 
     /// #559: a buffered window spans several reads; its event-time range is
@@ -7541,6 +7581,66 @@ mod tests {
             drained.last_timestamp.as_deref(),
             Some("2026-01-01T10:30:00.000Z")
         );
+    }
+
+    /// A buffered spool window's marker carries the earliest and latest line
+    /// times of all its reads, so its manifest does not describe only the
+    /// last read's lines.
+    #[test]
+    fn a_buffered_spool_window_keeps_the_earliest_and_latest_line_time() {
+        let source = DiscoveredSource {
+            source_type: SourceType::SyslogSpool,
+            source_name: "/spool".into(),
+            format: vtop_core::types::TelemetryFormat::Syslog,
+        };
+        let mut buf = PendingBuffer::new("default", source, BatchLimits::default());
+        let marker = |start: u64, end: u64, lo: Option<&str>, hi: Option<&str>| {
+            ProgressMarker::SyslogSpool {
+                spool_id: "spool".into(),
+                path: "/spool".into(),
+                inode: Some(7),
+                start_byte: start,
+                end_byte: end,
+                received_time_start: lo.map(str::to_owned),
+                received_time_end: hi.map(str::to_owned),
+                file_size: Some(300),
+                content_fingerprint: None,
+            }
+        };
+        let read = |start: u64, end: u64, lo: Option<&str>, hi: Option<&str>| ReadResult {
+            records: vec![b"r".to_vec()],
+            progress_start: marker(start, start, None, None),
+            progress_end: marker(start, end, lo, hi),
+            first_timestamp: None,
+            last_timestamp: None,
+            verbatim: false,
+        };
+        buf.append(read(
+            0,
+            100,
+            Some("2026-11-14T10:00:00Z"),
+            Some("2026-11-14T10:30:00Z"),
+        ));
+        buf.append(read(
+            100,
+            200,
+            Some("2026-11-14T09:00:00Z"),
+            Some("2026-11-14T09:05:00Z"),
+        ));
+        buf.append(read(200, 300, None, None));
+        let drained = buf.drain().unwrap();
+        let window = window_marker(&drained);
+        assert_eq!(window.range_token(), "b0-300");
+        let ProgressMarker::SyslogSpool {
+            received_time_start,
+            received_time_end,
+            ..
+        } = window
+        else {
+            unreachable!()
+        };
+        assert_eq!(received_time_start.as_deref(), Some("2026-11-14T09:00:00Z"));
+        assert_eq!(received_time_end.as_deref(), Some("2026-11-14T10:30:00Z"));
     }
 
     /// #66: a mutating engine is single-instance per state store AND work dir;
@@ -9064,6 +9164,32 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), waiting)
             .await
             .expect("the upload went on once the sweep let go")
+            .unwrap();
+        assert!(keys.lock().unwrap().live.is_empty());
+    }
+
+    /// Review of #892: a key has one uploader at a time. A second upload of it
+    /// (the replay of a superseded window, which names the same derived key)
+    /// waits until the first lets go, and different keys do not wait.
+    #[tokio::test]
+    async fn a_second_upload_of_a_live_key_waits_for_the_first() {
+        let keys = ActiveMultipart::default();
+        let uri = "s3://bucket/key.segment";
+        let first = LiveMultipart::start(&keys, uri).await;
+        drop(LiveMultipart::start(&keys, "s3://bucket/other.segment").await);
+        let second = {
+            let keys = Arc::clone(&keys);
+            tokio::spawn(async move { drop(LiveMultipart::start(&keys, uri).await) })
+        };
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !second.is_finished(),
+            "two uploads of one key were live at once"
+        );
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("the second upload went on once the first ended")
             .unwrap();
         assert!(keys.lock().unwrap().live.is_empty());
     }
@@ -15312,6 +15438,254 @@ mod tests {
             engine.upload_width(),
             2,
             "and the width controller halved the next cycle's width on it"
+        );
+    }
+
+    /// A multipart store that holds the first part of one object's upload at
+    /// a gate and refuses the creation of another's once, and counts what
+    /// reaches the held object while that part waits.
+    struct HeldMultipart {
+        inner: Arc<vtop_upload::MockBackend>,
+        /// The piece of the object key whose first part waits.
+        hold: String,
+        gate: Arc<tokio::sync::Semaphore>,
+        taken: AtomicBool,
+        waiting: AtomicBool,
+        /// Refuse the next `create_multipart_upload` whose key contains this.
+        refuse_create: std::sync::Mutex<Option<String>>,
+        /// Requests for the held object made while its first part waits: a
+        /// second writer of the same session.
+        intruders: AtomicUsize,
+    }
+
+    impl HeldMultipart {
+        fn note(&self, uri: &str) {
+            if uri.contains(&self.hold) && self.waiting.load(Ordering::SeqCst) {
+                self.intruders.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl UploadBackend for HeldMultipart {
+        async fn put_object(
+            &self,
+            local_path: &std::path::Path,
+            object_uri: &str,
+            checksum: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::StoredObject, VtopError> {
+            self.inner
+                .put_object(local_path, object_uri, checksum)
+                .await
+        }
+        async fn put_manifest(
+            &self,
+            local_path: &std::path::Path,
+            manifest_uri: &str,
+            checksum: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::StoredManifest, VtopError> {
+            self.inner
+                .put_manifest(local_path, manifest_uri, checksum)
+                .await
+        }
+        async fn head_object(&self, uri: &str) -> Result<vtop_upload::ObjectHead, VtopError> {
+            self.inner.head_object(uri).await
+        }
+        async fn get_object(&self, uri: &str) -> Result<Vec<u8>, VtopError> {
+            self.inner.get_object(uri).await
+        }
+        async fn get_object_bounded(&self, uri: &str, max: usize) -> Result<Vec<u8>, VtopError> {
+            self.inner.get_object_bounded(uri, max).await
+        }
+        async fn verify_object(
+            &self,
+            uri: &str,
+            size: u64,
+            expected: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::VerificationResult, VtopError> {
+            self.inner.verify_object(uri, size, expected).await
+        }
+        async fn delete_object(&self, uri: &str) -> Result<(), VtopError> {
+            self.inner.delete_object(uri).await
+        }
+        fn backend_name(&self) -> &'static str {
+            "held-multipart"
+        }
+        fn supports_checksum_verification(&self) -> bool {
+            true
+        }
+        fn supports_multipart(&self) -> bool {
+            true
+        }
+        fn reports_absent_objects(&self) -> bool {
+            true
+        }
+        async fn create_multipart_upload(
+            &self,
+            object_uri: &str,
+            content_type: &str,
+            checksum: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::CreatedUpload, VtopError> {
+            self.note(object_uri);
+            let refused = {
+                let mut refuse = self.refuse_create.lock().unwrap();
+                if refuse.as_deref().is_some_and(|p| object_uri.contains(p)) {
+                    refuse.take();
+                    true
+                } else {
+                    false
+                }
+            };
+            if refused {
+                return Err(VtopError::Upload(format!(
+                    "test: creating the upload of {object_uri} refused"
+                )));
+            }
+            self.inner
+                .create_multipart_upload(object_uri, content_type, checksum)
+                .await
+        }
+        async fn upload_part(
+            &self,
+            object_uri: &str,
+            upload_id: &str,
+            part_number: u32,
+            data: bytes::Bytes,
+        ) -> Result<vtop_upload::UploadedPart, VtopError> {
+            if object_uri.contains(&self.hold) {
+                if self.taken.swap(true, Ordering::SeqCst) {
+                    self.note(object_uri);
+                } else {
+                    self.waiting.store(true, Ordering::SeqCst);
+                    drop(self.gate.acquire().await.unwrap());
+                    self.waiting.store(false, Ordering::SeqCst);
+                }
+            }
+            self.inner
+                .upload_part(object_uri, upload_id, part_number, data)
+                .await
+        }
+        async fn complete_multipart_upload(
+            &self,
+            object_uri: &str,
+            upload_id: &str,
+            parts: &[vtop_upload::UploadedPart],
+        ) -> Result<vtop_upload::StoredObject, VtopError> {
+            self.note(object_uri);
+            self.inner
+                .complete_multipart_upload(object_uri, upload_id, parts)
+                .await
+        }
+        async fn abort_multipart_upload(
+            &self,
+            object_uri: &str,
+            upload_id: &str,
+        ) -> Result<(), VtopError> {
+            self.note(object_uri);
+            self.inner
+                .abort_multipart_upload(object_uri, upload_id)
+                .await
+        }
+    }
+
+    /// Review of #892: an earlier window fails while a later one is still
+    /// uploading a multipart object. The later window is superseded, its range
+    /// is read again, and the replacement names the same derived key (same
+    /// range, same bytes), so the same multipart session file. The replacement
+    /// must wait for the upload still running rather than write the session
+    /// beside it (a shared checkpoint file, an upload id, a delete under the
+    /// other's feet), then find what it left. Nothing commits before it is
+    /// VERIFIED, and the ranges tile the file.
+    #[tokio::test]
+    async fn a_replay_waits_for_the_superseded_multipart_upload_of_its_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = multipart_engine_config(dir.path(), "multipart-supersede-892");
+        cfg.batching.max_records = 20;
+        cfg.batching.max_concurrent_batches = 4;
+        cfg.batching.idle_poll_interval_ms = 20;
+        cfg.upload.multipart_max_parallelism = 1;
+        // No hour in the key: both attempts name it whatever the clock says.
+        cfg.partitioning.template = "tenant={tenant}/source={source}/format={format}".into();
+        let line = std::fs::read_to_string(dir.path().join("in.log"))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .len() as u64
+            + 1;
+        let (first, second) = (
+            format!("b0-{}-", 20 * line),
+            format!("b{}-{}-", 20 * line, 40 * line),
+        );
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let store = Arc::new(HeldMultipart {
+            inner: Arc::new(vtop_upload::MockBackend::new()),
+            hold: second,
+            gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            taken: AtomicBool::new(false),
+            waiting: AtomicBool::new(false),
+            refuse_create: std::sync::Mutex::new(Some(first)),
+            intruders: AtomicUsize::new(0),
+        });
+        engine.backend = store.clone();
+
+        // The first window's upload is refused and the second's waits at the
+        // gate. The first fails, the second is superseded, and the next pass
+        // reads both ranges again: the queue holds the superseded window and
+        // the replays of both.
+        let mut caught_up = false;
+        for _ in 0..300 {
+            let _ = engine.run_source(SourceType::File, false).await;
+            let queued = engine
+                .inflight
+                .get(&SourceType::File)
+                .map_or(0, VecDeque::len);
+            if queued == 3 {
+                caught_up = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(caught_up, "the replay never caught up to the held upload");
+        for _ in 0..30 {
+            let _ = engine.run_source(SourceType::File, false).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(store.waiting.load(Ordering::SeqCst), "the upload is held");
+        assert_eq!(
+            store.intruders.load(Ordering::SeqCst),
+            0,
+            "the replay used the multipart session of an upload still running"
+        );
+        assert!(
+            committed_file_ranges(&engine).await.is_empty(),
+            "nothing commits while the front of the queue is not VERIFIED"
+        );
+
+        store.gate.add_permits(1_000);
+        run_until_settled(&mut engine, SourceType::File).await;
+        assert_eq!(
+            store.intruders.load(Ordering::SeqCst),
+            0,
+            "a request reached the held object while its first part waited"
+        );
+        let len = std::fs::metadata(dir.path().join("in.log")).unwrap().len();
+        // The superseded window verified and was held; it settles once the
+        // replay has committed through its end, so its range is in the ledger
+        // twice, and every byte of the file is covered.
+        let mut ranges: Vec<_> = committed_file_ranges(&engine)
+            .await
+            .iter()
+            .map(|&(_, start, end, _)| (start, end))
+            .collect();
+        ranges.dedup();
+        assert_eq!(ranges, vec![(0, 20 * line), (20 * line, len)]);
+        assert_committed_without_a_gap("after the replay", &engine, len.into()).await;
+        assert!(
+            engine.active_multipart.lock().unwrap().live.is_empty(),
+            "an upload's key was left held"
         );
     }
 

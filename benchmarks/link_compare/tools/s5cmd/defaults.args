@@ -1,0 +1,10 @@
+# s5cmd for the link comparison (#747). s5cmd has no config file: this is its
+# command line, one argument per line, '#' lines ignored. At the `defaults`
+# cell the transfer flags are s5cmd's shipped ones: --numworkers 256,
+# cp --concurrency 5, cp --part-size 50 (MiB)
+# (https://github.com/peak/s5cmd/blob/v2.3.0/README.md#configuring-concurrency).
+# run.py adds the flags of equal-conns and tuned cells; the values are in the
+# row's `settings` column.
+# telemetry: none to turn off. s5cmd sends no usage reporting.
+# --endpoint-url: through the middlebox, as every tool dials it.
+--endpoint-url=http://netem:9200

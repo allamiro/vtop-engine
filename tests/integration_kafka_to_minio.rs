@@ -80,6 +80,9 @@ fn kafka_cfg(bootstrap: &str, group: &str) -> KafkaSourceConfig {
         sasl_username: None,
         sasl_password_env: None,
         ssl_ca_location: None,
+        ssl_certificate_location: None,
+        ssl_key_location: None,
+        ssl_key_password_env: None,
     };
     broker_env::apply(&mut cfg);
     cfg

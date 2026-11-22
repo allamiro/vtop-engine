@@ -21,7 +21,12 @@
 #   6. the survivor SERVES within CHAOS_PROMOTION_SERVE_LIMIT_MS (3 s) of
 #      the lease changing hands (#750): it needs a write quorum of replica
 #      streams, and one peer is the node just killed, so waiting for every
-#      stream cost each failover its whole ten-second deadline.
+#      stream cost each failover its whole ten-second deadline;
+#   7. the recorded histories (#728) pass both checkers: every acknowledged
+#      record is read back once, in order, and nothing else is visible; and
+#      from the control side, one Raft leader per term, one lease holder and
+#      one acting leader per epoch, linearizable lease reads, and the killed
+#      leader's epoch never acted on after its successor's grant.
 source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
 # A v2 range (#240): the promotion boundary marker this scenario asserts is
@@ -74,6 +79,16 @@ C2=$(start_candidate 2 "$LEADER_ID")
 C3=$(start_candidate 3 "$LEADER_ID")
 log "three candidates up from one config shape: $C1 $C2 $C3"
 
+# Who leads, recorded from here to the end (#728): every metadata node's
+# Raft status, the range's lease read through metadata, and each candidate's
+# own view of whether it holds the range.
+CONTROL_NODES=()
+for n in 1 2 3; do
+  read -r uuid _ <<<"$(candidate_identity "$n")"
+  CONTROL_NODES+=("candidate-$n=$(data_metrics_addr $((n + 10)))=$uuid")
+done
+control_history_start 1 2 3 -- "${CONTROL_NODES[@]}"
+
 read -r HOLDER EPOCH <<<"$(await_any_lease_holder "$LEADER_ID")"
 WINNER="$(candidate_by_uuid "$HOLDER")"
 log "candidate $WINNER ($HOLDER) took the range at epoch $EPOCH — unscripted"
@@ -92,7 +107,8 @@ produce_deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS))
 until "$VTOP_NODE" produce --client-config "$CLIENT_CFG" \
   --addr "$(candidate_native_addr "$WINNER")" \
   --records "$RECORDS" --batch "$BATCH" --durability quorum \
-  --acked-file "$ACKED_FILE" > "$WORKDIR/logs/produce.log" 2>&1; do
+  --acked-file "$ACKED_FILE" --history "$(history_file produce)" \
+  > "$WORKDIR/logs/produce.log" 2>&1; do
   [[ $SECONDS -lt $produce_deadline ]] \
     || fail "quorum produce to the winner never reached quorum within \
 ${PROGRESS_TIMEOUT_SECONDS}s: $(tail -3 "$WORKDIR/logs/produce.log")"
@@ -166,7 +182,8 @@ produce_deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS))
 until "$VTOP_NODE" produce --client-config "$CLIENT_CFG2" \
   --addr "$(candidate_native_addr "$NEW_LEADER")" \
   --records "$BATCH" --batch "$BATCH" --durability quorum \
-  --acked-file "$WORKDIR/acked-after" > "$WORKDIR/logs/produce-after.log" 2>&1; do
+  --acked-file "$WORKDIR/acked-after" --history "$(history_file produce-after)" \
+  > "$WORKDIR/logs/produce-after.log" 2>&1; do
   [[ $SECONDS -lt $produce_deadline ]] \
     || fail "post-failover quorum produce never reached quorum within \
 ${PROGRESS_TIMEOUT_SECONDS}s: $(tail -3 "$WORKDIR/logs/produce-after.log")"
@@ -181,7 +198,7 @@ log "quorum produce resumed at epoch $NEW_EPOCH on candidate $NEW_LEADER's own a
 # checked through the tail (await_verified_floor's own contract).
 # One boundary marker per promoted epoch, invisible to the consumer (#240):
 # the current epoch bounds how many offsets the view may skip.
-CHAOS_MAX_OFFSET_GAPS="$NEW_EPOCH" \
+CHAOS_MAX_OFFSET_GAPS="$NEW_EPOCH" CHAOS_READ_HISTORY="$(history_file read)" \
   await_verified_floor "$CLIENT_CFG2" "$(candidate_native_addr "$NEW_LEADER")" "$ACKED" "$ACKED"
 log "every one of the $ACKED pre-kill acknowledged records is intact after the failover"
 
@@ -251,5 +268,16 @@ await_metric_equals "$(data_metrics_addr "$((FOLLOWING + 10))")" \
 so only the role keeps this from reporting three leaseholders for one range"
 log "both roles are observable through one collector: offsets exported, and the holder \
 is identifiable from metrics alone"
+
+# --- the histories (#728) -----------------------------------------------------
+# Read once more, now that the post-failover batch is acknowledged, so the
+# last read covers everything both producers were told. Then both checkers:
+# the data plane's (nothing acknowledged lost, nothing unwritten visible) and
+# the control plane's (one leader per term and per epoch, linearizable lease
+# reads, the killed leader's epoch not acted on past its deadline).
+CHAOS_MAX_OFFSET_GAPS="$NEW_EPOCH" CHAOS_READ_HISTORY="$(history_file read)" \
+  await_verified_floor "$CLIENT_CFG2" "$(candidate_native_addr "$NEW_LEADER")" \
+  "$((ACKED + BATCH))" "$ACKED"
+check_history
 
 log "PASS"
