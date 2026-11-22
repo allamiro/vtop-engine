@@ -705,3 +705,25 @@ def test_the_run_directory_and_cli_shape_match_the_sibling_harnesses():
 def test_the_checker_reads_the_whole_bucket_a_runs_one_tool_in_a_fresh_one():
     assert "store.snapshot_commands(\"\", BUCKET, \"\", inner)" in open(os.path.join(ARCHIVE, "run.py")).read()
     assert kills.KILLS_COLUMNS[0] == "run_id"
+
+
+@pytest.mark.parametrize("name", ["smoke", "hosted", "hosted-store-kills", "full"])
+def test_every_put_trigger_is_reachable_by_the_tool_that_makes_the_fewest_puts(name):
+    # Vector writes one object per 32 MiB, or per 60 s of an idle tail, from all three partitions together: the
+    # fewest PUTs of the three tools. A life holding `remaining` bytes makes at most remaining/32 MiB + 1 PUTs, and a
+    # kill at the Nth PUT (K1: before it, K2: after it) uses up N-1 (N) whole objects. If the Nth PUT cannot happen the
+    # trigger never fires, and the first one failing makes the whole run a failed row (review of #908 found this
+    # for the spool comparison).
+    object_bytes = 32 * 2**20
+    plan = plans.select(plans.load_plans(os.path.join(ARCHIVE, "plans.json")), name)
+    for cell in plan["cells"]:
+        if cell["cell"] not in ("crash-K1", "crash-K2"):
+            continue
+        params, kind = cell["params"], cell["cell"].split("-")[1]
+        for variant in cell["variants"]:
+            for repetition in range(1, cell["repetitions"] + 1):
+                remaining = variant["records"] * variant["record_size"]
+                for point in kills.schedule(params["kill_seed"], kind, repetition, params["kills_per_run"],
+                                            n_range=tuple(params["n_range"])):
+                    assert remaining // object_bytes + 1 >= point.n, (name, cell["cell"], repetition, point)
+                    remaining = max(remaining - (point.n - 1 if kind == "K1" else point.n) * object_bytes, 0)
