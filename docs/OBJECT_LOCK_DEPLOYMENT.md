@@ -169,10 +169,16 @@ misspelt `retain_day` is caught. The 3650-day cap is the engine's guard
 against a typo, not a limit of S3. A `compliance` retention cannot be taken
 back, so an extra digit would otherwise lock every object for a century.
 
-`vtopctl tier copy` refuses an `--upload-config` with the block. It would put
-the lock on cold-tier copies without ever checking it. Use a separate upload
-config for the tier, and a bucket default retention on the cold-tier bucket if
-its copies must be locked.
+`vtopctl tier copy` honours the block in its `--upload-config`, as the
+engine does. Before it writes, it checks that the backend writes under the
+lock and that the target bucket has Object Lock enabled. A bucket whose
+configuration cannot be read is refused too, where the engine would start
+and check again later. Nothing is written in either case. After the write,
+it reads the retention of the exact segment and manifest versions it wrote
+and judges them against what each write asked for. It proposes the tier
+evidence only if both are locked as configured; otherwise it says what it
+found and proposes nothing. The objects already written stay in the store,
+locked or not, as after any refused copy.
 
 ## What the engine says
 
@@ -297,8 +303,6 @@ still reclaim them.
   relying on the setting, keep the bucket default retention as the floor, and
   run `scrub --check-retention` once they are gone. Downgrade is unsupported:
   a downgraded engine writes unlocked objects.
-- **The cluster plane's tier copies** (`vtopctl tier copy` refuses the
-  profile).
 - **Stores other than MinIO** have not been measured. The live tests run
   against the lab's MinIO, RELEASE.2025-09-07. It accepts locked writes for
   both checksum paths and for multipart, returns the lock headers on
