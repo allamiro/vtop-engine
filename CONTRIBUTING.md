@@ -56,7 +56,8 @@ docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.11.0 \
   scripts/k8s-forward.sh scripts/e2e-smoke.sh scripts/upgrade-compat.sh \
   scripts/manifest-compat.sh scripts/ledger-compat.sh scripts/compat/*.sh \
   scripts/traffic-snapshot.sh scripts/test-progress.sh scripts/check-naming.sh \
-  scripts/check-egress-claims.sh scripts/kafka-broker.sh
+  scripts/check-egress-claims.sh scripts/kafka-broker.sh \
+  scripts/update-surface-snapshots.sh
 
 docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.11.0 \
   -x -P scripts/live-chaos/scenarios \
@@ -75,6 +76,18 @@ file in `helm/vtop/ci/` — `default-values.yaml`, `separated-values.yaml`,
 `plaintext-values.yaml` and `replicated-values.yaml`; the Helm jobs in
 `.github/workflows/ci.yml` assert on the rendered output as well as the exit
 code.
+
+### Changing a command, flag or metric
+
+The `vtopctl` and `vtop-node` commands and flags, and every metric name and
+label name, are committed under `docs/surface/`, and `cargo test` fails when
+the code and the files disagree. After adding, renaming or removing any of
+them, run `scripts/update-surface-snapshots.sh` and commit what it writes. An
+addition needs nothing more. A removal or rename breaks dashboards, alerts
+and scripts, so it also needs a row in
+[docs/deprecations.md](docs/deprecations.md) and an upgrade note in the
+release notes; CI runs `scripts/check-surface-deprecations.py --base HEAD^1`
+to check that.
 
 ## What a change is expected to carry
 
