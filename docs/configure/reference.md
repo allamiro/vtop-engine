@@ -225,7 +225,7 @@ The Kafka releases the source is tested against are listed in
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | Read syslog spool files written by rsyslog or syslog-ng. |
-| `paths` | **Required** in the block | Glob patterns of spool files. |
+| `paths` | **Required** in the block | Glob patterns of spool files. Each batch's marker records the earliest and latest time its lines start with, when they start with an RFC 3339 or RFC 5424 timestamp ([limitations](../reference/limitations.md)). |
 
 ## `upload`
 
