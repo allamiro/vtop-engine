@@ -157,6 +157,23 @@ def compose_files(system: str, config: str | None) -> list[str]:
     return files
 
 
+def anonymous_volumes(mounts_json: str, project: str) -> list[str]:
+    """The names of the anonymous volumes in `docker inspect --format '{{json .Mounts}}'` output, one JSON
+    array per line: a volume whose name is a 64-character hex id. Named volumes (this project's data
+    volumes, `<project>_<name>`) are never in the answer."""
+    found = []
+    for line in mounts_json.splitlines():
+        try:
+            mounts = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        for mount in mounts or []:
+            name = mount.get("Name") or ""
+            if re.fullmatch(r"[0-9a-f]{64}", name) and not name.startswith(project):
+                found.append(name)
+    return found
+
+
 def topic_create_args(config: str) -> list[str]:
     args = ["--create", "--topic", TOPIC, "--partitions", "1", "--replication-factor", "3",
             "--config", "min.insync.replicas=2"]
@@ -529,9 +546,15 @@ class DockerBackend:
         self.host.call("drop")
 
     def release(self) -> None:
-        """Remove the dead containers so nothing holds the data filesystem open."""
+        """Remove the dead containers so nothing holds the data filesystem open, and the anonymous volumes the
+        image declares for them (they would pile up, one set per crash). The data volumes are left alone, and
+        removed only by the next reset, with the containers gone."""
         self.save_node_logs("killed")
+        names = sh(["docker", "inspect", "--format", "{{json .Mounts}}", *SPEC[self.system]["containers"]],
+                   check=False).stdout
         self.compose(self.system, "down", "--remove-orphans", config=self.config, check=False)
+        for volume in anonymous_volumes(names, SPEC[self.system]["project"]):
+            sh(["docker", "volume", "rm", volume], check=False)
 
     def restore(self) -> None:
         self.host.call("restore")

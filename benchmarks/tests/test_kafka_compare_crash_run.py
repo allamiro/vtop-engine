@@ -450,6 +450,20 @@ def test_a_cleanup_that_fails_does_not_end_the_run_or_change_the_row():
     assert row["status"] == "ok"
 
 
+def test_only_the_anonymous_volumes_of_the_dead_containers_are_removed():
+    anon = "a" * 64
+    other = "b" * 64
+    mounts = "\n".join([
+        json.dumps([{"Type": "volume", "Name": "kc-crash-kafka_kafka-1-data", "Destination": "/var/lib/kafka/data"},
+                    {"Type": "volume", "Name": anon, "Destination": "/etc/kafka/secrets"}]),
+        json.dumps([{"Type": "bind", "Source": "/x", "Destination": "/out"},
+                    {"Type": "volume", "Name": other, "Destination": "/mnt/shared/config"}]),
+        "not json",
+    ])
+    assert crash.anonymous_volumes(mounts, "kc-crash-kafka") == [anon, other]
+    assert crash.anonymous_volumes("", "kc-crash-kafka") == []
+
+
 def test_kafka_topic_creation_carries_the_profile():
     defaults = crash.topic_create_args("kafka-defaults")
     parity = crash.topic_create_args("kafka-fsync-parity")
