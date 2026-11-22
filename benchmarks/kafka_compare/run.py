@@ -32,6 +32,7 @@ from typing import Any
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
+from compare_common import hostmeta  # noqa: E402
 from kafka_compare import perftool, plan, schema, stats  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(HERE))
@@ -226,6 +227,28 @@ def probe_host_disk() -> str:
                          "or the permission it needs and run again.") from exc
 
 
+def checked_host_disk(given: str | None) -> str | None:
+    """`--host-disk` validated, or None when the flag was not given.
+
+    For a host whose probe cannot name the disk (an EBS NVMe volume that reports no model, a virtio VM), the
+    operator names it. The text goes into every image's footer, whose fields are `label: value` joined by
+    ' | ' on lines, so a value holding the separator or a line break is refused here, at argument parsing,
+    not when the report is drawn hours later."""
+    if given is None:
+        return None
+    text = given.strip()
+    if not text or "|" in text or "\n" in text or "\r" in text:
+        raise SystemExit(f"--host-disk {given!r}: must be a non-empty single line without '|' (the footer's "
+                         "field separator), for example --host-disk \"EBS gp3 100 GiB, SSD, NVMe, ext4\"")
+    return text
+
+
+def resolve_host_disk(given: str | None) -> str:
+    """The host disk to record: `--host-disk` as given, else the probe's answer."""
+    text = checked_host_disk(given)
+    return probe_host_disk() if text is None else text
+
+
 def git(*args: str) -> str:
     return sh(["git", "-C", REPO, *args]).stdout.strip()
 
@@ -251,7 +274,7 @@ def capture_environment(run_id: str, matrix: dict[str, Any], vtop_image: str, li
     others = [name for name in sh(["docker", "ps", "--format", "{{.Names}}"]).stdout.split() if name]
     host_mem = host_memory_bytes()
     comparable = {
-        "host_cpu": _sysctl("machdep.cpu.brand_string") or platform.processor(),
+        "host_cpu": _sysctl("machdep.cpu.brand_string") or hostmeta.cpu_model(),
         "host_model": _sysctl("hw.model"),
         "host_logical_cpus": _sysctl("hw.ncpu") or str(os.cpu_count()),
         "host_memory_bytes": host_mem,
@@ -294,6 +317,9 @@ def capture_environment(run_id: str, matrix: dict[str, Any], vtop_image: str, li
         "started_at": utc_now(),
         "label": "single host, Docker Desktop; indicative, not a production benchmark",
         "comparable": comparable,
+        # Which machine this was (#737): the instance type, the CPU model, the kernel. Beside `comparable`, not in
+        # it, so it is not part of the fingerprint and a run recorded without it loads as before.
+        "host_metadata": hostmeta.collect(),
         "matrix": matrix,
         "worktree_dirty": bool(git("status", "--porcelain")),
         # A count, not names: the names are other people's projects and do not
@@ -775,9 +801,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--rebuild", action="store_true", help="rebuild the vtop image even if it exists")
     parser.add_argument("--max-hours", type=float, default=30.0,
                         help="refuse a matrix projected to take longer, before any Docker work")
+    parser.add_argument("--host-disk", default=None, metavar="TEXT",
+                        help="name the disk behind Docker's data yourself, for a host whose probe cannot (an EBS "
+                             "NVMe volume that reports no model); recorded as given, one line, no '|'")
     parser.add_argument("--check", metavar="RUN_DIR", default=None,
                         help="report which rows a run still lacks; exit 0 when complete, 2 otherwise")
     args = parser.parse_args(argv)
+    checked_host_disk(args.host_disk)
 
     if args.check is not None:
         return check(args.check)
@@ -792,7 +822,7 @@ def main(argv: list[str] | None = None) -> int:
         running = sh(["docker", "ps", "-q", "--filter", f"label=com.docker.compose.project=kc-{system}"]).stdout
         if running.strip():
             raise SystemExit(f"kc-{system} is already running; stop it first (one system at a time, rule 1)")
-    disk = probe_host_disk()
+    disk = resolve_host_disk(args.host_disk)
     sh(["docker", "pull", "-q", KAFKA_IMAGE], timeout=1800)
     vtop_image = ensure_vtop_image(args.rebuild)
 
