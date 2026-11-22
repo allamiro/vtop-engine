@@ -185,6 +185,10 @@ What an older binary does with newer data, by case:
   the table below, the release notes, a warning where the surface is used
   (at startup for a config key, on stderr for a flag, and in
   `vtopctl validate` for both), and this page.
+- Commands, flags, accepted values, metric names and label names have their
+  own table, in [Deprecations](../deprecations.md), because CI checks it:
+  the surface is committed under `docs/surface/`, and a pull request that
+  removes or renames one of those without a row there fails (#719).
 
 | Surface | Deprecated in | Earliest removal | Replacement |
 |---|---|---|---|

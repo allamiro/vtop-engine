@@ -80,6 +80,8 @@ jobs:
             rust:
               - 'crates/**'
               - 'tests/**'
+              # Read by the surface snapshot tests (#719).
+              - 'docs/surface/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'deny.toml'
@@ -123,6 +125,7 @@ jobs:
               - 'crates/vtop-observe/**'
               - 'crates/vtop-protocol/**'
               - 'crates/vtop-state/**'
+              - 'crates/vtop-surface/**'
               - 'crates/vtop-upload/**'
               - 'tests/**'
               # Executed by the job's seeding step, and its output is what the
@@ -151,6 +154,7 @@ jobs:
               - 'crates/vtop-observe/**'
               - 'crates/vtop-protocol/**'
               - 'crates/vtop-state/**'
+              - 'crates/vtop-surface/**'
               - 'crates/vtop-upload/**'
               - 'docker/minio/**'
               - 'docker-compose.yml'
@@ -174,6 +178,7 @@ jobs:
             postgres:
               - 'crates/vtop-state/**'
               - 'crates/vtop-core/**'
+              - 'crates/vtop-surface/**'
               - 'crates/vtop-cli/Cargo.toml'
               - 'crates/vtop-cli/tests/postgres_migrate_restore.rs'
               - 'tests/integration_state_recovery.rs'
@@ -200,6 +205,7 @@ jobs:
               - 'crates/vtop-observe/**'
               - 'crates/vtop-protocol/**'
               - 'crates/vtop-state/**'
+              - 'crates/vtop-surface/**'
               - 'crates/vtop-upload/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
@@ -326,6 +332,7 @@ jobs:
               # The check that no shipped build carries the failpoints
               # feature (#725), listed here and in the shellcheck step.
               - 'scripts/check-failpoints-absent.sh'
+              - 'scripts/update-surface-snapshots.sh'
               - 'scripts/tests/**'
               # The test-progress runner: developer tooling, but shell that people
               # will paste and rely on, so it is linted like the rest — listed here
@@ -398,6 +405,7 @@ jobs:
             file_source:
               - 'crates/vtop-adapters/**'
               - 'crates/vtop-core/**'
+              - 'crates/vtop-surface/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '.cargo/**'
@@ -1286,7 +1294,7 @@ jobs:
             scripts/traffic-snapshot.sh scripts/test-progress.sh \
             scripts/check-naming.sh scripts/check-egress-claims.sh \
             scripts/check-failpoints-absent.sh scripts/kafka-broker.sh \
-            scripts/kafka-cluster.sh
+            scripts/kafka-cluster.sh scripts/update-surface-snapshots.sh
 
       # `-P scripts/live-chaos/scenarios` resolves the scenarios' dynamic
       # `source "$(dirname …)/../lib.sh"`. Without it every scenario reports
@@ -1319,6 +1327,10 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The parent too: the surface check below compares with HEAD^1,
+          # which on a pull request is the base the merge commit was made on.
+          fetch-depth: 2
 
       - name: naming check (no commercial mark outside the prior-art files)
         run: bash scripts/check-naming.sh
@@ -1347,6 +1359,18 @@ jobs:
       # longer understands fails here, not on release day.
       - name: the list of new config keys can fail (fixture refs and this tree's schema)
         run: python -m unittest discover -s scripts/tests -p 'test_config_keys_since.py' -v
+
+      # The operator-facing surface (#719). `cargo test` already fails when
+      # docs/surface/ drifts from the code; this asks every command, flag,
+      # value, metric or label the change removes or renames for its row in
+      # docs/deprecations.md. HEAD^1 is the base: on a pull request HEAD is
+      # the merge commit, so lines main gained since the branch point are on
+      # both sides and do not read as removals; on a push to main it is the
+      # commit before.
+      - name: the surface check can fail for each removal it exists to catch
+        run: python -m unittest discover -s scripts/tests -p 'test_check_surface_deprecations.py' -v
+      - name: surface removals carry a deprecation entry
+        run: python scripts/check-surface-deprecations.py --base HEAD^1
 
       # The threat map (#732): every threat in docs/SECURITY_MODEL.md section 17
       # names a control and a test, and each must still exist. It lives in this
