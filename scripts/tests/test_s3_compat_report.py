@@ -230,3 +230,16 @@ def test_an_informational_probes_observation_is_listed_and_never_judged(tmp_path
     committed = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", report.PAGE)
     with open(committed, encoding="utf-8") as handle:
         assert "## Observations" not in handle.read()
+
+
+@pytest.mark.parametrize("server", ["../../.github/workflows/evil", "a/b", ".hidden", "", "MinIO", 7])
+def test_an_ingested_server_that_is_not_a_plain_id_is_refused(tmp_path, server):
+    """The lines come from a downloaded artifact, and the id names the file written under RESULTS."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    src = tmp_path / "dl"
+    src.mkdir()
+    (src / "results-x.jsonl").write_text(json.dumps(dict(case("a", ["put_get_head"], "pass"), server=server)) + "\n")
+    with pytest.raises(report.Refused, match="is not a server id"):
+        report.ingest(str(src), str(repo))
+    assert not (tmp_path / ".github").exists() and not (repo / report.RESULTS).exists()

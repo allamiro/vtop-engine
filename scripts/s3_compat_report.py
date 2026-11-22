@@ -37,6 +37,7 @@ import yaml
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RESULTS = "tests/s3-compat/results"
 SERVERS = "tests/s3-compat/servers"
+SERVER_ID = re.compile(r"[a-z0-9][a-z0-9_-]*\Z")
 COMPOSE = "docker/s3-servers"
 PAGE = "docs/reference/s3-compatibility.md"
 README = "README.md"
@@ -326,7 +327,11 @@ def ingest(source: str, repo: str) -> list[str]:
             cases = [json.loads(line) for line in handle if line.strip()]
         if not cases:
             continue
-        server = cases[0]["server"]
+        server = cases[0].get("server")
+        # The id becomes a file name under RESULTS, and the lines come from a
+        # downloaded artifact: a plain id only, so nothing can name a path.
+        if not isinstance(server, str) or not SERVER_ID.match(server):
+            raise Refused(f"{path}: server {server!r} is not a server id (lowercase letters, digits, '-' and '_')")
         if any(c.get("server") != server for c in cases):
             raise Refused(f"{path}: lines for more than one server")
         first = cases[0]

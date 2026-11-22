@@ -32,11 +32,16 @@ jobs:
       actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version: "3.12"
+      # No setup-python and no cache action anywhere in this job: the runner's
+      # own python3 and a throwaway virtual environment in RUNNER_TEMP carry
+      # the report's one dependency. The job downloads artifacts from other
+      # runs, so it must hold nothing that reads or writes the Actions cache
+      # (CodeQL actions/cache-poisoning/poisonable-step).
       - name: Install the report's one dependency
-        run: pip install --disable-pip-version-check pyyaml==6.0.3
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --disable-pip-version-check pyyaml==6.0.3
 
       # The newest run of the nightly matrix on main that uploaded results
       # (every server, unlike the MinIO-only call from ci.yml), and the
@@ -50,8 +55,14 @@ jobs:
           mkdir -p "$RUNNER_TEMP/results"
           newest() {
             local workflow=$1 dest=$2 run
+            # Only runs a fork cannot start: schedule, dispatch or a push to
+            # main. `--branch main` alone also matches a fork's pull request
+            # whose branch is named main, and the matrix runs on
+            # pull_request, so its artifact would be untrusted input here.
             for run in $(gh run list --workflow "$workflow" --branch main --limit 30 \
-                --json databaseId,conclusion --jq '.[] | select(.conclusion == "success" or .conclusion == "failure") | .databaseId'); do
+                --json databaseId,conclusion,event --jq '.[]
+                  | select(.event == "schedule" or .event == "workflow_dispatch" or .event == "push")
+                  | select(.conclusion == "success" or .conclusion == "failure") | .databaseId'); do
               if gh run download "$run" --pattern 's3-compat-results-*' --dir "$dest" 2>/dev/null; then
                 # The run's own date, so an old artifact keeps it (the report
                 # reads the nearest RUN_DATE) instead of looking newly run.
@@ -76,7 +87,9 @@ jobs:
 
       - name: Regenerate from them
         if: env.RUN_ID != ''
-        run: python3 scripts/s3_compat_report.py --ingest "$RUNNER_TEMP/results"
+        run: >-
+          "$RUNNER_TEMP/venv/bin/python" scripts/s3_compat_report.py
+          --ingest "$RUNNER_TEMP/results"
 
       # Only the files that change, in the layout of the repository, so the
       # maintainer unpacks them over a checkout of main and opens a pull
