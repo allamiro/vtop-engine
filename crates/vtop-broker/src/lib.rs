@@ -1153,6 +1153,10 @@ impl LocalBroker {
         &self,
         mut journal: crate::fencing_epochs::FencingEpochJournal,
     ) {
+        // A break an earlier run persisted is in force before anything reads
+        // or extends this history (#881).
+        self.fencing_epoch_history_broken
+            .attach(journal.break_marker(), &self.replica_name());
         let (_, next_offset) = self.local_offsets();
         if !Self::attach_epoch_journal_to_log(&mut journal, next_offset) {
             self.fencing_epoch_history_broken.mark(
@@ -2501,6 +2505,9 @@ impl LocalBroker {
         range: &RangeIdentity,
         fencing_epoch: u64,
     ) -> Result<(), (ErrorCode, &'static str)> {
+        // Every produce passes here: a break whose mark a full disk refused
+        // is retried before the next record can land (#881).
+        self.fencing_epoch_history_broken.persist_pending();
         if range != &self.range {
             return Err((
                 ErrorCode::WrongRange,
