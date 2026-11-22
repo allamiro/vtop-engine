@@ -1437,6 +1437,7 @@ v0.10.4 was a patch; this release carries the features held back since v0.10.0 a
   - A range written in segment format v2 with `retention` configured panicked on every produce once it had a sealed segment: the range's worker threads panicked and nothing was acknowledged. Retention now sizes a segment the same way for both formats (#881).
   - A restarted leader whose followers were behind its own log kept `vtop_broker_follower_connected` at 0 and refused every produce with "quorum not reached", in about half of the crashes of a whole replica set that the harness made. No acknowledged record was lost on disk (#923).
   - A data node's lease release at shutdown was refused under an enforcing admin authorization, so every planned handover waited out the lease (#870).
+  - The soak's disk-full criterion (`enospc_recovered`) could pass with no engine sample in the fault window; it now needs at least two. The chaos campaign treated only some runner labels as GitHub-hosted; any `ubuntu-*`, `windows-*` or `macos-*` label is now (#926). Both are test and CI tooling; the engine is unchanged.
   - An object-lock check that SeaweedFS answers with two codes other than `NoSuchObjectLockConfiguration` could not confirm an absent lock, so the replay fallback would have refused (#837).
 - **Release pipeline, tests, CI and docs.**
   - The 1.0 release gate, a dated status table for every criterion of #714 (#905); the README's generated cards and one data source for the landing page (#795).
