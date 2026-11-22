@@ -157,13 +157,12 @@ class FakeBackend:
         count = end - (1 if self.sentinel_done else 0)
         lines = [f"Offset:{i}\t{self.prefix}.{i}" for i in range(count)]
         if self.sentinel_done:
-            lines.append(f"Offset:{count}\t{ca.sentinel_value()}")
+            lines.append(f"Offset:{count}\t{ca.sentinel_value(self.crash_no)}")
         return "\n".join(lines) + "\n"
 
-    def produce_sentinel(self, value):
-        self.calls.append(("produce_sentinel", value))
+    def produce_sentinel(self, value, end_before):
+        self.calls.append(("produce_sentinel", value, end_before))
         self.sentinel_done = True
-        return self.survivors()
 
     def save_logs(self, config, mode, crash_no, summary):
         self.calls.append(("save_logs", config, mode, crash_no))
@@ -218,7 +217,9 @@ def test_a_process_kill_never_drops_or_restores_the_filesystem():
 def test_the_sentinel_is_produced_before_the_read_back_that_decides_the_loss():
     b, row = one(sentinel_needed=True)
     order = [c for c in b.calls if c[0] in ("read_all", "produce_sentinel")]
-    assert order == [("read_all", False), ("produce_sentinel", "0.0"), ("read_all", True)]
+    assert order == [("read_all", False),
+                     ("produce_sentinel", "sentinel-c001", row["served_end_before_sentinel"]),
+                     ("read_all", True)]
     # both columns are written, and the sentinel was what made the reads whole
     assert row["read_missing_before_sentinel"] == row["acked_lost"] + 5
     assert row["sentinel_needed"] is True
@@ -234,23 +235,21 @@ def test_the_read_that_decides_the_loss_waits_for_the_sentinel_to_be_served():
     b, row = one()
     served = [c for c in b.calls if c[0] == "wait_served"]
     assert served[0] == ("wait_served", 0)
-    assert served[1][1] == row["sentinel_offset"] + 1  # not before the acknowledged sentinel is readable
-    assert row["served_end_before_sentinel"] == row["sentinel_offset"]
-    assert row["served_end_after_sentinel"] == row["sentinel_offset"] + 1
+    # the end offset must move past what it was before the sentinel, or the read does not happen
+    assert served[1] == ("wait_served", row["served_end_before_sentinel"] + 1)
+    assert row["served_end_after_sentinel"] == row["served_end_before_sentinel"] + 1
 
 
 def test_a_sentinel_that_never_becomes_readable_is_a_failed_row_not_a_total_loss():
     b = FakeBackend()
-    original = b.produce_sentinel
 
-    def lying(value):
-        original(value)
-        return 10**9  # acknowledged at an offset the partition never reaches
+    def never(value, end_before):
+        raise crash.Refused("no write became readable within 120 s of the restart")
 
-    b.produce_sentinel = lying
+    b.produce_sentinel = never
     row = crash.run_crash(b, params(), "vtop-shipped", "flakey-drop", 1, 20.0)
     assert row["status"] == "failed" and row["needed_manual_repair"] is True
-    assert "stayed at" in row["note"]
+    assert "no write became readable" in row["note"]
     assert "acked_lost" not in row  # no loss is claimed from a read that never happened
 
 

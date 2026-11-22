@@ -56,20 +56,6 @@ def test_the_value_prefix_is_the_crash_number_the_only_prefix_the_client_accepts
         ca.value_prefix(0)
 
 
-def test_the_sentinel_is_a_record_no_crash_can_send_and_its_ack_is_read_from_the_producers_json():
-    # crash numbers start at 1, so the integer prefix 0 is the sentinel's alone
-    assert ca.sentinel_value() == "0.0"
-    ok = "\n".join([json.dumps({"timestamp": 1, "name": "startup_complete"}),
-                    json.dumps({"timestamp": 2, "name": "producer_send_success", "value": "0.0", "offset": 41,
-                                "partition": 0, "topic": "bench"})])
-    assert ca.parse_sentinel_ack(ok) == 41
-    failed = "\n".join([json.dumps({"timestamp": 1, "name": "startup_complete"}),
-                        json.dumps({"timestamp": 2, "name": "producer_send_error", "exception": "TimeoutException",
-                                    "message": "Expiring", "value": "0.0"})])
-    assert ca.parse_sentinel_ack(failed) is None
-    assert ca.parse_sentinel_ack("") is None
-
-
 def consumed_text(*values, start=0):
     return "".join(f"Offset:{start + i}\t{v}\n" for i, v in enumerate(values)) + "Processed a total of 9 messages\n"
 
@@ -254,7 +240,7 @@ def good_row(env, config="kafka-defaults", mode="flakey-drop", crash=1, **over):
            "trigger_method": "dm-flakey drop_writes after SIGKILL of all three", "offered_rate": 1000,
            "client": "kafka-verifiable-producer", "idempotent": True, "send_errors": 0,
            "acked": 39990, "acked_last_seq": 39989, "acked_in_last_10s": 9990, "read_records": 39000,
-           "served_end_before_sentinel": 39000, "sentinel_offset": 39000, "served_end_after_sentinel": 39001,
+           "served_end_before_sentinel": 39000, "served_end_after_sentinel": 39001,
            "read_missing_before_sentinel": 990, "acked_lost": 990, "lost_first_seq": 39000,
            "lost_last_seq": 39989, "lost_runs": 1, "lost_window_s": 10.5, "present_unacked": 0,
            "duplicates": 0, "reordered": 0, "offset_mismatch": 0, "unexpected": 0, "canary_synced_ok": True,

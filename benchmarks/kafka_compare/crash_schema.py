@@ -49,7 +49,6 @@ COLUMNS = (
     "acked_in_last_10s",
     "read_records",
     "served_end_before_sentinel",
-    "sentinel_offset",
     "served_end_after_sentinel",
     "read_missing_before_sentinel",
     "acked_lost",
@@ -77,7 +76,7 @@ RUN_CONSTANT = ("run_id", "env_fingerprint", "vtop_commit", "kafka_image")
 
 # An ok row carries every one of these as a number (kill_to_drop_ms only in a power-loss mode).
 _NUMERIC_OK = ("seed", "trigger_after_s", "offered_rate", "send_errors", "acked", "read_records",
-               "served_end_before_sentinel", "sentinel_offset", "served_end_after_sentinel",
+               "served_end_before_sentinel", "served_end_after_sentinel",
                "read_missing_before_sentinel", "acked_lost", "lost_runs", "present_unacked", "duplicates",
                "reordered", "offset_mismatch", "unexpected", "recovery_seconds", "wall_seconds")
 

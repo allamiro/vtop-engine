@@ -247,7 +247,7 @@ the in-sync replicas have it in their page cache. `crash.py` kills the whole rep
 acknowledged records that are missing afterwards, for Kafka as shipped, Kafka made to fsync, and VTOP.
 
 ```bash
-# The short profile: 2 crashes per cell, both modes, SIGKILL and power-loss, about 25 minutes on this laptop-class VM.
+# The short profile: 2 crashes per cell, both modes, SIGKILL and power-loss, about 15 minutes on a 4-vCPU VM.
 python3 benchmarks/kafka_compare/crash.py --smoke --setup-flakey 8192
 
 # The full run on a dedicated Linux host (see below): about 1 hour.
@@ -269,7 +269,7 @@ script can crash. The reference shape for the full run is one EC2 instance of 16
 24.04 and a gp3 or instance-store volume (a `c7i.4xlarge` or `m7i.4xlarge`): three 2-CPU nodes, the 4-CPU client and
 headroom, with nothing else running. `environment.json` records the instance type (from the DMI), kernel,
 filesystem and mount options, the `vm.dirty_*` sysctls, and the disk behind Docker's data. The first run builds
-`vtop-bench:<commit>` from `docker/Dockerfile` if it is not there (several minutes on 16 vCPUs). Docker installs with
+`vtop-bench:<commit>` from `docker/Dockerfile` if it is not there (the release build took 7 minutes with 2 CPUs). Docker installs with
 `curl -fsSL https://get.docker.com | sudo sh`; the harness needs only the Python standard library.
 
 `--setup-flakey MIB` makes `--data-root` (default `/var/lib/kc599/data`) a sparse image file, a loop device, a

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Acknowledged records that survive a crash of the whole replica set, VTOP vs Apache Kafka (#599).
 
-    python3 benchmarks/kafka_compare/crash.py --smoke                  # 12 crashes, about 25 minutes
+    python3 benchmarks/kafka_compare/crash.py --smoke                  # 12 crashes, about 15 minutes
     python3 benchmarks/kafka_compare/crash.py --setup-flakey 20480 --crashes 10   # about 1 hour, see README
 
 For every (crash number, configuration, crash mode): a fresh three-node cluster on empty data
@@ -83,7 +83,9 @@ PRODUCER_PROPS = ("retries=2147483647", "enable.idempotence=true")
 CLIENT_HEAP = phase1.CLIENT_HEAP
 
 FIXED_TRIGGER_WINDOW = (25.0, 55.0)
-CANARY_LEAD_S = 3.0          # the unsynced canary is written this long before the kill
+CANARY_LEAD_S = 1.0          # the unsynced canary is written this long before the kill (a journal commit or an
+                             # fsync by the system under test between the two would flush it)
+CLOCK_LEAD_S = 4.0           # the clock probe runs this much earlier still
 STOP_PRODUCER_AFTER_S = 1.0  # stdout of the last acknowledgements reaches the file before the client dies
 SERVE_DEADLINE_S = 240.0
 SENTINEL_DEADLINE_S = 120.0
@@ -225,8 +227,9 @@ def _crash(b: Any, p: Params, row: dict[str, Any], config: str, mode: str, crash
     b.start_producer(config, prefix, int(p.rate * (trigger_after_s + 120)))
     startup_wall = b.wait_producer_started()
     trigger_at = startup_wall + trigger_after_s
-    b.wait_until(trigger_at - CANARY_LEAD_S)
+    b.wait_until(trigger_at - CANARY_LEAD_S - CLOCK_LEAD_S)
     offset_ms, uncertainty_ms = b.clock_probe()
+    b.wait_until(trigger_at - CANARY_LEAD_S)
     b.canary_unsynced()
     b.wait_until(trigger_at)
 
@@ -264,18 +267,18 @@ def _crash(b: Any, p: Params, row: dict[str, Any], config: str, mode: str, crash
         row.update(status="refused", note=verdict.reason)
 
     started = time.monotonic()
-    sentinel = ca.sentinel_value()
+    sentinel = ca.sentinel_value(crash)
     try:
         b.restart(config)
         end_before = b.wait_served()
         first = ca.diff_acked(acks, ca.parse_consumed(b.read_all(end_before) if end_before else "", prefix, sentinel))
-        # The sentinel is acknowledged, and then waited for until the partition's end offset covers it: a
-        # leader that restarted serves what is cluster-committed, and a record acknowledged before the crash
-        # may not be readable until a new commit advances that (D10). The read that decides the loss is the
-        # one after it, so a read of a leader that is not yet serving is never counted as a loss.
-        sentinel_offset = b.produce_sentinel(sentinel)
+        # The sentinel is produced, and then waited for until the partition's end offset has moved past what
+        # it was: a leader that restarted serves what is cluster-committed, and a record acknowledged before
+        # the crash may not be readable until a new commit advances that (D10). The read that decides the
+        # loss is the one after it, so a read of a leader that is not yet serving is never counted as one.
+        b.produce_sentinel(sentinel, end_before)
         row["recovery_seconds"] = round(time.monotonic() - started, 1)
-        end_after = b.wait_served(at_least=sentinel_offset + 1)
+        end_after = b.wait_served(at_least=end_before + 1)
         consumed = ca.parse_consumed(b.read_all(end_after), prefix, sentinel)
     except Exception as exc:
         row.update(needed_manual_repair=True, recovery_seconds=round(time.monotonic() - started, 1))
@@ -287,7 +290,7 @@ def _crash(b: Any, p: Params, row: dict[str, Any], config: str, mode: str, crash
     final = ca.diff_acked(acks, consumed)
     row.update(
         read_records=sum(1 for c in consumed if c.kind != "sentinel"), served_end_before_sentinel=end_before,
-        sentinel_offset=sentinel_offset, served_end_after_sentinel=end_after,
+        served_end_after_sentinel=end_after,
         read_missing_before_sentinel=first.acked_lost,
         acked_lost=final.acked_lost, lost_first_seq=final.lost_first_seq, lost_last_seq=final.lost_last_seq,
         lost_runs=final.lost_runs, lost_window_s=(None if not final.lost else round(
@@ -539,10 +542,10 @@ class DockerBackend:
         except RuntimeError as exc:
             raise Refused(f"compose up after the crash: {exc}"[:400]) from None
 
-    def wait_served(self, at_least: int = 0) -> int:
+    def wait_served(self, at_least: int = 0, deadline_s: float = SERVE_DEADLINE_S) -> int:
         """The partition's end offset, once the cluster answers ListOffsets (the first served read) and the
         end offset is at least `at_least`."""
-        deadline = time.monotonic() + SERVE_DEADLINE_S
+        deadline = time.monotonic() + deadline_s
         last = ""
         while time.monotonic() < deadline:
             done = self.client(["/opt/kafka/bin/kafka-get-offsets.sh", "--bootstrap-server",
@@ -557,7 +560,7 @@ class DockerBackend:
             else:
                 last = (done.stderr or done.stdout).strip()[-200:]
             time.sleep(2)
-        raise Refused(f"the cluster did not serve within {SERVE_DEADLINE_S:.0f} s of the restart: {last}")
+        raise Refused(f"the cluster did not serve within {deadline_s:.0f} s of the restart: {last}")
 
     def read_all(self, end: int) -> str:
         done = self.client(["/opt/kafka/bin/kafka-console-consumer.sh", "--bootstrap-server",
@@ -568,22 +571,26 @@ class DockerBackend:
             handle.write(done.stdout)
         return done.stdout
 
-    def produce_sentinel(self, value: str) -> int:
-        """Produce the sentinel with the same client and return the offset it was acknowledged at; retried
-        until an acknowledgement is printed (the client's own exit status is not a proof of one)."""
-        prefix = value.split(ca.VALUE_SEP)[0]
+    def produce_sentinel(self, value: str, end_before: int) -> None:
+        """Produce the sentinel with `acks=all` and wait until the end offset has moved past `end_before`. The
+        console producer's exit status is not a proof of an acknowledgement (it exits 0 after a send that was
+        refused), and a fresh idempotent client is refused by VTOP's gateway while the old producer's state
+        stands, so what is checked is the effect: the partition grew. Retried until it does."""
         deadline = time.monotonic() + SENTINEL_DEADLINE_S
         last = ""
         while time.monotonic() < deadline:
-            done = self.client(["/opt/kafka/bin/kafka-verifiable-producer.sh", "--bootstrap-server",
-                                SPEC[self.system]["bootstrap"], "--topic", TOPIC, "--acks", "-1",
-                                "--max-messages", "1", "--value-prefix", prefix], timeout=180, check=False)
-            offset = ca.parse_sentinel_ack(done.stdout)
-            if offset is not None:
-                return offset
+            done = self.client(["/opt/kafka/bin/kafka-console-producer.sh", "--bootstrap-server",
+                                SPEC[self.system]["bootstrap"], "--topic", TOPIC, "--command-property", "acks=all"],
+                               timeout=180, input_text=value + "\n", check=False)
             last = (done.stderr or done.stdout).strip()[-200:]
+            if done.returncode == 0:
+                try:
+                    self.wait_served(at_least=end_before + 1, deadline_s=20)
+                    return
+                except Refused as exc:
+                    last = str(exc)
             time.sleep(3)
-        raise Refused(f"no write was acknowledged within {SENTINEL_DEADLINE_S:.0f} s of the restart: {last}")
+        raise Refused(f"no write became readable within {SENTINEL_DEADLINE_S:.0f} s of the restart: {last}")
 
     # --- evidence and cleanup
     def save_node_logs(self, tag: str) -> None:
