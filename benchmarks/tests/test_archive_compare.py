@@ -745,3 +745,11 @@ def test_every_run_checks_its_images_first_so_a_pruned_image_is_rebuilt_not_a_fa
     seen.clear()
     driver.ensure_images("vtop")
     assert seen[0] == "vtop"
+
+
+def test_no_tool_makes_a_bucket_put_the_tap_would_count_as_the_first_put():
+    # VTOP's `create_bucket: true` sent `PUT /bench/` (answered 409) as PUT number 1, so a K2 trigger at N=1
+    # never saw a successful Nth PUT. The lab makes the bucket; the tools are told not to.
+    for rel in TOOLS["vtop"]["profiles"].values():
+        assert re.search(r"(?m)^  create_bucket: false\s*$", _read(rel)), rel
+    assert "mc mb --ignore-existing" in open(os.path.join(ARCHIVE, "run.py")).read()

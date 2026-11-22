@@ -48,7 +48,10 @@ upload:
   region: us-east-1
   force_path_style: true
   verify_tls: false
-  create_bucket: true
+  # The lab creates the bucket before any tool starts (the harness's `mc mb`), so no tool makes a bucket PUT:
+  # the S3 tap counts every PUT, and a bucket PUT answered 409 would be the Nth request that a K2 trigger
+  # waits for and never sees succeed (docs/configure/reference.md "upload.create_bucket", default false).
+  create_bucket: false
   # The deliberate weakening this profile exists to measure.
   require_strong_verification: false
 
