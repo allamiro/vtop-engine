@@ -477,6 +477,48 @@ fn a_call_past_the_ceiling_is_reported_once_and_still_waited_for() {
     drop(retired);
 }
 
+/// A quiesce that is cancelled while it waits, and retried, must still wait
+/// for the call that holds the retired bridge: the retry rotates a new,
+/// empty generation, and the old one is the work that matters. The same holds
+/// for a second quiesce started beside the first. Red against a quiesce that
+/// kept the closed generation only in its own frame (a Codex finding on this
+/// PR).
+#[test]
+fn a_cancelled_quiesce_that_is_retried_still_waits_for_the_call_in_flight() {
+    let node = gated_node(Duration::from_secs(5));
+    let client = std::thread::spawn({
+        let addr = node.addr;
+        move || produce(addr, TOPIC, &["in flight"])
+    });
+    node.entered.recv().unwrap();
+    let retired = node.slot.clear();
+
+    // The first quiesce is cancelled while it waits.
+    let handle = node.handle.clone();
+    let first = node.rt().spawn(async move { handle.quiesce(|_| ()).await });
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!first.is_finished());
+    first.abort();
+    assert!(node.rt().block_on(first).unwrap_err().is_cancelled());
+
+    // The retry, and a concurrent one through a cloned handle, still wait.
+    let (a, b) = (node.handle.clone(), node.handle.clone());
+    let retry = node.rt().spawn(async move { a.quiesce(|_| ()).await });
+    let beside = node.rt().spawn(async move { b.quiesce(|_| ()).await });
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !retry.is_finished() && !beside.is_finished(),
+        "a retried quiesce returned while a call still held the retired bridge"
+    );
+
+    node.release.send(()).unwrap();
+    let report = node.rt().block_on(retry).unwrap();
+    assert_eq!(report.in_flight, 1, "it was for the one call that held it");
+    node.rt().block_on(beside).unwrap();
+    assert_eq!(client.join().unwrap(), (0, 0));
+    drop(retired);
+}
+
 #[test]
 fn a_call_that_starts_after_the_slot_is_cleared_never_reaches_the_old_bridge() {
     let node = gated_node(Duration::from_secs(5));
