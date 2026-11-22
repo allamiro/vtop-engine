@@ -33,7 +33,7 @@ def test_the_registry_is_the_validated_pair():
 def test_the_pair_passes_every_palette_check_on_its_surface(theme):
     """The validator's checks, in Python: lightness band, chroma floor, CVD separation,
     normal-vision distance, and 3:1 contrast against the surface the image is shown on."""
-    mode = "dark" if theme == "dark" else "light"
+    mode = colours.surface_mode(theme)
     kafka, vtop = colours.colour("kafka", mode), colours.colour("vtop", mode)
     low, high = colours.LIGHTNESS_BAND[mode]
     for hex_ in (kafka, vtop):
@@ -91,7 +91,7 @@ def test_every_slot_pair_passes_every_check_in_both_modes(mode):
     # The docstring's claim, enforced: each slot clears the band, the floor and 3:1 on every surface
     # it is shown on, and every pair clears the CVD target (all three deficiencies) and the
     # normal-vision floor.
-    surfaces = [colours.SURFACES["dark"]] if mode == "dark" else [colours.SURFACES["docs"], colours.SURFACES["light"]]
+    surfaces = [hex_ for name, hex_ in colours.SURFACES.items() if colours.surface_mode(name) == mode]
     steps = [light if mode == "light" else dark for _name, light, dark in colours.SLOTS]
     low, high = colours.LIGHTNESS_BAND[mode]
     for hex_ in steps:
@@ -105,6 +105,40 @@ def test_every_slot_pair_passes_every_check_in_both_modes(mode):
                 assert colours.delta_e(one, two, kind) >= colours.CVD_TARGET, (one, two, kind)
             assert colours.delta_e(one, two) >= colours.NORMAL_FLOOR, (one, two)
     assert len(colours.SLOTS) == colours.MAX_SYSTEMS
+
+
+@pytest.mark.parametrize("mode", ("light", "dark"))
+def test_text_tokens_meet_aa_on_every_fill_they_sit_on(mode):
+    # The README cards set text in ink or ink2 only, on the card's fill or a tile's; never in a
+    # system colour, so 4.5:1 (WCAG AA body text) is the bar for every pair.
+    neutrals = colours.NEUTRALS[mode]
+    for text in colours.TEXT_TOKENS:
+        for fill in colours.FILL_TOKENS:
+            ratio = colours.contrast(neutrals[text], neutrals[fill])
+            assert ratio >= 4.5, (mode, text, fill, round(ratio, 2))
+
+
+@pytest.mark.parametrize("mode", ("light", "dark"))
+def test_system_colours_are_marks_of_three_to_one_on_the_card_fills(mode):
+    # A system colour is a mark beside a value printed in ink (the relief rule), so 3:1 on the fills it sits on.
+    neutrals = colours.NEUTRALS[mode]
+    for system in colours.SYSTEM_SLOT:
+        for fill in colours.FILL_TOKENS:
+            assert colours.contrast(colours.colour(system, mode), neutrals[fill]) >= 3.0, (mode, system, fill)
+
+
+def test_every_neutral_is_a_grey_and_the_card_fills_are_registered_surfaces():
+    for mode, neutrals in colours.NEUTRALS.items():
+        for name, hex_ in neutrals.items():
+            assert colours.is_neutral(hex_), (mode, name, hex_)
+        assert neutrals["card"] == colours.SURFACES[f"card-{mode}"]
+
+
+def test_the_chart_themes_are_the_registry_neutrals():
+    import readme_charts
+
+    for mode, theme in readme_charts.THEMES.items():
+        assert {key: theme[key] for key in colours.NEUTRALS[mode]} == colours.NEUTRALS[mode]
 
 
 def test_each_slot_keeps_its_hue_in_light_and_dark():

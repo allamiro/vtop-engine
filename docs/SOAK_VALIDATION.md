@@ -22,7 +22,7 @@ closes when a maintainer attaches the evidence of a passing 72 hour run
 |---|---|
 | Load | 1,000 records per second of about 700 bytes (random ASCII payload from Kafka's own producer performance tool, so the records are not numbered), over 3 partitions, for 72 hours. `acks=all`; the producer is restarted if a broker restart ends it. |
 | Path under test | Kafka (single node, KRaft, plaintext) to the engine (`vtopctl run`, SQLite ledger, gzip level 1, 20,000 records or 30 s a batch) to the lab's MinIO. |
-| Faults | One every 30 minutes from minute 30, cycling through five kinds, none in the last hour. 142 faults in all, about 28 of each kind. |
+| Faults | One every 30 minutes from minute 30, cycling through six kinds, none in the last hour. 142 faults in all: 24 each of `kill9`, `broker_restart`, `partition` and `store_outage`, and 23 each of `clock_step` and `enospc`. |
 | Sampled | Every 30 s: the engine process's resident memory and open files, the work directory's size, the ledger's size (the state database and its log), the engine's own counters, and the host's free disk. Every 60 s: the topic's end offset and the consumer group's committed offset. Hourly: a full copy of the engine's `/metrics`. |
 | On a schedule | `prune-ledger` every hour. A `scrub` over 200 batches chosen at random every 6 hours. `audit-coverage` after every fault, once the engine has caught up. |
 | At the end | The producer stops, the engine drains, and then: `audit-coverage --check-storage`, a full `scrub` of every committed batch, the group's committed offset against the topic's end on every partition, and `SIGTERM` to the engine, which must exit 0. |
@@ -47,6 +47,25 @@ its effect fails the run and says what it saw.
 | `partition` | both toxiproxy proxies disabled for 180 s: the engine can reach neither the broker nor the store | the engine container cannot open a connection through either proxy while it is cut, and can before and after | scenario 06, partition |
 | `store_outage` | the store's proxy disabled for 300 s | the same, for the store only; the broker stays reachable | |
 | `clock_step` | the engine is stopped and started again with its wall clock 3,600 s ahead of the host's, held there for 180 s, then stopped and started on the real clock. Successive clock steps alternate the direction: the next one starts 3,600 s behind | the shim records the time it loaded at, which must be the host's plus the step, and the real-clock start must record none | scenario 07, clock skew |
+| `enospc` | a 256 KiB tmpfs is laid over the engine's work directory, in the engine's mount namespace, and filled with `dd` until a write fails; held full for 300 s; then lifted | a write to the directory works before; after the fill a write fails with `No space left on device`; the engine's own log shows that text while the directory is full; after the lift the directory has its original mount and a write works | the engine crash sweep's `enospc` leg (`ENGINE_SWEEP_FAULT=enospc`: a size-limited tmpfs at the work directory) |
+
+The disk-full fault is the sweep's `enospc` leg made in a running engine. The
+engine's container is not changed for it: it keeps no capabilities and its
+read-only root. A throwaway container, started from the engine's own image and
+privileged, joins the engine's PID namespace and runs `mount -t tmpfs` and
+`umount` in the engine's mount namespace (`nsenter -t 1 -m`), so the tmpfs
+exists for the engine's processes and nobody else, and goes with the container
+if the engine dies. What the work directory's volume holds is hidden while the
+tmpfs is there, not touched, and is back when it is lifted, with the batches
+the engine had staged. The fill is 256 KiB, so the engine meets the full disk
+on the first file it creates, not after a gigabyte of staging. The engine is
+meant to survive the hold: one that exits during it is a finding, as in the
+clock step. The space is freed by lifting the mount, and the fault is not
+over until a write to the directory works again and the engine has caught up
+(the recovery wait below, then `audit-coverage`). Because it needs Docker to
+run a privileged helper, the driver lays the tmpfs and lifts it once, on the
+idle engine, before the load starts, and refuses to run if it cannot: a host
+that would fail the first disk-full fault, hours in, fails at the start.
 
 The clock step uses the shim that scenario 07 embeds. The Dockerfile layer
 (`Dockerfile.engine`) compiles it from that scenario's own source, which
@@ -87,6 +106,7 @@ sampled nothing, or ran no scrub does not pass.
 | `samples` | the resource samples (every 30 s) and the lag samples (every 60 s) are each counted on their own over the run's duration: at least 90% of each kind's expected number exist and observed something (a resource record the engine could not be probed for, or a lag record whose query failed, is not a sample), and none is more than 5 minutes after the one before |
 | `faults_executed` | every fault in the plan was injected, landed, and the engine recovered from it |
 | `recovery_time` | the slowest recovery was within the timeout (15 minutes) |
+| `enospc_recovered` | for every disk-full fault in the plan (a profile without one is not asked): a write failed with `ENOSPC` and then worked again, the engine's log showed the condition, the engine's counters showed no commit beyond a verification from the fault's start until the engine had recovered, and the `audit-coverage` after the fault found no hole |
 | `no_unplanned_exit` | the engine never exited except when a fault stopped it |
 | `commit_rule` | `vtop_commits_total` never exceeded `vtop_verified_total` (two samples in a row, within one engine process, since a scrape reads the two a moment apart), and `vtop_verification_failures_total` never rose |
 | `trend_rss_bytes`, `trend_open_fds`, `trend_ledger_bytes`, `trend_work_dir_bytes`, `trend_batch_seconds`, `trend_lag_seconds` | no growth trend over the last 80% of the run: see below |
@@ -165,7 +185,7 @@ so the file reaches a plateau, and that plateau is what a flat series is.
 | | |
 |---|---|
 | Operating system | Linux, x86_64 |
-| Software | Docker with the Compose plugin, `python3` (3.9 or later), `bash`. Nothing is built on the host except Docker images. |
+| Software | Docker with the Compose plugin, `python3` (3.9 or later), `bash`. Nothing is built on the host except Docker images. The disk-full fault runs a privileged throwaway container (see [The faults](#the-faults)), so Docker must allow one; the driver checks this before the load starts. |
 | Disk | about 180 GB free on the disk that holds the lab's data (`--data-dir`, or Docker's data root) |
 | Time | the host dedicated for 72 hours, the hour of quiet tail, the drain, the final checks and the teardown: plan for 80 hours |
 | Runner | a GitHub Actions self-hosted runner registered with the label `vtop-soak` |
@@ -264,6 +284,14 @@ Two things the run showed about the engine:
   within one engine process and why the ledger limit has an absolute floor.
   Whether the plateau holds for 72 hours is what the real run is for.
 
+After the `enospc` fault was added the smoke run was repeated on the same
+machine (the same caps; a release build of the engine on a stand-in Ubuntu
+24.04 image). It passed every criterion, the new `enospc_recovered` among them,
+over six faults, one of each kind: the disk-full fault held a 256 KiB tmpfs full
+for 25 s, the engine logged `batch failed ... compression error: No space left
+on device (os error 28)` ten times and carried on, and 12 s after the space was
+freed it had committed past where it was; the audit after the fault was clean.
+
 The `ci-smoke` job in `soak.yml` has not run on a GitHub-hosted runner yet:
 it first runs when this workflow is on the default branch and someone
 dispatches it, or on the next pull request that changes only the soak's files.
@@ -311,11 +339,14 @@ not attached; its tarball is the report of the bug it found.
 
 Written down so the evidence is not read as more than it is.
 
-- **No `ENOSPC` fault.** Issue #726 lists a full disk among the faults. The
-  injectors here are the four the engine's lab can make without privileges and
-  the store outage; a disk-full fault on the engine's work directory or ledger
-  is not injected, and the evidence does not speak to it. Live-chaos scenarios
-  05 and 05b cover a full or failing disk on the native cluster's nodes.
+- **The full disk is the work directory's, and small.** The `enospc` fault fills
+  the engine's work directory, where it stages batches. It does not fill the
+  state database's volume or the store's: a full ledger is a different failure
+  (the engine cannot record a commit) and is not injected here. Live-chaos
+  scenarios 05 and 05b cover a full or failing disk on the native cluster's
+  nodes. The directory is filled to 256 KiB, not to the size of a production
+  disk, so what the fault shows is the engine's reaction to the error, not how
+  it behaves with a large backlog of staged data stuck behind it.
 - **One engine, one broker, one store.** The Kafka broker is a single KRaft
   node with plaintext listeners; the store is the lab's MinIO. Nothing here
   speaks to a replicated Kafka cluster, to TLS, to another S3
