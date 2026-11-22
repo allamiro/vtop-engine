@@ -80,3 +80,23 @@ every committed object back clean:
 |---|---|---|---|---|---|---|
 | crash2-p4 | p4 | 8 | held | 0 | no hole | clean |
 | crash2-p1 | p1 | 8 | held | 0 | no hole | clean |
+
+## The read path
+
+`pr4-*` runs: the build of the read-path change (no forced re-assign after a
+pass that fills its budget; no idle sleep after one empty pass that follows a
+productive one), on top of the pipelined engine. They ran after the runs
+above, so under the host load of that later hour:
+
+| Build | max_bytes | Partitions | Runs | MiB/s end to end, median (range) | MiB/s to 90% | empty passes per drain |
+|---|---|---|---|---|---|---|
+| pipelined | 16 MiB | 1 | 3 | 33.5 (33.3–34.6) | 54.6 | 13 |
+| pipelined | 16 MiB | 4 | 3 | 33.9 (33.3–34.2) | 53.7 | 12 |
+| read path | 16 MiB | 1 | 2 | 32.2 (31.6–32.8) | 52.9 | 16 |
+| read path | 16 MiB | 4 | 2 | 33.7 (33.3–34.2) | 50.9 | 16 |
+| pipelined | 64 MiB | 1 | 2 | 22.8 (20.0–25.6) | 29.1 | 34 |
+| pipelined | 64 MiB | 4 | 2 | 26.8 (23.6–30.0) | 25.3 | 26 |
+| read path | 64 MiB | 1 | 2 | 30.6 (27.4–33.7) | 47.1 | 29 |
+| read path | 64 MiB | 4 | 2 | 27.9 (25.1–30.8) | 28.0 | 34 |
+
+An empty pass still follows many full ones; what changed is what it costs.

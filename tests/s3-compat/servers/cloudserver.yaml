@@ -1,0 +1,32 @@
+# Zenko CloudServer 9.5.5 with its file backends (docker/s3-servers/
+# cloudserver). Settled from a first run of every live case, in both SDK
+# checksum modes, with every capability unknown (#722). New to the matrix,
+# so not gating yet (D11).
+id: cloudserver
+name: Zenko CloudServer
+gating: false
+capabilities:
+  put_get_head: pass
+  path_style: pass
+  # The lab is reached by path style only (decision D12).
+  virtual_host: not_applicable
+  checksum_sha256_enforced: pass
+  checksum_sha256_returned: pass
+  checksum_crc32_default:
+    state: xfail
+    issue: 778
+    note: "A PUT carrying the SDK's default CRC32 trailer (aws-chunked) is refused with 400 BadRequest; with AWS_REQUEST_CHECKSUM_CALCULATION=when_required a plain one succeeds. VTOP no longer sends the trailer (#778 was fixed by #788: BLAKE3 and no-checksum writes carry a SHA-256 header), so no VTOP write depends on it; only the informational probe asks."
+  multipart: pass
+  multipart_abort: pass
+  multipart_list_uploads: pass
+  multipart_resume: pass
+  versioning: pass
+  object_lock: pass
+  object_lock_enforced: pass
+  object_lock_retention_clear:
+    state: not_applicable
+    note: "PutObjectRetention with an empty retention answers 400 MalformedXML (request xml does not contain Mode), so the case that clears a receipt's retention to see the scrub report it cannot run here. VTOP never clears a retention; only that test does."
+  conditional_put:
+    state: xfail
+    issue: 722
+    note: "PutObject ignores If-None-Match: a second PUT overwrites the key. Informational: VTOP does not use conditional writes."
