@@ -11,19 +11,26 @@ healthiest.
   store_outage    cut the engine off from the store only
   clock_step      restart the engine with its wall clock moved by a step, hold
                   it there, then restart it with the clock back
+  enospc          fill the engine's work directory until a write to it fails
+                  with ENOSPC, hold it full, then free the space
 
 These are the scenarios of scripts/live-chaos at the scale of one engine:
 kill -9 is scenario 04's fault, the partition is 06's (through a proxy
 instead of a network namespace, since the engine and the broker are
 containers), and the clock step is 07's shim, built from the very source
-that scenario embeds. See docs/SOAK_VALIDATION.md.
+that scenario embeds, and the full disk is the sweep's enospc leg
+(scripts/live-chaos/engine/run-sweep.sh, ENGINE_SWEEP_FAULT=enospc: a
+size-limited tmpfs at the work directory) made in a running engine's
+container. See docs/SOAK_VALIDATION.md.
 
 System model: a crash-recovery engine process, a partially synchronous
 network, honest nodes. Invariants (checked by the evaluator, not here):
 safety, the engine never commits past what it verified and the archive has no
 hole; liveness, once the fault is lifted the engine catches up within the
 recovery timeout. Timers may only affect liveness: the clock step must leave
-safety intact and let liveness return once the clock is back.
+safety intact and let liveness return once the clock is back. A full work
+directory must stop batches, never commit one that was not verified, and let
+the engine carry on from the ledger once space is back.
 """
 
 from __future__ import annotations
@@ -40,6 +47,11 @@ from soak_record import Recorder, RunState
 # the step to count as applied. The step is an hour; the Docker VM's clock can
 # differ from the host's by seconds, so this is wide, and still far from zero.
 SKEW_TOLERANCE_S = 300
+
+
+# How long, after the hold, the engine may take to show the disk-full condition
+# in its log before the fault counts as one the engine never felt.
+ENOSPC_LOG_GRACE_S = 30
 
 
 class FaultError(RuntimeError):
@@ -204,12 +216,119 @@ def clock_step(ctx: Context, fault: soak_profile.PlannedFault, occurrence: int) 
     return f"engine ran with its clock {applied:+d} s from the host's for {fault.hold_s} s, then restarted with it back"
 
 
+def _enospc_lines(text: str) -> int:
+    return sum(1 for line in text.splitlines() if soak_lab.ENOSPC_TEXT in line)
+
+
+def _fill_work_until_full(ctx: Context) -> None:
+    """Fill the work directory until a write to it fails with ENOSPC, and show
+    that it does. The engine writes there too, so a few rounds are allowed for
+    space it frees between ours."""
+    lab = ctx.lab
+    for _ in range(5):
+        lab.fill_work()
+        probe = lab.probe_work_write()
+        if not probe.ok:
+            if soak_lab.ENOSPC_TEXT not in probe.text():
+                raise FaultError(f"a write to the work directory failed, but not with ENOSPC: {probe.text()[-200:]}")
+            return
+    raise FaultError("the work directory still accepted a write after it was filled five times: the fault did not land")
+
+
+def _lift_enospc(ctx: Context, depth_before: int) -> None:
+    """Free the space and show that writes work again. An engine that is not
+    running has no mount to lift: the tmpfs went with its namespace."""
+    lab = ctx.lab
+    if not lab.running("engine"):
+        return
+    lab.unmount_work_tmpfs()
+    depth = lab.work_mount_depth()
+    if depth != depth_before:
+        raise FaultError(f"the work directory has {depth} mounts after the tmpfs was lifted, it had {depth_before}")
+    resumed = lab.probe_work_write()
+    if not resumed.ok:
+        raise FaultError(
+            f"a write to the work directory still fails after the space was freed: {resumed.text()[-200:]}"
+        )
+
+
+def enospc(ctx: Context, fault: soak_profile.PlannedFault, occurrence: int) -> str:
+    lab = ctx.lab
+    if not lab.running("engine"):
+        raise FaultError("the engine was not running when its disk-full fault was due")
+    # A control first: a write that fails before anything is done would "prove"
+    # that the disk was filled.
+    control = lab.probe_work_write()
+    if not control.ok:
+        raise FaultError(f"a write to the work directory failed before the fault: {control.text()[-200:]}")
+    depth_before = lab.work_mount_depth()
+    since = lab.daemon_time()
+    mounted = False
+    try:
+        lab.mount_work_tmpfs()
+        mounted = True
+        depth = lab.work_mount_depth()
+        if depth != depth_before + 1:
+            raise FaultError(
+                f"the tmpfs is not mounted over the work directory ({depth} mounts, expected {depth_before + 1})"
+            )
+        _fill_work_until_full(ctx)
+        _hold_watching_engine(ctx, fault.hold_s, f"{fault.hold_s} s hold with its work directory full")
+        logged = _enospc_lines(lab.engine_log_since(since))
+        waited = 0
+        while not logged and waited < ENOSPC_LOG_GRACE_S:
+            ctx.sleep(1)
+            waited += 1
+            logged = _enospc_lines(lab.engine_log_since(since))
+        if not logged:
+            raise FaultError(
+                f"the engine ran {fault.hold_s + waited} s with its work directory full and logged no "
+                f"'{soak_lab.ENOSPC_TEXT}': the fault did not reach it"
+            )
+    finally:
+        # Lifted even when the proof above failed: a fault must never outlive
+        # its own error.
+        if mounted:
+            _lift_enospc(ctx, depth_before)
+    ctx.rec.event(
+        "fault_probe",
+        id=fault.id,
+        fault="enospc",
+        write_failed_enospc=True,
+        engine_enospc_lines=logged,
+        writes_resumed=True,
+        tmpfs_bytes=soak_lab.ENOSPC_TMPFS_BYTES,
+    )
+    return (
+        f"work directory full ({soak_lab.ENOSPC_TMPFS_BYTES} byte tmpfs, writes failed with ENOSPC) for "
+        f"{fault.hold_s} s; the engine logged {logged} line(s) of it; space freed, writes resumed"
+    )
+
+
+def preflight_enospc(ctx: Context) -> None:
+    """Before the load starts: lay the tmpfs over the idle engine's work
+    directory and lift it. A host whose Docker refuses a privileged helper, or
+    whose engine image has no nsenter, finds out now and not at the first
+    disk-full fault, hours in."""
+    lab = ctx.lab
+    depth = lab.work_mount_depth()
+    lab.mount_work_tmpfs()
+    try:
+        if lab.work_mount_depth() != depth + 1:
+            raise FaultError("the tmpfs did not appear over the engine's work directory: the enospc fault cannot run")
+    finally:
+        lab.unmount_work_tmpfs()
+    if lab.work_mount_depth() != depth:
+        raise FaultError("the tmpfs over the engine's work directory could not be lifted")
+
+
 INJECTORS = {
     "kill9": kill9,
     "broker_restart": broker_restart,
     "partition": partition,
     "store_outage": store_outage,
     "clock_step": clock_step,
+    "enospc": enospc,
 }
 
 assert set(INJECTORS) == set(soak_profile.FAULT_KINDS), "every fault kind in a profile has an injector"
