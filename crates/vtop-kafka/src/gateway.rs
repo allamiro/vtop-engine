@@ -191,6 +191,12 @@ struct Jobs {
     active: std::sync::atomic::AtomicUsize,
     idle: tokio::sync::Notify,
     generation: std::sync::Mutex<Arc<Generation>>,
+    /// Closed generations that still had jobs when a later rotation looked,
+    /// kept so that a quiesce which was cancelled, or which runs beside
+    /// another, still waits for work an earlier rotation closed: that work
+    /// may hold the retired bridge. Locked only while the `generation` lock
+    /// is held, and pruned of generations that have ended on every rotation.
+    retired: std::sync::Mutex<Vec<Arc<Generation>>>,
 }
 
 /// The jobs started between two rotations.
@@ -242,14 +248,25 @@ impl Jobs {
         }
     }
 
-    /// Close the current generation and start the next, returning the one
-    /// closed: the jobs that were running or queued when this was called.
-    fn rotate(&self) -> Arc<Generation> {
+    /// Close the current generation and start the next, returning every
+    /// generation closed so far that still has a job running, this one
+    /// included: the jobs that were running or queued when this was called,
+    /// and any an earlier rotation closed whose quiesce was cancelled or is
+    /// still waiting.
+    fn rotate(&self) -> Closed {
         let mut current = self
             .generation
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        std::mem::take(&mut *current)
+        let closed = std::mem::take(&mut *current);
+        let mut retired = self
+            .retired
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        retired.push(closed);
+        // A closed generation takes no new job, so a count of zero is final.
+        retired.retain(|generation| generation.active() > 0);
+        Closed(retired.clone())
     }
 
     fn blocking<T: Send + 'static>(
@@ -287,6 +304,21 @@ impl Jobs {
                 return;
             }
             notified.await;
+        }
+    }
+}
+
+/// The generations a quiesce waits for.
+struct Closed(Vec<Arc<Generation>>);
+
+impl Closed {
+    fn active(&self) -> usize {
+        self.0.iter().map(|generation| generation.active()).sum()
+    }
+
+    async fn idle(&self) {
+        for generation in &self.0 {
+            generation.idle().await;
         }
     }
 }
