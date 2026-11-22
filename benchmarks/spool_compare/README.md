@@ -121,3 +121,12 @@ generator's state, the bucket snapshot the checker read).
 - **Laptop**: tests, `--plan smoke`, charts. No `drain`, no `live`.
 - **Hosted runner**: `smoke`, `hosted-crash`, `hosted-rotation` (correctness only).
 - **Dedicated Linux host**: `--plan full` (projected 18.5 hours by `plan.py`'s per-run estimates).
+
+## Known limits
+
+- **The nightly smoke's job result.** `run.py` exits 0 when the run directory is schema-valid and complete,
+  and a `failed` or `refused` row is complete. A tool that loses lines or whose configuration is rejected in
+  the smoke is therefore a recorded row (every later cell of that tool is `refused` behind it), not a red
+  job: whoever reads the nightly artifact (`spool.csv`, or `--check`'s "problem" lines) sees it, the job
+  itself does not turn red. The diagnostic rows are kept on purpose; a nonzero exit for an unsuccessful smoke
+  is not made yet.
