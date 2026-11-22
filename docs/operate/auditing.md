@@ -114,6 +114,16 @@ the leader itself verified, never what the client declared:
 | The leader's clock | When it wrapped the command. Audit only: applying the entry never reads it. |
 | The command | Its request id, its kind and a digest of its bytes, so the actor stays bound to one command after the log is purged, and whether the state machine applied or rejected it. |
 
+Every replica's applied record of such a command carries the actor from the
+entry, as three parameters: `requested_by` (`certificate:<name>` for an
+operator, `node:<uuid>` for a data node, `meta-<id>` for a metadata node, or
+`anonymous`), `requested_from` (the address the leader saw, left out when it
+saw none) and `vouched_by` (`meta-<id>` of the leader). They are read from the
+committed entry, never from what the replica itself observed, so the three
+replicas write the same values for one entry and a replica that lost the edge
+record still names the actor. A command committed bare (below level 9, or a
+node's own release) has none of them.
+
 The cluster state keeps the last 1024 such entries and a snapshot carries
 them, so a replica that restarts or installs a snapshot still knows who asked.
 A retry of a request that was already applied records nothing, so a second

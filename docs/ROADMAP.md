@@ -46,9 +46,11 @@ what each release does **not** yet do.
   before authorization, and audits the refusal. The wrapper is applied only to
   commands the audit list already names, never to a node's own traffic (a data
   node handing a range back); a certificate name over 128 bytes is refused
-  before anything is proposed. Reading the tail back, request ids for
-  bootstrap and membership, and the applied records' `requested_by` field are
-  the rest of #706.
+  before anything is proposed. Each replica's applied record of such a
+  command now names the actor from the log (`requested_by`, `requested_from`
+  and `vouched_by` parameters), so every replica writes the same three values.
+  Reading the tail back and request ids for bootstrap and membership are the
+  rest of #706.
 - **Upgrade note (#706, one-way): feature level 9.** Below level 9 nothing
   changes: the leader proposes the bare command, byte for byte as before, and
   logs once per term that the actor is recorded at the admin endpoint only.

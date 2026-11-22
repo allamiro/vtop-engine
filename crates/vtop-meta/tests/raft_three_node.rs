@@ -2189,6 +2189,32 @@ async fn the_actor_is_in_the_log_only_from_level_9_and_survives_a_restart() {
     assert!(records
         .iter()
         .all(|record| record.stage == vtop_meta::audit::AuditStage::Applied));
+    // And each names the actor from the log: the same three values on every
+    // replica, none of them taken from what this node saw.
+    let param = |record: &vtop_meta::audit::AuditRecord, name: &str| -> Option<String> {
+        record
+            .params
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value.clone())
+    };
+    for record in &records {
+        assert_eq!(
+            param(record, "requested_by").as_deref(),
+            Some("certificate:ops-alice"),
+            "the applied record names the actor (seed={seed:#x}): {record:?}"
+        );
+        assert_eq!(
+            param(record, "requested_from").as_deref(),
+            Some("192.0.2.44"),
+            "(seed={seed:#x}): {record:?}"
+        );
+        assert_eq!(
+            param(record, "vouched_by"),
+            Some(format!("meta-{leader_id}")),
+            "(seed={seed:#x}): {record:?}"
+        );
+    }
     // The node the command registered exists on every replica, as bare.
     cluster.assert_converged_snapshots();
 

@@ -320,6 +320,62 @@ mod tests {
         }
     }
 
+    /// #706: an applied record of an attributed entry keeps the actor, the
+    /// address and the voucher through `to_event`, on the actions whose
+    /// commands the leader wraps. A name off the allowlist would be dropped
+    /// without a sound, so this fails if one is.
+    #[test]
+    fn an_applied_record_keeps_the_actor_the_log_named() {
+        let commands = [
+            MetadataCommand::SetFeatureLevel {
+                env: env(),
+                feature_level: 9,
+            },
+            MetadataCommand::RegisterNode {
+                env: env(),
+                node_uuid: Uuid::from_u128(1),
+                addr: "10.0.0.1:9200".into(),
+                expected_generation: None,
+            },
+        ];
+        for command in &commands {
+            let audit = vtop_meta::audit::command_audit(command).expect("audited");
+            let mut record = AuditRecord::for_command(
+                AuditStage::Applied,
+                AuditActor::Replica(Some(2)),
+                command,
+                audit,
+                AuditOutcome::Success,
+            );
+            record.params.extend(vtop_meta::audit::attribution_params(
+                &vtop_meta::Attribution {
+                    actor: vtop_meta::CommandActor::Named("ops-alice".into()),
+                    peer: Some("192.0.2.44".parse().unwrap()),
+                    vouched_by: 1,
+                    recorded_at_ms: 0,
+                },
+            ));
+            let event = to_event(&record, "meta-2");
+            let name = vtop_meta::audit::command_name(command);
+            assert_eq!(
+                event.params.get("requested_by").map(String::as_str),
+                Some("certificate:ops-alice"),
+                "{name}: {:?}",
+                event.params
+            );
+            assert_eq!(
+                event.params.get("requested_from").map(String::as_str),
+                Some("192.0.2.44"),
+                "{name}"
+            );
+            assert_eq!(
+                event.params.get("vouched_by").map(String::as_str),
+                Some("meta-1"),
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn identities_become_actors_with_their_source() {
         let named = actor(&AuditActor::Caller(AdminIdentity::Named("ops-bob".into())));

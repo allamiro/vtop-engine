@@ -67,6 +67,14 @@ impl MetaRaftStateMachine {
         );
         let index = to_meta_index(entry.log_id.index);
         record.log_index = Some(index);
+        // An attributed entry names its actor in the log (#706), so this
+        // replica's record does too, from the entry and not from anything
+        // this node saw: every replica writes the same three values.
+        if let crate::command::MetadataCommand::Attributed { attribution, .. } = command {
+            record
+                .params
+                .extend(crate::audit::attribution_params(attribution));
+        }
         if let crate::command::MetadataResponse::Rejected(error) = response {
             record.outcome = crate::audit::AuditOutcome::Failure;
             record.reason = Some(format!(
