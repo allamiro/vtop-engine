@@ -1,0 +1,30 @@
+# The lab's MinIO, built from source by docker/minio/Dockerfile (#507: no
+# registry serves its images). The baseline every live test ran against
+# before #722, so it gates: each capability a case needs is settled.
+#
+# Every capability is listed (the test kit refuses a file that leaves one
+# out). States: pass, unsupported (with refusal: startup | first_batch),
+# xfail (with issue: N), unknown (discovery only; refused on a gating server
+# by any case that needs it), not_applicable. tests/s3-compat/README.md says
+# what each means.
+id: minio
+name: MinIO (lab, source-built)
+gating: true
+capabilities:
+  put_get_head: pass
+  path_style: pass
+  # The lab is reached by path style only (decision D12): no wildcard DNS.
+  virtual_host: not_applicable
+  # No live case probes these yet; the checksum and conditional-PUT probes
+  # of #722 settle them.
+  checksum_sha256_enforced: unknown
+  checksum_sha256_returned: pass
+  checksum_crc32_default: pass
+  multipart: pass
+  multipart_abort: pass
+  multipart_list_uploads: pass
+  multipart_resume: pass
+  versioning: pass
+  object_lock: pass
+  object_lock_enforced: pass
+  conditional_put: unknown
