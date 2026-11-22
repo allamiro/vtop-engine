@@ -844,16 +844,12 @@ impl ReplicaPeerServer {
             tokio::select! {
                 _ = &mut shutdown => break Ok(()),
                 _ = connections.join_next(), if !connections.is_empty() => {}
-                accepted = listener.accept() => {
-                    let (tcp, peer) = match accepted {
-                        Ok(accepted) => accepted,
-                        Err(source) => {
-                            break Err(crate::BrokerError::Io {
-                                path: std::path::PathBuf::from("replica-peer-listener"),
-                                source,
-                            });
-                        }
-                    };
+                accepted = crate::accept::accept_retrying(
+                    "replica listener",
+                    crate::accept::ACCEPT_RETRY_DELAY,
+                    || listener.accept(),
+                ) => {
+                    let (tcp, peer) = accepted;
                     // Over the cap: closed now, before the handshake, and
                     // counted (#732, R7).
                     let Some(slot) = self.limit.admit(peer) else {

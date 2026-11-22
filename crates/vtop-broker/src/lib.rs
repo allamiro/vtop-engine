@@ -27,6 +27,7 @@
 //! requests validate lineage against that store; membership join/leave/assign
 //! remain metadata commands (Raft-proposed in later wiring).
 
+mod accept;
 pub mod committed_floor;
 pub mod fencing_epochs;
 pub mod group_commit;
@@ -3048,11 +3049,12 @@ impl NativeServer {
                 completed = sessions.join_next(), if !sessions.is_empty() => {
                     if let Some(result) = completed { result?; }
                 }
-                accepted = listener.accept() => {
-                    let (socket, peer) = match accepted {
-                        Ok(value) => value,
-                        Err(source) => return Err(BrokerError::Io { path: PathBuf::from("tcp-listener"), source }),
-                    };
+                accepted = crate::accept::accept_retrying(
+                    "native listener",
+                    crate::accept::ACCEPT_RETRY_DELAY,
+                    || listener.accept(),
+                ) => {
+                    let (socket, peer) = accepted;
                     let Ok(permit) = Arc::clone(&self.sessions).try_acquire_owned() else {
                         // Explicit overload: refuse the socket rather than queue
                         // unbounded accept work. No request was accepted.

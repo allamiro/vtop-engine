@@ -21,6 +21,7 @@
 //! wall clock. Loopback tests exercise the path but do not claim seed-level
 //! reproducibility.
 
+mod accept;
 pub mod admin;
 pub mod authz;
 pub mod limit;

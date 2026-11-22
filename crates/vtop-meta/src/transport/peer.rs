@@ -193,7 +193,12 @@ impl PeerServer {
             );
         }
         loop {
-            let (tcp, peer_addr) = listener.accept().await?;
+            let (tcp, peer_addr) = super::accept::accept_retrying(
+                "metadata peer listener",
+                super::accept::ACCEPT_RETRY_DELAY,
+                || listener.accept(),
+            )
+            .await;
             // Over the cap: closed now, before the handshake, and counted.
             let Some(slot) = self.limit.admit(peer_addr) else {
                 drop(tcp);
