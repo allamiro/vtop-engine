@@ -170,6 +170,7 @@ nav:
       - deploy/index.md
       - Single engine with SQLite: deploy/single-node.md
       - Single engine with PostgreSQL: deploy/postgresql.md
+      - Losing the engine's host: deploy/engine-host-loss.md
       - PostgreSQL in depth: POSTGRES_DEPLOYMENT.md
       - Several engines (HA): deploy/ha.md
       - Kubernetes with Helm: deploy/kubernetes.md
@@ -202,6 +203,7 @@ nav:
       - Archive path: reference/archive-path.md
       - Known limitations: reference/limitations.md
       - Compatibility and upgrade policy: reference/compatibility.md
+      - "Deprecations: commands, flags and metrics": deprecations.md
       - Data-safety register: reference/data-safety-register.md
       - Component status: reference/component-status.md
       - Tamper evidence: reference/tamper-evidence.md
