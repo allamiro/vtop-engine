@@ -140,7 +140,7 @@ class Lab:
         self.project, self.system, self.tap = project, system, tap
         self.env = {"VTOP_IMAGE": vtop_image, "TOOL_CONFIG": config, "BENCH_DIR": BENCH, "RUN_LOGS": logs,
                     "TOOL_CPUS": cpus, "TOOL_MEMORY": memory, "STORE_ALIAS": "minio-real" if tap else "minio",
-                    "DOCKER_SOCKET": docker_api.SOCKET, "HARNESS_IMAGE": lab.HARNESS_IMAGE}
+                    "DOCKER_SOCKET": "/var/run/docker.sock", "HARNESS_IMAGE": lab.HARNESS_IMAGE}
         self.profiles = ["--profile", system] + (["--profile", "tap"] if tap else [])
         self.ports: dict[str, int] = {}
 
@@ -156,7 +156,7 @@ class Lab:
         return self.ports[key]
 
     def up_base(self) -> None:
-        self.compose("up", "-d", "--wait", "minio")
+        self.compose("up", "-d", "--wait", "store")
         self.compose("run", "--rm", "volume-init")
         services = ["generator"] + (["tap"] if self.tap else [])
         self.compose("up", "-d", *services)
@@ -164,7 +164,7 @@ class Lab:
         _wait(lambda: self._http("generator", 9400, "/state", None) is not None, 60, "the generator")
 
     def mc(self, script: str) -> str:
-        return self.compose("exec", "-T", "minio", "sh", "-c", script).stdout
+        return self.compose("exec", "-T", "store", "sh", "-c", script).stdout
 
     def _http(self, service: str, inner: int, path: str, body: dict | None, timeout: float = 600) -> Any:
         url = f"http://127.0.0.1:{self.port(service, inner)}{path}"
@@ -229,14 +229,14 @@ class Lab:
         inner = "/tmp/snap"
         lines = store.snapshot_commands("", BUCKET, prefix, inner)
         self.mc(f"rm -rf {inner} && " + " && ".join(lines))
-        self.compose("cp", f"minio:{inner}/.", out_dir)
+        self.compose("cp", f"store:{inner}/.", out_dir)
         listing = checker.read_json_lines(os.path.join(out_dir, "listing.jsonl"))
         incomplete = [entry.get("key", "") for entry in checker.read_json_lines(
             os.path.join(out_dir, "incomplete.jsonl")) if entry.get("key")]
         return checker.snapshot_from_dir(os.path.join(out_dir, "objects"), listing, incomplete)
 
     def request_counts(self) -> dict[str, float]:
-        url = f"http://127.0.0.1:{self.port('minio', 9000)}/minio/v2/metrics/cluster"
+        url = f"http://127.0.0.1:{self.port('store', 9000)}/minio/v2/metrics/cluster"
         with urllib.request.urlopen(url, timeout=30) as response:
             return store.request_counts(response.read().decode())
 

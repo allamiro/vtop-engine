@@ -2,7 +2,7 @@
 #
 #   run.py drives it; by hand:
 #   TOOL_CONFIG=$PWD/benchmarks/spool_compare/tools/vector/acks.yaml VTOP_IMAGE=vtop-compare:<tree> \
-#     docker compose -p vtop748-try -f benchmarks/spool_compare/compose.yml up -d minio generator vector
+#     docker compose -p vtop748-try -f benchmarks/spool_compare/compose.yml --profile vector up -d store generator vector
 #
 # Every tool runs in the same limit class (#744 rule 12): TOOL_CPUS (2; 1 on a
 # hosted runner), TOOL_MEMORY (2g), no swap. A test reads these limits from this
@@ -18,7 +18,9 @@ x-tool-env: &tool-env
   OTEL_SDK_DISABLED: "true"
 
 services:
-  minio:
+  # The store's service name is not `minio`: the name tools dial is an alias, so the S3 tap can take
+  # it in crash cells (a service name is a DNS name too, and would answer beside the tap's alias).
+  store:
     image: vtop-minio:RELEASE.2025-09-07T16-13-09Z
     pull_policy: never
     command: ["server", "/data"]
