@@ -1272,10 +1272,14 @@ mode_mismatch. The deployment profile is
 - **`vtopctl tier copy` locks cold-tier copies** under the block and reads
   both retentions back before it proposes the evidence; it used to refuse
   the block.
-- **Proven against MinIO only** (RELEASE.2025-09-07, the lab's build). AWS S3
-  behaviour is taken from its documentation (the integrity header a locked
-  write needs, the permissions a HEAD needs to return the lock headers), not
-  measured.
+- **Proven against the S3 compatibility matrix's servers, not yet AWS S3.**
+  The live Object Lock tests run against MinIO (RELEASE.2025-09-07, the lab's
+  build), RustFS, SeaweedFS, Versity S3 Gateway and Zenko CloudServer, and
+  against Garage, which has no Object Lock and is refused at startup (#722;
+  [S3 compatibility](reference/s3-compatibility.md)). AWS S3 behaviour is
+  taken from its documentation (the integrity header a locked write needs,
+  the permissions a HEAD needs to return the lock headers), not measured,
+  until the opt-in AWS workflow has run.
 
 **File source: the read's ctime is recorded in the ledger (#619).** A file
 marker now carries `ctime`, the file's ctime from the same fstat as its

@@ -226,6 +226,11 @@ pub struct ResultLine {
     pub seconds: f64,
     /// For an unexpected outcome or a failed body: the first line of why.
     pub detail: Option<String>,
+    /// What an informational probe saw the store do, when the case recorded
+    /// it with [`record_observation`]: a fact about the server, never judged
+    /// (the case passes whichever way the store answered).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<String>,
 }
 
 thread_local! {
@@ -234,6 +239,9 @@ thread_local! {
     /// runtime is current-thread), so parallel tests cannot take each
     /// other's.
     static METHOD: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// The observation the running case recorded, per thread for the same
+    /// reason as [`METHOD`].
+    static OBSERVATION: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 /// Record the verification method the running case observed, for its
@@ -244,6 +252,18 @@ pub fn record_method(method: &str) {
 
 fn take_method() -> Option<String> {
     METHOD.with(|m| m.borrow_mut().take())
+}
+
+/// Record what an informational probe saw the store do, for its results line
+/// and the compatibility page's observations. It is a fact, not a verdict:
+/// the case passes whichever way the store answered. Call it from the case's
+/// body, on the case's own task; the last call wins.
+pub fn record_observation(observation: &str) {
+    OBSERVATION.with(|o| *o.borrow_mut() = Some(observation.to_owned()));
+}
+
+fn take_observation() -> Option<String> {
+    OBSERVATION.with(|o| o.borrow_mut().take())
 }
 
 fn panic_text(payload: &(dyn Any + Send)) -> String {
@@ -332,6 +352,7 @@ impl LiveS3 {
             method: None,
             seconds: 0.0,
             detail: Some(why.to_owned()),
+            observation: None,
         };
         if let Some(path) = &self.recorder.path {
             write_line(path, &line);
@@ -455,6 +476,7 @@ where
 {
     let plan = plan(server, needs, refusal.is_some());
     take_method();
+    take_observation();
     let started = Instant::now();
     let ran = match (&plan.step, refusal) {
         (Step::Positive, _) => Some(AssertUnwindSafe(positive()).catch_unwind().await),
@@ -494,6 +516,7 @@ where
         method: take_method(),
         seconds: (seconds * 1000.0).round() / 1000.0,
         detail,
+        observation: take_observation(),
     };
     if let Some(path) = &recorder.path {
         write_line(path, &line);
@@ -663,6 +686,42 @@ mod tests {
                 l.vtop_commit.as_deref()
             ),
             (Some("1.0"), Some("sha256:abc"), Some("deadbeef"))
+        );
+    }
+
+    /// An informational probe's observation rides on its own results line and
+    /// is taken with it: the next case starts without it, and a case that
+    /// recorded none writes none.
+    #[tokio::test]
+    async fn an_observation_is_recorded_on_its_case_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = recorder(dir.path());
+        let s = server(true, &[]);
+        let needs = [Capability::PutGetHead];
+        let observed = run_case(
+            &s,
+            &r,
+            "kit.observed",
+            &needs,
+            || async { record_observation("a locked PUT with no integrity header: refused (400)") },
+            None::<fn(Capability, RefusalAt) -> std::future::Ready<()>>,
+        )
+        .await;
+        assert_eq!(observed, Ok(()));
+        assert_eq!(run(&s, &r, &needs, true, None).await, None);
+        let got = lines(r.path.as_ref().unwrap());
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            got[0].observation.as_deref(),
+            Some("a locked PUT with no integrity header: refused (400)")
+        );
+        assert_eq!(got[0].outcome, "pass");
+        assert_eq!(got[1].observation, None);
+        let text = std::fs::read_to_string(r.path.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            text.matches("\"observation\"").count(),
+            1,
+            "a line without one does not carry the key: {text}"
         );
     }
 

@@ -210,3 +210,23 @@ def test_a_malformed_run_date_is_refused(tmp_path):
     (src / "results-x.jsonl").write_text(json.dumps(dict(case("a", ["put_get_head"], "pass"), server="x")) + "\n")
     with pytest.raises(report.Refused, match="not a YYYY-MM-DD date"):
         report.ingest(str(src), str(repo))
+
+
+def test_an_informational_probes_observation_is_listed_and_never_judged(tmp_path):
+    """The locked-PUT probe passes whichever way the store answers; what it saw is shown as an observation, not a cell."""
+    probe = "probe.a_locked_put_without_an_integrity_header_is_handled_as_the_store_does"
+    seen = dict(case(probe, ["object_lock", "versioning", "path_style"], "pass"), observation="a locked PUT with no Content-MD5 and no checksum header was refused (400 InvalidRequest)")
+    repo = write_repo(tmp_path, [run("srv", [seen, case("v", ["put_get_head"], "pass")])])
+    assert report.main(["--repo", repo]) == 0
+    page = (tmp_path / report.PAGE).read_text()
+    assert "## Observations" in page
+    assert f"- srv, `{probe}`: a locked PUT with no Content-MD5 and no checksum header was refused (400 InvalidRequest)" in page
+    # A probe that refused (no positive body ran) saw nothing to report.
+    refused = dict(case(probe, ["object_lock"], "refused", "unsupported (refused at startup)", "object_lock"), observation="stale")
+    repo2 = write_repo(tmp_path / "two", [run("srv", [refused])])
+    assert report.main(["--repo", repo2]) == 0
+    assert "## Observations" not in (tmp_path / "two" / report.PAGE).read_text()
+    # Results with no observation (every committed run today) render without the section.
+    committed = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", report.PAGE)
+    with open(committed, encoding="utf-8") as handle:
+        assert "## Observations" not in handle.read()
