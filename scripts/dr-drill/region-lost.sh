@@ -49,8 +49,8 @@ dr_init region-lost "${1:-}"
 VTOP_DR_REGION_LOST_RTO_S=180
 dr_check_doc VTOP_DR_REGION_LOST_RTO_S=$VTOP_DR_REGION_LOST_RTO_S
 
-BUCKET=dr-region-lost
-REC=dr-rec-
+BUCKET="dr-region-lost"
+REC="dr-rec-"
 FIRST=120  # archived, and backed up, before the last stretch
 LAST=60    # archived in the last stretch, after the backup (and cut off, when lagging)
 DURING=60  # produced while the region is gone
