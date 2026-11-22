@@ -899,8 +899,11 @@ impl<'a> Pipeline<'a> {
     /// VERIFIED range with no row for the range below it, which it would
     /// commit, moving the source past data no row records (review of #924).
     ///
-    /// Returns the window's format, which the task is handed so the row is
-    /// not written twice; `None` for an empty read, which has no row.
+    /// Returns the window's format and the batch id the row was written
+    /// under, which the task is handed so the row is not written twice and is
+    /// updated under the same id (a second `build_batch_id` call names a new
+    /// id: it carries the time and a random part); `None` for an empty read,
+    /// which has no row.
     async fn record_queued(
         &self,
         source: &DiscoveredSource,
@@ -908,7 +911,7 @@ impl<'a> Pipeline<'a> {
         stream: Option<&StreamConfig>,
         sealed_at: chrono::DateTime<Utc>,
         queued_at: chrono::DateTime<Utc>,
-    ) -> Result<Option<vtop_core::types::TelemetryFormat>, VtopError> {
+    ) -> Result<Option<QueuedRow>, VtopError> {
         if read.is_empty() {
             return Ok(None);
         }
@@ -925,7 +928,7 @@ impl<'a> Pipeline<'a> {
             &queued_at.to_rfc3339(),
         );
         self.store.save_batch_state(&record).await?;
-        Ok(Some(format))
+        Ok(Some(QueuedRow { format, batch_id }))
     }
 
     /// Run a [`ReadResult`] all the way through the state machine. Source
@@ -976,9 +979,10 @@ impl<'a> Pipeline<'a> {
     /// waited for an upload slot, two windows of one unit could be stamped in
     /// the reverse of their seal order (review of #895).
     ///
-    /// `recorded` is the format [`Pipeline::record_queued`] decided when it
-    /// wrote the window's ledger row: the row exists already, and is not
-    /// written again. `None` writes it here, as the first thing the batch does.
+    /// `recorded` is the format and batch id [`Pipeline::record_queued`]
+    /// decided when it wrote the window's ledger row: the row exists already,
+    /// is not written again, and is carried on under that same id. `None`
+    /// writes it here, as the first thing the batch does.
     #[allow(clippy::too_many_arguments)]
     async fn process_until_verified(
         &self,
@@ -988,7 +992,7 @@ impl<'a> Pipeline<'a> {
         sealed_at: chrono::DateTime<Utc>,
         queued_at: chrono::DateTime<Utc>,
         rebuild: Option<RecordedWindow>,
-        recorded: Option<vtop_core::types::TelemetryFormat>,
+        recorded: Option<QueuedRow>,
     ) -> Result<VerifyStep, VtopError> {
         if read.is_empty() {
             return Ok(VerifyStep::Finished(BatchOutcome {
@@ -1039,15 +1043,15 @@ impl<'a> Pipeline<'a> {
         stream: Option<&StreamConfig>,
         (sealed_at, queued_at): (chrono::DateTime<Utc>, chrono::DateTime<Utc>),
         rebuild: Option<RecordedWindow>,
-        recorded: Option<vtop_core::types::TelemetryFormat>,
+        recorded: Option<QueuedRow>,
     ) -> Result<VerifyStep, VtopError> {
         let started = Instant::now();
 
         let tenant = self.window_tenant(stream);
         let already_recorded = recorded.is_some();
-        let format = match recorded {
-            Some(format) => format,
-            None => self.window_format(source, &read, stream),
+        let (format, queued_batch_id) = match recorded {
+            Some(row) => (row.format, Some(row.batch_id)),
+            None => (self.window_format(source, &read, stream), None),
         };
         // Optional path rename (e.g. app_events -> app) for the object key.
         let s3_source = stream
@@ -1057,7 +1061,11 @@ impl<'a> Pipeline<'a> {
         // The range the batch's object holds, for its name and its manifest.
         // The ledger and the adapter commit keep `read.progress_end` as it is.
         let window = window_marker(&read);
-        let batch_id = vtop_core::batch::build_batch_id(&source.source_name, &window);
+        // The id the queued row was written under, when it was: an id built
+        // again here would name a row that does not exist (it carries the
+        // time and a random part).
+        let batch_id = queued_batch_id
+            .unwrap_or_else(|| vtop_core::batch::build_batch_id(&source.source_name, &window));
         let now = queued_at.to_rfc3339();
         trace.record("batch_id", batch_id.as_str());
         trace.record("tenant", tenant.as_str());
@@ -3438,6 +3446,15 @@ pub struct Engine {
     _instance_locks: Vec<InstanceLock>,
 }
 
+/// A window's ledger row written when it was queued (#924): its format and
+/// the batch id the row was written under, handed to the window's task so it
+/// carries the batch on under that id instead of building a new one.
+#[derive(Debug, Clone)]
+pub(crate) struct QueuedRow {
+    pub(crate) format: vtop_core::types::TelemetryFormat,
+    pub(crate) batch_id: String,
+}
+
 /// One sealed batch between seal and settlement; see [`Engine::inflight`].
 struct InFlight {
     /// The unit (Kafka partition, file at its inode) the window was read from.
@@ -4732,6 +4749,14 @@ impl Engine {
         if !work.is_empty() {
             let owned = self.owned_pipeline();
             let queue = self.inflight.entry(source_type.clone()).or_default();
+            // Units whose row could not be written this pass: a later window
+            // of the same unit is not recorded or started either. Its row
+            // would sit above a range with none, and a crash before the
+            // failure settles would leave recovery the same hole the queued
+            // row exists to close (#924). It is handed back with the failed
+            // one when the failure settles.
+            let mut unrecorded_units: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             for (source, read, stream, sealed_at, rebuild) in work {
                 // Stamped here, in seal order: a task that starts after a
                 // later window's must not file its row after it.
@@ -4747,6 +4772,24 @@ impl Engine {
                     bounded: false,
                 });
                 let bytes = read.records.iter().map(Vec::len).sum();
+                let unit = unit_key(&window.start);
+                if unrecorded_units.contains(&unit) {
+                    queue.push_back(InFlight {
+                        unit,
+                        window,
+                        bytes,
+                        superseded: false,
+                        failure_handled: false,
+                        task: None,
+                        result: Some(Err(VtopError::Other(
+                            "an earlier window of this source unit could not be recorded in the \
+                             ledger this pass; this window was not started and its range is \
+                             handed back"
+                                .to_owned(),
+                        ))),
+                    });
+                    continue;
+                }
                 // The row is written HERE, in seal order, before any task can
                 // win an upload slot (see `Pipeline::record_queued`). A write
                 // that fails is the window's failure, settled like any other
@@ -4756,8 +4799,9 @@ impl Engine {
                     .record_queued(&source, &read, stream.as_ref(), sealed_at, queued_at)
                     .await;
                 let recorded = match recorded {
-                    Ok(format) => format,
+                    Ok(row) => row,
                     Err(e) => {
+                        unrecorded_units.insert(unit.clone());
                         queue.push_back(InFlight {
                             unit: unit_key(&window.start),
                             window,
