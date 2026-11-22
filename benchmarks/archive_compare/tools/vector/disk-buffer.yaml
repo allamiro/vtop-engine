@@ -1,0 +1,60 @@
+# Vector 0.61.0, profile `disk-buffer`, for the archive comparison (#746). Each setting names
+# its page under https://vector.dev/docs/ (as published for 0.61). It differs from `acks` in the buffer only.
+#
+# telemetry: Vector has no usage reporting; its API server is off
+# (reference/api/: `api.enabled`, default false, stated here).
+
+# reference/configuration/global-options/#data_dir: checkpoints and buffers on the tool's own volume.
+data_dir: /var/lib/vector
+
+api:
+  enabled: false
+
+sources:
+  topic:
+    # reference/configuration/sources/kafka/: one topic, a consumer group of its own, from the start.
+    type: kafka
+    bootstrap_servers: kafka:9092
+    group_id: vector-bench
+    topics: [bench]
+    auto_offset_reset: earliest
+    # sources/kafka/#decoding: the record's value is the event's `message`, byte for byte.
+    decoding:
+      codec: bytes
+
+sinks:
+  s3:
+    # reference/configuration/sinks/aws_s3/
+    type: aws_s3
+    inputs: [topic]
+    bucket: bench
+    key_prefix: "vector/%Y/%m/%d/"
+    region: us-east-1
+    # sinks/aws_s3/#endpoint: the lab MinIO (the S3 tap in crash cells).
+    endpoint: http://minio:9000
+    force_path_style: true
+    # #744 rule 15: one JSON line per record (the Kafka value, newline-delimited), gzip at its default level.
+    encoding:
+      codec: raw_message
+    framing:
+      method: newline_delimited
+    compression: gzip
+    # #744 rule 15: about 32 MiB or 60 s per object.
+    batch:
+      max_bytes: 33554432
+      timeout_secs: 60
+    # sinks/aws_s3/#request.concurrency: the default.
+    request:
+      concurrency: adaptive
+    # reference/end-to-end-acknowledgements/
+    acknowledgements:
+      enabled: true
+    # reference/configuration/sinks/aws_s3/#buffer: a disk buffer; with it an event is
+    # acknowledged once it is in the buffer, which is synced every 500 ms
+    # (reference/end-to-end-acknowledgements/). The documented durability trade.
+    buffer:
+      type: disk
+      max_size: 1073741824
+      when_full: block
+    # Credentials come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in the
+    # container's environment (sinks/aws_s3/#auth, the default chain).
