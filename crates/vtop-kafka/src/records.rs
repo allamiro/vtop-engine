@@ -130,6 +130,23 @@ pub struct Record {
     pub headers: Vec<(String, Option<Vec<u8>>)>,
 }
 
+/// The latest record timestamp a fetch response carries, in milliseconds.
+/// 2^52 ms is well past the year 100000; nothing real is later.
+pub const MAX_SERVED_TIMESTAMP_MILLIS: i64 = 1 << 52;
+
+/// A stored record's timestamp as a Kafka consumer is served it: -1 ("no
+/// timestamp") at the lowest and [`MAX_SERVED_TIMESTAMP_MILLIS`] at the
+/// highest.
+///
+/// A producer chooses its records' timestamps freely, and the batch encoding
+/// stores each as a delta from the first record's. Two records stored with
+/// timestamps further apart than an `i64` can express could not be encoded
+/// into one fetch response, and the encoder panics rather than wrap, which
+/// would leave the partition unreadable for every consumer.
+pub fn served_timestamp(timestamp_millis: i64) -> i64 {
+    timestamp_millis.clamp(-1, MAX_SERVED_TIMESTAMP_MILLIS)
+}
+
 /// A decoded batch: the producer identity the idempotence bridge needs, plus
 /// the records themselves.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1008,6 +1025,31 @@ mod tests {
             },
         ];
         let _ = RecordBatch::encode(0, 1, 0, 0, &records);
+    }
+
+    /// Records stored with the widest timestamp span a producer can choose are
+    /// still served: the clamp keeps every delta inside an `i64`, so the
+    /// encoder does not panic and the batch decodes.
+    #[test]
+    fn records_with_extreme_stored_timestamps_are_still_encodable() {
+        assert_eq!(served_timestamp(i64::MIN), -1);
+        assert_eq!(served_timestamp(i64::MAX), MAX_SERVED_TIMESTAMP_MILLIS);
+        assert_eq!(served_timestamp(1_700_000_000_000), 1_700_000_000_000);
+        let records: Vec<Record> = [i64::MIN, i64::MAX, 0]
+            .iter()
+            .enumerate()
+            .map(|(offset, stored)| Record {
+                offset: offset as i64,
+                timestamp_millis: served_timestamp(*stored),
+                key: None,
+                value: None,
+                headers: Vec::new(),
+            })
+            .collect();
+        let encoded = RecordBatch::encode(0, -1, -1, -1, &records);
+        let decoded = RecordBatch::decode(&encoded).expect("the batch decodes");
+        let served: Vec<i64> = decoded.records.iter().map(|r| r.timestamp_millis).collect();
+        assert_eq!(served, vec![-1, MAX_SERVED_TIMESTAMP_MILLIS, 0]);
     }
 
     /// A count no record could hold is refused without reading a header at
