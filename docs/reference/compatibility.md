@@ -339,7 +339,7 @@ table differs from what the registry generates. Edit the registry and run
 | 15 | Metadata log chunk and entry frames | `VTOPMLG1`, `VTOPMLE1` | B | evolving | follows #740 |
 | 16 | Metadata command set | command kinds, feature levels 3 to 8 | B | evolving, level-gated | follows #740 |
 | 17 | Metadata snapshot and state encoding | `VTOPMSN1` v1 and v2, payload version `1` | B | evolving, level-gated | follows #740 |
-| 18 | Metadata hard state, applied, purged, membership log id | `VTOPMHS1`, `VTOPMAP1`, `VTOPMPG1`, `VTOPMML1` | B | evolving | follows #740 |
+| 18 | Metadata hard state, applied, purged, membership log id, audit frontier | `VTOPMHS1`, `VTOPMAP1`, `VTOPMPG1`, `VTOPMML1`, `VTOPMAU1` | B | evolving | follows #740 |
 | 19 | Native protocol | `VTPW`, major `1`, minor `0` | C | evolving | follows #740 |
 | 20 | Replica protocol negotiation | replica protocol `1` and `2` | C | evolving | follows #740 |
 | 21 | Metadata peer and admin transport | `VTPM`, version `1` | C | evolving | follows #740 |
