@@ -1413,13 +1413,14 @@ upgrading:
   `--set 'meta.adminAuthorization.operatorCommonNames={vtop-admin}'`.
 - Once the policy is on, other certificates the CA signed, data nodes' included,
   can no longer run `meta init`, change membership or grant leases. A data
-  node keeps its own lease, version report and group cursors. Today a data
-  node's lease *release* at shutdown names no holder, so the policy refuses
+  node keeps its own lease, version report and group cursors. From metadata
+  feature level 9 a data node's lease *release* at shutdown names its
+  holder, and the policy admits it from the node's own certificate (#850,
+  #870). Raise to level 9 after upgrading (every metadata voter and data node
+  first, then `vtopctl meta enable-features --level 9`), and releases are
+  immediate. Below level 9 a release names no holder, so the policy refuses
   it as an operator's command and the lease lapses on its deadline (15 s by
-  default): a planned handover waits that long. A release that names its
-  holder, which the policy admits from the node's own certificate, is in
-  review (#870, on metadata feature level 9 from #850); this note will say
-  how to turn it on once both are in.
+  default): a planned handover waits that long.
 - A cluster administered out of band can set `allowNoOperators: true` (nobody
   may run cluster-scoped commands). A lab can opt out with `enabled: false`;
   the install notes then print a WARNING. A plaintext admin plane
