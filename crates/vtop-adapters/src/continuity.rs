@@ -341,43 +341,43 @@ pub fn proves_at_path(path: &std::path::Path, identity: &Identity<'_>) -> bool {
 
 /// Up to `len` bytes of `file` from `from`, read at an offset so the
 /// descriptor's position is left alone; fewer at the end of the file.
-#[cfg(unix)]
 pub(crate) fn read_at_most(file: &std::fs::File, from: u64, len: u64) -> std::io::Result<Vec<u8>> {
-    use std::os::unix::fs::FileExt;
-    let mut bytes = vec![0u8; usize::try_from(len).unwrap_or(usize::MAX)];
-    let mut filled = 0;
-    while filled < bytes.len() {
-        match file.read_at(&mut bytes[filled..], from + filled as u64) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        let mut bytes = vec![0u8; usize::try_from(len).unwrap_or(usize::MAX)];
+        let mut filled = 0;
+        while filled < bytes.len() {
+            match file.read_at(&mut bytes[filled..], from + filled as u64) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
         }
+        bytes.truncate(filled);
+        Ok(bytes)
     }
-    bytes.truncate(filled);
-    Ok(bytes)
+    #[cfg(not(unix))]
+    {
+        // Without inodes nothing can be proven (`inode_of` is `None`), so no
+        // caller gets this far.
+        let _ = (file, from, len);
+        Ok(Vec::new())
+    }
 }
 
-#[cfg(not(unix))]
-pub(crate) fn read_at_most(
-    _file: &std::fs::File,
-    _from: u64,
-    _len: u64,
-) -> std::io::Result<Vec<u8>> {
-    // Without inodes nothing can be proven (`inode_of` is `None`), so no
-    // caller gets this far.
-    Ok(Vec::new())
-}
-
-#[cfg(unix)]
 fn inode_of(md: &std::fs::Metadata) -> Option<u64> {
-    use std::os::unix::fs::MetadataExt;
-    Some(md.ino())
-}
-
-#[cfg(not(unix))]
-fn inode_of(_md: &std::fs::Metadata) -> Option<u64> {
-    None
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(md.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = md;
+        None
+    }
 }
 
 /// Whether a commit for a range ending at `end_byte` still describes the file
@@ -525,6 +525,7 @@ impl Generations {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn seen(inode: Option<u64>, size: u64) -> Option<Observed> {
         Some(Observed {
@@ -882,6 +883,136 @@ mod tests {
             ),
             Settled::Current
         );
+    }
+
+    /// Settling a range retires the ranges of its own generation read BEFORE
+    /// it - and only those: a range read after it is still to be settled by
+    /// name, and one read just before it goes with it.
+    #[test]
+    fn settling_a_range_retires_those_before_it_and_keeps_those_after_it() {
+        let mut generations = Generations::default();
+        generations.issue(0, 50);
+        generations.issue(50, 80);
+        generations.issue(80, 100);
+        generations.issue(100, 120);
+        // The third range is committed: the window it closed is retired with
+        // it, the range read after it is not.
+        assert_eq!(generations.settle(80, 100), Settled::Current);
+        assert_eq!(generations.settle(0, 50), Settled::Unknown, "retired");
+        assert_eq!(
+            generations.settle(50, 80),
+            Settled::Unknown,
+            "the range read just before it is retired as well"
+        );
+        assert_eq!(generations.settle(100, 120), Settled::Current);
+
+        // The first range of a window: everything after it is kept.
+        let mut generations = Generations::default();
+        generations.issue(0, 10);
+        generations.issue(10, 20);
+        generations.issue(20, 30);
+        assert_eq!(generations.settle(0, 10), Settled::Current);
+        assert_eq!(generations.settle(10, 20), Settled::Current);
+        assert_eq!(generations.settle(20, 30), Settled::Current);
+    }
+
+    /// Run `work` on its own thread and fail the test, instead of hanging it,
+    /// when it does not finish: the loops under test can spin for ever on
+    /// the failure they are meant to report.
+    fn finishes<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(work());
+        });
+        result
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the read did not finish")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_at_an_offset_returns_what_is_there_and_fails_on_a_failed_read() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"0123456789").unwrap();
+        file.flush().unwrap();
+        let path = file.path().to_path_buf();
+        let (middle, whole, short, past, nothing, unreadable) = finishes(move || {
+            let open = || std::fs::File::open(&path).unwrap();
+            // A descriptor that cannot be read is an error, not a read to retry.
+            let write_only = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            (
+                read_at_most(&open(), 2, 4).unwrap(),
+                read_at_most(&open(), 0, 10).unwrap(),
+                read_at_most(&open(), 7, 100).unwrap(),
+                read_at_most(&open(), 50, 4).unwrap(),
+                read_at_most(&open(), 3, 0).unwrap(),
+                read_at_most(&write_only, 0, 4),
+            )
+        });
+        assert_eq!(middle, b"2345");
+        assert_eq!(whole, b"0123456789");
+        assert_eq!(short, b"789", "fewer at the end of the file");
+        assert_eq!(past, b"", "past the end");
+        assert_eq!(nothing, b"", "nothing asked");
+        assert!(unreadable.is_err(), "{unreadable:?}");
+    }
+
+    #[test]
+    fn the_bytes_ending_at_an_offset_are_the_ones_just_below_it() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"0123456789").unwrap();
+        file.flush().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let below = |end: u64, len: u64| {
+            runtime.block_on(async {
+                let mut open = tokio::fs::File::open(file.path()).await.unwrap();
+                read_ending_at(&mut open, end, len).await.unwrap()
+            })
+        };
+        assert_eq!(below(7, 3), b"456");
+        assert_eq!(below(10, 4), b"6789");
+        assert_eq!(
+            below(4, 10),
+            b"0123",
+            "a file shorter than the page asked for"
+        );
+        assert_eq!(below(0, 5), b"");
+        assert_eq!(
+            below(25, 5),
+            b"",
+            "past the end of the file: fewer bytes than a fingerprint covers"
+        );
+    }
+
+    /// A tail that ends well inside a longer file: the bytes proven are the
+    /// `len` ones below `end`, not what follows them.
+    #[cfg(unix)]
+    #[test]
+    fn a_tail_below_a_longer_files_end_is_proven_by_its_own_bytes() {
+        use std::os::unix::fs::MetadataExt;
+        let bytes: Vec<u8> = (0..100u8).map(|i| b'a' + i % 26).collect();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&bytes).unwrap();
+        file.flush().unwrap();
+        let inode = std::fs::metadata(file.path()).unwrap().ino();
+        let content = ContentFingerprint::of(&bytes[..40]).unwrap();
+        let tail = Tail::at(60, ContentFingerprint::of(&bytes[50..60])).unwrap();
+        let identity = |tail: &Tail| {
+            proves_at_path(
+                file.path(),
+                &Identity {
+                    inode,
+                    contents: &[&content],
+                    tails: &[tail],
+                    min_len: 60,
+                },
+            )
+        };
+        assert!(identity(&tail));
+        let other = Tail::at(60, ContentFingerprint::of(&bytes[51..61])).unwrap();
+        assert!(!identity(&other), "other bytes below the same end");
     }
 }
 
