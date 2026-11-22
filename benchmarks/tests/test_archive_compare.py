@@ -728,3 +728,20 @@ def test_every_put_trigger_is_reachable_by_the_tool_that_makes_the_fewest_puts(n
                                             n_range=tuple(params["n_range"])):
                     assert remaining // object_bytes + 1 >= point.n, (name, cell["cell"], repetition, point)
                     remaining = max(remaining - (point.n - 1 if kind == "K1" else point.n) * object_bytes, 0)
+
+
+def test_every_run_checks_its_images_first_so_a_pruned_image_is_rebuilt_not_a_failed_run(monkeypatch, tmp_path):
+    seen = []
+    monkeypatch.setattr(run.lab, "ensure_vtop_image", lambda rebuild: seen.append("vtop") or "vtop-compare:x")
+    monkeypatch.setattr(run.lab, "ensure_minio_image", lambda: seen.append("minio"))
+    monkeypatch.setattr(run.lab, "ensure_image", lambda ref: seen.append(ref.split("@")[0]))
+    built = []
+    monkeypatch.setattr(run.lab, "sh", lambda args, **kw: built.append(args[:3]) or type(
+        "R", (), {"returncode": 1, "stdout": "", "stderr": ""})())
+    driver = run.Runner(None, fixture.environment("r"), str(tmp_path), "")
+    driver.ensure_images("connect-lenses")
+    assert "minio" in seen and any(ref.startswith("apache/kafka") for ref in seen)
+    assert any(args[:2] == ["docker", "build"] for args in built)  # the inspect said it is gone, so it is built
+    seen.clear()
+    driver.ensure_images("vtop")
+    assert seen[0] == "vtop"

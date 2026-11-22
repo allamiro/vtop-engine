@@ -496,6 +496,7 @@ class Runner:
         reason = self.smoke_failed(item)
         if reason:
             raise runner.CellRefused(reason)
+        self.ensure_images(item.system)
         self.index += 1
         key = "-".join(item.key(KIND.variant_columns))
         logs = os.path.join(self.run_dir, "logs", key)
@@ -520,6 +521,15 @@ class Runner:
                 log(f"could not save the logs of {project}: {exc}")
             finally:
                 tool.down()
+
+    def ensure_images(self, system: str) -> None:
+        """Every image this run uses is there before the run starts: a host shared with other work prunes unused
+        images, and a long plan must not fail an hour in on one that went missing (each is a cheap inspect)."""
+        if system == "vtop":
+            lab.ensure_vtop_image(False)
+        lab.ensure_minio_image()
+        lab.ensure_image(lab.HARNESS_IMAGE)
+        ensure_tool_images([system], registry.load(), False)
 
     def _wait_fired(self, tool: Lab, fired: int, timeout: float) -> bool:
         """Wait for the tap's next kill; give up when the tool has gone quiet (no new object for the quiet
