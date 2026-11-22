@@ -1224,6 +1224,10 @@ fn golden_fuzz_seeds() -> Vec<(&'static str, Vec<u8>)> {
             "golden-command-attributed-node-v4",
             with(0, GOLDEN_ATTRIBUTED_NODE_V4_HEX),
         ),
+        (
+            "golden-command-release-as-holder",
+            with(0, GOLDEN_RELEASE_AS_HOLDER_HEX),
+        ),
         ("golden-snapshot-state", with(3, GOLDEN_STATE_PAYLOAD_HEX)),
         (
             "golden-snapshot-split-state",
