@@ -218,6 +218,7 @@ nav:
           - Comparison: COMPARISON.md
   - Benchmarks:
       - benchmarks/index.md
+      - Comparison summary: benchmarks/comparison-summary.md
       - Kafka comparison: benchmarks/kafka-comparison.md
       - Kafka failover: benchmarks/kafka-failover.md
       - Throughput research: THROUGHPUT_RESEARCH.md

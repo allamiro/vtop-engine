@@ -8,6 +8,9 @@
 
 ## The full reports
 
+- [Comparison summary](comparison-summary.md): VTOP against other telemetry and archive
+  products, per use case, with the fairness rules and the limits. Cells are
+  "not measured yet" until a run is committed.
 - [Kafka comparison](kafka-comparison.md) and [Kafka failover](kafka-failover.md):
   method, raw data and every condition.
 - [Egress transport research](../EGRESS_TRANSPORT_RESEARCH.md): the upload
