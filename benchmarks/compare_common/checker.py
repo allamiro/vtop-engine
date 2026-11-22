@@ -175,7 +175,8 @@ def parse_time(text: str) -> float:
     if not match:
         raise ValueError(f"not a timestamp: {text!r}")
     head, frac, tail = match.groups()
-    frac = (frac or "")[:7]
+    # Exactly six digits: Python 3.9 takes only 3 or 6, and MinIO prints as few as it needs ("…:35.45Z").
+    frac = "." + ((frac or ".")[1:] + "000000")[:6]
     return dt.datetime.fromisoformat(head + frac + (tail or "+00:00")).timestamp()
 
 
