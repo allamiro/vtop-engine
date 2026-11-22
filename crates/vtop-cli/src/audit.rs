@@ -437,7 +437,7 @@ async fn run_inner(command: AuditCommand, json: bool) -> Result<i32, VtopError> 
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({
+                    crate::report::report_json!({
                         "passed": report.passed(),
                         "rows": report.rows,
                         "keyed_rows": report.keyed_rows,

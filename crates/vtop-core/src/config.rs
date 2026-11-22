@@ -649,7 +649,9 @@ pub struct BatchingConfig {
     #[serde(default = "default_idle_poll_interval_ms")]
     pub idle_poll_interval_ms: u64,
     /// How many batches may be in the verify phase (compress, checksum,
-    /// upload, manifest, verify) at once.
+    /// upload, manifest, verify) at once, whichever cycle sealed them: the
+    /// engine reads on while they are on the wire, and stops reading while
+    /// sealed batches hold this many times `max_bytes`.
     ///
     /// That phase is ~64% blocking network I/O by measurement, so running one
     /// batch at a time leaves the CPU idle waiting on the object store — under

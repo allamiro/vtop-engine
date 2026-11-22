@@ -302,6 +302,16 @@ class KillStateTest(unittest.TestCase):
             self.assertIn("a MANIFEST_UPLOADED row", msg)
             self.assertIn("must find a VERIFIED row", msg)
 
+    def test_the_batch_at_the_point_need_not_be_the_newest(self):
+        # Batches overlap across cycles: when one is SOURCE_COMMITTED at the
+        # point, a window read after it can already be VERIFIED and waiting.
+        ok, msg = sc.kill_state(
+            "after_ledger_source_committed",
+            {"newest_state": "VERIFIED", "states": {"SOURCE_COMMITTED": 1, "VERIFIED": 1}},
+        )
+        self.assertTrue(ok, msg)
+        self.assertIn("a ledger row is SOURCE_COMMITTED", msg)
+
     def test_a_row_where_none_should_be_is_named(self):
         ok, msg = sc.kill_state("before_insert", {"newest_state": "BATCHING", "states": {}})
         self.assertFalse(ok)

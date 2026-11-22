@@ -171,6 +171,11 @@ pub struct MetadataTopic {
 pub struct MetadataPartition {
     pub index: i32,
     pub leader: i32,
+    /// The fencing epoch the leader holds the range at, as far as the
+    /// answering node knows it (#751); `-1` when it does not, which a client
+    /// reads as "no epoch" and never compares. Never `0` for "unknown": a
+    /// client that has seen a real epoch ignores metadata with a lower one.
+    pub leader_epoch: i32,
     pub error: ErrorCode,
 }
 
@@ -217,7 +222,7 @@ pub fn encode_metadata(out: &mut Encoder, version: i16, r: &MetadataResponse) {
                     out.i32(partition.index);
                     out.i32(partition.leader);
                     if version >= 7 {
-                        out.i32(0); // leader_epoch
+                        out.i32(partition.leader_epoch);
                     }
                     out.array_len(1);
                     out.i32(partition.leader); // replica_nodes
@@ -344,6 +349,10 @@ pub fn encode_produce(out: &mut Encoder, version: i16, topics: &[ProduceTopicRes
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchPartition {
     pub index: i32,
+    /// The leader epoch the client last saw for this partition (Fetch v9+),
+    /// `-1` when it sent none (#751): the gateway refuses a request made
+    /// under an epoch that is not the one it holds the range at.
+    pub current_leader_epoch: i32,
     pub fetch_offset: i64,
     pub max_bytes: i32,
 }
@@ -386,9 +395,11 @@ pub fn decode_fetch(d: &mut Decoder<'_>, version: i16) -> Result<FetchRequest, W
         let mut partitions = Vec::with_capacity(partition_count);
         for _ in 0..partition_count {
             let index = d.i32("fetch.partitions.partition")?;
-            if version >= 9 {
-                d.i32("fetch.partitions.currentLeaderEpoch")?;
-            }
+            let current_leader_epoch = if version >= 9 {
+                d.i32("fetch.partitions.currentLeaderEpoch")?
+            } else {
+                -1
+            };
             let fetch_offset = d.i64("fetch.partitions.fetchOffset")?;
             if version >= 5 {
                 d.i64("fetch.partitions.logStartOffset")?;
@@ -396,6 +407,7 @@ pub fn decode_fetch(d: &mut Decoder<'_>, version: i16) -> Result<FetchRequest, W
             let max_bytes = d.i32("fetch.partitions.partitionMaxBytes")?;
             partitions.push(FetchPartition {
                 index,
+                current_leader_epoch,
                 fetch_offset,
                 max_bytes,
             });
@@ -479,6 +491,8 @@ pub const TIMESTAMP_EARLIEST: i64 = -2;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListOffsetsPartition {
     pub index: i32,
+    /// As on a fetch: the epoch the client last saw, `-1` for none (#751).
+    pub current_leader_epoch: i32,
     pub timestamp: i64,
 }
 
@@ -513,11 +527,17 @@ pub fn decode_list_offsets(
         let mut partitions = Vec::with_capacity(partition_count);
         for _ in 0..partition_count {
             let index = d.i32("listOffsets.partitions.partitionIndex")?;
-            if version >= 4 {
-                d.i32("listOffsets.partitions.currentLeaderEpoch")?;
-            }
+            let current_leader_epoch = if version >= 4 {
+                d.i32("listOffsets.partitions.currentLeaderEpoch")?
+            } else {
+                -1
+            };
             let timestamp = d.i64("listOffsets.partitions.timestamp")?;
-            partitions.push(ListOffsetsPartition { index, timestamp });
+            partitions.push(ListOffsetsPartition {
+                index,
+                current_leader_epoch,
+                timestamp,
+            });
         }
         topics.push(ListOffsetsTopic { name, partitions });
     }
@@ -589,6 +609,7 @@ mod tests {
                     partitions: vec![MetadataPartition {
                         index: 0,
                         leader: 1,
+                        leader_epoch: 7,
                         error: ErrorCode::None,
                     }],
                 },
@@ -699,7 +720,7 @@ mod tests {
         e.array_len(1);
         e.i32(0);
         if version >= 9 {
-            e.i32(-1); // current_leader_epoch
+            e.i32(5); // current_leader_epoch
         }
         e.i64(3); // fetch_offset
         if version >= 5 {
@@ -724,6 +745,13 @@ mod tests {
             d.expect_consumed("fetch").unwrap();
             assert_eq!(request.max_wait_ms, 500);
             assert_eq!(request.topics[0].partitions[0].fetch_offset, 3);
+            // The epoch the client names is carried to the gateway where the
+            // version has one (#751), and is "none" where it does not.
+            assert_eq!(
+                request.topics[0].partitions[0].current_leader_epoch,
+                if version >= 9 { 5 } else { -1 },
+                "v{version}"
+            );
 
             let mut out = Encoder::new();
             encode_fetch(
@@ -775,7 +803,7 @@ mod tests {
             e.array_len(1);
             e.i32(0);
             if version >= 4 {
-                e.i32(-1);
+                e.i32(5);
             }
             e.i64(TIMESTAMP_LATEST);
             let bytes = e.into_vec();
@@ -783,6 +811,11 @@ mod tests {
             let request = decode_list_offsets(&mut d, version).unwrap();
             d.expect_consumed("listOffsets").unwrap();
             assert_eq!(request.topics[0].partitions[0].timestamp, TIMESTAMP_LATEST);
+            assert_eq!(
+                request.topics[0].partitions[0].current_leader_epoch,
+                if version >= 4 { 5 } else { -1 },
+                "v{version}"
+            );
 
             let mut out = Encoder::new();
             encode_list_offsets(

@@ -229,6 +229,11 @@ pub enum ErrorCode {
     OffsetOutOfRange = 1,
     CorruptMessage = 2,
     UnknownTopicOrPartition = 3,
+    /// The partition exists and has no leader this node can name right now
+    /// (#751): a candidate that does not hold the range and has not read who
+    /// does. A client retries its metadata, which is what finds the holder
+    /// once the lease names one.
+    LeaderNotAvailable = 5,
     NotLeaderOrFollower = 6,
     RequestTimedOut = 7,
     /// The external cluster (or this node's Kafka listener) could not be
@@ -281,6 +286,14 @@ pub enum ErrorCode {
     MemberIdRequired = 79,
     /// One member over the group's cap.
     GroupMaxSizeReached = 84,
+    /// A request carrying a leader epoch older than the one this node holds
+    /// the range at (#751): the client's metadata is behind a failover. It
+    /// refreshes and finds the new leader; this node never answers it.
+    FencedLeaderEpoch = 74,
+    /// A request carrying a leader epoch newer than the one this node holds
+    /// the range at (#751): this node is the stale one. The client refreshes
+    /// its metadata, as it does for a fenced epoch.
+    UnknownLeaderEpoch = 75,
     /// A request the gateway cannot answer whole: an OffsetFetch naming no
     /// topics for a group that has committed more partitions than one answer
     /// carries — the client names the partitions it wants.
@@ -301,6 +314,7 @@ impl ErrorCode {
             1 => Self::OffsetOutOfRange,
             2 => Self::CorruptMessage,
             3 => Self::UnknownTopicOrPartition,
+            5 => Self::LeaderNotAvailable,
             6 => Self::NotLeaderOrFollower,
             7 => Self::RequestTimedOut,
             8 => Self::BrokerNotAvailable,
@@ -321,6 +335,8 @@ impl ErrorCode {
             46 => Self::DuplicateSequenceNumber,
             47 => Self::InvalidProducerEpoch,
             56 => Self::KafkaStorageError,
+            74 => Self::FencedLeaderEpoch,
+            75 => Self::UnknownLeaderEpoch,
             76 => Self::UnsupportedCompressionType,
             79 => Self::MemberIdRequired,
             84 => Self::GroupMaxSizeReached,

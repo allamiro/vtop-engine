@@ -194,6 +194,13 @@ with an endpoint set.
   anything that can reach the port and knows that UUID may produce and
   consume); a plaintext admin plane refuses an enforcing
   `admin_authorization`, since there is no CN to match.
+- The Helm chart renders `admin_authorization` by default (#732): only the
+  certificate CNs in `meta.adminAuthorization.operatorCommonNames` may run
+  cluster-scoped admin commands, and the chart refuses to render with the
+  policy on and no operator named rather than fall back to an open admin
+  plane. `meta.adminAuthorization.enabled: false` is the lab opt-out, warned
+  about in the install notes; a hand-written node config without the block is
+  still authenticate-only and warns at startup.
 - Certificate validity alone does not grant a role. The embedding deployment
   **MUST** supply a `SessionAuthorizer` that binds the peer certificate chain,
   declared principal ID, and requested producer/consumer role. Produce requests
@@ -226,6 +233,24 @@ with an endpoint set.
   authentication, confidentiality, and active-tamper protection.
 - Session count, global in-flight work, negotiated record/frame limits, idle
   timeouts, and fetch-response byte credit are explicit resource boundaries.
+- Every cluster listener caps its concurrent connections (#732). The native
+  plane caps sessions; the metadata peer and admin listeners and the replica
+  listener cap connections with `max_peer_connections` (default 256),
+  `max_admin_connections` (default 1024) and `max_replica_connections`
+  (default 256) in the node config. A connection over the cap is closed at
+  accept, before its TLS handshake, so a client holding a CA-signed
+  certificate (or anything that reaches a plaintext plane) cannot open
+  connections until the node runs out of descriptors or memory. A connection
+  holds its slot from accept, so it has 10 s from accept to its first request
+  (dialect check, TLS handshake and first frame); one that misses that is
+  closed, and a client with no certificate cannot keep slots by opening
+  sockets and sending nothing. Each refusal is counted in
+  `vtop_listener_connections_refused_total{plane,reason}` (`capacity` or
+  `handshake_timeout`) and named in a rate-limited WARN. A cap bounds how many
+  connections there are, not who holds them: a flood can still take every
+  slot and keep legitimate peers out while it lasts, and an authenticated
+  client that sends its first request may hold its slot while it stays
+  connected. The counter and the WARN make both visible.
 - The observability endpoint (`/metrics`, `/healthz`, `/readyz`) **MAY** be
   served over TLS 1.3 (#294 slice 4): `observability.tls` in a node config, or
   `VTOP_METRICS_TLS_CERT`/`_KEY` for the engine. Server-only by default so
@@ -732,6 +757,10 @@ Resource exhaustion controls are part of the security boundary:
   exceed it fail without advancing source progress.
 - Compression streams directly to the staging file instead of holding both an
   uncompressed aggregate and compressed aggregate in memory.
+- The metadata peer and admin listeners and the replica listener hold at
+  most `max_peer_connections`, `max_admin_connections` and
+  `max_replica_connections` connections at once (#732); the native plane
+  caps its sessions. See "Native broker transport" in §2.
 - Successfully processed staging objects/manifests are removed immediately.
   Crash-left VTOP artifacts are removed after `engine.work_retention_seconds`,
   with `engine.work_max_bytes` enforcing an oldest-first aggregate ceiling on
@@ -1066,11 +1095,11 @@ the rows in §17.7 that say "every plane" apply to all four.
 | ID | Threat | Control | Test or CI check | Residual risk |
 |----|--------|---------|------------------|---------------|
 | M1 | A host with a certificate joins the Raft group as another node, or spoofs a vote or a version request | `crates/vtop-meta/src/transport/tls.rs::assert_peer_identity` binds the certificate's CN to the claimed sender | `crates/vtop-meta/src/transport/peer.rs::mtls_rejects_wrong_peer_cn`, `crates/vtop-meta/src/transport/peer.rs::mtls_rejects_vote_sender_spoof`, `crates/vtop-meta/src/transport/peer.rs::mtls_refuses_a_version_request_from_a_spoofed_sender` | Every node's certificate comes from one CA: a compromised CA key, or a stolen node key, is a node. |
-| M2 | A certificate-holding data node, or any client, rewrites cluster membership or grants a range lease to an arbitrary holder | `crates/vtop-meta/src/transport/authz.rs::AdminAuthorizer`: reads for any authenticated client, a node's own lease commands for that node, everything cluster-scoped for named operators | `crates/vtop-meta/src/transport/admin.rs::a_node_may_not_change_membership_over_the_wire`, `crates/vtop-meta/src/transport/admin.rs::a_node_may_not_drive_another_nodes_lease_over_the_wire`, `scripts/live-chaos/scenarios/11-admin-authorization.sh` | Opt-in. Without `admin_authorization` every certificate the CA signed is an operator and the node only warns at startup (test `an_unconfigured_endpoint_still_permits_everything` documents it). The Helm chart renders the policy only when `meta.adminAuthorization.enabled` is true, and it defaults to false (`helm/vtop/values.yaml::adminAuthorization`). In review, PR #864: the chart turns the policy on by default and refuses to render with no operator named; PR #870 (on #850's feature level 9) lets a data node release its own lease under the policy, which today it cannot, so its lease lapses on its deadline. |
+| M2 | A certificate-holding data node, or any client, rewrites cluster membership or grants a range lease to an arbitrary holder | `crates/vtop-meta/src/transport/authz.rs::AdminAuthorizer`: reads for any authenticated client, a node's own lease commands for that node, everything cluster-scoped for named operators | `crates/vtop-meta/src/transport/admin.rs::a_node_may_not_change_membership_over_the_wire`, `crates/vtop-meta/src/transport/admin.rs::a_node_may_not_drive_another_nodes_lease_over_the_wire`, `scripts/live-chaos/scenarios/11-admin-authorization.sh` | On by default in the Helm chart only. A hand-written node config without `admin_authorization` makes every certificate the CA signed an operator, and the node only warns at startup (test `an_unconfigured_endpoint_still_permits_everything` documents it). The chart renders the policy unless `meta.adminAuthorization.enabled` is false, the lab opt-out, and refuses to render with the policy on and no operator named (`helm/vtop/values.yaml::adminAuthorization`, #864). A data node releases its own lease under the policy only from metadata feature level 9 (#870); below it the release is refused and the lease lapses on its deadline. |
 | M3 | A plaintext admin plane is reachable, so anyone who reaches it runs `meta init`, membership and lease commands | `crates/vtop-meta/src/transport/admin.rs::plaintext_on_any_interface` is the only way off loopback; an enforcing policy on plaintext is refused because no CN exists to match | `crates/vtop-meta/src/transport/admin.rs::a_plaintext_admin_endpoint_refuses_a_routable_address`, `crates/vtop-meta/src/transport/admin.rs::a_plaintext_admin_endpoint_refuses_a_policy_it_could_not_enforce` | On loopback, or after the named opt-in, plaintext admin is unauthenticated: the node warns every start. |
 | M4 | A plaintext peer plane lets any host that can reach it join the Raft group as any node id | `crates/vtop-meta/src/transport/peer.rs::plaintext_on_any_interface` is the only way off loopback | `crates/vtop-meta/src/transport/peer.rs::plaintext_refuses_a_non_loopback_bind`, `crates/vtop-meta/src/transport/peer.rs::plaintext_cannot_detect_a_spoofed_vote_sender` | The second test records the limit: on a plaintext peer plane the sender is self-asserted and membership rests on network isolation. |
 | M5 | A malformed or oversized admin or peer frame exhausts or crashes a metadata node | `crates/vtop-meta/src/transport/wire.rs::MAX_FRAME_BYTES` and the per-field bounds in the same file | `crates/vtop-meta/src/transport/wire.rs::a_placement_response_claiming_an_absurd_replica_count_is_refused`, `crates/vtop-meta/src/transport/wire.rs::the_committed_fuzz_seeds_decode`, `fuzz/fuzz_targets/vtpm_frame.rs`, `.github/workflows/ci.yml::fuzz smoke (every target)` | The bounds are per frame. Concurrent connections are M6. |
-| M6 | A client with a valid certificate opens connections to the peer or admin plane without limit | GAP: neither plane's server (`crates/vtop-meta/src/transport/peer.rs`, `crates/vtop-meta/src/transport/admin.rs`) caps concurrent connections. In review, PR #862: a cap per listener (`max_peer_connections`, default 256; `max_admin_connections`, default 1024), closing the connection over it at accept, plus a 10 s deadline from accept to the first request so silent sockets cannot hold the slots; both counted on `vtop_listener_connections_refused_total` | GAP: nothing tests a connection flood on these planes. In review, PR #862: a cap-of-one test and a silent-connection test on each server | Each connection is a task; the handshake and frame bounds limit what one connection costs, not how many there are. With PR #862, a flood can still take every slot while it lasts, and an authenticated client that sends its first request may hold a slot while connected. |
+| M6 | A client with a valid certificate opens connections to the peer or admin plane without limit | `crates/vtop-meta/src/transport/limit.rs::ConnectionLimit` caps each listener (`max_peer_connections`, default 256; `max_admin_connections`, default 1024; `crates/vtop-node/src/config.rs::check_connection_cap`), closes the connection over the cap at accept, before its TLS handshake, and closes one that sends no request within 10 s of accept (`DEFAULT_HANDSHAKE_DEADLINE`); both are counted on `vtop_listener_connections_refused_total{plane,reason}` (`crates/vtop-node/src/observe.rs::ConnectionLimitCollector`) and named in a rate-limited WARN | `crates/vtop-meta/src/transport/peer.rs::a_peer_connection_over_the_cap_is_closed_and_counted`, `crates/vtop-meta/src/transport/peer.rs::a_silent_peer_connection_is_closed_at_the_handshake_deadline`, `crates/vtop-meta/src/transport/admin.rs::an_admin_connection_over_the_cap_is_closed_and_counted`, `crates/vtop-meta/src/transport/admin.rs::a_silent_admin_connection_is_closed_at_the_handshake_deadline`, `crates/vtop-meta/src/transport/limit.rs::the_connection_over_the_cap_is_refused_and_counted_and_a_freed_slot_is_reused` | A cap bounds how many connections there are, not who holds them: a flood can still take every slot while it lasts, and an authenticated client that sends its first request may hold a slot while connected. The counter and the WARN make both visible. |
 
 ### 17.4 Cluster plane: replica plane
 
@@ -1082,7 +1111,7 @@ the rows in §17.7 that say "every plane" apply to all four.
 | R4 | A peer fences a replica to an epoch metadata never granted, parking it in permanent refusal | `crates/vtop-broker/src/replication/mod.rs::fn fence` refuses an epoch above the granted one | `crates/vtop-broker/tests/replica_fencing.rs::a_fence_above_the_granted_epoch_is_refused` | Needs a reachable replica port and a certificate (or a plaintext plane, R1). |
 | R5 | A frame is corrupted or forged in flight, or announces a length that exhausts memory before it is read | `crates/vtop-protocol/src/lib.rs::decode_frame` checks the BLAKE3 checksum and the length bound before allocating | `crates/vtop-protocol/src/lib.rs::rejects_corruption_trailing_bytes_and_oversized_lengths_before_allocation`, `fuzz/fuzz_targets/protocol_frame.rs`, `.github/workflows/ci.yml::fuzz smoke (every target)` | The checksum is unkeyed framing integrity. Authenticity is TLS's; a plaintext plane has none. |
 | R6 | A slow or flooding replica holds leader memory | `crates/vtop-broker/src/memory_budget.rs::MemoryBudgetPool` bounds in-flight and catch-up bytes per follower | `crates/vtop-broker/tests/memory_budget.rs::follower_budget_bounds_slow_replica_inflight`, `crates/vtop-broker/tests/memory_budget.rs::producer_flood_stays_bounded_and_rejects_retryably` | A budget refusal is retryable. The bound is on memory held, not on how many peers connect (R7). |
-| R7 | A peer with a valid certificate opens connections to the replica plane without limit | GAP: `crates/vtop-broker/src/replication/network.rs` caps neither sessions nor connections, unlike the native plane's `max_sessions`. In review, PR #862: `max_replica_connections` (default 256) and the same handshake deadline, counted on `vtop_listener_connections_refused_total` | GAP: nothing tests a connection flood on the replica plane. In review, PR #862: a cap-of-one test and a silent-connection test on the replica server | As M6. |
+| R7 | A peer with a valid certificate opens connections to the replica plane without limit | `crates/vtop-meta/src/transport/limit.rs::ConnectionLimit` on the replica listener (`crates/vtop-broker/src/replication/network.rs::with_max_connections`; `max_replica_connections`, default 256), with the same accept-time refusal and 10 s handshake deadline, counted on `vtop_listener_connections_refused_total` | `crates/vtop-broker/src/replication/network.rs::a_replica_connection_over_the_cap_is_closed_and_counted` (the cap of one, then a silent connection closed at its deadline) | As M6. |
 
 ### 17.5 Cluster plane: native produce and fetch
 
@@ -1138,9 +1167,7 @@ Each row below is a cell marked GAP above. Closing one means adding the control 
 | A14 | both | A startup probe or a documented least-privilege policy test against the engine's actual calls; today the scope is storage-side IAM. |
 | A23 | test | A check that every `uses:` in `.github/workflows` carries a 40-character SHA. |
 | A24 | test | A chart test that renders the pod and asserts the non-root, read-only and capability settings. |
-| M6 | both | A connection cap on the peer and admin servers, with a test that the connection over the cap is refused and counted. In review, PR #862. |
 | R2 | test | A `vtop-node` test that a TLS peer outside the followers and `transfer_peers` is refused a transfer. |
-| R7 | both | A session cap on the replica server, as the native plane has, with a test. In review, PR #862. |
 | N5 | test | A broker test that opens `max_sessions + 1` sessions and sees the last refused and counted. |
 | K2 | both | A Kafka-side authentication and authorization design (TLS, SASL, ACLs) for the gateway; until then the control is the loopback default and a network policy. |
 | K5 | test | A gateway test with a short `idle_timeout` and a silent session. |

@@ -4095,6 +4095,7 @@ version = "0.10.4"
 dependencies = [
  "async-trait",
  "flate2",
+ "rdkafka",
  "sha2 0.11.1",
  "tempfile",
  "thiserror 2.0.21",
