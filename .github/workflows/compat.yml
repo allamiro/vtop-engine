@@ -37,6 +37,8 @@ on:
       - 'scripts/compat/**'
       - 'scripts/manifest-compat.sh'
       - 'scripts/ledger-compat.sh'
+      - 'scripts/upgrade-compat.sh'
+      - 'scripts/live-chaos/gen-certs.sh'
       - '.github/workflows/compat.yml'
   push:
     branches: [main]
@@ -49,6 +51,8 @@ on:
       - 'scripts/compat/**'
       - 'scripts/manifest-compat.sh'
       - 'scripts/ledger-compat.sh'
+      - 'scripts/upgrade-compat.sh'
+      - 'scripts/live-chaos/gen-certs.sh'
       - '.github/workflows/compat.yml'
   schedule:
     - cron: '23 4 * * *'
@@ -134,12 +138,20 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-compat-head-${{ hashFiles('**/Cargo.lock') }}
+      # With the `postgres` feature (the published archives do not have it):
+      # the ledger-postgres cell needs it of both binaries, and the other
+      # cells run the same code on SQLite.
       - name: Build vtopctl
-        run: cargo build -p vtop-cli --no-default-features --bin vtopctl --locked
+        run: cargo build -p vtop-cli --no-default-features --features postgres --bin vtopctl --locked
+      # The segments cell opens a released node's directory with this build's.
+      - name: Build vtop-node
+        run: cargo build -p vtop-node --bin vtop-node --locked
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: compat-head-bin
-          path: target/debug/vtopctl
+          path: |
+            target/debug/vtopctl
+            target/debug/vtop-node
           if-no-files-found: error
           retention-days: 3
 
@@ -157,7 +169,7 @@ jobs:
         with:
           name: compat-head-bin
           path: head
-      - run: chmod +x head/vtopctl
+      - run: chmod +x head/vtopctl head/vtop-node
       # cosign v3: releases are signed in the new Sigstore bundle format,
       # which cosign v2 cannot read (fetch-release.sh refuses a v2). Pinned
       # here rather than left to the installer's default.
@@ -172,6 +184,7 @@ jobs:
           key: compat-release-${{ matrix.tag }}-${{ env.COMPAT_TARGET }}
       - name: Fetch and check the released binaries
         id: fetch
+        if: matrix.source == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ matrix.tag }}
@@ -179,6 +192,34 @@ jobs:
           set -euo pipefail
           dir="$(scripts/compat/fetch-release.sh "$TAG" released "$COMPAT_TARGET")"
           echo "dir=$dir" >> "$GITHUB_OUTPUT"
+      # A cell whose old binary needs the `postgres` feature builds the
+      # release's tag from source with it: the published archives lack it.
+      # The tag is this repository's own, built with its own lockfile.
+      - name: Build the release's tag with the postgres feature
+        id: build-tag
+        if: matrix.source == 'build'
+        env:
+          TAG: ${{ matrix.tag }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth 1 origin "refs/tags/$TAG:refs/tags/$TAG"
+          git worktree add "$RUNNER_TEMP/old" "$TAG"
+          (cd "$RUNNER_TEMP/old" && cargo build -p vtop-cli --no-default-features --features postgres --bin vtopctl --locked)
+          mkdir -p "$RUNNER_TEMP/old-bin"
+          cp "$RUNNER_TEMP/old/target/debug/vtopctl" "$RUNNER_TEMP/old-bin/"
+          echo "dir=$RUNNER_TEMP/old-bin" >> "$GITHUB_OUTPUT"
+      - name: Start a throwaway PostgreSQL
+        if: matrix.cell == 'ledger-postgres'
+        run: |
+          set -euo pipefail
+          docker run -d --name vtop-compat-pg -e POSTGRES_PASSWORD=compat -p 127.0.0.1:5432:5432 \
+            postgres:16@sha256:63e83b5a3dc36a917dccb76fe1bd2ac51f1ec9c1deb47ff20d4f04233bf6eae9
+          for _ in $(seq 1 60); do
+            docker exec vtop-compat-pg pg_isready -U postgres -h 127.0.0.1 && exit 0
+            sleep 1
+          done
+          docker logs vtop-compat-pg
+          exit 1
       - name: Run the cell
         env:
           CELL: ${{ matrix.cell }}
@@ -186,7 +227,9 @@ jobs:
           DIRECTION: ${{ matrix.direction }}
           EXPECT: ${{ matrix.expect }}
           MESSAGE: ${{ matrix.message }}
-          RELEASED: ${{ steps.fetch.outputs.dir }}
+          RELEASED: ${{ steps.fetch.outputs.dir || steps.build-tag.outputs.dir }}
+          LEDGER_POSTGRES_URL: postgres://postgres:compat@127.0.0.1:5432
+          PSQL: docker exec -i vtop-compat-pg psql
         run: |
           COMPAT_WORKDIR="$GITHUB_WORKSPACE/compat-work" \
             scripts/compat/cell.sh "$CELL" "$TAG" "$DIRECTION" "$EXPECT" "$RELEASED" head "$MESSAGE"
@@ -214,7 +257,10 @@ jobs:
         if: failure()
         with:
           name: compat-logs-${{ matrix.cell }}-${{ matrix.direction }}-${{ matrix.tag }}
-          path: compat-work/logs
+          path: |
+            compat-work/logs
+            compat-work/*/logs
+            compat-work/*/ledger-compat/logs
           if-no-files-found: ignore
           retention-days: 7
 

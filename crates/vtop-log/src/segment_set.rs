@@ -1276,7 +1276,7 @@ impl SegmentSet {
         let sealed_bytes: u64 = self
             .sealed
             .iter()
-            .map(|reader| reader.manifest().content_bytes)
+            .map(|reader| reader.content_bytes())
             .sum();
         let total = sealed_bytes + self.tail().content_bytes();
         if total <= policy.max_total_bytes {
@@ -1294,7 +1294,7 @@ impl SegmentSet {
             if reader.next_offset() > floor {
                 break;
             }
-            bytes_removed += reader.manifest().content_bytes;
+            bytes_removed += reader.content_bytes();
             cut += 1;
         }
         let retained_bytes = total - bytes_removed;
@@ -3175,6 +3175,68 @@ mod tests {
         SegmentSet::open_in(&Env::real(), dir.path())
             .unwrap()
             .expect("a retained range must still open");
+    }
+
+    /// Retention over a rolled v2 range (#727): the pass reads each sealed
+    /// segment's size through the format-independent accessor. It used the
+    /// v1 manifest's, which panics on a v2 segment, so a v2 range with
+    /// retention on panicked on its first pass once it had a sealed segment.
+    #[test]
+    fn retention_reclaims_a_rolled_v2_range() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(44);
+        let mut set = SegmentSet::create_v2_in(
+            &Env::real(),
+            directory.path(),
+            crate::SegmentDescriptorV2 {
+                segment_id: Uuid::from_u128(8),
+                topic: "events.v1".to_owned(),
+                topic_epoch: 1,
+                lineage: RangeLineage::root(Uuid::from_u128(101)),
+                base_offset: 0,
+                segment_generation: 0,
+                creation_node_id: Uuid::from_u128(0xA1),
+                creation_fencing_epoch: 1,
+            },
+            crate::SegmentConfigV2 {
+                max_record_bytes: 256,
+                max_group_bytes: 1024,
+                max_segment_bytes: 4096,
+                max_segment_records: 8,
+                index_stride: 2,
+                chunk_size: 64 * 1024,
+            },
+        )
+        .unwrap();
+        for sequence in 0..40 {
+            set.append_group(
+                &[record(producer, sequence)],
+                Durability::Fsync,
+                Uuid::from_u128(13_000 + sequence as u128),
+            )
+            .unwrap();
+        }
+        let before = set.sealed().len();
+        assert!(before >= 2, "the range rolled: {before} sealed segments");
+        let next_offset = set.next_offset();
+
+        let outcome = set
+            .retain(
+                &RetentionPolicy {
+                    max_total_bytes: 600,
+                },
+                next_offset,
+            )
+            .expect("retention over a v2 range must succeed");
+
+        assert!(outcome.segments_removed >= 1, "{outcome:?}");
+        assert_eq!(set.sealed().len(), before - outcome.segments_removed);
+        let new_base = set.base_offset();
+        assert!(new_base > 0, "the front moved");
+        let batch = set
+            .fetch_through(new_base, 1 << 20, 10_000, next_offset)
+            .unwrap();
+        assert_eq!(batch.records.len() as u64, next_offset - new_base);
     }
 
     /// Data the quorum has not acknowledged is not reclaimable disk. A floor

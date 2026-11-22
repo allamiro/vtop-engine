@@ -96,6 +96,11 @@ shows how to mint them (ECDSA P-256).
     client_key: operator-key.pem
     ```
 
+    The Common Name of `operator.pem` must be in
+    `meta.adminAuthorization.operatorCommonNames`. Admin authorization is on
+    by default since v0.11.0, and the chart refuses to render without an
+    operator named ([chart README](../../helm/vtop/README.md#admin-authorization-on-by-default-732)).
+
 4. **Under `replicated`, register the topic, range and nodes.** Every pod
    stays not ready until they exist, which is expected. The chart's
    post-install notes print the exact commands for your values:
