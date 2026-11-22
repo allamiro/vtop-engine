@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
 
 [[bin]]
 name = "vtop-node"
@@ -32,8 +33,11 @@ vtop-meta = { workspace = true }
 vtop-observe = { workspace = true }
 vtop-kafka = { workspace = true }
 vtop-protocol = { workspace = true }
+vtop-surface = { workspace = true }
 
 [dev-dependencies]
+# The command-tree half of the surface snapshot (#719).
+vtop-surface = { workspace = true, features = ["clap"] }
 tempfile = { workspace = true }
 # Only for the promotion-probe test: building a ReplicaStatusClient needs real
 # TLS material even when the point of the test is that the connection fails.

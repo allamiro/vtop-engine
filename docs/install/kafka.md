@@ -9,8 +9,9 @@ against, what "tested" covers, and what is not tested.
 - **Apache Kafka 3.7 to 4.4**, KRaft, every release line in the table below.
   The oldest, 3.7, is the first release the official `apache/kafka` image
   exists for.
-- **Listeners:** PLAINTEXT, TLS (`security_protocol: SSL`) and SASL over
-  either, with the mechanisms PLAIN, SCRAM-SHA-256 and SCRAM-SHA-512.
+- **Listeners:** PLAINTEXT, TLS (`security_protocol: SSL`), TLS with a
+  client certificate (mutual TLS), and SASL over PLAINTEXT or TLS, with the
+  mechanisms PLAIN, SCRAM-SHA-256 and SCRAM-SHA-512.
 - **One broker that is not Apache Kafka:** Redpanda, smoke-tested (see
   below).
 
@@ -41,7 +42,8 @@ release it is named for.
 
 Other patch releases of these lines are expected to behave the same and are
 not run. A pull request that changes the workflow or `scripts/kafka-broker.sh`
-runs every release in the table before it merges.
+runs every release in the table (plaintext) before it merges, and the oldest
+and newest releases through every listener below.
 
 ## Authentication and encryption
 
@@ -49,12 +51,15 @@ The same suite runs through each of these listeners, on the release named in
 the second column, and each leg also runs the refusal tests of
 `tests/integration_kafka_auth.rs`. A leg is one broker with one listener; the
 broker is started by `scripts/kafka-broker.sh`, which also creates the user
-(`vtop`) and, for TLS, a CA and a server certificate for `localhost`.
+(`vtop`) and, for TLS, a CA and a server certificate for `localhost` (and,
+for mutual TLS, a client certificate that CA signed and one another CA
+signed).
 
 | Listener (`security_protocol`) | `sasl_mechanism` | Releases | Refusal tests |
 |---|---|---|---|
 | `PLAINTEXT` | none | every release | none: there is nothing to refuse |
 | `SSL` | none | every release | no CA, another CA, a plaintext client |
+| `SSL`, client certificate required | none | 3.7.2 and 4.4.0 | the TLS ones, no client certificate, a client certificate another CA signed |
 | `SASL_SSL` | `SCRAM-SHA-512` | every release | the SASL ones of the rows below, and the TLS ones |
 | `SASL_PLAINTEXT` | `PLAIN` | 3.7.2 and 4.4.0 | wrong password, unknown user, no credentials, a client with no SASL |
 | `SASL_PLAINTEXT` | `SCRAM-SHA-256` | 3.7.2 and 4.4.0 | the same |
@@ -68,17 +73,34 @@ and on dispatch, never on an ordinary pull request.
 
 The legs' client settings are exactly the `sources.kafka` settings
 (`security_protocol`, `sasl_mechanism`, `sasl_username`, `sasl_password_env`,
-`ssl_ca_location`), set through `VTOP_TEST_KAFKA_*` environment variables read
+`ssl_ca_location`, `ssl_certificate_location`, `ssl_key_location`), set through `VTOP_TEST_KAFKA_*` environment variables read
 by the test config (`tests/kafka_broker_env.rs`).
 
-## Mutual TLS is not supported
+## Mutual TLS
 
-`sources.kafka` can verify the broker (`ssl_ca_location`) and can log in with
-SASL, but it has no setting for a client certificate or a client key, so the
-engine cannot present one, so a listener that requires client certificates
-(`ssl.client.auth=required`) cannot be used with it. This is a documented
-limitation and is not tested: the legs use `ssl.client.auth=none`. Use a
-listener that does not require them, with SASL for the client's identity.
+A listener that requires client certificates (`ssl.client.auth=required`)
+takes a certificate and its key:
+
+```yaml
+sources:
+  kafka:
+    security_protocol: SSL          # or SASL_SSL
+    ssl_ca_location: /etc/vtop/kafka/ca.pem
+    ssl_certificate_location: /etc/vtop/kafka/client.pem
+    ssl_key_location: /etc/vtop/kafka/client.key
+    # ssl_key_password_env: VTOP_KAFKA_KEY_PASSWORD   # for an encrypted key
+```
+
+Both files are PEM. The certificate and the key are set together, and only
+with `SSL` or `SASL_SSL`; anything else is refused when the config loads,
+naming the keys. A key passphrase is read from the environment variable
+`ssl_key_password_env` names, never from the file. Keep the key readable by
+the engine's user only. An engine older than this setting ignores the keys
+and connects without a certificate, which such a listener refuses.
+
+The `mtls` legs above run the whole suite presenting the certificate, and
+check that the broker refuses a client with none and one whose certificate
+another CA signed.
 
 ## A three-broker cluster
 
@@ -117,7 +139,6 @@ tested and nothing here is claimed for them.
 - **Clusters larger than three brokers, and other failures.** The cluster
   job below stops one node at a time, in an orderly way; a crash, a network
   partition and a rolling upgrade are not exercised.
-- **Mutual TLS.** See above.
 - **SASL OAUTHBEARER and delegation tokens.** Not tested.
 - **Kerberos (SASL GSSAPI).** Needs a build with `--features kafka-gssapi`
   ([from-source.md](from-source.md)) and is not tested.
