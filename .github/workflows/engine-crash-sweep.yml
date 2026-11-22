@@ -6,13 +6,33 @@ name: engine crash sweep
 # verified (#725). The harness is scripts/live-chaos/engine/run-sweep.sh.
 #
 # Three tiers, so a pull request does not pay for the full sweep:
-#   schedule           every point, nightly at 06:37 UTC (after the fuzz
-#                      nightly at 02:37)
-#   workflow_dispatch  every point, or the ones named
-#   pull_request       the five commit-boundary points, and only when the
-#                      engine, the ledger, the upload path, the adapters or
-#                      the harness change (55 s measured locally, after
-#                      the build)
+#   schedule           every point on every leg, nightly at 06:37 UTC (after
+#                      the fuzz nightly at 02:37)
+#   workflow_dispatch  every point, or the ones named, on every leg or the
+#                      ones named
+#   pull_request       the five commit-boundary points on the SQLite + Kafka
+#                      leg, and only when the engine, the ledger, the upload
+#                      path, the adapters or the harness change (55 s
+#                      measured locally, after the build); on every leg when
+#                      this file changes
+#
+# The legs (issue 725: "SQLite and PostgreSQL, Kafka and file sources, and
+# with a store outage and ENOSPC"). Each is the same script with different
+# knobs, so each is held to the same invariants:
+#   sqlite-kafka               the baseline, and the only leg a pull request runs
+#   postgres-kafka             the ledger is a PostgreSQL database
+#   sqlite-file                the source is a file; the commit rule is read
+#                              from the ledger's cursor
+#   sqlite-spool               the source is a syslog spool file, read by the
+#                              spool source; as sqlite-file otherwise
+#   sqlite-kafka-store-outage  MinIO is stopped while the engine runs towards
+#                              each failpoint
+#   sqlite-kafka-enospc        the engine's work directory is a full tmpfs
+#                              while it runs towards each failpoint
+#   postgres-kafka-host-loss   the kill takes the engine's host (#739): its
+#                              work directory is deleted and a standby with
+#                              a new one recovers on the same PostgreSQL
+#                              ledger, Kafka group and store
 # A scheduled workflow runs only from the default branch, so the nightly
 # itself is first proven on main; a pull request proves the same job with
 # fewer points.
@@ -35,6 +55,10 @@ on:
         description: "records produced for each point"
         required: false
         default: "50"
+      legs:
+        description: "all, or comma-separated legs: sqlite-kafka, postgres-kafka, sqlite-file, sqlite-spool, sqlite-kafka-store-outage, sqlite-kafka-enospc, postgres-kafka-host-loss"
+        required: false
+        default: all
   pull_request:
 
 permissions:
@@ -47,6 +71,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # The PostgreSQL 18 image postgres-matrix.yml pins (its list is the one
+  # place the pins are refreshed; this is the newest major's line, kept in
+  # step by hand).
+  POSTGRES_IMAGE: postgres:18@sha256:b9f6b8ff03b62f3cfd9d9ba3fe56226a9991c79d3fb46fd46536263bf02be553
 
 jobs:
   changes:
@@ -59,6 +87,7 @@ jobs:
     outputs:
       sweep: ${{ steps.filter.outputs.sweep }}
       absent: ${{ steps.filter.outputs.absent }}
+      legs: ${{ steps.legs.outputs.legs }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
@@ -79,6 +108,8 @@ jobs:
               - 'crates/vtop-adapters/**'
               - 'docker/minio/**'
               - 'docker-compose.yml'
+            workflow:
+              - '.github/workflows/engine-crash-sweep.yml'
             absent:
               - '.github/workflows/engine-crash-sweep.yml'
               - 'scripts/check-failpoints-absent.sh'
@@ -86,6 +117,53 @@ jobs:
               - 'crates/*/Cargo.toml'
               - '.github/workflows/release.yml'
               - 'docker/Dockerfile'
+      # Which legs this run has: the baseline for a pull request, except that
+      # a pull request which changes this workflow runs every leg on its own
+      # head (the schedule and dispatch run only from main, so this is the
+      # one way a changed leg is proven before it merges); every leg nightly;
+      # and on dispatch the ones the input names (a name nobody defined is an
+      # error, so a typo does not run nothing and pass).
+      - name: Choose the legs
+        id: legs
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_LEGS: ${{ inputs.legs }}
+          WORKFLOW_CHANGED: ${{ steps.filter.outputs.workflow }}
+        run: |
+          set -euo pipefail
+          all='[
+            {"name":"sqlite-kafka","backend":"sqlite","source":"kafka","fault":"none","features":"failpoints","primary":true},
+            {"name":"postgres-kafka","backend":"postgres","source":"kafka","fault":"none","features":"failpoints,postgres","primary":false},
+            {"name":"sqlite-file","backend":"sqlite","source":"file","fault":"none","features":"failpoints","primary":false},
+            {"name":"sqlite-spool","backend":"sqlite","source":"syslog_spool","fault":"none","features":"failpoints","primary":false},
+            {"name":"sqlite-kafka-store-outage","backend":"sqlite","source":"kafka","fault":"store_outage","features":"failpoints","primary":false},
+            {"name":"sqlite-kafka-enospc","backend":"sqlite","source":"kafka","fault":"enospc","features":"failpoints","primary":false},
+            {"name":"postgres-kafka-host-loss","backend":"postgres","source":"kafka","fault":"host_loss","features":"failpoints,postgres","primary":false}
+          ]'
+          case "$EVENT" in
+            pull_request)
+              if [ "$WORKFLOW_CHANGED" = true ]; then
+                legs=$(jq -c . <<< "$all")
+              else
+                legs=$(jq -c '[.[] | select(.primary)]' <<< "$all")
+              fi ;;
+            workflow_dispatch)
+              want="${INPUT_LEGS:-all}"
+              if [ "$want" = all ]; then
+                legs=$(jq -c . <<< "$all")
+              else
+                legs=$(jq -c --arg want "$want" '[.[] | select(.name as $n | ($want | split(",") | index($n)))]' <<< "$all")
+                # Every name asked for must be a leg.
+                for name in $(tr ',' ' ' <<< "$want"); do
+                  jq -e --arg n "$name" 'map(.name) | index($n)' <<< "$all" > /dev/null \
+                    || { echo "::error::no leg named '$name'; legs: $(jq -r 'map(.name) | join(", ")' <<< "$all")"; exit 1; }
+                done
+              fi ;;
+            *)
+              legs=$(jq -c . <<< "$all") ;;
+          esac
+          echo "legs: $legs"
+          echo "legs=$legs" >> "$GITHUB_OUTPUT"
 
   failpoints-absent:
     name: failpoints absent from release builds
@@ -102,11 +180,16 @@ jobs:
         run: bash scripts/check-failpoints-absent.sh
 
   sweep:
-    name: engine crash sweep (real Kafka, MinIO)
+    name: engine crash sweep (real Kafka, MinIO) (${{ matrix.name }})
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.sweep == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      # One leg failing must not hide the result of another.
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.changes.outputs.legs) }}
     services:
       # As the kafka-integration job in ci.yml runs it: the same pinned image,
       # advertising localhost so the engine on the runner reaches it.
@@ -159,21 +242,26 @@ jobs:
             cmake clang libssl-dev libsasl2-dev libcurl4-openssl-dev zlib1g-dev pkg-config
 
       - name: The harness checks (unit tests)
+        if: matrix.primary
         run: python3 -m unittest discover -s scripts/live-chaos/engine -p 'test_*.py' -v
 
       # The workspace clippy in ci.yml builds without the feature, so the
       # code behind it (the decorators, the kill) is linted only here.
       - name: Clippy with failpoints (deny warnings)
+        if: matrix.primary
         run: cargo clippy -p vtop-cli --features failpoints --all-targets --locked -- -D warnings
 
       # Every point kills the real binary where it says, with a local file
       # source and store: seconds, and it pins the placement the live sweep
       # relies on.
       - name: Every failpoint fires where it says (in-repo test)
+        if: matrix.primary
         run: cargo test -p vtop-cli --features failpoints --locked --test failpoints
 
       - name: Build vtopctl with failpoints
-        run: cargo build -p vtop-cli --features failpoints --locked --bin vtopctl
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: cargo build -p vtop-cli --features "$FEATURES" --locked --bin vtopctl
 
       # The positive control for the release-binary check in ci.yml's test
       # job: the same search finds the kill in a build that has it.
@@ -203,6 +291,24 @@ jobs:
           set -euo pipefail
           docker compose build minio
           docker compose up -d --wait minio
+
+      # The ledger of the postgres leg. Run by hand, not as a service, so the
+      # legs that do not use it do not start it. psql inside the container is
+      # what the harness reads the ledger with.
+      - name: Start PostgreSQL (the ledger of the postgres leg)
+        if: matrix.backend == 'postgres'
+        run: |
+          set -euo pipefail
+          docker run -d --name sweep-postgres -p 127.0.0.1:5432:5432 \
+            -e POSTGRES_USER=vtop -e POSTGRES_PASSWORD=vtop -e POSTGRES_DB=vtop \
+            "$POSTGRES_IMAGE"
+          for _ in $(seq 1 60); do
+            docker exec sweep-postgres pg_isready -U vtop -d vtop && exit 0
+            sleep 1
+          done
+          echo "::error::PostgreSQL did not become ready in 60 s"
+          docker logs sweep-postgres | tail -n 30
+          exit 1
 
       - name: Choose the points
         id: points
@@ -234,6 +340,10 @@ jobs:
           CHAOS_WORKDIR: ${{ runner.temp }}/engine-sweep
           ENGINE_SWEEP_POINTS: ${{ steps.points.outputs.points }}
           ENGINE_SWEEP_RECORDS: ${{ steps.points.outputs.records }}
+          ENGINE_SWEEP_BACKEND: ${{ matrix.backend }}
+          ENGINE_SWEEP_SOURCE: ${{ matrix.source }}
+          ENGINE_SWEEP_FAULT: ${{ matrix.fault }}
+          ENGINE_SWEEP_PG_CONTAINER: sweep-postgres
           ENGINE_SWEEP_KAFKA_BOOTSTRAP: localhost:9092
           ENGINE_SWEEP_S3_ENDPOINT: http://127.0.0.1:9000
         run: scripts/live-chaos/engine/run-sweep.sh
@@ -242,7 +352,7 @@ jobs:
         if: steps.sweep.outcome == 'failure'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: engine-sweep-logs
+          name: engine-sweep-logs-${{ matrix.name }}
           path: |
             ${{ runner.temp }}/engine-sweep/**/*.log
             ${{ runner.temp }}/engine-sweep/**/*.json
@@ -253,3 +363,7 @@ jobs:
       - name: MinIO logs on failure
         if: failure()
         run: docker compose logs --tail=200 minio || true
+
+      - name: PostgreSQL logs on failure
+        if: failure() && matrix.backend == 'postgres'
+        run: docker logs --tail=200 sweep-postgres || true

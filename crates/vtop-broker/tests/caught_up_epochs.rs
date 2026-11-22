@@ -622,3 +622,263 @@ fn a_refused_append_group_leaves_no_record_filed_outside_the_lineage() {
         "the record at 10 is epoch 20's, as R files it; 21 begins at the tail"
     );
 }
+
+/// #881: a full disk at an epoch-journal write breaks a replica's history
+/// for good, and that used to be silent: the soak's data-1 sat out every
+/// later epoch ("no epoch history this leader can compare") with nothing in
+/// its own log to say why. The refusal is deliberate and unchanged; the
+/// break is now reported.
+///
+/// Invariant: the first failed journal write marks the history broken, says
+/// what happened, what the replica now does and what to do (free space, then
+/// `vtopctl node repair`), and the replica still answers with no history -
+/// even once space is back.
+#[test]
+fn a_full_disk_at_an_epoch_journal_write_breaks_the_history_loudly_and_keeps_refusing() {
+    use vtop_log::sim::{FaultPlan, SimStorage};
+
+    let dir = tempfile::tempdir().unwrap();
+    let meta = MetaFencingEpoch::new(OLD_EPOCH);
+    let node = InProcessFollower::new(
+        Uuid::from_u128(0xA1),
+        segment_at(dir.path()),
+        ProducerEpochJournal::open(dir.path().join("epochs")).unwrap(),
+        range_identity(),
+        OLD_EPOCH,
+        meta.clone(),
+        ClusterCommittedOffset::new(0),
+    )
+    .unwrap();
+    // The journal on a disk the test can fill.
+    let sim = SimStorage::new();
+    sim.create_dir_all(Path::new("/journal"));
+    let env = sim.env(0x5eed_0881);
+    node.set_fencing_epoch_journal(
+        FencingEpochJournal::open_in(&env, "/journal/fencing-epochs").unwrap(),
+    );
+    // A record under the history, so the replica holds something a leader
+    // would need that history to judge.
+    node.apply_append(&ReplicaAppendRequest {
+        range: range_identity(),
+        fencing_epoch: OLD_EPOCH,
+        leader_node_id: Uuid::from_u128(0xA2),
+        expected_base_offset: 0,
+        producer_id: Uuid::from_u128(0xB1),
+        producer_epoch: 1,
+        first_sequence: 0,
+        records: vec![ProduceRecord {
+            timestamp_millis: 1,
+            key: b"k".to_vec(),
+            value: b"v0".to_vec(),
+        }],
+    })
+    .unwrap();
+    assert!(!node.epoch_history_broken());
+    assert!(!node.epoch_starts().is_empty(), "precondition: a history");
+
+    // The disk fills; the next grant's adoption cannot be recorded.
+    sim.set_fault(FaultPlan::FailOpsFrom {
+        op: sim.op_count(),
+        kind: std::io::ErrorKind::StorageFull,
+    });
+    meta.set(C_EPOCH);
+    node.adopt_fencing_epoch(C_EPOCH);
+
+    assert!(
+        node.epoch_history_broken(),
+        "the failed write must break the history"
+    );
+    let reason = node
+        .epoch_history_broken_reason()
+        .expect("a broken history says why");
+    for needed in [
+        "epoch history could not be written",
+        "recording an adopted epoch",
+        "no leader gives it a replication session",
+        "Free space",
+        "vtopctl node repair",
+    ] {
+        assert!(reason.contains(needed), "{needed:?} missing from: {reason}");
+    }
+
+    // The refusal itself is unchanged: no history to offer, so no leader
+    // can reconcile against it or count it.
+    assert!(node.epoch_starts().is_empty());
+
+    // Space back is not a repair: it stays broken until an operator acts.
+    sim.set_fault(FaultPlan::None);
+    meta.set(R_EPOCH);
+    node.adopt_fencing_epoch(R_EPOCH);
+    assert!(node.epoch_history_broken());
+    assert!(node.epoch_starts().is_empty());
+}
+
+/// A follower over a real segment directory, with its epoch journal on the
+/// simulated disk `env` at `/journal/fencing-epochs`.
+fn follower_on(
+    dir: &Path,
+    env: &vtop_log::env::Env,
+    held: u64,
+) -> (MetaFencingEpoch, InProcessFollower) {
+    let meta = MetaFencingEpoch::new(held);
+    let node = InProcessFollower::new(
+        Uuid::from_u128(0xA1),
+        segment_at(dir),
+        ProducerEpochJournal::open(dir.join("epochs")).unwrap(),
+        range_identity(),
+        held,
+        meta.clone(),
+        ClusterCommittedOffset::new(0),
+    )
+    .unwrap();
+    node.set_fencing_epoch_journal(
+        FencingEpochJournal::open_in(env, "/journal/fencing-epochs").unwrap(),
+    );
+    (meta, node)
+}
+
+fn one_record(node: &InProcessFollower) {
+    node.apply_append(&ReplicaAppendRequest {
+        range: range_identity(),
+        fencing_epoch: OLD_EPOCH,
+        leader_node_id: Uuid::from_u128(0xA2),
+        expected_base_offset: 0,
+        producer_id: Uuid::from_u128(0xB1),
+        producer_epoch: 1,
+        first_sequence: 0,
+        records: vec![ProduceRecord {
+            timestamp_millis: 1,
+            key: b"k".to_vec(),
+            value: b"v0".to_vec(),
+        }],
+    })
+    .unwrap();
+}
+
+/// #881, approved follow-up: the broken mark is durable. Before this, it
+/// lived in memory, and a restart reopened the journal without the failed
+/// write and offered the surviving entries as if whole - the one way a
+/// history with a hole could be served again.
+///
+/// Invariant: once broken, a replica keeps answering with no history across
+/// a restart, with the earlier reason; a mark a full disk refused is written
+/// as soon as space is back; and a repair (installing the source's history)
+/// clears it, after which the replica answers with a history again. A
+/// directory that never broke behaves exactly as before.
+#[test]
+fn a_broken_epoch_history_stays_broken_across_a_restart_until_repair() {
+    use vtop_log::sim::{FaultPlan, SimStorage};
+    let marker = Path::new("/journal/fencing-epochs.broken");
+    let dir = tempfile::tempdir().unwrap();
+    let sim = SimStorage::new();
+    sim.create_dir_all(Path::new("/journal"));
+    let env = sim.env(0x5eed_0882);
+
+    let (meta, node) = follower_on(dir.path(), &env, OLD_EPOCH);
+    one_record(&node);
+    let healthy_history = node.epoch_starts();
+    assert!(!healthy_history.is_empty());
+    assert!(!sim_exists(&env, marker), "a healthy directory has no mark");
+
+    // The disk fills at the adoption: the journal write fails, and so does
+    // the mark's own write.
+    sim.set_fault(FaultPlan::FailOpsFrom {
+        op: sim.op_count(),
+        kind: std::io::ErrorKind::StorageFull,
+    });
+    meta.set(C_EPOCH);
+    node.adopt_fencing_epoch(C_EPOCH);
+    assert!(node.epoch_history_broken());
+
+    // Space is back: the next consultation of the history writes the mark.
+    sim.set_fault(FaultPlan::None);
+    assert!(!sim_exists(&env, marker), "the full disk refused the mark");
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    assert!(node.epoch_starts().is_empty());
+    assert!(
+        sim_exists(&env, marker),
+        "the pending mark is written once space is back"
+    );
+
+    // Restart. The journal reopens without the failed write - and the mark
+    // still refuses the history it holds.
+    drop(node);
+    let (_meta, node) = follower_on(dir.path(), &env, C_EPOCH);
+    assert!(
+        node.epoch_history_broken(),
+        "a restart must not clear the break"
+    );
+    assert!(node.epoch_starts().is_empty());
+    let reason = node.epoch_history_broken_reason().unwrap();
+    assert!(reason.contains("recording an adopted epoch"), "{reason}");
+    assert!(reason.contains("vtopctl node repair"), "{reason}");
+
+    // Repair installs the source's history, which clears the mark.
+    drop(node);
+    vtop_broker::fencing_epochs::install_transferred_history(
+        &env,
+        "/journal/fencing-epochs",
+        &healthy_history,
+        1,
+    )
+    .unwrap();
+    assert!(!sim_exists(&env, marker));
+    let (_meta, node) = follower_on(dir.path(), &env, C_EPOCH);
+    assert!(!node.epoch_history_broken());
+    assert_eq!(node.epoch_starts(), healthy_history);
+}
+
+/// The window the mark cannot close: the journal write fails and the
+/// process dies before the mark is on disk (here the full disk refuses it,
+/// and the crash follows). The restarted replica has no mark - and that is
+/// safe, because the hazard a mark guards against is records appended AFTER
+/// the failed write under a history that does not describe them, and a
+/// process that died in the window appended none. What the restart opens is
+/// the pre-failure history over a log that ends where it ended then: the
+/// state ordinary journal recovery after a crash mid-write already handles.
+#[test]
+fn a_crash_before_the_mark_lands_leaves_the_pre_failure_history_over_an_unchanged_log() {
+    use vtop_log::sim::{FaultPlan, SimStorage};
+    let dir = tempfile::tempdir().unwrap();
+    let sim = SimStorage::new();
+    sim.create_dir_all(Path::new("/journal"));
+    let env = sim.env(0x5eed_0883);
+
+    let (meta, node) = follower_on(dir.path(), &env, OLD_EPOCH);
+    one_record(&node);
+    let before = node.epoch_starts();
+    let tail_before = node.next_offset();
+
+    sim.set_fault(FaultPlan::FailOpsFrom {
+        op: sim.op_count(),
+        kind: std::io::ErrorKind::StorageFull,
+    });
+    meta.set(C_EPOCH);
+    node.adopt_fencing_epoch(C_EPOCH);
+    assert!(node.epoch_history_broken());
+    // Dies in the window: nothing after the failure reaches the disk.
+    sim.crash();
+    drop(node);
+    sim.reboot();
+    sim.set_fault(FaultPlan::None);
+
+    let (_meta, node) = follower_on(dir.path(), &env, OLD_EPOCH);
+    assert!(
+        !node.epoch_history_broken(),
+        "no mark landed, so nothing marks it"
+    );
+    assert_eq!(
+        node.epoch_starts(),
+        before,
+        "the history is the pre-failure one: the failed write left nothing behind"
+    );
+    assert_eq!(
+        node.next_offset(),
+        tail_before,
+        "and the log ends where it did: no record was taken after the failure"
+    );
+}
+
+fn sim_exists(env: &vtop_log::env::Env, path: &Path) -> bool {
+    env.storage.exists(path).unwrap()
+}

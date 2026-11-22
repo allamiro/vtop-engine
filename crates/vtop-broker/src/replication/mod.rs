@@ -48,9 +48,9 @@ pub use fault::{
     FaultInjectingReplicaSet, FollowerNetworkFault, NetworkFaultPlan, PendingDeliveryStats,
 };
 pub use network::{
-    address_now, FlowControlConfig, LeaderLineage, LeaderLineageSnapshot, NetworkFollowerConfig,
-    NetworkedReplicaSet, ReplicaPeerHandler, ReplicaPeerServer, ReplicaStatusClient,
-    ReplicaTlsMaterial,
+    address_now, CatchUpRead, FlowControlConfig, LeaderLineage, LeaderLineageSnapshot,
+    NetworkFollowerConfig, NetworkedReplicaSet, ReplicaPeerHandler, ReplicaPeerServer,
+    ReplicaStatusClient, ReplicaTlsMaterial,
 };
 pub use transfer::{LeaderSegmentTransferHandler, SegmentTransferClient, TransferredPrefix};
 pub use version::{ClusterFeatureLevel, PeerVersion, ReplicaVersionPolicy};
@@ -236,7 +236,7 @@ pub struct InProcessFollower {
     /// [`crate::LocalBroker::epoch_starts`] for why absence and breakage are
     /// deliberately the same answer.
     fencing_epoch_journal: Mutex<Option<crate::fencing_epochs::FencingEpochJournal>>,
-    fencing_epoch_history_broken: AtomicBool,
+    fencing_epoch_history_broken: crate::fencing_epochs::EpochHistoryHealth,
     meta_fencing_epoch: MetaFencingEpoch,
     segment_format: SegmentFormat,
     cluster_committed: ClusterCommittedOffset,
@@ -398,7 +398,7 @@ impl InProcessFollower {
             range,
             held_fencing_epoch: AtomicU64::new(held_fencing_epoch),
             fencing_epoch_journal: Mutex::new(None),
-            fencing_epoch_history_broken: AtomicBool::new(false),
+            fencing_epoch_history_broken: crate::fencing_epochs::EpochHistoryHealth::new(),
             meta_fencing_epoch,
             segment_format,
             cluster_committed,
@@ -505,8 +505,14 @@ impl InProcessFollower {
                         .follow_held_leader_lineage(next_offset)
                         .and_then(|_| journal.record_adoption(epoch, next_offset));
                     if adopted.is_err() {
-                        self.fencing_epoch_history_broken
-                            .store(true, Ordering::SeqCst);
+                        self.fencing_epoch_history_broken.mark(
+                            &self.replica_name(),
+                            "recording an adopted epoch",
+                            adopted
+                                .as_ref()
+                                .err()
+                                .map(|error| error as &dyn std::fmt::Display),
+                        );
                     }
                 }
             }
@@ -536,8 +542,11 @@ impl InProcessFollower {
                 true
             }
             Err(_) => {
-                self.fencing_epoch_history_broken
-                    .store(true, Ordering::SeqCst);
+                self.fencing_epoch_history_broken.mark(
+                    &self.replica_name(),
+                    "filing records under the leader's lineage",
+                    None,
+                );
                 true
             }
         }
@@ -593,7 +602,7 @@ impl InProcessFollower {
         let Some(journal) = guard.as_mut() else {
             return;
         };
-        if self.fencing_epoch_history_broken.load(Ordering::SeqCst) {
+        if self.fencing_epoch_history_broken.is_broken() {
             return;
         }
         let outcome = if disputed {
@@ -617,8 +626,11 @@ impl InProcessFollower {
             }
             Ok(_) => {}
             Err(_) => {
-                self.fencing_epoch_history_broken
-                    .store(true, Ordering::SeqCst);
+                self.fencing_epoch_history_broken.mark(
+                    &self.replica_name(),
+                    "taking the leader's lineage at a fence",
+                    None,
+                );
             }
         }
     }
@@ -740,11 +752,18 @@ impl InProcessFollower {
         &self,
         mut journal: crate::fencing_epochs::FencingEpochJournal,
     ) {
+        // A break an earlier run persisted is in force before anything reads
+        // or extends this history (#881).
+        self.fencing_epoch_history_broken
+            .attach(journal.break_marker(), &self.replica_name());
         let epoch = self.held_fencing_epoch.load(Ordering::SeqCst);
         let next_offset = self.next_offset();
         if !crate::LocalBroker::attach_epoch_journal_to_log(&mut journal, next_offset) {
-            self.fencing_epoch_history_broken
-                .store(true, Ordering::SeqCst);
+            self.fencing_epoch_history_broken.mark(
+                &self.replica_name(),
+                "attaching the journal to the log",
+                None,
+            );
         }
         // Epoch 0 is the "no grant yet" sentinel, never a writing epoch.
         if journal.latest().is_none()
@@ -752,8 +771,11 @@ impl InProcessFollower {
             && epoch > 0
             && journal.record(epoch, 0).is_err()
         {
-            self.fencing_epoch_history_broken
-                .store(true, Ordering::SeqCst);
+            self.fencing_epoch_history_broken.mark(
+                &self.replica_name(),
+                "recording the first epoch",
+                None,
+            );
         }
         let reloaded = self.reload_kept_dispute(&mut journal, next_offset);
         // A lineage reloaded from its sidecar (#640) is replayed over the log
@@ -762,9 +784,11 @@ impl InProcessFollower {
         // left those records filed under the old entries.
         match journal.replay_leader_lineage_at_open(next_offset) {
             Ok(following) => self.lineage_following.store(following, Ordering::SeqCst),
-            Err(_) => self
-                .fencing_epoch_history_broken
-                .store(true, Ordering::SeqCst),
+            Err(_) => self.fencing_epoch_history_broken.mark(
+                &self.replica_name(),
+                "replaying the leader's lineage at open",
+                None,
+            ),
         }
         // A history held while its fence's dispute was pending, whose dispute
         // is no longer held (#640, with #635): a settlement a crash cut short
@@ -796,9 +820,11 @@ impl InProcessFollower {
                         self.lineage_following.store(!complete, Ordering::SeqCst);
                     }
                     Ok(_) => {}
-                    Err(_) => self
-                        .fencing_epoch_history_broken
-                        .store(true, Ordering::SeqCst),
+                    Err(_) => self.fencing_epoch_history_broken.mark(
+                        &self.replica_name(),
+                        "taking the leader's lineage at open",
+                        None,
+                    ),
                 }
             }
         }
@@ -879,8 +905,8 @@ impl InProcessFollower {
             }
             return None;
         };
-        let history_known = !self.fencing_epoch_history_broken.load(Ordering::SeqCst)
-            && !journal.entries().is_empty();
+        let history_known =
+            !self.fencing_epoch_history_broken.is_broken() && !journal.entries().is_empty();
         let stale = if next_offset <= record.from {
             Some("the log no longer reaches past its start")
         } else if record.from < self.cluster_committed.get() {
@@ -1195,8 +1221,11 @@ impl InProcessFollower {
                 }
             });
             if repaired.is_err() {
-                self.fencing_epoch_history_broken
-                    .store(true, Ordering::SeqCst);
+                self.fencing_epoch_history_broken.mark(
+                    &self.replica_name(),
+                    "truncating the history with the log",
+                    None,
+                );
             }
         }
         drop(guard);
@@ -1375,8 +1404,30 @@ impl InProcessFollower {
         crate::fencing_epochs::FencingEpochJournal::seed_attested_history_in(
             &self.fencing_epoch_journal,
             &self.fencing_epoch_history_broken,
+            &self.replica_name(),
             epoch,
         )
+    }
+
+    /// Whether this replica's epoch history is broken: a journal write
+    /// failed, so it answers every fence with no history and no leader gives
+    /// it a session until it is repaired (#881). Exported as
+    /// `vtop_broker_epoch_history_broken`. Never blocks.
+    pub fn epoch_history_broken(&self) -> bool {
+        self.fencing_epoch_history_broken.is_broken()
+    }
+
+    /// The operator message the break was reported with, if it is broken.
+    pub fn epoch_history_broken_reason(&self) -> Option<String> {
+        self.fencing_epoch_history_broken.reason()
+    }
+
+    fn replica_name(&self) -> crate::fencing_epochs::ReplicaName<'_> {
+        crate::fencing_epochs::ReplicaName {
+            node_id: self.node_id,
+            topic: &self.range.topic,
+            range_id: self.range.range_id,
+        }
     }
 
     /// This replica's epoch history; empty means "unknown", never "no changes".
@@ -1386,7 +1437,7 @@ impl InProcessFollower {
             .fencing_epoch_journal
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self.fencing_epoch_history_broken.load(Ordering::SeqCst) {
+        if self.fencing_epoch_history_broken.is_broken() {
             return Vec::new();
         }
         guard
@@ -1676,7 +1727,7 @@ impl InProcessFollower {
                 .fencing_epoch_journal
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if self.fencing_epoch_history_broken.load(Ordering::SeqCst) {
+            if self.fencing_epoch_history_broken.is_broken() {
                 crate::fencing_epochs::Lineage::Unknown
             } else {
                 guard
@@ -2135,6 +2186,9 @@ impl InProcessFollower {
         &self,
         request: &ReplicaAppendRequest,
     ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
+        // A break whose mark a full disk refused is retried before the next
+        // record can land (#881): an append needs the space the mark does.
+        self.fencing_epoch_history_broken.persist_pending();
         if !self.is_online() {
             return Err((
                 ErrorCode::Overloaded,
@@ -2323,6 +2377,9 @@ impl InProcessFollower {
         &self,
         requests: &[ReplicaAppendRequest],
     ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
+        // A break whose mark a full disk refused is retried before the next
+        // record can land (#881): an append needs the space the mark does.
+        self.fencing_epoch_history_broken.persist_pending();
         if requests.is_empty() {
             return Ok(ReplicaAppendResponse {
                 local_committed_offset: self.replication_status().0,
@@ -2367,115 +2424,138 @@ impl InProcessFollower {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for request in requests {
-            if request.range != self.range {
-                return Err((
-                    ErrorCode::WrongRange,
-                    "replica append range identity does not match this follower".to_owned(),
-                ));
-            }
-            if let Err((code, message)) =
-                check_follower_fencing(&meta, self.held_fencing_epoch(), request.fencing_epoch)
-            {
-                return Err((code, message.to_owned()));
-            }
-            let tip = state.segment.next_offset();
-            if tip > request.expected_base_offset {
-                let batch_end = request
-                    .expected_base_offset
-                    .checked_add(request.records.len() as u64)
-                    .ok_or((
-                        ErrorCode::InvalidRequest,
-                        "replica append batch end overflows u64".to_owned(),
-                    ))?;
-                if state.segment.committed_offset() >= batch_end {
-                    continue;
+        let tip_before = state.segment.next_offset();
+        let applied = (|| {
+            for request in requests {
+                if request.range != self.range {
+                    return Err((
+                        ErrorCode::WrongRange,
+                        "replica append range identity does not match this follower".to_owned(),
+                    ));
                 }
-                return Err((
-                    ErrorCode::InvalidRequest,
-                    format!(
-                        "follower next_offset {tip} is ahead of expected_base_offset {} but not durable through {batch_end}",
-                        request.expected_base_offset
-                    ),
-                ));
-            }
-            if tip != request.expected_base_offset {
-                return Err((
-                    ErrorCode::InvalidRequest,
-                    format!(
-                        "follower next_offset {tip} does not match expected_base_offset {}",
-                        request.expected_base_offset
-                    ),
-                ));
-            }
-            if let Err(problem) = state
-                .producer_epochs
-                .accept(request.producer_id, request.producer_epoch)
-            {
-                return Err(match problem {
-                    BrokerError::ProducerFenced { .. } => (ErrorCode::Fenced, problem.to_string()),
-                    other => (ErrorCode::Storage, other.to_string()),
-                });
-            }
-            // Same refusal as the single-request path: a v1 frame cannot
-            // store the marker's reserved identity, and hiding that loss
-            // would be worse than failing the ack (#240).
-            if self.segment_format == SegmentFormat::V1
-                && request.producer_id == PROMOTION_MARKER_PRODUCER
-            {
-                return Err((
-                    ErrorCode::InvalidRequest,
-                    "a v1-format follower cannot store the promotion marker under its \
-                     recognizable identity, so it refuses the marker rather than hide the loss"
-                        .to_owned(),
-                ));
-            }
-            let (stored_id, stored_epoch) = match self.segment_format {
-                SegmentFormat::V1 => (
-                    storage_producer_id(request.producer_id, request.producer_epoch),
-                    0,
-                ),
-                SegmentFormat::V2 => (request.producer_id, request.producer_epoch),
-            };
-            let records = match records_from_wire(
-                &request.records,
-                stored_id,
-                stored_epoch,
-                request.first_sequence,
-            ) {
-                Ok(records) => records,
-                Err(message) => return Err((ErrorCode::InvalidRequest, message.to_owned())),
-            };
-            // A roll mid-batch commits the sealed tail early, which
-            // strengthens the shared durability barrier for a HEALTHY
-            // follower: nothing is acknowledged before the final commit
-            // below. Under an fsync hold that same early commit would break
-            // the injection's promise that held bytes die with a crash, so
-            // the bound refuses instead of rolling there.
-            let appended = if self.hold_fsync() {
-                state
-                    .segment
-                    .append_group_tail_only(&records, Durability::Buffered)
-            } else {
-                state
-                    .segment
-                    .append_group_minting(&records, Durability::Buffered)
-            };
-            if let Err(problem) = appended {
-                return Err((
-                    match problem {
-                        vtop_log::LogError::FirstSequence { .. }
-                        | vtop_log::LogError::SequenceGap { .. }
-                        | vtop_log::LogError::SequenceConflict { .. }
-                        | vtop_log::LogError::SequenceBelowWindow { .. } => {
-                            ErrorCode::SequenceConflict
+                if let Err((code, message)) =
+                    check_follower_fencing(&meta, self.held_fencing_epoch(), request.fencing_epoch)
+                {
+                    return Err((code, message.to_owned()));
+                }
+                let tip = state.segment.next_offset();
+                if tip > request.expected_base_offset {
+                    let batch_end = request
+                        .expected_base_offset
+                        .checked_add(request.records.len() as u64)
+                        .ok_or((
+                            ErrorCode::InvalidRequest,
+                            "replica append batch end overflows u64".to_owned(),
+                        ))?;
+                    if state.segment.committed_offset() >= batch_end {
+                        continue;
+                    }
+                    return Err((
+                        ErrorCode::InvalidRequest,
+                        format!(
+                            "follower next_offset {tip} is ahead of expected_base_offset {} but not durable through {batch_end}",
+                            request.expected_base_offset
+                        ),
+                    ));
+                }
+                if tip != request.expected_base_offset {
+                    return Err((
+                        ErrorCode::InvalidRequest,
+                        format!(
+                            "follower next_offset {tip} does not match expected_base_offset {}",
+                            request.expected_base_offset
+                        ),
+                    ));
+                }
+                if let Err(problem) = state
+                    .producer_epochs
+                    .accept(request.producer_id, request.producer_epoch)
+                {
+                    return Err(match problem {
+                        BrokerError::ProducerFenced { .. } => {
+                            (ErrorCode::Fenced, problem.to_string())
                         }
-                        vtop_log::LogError::ProducerFenced { .. } => ErrorCode::Fenced,
-                        _ => ErrorCode::Storage,
-                    },
-                    problem.to_string(),
-                ));
+                        other => (ErrorCode::Storage, other.to_string()),
+                    });
+                }
+                // Same refusal as the single-request path: a v1 frame cannot
+                // store the marker's reserved identity, and hiding that loss
+                // would be worse than failing the ack (#240).
+                if self.segment_format == SegmentFormat::V1
+                    && request.producer_id == PROMOTION_MARKER_PRODUCER
+                {
+                    return Err((
+                        ErrorCode::InvalidRequest,
+                        "a v1-format follower cannot store the promotion marker under its \
+                         recognizable identity, so it refuses the marker rather than hide the loss"
+                            .to_owned(),
+                    ));
+                }
+                let (stored_id, stored_epoch) = match self.segment_format {
+                    SegmentFormat::V1 => (
+                        storage_producer_id(request.producer_id, request.producer_epoch),
+                        0,
+                    ),
+                    SegmentFormat::V2 => (request.producer_id, request.producer_epoch),
+                };
+                let records = match records_from_wire(
+                    &request.records,
+                    stored_id,
+                    stored_epoch,
+                    request.first_sequence,
+                ) {
+                    Ok(records) => records,
+                    Err(message) => return Err((ErrorCode::InvalidRequest, message.to_owned())),
+                };
+                // A roll mid-batch commits the sealed tail early, which
+                // strengthens the shared durability barrier for a HEALTHY
+                // follower: nothing is acknowledged before the final commit
+                // below. Under an fsync hold that same early commit would break
+                // the injection's promise that held bytes die with a crash, so
+                // the bound refuses instead of rolling there.
+                let appended = if self.hold_fsync() {
+                    state
+                        .segment
+                        .append_group_tail_only(&records, Durability::Buffered)
+                } else {
+                    state
+                        .segment
+                        .append_group_minting(&records, Durability::Buffered)
+                };
+                if let Err(problem) = appended {
+                    return Err((
+                        match problem {
+                            vtop_log::LogError::FirstSequence { .. }
+                            | vtop_log::LogError::SequenceGap { .. }
+                            | vtop_log::LogError::SequenceConflict { .. }
+                            | vtop_log::LogError::SequenceBelowWindow { .. } => {
+                                ErrorCode::SequenceConflict
+                            }
+                            vtop_log::LogError::ProducerFenced { .. } => ErrorCode::Fenced,
+                            _ => ErrorCode::Storage,
+                        },
+                        problem.to_string(),
+                    ));
+                }
             }
+            Ok(())
+        })();
+        if let Err(refusal) = applied {
+            // The members before the refused one were appended, buffered,
+            // and passed every check a member gets. Left uncommitted they
+            // stranded this replica (#881 soak): its tail ran past its
+            // durable offset, and every later append at that offset was
+            // refused as "ahead but not durable". Committed, the replica is
+            // consistent again and reports where it really is; the leader
+            // resumes from there.
+            if !self.hold_fsync() && state.segment.next_offset() > tip_before {
+                if let Ok(_committed) = state.segment.commit() {
+                    let tail = state.segment.next_offset();
+                    drop(state);
+                    self.follow_leader_lineage_after_append(requests[0].fencing_epoch, tail);
+                }
+            }
+            return Err(refusal);
         }
         // Every member was checked against the held epoch above, so the
         // group is one leader's, and so is the lineage it is filed under

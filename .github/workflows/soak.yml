@@ -1,0 +1,262 @@
+name: soak
+
+# The engine soak (#726): Kafka to S3 with a fault on a schedule, judged by
+# benchmarks/soak/soak_eval.py. Two profiles (benchmarks/soak/profiles/):
+#
+#   72h       the release-candidate soak. Dispatch only, on a self-hosted
+#             runner with the label `vtop-soak` (Linux x86_64, Docker, about
+#             180 GB free), run by a maintainer before each release candidate.
+#             It never runs on a pull request: a pull request must not reach
+#             a self-hosted runner.
+#   ci-smoke  about ten minutes on a GitHub-hosted runner, after the images are built. It proves the
+#             harness works (lab, load, every fault kind, prune, scrub, the
+#             evaluator, the evidence tarball); its trend limits are loose, so
+#             it is not evidence about the engine. Dispatch, or a pull request
+#             that touches only the soak's own files.
+#
+# See docs/SOAK_VALIDATION.md for the host requirements, how to start a run,
+# and what to attach to the release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "72h (self-hosted, vtop-soak) or ci-smoke (GitHub-hosted)"
+        type: choice
+        options:
+          - ci-smoke
+          - 72h
+        default: ci-smoke
+  pull_request:
+    paths:
+      - "benchmarks/soak/**"
+      - ".github/workflows/soak.yml"
+      - "docs/SOAK_VALIDATION.md"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: soak-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # A pull request runs the smoke only when every file it changes is one the
+  # soak owns: the soak's directory, this workflow, its docs page, and the
+  # shared files a soak change has to touch (the docs navigation, the
+  # limitations table, the benchmark test paths and the runner label that
+  # actionlint is told about). Anything else is another
+  # change's business, and the heavier job is not paid for on it.
+  scope:
+    name: soak files only?
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      soak_only: ${{ steps.files.outputs.soak_only }}
+    steps:
+      - id: files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename' > files.txt
+          echo "changed files:"; cat files.txt
+          other="$(grep -Ev '^(benchmarks/soak/|\.github/workflows/soak\.yml$|docs/SOAK_VALIDATION\.md$|mkdocs\.yml$|docs/reference/limitations\.md$|benchmarks/pytest\.ini$|\.github/actionlint\.yaml$)' files.txt || true)"
+          if [ -z "$other" ]; then
+            echo "soak_only=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "soak_only=false" >> "$GITHUB_OUTPUT"
+            echo "not soak files, so no smoke run on this pull request:"; echo "$other"
+          fi
+
+  checks:
+    name: evaluator, driver and lab tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Install test tooling
+        run: pip install --disable-pip-version-check pytest pyyaml ruff==0.17.0
+      - name: ruff
+        working-directory: benchmarks
+        run: ruff check soak
+      - name: Unit tests (the evaluator, the profiles, the injectors, the lab)
+        working-directory: benchmarks
+        run: python -m pytest soak/tests
+      - name: shellcheck the engine container's entrypoint
+        run: shellcheck benchmarks/soak/soak-entrypoint.sh
+
+  smoke:
+    name: ci-smoke (real Kafka, MinIO, faults)
+    needs: [scope, checks]
+    # `scope` is skipped on dispatch, and a skipped need would skip this job
+    # too, so the condition names it explicitly.
+    if: >-
+      !cancelled() && needs.checks.result == 'success' && (
+        (github.event_name == 'workflow_dispatch' && inputs.profile == 'ci-smoke') ||
+        (github.event_name == 'pull_request' && needs.scope.outputs.soak_only == 'true')
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Read-only use of the image job's cache entry: no cache of this
+      # workflow's own is written.
+      - name: Build the engine image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          tags: vtop-engine:local
+          load: true
+          cache-from: type=gha,scope=ci-image
+
+      - name: Build the lab's MinIO image
+        run: docker compose build minio
+
+      - name: Run the ci-smoke profile
+        id: soak
+        env:
+          OUT: ${{ runner.temp }}/soak
+        run: |
+          set -euo pipefail
+          python3 benchmarks/soak/soak_driver.py --profile ci-smoke --out "$OUT" \
+            --build-engine-from vtop-engine:local --project vtop-soak
+
+      - name: Verdict in the job summary
+        if: always() && steps.soak.outcome != 'skipped'
+        env:
+          OUT: ${{ runner.temp }}/soak
+        run: |
+          shopt -s nullglob
+          for dir in "$OUT"/soak-ci-smoke-*/; do
+            {
+              echo '```'
+              python3 benchmarks/soak/soak_eval.py --profile ci-smoke --run-dir "$dir" --out "$RUNNER_TEMP/verdict-again.json" || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Upload the evidence tarball
+        if: always() && steps.soak.outcome != 'skipped'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: soak-ci-smoke-evidence
+          path: ${{ runner.temp }}/soak/*.tar.gz
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Tear the lab down
+        if: always()
+        run: docker compose -p vtop-soak -f benchmarks/soak/docker-compose.soak.yml down --volumes --remove-orphans --timeout 30 || true
+        env:
+          SOAK_RUN_DIR: /nonexistent
+
+  soak-72h:
+    name: 72 hour soak (self-hosted, vtop-soak)
+    needs: checks
+    # Dispatch only, by a maintainer; never a pull request (see the header).
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == '72h'
+    runs-on: [self-hosted, vtop-soak]
+    # 72 hours of load, an hour of quiet tail, the drain and the final checks,
+    # with room: 80 hours.
+    timeout-minutes: 4800
+    # One soak on the host at a time; a second dispatch waits, never cancels
+    # a run that is hours in.
+    concurrency:
+      group: soak-72h-host
+      cancel-in-progress: false
+    env:
+      # The runner's data disk. Set the repository variable VTOP_SOAK_DATA_DIR
+      # to a directory on a disk with about 180 GB free.
+      DATA_DIR: ${{ vars.VTOP_SOAK_DATA_DIR || '/var/lib/vtop-soak' }}
+      OUT: ${{ github.workspace }}/soak-out
+      # The lab's containers write the data directories as their own users
+      # (the engine as 10001, Kafka as its appuser, MinIO as root), which a
+      # runner user cannot delete: the data is removed from a root container,
+      # as soak_lab.py's prepare_data_dirs chowns it. The engine image's own
+      # base, pinned by the same digest as docker/Dockerfile.
+      CLEANUP_IMAGE: debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: The host meets the requirements
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+          docker info --format '{{.ServerVersion}}'
+          docker compose version
+          python3 --version
+          mkdir -p "$DATA_DIR"
+          df -h "$DATA_DIR"
+      # A run whose runner died skipped its tear-down; its data would make
+      # this run's preparation fail on directories it cannot chmod.
+      - name: Remove what an earlier run left in the data directory
+        run: |
+          set -euo pipefail
+          docker run --rm --user 0 --network none -v "$DATA_DIR:/data" --entrypoint /bin/rm \
+            "$CLEANUP_IMAGE" -rf /data/kafka /data/minio /data/engine-state /data/engine-work
+      - name: Unit tests
+        working-directory: benchmarks
+        run: python3 -m pip install --user --disable-pip-version-check pytest pyyaml && python3 -m pytest soak/tests
+      - name: Build the engine image and the lab's MinIO
+        run: |
+          set -euo pipefail
+          docker build -f docker/Dockerfile -t vtop-engine:local .
+          docker compose build minio
+      - name: Run the 72h profile
+        id: soak
+        run: |
+          set -euo pipefail
+          python3 benchmarks/soak/soak_driver.py --profile 72h --out "$OUT" \
+            --data-dir "$DATA_DIR" --build-engine-from vtop-engine:local --project vtop-soak
+      - name: Verdict in the job summary
+        if: always() && steps.soak.outcome != 'skipped'
+        run: |
+          shopt -s nullglob
+          for dir in "$OUT"/soak-72h-*/; do
+            {
+              echo '```'
+              python3 benchmarks/soak/soak_eval.py --profile 72h --run-dir "$dir" --out "$RUNNER_TEMP/verdict-again.json" || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Upload the evidence tarball
+        if: always() && steps.soak.outcome != 'skipped'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: soak-72h-evidence
+          path: ${{ github.workspace }}/soak-out/*.tar.gz
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Tear the lab down and free the disk
+        if: always()
+        run: |
+          set -uo pipefail
+          docker compose -p vtop-soak -f benchmarks/soak/docker-compose.soak.yml down --volumes --remove-orphans --timeout 60 || true
+          docker run --rm --user 0 --network none -v "$DATA_DIR:/data" --entrypoint /bin/rm \
+            "$CLEANUP_IMAGE" -rf /data/kafka /data/minio /data/engine-state /data/engine-work || true
+          left=""
+          for sub in kafka minio engine-state engine-work; do
+            if [ -e "$DATA_DIR/$sub" ]; then left="$left $sub"; fi
+          done
+          if [ -n "$left" ]; then
+            echo "::error::could not remove$left under $DATA_DIR; delete them as root before the next dispatch, or it fails preparing them"
+            exit 1
+          fi
+        env:
+          SOAK_RUN_DIR: /nonexistent

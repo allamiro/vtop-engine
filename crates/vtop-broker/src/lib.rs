@@ -657,7 +657,7 @@ pub struct LocalBroker {
     fencing_epoch_journal: Mutex<Option<crate::fencing_epochs::FencingEpochJournal>>,
     /// Set if a start could not be recorded. From that point the vector has a
     /// hole, so it is no longer safe to reconcile against.
-    fencing_epoch_history_broken: AtomicBool,
+    fencing_epoch_history_broken: crate::fencing_epochs::EpochHistoryHealth,
     /// Latest metadata-committed fencing epoch for the range.
     meta_fencing_epoch: MetaFencingEpoch,
     segment_format: SegmentFormat,
@@ -803,7 +803,7 @@ impl LocalBroker {
             range,
             held_fencing_epoch: AtomicU64::new(held_fencing_epoch),
             fencing_epoch_journal: Mutex::new(None),
-            fencing_epoch_history_broken: AtomicBool::new(false),
+            fencing_epoch_history_broken: crate::fencing_epochs::EpochHistoryHealth::new(),
             meta_fencing_epoch,
             segment_format,
             retention_max_total_bytes: std::sync::atomic::AtomicU64::new(0),
@@ -1153,10 +1153,17 @@ impl LocalBroker {
         &self,
         mut journal: crate::fencing_epochs::FencingEpochJournal,
     ) {
+        // A break an earlier run persisted is in force before anything reads
+        // or extends this history (#881).
+        self.fencing_epoch_history_broken
+            .attach(journal.break_marker(), &self.replica_name());
         let (_, next_offset) = self.local_offsets();
         if !Self::attach_epoch_journal_to_log(&mut journal, next_offset) {
-            self.fencing_epoch_history_broken
-                .store(true, Ordering::SeqCst);
+            self.fencing_epoch_history_broken.mark(
+                &self.replica_name(),
+                "attaching the journal to the log",
+                None,
+            );
         }
         // The directory may have been a follower's until a role flip, with
         // a crash between an append it took from a leader and the journal's
@@ -1164,8 +1171,11 @@ impl LocalBroker {
         // replay files those records as the leader did before this broker
         // reads or extends the history.
         if journal.replay_leader_lineage_at_open(next_offset).is_err() {
-            self.fencing_epoch_history_broken
-                .store(true, Ordering::SeqCst);
+            self.fencing_epoch_history_broken.mark(
+                &self.replica_name(),
+                "replaying the leader's lineage at open",
+                None,
+            );
         }
         if journal.latest().is_none() {
             let epoch = self.held_fencing_epoch.load(Ordering::SeqCst);
@@ -1174,8 +1184,11 @@ impl LocalBroker {
             // would put a fabricated entry at the head of the vector claiming
             // epoch 0 owns records it never wrote.
             if next_offset == 0 && epoch > 0 && journal.record(epoch, 0).is_err() {
-                self.fencing_epoch_history_broken
-                    .store(true, Ordering::SeqCst);
+                self.fencing_epoch_history_broken.mark(
+                    &self.replica_name(),
+                    "recording the first epoch",
+                    None,
+                );
             }
         }
         *self
@@ -1224,8 +1237,30 @@ impl LocalBroker {
         crate::fencing_epochs::FencingEpochJournal::seed_attested_history_in(
             &self.fencing_epoch_journal,
             &self.fencing_epoch_history_broken,
+            &self.replica_name(),
             epoch,
         )
+    }
+
+    /// Whether this replica's epoch history is broken: a journal write
+    /// failed, so it answers every fence with no history and no leader gives
+    /// it a session until it is repaired (#881). Exported as
+    /// `vtop_broker_epoch_history_broken`. Never blocks.
+    pub fn epoch_history_broken(&self) -> bool {
+        self.fencing_epoch_history_broken.is_broken()
+    }
+
+    /// The operator message the break was reported with, if it is broken.
+    pub fn epoch_history_broken_reason(&self) -> Option<String> {
+        self.fencing_epoch_history_broken.reason()
+    }
+
+    fn replica_name(&self) -> crate::fencing_epochs::ReplicaName<'_> {
+        crate::fencing_epochs::ReplicaName {
+            node_id: self.node_id,
+            topic: &self.range.topic,
+            range_id: self.range.range_id,
+        }
     }
 
     /// This replica's epoch history.
@@ -1244,7 +1279,7 @@ impl LocalBroker {
             .fencing_epoch_journal
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self.fencing_epoch_history_broken.load(Ordering::SeqCst) {
+        if self.fencing_epoch_history_broken.is_broken() {
             return Vec::new();
         }
         guard
@@ -1317,8 +1352,11 @@ impl LocalBroker {
                 // offered as one: `epoch_starts` reports "unknown", which every
                 // caller already handles, rather than a vector a peer could
                 // reconcile against and truncate itself on the strength of.
-                self.fencing_epoch_history_broken
-                    .store(true, Ordering::SeqCst);
+                self.fencing_epoch_history_broken.mark(
+                    &self.replica_name(),
+                    "truncating the history with the log",
+                    None,
+                );
             }
         }
         Ok(outcome)
@@ -1339,8 +1377,11 @@ impl LocalBroker {
                 // `epoch_starts` report "unknown", which callers must already
                 // handle — a structurally unusable answer rather than a log
                 // line someone has to notice.
-                self.fencing_epoch_history_broken
-                    .store(true, Ordering::SeqCst);
+                self.fencing_epoch_history_broken.mark(
+                    &self.replica_name(),
+                    "recording an epoch start",
+                    None,
+                );
             }
         }
     }
@@ -2464,6 +2505,9 @@ impl LocalBroker {
         range: &RangeIdentity,
         fencing_epoch: u64,
     ) -> Result<(), (ErrorCode, &'static str)> {
+        // Every produce passes here: a break whose mark a full disk refused
+        // is retried before the next record can land (#881).
+        self.fencing_epoch_history_broken.persist_pending();
         if range != &self.range {
             return Err((
                 ErrorCode::WrongRange,

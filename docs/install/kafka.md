@@ -41,7 +41,8 @@ release it is named for.
 
 Other patch releases of these lines are expected to behave the same and are
 not run. A pull request that changes the workflow or `scripts/kafka-broker.sh`
-runs every release in the table before it merges.
+runs every release in the table (plaintext) before it merges, and the oldest
+and newest releases through every listener below.
 
 ## Authentication and encryption
 
@@ -80,6 +81,25 @@ engine cannot present one, so a listener that requires client certificates
 limitation and is not tested: the legs use `ssl.client.auth=none`. Use a
 listener that does not require them, with SASL for the client's identity.
 
+## A three-broker cluster
+
+The [kafka cluster](https://github.com/allamiro/vtop-engine/blob/main/.github/workflows/kafka-cluster.yml)
+workflow starts three Apache Kafka 4.4.0 nodes in KRaft, each broker and
+controller (`scripts/kafka-cluster.sh`). The restart tests' topics are at
+replication 3 with `min.insync.replicas` 2; the live suite's own topics keep
+the replication 1 it creates them with. It runs the whole live suite with the three
+nodes as `bootstrap_servers`, and then `tests/integration_kafka_cluster.rs`:
+
+- the leader of the partition the engine is reading is stopped between two
+  batches, records keep arriving at the other two nodes, and the node is
+  started again and catches up while the engine reads on;
+- a follower is stopped the same way.
+
+Each requires every record committed exactly once, in order, without a
+restart of the engine, and the consumer group's offset at the end of the
+partition. It runs nightly and on dispatch, and on a pull request that
+changes the workflow, the script or the test.
+
 ## A broker that is not Apache Kafka
 
 **Redpanda v26.3.1** (`redpandadata/redpanda`, a single node in
@@ -95,9 +115,9 @@ tested and nothing here is claimed for them.
   whose versions librdkafka negotiates with each broker, but untested. 3.7 is
   the first release with an official `apache/kafka` image.
 - **Brokers other than Apache Kafka and the Redpanda smoke above.**
-- **Multi-broker clusters.** Every leg is one broker that is also its own
-  controller, so a partition leader moving to another broker is not
-  exercised.
+- **Clusters larger than three brokers, and other failures.** The cluster
+  job below stops one node at a time, in an orderly way; a crash, a network
+  partition and a rolling upgrade are not exercised.
 - **Mutual TLS.** See above.
 - **SASL OAUTHBEARER and delegation tokens.** Not tested.
 - **Kerberos (SASL GSSAPI).** Needs a build with `--features kafka-gssapi`

@@ -87,7 +87,8 @@ vtopctl scrub --config /etc/vtop/config.yaml
 To check one batch by hand, pass its manifest URI (it ends in
 `.manifest.json`, and is in the `manifest_uploaded` log line) to
 `vtopctl verify-manifest --manifest <uri> --config ...`. It ends with
-`verdict : PASSED`.
+`verdict : PASSED`. Pass the URI exactly as logged: the check fails a
+manifest that names another key than the one it was read from.
 
 ## 5. Keep it running
 

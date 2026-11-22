@@ -9,11 +9,12 @@ for each rule, is issue
 
 > [!IMPORTANT]
 > This is the policy 1.0 is held to. VTOP is at 0.x, and where 0.x differs
-> today, the rule says so. **Downgrade is not supported in 0.x**: nothing
-> tests it yet. The downgrade rules below are targets; they take effect for
-> a pair of releases only once the compatibility matrix records a downgrade
-> result for that pair. The compatibility matrix this page refers to is
-> being added under #743.
+> today, the rule says so. **Downgrade is not supported in 0.x**, except
+> for the formats and pairs of releases the compatibility matrix records a
+> result for (see [downgrade](#downgrade)): the downgrade rules below are
+> targets, and take effect for a pair of releases only once the matrix
+> records a downgrade result for it. The compatibility matrix is added
+> under #743; it records the ledger, its digests and the audit trail so far.
 
 ## Status words
 
@@ -101,8 +102,8 @@ warning. Verification receipts stay opt-in for 1.0.
 ## Upgrade
 
 - **From any release of minor N-1 to any release of minor N** is supported.
-  What is tested today is below; cells for the ledger and the other
-  node-local formats are being added under #743.
+  What is tested today is below; cells for the other node-local formats are
+  being added under #743.
 - **From 0.x to 1.0** goes through a **bridge release**: the last 0.x minor.
   It reads every 0.x ledger it is upgraded from, and 1.0 reads the bridge
   release's state. 1.0 does not have to read a v0.7.0 or v0.8.0 ledger
@@ -119,16 +120,48 @@ What is tested today:
   a restart ([`scripts/upgrade-compat.sh`](../../scripts/upgrade-compat.sh)).
 - The metadata tier rolls from the newest release to the current build, one
   voter at a time (live-chaos scenario 22).
+- A metadata voter's directory (the Raft log, the snapshot, the applied,
+  purged and hard-state files), written by the published `vtop-node` of
+  v0.8.0, v0.9.0 and v0.10.1 at the highest feature level each accepts, must
+  open under the current build: the same applied index, voter set, feature
+  level and record generations the release reported, a read-only open that
+  rewrites nothing, and a new write that survives a reopen
+  (`released_meta_dirs` in `vtop-meta`; the fixtures carry a `PROVENANCE`).
+  [`scripts/compat/cells/meta.sh`](../../scripts/compat/cells/meta.sh) runs
+  the same live, in both directions, against a released binary.
 - The released `vtopctl` of v0.7.0 and later is run over a manifest archive
   the current build wrote: v0.8.0 and later must verify it, and v0.7.0 must
   report the documented self-hash failure
-  ([`scripts/manifest-compat.sh`](../../scripts/manifest-compat.sh)).
+  ([`scripts/manifest-compat.sh`](../../scripts/manifest-compat.sh), run by the
+  [Compat workflow](../../.github/workflows/compat.yml) on the published,
+  signature-checked release binaries).
+- **The state ledger and its digests, in the compatibility matrix** (the
+  `ledger-sqlite`, `digests-audit` and `ledger-postgres` cells of
+  [`scripts/compat/expected.yaml`](../../scripts/compat/expected.yaml)). For
+  every release since v0.7.0 the published `vtopctl` writes a SQLite ledger
+  (batches committed, handed back for replay and retired, one committed row
+  pruned into a digest, and from v0.10.0 the audit trail), and the current
+  build must open it, read every row, audit coverage over the ledger and the
+  digest, scrub, recover, archive new input behind it, and leave every
+  batch the release committed committed, with the schema version at the one
+  it writes: opening it is not a one-way step. (A ledger an older release
+  created is at mode 0644, which the current build refuses to read until the
+  operator runs `chmod 0600` on it
+  ([#775](https://github.com/allamiro/vtop-engine/pull/775)); the cell
+  checks that refusal changes nothing, then takes the step.) The same for PostgreSQL, from
+  v0.9.0, with the release built from its tag because the published
+  archives have no PostgreSQL support; the current build runs `vtopctl
+  migrate` on what the release migrated, and a second `migrate` changes
+  nothing. The released ledgers are also committed as fixtures from each
+  release's binary
+  (`crates/vtop-cli/tests/fixtures/ledger-sqlite/<tag>/`, each with a
+  `PROVENANCE`), which `ledger_sqlite_compat` opens on every build.
 
 ## Downgrade
 
-In 0.x, downgrade is not supported. The rules below are the target; each
-applies to a pair of releases once the matrix records a downgrade result for
-it.
+In 0.x, downgrade is not supported, except where the matrix records a
+result for a pair of releases. The rules below are the target; each applies
+to a pair once the matrix records a downgrade result for it.
 
 - **Between patches of one minor:** supported in both directions.
 - **From minor N to N-1:** supported **until the first one-way step**. The
@@ -143,20 +176,40 @@ it.
   one-way step is justified in its pull request and has a refusal test. (The
   SQLite ledger has no such gate yet; see the change rules.)
 - **After a feature level is raised,** the metadata tier can go back only by
-  restoring a backup taken before the raise. That restore will be documented
-  and drilled with the backup work
-  ([#734](https://github.com/allamiro/vtop-engine/issues/734)); until then
-  there is no tested way back after a raise, and there is no export tool.
+  restoring a backup taken before the raise. The ledger's restore is
+  documented and drilled
+  ([#734](https://github.com/allamiro/vtop-engine/issues/734),
+  [Backup and recovery](../operate/backup-and-recovery.md)); the metadata
+  tier's is not, so there is no tested way back after a raise, and there is no
+  export tool.
+
+Today the matrix records downgrade results for these formats, against the
+**previous release** (the older releases down to v0.7.0 are run too, and
+what they do is recorded, not promised):
+
+| Format | The previous release, on what the current build wrote | Recorded in |
+|---|---|---|
+| State ledger, SQLite | Runs `status`, `list-batches` and `process-once`, then (`scripts/ledger-compat.sh`) archives, audits coverage over the digests and writes the nullable columns it knows, and the current build carries on over what it wrote. | `ledger-sqlite` forward |
+| Prune digest and audit trail | Reads the digest (`audit-coverage`, `scrub`) with the `sealed_at` key it does not know, and verifies and lists the audit chain. | `digests-audit` forward |
+| State ledger, PostgreSQL | After the current build ran `vtopctl migrate` and wrote, runs `status`, `list-batches` and `process-once`. Nightly. | `ledger-postgres` forward |
+
+Each is `pass` in `expected.yaml` for the previous release, with one recorded
+refusal: **a release before v0.8.0 stops on a ledger that holds a
+`SUPERSEDED` row** (a handed-back range the current build retired), saying
+`unknown batch state`, on its first read, and changes nothing. A result that
+is not `pass` is an edit to that reviewed file: the older binary exits
+non-zero with a message, and the ledger is exactly as the current build left
+it. Two minors apart is not a supported downgrade.
 
 What an older binary does with newer data, by case:
 
 | Newer data | The N-1 binary | Policy (target) | Tested today |
 |---|---|---|---|
-| A nullable ledger column | Names its own columns, ignores the new one and writes `NULL` in the rows it inserts. A later release reads `NULL` as unknown. | Supported. No marker bump, and the column is never dropped. Only N-1 shares a PostgreSQL ledger with N. | No |
+| A nullable ledger column | Names its own columns, ignores the new one and writes `NULL` in the rows it inserts. A later release reads `NULL` as unknown. | Supported. No marker bump, and the column is never dropped. Only N-1 shares a PostgreSQL ledger with N. | Yes: `sealed_at` (#626) against the previous release, SQLite on every pull request and PostgreSQL nightly (`ledger-sqlite`, `ledger-postgres`, forward) |
 | A Kafka progress marker with a `topic_id` | Ignores the key. It resumes a partition from the newest committed row, as it always did, and its pruning keeps that row. | Supported: an optional field in an unhashed document, read as unknown when absent. | No |
 | A ledger row in a state, or of a source type, N-1 does not know | Fails closed. | One-way: needs a marker or version bump, so the refusal comes at startup and not mid-run. | No |
-| A `0.4` manifest | v0.8.0 and later verify it; v0.7.0 and earlier report it as tampered. | The documented cutoff. Archives are never rewritten; set `write_version: "0.3"` to stop writing more. | Yes: v0.7.0, and v0.8.0 and later (`manifest-compat`) |
-| A metadata log entry or snapshot record from a raised feature level | The voter refuses to start, saying *newer format*, and changes nothing. Today that holds for a new command kind, log entry kind, value tag or key category; other enum values inside records are reported as corrupt until [#763](https://github.com/allamiro/vtop-engine/pull/763). | One-way at the raise, which is operator-gated and permanent. The notes say which level first puts a new kind in the log. | No |
+| A `0.4` manifest | v0.8.0 and later verify it; v0.7.0 and earlier report it as tampered. | The documented cutoff. Archives are never rewritten; set `write_version: "0.3"` to stop writing more. | Yes: v0.7.0, and v0.8.0 and later (the `manifest` cell of the Compat workflow) |
+| A metadata log entry or snapshot record from a raised feature level | The voter refuses to start, saying *newer format*, and changes nothing. Today that holds for a new command kind, log entry kind, value tag or key category; other enum values inside records are reported as corrupt until [#763](https://github.com/allamiro/vtop-engine/pull/763). A raise whose level a release does not support is not such a record: the command is one it decodes, and it applies it as a rejection. | One-way at the raise, which is operator-gated and permanent. The notes say which level first puts a new kind in the log. | Partly. Level 8 is the highest raise today and adds no kind: v0.10.1 reads it, and v0.8.0 and v0.9.0 (level 7) open the directory and take writes: they report level 3 while the raise is still in the log (they apply it as a rejection) and level 8 once it is inside a snapshot (they install the snapshot as it is), so the downgrade is silent, not refused. No release writes a kind an older one cannot decode yet, so the refusal has no live case (`meta.sh` takes `refuse` for the release that adds one) |
 | A segment v2 directory | Every release since v0.5.0 reads v2. | Supported. A later segment version follows [reader first](#reader-first). | No |
 
 ## Deprecation
@@ -172,6 +225,10 @@ What an older binary does with newer data, by case:
   the table below, the release notes, a warning where the surface is used
   (at startup for a config key, on stderr for a flag, and in
   `vtopctl validate` for both), and this page.
+- Commands, flags, accepted values, metric names and label names have their
+  own table, in [Deprecations](../deprecations.md), because CI checks it:
+  the surface is committed under `docs/surface/`, and a pull request that
+  removes or renames one of those without a row there fails (#719).
 
 | Surface | Deprecated in | Earliest removal | Replacement |
 |---|---|---|---|

@@ -1,0 +1,316 @@
+# The compatibility matrix (#743, docs/reference/compatibility.md): released
+# binaries against what this commit writes, and this commit against what
+# released binaries wrote.
+#
+# A cell is one format, one released tag and one direction (upgrade: the
+# release writes, this build reads; forward: this build writes, the release
+# reads). scripts/compat/select_cells.py picks the cells from the
+# repository's tags and scripts/compat/expected.yaml, which lists every
+# expected result that is not `pass`. A refusal with no row there fails.
+#
+# Only tags with a published (non-draft) GitHub release are downloaded: a tag
+# is pushed before release.yml has built its assets, and a tag with no release
+# is not run. The released binaries are the published archives, never rebuilds:
+# scripts/compat/fetch-release.sh checks each against the release's
+# SHA256SUMS and its Sigstore bundle (signed by release.yml at that tag),
+# and checks what the archive holds, before anything runs.
+#
+# How much runs (the #743 decision on hosted-runner cost):
+#   pull request  the newest released minor, plus each exception row's
+#                 boundary (the newest release it names and the first after
+#                 it), so a documented cutoff is checked on both sides on
+#                 every PR at two releases per row;
+#   nightly       every release since each cell applies, so a new tag or a
+#                 change on the runner is seen without a format change;
+#   push to main  the same as a pull request;
+#   on demand     the same as nightly.
+name: Compat
+
+on:
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - 'rust-toolchain*'
+      - 'scripts/compat/**'
+      - 'scripts/manifest-compat.sh'
+      - 'scripts/ledger-compat.sh'
+      - '.github/workflows/compat.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - 'rust-toolchain*'
+      - 'scripts/compat/**'
+      - 'scripts/manifest-compat.sh'
+      - 'scripts/ledger-compat.sh'
+      - '.github/workflows/compat.yml'
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compat-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # The archives every cell runs. The hosted runners are x86_64 Linux.
+  COMPAT_TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  select:
+    name: select the cells
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install the pinned PyYAML
+        run: python -m pip install --disable-pip-version-check --require-hashes -r scripts/compat/requirements.txt
+      - name: The selection and provenance rules hold
+        run: python -m unittest discover -s scripts/compat/tests -v
+      - name: Select
+        id: select
+        env:
+          EVENT: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # A push to main gets the pull request's cells: the nightly run
+          # covers the rest.
+          mode="full"
+          if [[ "$EVENT" == pull_request || "$EVENT" == push ]]; then mode="pr"; fi
+          # Tags with a published release only: a tag whose release is still
+          # being built has no assets to run yet.
+          matrix="$(python scripts/compat/select_cells.py --mode "$mode" --tags-from-releases)"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "mode: $mode"
+          python -m json.tool <<< "$matrix"
+
+  # Every fixture under crates/*/tests/fixtures/<format>/<tag>/ came from that
+  # release's published binary, and its PROVENANCE says so checkably.
+  provenance:
+    name: released-binary fixtures carry their provenance
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install the pinned PyYAML
+        run: python -m pip install --disable-pip-version-check --require-hashes -r scripts/compat/requirements.txt
+      - name: Check every PROVENANCE against its release's SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/compat/check_provenance.py .
+
+  build-head:
+    name: build this commit's vtopctl
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-compat-head-${{ hashFiles('**/Cargo.lock') }}
+      # With the `postgres` feature (the published archives do not have it):
+      # the ledger-postgres cell needs it of both binaries, and the other
+      # cells run the same code on SQLite.
+      - name: Build vtopctl
+        run: cargo build -p vtop-cli --no-default-features --features postgres --bin vtopctl --locked
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: compat-head-bin
+          path: target/debug/vtopctl
+          if-no-files-found: error
+          retention-days: 3
+
+  cell:
+    name: ${{ matrix.cell }} ${{ matrix.direction }} ${{ matrix.tag }} (expect ${{ matrix.expect }})
+    needs: [select, build-head]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.select.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: compat-head-bin
+          path: head
+      - run: chmod +x head/vtopctl
+      # cosign v3: releases are signed in the new Sigstore bundle format,
+      # which cosign v2 cannot read (fetch-release.sh refuses a v2). Pinned
+      # here rather than left to the installer's default.
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: 'v3.0.2'
+      # A published release's assets never change, so the download is cached
+      # by tag; fetch-release.sh checks a cached copy again on every run.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: released/${{ matrix.tag }}
+          key: compat-release-${{ matrix.tag }}-${{ env.COMPAT_TARGET }}
+      - name: Fetch and check the released binaries
+        id: fetch
+        if: matrix.source == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ matrix.tag }}
+        run: |
+          set -euo pipefail
+          dir="$(scripts/compat/fetch-release.sh "$TAG" released "$COMPAT_TARGET")"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+      # A cell whose old binary needs the `postgres` feature builds the
+      # release's tag from source with it: the published archives lack it.
+      # The tag is this repository's own, built with its own lockfile.
+      - name: Build the release's tag with the postgres feature
+        id: build-tag
+        if: matrix.source == 'build'
+        env:
+          TAG: ${{ matrix.tag }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth 1 origin "refs/tags/$TAG:refs/tags/$TAG"
+          git worktree add "$RUNNER_TEMP/old" "$TAG"
+          (cd "$RUNNER_TEMP/old" && cargo build -p vtop-cli --no-default-features --features postgres --bin vtopctl --locked)
+          mkdir -p "$RUNNER_TEMP/old-bin"
+          cp "$RUNNER_TEMP/old/target/debug/vtopctl" "$RUNNER_TEMP/old-bin/"
+          echo "dir=$RUNNER_TEMP/old-bin" >> "$GITHUB_OUTPUT"
+      - name: Start a throwaway PostgreSQL
+        if: matrix.cell == 'ledger-postgres'
+        run: |
+          set -euo pipefail
+          docker run -d --name vtop-compat-pg -e POSTGRES_PASSWORD=compat -p 127.0.0.1:5432:5432 \
+            postgres:16@sha256:63e83b5a3dc36a917dccb76fe1bd2ac51f1ec9c1deb47ff20d4f04233bf6eae9
+          for _ in $(seq 1 60); do
+            docker exec vtop-compat-pg pg_isready -U postgres -h 127.0.0.1 && exit 0
+            sleep 1
+          done
+          docker logs vtop-compat-pg
+          exit 1
+      - name: Run the cell
+        env:
+          CELL: ${{ matrix.cell }}
+          TAG: ${{ matrix.tag }}
+          DIRECTION: ${{ matrix.direction }}
+          EXPECT: ${{ matrix.expect }}
+          MESSAGE: ${{ matrix.message }}
+          RELEASED: ${{ steps.fetch.outputs.dir || steps.build-tag.outputs.dir }}
+          LEDGER_POSTGRES_URL: postgres://postgres:compat@127.0.0.1:5432
+          PSQL: docker exec -i vtop-compat-pg psql
+        run: |
+          COMPAT_WORKDIR="$GITHUB_WORKSPACE/compat-work" \
+            scripts/compat/cell.sh "$CELL" "$TAG" "$DIRECTION" "$EXPECT" "$RELEASED" head "$MESSAGE"
+      - name: Record the result
+        if: always()
+        env:
+          CELL: ${{ matrix.cell }}
+          TAG: ${{ matrix.tag }}
+          DIRECTION: ${{ matrix.direction }}
+          EXPECT: ${{ matrix.expect }}
+          OUTCOME: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          mkdir -p result
+          printf '%s\t%s\t%s\t%s\t%s\n' "$CELL" "$DIRECTION" "$TAG" "$EXPECT" "$OUTCOME" \
+            > "result/$CELL-$DIRECTION-$TAG.tsv"
+          echo "| $CELL | $DIRECTION | $TAG | $EXPECT | $OUTCOME |" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: compat-result-${{ matrix.cell }}-${{ matrix.direction }}-${{ matrix.tag }}
+          path: result/
+          retention-days: 7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: compat-logs-${{ matrix.cell }}-${{ matrix.direction }}-${{ matrix.tag }}
+          path: |
+            compat-work/logs
+            compat-work/*/logs
+            compat-work/*/ledger-compat/logs
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # The tag-by-format table a release note and #714's criteria cite.
+  report:
+    name: compatibility matrix
+    needs: [select, cell]
+    if: always() && needs.select.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: compat-result-*
+          path: results
+          merge-multiple: true
+      - name: Render the table
+        env:
+          MATRIX: ${{ needs.select.outputs.matrix }}
+        run: |
+          set -euo pipefail
+          expected="$(jq '.include | length' <<< "$MATRIX")"
+          {
+            echo "## Compatibility matrix"
+            echo
+            echo "| Cell | Direction | Release | Expected | Outcome |"
+            echo "|---|---|---|---|---|"
+            sort results/*.tsv 2>/dev/null | awk -F'\t' '{ printf "| %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5 }'
+          } >> "$GITHUB_STEP_SUMMARY"
+          got="$(cat results/*.tsv 2>/dev/null | wc -l)"
+          ok="$(cat results/*.tsv 2>/dev/null | awk -F'\t' '$5 == "success"' | wc -l)"
+          echo "$ok of $expected cells succeeded; $got reported"
+          [[ "$got" -eq "$expected" && "$ok" -eq "$expected" ]]
+
+  # A nightly failure mails only whoever last edited the schedule, so it
+  # files (or adds to) one issue instead: the nightly run is how a new tag
+  # or a change on the runners is seen.
+  alert:
+    name: report a nightly failure
+    needs: [select, provenance, build-head, cell, report]
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: File or update the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="compat: the nightly compatibility matrix failed"
+          number="$(gh issue list --state open --search "\"$title\" in:title" --json number,title \
+            --jq ".[] | select(.title == \"$title\") | .number" | head -1)"
+          body="The nightly run of the compatibility matrix failed: $RUN"
+          if [[ -n "$number" ]]; then
+            gh issue comment "$number" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body (#743)."
+          fi

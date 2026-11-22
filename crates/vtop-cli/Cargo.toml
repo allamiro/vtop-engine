@@ -60,6 +60,9 @@ bytes = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The surface snapshot (#719): the vtopctl command tree and the engine's
+# metric families, against docs/surface/.
+vtop-surface = { workspace = true, features = ["clap"] }
 # The in-memory span exporter the trace tests assert against (#683).
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
@@ -105,6 +108,13 @@ required-features = ["kafka"]
 [[test]]
 name = "integration_kafka_auth"
 path = "../../tests/integration_kafka_auth.rs"
+required-features = ["kafka"]
+
+# The same Kafka source against a three-broker cluster whose partition leader
+# is stopped and started mid-read (#721, scripts/kafka-cluster.sh).
+[[test]]
+name = "integration_kafka_cluster"
+path = "../../tests/integration_kafka_cluster.rs"
 required-features = ["kafka"]
 
 # Every failpoint kills the real binary where it says it does (#725).

@@ -253,6 +253,7 @@ async fn backend(endpoint: String, lock: Option<ObjectLockPolicy>) -> S3NativeBa
         request_min_bytes_per_second: 4 * 1024,
         max_egress_bytes_per_second: None,
         object_lock: lock,
+        server_side_encryption: None,
     })
     .await
     .expect("the backend builds against a plaintext lab endpoint")

@@ -1,8 +1,9 @@
 name: fuzz nightly
 
 # Long fuzzing campaigns over every decoder of untrusted bytes, with a corpus
-# that persists from one night to the next, and a report-only mutation run
-# over the verify, recovery and file-continuity code (#729).
+# that persists from one night to the next, and a mutation run over the
+# verify, recovery and file-continuity code, gated per file where the
+# maintainer's threshold can be met and report-only elsewhere (#729).
 #
 # The PR job in ci.yml runs each target for 30 seconds from the committed
 # seeds. That catches a regression on the way in; it does not find the bug
@@ -48,7 +49,7 @@ on:
         type: boolean
         default: false
       mutation:
-        description: "Also run the report-only mutation job"
+        description: "Also run the mutation job"
         type: boolean
         default: true
   pull_request:
@@ -119,7 +120,7 @@ jobs:
       - name: Seed the fuzz lockfile from the workspace
         run: cp Cargo.lock fuzz/Cargo.lock
       # The matrix is whatever the crate declares, so a target added to
-      # fuzz/Cargo.toml (#706's meta_decode, for one) runs here with no edit.
+      # fuzz/Cargo.toml (meta_decode, for one) runs here with no edit.
       - name: List the targets
         id: targets
         run: |
@@ -294,15 +295,25 @@ jobs:
           echo "::error::$TARGET crashed; the input is in the artifact fuzz-crash-$TARGET-${{ github.run_id }}"
           exit 1
 
-  # Report only. The verify, recovery and file-continuity code has no
-  # measured mutation score yet, so a gate on it now would be a number
-  # picked from nothing. This records the score every night; once scores
-  # exist, each file is gated at its measured score minus 5 points, never
-  # below 0.80 (the maintainer's rule on #729).
+  # The verify, recovery and file-continuity code, mutated every night.
+  #
+  # GATED where the maintainer's rule on #729 can be met: each file of a leg
+  # with `gate` fails the job below its own threshold, which is the file's
+  # measured score minus 5 points and never below 0.80 (scripts/mutants-gate.py
+  # --file-min-score). The recovery path in vtop-state is gated. REPORT ONLY
+  # where it cannot yet: vtop-upload and vtop-adapters measured 0.64 to 0.77
+  # over the nights of 2026-11-16 to 2026-11-21, under the 0.80 floor, so a
+  # gate there would fail every night until tests are added; their score is
+  # recorded in the step summary and joins the gate once it reaches 0.85.
+  #
+  # The legs take up to two hours (vtop-adapters measured 110 minutes); the
+  # budget leaves room for a slow runner, which the old 120 minutes did not:
+  # four of the first six nights cancelled a leg part-way, and a cancelled run
+  # has no score at all.
   mutants:
-    name: mutation (report only) ${{ matrix.package }}
+    name: mutation (${{ matrix.gate && 'gated' || 'report only' }}) ${{ matrix.package }}
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 200
     if: github.event_name != 'workflow_dispatch' || inputs.mutation
     strategy:
       fail-fast: false
@@ -311,15 +322,29 @@ jobs:
           # Verification of an upload and the multipart resume checks.
           - package: vtop-upload
             files: crates/vtop-upload/src/base.rs crates/vtop-upload/src/multipart.rs
+            gate: ""
           # File continuity: identity, rotation and resume across restarts.
           - package: vtop-adapters
             files: crates/vtop-adapters/src/continuity.rs crates/vtop-adapters/src/rotated.rs crates/vtop-adapters/src/file_source.rs
-          # Recovery: the ledger's claims, fences and the store's recovery reads.
+            gate: ""
+          # Recovery: the ledger's claims, fences and the store's recovery
+          # reads. Gated: each file's score after the tests of #729 (fence.rs
+          # 36 of 38 = 0.947, sqlite_store.rs 67 of 71 = 0.944, store.rs 13
+          # of 14 = 0.929), minus 5 points, rounded down.
           - package: vtop-state
             files: crates/vtop-state/src/store.rs crates/vtop-state/src/fence.rs crates/vtop-state/src/sqlite_store.rs
+            gate: >-
+              crates/vtop-state/src/store.rs=0.87
+              crates/vtop-state/src/fence.rs=0.89
+              crates/vtop-state/src/sqlite_store.rs=0.89
     env:
       PACKAGE: ${{ matrix.package }}
       FILES: ${{ matrix.files }}
+      GATE: ${{ matrix.gate }}
+      # A pull request that changes this file runs a gated leg in full, so
+      # the gate is proven on the PR head; a report-only leg only lists its
+      # mutants there (two hours would prove nothing the listing does not).
+      RUN_IN_FULL: ${{ github.event_name != 'pull_request' || matrix.gate != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -329,12 +354,12 @@ jobs:
         with:
           tool: cargo-mutants
       - name: Install librdkafka build dependencies
-        if: github.event_name != 'pull_request'
+        if: env.RUN_IN_FULL == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake clang libssl-dev libsasl2-dev libcurl4-openssl-dev zlib1g-dev pkg-config
-      - name: Build the --file arguments
+      - name: Build the --file and --file-min-score arguments
         id: args
         run: |
           args=""
@@ -343,10 +368,21 @@ jobs:
             args="$args --file $f"
           done
           echo "args=$args" >> "$GITHUB_OUTPUT"
-      # On a pull request this lists the mutants instead of testing them: it
-      # proves the scope matches code without spending two hours on it.
+          # Every gated file must be in the scope: a threshold on a file that
+          # is not mutated would gate nothing.
+          gates=""
+          for g in $GATE; do
+            case " $FILES " in
+              *" ${g%=*} "*) ;;
+              *) echo "::error::$g gates a file that is not in this leg's files"; exit 1 ;;
+            esac
+            gates="$gates --file-min-score $g"
+          done
+          echo "gates=$gates" >> "$GITHUB_OUTPUT"
+      # On a pull request a report-only leg lists the mutants instead of
+      # testing them: it proves the scope matches code.
       - name: List the mutants (pull request)
-        if: github.event_name == 'pull_request'
+        if: env.RUN_IN_FULL != 'true'
         env:
           ARGS: ${{ steps.args.outputs.args }}
         run: |
@@ -356,22 +392,35 @@ jobs:
           echo "$count mutant(s) in scope for $PACKAGE" | tee -a "$GITHUB_STEP_SUMMARY"
           test "$count" -gt 0
       - name: Run cargo-mutants
-        if: github.event_name != 'pull_request'
+        if: env.RUN_IN_FULL == 'true'
         env:
           ARGS: ${{ steps.args.outputs.args }}
         run: |
           # shellcheck disable=SC2086
           cargo mutants --package "$PACKAGE" $ARGS \
             --timeout 300 --no-shuffle | tail -40 || true
-      - name: Report the score
-        if: github.event_name != 'pull_request'
+      # The script decides, not cargo-mutants' exit code: it refuses a run
+      # that is not evidence (no end time, a failed baseline, a gated file
+      # with no viable mutant) and names every survivor.
+      - name: Gate or report the score
+        if: env.RUN_IN_FULL == 'true'
+        env:
+          GATE_ARGS: ${{ steps.args.outputs.gates }}
         run: |
-          python3 scripts/mutants-gate.py --report-only \
-            --outcomes mutants.out/outcomes.json \
-            --title "Mutation testing (report only): $PACKAGE" \
-            --summary "$GITHUB_STEP_SUMMARY"
+          if [ -n "$GATE" ]; then
+            # shellcheck disable=SC2086
+            python3 scripts/mutants-gate.py $GATE_ARGS \
+              --outcomes mutants.out/outcomes.json \
+              --title "Mutation testing (gated): $PACKAGE" \
+              --summary "$GITHUB_STEP_SUMMARY"
+          else
+            python3 scripts/mutants-gate.py --report-only \
+              --outcomes mutants.out/outcomes.json \
+              --title "Mutation testing (report only): $PACKAGE" \
+              --summary "$GITHUB_STEP_SUMMARY"
+          fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: always() && github.event_name != 'pull_request'
+        if: always() && env.RUN_IN_FULL == 'true'
         with:
           name: mutants-${{ matrix.package }}-${{ github.run_id }}
           path: |
