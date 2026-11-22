@@ -1,0 +1,19 @@
+[package]
+name = "vtop-s3-testkit"
+description = "Test support for VTOP's live S3 tests (#722): which server a run is against, what that server is expected to do per capability, and a results line per case. Not published."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }

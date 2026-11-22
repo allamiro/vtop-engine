@@ -18,6 +18,7 @@
 //!   [`remote`]    an external Kafka cluster as a Bridge, over these codecs
 //!   [`gateway`]   the listener: frames in, the map behind, refusals by name
 //!   [`native`]    the backend over `LocalBroker` (feature `native`, on by default)
+//!   [`slot`]      a bridge that may be empty, for a gateway that outlives its leadership
 //!
 //! The codec layers landed first, and the bridge and listener after them —
 //! deliberately, because everything above the codecs is a translation, and a
@@ -43,6 +44,7 @@ pub mod offsets;
 pub mod records;
 pub mod refusals;
 pub mod remote;
+pub mod slot;
 pub mod topics;
 mod turnstile;
 pub mod wire;
@@ -51,9 +53,12 @@ pub use bridge::{Appended, Bridge, Fetched, MemoryBridge, Sequenced};
 pub use dual::{
     load_receipts_jsonl, CutoverStore, DualBridge, DualRead, Receipt, ReceiptKind, ReceiptLog,
 };
-pub use gateway::{coordinator_partition_index, Gateway, GatewayConfig, PartitionLeader};
+pub use gateway::{
+    coordinator_partition_index, Gateway, GatewayConfig, GatewayHandle, KafkaBroker,
+    PartitionLeader, Quiesced,
+};
 pub use groups::{Coordinator, GroupConfig};
-pub use lease::{LeaseState, LeaseView};
+pub use lease::{HolderView, LeaseState, LeaseView, RangeHolder};
 pub use messages::{ApiKey, ErrorCode, HeaderVerdict, RequestHeader};
 #[cfg(feature = "native")]
 pub use native::{EpochsExhausted, NativeBridge, NativeBridgeConfig};
@@ -61,5 +66,6 @@ pub use offsets::{Committed, MemoryOffsetStore, OffsetStore, OverlayOffsetStore}
 pub use records::{Record, RecordBatch};
 pub use refusals::{Refusal, Refusals};
 pub use remote::{RemoteBridge, RemoteConfig};
+pub use slot::BridgeSlot;
 pub use topics::{TopicBinding, TopicMap};
 pub use wire::{Decoder, Encoder, WireError};

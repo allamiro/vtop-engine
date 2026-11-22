@@ -1,0 +1,688 @@
+{
+ "kind": "link",
+ "plan_version": 1,
+ "_comment": "What each link run owes (#747). minutes_per_run is an estimate per tool run, not a measurement. Variant keys: link_profile (benchmarks/egress_baseline.py PROFILES), connections (default, or the equal-conns target), grid_point (g1..g6 index into the plan's grids, or best). The system order is rotated by one per repetition.",
+ "plans": {
+  "smoke": {
+   "_comment": "Minutes on any host, the Mac included: the unshaped lan profile, through the middlebox, a few small files, all four tools, the harness read-back. Proves the lab end to end; never a published number.",
+   "host_class": "laptop",
+   "systems": [
+    "aws-cli",
+    "vtop",
+    "rclone",
+    "s5cmd"
+   ],
+   "profiles": {
+    "aws-cli": [
+     "exit-code"
+    ],
+    "vtop": [
+     "strong"
+    ],
+    "rclone": [
+     "size-and-checksum"
+    ],
+    "s5cmd": [
+     "exit-code"
+    ]
+   },
+   "grids": {
+    "vtop": [
+     {
+      "max_concurrency": 4,
+      "parts_in_flight": 1
+     },
+     {
+      "max_concurrency": 8,
+      "parts_in_flight": 1
+     },
+     {
+      "max_concurrency": 16,
+      "parts_in_flight": 1
+     },
+     {
+      "max_concurrency": 4,
+      "parts_in_flight": 3
+     },
+     {
+      "max_concurrency": 8,
+      "parts_in_flight": 2
+     },
+     {
+      "max_concurrency": 8,
+      "parts_in_flight": 3
+     }
+    ],
+    "aws-cli": [
+     {
+      "max_concurrent_requests": 4
+     },
+     {
+      "max_concurrent_requests": 10
+     },
+     {
+      "max_concurrent_requests": 16
+     },
+     {
+      "max_concurrent_requests": 10,
+      "multipart_chunksize": 5242880
+     },
+     {
+      "max_concurrent_requests": 16,
+      "multipart_chunksize": 5242880
+     },
+     {
+      "max_concurrent_requests": 32
+     }
+    ],
+    "rclone": [
+     {
+      "transfers": 4,
+      "upload_concurrency": 1
+     },
+     {
+      "transfers": 8,
+      "upload_concurrency": 1
+     },
+     {
+      "transfers": 16,
+      "upload_concurrency": 1
+     },
+     {
+      "transfers": 4,
+      "upload_concurrency": 4,
+      "upload_cutoff": 8388608,
+      "chunk_size": 5242880
+     },
+     {
+      "transfers": 8,
+      "upload_concurrency": 2,
+      "upload_cutoff": 8388608,
+      "chunk_size": 5242880
+     },
+     {
+      "transfers": 16,
+      "upload_concurrency": 2,
+      "upload_cutoff": 8388608,
+      "chunk_size": 5242880
+     }
+    ],
+    "s5cmd": [
+     {
+      "numworkers": 4,
+      "concurrency": 1
+     },
+     {
+      "numworkers": 8,
+      "concurrency": 1
+     },
+     {
+      "numworkers": 16,
+      "concurrency": 1
+     },
+     {
+      "numworkers": 4,
+      "concurrency": 4,
+      "part_size": 5
+     },
+     {
+      "numworkers": 8,
+      "concurrency": 2,
+      "part_size": 5
+     },
+     {
+      "numworkers": 16,
+      "concurrency": 2,
+      "part_size": 5
+     }
+    ]
+   },
+   "cells": [
+    {
+     "cell": "smoke",
+     "repetitions": 1,
+     "minutes_per_run": 2,
+     "variants": [
+      {
+       "link_profile": "lan",
+       "connections": "default",
+       "grid_point": ""
+      }
+     ],
+     "params": {
+      "files": 4,
+      "file_mib": 10
+     }
+    }
+   ]
+  },
+  "hosted": {
+   "_comment": "A GitHub-hosted runner with ifb (workflow_dispatch): objects committed of 48 on the policed link only, where the link and not the CPU decides; refused for CPU-seconds always (#744 section 4.4).",
+   "host_class": "hosted",
+   "systems": [
+    "aws-cli",
+    "vtop",
+    "rclone",
+    "s5cmd"
+   ],
+   "profiles": {
+    "aws-cli": [
+     "exit-code"
+    ],
+    "vtop": [
+     "strong"
+    ],
+    "rclone": [
+     "size-and-checksum"
+    ],
+    "s5cmd": [
+     "exit-code"
+    ]
+   },
+   "grids": {
+    "vtop": [
+     {
+      "max_concurrency": 4,
+      "parts_in_flight": 1
+     },
+     {
+      "max_concurrency": 8,
+      "parts_in_flight": 1
+     },
+     {
+      "max_concurrency": 16,
+      "parts_in_flight": 1
+     },
+     {
+      "max_concurrency": 4,
+      "parts_in_flight": 3
+     },
+     {
+      "max_concurrency": 8,
+      "parts_in_flight": 2
+     },
+     {
+      "max_concurrency": 8,
+      "parts_in_flight": 3
+     }
+    ],
+    "aws-cli": [
+     {
+      "max_concurrent_requests": 4
+     },
+     {
+      "max_concurrent_requests": 10
+     },
+     {
+      "max_concurrent_requests": 16
+     },
+     {
+      "max_concurrent_requests": 10,
+      "multipart_chunksize": 5242880
+     },
+     {
+      "max_concurrent_requests": 16,
+      "multipart_chunksize": 5242880
+     },
+     {
+      "max_concurrent_requests": 32
+     }
+    ],
+    "rclone": [
+     {
+      "transfers": 4,
+      "upload_concurrency": 1
+     },
+     {
+      "transfers": 8,
+      "upload_concurrency": 1
+     },
+     {
+      "transfers": 16,
+      "upload_concurrency": 1
+     },
+     {
+      "transfers": 4,
+      "upload_concurrency": 4,
+      "upload_cutoff": 8388608,
+      "chunk_size": 5242880
+     },
+     {
+      "transfers": 8,
+      "upload_concurrency": 2,
+      "upload_cutoff": 8388608,
+      "chunk_size": 5242880
+     },
+     {
+      "transfers": 16,
+      "upload_concurrency": 2,
+      "upload_cutoff": 8388608,
+      "chunk_size": 5242880
+     }
+    ],
+    "s5cmd": [
+     {
+      "numworkers": 4,
+      "concurrency": 1
+     },
+     {
+      "numworkers": 8,
+      "concurrency": 1
+     },
+     {
+      "numworkers": 16,
+      "concurrency": 1
+     },
+     {
+      "numworkers": 4,
+      "concurrency": 4,
+      "part_size": 5
+     },
+     {
+      "numworkers": 8,
+      "concurrency": 2,
+      "part_size": 5
+     },
+     {
+      "numworkers": 16,
+      "concurrency": 2,
+      "part_size": 5
+     }
+    ]
+   },
+   "cells": [
+    {
+     "cell": "smoke",
+     "repetitions": 1,
+     "minutes_per_run": 2,
+     "variants": [
+      {
+       "link_profile": "lan",
+       "connections": "default",
+       "grid_point": ""
+      }
+     ],
+     "params": {
+      "files": 4,
+      "file_mib": 10
+     }
+    },
+    {
+     "cell": "committed",
+     "repetitions": 1,
+     "minutes_per_run": 17,
+     "variants": [
+      {
+       "link_profile": "wan100-policed",
+       "connections": "default",
+       "grid_point": ""
+      }
+     ],
+     "params": {
+      "files": 48,
+      "file_mib": 20
+     }
+    }
+   ]
+  },
+  "full": {
+   "_comment": "The dedicated Linux host with ifb (#747 'Where it runs'): about 35 hours of mostly idle wall time; run it in pieces with --budget-minutes and --resume.",
+   "host_class": "dedicated",
+   "systems": [
+    "aws-cli",
+    "vtop",
+    "rclone",
+    "s5cmd"
+   ],
+   "profiles": {
+    "aws-cli": [
+     "exit-code"
+    ],
+    "vtop": [
+     "strong"
+    ],
+    "rclone": [
+     "size-and-checksum"
+    ],
+    "s5cmd": [
+     "exit-code"
+    ]
+   },
+   "grids": {
+    "vtop": [
+     {
+      "max_concurrency": 4,
+      "parts_in_flight": 1
+     },
+     {
+      "max_concurrency": 8,
+      "parts_in_flight": 1
+     },
+     {
+      "max_concurrency": 16,
+      "parts_in_flight": 1
+     },
+     {
+      "max_concurrency": 4,
+      "parts_in_flight": 3
+     },
+     {
+      "max_concurrency": 8,
+      "parts_in_flight": 2
+     },
+     {
+      "max_concurrency": 8,
+      "parts_in_flight": 3
+     }
+    ],
+    "aws-cli": [
+     {
+      "max_concurrent_requests": 4
+     },
+     {
+      "max_concurrent_requests": 10
+     },
+     {
+      "max_concurrent_requests": 16
+     },
+     {
+      "max_concurrent_requests": 10,
+      "multipart_chunksize": 5242880
+     },
+     {
+      "max_concurrent_requests": 16,
+      "multipart_chunksize": 5242880
+     },
+     {
+      "max_concurrent_requests": 32
+     }
+    ],
+    "rclone": [
+     {
+      "transfers": 4,
+      "upload_concurrency": 1
+     },
+     {
+      "transfers": 8,
+      "upload_concurrency": 1
+     },
+     {
+      "transfers": 16,
+      "upload_concurrency": 1
+     },
+     {
+      "transfers": 4,
+      "upload_concurrency": 4,
+      "upload_cutoff": 8388608,
+      "chunk_size": 5242880
+     },
+     {
+      "transfers": 8,
+      "upload_concurrency": 2,
+      "upload_cutoff": 8388608,
+      "chunk_size": 5242880
+     },
+     {
+      "transfers": 16,
+      "upload_concurrency": 2,
+      "upload_cutoff": 8388608,
+      "chunk_size": 5242880
+     }
+    ],
+    "s5cmd": [
+     {
+      "numworkers": 4,
+      "concurrency": 1
+     },
+     {
+      "numworkers": 8,
+      "concurrency": 1
+     },
+     {
+      "numworkers": 16,
+      "concurrency": 1
+     },
+     {
+      "numworkers": 4,
+      "concurrency": 4,
+      "part_size": 5
+     },
+     {
+      "numworkers": 8,
+      "concurrency": 2,
+      "part_size": 5
+     },
+     {
+      "numworkers": 16,
+      "concurrency": 2,
+      "part_size": 5
+     }
+    ]
+   },
+   "cells": [
+    {
+     "cell": "smoke",
+     "repetitions": 1,
+     "minutes_per_run": 2,
+     "variants": [
+      {
+       "link_profile": "lan",
+       "connections": "default",
+       "grid_point": ""
+      }
+     ],
+     "params": {
+      "files": 4,
+      "file_mib": 10
+     }
+    },
+    {
+     "cell": "defaults",
+     "repetitions": 3,
+     "minutes_per_run": 17,
+     "variants": [
+      {
+       "link_profile": "wan100",
+       "connections": "default",
+       "grid_point": ""
+      },
+      {
+       "link_profile": "wan100-loss1",
+       "connections": "default",
+       "grid_point": ""
+      },
+      {
+       "link_profile": "wan100-policed",
+       "connections": "default",
+       "grid_point": ""
+      }
+     ],
+     "params": {
+      "files": 48,
+      "file_mib": 20
+     }
+    },
+    {
+     "cell": "equal-conns",
+     "repetitions": 3,
+     "minutes_per_run": 15,
+     "variants": [
+      {
+       "link_profile": "wan100",
+       "connections": "4",
+       "grid_point": ""
+      },
+      {
+       "link_profile": "wan100",
+       "connections": "8",
+       "grid_point": ""
+      },
+      {
+       "link_profile": "wan100",
+       "connections": "16",
+       "grid_point": ""
+      },
+      {
+       "link_profile": "wan100-loss1",
+       "connections": "4",
+       "grid_point": ""
+      },
+      {
+       "link_profile": "wan100-loss1",
+       "connections": "8",
+       "grid_point": ""
+      },
+      {
+       "link_profile": "wan100-loss1",
+       "connections": "16",
+       "grid_point": ""
+      }
+     ],
+     "params": {
+      "files": 48,
+      "file_mib": 20
+     }
+    },
+    {
+     "cell": "tuned-grid",
+     "repetitions": 1,
+     "minutes_per_run": 3,
+     "variants": [
+      {
+       "link_profile": "wan100",
+       "connections": "default",
+       "grid_point": "g1"
+      },
+      {
+       "link_profile": "wan100",
+       "connections": "default",
+       "grid_point": "g2"
+      },
+      {
+       "link_profile": "wan100",
+       "connections": "default",
+       "grid_point": "g3"
+      },
+      {
+       "link_profile": "wan100",
+       "connections": "default",
+       "grid_point": "g4"
+      },
+      {
+       "link_profile": "wan100",
+       "connections": "default",
+       "grid_point": "g5"
+      },
+      {
+       "link_profile": "wan100",
+       "connections": "default",
+       "grid_point": "g6"
+      },
+      {
+       "link_profile": "wan100-loss1",
+       "connections": "default",
+       "grid_point": "g1"
+      },
+      {
+       "link_profile": "wan100-loss1",
+       "connections": "default",
+       "grid_point": "g2"
+      },
+      {
+       "link_profile": "wan100-loss1",
+       "connections": "default",
+       "grid_point": "g3"
+      },
+      {
+       "link_profile": "wan100-loss1",
+       "connections": "default",
+       "grid_point": "g4"
+      },
+      {
+       "link_profile": "wan100-loss1",
+       "connections": "default",
+       "grid_point": "g5"
+      },
+      {
+       "link_profile": "wan100-loss1",
+       "connections": "default",
+       "grid_point": "g6"
+      },
+      {
+       "link_profile": "wan100-policed",
+       "connections": "default",
+       "grid_point": "g1"
+      },
+      {
+       "link_profile": "wan100-policed",
+       "connections": "default",
+       "grid_point": "g2"
+      },
+      {
+       "link_profile": "wan100-policed",
+       "connections": "default",
+       "grid_point": "g3"
+      },
+      {
+       "link_profile": "wan100-policed",
+       "connections": "default",
+       "grid_point": "g4"
+      },
+      {
+       "link_profile": "wan100-policed",
+       "connections": "default",
+       "grid_point": "g5"
+      },
+      {
+       "link_profile": "wan100-policed",
+       "connections": "default",
+       "grid_point": "g6"
+      }
+     ],
+     "params": {
+      "files": 8,
+      "file_mib": 20
+     }
+    },
+    {
+     "cell": "tuned",
+     "repetitions": 3,
+     "minutes_per_run": 15,
+     "variants": [
+      {
+       "link_profile": "wan100-loss1",
+       "connections": "default",
+       "grid_point": "best"
+      },
+      {
+       "link_profile": "wan100-policed",
+       "connections": "default",
+       "grid_point": "best"
+      }
+     ],
+     "params": {
+      "files": 48,
+      "file_mib": 20
+     }
+    },
+    {
+     "cell": "neighbour",
+     "repetitions": 3,
+     "minutes_per_run": 20,
+     "variants": [
+      {
+       "link_profile": "wan100",
+       "connections": "default",
+       "grid_point": ""
+      }
+     ],
+     "params": {
+      "files": 48,
+      "file_mib": 20,
+      "neighbour_seconds": 120
+     }
+    }
+   ]
+  }
+ }
+}
