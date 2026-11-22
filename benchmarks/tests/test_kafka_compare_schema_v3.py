@@ -12,9 +12,9 @@ import csv
 import os
 
 import pytest
+from test_kafka_compare_schema_v2 import PHASE_1, complete_rows, environment, write_run
 
 from kafka_compare import e2e, plan, schema
-from test_kafka_compare_schema_v2 import PHASE_1, complete_rows, environment, write_run
 
 V3 = {
     "record_sizes": [100], "partitions": [1], "producers": [1], "compressions": ["none"], "acks": ["all"],
