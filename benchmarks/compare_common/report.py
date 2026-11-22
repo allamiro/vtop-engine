@@ -49,6 +49,9 @@ class Metric(NamedTuple):
     cells: tuple[str, ...]
     reduce: str = "median"  # or "sum" (counts across repetitions, e.g. gaps after kills)
     digits: int = 1
+    # False for a display-only metric (a tuned result drawn beside the defaults): charted and tabled,
+    # never in the scoreboard or the ahead/level/behind sentences (#744 rule 14).
+    ranked: bool = True
 
 
 class Chart(NamedTuple):
@@ -376,7 +379,7 @@ def build(run_dir: str, spec: Report, repo: str, *, doc_path: str | None = None,
     doc_path = doc_path or os.path.join(repo, "docs", "benchmarks", f"{spec.doc_name}.md")
     img_dir = img_dir or os.path.join(repo, "docs", "benchmarks", spec.img_dir)
     footer = footer_text(env, systems, reg, rows)
-    metrics = [m for chart in spec.charts for m in chart.metrics]
+    metrics = [m for chart in spec.charts for m in chart.metrics if m.ranked]
     scores = scoreboard(rows, kind, metrics, systems, profiles, spec.group_label)
     plt = setup_matplotlib(f"vtop-{kind.name}-compare")
     os.makedirs(img_dir, exist_ok=True)
