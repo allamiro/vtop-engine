@@ -434,7 +434,7 @@ formats:
     marker: none
     status: experimental
     at_1_0: experimental
-    fuzz: [kafka_request]
+    fuzz: [kafka_request, kafka_batch]
 
   - id: 23
     name: "`config.yaml`"
