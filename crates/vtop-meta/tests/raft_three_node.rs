@@ -1322,6 +1322,78 @@ async fn single_node_client_write_commits() {
     assert!(resp.log_id.index >= 1);
 }
 
+/// #743: a raise above the leader's own level never reaches the log. Applied
+/// there it would stop this leader's Raft engine, and every voter on its
+/// release with it, so the leader refuses it, names both levels, and leaves
+/// the log and the level as they were.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_raise_above_this_builds_level_is_refused_before_the_log() {
+    use vtop_meta::{Consensus, ConsensusError, OpenraftConsensus};
+    use vtop_meta::{BASELINE_FEATURE_LEVEL, SUPPORTED_FEATURE_LEVEL};
+
+    let seed = SEED ^ 0x743;
+    let mut cluster = Cluster::boot(seed).await;
+    let consensus = OpenraftConsensus::new(cluster.leader().raft.clone())
+        .with_store(cluster.leader().store.clone())
+        .with_member_probe(this_build());
+    let before = cluster
+        .leader()
+        .raft
+        .metrics()
+        .borrow()
+        .last_log_index
+        .unwrap_or(0);
+    let above = SUPPORTED_FEATURE_LEVEL + 1;
+    let env = cluster.envelope();
+    match consensus
+        .propose(MetadataCommand::SetFeatureLevel {
+            env,
+            feature_level: above,
+        })
+        .await
+    {
+        Err(ConsensusError::Refused(message)) => {
+            assert!(
+                message.contains(&format!("feature level {above}")),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("({SUPPORTED_FEATURE_LEVEL})")),
+                "{message}"
+            );
+            assert!(
+                message.contains("Run the metadata tier on a release"),
+                "{message}"
+            );
+            assert!(
+                message.len() <= 256,
+                "over the admin error bound: {message}"
+            );
+        }
+        other => {
+            panic!("a raise above this build's level was not refused (seed={seed:#x}): {other:?}")
+        }
+    }
+    assert_eq!(
+        cluster
+            .leader()
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .unwrap_or(0),
+        before,
+        "the refused raise reached the log"
+    );
+    assert_eq!(
+        cluster
+            .leader()
+            .store
+            .with_storage(|s| s.state().feature_level()),
+        BASELINE_FEATURE_LEVEL
+    );
+}
+
 /// #554: during a rolling upgrade an upgraded leader must not put a command
 /// kind into the log that a voter still on the previous release cannot decode
 /// - the old voter would fail the whole AppendEntries batch and append nothing
