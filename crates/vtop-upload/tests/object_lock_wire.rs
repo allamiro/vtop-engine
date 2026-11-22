@@ -823,6 +823,27 @@ async fn an_absent_lock_is_confirmed_with_a_request_that_refuses_rather_than_omi
         .confirm_lock_absent(uri, Some("ver-1"), LockPart::Retention)
         .await
         .unwrap());
+    // SeaweedFS's spellings of the same answer (#722): a 404 naming the
+    // missing lock configuration, and one naming the missing legal hold.
+    // Still an absent lock, not an error.
+    let seaweed = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error>\
+                   <Code>ObjectLockConfigurationNotFoundError</Code>\
+                   <Message>Object Lock configuration does not exist for this bucket</Message>\
+                   </Error>";
+    store.answer_retention("404 Not Found", seaweed);
+    assert!(backend
+        .confirm_lock_absent(uri, Some("ver-1"), LockPart::Retention)
+        .await
+        .unwrap());
+    let seaweed_hold = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error>\
+                        <Code>NoSuchObjectLegalHold</Code>\
+                        <Message>The specified object does not have a legal hold</Message>\
+                        </Error>";
+    store.answer_legal_hold("404 Not Found", seaweed_hold);
+    assert!(backend
+        .confirm_lock_absent(uri, None, LockPart::LegalHold)
+        .await
+        .unwrap());
     store.answer_retention(
         "200 OK",
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Retention><Mode>GOVERNANCE</Mode>\
