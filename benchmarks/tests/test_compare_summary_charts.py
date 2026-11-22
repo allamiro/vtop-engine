@@ -44,7 +44,10 @@ def test_every_kind_measured_draws_every_chart_with_a_source_and_a_scoreboard_ro
                 # the metric's table, then its scoreboard rows (#744 section 8 test 10: VTOP's is always there)
                 assert block.count(f"**{label}**") == 1
                 assert re.search(rf"^\| {re.escape(label)} \| .* \|$", block, re.M)
-    assert "not measured yet" not in page.split("## Products")[0].replace("What is measured yet", "")
+    # Every kind is measured: the status table and the verdicts say so. (A table may still say "not measured
+    # yet" in a secondary-profile column whose profile the plan does not run in that cell.)
+    top = page.split("## (a)", 1)[0]
+    assert "not measured yet" not in top.replace("What is measured yet", "")
 
 
 def test_vtop_last_is_in_the_scoreboard_and_in_the_sentences_that_say_it_is_behind(tmp_path):
@@ -99,10 +102,10 @@ def test_each_chart_s_source_tool_versions_and_licences_come_from_its_run_and_th
     products = page.split("## Products, versions and licences", 1)[1].split("\n## ", 1)[0]
     reg = registry.load()
     for pid in ("vector", "fluent-bit", "rclone"):
-        row = next(line for line in products.splitlines()
-                   if line.startswith(f"| {creport.md_cell(registry.product(reg, pid)['name'])} |"))
+        name = registry.product(reg, pid)["name"]
+        row = next(line for line in products.splitlines() if line.startswith(f"| {name} |"))
         assert "fixture" in row, row  # the version the run recorded, not the registry's pin
-        assert creport.md_cell(registry.product(reg, pid)["licence"]) in row
+        assert f" {registry.product(reg, pid)['licence']} " in row
     vtop = next(line for line in products.splitlines() if line.startswith("| VTOP |"))
     assert "commit 000000000000" in vtop and "MIT" in vtop
 

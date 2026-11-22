@@ -263,6 +263,17 @@ def check_summary_spec() -> None:
 # ------------------------------------------------------------------------ pieces
 
 
+def link_table(header: Sequence[str], body: Sequence[Sequence[str]]) -> str:
+    """A Markdown table whose cells may hold the code spans and links written here (creport.md_table escapes
+    those); only the cell separator is escaped."""
+    def cell(text: str) -> str:
+        return " ".join(str(text).split()).replace("|", "\\|")
+
+    lines = ["| " + " | ".join(cell(h) for h in header) + " |", "|" + "---|" * len(header)]
+    lines += ["| " + " | ".join(cell(c) for c in line) + " |" for line in body]
+    return "\n".join(lines)
+
+
 def _fmt(v: creport.Value, metric: creport.Metric) -> str:
     if v.summary is None and v.stub in ("no row", "not measured"):
         return NOT_MEASURED
@@ -441,7 +452,7 @@ def _status_table(measured: Mapping[str, Measured], doc_dir: str, reg: dict[str,
         c = m.env["comparable"]
         body.append([kind, cases, f"`{m.env['run_id']}`", str(c.get("host_class")), str(m.env["plan"].get("name")),
                      m.env["started_at"][:10], f"[full report]({kind_page(kind)})"])
-    return creport.md_table(["comparison", "use cases", "run", "host class", "plan", "date", "page"], body)
+    return link_table(["comparison", "use cases", "run", "host class", "plan", "date", "page"], body)
 
 
 def _standing_section(scores_by_case: Mapping[str, Mapping[str, list[creport.Score]]],
@@ -489,8 +500,8 @@ def _products_table(measured: Mapping[str, Measured], reg: dict[str, Any]) -> st
                      ", ".join(f"({c})" for c in sorted(cases[system])),
                      f"[licence]({p['evidence_url']}), read {p['retrieved']}; publish_ok {str(p['publish_ok']).lower()}"
                      ])
-    return creport.md_table(["product", "role", "licence", "version", "profile drawn (what its commit means)",
-                             "use cases", "evidence"], body)
+    return link_table(["product", "role", "licence", "version", "profile drawn (what its commit means)",
+                       "use cases", "evidence"], body)
 
 
 def _run_limits(measured: Mapping[str, Measured]) -> list[str]:

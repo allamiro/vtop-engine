@@ -157,15 +157,15 @@ Not measured yet: no committed `archive` run yet. Every cell below is empty unti
 
 | product | role | licence | version | profile drawn (what its commit means) | use cases | evidence |
 |---|---|---|---|---|---|---|
-| Kafka Connect S3 (Lenses) | comparand | Apache-2.0 | 12.1.2 (pinned, not run yet) |  | (a), (d), (e) | \[licence\](https://github.com/lensesio/stream-reactor/blob/master/LICENSE), read 2026-11-14; publish\_ok true |
-| VTOP | subject | MIT | commit under test |  | (a), (b), (c), (d), (e) | \[licence\](https://github.com/allamiro/vtop-engine/blob/main/LICENSE), read 2026-11-22; publish\_ok true |
-| Vector | comparand | MPL-2.0 | 0.61.0 (pinned, not run yet) |  | (a), (b), (d), (e) | \[licence\](https://github.com/vectordotdev/vector/blob/master/LICENSE), read 2026-11-14; publish\_ok true |
-| Fluent Bit | comparand | Apache-2.0 | 5.2.0 (pinned, not run yet) |  | (b), (d) | \[licence\](https://github.com/fluent/fluent-bit/blob/master/LICENSE), read 2026-11-14; publish\_ok true |
-| OpenTelemetry Collector | comparand | Apache-2.0 | 0.165.0 (pinned, not run yet) |  | (b), (d) | \[licence\](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/LICENSE), read 2026-11-14; publish\_ok true |
-| aws-cli | comparand | Apache-2.0 | 2.40.3 (pinned, not run yet) |  | (c) | \[licence\](https://github.com/aws/aws-cli/blob/v2/LICENSE.txt), read 2026-11-14; publish\_ok true |
-| rclone | comparand | MIT | 1.76.0 (pinned, not run yet) |  | (c) | \[licence\](https://github.com/rclone/rclone/blob/master/COPYING), read 2026-11-14; publish\_ok true |
-| s5cmd | comparand | MIT | 2.3.0 (pinned, not run yet) |  | (c) | \[licence\](https://github.com/peak/s5cmd/blob/master/LICENSE), read 2026-11-14; publish\_ok true |
-| Apache Kafka (the source) | source | Apache-2.0 | 4.3.2 (pinned, not run yet) |  | (a) | \[licence\](https://github.com/apache/kafka/blob/trunk/LICENSE), read 2026-11-14; publish\_ok true |
+| Kafka Connect S3 (Lenses) | comparand | Apache-2.0 | 12.1.2 (pinned, not run yet) |  | (a), (d), (e) | [licence](https://github.com/lensesio/stream-reactor/blob/master/LICENSE), read 2026-11-14; publish_ok true |
+| VTOP | subject | MIT | commit under test |  | (a), (b), (c), (d), (e) | [licence](https://github.com/allamiro/vtop-engine/blob/main/LICENSE), read 2026-11-22; publish_ok true |
+| Vector | comparand | MPL-2.0 | 0.61.0 (pinned, not run yet) |  | (a), (b), (d), (e) | [licence](https://github.com/vectordotdev/vector/blob/master/LICENSE), read 2026-11-14; publish_ok true |
+| Fluent Bit | comparand | Apache-2.0 | 5.2.0 (pinned, not run yet) |  | (b), (d) | [licence](https://github.com/fluent/fluent-bit/blob/master/LICENSE), read 2026-11-14; publish_ok true |
+| OpenTelemetry Collector | comparand | Apache-2.0 | 0.165.0 (pinned, not run yet) |  | (b), (d) | [licence](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/LICENSE), read 2026-11-14; publish_ok true |
+| aws-cli | comparand | Apache-2.0 | 2.40.3 (pinned, not run yet) |  | (c) | [licence](https://github.com/aws/aws-cli/blob/v2/LICENSE.txt), read 2026-11-14; publish_ok true |
+| rclone | comparand | MIT | 1.76.0 (pinned, not run yet) |  | (c) | [licence](https://github.com/rclone/rclone/blob/master/COPYING), read 2026-11-14; publish_ok true |
+| s5cmd | comparand | MIT | 2.3.0 (pinned, not run yet) |  | (c) | [licence](https://github.com/peak/s5cmd/blob/master/LICENSE), read 2026-11-14; publish_ok true |
+| Apache Kafka (the source) | source | Apache-2.0 | 4.3.2 (pinned, not run yet) |  | (a) | [licence](https://github.com/apache/kafka/blob/trunk/LICENSE), read 2026-11-14; publish_ok true |
 
 ## Fairness rules
 

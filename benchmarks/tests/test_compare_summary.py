@@ -107,9 +107,9 @@ def test_the_products_table_states_licence_version_and_evidence_from_the_registr
     for pid in ("vtop", "kafka", "connect-lenses", "vector", "fluent-bit", "otel-collector", "aws-cli", "rclone",
                 "s5cmd"):
         entry = registry.product(reg, pid)
-        row = next(line for line in table.splitlines() if line.startswith(f"| {creport.md_cell(entry['name'])} |"))
-        assert creport.md_cell(entry["licence"]) in row, row
-        assert entry["evidence_url"] in row.replace("\\", "") and entry["retrieved"] in row
+        row = next(line for line in table.splitlines() if line.startswith(f"| {entry['name']} |"))
+        assert f" {entry['licence']} " in row, row
+        assert f"[licence]({entry['evidence_url']})" in row and entry["retrieved"] in row
     assert registry.product(reg, "vtop")["licence"] == "MIT"
     assert "VTOP's licence is MIT" in page
 
