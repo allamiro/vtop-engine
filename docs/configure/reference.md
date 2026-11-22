@@ -15,6 +15,7 @@ Default column means the key is unset unless you set it.
     Most sections accept a key they do not know and ignore it, so a misspelled
     key falls back to its default without an error. The exceptions, which
     refuse unknown keys, are `upload.transports.<name>`, `upload.object_lock`,
+    `upload.server_side_encryption`,
     a stream's `checksum` block, and the `{ env: ... }` / `{ file: ... }` forms of
     `engine.state_store`. Check what took effect with
     `vtopctl validate --print-effective`.
@@ -45,7 +46,7 @@ Default column means the key is unset unless you set it.
 | `work_retention_seconds` | `86400` | Staging files left by a crash and older than this are removed. Successful batches remove theirs at once. |
 | `work_max_bytes` | `10737418240` (10 GiB) | Ceiling on VTOP staging files in `work_dir`. Startup removes the oldest until the directory is under it. |
 | `log_level` | `INFO` | Log level. `--log-level` overrides it, and `RUST_LOG` overrides both. |
-| `ledger_retention_days` | - (no pruning) | Prune `SOURCE_COMMITTED` rows older than this many days, on idle cycles. The newest committed row per source path is always kept. Refused on PostgreSQL; schedule `vtopctl prune-ledger` there instead. |
+| `ledger_retention_days` | - (no pruning) | Prune `SOURCE_COMMITTED` rows older than this many days, on idle cycles. The newest committed row per source path is always kept, and for Kafka the committed row with the highest end offset per topic, partition, consumer group and topic id (the newest row for rows recorded without a topic id). Refused on PostgreSQL; schedule `vtopctl prune-ledger` there instead. |
 | `ledger_prune_batch` | `500` | Most rows deleted per prune pass. Must be at least 1. |
 | `state_store_timeout_seconds` | `30` | Limit for one state-store request. Whole-ledger scans (startup recovery, pruning) get ten times it. Must be > 0. |
 | `ledger_digest_dir` | - | Where prune digests are written and read. Unset: `<database file>.ledger-digests` beside a SQLite file, otherwise `<work_dir>/ledger-digests`, which is scratch; name a durable directory for PostgreSQL. |
@@ -245,8 +246,9 @@ The Kafka releases the source is tested against are listed in
 | `max_concurrency_ceiling` | - | An operator maximum above the concurrency settings: `batching.max_concurrent_batches`, `batching.adaptive_width.min_width` and every `transports.*.max_concurrency` must be at or below it. |
 | `create_bucket` | `false` | `s3_native` only: create the bucket if it does not exist. Needs the CreateBucket permission. |
 | `require_strong_verification` | `true` | Commit only when verification is derived from stored content or a store-computed digest. `false` accepts same-size corruption; the engine warns at startup and in `validate`. |
-| `require_object_versioning` | `false` | Hardened profile: the bucket must have versioning enabled and every manifest upload must return a version, which recovery then reads. A backend that cannot address object versions refuses startup, and so does a literal bucket without versioning or on a store that does not implement it; a templated bucket, or one `create_bucket` will create, is checked at its first upload instead, and refused there in the same words. |
+| `require_object_versioning` | `false` | Hardened profile: the bucket must have versioning enabled and every manifest upload must return a version, which recovery then reads. A backend that cannot address object versions refuses startup, and so does a literal bucket without versioning or on a store that does not implement it; a templated bucket, or one `create_bucket` will create, is checked at its first upload instead. A bucket that does not keep versions at a batch (its versioning suspended under a running engine, or a templated bucket without it) is not written to: the engine stops writing to it, checks its versioning again on a backoff (5 s, doubling to 60 s) and resumes once it is enabled; nothing in it commits meanwhile (`vtop_bucket_versioning_paused`, runbook [VtopBucketVersioningPaused](../operate/runbooks.md#vtopbucketversioningpaused)). |
 | `object_lock` | - | `s3_native` only (any other backend is refused at load): the S3 Object Lock profile. Write every object and manifest under a retention lock, refuse a bucket without Object Lock, and fail a batch whose stored object or manifest does not carry the retention asked for. Needs `require_object_versioning: true`; refuses `create_bucket: true`. See [below](#uploadobject_lock). |
+| `server_side_encryption` | `{mode: none}` | `s3_native` only (any mode but `none` is refused at load on every other backend): encryption at rest through S3 server-side encryption. Every object, manifest and verification receipt write, single-part and multipart, asks the store to encrypt it, and a batch whose stored object is not reported as encrypted the way it was asked for fails verification, as a checksum mismatch does, and is replayed. `none` sends no encryption header and checks nothing. SSE-C is not supported. See [below](#uploadserver_side_encryption). |
 | `local_path` | - | `localfs` only, and required there: objects are written under `<local_path>/<bucket>/<key>`. |
 | `command_binary` | - | `awscli`, `s3cmd`, `minio`: absolute path of the client. Required for those backends; PATH is never searched. |
 | `profile` | - | Command backends: named profile or alias (`minio` defaults to `local`). |
@@ -286,6 +288,32 @@ deployment profile, with the bucket setup and the permissions, is
 | `mode` | **Required** in the block | `governance` (a principal with `s3:BypassGovernanceRetention` can shorten or remove it) or `compliance` (nobody can, the account root included, until the date passes; the engine warns at startup). |
 | `retain_days` | **Required** in the block | Days each object and manifest is retained, counted from its write (from its CreateMultipartUpload for a multipart object). 1 to 3650. |
 | `legal_hold` | `false` | Also place a legal hold on every object and manifest. It has no end date: it stays until someone with `s3:PutObjectLegalHold` removes it. |
+
+### `upload.server_side_encryption`
+
+Encryption at rest through the store (SSE-S3 or SSE-KMS). Unset is the same as
+`mode: none`: no encryption header is sent and nothing is checked. Unknown keys
+inside the block are refused, so a misspelled key cannot fall back to writing
+unencrypted objects. The block is read by `s3_native` only: any other backend
+refuses a mode other than `none` at load, because it would write plaintext
+while the config says otherwise. SSE-C (a key VTOP would have to supply on
+every request) is out of scope. How it is checked, and what the identity needs
+to be allowed, is in the
+[security model](../SECURITY_MODEL.md#7-data-at-rest-and-object-immutability).
+
+```yaml
+upload:
+  server_side_encryption:
+    mode: sse-kms
+    kms_key_id: arn:aws:kms:eu-west-1:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab
+    bucket_key: true
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `mode` | `none` | `none`; `sse-s3` (`x-amz-server-side-encryption: AES256`, keys the store manages); or `sse-kms` (`aws:kms`). Verification fails the batch when the store reports no encryption, or an algorithm other than the one asked for. |
+| `kms_key_id` | - | `sse-kms` only, and optional. **Unset**, the request carries `aws:kms` and no key id, so the store applies its default KMS key: on AWS, the account's AWS-managed `aws/s3` key, which has no monthly charge. Verification then accepts any `aws:kms` object and checks the algorithm only; it does not check that the key is `aws/s3`. **Set** (a key id, a key ARN, an alias or an alias ARN), it is sent with every write and verification also checks the key the store reports: a match by key id or by key ARN passes, anything else fails the batch. A store reports the key's ARN and never an alias, so for an alias only the algorithm is checked and the engine says so at startup. Refused with any other mode. |
+| `bucket_key` | `false` | `sse-kms` only: ask S3 to use an S3 Bucket Key, which cuts the KMS requests a busy bucket makes. Not checked at verification. Refused with any other mode. |
 
 ## `partitioning`
 

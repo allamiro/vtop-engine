@@ -50,7 +50,16 @@ pub const STAGES: [&str; 7] = [
 /// is not usable either (a store that does not keep the lock), so nothing is
 /// written and the batch fails; outside the `fallback_` prefix on purpose,
 /// since no second object was written.
-pub const OBJECT_KEY_DECISIONS: [&str; 13] = [
+///
+/// The last two (#773) are taken only on a backend that cannot report an
+/// absent key (`awscli`, `minio`, `s3cmd`), for a window that rebuilds one an
+/// earlier attempt sealed, when the ledger recorded the object that attempt
+/// uploaded. `adopted`: that object was read back and its bytes match the
+/// batch's digest, so it is reused and nothing is uploaded. `adopt_rejected`:
+/// it did not verify (damaged, missing, unreadable, size-only) or lies outside
+/// the configured bucket and prefix, so the batch is written under its attempt
+/// key as a second object, and the recorded one is left as it is.
+pub const OBJECT_KEY_DECISIONS: [&str; 15] = [
     "derived",
     "reused",
     "fallback_differs",
@@ -64,6 +73,8 @@ pub const OBJECT_KEY_DECISIONS: [&str; 13] = [
     "fallback_lock_mode",
     "fallback_hold_missing",
     "lock_withheld",
+    "adopted",
+    "adopt_rejected",
 ];
 
 /// The values of `result` on `vtop_replay_rebuilds_total` (#626): what a
@@ -140,6 +151,10 @@ pub const RECOVERY_HOLD_REASONS: [&str; 2] = ["ledger_write_failed", "newer_mani
 /// The values of `mode` on `vtop_object_lock_mode` (#684).
 pub const OBJECT_LOCK_MODES: [&str; 3] = ["off", "governance", "compliance"];
 
+/// The values of `mode` on `vtop_server_side_encryption_mode`: the spellings
+/// of `upload.server_side_encryption.mode`.
+pub const SERVER_SIDE_ENCRYPTION_MODES: [&str; 3] = ["none", "sse-s3", "sse-kms"];
+
 /// The values of `outcome` on `vtop_file_delete_decisions_total` (#619):
 /// `deleted`, `deleted_unchecked` (deleted under `delete_without_open_check`
 /// with no lease to prove no process had it open), or why
@@ -207,6 +222,14 @@ pub struct Metrics {
     /// is set, 1 for `mode="off"` otherwise; the other values read 0. Set
     /// once at startup, like `verification_mode`.
     pub object_lock_mode: IntGaugeVec,
+
+    /// The server-side encryption this engine writes under, set once at
+    /// startup like `verification_mode`: 1 for the configured
+    /// `upload.server_side_encryption.mode` (`none`, `sse-s3`, `sse-kms`),
+    /// 0 for the others. A batch whose stored object does not report the
+    /// encryption asked for fails verification and counts in
+    /// `vtop_verification_failures_total`.
+    pub server_side_encryption_mode: IntGaugeVec,
     /// Object Lock checks by `result` (#684), the bounded set
     /// [`OBJECT_LOCK_CHECK_RESULTS`]: one per object and per manifest a
     /// batch wrote or reused under the profile, plus `bucket_not_locked`
@@ -281,6 +304,15 @@ pub struct Metrics {
     /// width, or the adaptive controller's current one. Read beside
     /// `upload_throttled_total`: a width that fell is a store that asked.
     pub upload_width: IntGauge,
+    /// Buckets the engine stopped writing to because they no longer keep
+    /// object versions while `upload.require_object_versioning` is set: a
+    /// PUT returned no version to pin, or the store said versioning is not
+    /// enabled. Nothing in such a bucket commits until its versioning is
+    /// enabled again. Non-zero is an operator action.
+    pub bucket_versioning_paused: IntGauge,
+    /// Batches that failed without writing anything because writes to their
+    /// bucket were paused (see `bucket_versioning_paused`); each is replayed.
+    pub bucket_versioning_paused_batches_total: IntCounterVec,
     /// Cycles where a source read failed and was skipped (the engine retries
     /// next cycle). A steady rate means a source is unhealthy.
     ///
@@ -328,7 +360,10 @@ pub struct Metrics {
     /// `per_attempt` rate means replays are writing second objects. Under
     /// the Object Lock profile, `fallback_unlocked`, `fallback_lock_mode`,
     /// `fallback_hold_missing` and `lock_withheld` mean an object that should
-    /// be locked is not (#709).
+    /// be locked is not (#709). `adopted` is a replay on a backend that cannot
+    /// report an absent key reusing the object the earlier attempt recorded,
+    /// and `adopt_rejected` the same replay finding that object unusable
+    /// and writing a second one (#773).
     pub object_key_decisions_total: IntCounterVec,
     /// What each replay of a window an earlier attempt sealed came to (#626),
     /// by the bounded set [`REPLAY_REBUILD_RESULTS`]. Any result but `exact`
@@ -414,7 +449,7 @@ pub struct Metrics {
 
 /// The values of `action` on `vtop_audit_events_total` (#694); the same set
 /// as `vtop_observe::audit::Action`.
-pub const AUDIT_ACTIONS: [&str; 13] = [
+pub const AUDIT_ACTIONS: [&str; 14] = [
     "ledger.replay",
     "ledger.prune",
     "ledger.migrate",
@@ -428,6 +463,7 @@ pub const AUDIT_ACTIONS: [&str; 13] = [
     "node.reconfigure_range",
     "promotion.attest",
     "security.override",
+    "native.session",
 ];
 
 /// The values of `outcome` on `vtop_audit_events_total`.
@@ -496,6 +532,14 @@ impl Metrics {
             &["tenant", "mode"],
         )?;
         registry.register(Box::new(object_lock_mode.clone()))?;
+        let server_side_encryption_mode = IntGaugeVec::new(
+            Opts::new(
+                "server_side_encryption_mode",
+                "1 for the server-side encryption mode this engine writes under (none, sse-s3, sse-kms), from upload.server_side_encryption.mode",
+            ),
+            &["tenant", "mode"],
+        )?;
+        registry.register(Box::new(server_side_encryption_mode.clone()))?;
         let object_lock_checks_total = cv(
             "object_lock_checks_total",
             "S3 Object Lock checks of written or reused objects and manifests, by result (ok, missing, mode_mismatch, too_short, legal_hold_missing, error) and bucket_not_locked or store_unsupported for a batch refused at its bucket's preflight; anything but ok failed the batch, which is replayed",
@@ -691,6 +735,16 @@ impl Metrics {
             "Uploads kept in flight this cycle: the configured width, or the adaptive controller's current width when batching.adaptive_width is enabled",
         ))?;
         registry.register(Box::new(upload_width.clone()))?;
+        let bucket_versioning_paused = IntGauge::with_opts(Opts::new(
+            "bucket_versioning_paused",
+            "Buckets the engine stopped writing to under upload.require_object_versioning because they no longer keep object versions (a PUT returned no version to pin, or the store said versioning is not enabled); nothing in them commits until versioning is enabled again, and the engine checks on a backoff of at most 60 s",
+        ))?;
+        registry.register(Box::new(bucket_versioning_paused.clone()))?;
+        let bucket_versioning_paused_batches_total = cv(
+            "bucket_versioning_paused_batches_total",
+            "Batches that failed without writing anything because writes to their bucket were paused (see vtop_bucket_versioning_paused); each is replayed",
+            labels3(),
+        )?;
 
         Ok(Self {
             registry,
@@ -701,6 +755,7 @@ impl Metrics {
             verification_backend_limited_total,
             verification_mode,
             object_lock_mode,
+            server_side_encryption_mode,
             object_lock_checks_total,
             replay_required_total,
             failed_total,
@@ -719,6 +774,8 @@ impl Metrics {
             compression_ratio,
             inflight_batches,
             upload_width,
+            bucket_versioning_paused,
+            bucket_versioning_paused_batches_total,
             source_read_errors_total,
             retention_lost_records_total,
             source_replay_refused_total,
