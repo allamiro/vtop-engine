@@ -1463,6 +1463,19 @@ async fn repair(
         .map_err(|error| format!("install epoch history in {}: {error}", into.display()))?;
     }
 
+    // A repaired directory holds the source's history, so no broken-history
+    // mark (#881) may stand in it. Repair only writes into a fresh directory
+    // or one an earlier repair owns, so there is normally none; one there
+    // would refuse every session to a replica that is now whole.
+    vtop_broker::fencing_epochs::BreakMarker::beside(&env, into.join("fencing-epochs"))
+        .clear()
+        .map_err(|error| {
+            format!(
+                "clear the broken-history mark in {}: {error}",
+                into.display()
+            )
+        })?;
+
     // ADOPT, so the result is a range and not a pile of segments. The successor
     // id is minted here because nothing else in this command owns one, and a
     // fresh id is correct: this tail has never existed anywhere else.
