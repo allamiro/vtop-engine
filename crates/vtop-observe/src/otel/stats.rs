@@ -7,7 +7,8 @@
 
 use std::sync::OnceLock;
 
-use prometheus::{IntCounter, IntCounterVec, IntGauge, Opts, Registry};
+use prometheus::{IntCounter, IntCounterVec, IntGauge, Opts};
+use vtop_surface::Registry;
 
 /// The counters. Every label is from a fixed set.
 #[derive(Clone)]
