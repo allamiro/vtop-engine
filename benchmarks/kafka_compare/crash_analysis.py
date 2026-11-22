@@ -70,8 +70,26 @@ def value_prefix(crash: int) -> str:
     return str(crash)
 
 
-def sentinel_value(crash: int) -> str:
-    return f"sentinel-c{crash:03d}"
+def sentinel_value() -> str:
+    """The record produced after the restart: `0.0`, the integer prefix 0 that no crash uses (crash numbers
+    start at 1). It is produced with the same client, and read back, so it is told apart from the records."""
+    return f"0{VALUE_SEP}0"
+
+
+def parse_sentinel_ack(output: str) -> int | None:
+    """The offset the sentinel was acknowledged at, from the producer's JSON lines, or None when no
+    acknowledgement was printed (a producer that gave up prints `producer_send_error`)."""
+    for line in output.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("name") == "producer_send_success" and event.get("value") == sentinel_value():
+            return int(event["offset"])
+    return None
 
 
 class Ack(NamedTuple):

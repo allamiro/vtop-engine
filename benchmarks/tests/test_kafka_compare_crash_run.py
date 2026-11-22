@@ -136,10 +136,12 @@ class FakeBackend:
         if self.restart_fails:
             raise crash.Refused("the cluster did not serve within 240 s of the restart")
 
-    def wait_served(self):
-        self.calls.append(("wait_served",))
-        survivors = self.survivors()
-        return survivors + (1 if self.sentinel_done else 0)
+    def wait_served(self, at_least=0):
+        self.calls.append(("wait_served", at_least))
+        end = self.survivors() + (1 if self.sentinel_done else 0)
+        if end < at_least:
+            raise crash.Refused(f"the end offset stayed at {end}, below the sentinel's {at_least}")
+        return end
 
     def survivors(self):
         if self.mode == "flakey-drop":
@@ -155,12 +157,13 @@ class FakeBackend:
         count = end - (1 if self.sentinel_done else 0)
         lines = [f"Offset:{i}\t{self.prefix}.{i}" for i in range(count)]
         if self.sentinel_done:
-            lines.append(f"Offset:{count}\t{ca.sentinel_value(self.crash_no)}")
+            lines.append(f"Offset:{count}\t{ca.sentinel_value()}")
         return "\n".join(lines) + "\n"
 
     def produce_sentinel(self, value):
         self.calls.append(("produce_sentinel", value))
         self.sentinel_done = True
+        return self.survivors()
 
     def save_logs(self, config, mode, crash_no, summary):
         self.calls.append(("save_logs", config, mode, crash_no))
@@ -215,7 +218,7 @@ def test_a_process_kill_never_drops_or_restores_the_filesystem():
 def test_the_sentinel_is_produced_before_the_read_back_that_decides_the_loss():
     b, row = one(sentinel_needed=True)
     order = [c for c in b.calls if c[0] in ("read_all", "produce_sentinel")]
-    assert order == [("read_all", False), ("produce_sentinel", "sentinel-c001"), ("read_all", True)]
+    assert order == [("read_all", False), ("produce_sentinel", "0.0"), ("read_all", True)]
     # both columns are written, and the sentinel was what made the reads whole
     assert row["read_missing_before_sentinel"] == row["acked_lost"] + 5
     assert row["sentinel_needed"] is True
@@ -225,6 +228,30 @@ def test_without_the_sentinel_effect_both_missing_columns_agree():
     _, row = one()
     assert row["read_missing_before_sentinel"] == row["acked_lost"] and row["acked_lost"] > 0
     assert row["sentinel_needed"] is False
+
+
+def test_the_read_that_decides_the_loss_waits_for_the_sentinel_to_be_served():
+    b, row = one()
+    served = [c for c in b.calls if c[0] == "wait_served"]
+    assert served[0] == ("wait_served", 0)
+    assert served[1][1] == row["sentinel_offset"] + 1  # not before the acknowledged sentinel is readable
+    assert row["served_end_before_sentinel"] == row["sentinel_offset"]
+    assert row["served_end_after_sentinel"] == row["sentinel_offset"] + 1
+
+
+def test_a_sentinel_that_never_becomes_readable_is_a_failed_row_not_a_total_loss():
+    b = FakeBackend()
+    original = b.produce_sentinel
+
+    def lying(value):
+        original(value)
+        return 10**9  # acknowledged at an offset the partition never reaches
+
+    b.produce_sentinel = lying
+    row = crash.run_crash(b, params(), "vtop-shipped", "flakey-drop", 1, 20.0)
+    assert row["status"] == "failed" and row["needed_manual_repair"] is True
+    assert "stayed at" in row["note"]
+    assert "acked_lost" not in row  # no loss is claimed from a read that never happened
 
 
 # ------------------------------------------------------------------------------ the row
@@ -536,3 +563,41 @@ def test_the_override_files_change_only_the_data_volumes_the_cpus_the_network_an
     # nothing about memory, flushing (outside the parity file) or the engine's settings is overridden
     assert "mem_limit" not in kafka + vtop and "KAFKA_" not in kafka + vtop
     assert "name: kc-crash-kafka-bench" in kafka and "name: kc-crash-vtop-bench" in vtop
+
+
+def readme_commands():
+    text = read("README.md")
+    section = text[text.index("## Whole-replica-set crash (#599)"):text.index("## Known gaps")]
+    block = section[section.index("```bash"):]
+    block = block[:block.index("```", 3)].replace("\\\n", " ")
+    commands = []
+    for line in block.splitlines():
+        line = line.strip()
+        if line.startswith("python3 benchmarks/kafka_compare/crash.py"):
+            commands.append(shlex_split(line)[2:])
+    return commands
+
+
+def shlex_split(line):
+    import shlex
+
+    return shlex.split(line)
+
+
+def test_every_command_the_readme_shows_parses_and_the_full_run_fits_its_own_cap():
+    commands = readme_commands()
+    assert len(commands) == 4
+    runs = []
+    for argv in commands:
+        args = crash.parse_args(argv)
+        if args.check is not None:
+            continue
+        matrix = crash.build_matrix(args)
+        hours = crash.check_args(args, matrix)  # the plan is within its own --max-hours
+        runs.append((args, matrix, hours))
+    smoke, full, resume = runs
+    assert smoke[1]["smoke"] and not full[1]["smoke"]
+    # the documented one-hour command: 14 crashes of three configurations in power-loss mode, about an hour
+    assert full[1]["crashes"] == 14 and full[1]["crash_modes"] == ["flakey-drop"]
+    assert 0.8 <= full[2] <= 1.25, full[2]
+    assert resume[0].resume == "<run-id>"

@@ -48,6 +48,9 @@ COLUMNS = (
     "acked_last_seq",
     "acked_in_last_10s",
     "read_records",
+    "served_end_before_sentinel",
+    "sentinel_offset",
+    "served_end_after_sentinel",
     "read_missing_before_sentinel",
     "acked_lost",
     "lost_first_seq",
@@ -74,6 +77,7 @@ RUN_CONSTANT = ("run_id", "env_fingerprint", "vtop_commit", "kafka_image")
 
 # An ok row carries every one of these as a number (kill_to_drop_ms only in a power-loss mode).
 _NUMERIC_OK = ("seed", "trigger_after_s", "offered_rate", "send_errors", "acked", "read_records",
+               "served_end_before_sentinel", "sentinel_offset", "served_end_after_sentinel",
                "read_missing_before_sentinel", "acked_lost", "lost_runs", "present_unacked", "duplicates",
                "reordered", "offset_mismatch", "unexpected", "recovery_seconds", "wall_seconds")
 
@@ -129,16 +133,18 @@ def expected_keys(matrix: dict[str, Any]) -> set[tuple[str, str, int]]:
             for crash in range(1, int(matrix["crashes"]) + 1)}
 
 
-# Seconds per step of one crash, measured on the smoke run (Docker Desktop, 18 CPUs) and rounded up.
-# `bring_up` is the fresh cluster (VTOP's is the shorter), `restart` the cluster back after the crash,
-# `readback` two reads of the partition and the sentinel, `restore` the filesystem's drop and remount.
+# Seconds per step of one crash, beyond the trigger. Measured on the smoke run (a 4-vCPU Linux VM, one CPU per
+# node): a Kafka crash took 45 s and a VTOP crash 20 s beyond its trigger; the figures here are rounded up and
+# carry the sentinel's producer and the end-offset polls, each a JVM start. `bring_up` is the fresh cluster and
+# the topic, `warm_up` the producer's start, `restore` the filesystem's drop and remount (power-loss mode only),
+# `restart` the cluster back after the crash, `readback` the reads of the partition, `teardown` the cluster's removal.
 DEFAULT_TIMING = {
-    "bring_up": {"kafka": 40.0, "vtop": 25.0},
-    "warm_up": 5.0,
-    "restore": {"sigkill": 8.0, "flakey-drop": 20.0},
-    "restart": {"kafka": 45.0, "vtop": 30.0},
-    "readback": 40.0,
-    "teardown": 12.0,
+    "bring_up": {"kafka": 24.0, "vtop": 10.0},
+    "warm_up": 4.0,
+    "restore": {"sigkill": 1.0, "flakey-drop": 4.0},
+    "restart": {"kafka": 12.0, "vtop": 4.0},
+    "readback": {"kafka": 12.0, "vtop": 8.0},
+    "teardown": {"kafka": 6.0, "vtop": 4.0},
 }
 
 
@@ -152,7 +158,7 @@ def projected_seconds(matrix: dict[str, Any], timing: dict[str, Any] | None = No
         system = ca.CONFIGS[config][0]
         for mode in matrix["crash_modes"]:
             one = (t["bring_up"][system] + t["warm_up"] + mean_trigger + t["restore"][mode] + t["restart"][system]
-                   + t["readback"] + t["teardown"])
+                   + t["readback"][system] + t["teardown"][system])
             total += one * int(matrix["crashes"])
     return total
 

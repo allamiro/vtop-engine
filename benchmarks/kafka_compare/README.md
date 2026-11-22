@@ -240,6 +240,100 @@ default) and the VTOP side by its native client (`vtop-node produce` via
   comparable with Kafka's (#613 review). That run was added in e0c3d35 and is last present, unchanged, in
   190037b on the #613 branch (`git show 190037b:benchmarks/kafka_compare/results/failover-20261110T185855Z/failover.csv`).
 
+## Whole-replica-set crash (#599)
+
+`acks=all` means *replicated*, not *on disk*: Kafka's default (`flush.messages` unset) acknowledges a write once
+the in-sync replicas have it in their page cache. `crash.py` kills the whole replica set at once and counts the
+acknowledged records that are missing afterwards, for Kafka as shipped, Kafka made to fsync, and VTOP.
+
+```bash
+# The short profile: 2 crashes per cell, both modes, SIGKILL and power-loss, about 25 minutes on this laptop-class VM.
+python3 benchmarks/kafka_compare/crash.py --smoke --setup-flakey 8192
+
+# The full run on a dedicated Linux host (see below): about 1 hour.
+python3 benchmarks/kafka_compare/crash.py --setup-flakey 10240 --teardown-flakey \
+    --crashes 14 --modes flakey-drop --max-hours 1.5
+
+# What a run directory still owes, whatever its state (exit 0 when complete, 2 listing the missing crashes), and
+# the way to continue an interrupted one.
+python3 benchmarks/kafka_compare/crash.py --check benchmarks/kafka_compare/results/<run-id>
+python3 benchmarks/kafka_compare/crash.py --resume <run-id> --crashes 14 --modes flakey-drop
+```
+
+**The host.** One Linux machine with Docker Engine (Compose v2), a user in the `docker` group with passwordless
+`sudo` (the harness runs only `crash/powercut.sh` through `sudo -n`; run it as root and git will want
+`safe.directory` for the checkout), and a kernel that has `loop` and `dm-flakey`
+(`sudo modprobe dm-flakey` must succeed; on Ubuntu the `linux-modules-extra-$(uname -r)` package carries it).
+Nothing in the harness is macOS-specific, and it does not use Docker Desktop: Docker Desktop's VM is not one this
+script can crash. The reference shape for the full run is one EC2 instance of 16 vCPUs and 32 GiB with Ubuntu
+24.04 and a gp3 or instance-store volume (a `c7i.4xlarge` or `m7i.4xlarge`): three 2-CPU nodes, the 4-CPU client and
+headroom, with nothing else running. `environment.json` records the instance type (from the DMI), kernel,
+filesystem and mount options, the `vm.dirty_*` sysctls, and the disk behind Docker's data. The first run builds
+`vtop-bench:<commit>` from `docker/Dockerfile` if it is not there (several minutes on 16 vCPUs). Docker installs with
+`curl -fsSL https://get.docker.com | sudo sh`; the harness needs only the Python standard library.
+
+`--setup-flakey MIB` makes `--data-root` (default `/var/lib/kc599/data`) a sparse image file, a loop device, a
+dm-flakey device and an ext4 filesystem (`crash/powercut.sh setup`); `--teardown-flakey` removes it at the end. A host
+whose disk the probe cannot name (a virtio VM) is told with `--host-disk TEXT`. The CPUs per node default to 2, as the
+Compose files say; the smoke run on a small VM lowers them (`--node-cpus 1 --client-cpus 1 --client-memory 2g`) for
+Kafka and VTOP alike, and `environment.json` records what ran.
+
+**Per crash** (one row of `crash.csv`): wipe the three data directories, bring a fresh three-node cluster up, create
+the topic, `sync` the data filesystem, write the fsynced canary, start the producer, and at `t_i` seconds after it
+started (`t_i` is uniform in the trigger window, drawn from the seed and `i` only, so every
+configuration and mode sees the same schedule) write the unsynced canary and:
+
+1. `docker kill --signal KILL` on all three nodes, one command;
+2. in `flakey-drop` mode, immediately `dmsetup` reload of the data device with `drop_writes`, with the filesystem
+   neither frozen nor synced; no sync runs between the kill and the drop;
+3. stop the client (its last acknowledgements are already on disk), remove the dead containers, and in `flakey-drop`
+   unmount, write again, and mount (journal recovery);
+4. read the canaries: the fsynced one must be whole; the unsynced one must be absent or short in `flakey-drop` and whole
+   in `sigkill`, or the crash is a `refused` row (kept, with the reason) and not an `ok` one;
+5. `docker compose up`; wait until ListOffsets is served (the first served read); read the whole partition
+   (`read_missing_before_sentinel`); produce a **sentinel** record and wait for its acknowledgement; read the whole
+   partition again: that read decides the loss, `acked_lost`. `sentinel_needed` says the two differ.
+
+The client is the same for both systems: `kafka-verifiable-producer.sh` from the pinned apache/kafka image,
+`acks=all`, idempotence on, at a fixed offered rate (default 1,000 records/s), bootstrapped at all three Kafka brokers
+and at VTOP's range leader (the Kafka gateway). It prints one line per acknowledgement with its offset, so
+"acknowledged" is what the client saw before the kill. Records are `<crash>.<n>` (a few bytes): this tool takes only
+an integer `--value-prefix` and has no record-size flag, so the issue's 1 KiB is not reproduced; the loss window of a
+page cache depends on time, not on bytes.
+
+**Configurations** (`config`): `kafka-defaults`, `kafka-fsync-parity` (`log.flush.interval.messages=1` on every broker
+through `crash/compose.kafka.fsync-parity.yml`, and `flush.messages=1` on the topic; the brokers' own report of the
+setting is checked and a mismatch refuses the cell), and `vtop-shipped` (the node configuration as shipped: an append is
+acknowledged after 2 of 3 replicas have fsynced it; it answers both Kafka profiles). VTOP has no fsync-policy or
+group-commit switch in its node configuration at this commit, so there is no second VTOP configuration.
+
+**What `flakey-drop` simulates, and what it does not.** The three data directories are on one ext4 filesystem on one
+dm-flakey device over a loop device. After the SIGKILL, `drop_writes` discards every write the page cache has not yet
+sent to the device, and the filesystem is unmounted and mounted again. What is left is what had reached the device:
+data an fsync returned for, and whatever the kernel's own writeback had already flushed. That is the loss of one host's
+page cache for all three replicas at once: a kernel panic, or power loss with a disk that honours flushes. It does
+**not** model a drive whose volatile write cache lies about flushes, a torn write inside a block, a host with a hardware
+write-back cache, or independent crashes (the replicas share one failure domain, on purpose). Between the kill and the
+drop there is a gap (`kill_to_drop_ms`, about 0.15 s here) in which the kernel may flush a little more; that can only
+make a system look better. `sigkill` is the control: killing processes leaves the page cache intact, so no
+acknowledged record may be lost in either system, and the canary says so.
+
+The method is not the issue's first choice (`echo b > /proc/sysrq-trigger` in a VM that holds all three replicas, with the
+client outside it): that needs a second machine for the client, and the harness here is one process on one host. The
+two agree on what they simulate (the guest's page cache is lost and what an fsync returned for is kept); the issue's
+calibration of one against the other is not done here.
+
+**A run that looks wrong stops.** If Kafka's defaults lose nothing in `--suspect-after` (5) `flakey-drop` crashes, the
+method is probably not dropping the page cache, and the run stops (exit 3) with that said, before any chart.
+
+**Output.** `results/<run-id>/crash.csv` (columns in [`crash_schema.py`](crash_schema.py)) and `environment.json`
+(`kind: "crash"`, schema 2; `matrix`, `comparable` and the verbatim Compose files and `powercut.sh`); `logs/<cell>/`
+holds each crash's three node logs (as they died and after the restart) and a summary. The report generator reads a
+run through `crash_schema.load_crash_run(run_dir, min_ok=N)`, which refuses a partial, mixed-environment or
+unfinished run, a row that is `ok` while its canary did not behave, and fewer than `N` ok crashes in any cell, by name.
+`crash_analysis.upper_bound_95(0, n)` gives the exact binomial bound to print beside every "0 of n": 13.9 % at 20
+crashes, 9.5 % at 30. The issue's plan asks for 30 crashes per configuration (about 2 hours: `--crashes 30`).
+
 ## Known gaps
 
 - Matrix: 100 B and 1 KiB, 1 partition, 1 producer, no compression, `defaults` only (no `fsync-parity`,

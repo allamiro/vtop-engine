@@ -264,15 +264,19 @@ def _crash(b: Any, p: Params, row: dict[str, Any], config: str, mode: str, crash
         row.update(status="refused", note=verdict.reason)
 
     started = time.monotonic()
+    sentinel = ca.sentinel_value()
     try:
         b.restart(config)
         end_before = b.wait_served()
-        first = ca.diff_acked(acks, ca.parse_consumed(b.read_all(end_before) if end_before else "", prefix,
-                                                      ca.sentinel_value(crash)))
-        b.produce_sentinel(ca.sentinel_value(crash))
+        first = ca.diff_acked(acks, ca.parse_consumed(b.read_all(end_before) if end_before else "", prefix, sentinel))
+        # The sentinel is acknowledged, and then waited for until the partition's end offset covers it: a
+        # leader that restarted serves what is cluster-committed, and a record acknowledged before the crash
+        # may not be readable until a new commit advances that (D10). The read that decides the loss is the
+        # one after it, so a read of a leader that is not yet serving is never counted as a loss.
+        sentinel_offset = b.produce_sentinel(sentinel)
         row["recovery_seconds"] = round(time.monotonic() - started, 1)
-        end_after = b.wait_served()
-        consumed = ca.parse_consumed(b.read_all(end_after), prefix, ca.sentinel_value(crash))
+        end_after = b.wait_served(at_least=sentinel_offset + 1)
+        consumed = ca.parse_consumed(b.read_all(end_after), prefix, sentinel)
     except Exception as exc:
         row.update(needed_manual_repair=True, recovery_seconds=round(time.monotonic() - started, 1))
         if row["status"] == "ok":
@@ -282,7 +286,9 @@ def _crash(b: Any, p: Params, row: dict[str, Any], config: str, mode: str, crash
         return row
     final = ca.diff_acked(acks, consumed)
     row.update(
-        read_records=sum(1 for c in consumed if c.kind != "sentinel"), read_missing_before_sentinel=first.acked_lost,
+        read_records=sum(1 for c in consumed if c.kind != "sentinel"), served_end_before_sentinel=end_before,
+        sentinel_offset=sentinel_offset, served_end_after_sentinel=end_after,
+        read_missing_before_sentinel=first.acked_lost,
         acked_lost=final.acked_lost, lost_first_seq=final.lost_first_seq, lost_last_seq=final.lost_last_seq,
         lost_runs=final.lost_runs, lost_window_s=(None if not final.lost else round(
             ca.lost_window_seconds(acks, final.lost, kill_vm_ms) or 0.0, 2)),
@@ -533,8 +539,9 @@ class DockerBackend:
         except RuntimeError as exc:
             raise Refused(f"compose up after the crash: {exc}"[:400]) from None
 
-    def wait_served(self) -> int:
-        """The partition's end offset, once the cluster answers ListOffsets: the first served read."""
+    def wait_served(self, at_least: int = 0) -> int:
+        """The partition's end offset, once the cluster answers ListOffsets (the first served read) and the
+        end offset is at least `at_least`."""
         deadline = time.monotonic() + SERVE_DEADLINE_S
         last = ""
         while time.monotonic() < deadline:
@@ -543,8 +550,12 @@ class DockerBackend:
                                check=False)
             match = re.search(rf"^{TOPIC}:0:(\d+)\s*$", done.stdout, re.MULTILINE)
             if done.returncode == 0 and match:
-                return int(match.group(1))
-            last = (done.stderr or done.stdout).strip()[-200:]
+                end = int(match.group(1))
+                if end >= at_least:
+                    return end
+                last = f"the end offset is {end}, below {at_least}"
+            else:
+                last = (done.stderr or done.stdout).strip()[-200:]
             time.sleep(2)
         raise Refused(f"the cluster did not serve within {SERVE_DEADLINE_S:.0f} s of the restart: {last}")
 
@@ -557,15 +568,19 @@ class DockerBackend:
             handle.write(done.stdout)
         return done.stdout
 
-    def produce_sentinel(self, value: str) -> None:
+    def produce_sentinel(self, value: str) -> int:
+        """Produce the sentinel with the same client and return the offset it was acknowledged at; retried
+        until an acknowledgement is printed (the client's own exit status is not a proof of one)."""
+        prefix = value.split(ca.VALUE_SEP)[0]
         deadline = time.monotonic() + SENTINEL_DEADLINE_S
         last = ""
         while time.monotonic() < deadline:
-            done = self.client(["/opt/kafka/bin/kafka-console-producer.sh", "--bootstrap-server",
-                                SPEC[self.system]["bootstrap"], "--topic", TOPIC, "--command-property", "acks=all"],
-                               timeout=120, input_text=value + "\n", check=False)
-            if done.returncode == 0:
-                return
+            done = self.client(["/opt/kafka/bin/kafka-verifiable-producer.sh", "--bootstrap-server",
+                                SPEC[self.system]["bootstrap"], "--topic", TOPIC, "--acks", "-1",
+                                "--max-messages", "1", "--value-prefix", prefix], timeout=180, check=False)
+            offset = ca.parse_sentinel_ack(done.stdout)
+            if offset is not None:
+                return offset
             last = (done.stderr or done.stdout).strip()[-200:]
             time.sleep(3)
         raise Refused(f"no write was acknowledged within {SENTINEL_DEADLINE_S:.0f} s of the restart: {last}")
