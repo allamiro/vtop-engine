@@ -1594,3 +1594,509 @@ mod object_lock_tests {
         }
     }
 }
+
+/// What the verification and read-back helpers accept and refuse, and the
+/// answers a backend that overrides nothing gives (#729). Each test states a
+/// behaviour an operator or the engine relies on.
+#[cfg(test)]
+mod verification_surface_tests {
+    use super::*;
+
+    fn sha256_of(data: &[u8]) -> String {
+        vtop_core::checksum::sha256_bytes(data)
+    }
+
+    #[test]
+    fn only_sha256_selects_the_service_checksum_arm_whatever_its_case() {
+        assert!(ObjectChecksum::new("sha256", "ab").is_sha256());
+        assert!(ObjectChecksum::new("SHA256", "ab").is_sha256());
+        assert!(!ObjectChecksum::new("blake3", "ab").is_sha256());
+        assert!(!ObjectChecksum::new("sha2", "ab").is_sha256());
+    }
+
+    /// The SHA-256 the store computed is the strong evidence (#482): equal
+    /// (in either case) passes by the store's checksum, a different one
+    /// fails, and none at all is size-only, never a pass by omission.
+    #[test]
+    fn the_service_checksum_passes_only_when_it_equals_the_expected_digest() {
+        let passed = judge_service_sha256(Some("ABCDEF"), "abcdef");
+        assert!(passed.passed && !passed.backend_limited);
+        assert_eq!(passed.method, Some(VerificationMethod::StoreChecksum));
+
+        let failed = judge_service_sha256(Some("abcdee"), "abcdef");
+        assert!(!failed.passed && !failed.backend_limited, "{failed:?}");
+        assert_eq!(failed.method, None);
+        assert!(failed.message.contains("mismatch"), "{}", failed.message);
+
+        let limited = judge_service_sha256(None, "abcdef");
+        assert!(limited.passed && limited.backend_limited, "{limited:?}");
+        assert_eq!(limited.method, Some(VerificationMethod::SizeOnly));
+    }
+
+    /// The content check refuses a size mismatch before it trusts a digest,
+    /// refuses a wrong digest of the right size, and passes the exact bytes
+    /// as a read-back.
+    #[tokio::test]
+    async fn a_stored_body_passes_only_with_the_expected_size_and_digest() {
+        let data = b"the stored body";
+        let digest = sha256_of(data);
+        let check = |size: u64, hex: String| async move {
+            verify_reader_content(&data[..], size, ObjectChecksum::new("sha256", &hex), "test")
+                .await
+                .unwrap()
+        };
+
+        let (ok, oversized) = check(data.len() as u64, digest.clone()).await;
+        assert!(ok.passed && !ok.backend_limited && !oversized, "{ok:?}");
+        assert_eq!(ok.method, Some(VerificationMethod::ReadBack));
+
+        let (upper, _) = check(data.len() as u64, digest.to_uppercase()).await;
+        assert!(upper.passed, "the digest compares without regard to case");
+
+        let (wrong, oversized) = check(data.len() as u64, sha256_of(b"another body")).await;
+        assert!(!wrong.passed && !oversized, "{wrong:?}");
+        assert!(wrong.message.contains("checksum mismatch"), "{wrong:?}");
+
+        // Shorter than the store holds: refused, and not flagged oversized.
+        let (short, oversized) = check(data.len() as u64 + 5, digest.clone()).await;
+        assert!(!short.passed && !oversized, "{short:?}");
+        assert!(short.message.contains("size mismatch"), "{short:?}");
+    }
+
+    #[tokio::test]
+    async fn the_content_check_refuses_an_unusable_checksum_declaration() {
+        let (none, _) =
+            verify_reader_content(&b"x"[..], 1, ObjectChecksum::new("none", "00"), "test")
+                .await
+                .unwrap();
+        assert!(!none.passed, "{none:?}");
+        let (unknown, _) =
+            verify_reader_content(&b"x"[..], 1, ObjectChecksum::new("md5-ish", "00"), "test")
+                .await
+                .unwrap();
+        assert!(!unknown.passed, "{unknown:?}");
+    }
+
+    /// With checksums disabled a file can only be confirmed by its size: a
+    /// match is a limited pass, a mismatch a failure.
+    #[tokio::test]
+    async fn a_file_without_a_checksum_is_confirmed_by_size_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("object");
+        std::fs::write(&path, b"12345").unwrap();
+        let ok = verify_file_content(&path, 5, None, "localfs")
+            .await
+            .unwrap();
+        assert!(ok.passed && ok.backend_limited, "{ok:?}");
+        let bad = verify_file_content(&path, 6, None, "localfs")
+            .await
+            .unwrap();
+        assert!(
+            !bad.passed && bad.message.contains("size mismatch"),
+            "{bad:?}"
+        );
+        let digest = sha256_of(b"12345");
+        let strong = verify_file_content(
+            &path,
+            5,
+            Some(ObjectChecksum::new("sha256", &digest)),
+            "localfs",
+        )
+        .await
+        .unwrap();
+        assert!(strong.passed && !strong.backend_limited, "{strong:?}");
+    }
+
+    #[test]
+    fn a_malformed_s3_uri_is_refused() {
+        for bad in [
+            "s3://bucket/",
+            "s3:///key",
+            "s3://",
+            "s3://bucket",
+            "bucket/key",
+        ] {
+            assert!(parse_s3_uri(bad).is_err(), "{bad} must be refused");
+        }
+        assert_eq!(
+            parse_s3_uri("s3://b/k/with/slashes").unwrap(),
+            ("b".to_string(), "k/with/slashes".to_string())
+        );
+    }
+
+    fn lock_config(mode: ObjectLockMode, days: u32, hold: bool) -> ObjectLockConfig {
+        ObjectLockConfig {
+            mode,
+            retain_days: days,
+            legal_hold: hold,
+        }
+    }
+
+    #[test]
+    fn a_lock_policy_matches_only_the_configuration_it_was_built_from() {
+        let cfg = lock_config(ObjectLockMode::Governance, 30, false);
+        let policy = ObjectLockPolicy::from_config(&cfg);
+        assert_eq!(policy.retain_for(), Duration::from_secs(30 * 86_400));
+        assert!(policy.matches(&cfg));
+        assert!(!policy.matches(&lock_config(ObjectLockMode::Compliance, 30, false)));
+        assert!(!policy.matches(&lock_config(ObjectLockMode::Governance, 31, false)));
+        assert!(!policy.matches(&lock_config(ObjectLockMode::Governance, 30, true)));
+        let short = ObjectLockPolicy::with_retention_for_tests(
+            ObjectLockMode::Compliance,
+            Duration::from_millis(1_500),
+            true,
+        );
+        assert_eq!(short.retain_for(), Duration::from_millis(1_500));
+    }
+
+    #[test]
+    fn a_lock_part_names_itself_and_the_permission_its_read_needs() {
+        assert_eq!(LockPart::Retention.describe(), "retention");
+        assert_eq!(LockPart::LegalHold.describe(), "legal hold");
+        assert_eq!(LockPart::Retention.permission(), "s3:GetObjectRetention");
+        assert_eq!(LockPart::LegalHold.permission(), "s3:GetObjectLegalHold");
+    }
+
+    /// Only `Ok` passes: every other outcome is a failed retention check, and
+    /// each tells the operator what was expected and what was found.
+    #[test]
+    fn only_an_intact_retention_passes_and_each_failure_says_what_it_found() {
+        let expected = RetentionExpectation {
+            mode: ObjectLockMode::Governance,
+            retain_until_at_least_unix_secs: 2_000,
+            legal_hold: true,
+        };
+        let want = format!("governance until at least {}", format_unix_secs(2_000));
+        let at = |secs: i64| format_unix_secs(secs);
+
+        let cases = [
+            (
+                RetentionCheck::Ok {
+                    retain_until_unix_secs: 3_000,
+                },
+                true,
+                format!("governance until {} (expected {want})", at(3_000)),
+            ),
+            (
+                RetentionCheck::Missing,
+                false,
+                format!("expected {want}, found no retention"),
+            ),
+            (
+                RetentionCheck::ModeMismatch {
+                    found: "COMPLIANCE".into(),
+                },
+                false,
+                format!("expected {want}, found mode COMPLIANCE"),
+            ),
+            (
+                RetentionCheck::TooShort {
+                    retain_until_unix_secs: 1_000,
+                },
+                false,
+                format!("expected {want}, found retain-until {}", at(1_000)),
+            ),
+            (
+                RetentionCheck::LegalHoldMissing,
+                false,
+                format!("expected {want} with a legal hold, found no legal hold"),
+            ),
+            (
+                RetentionCheck::Unsupported,
+                false,
+                "the backend cannot read an object's retention".to_string(),
+            ),
+        ];
+        for (check, passes, message) in cases {
+            assert_eq!(check.passed(), passes, "{check:?}");
+            assert_eq!(check.describe(&expected), message, "{check:?}");
+        }
+        assert_eq!(
+            RetentionCheck::Ok {
+                retain_until_unix_secs: 1
+            }
+            .label(),
+            "ok"
+        );
+        assert_eq!(
+            RetentionCheck::ModeMismatch { found: "x".into() }.label(),
+            "mode_mismatch"
+        );
+        assert_eq!(
+            RetentionCheck::TooShort {
+                retain_until_unix_secs: 1
+            }
+            .label(),
+            "too_short"
+        );
+    }
+
+    /// A backend that implements only the required methods. Everything else
+    /// is the trait's default, which must FAIL CLOSED: a backend that cannot
+    /// address versions, confirm a lock or multipart must not answer as if it
+    /// could.
+    struct Bare;
+
+    #[async_trait]
+    impl UploadBackend for Bare {
+        async fn put_object(
+            &self,
+            _: &Path,
+            _: &str,
+            _: Option<ObjectChecksum<'_>>,
+        ) -> Result<StoredObject, VtopError> {
+            unreachable!()
+        }
+        async fn put_manifest(
+            &self,
+            _: &Path,
+            _: &str,
+            _: Option<ObjectChecksum<'_>>,
+        ) -> Result<StoredManifest, VtopError> {
+            unreachable!()
+        }
+        async fn head_object(&self, _: &str) -> Result<ObjectHead, VtopError> {
+            unreachable!()
+        }
+        async fn get_object(&self, _: &str) -> Result<Vec<u8>, VtopError> {
+            unreachable!()
+        }
+        async fn get_object_bounded(&self, _: &str, _: usize) -> Result<Vec<u8>, VtopError> {
+            unreachable!()
+        }
+        async fn verify_object(
+            &self,
+            _: &str,
+            _: u64,
+            _: Option<ObjectChecksum<'_>>,
+        ) -> Result<VerificationResult, VtopError> {
+            unreachable!()
+        }
+        async fn delete_object(&self, _: &str) -> Result<(), VtopError> {
+            unreachable!()
+        }
+        fn backend_name(&self) -> &'static str {
+            "bare"
+        }
+        fn supports_checksum_verification(&self) -> bool {
+            false
+        }
+        fn supports_multipart(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_overrides_nothing_fails_closed() {
+        let backend = Bare;
+        let uri = "s3://bucket/object";
+
+        for err in [
+            backend
+                .get_manifest_pinned(uri, "v1", 10)
+                .await
+                .unwrap_err(),
+            backend.get_object_pinned(uri, "v1", 10).await.unwrap_err(),
+        ] {
+            let message = err.to_string();
+            assert!(
+                message.contains("backend bare cannot read a pinned object version of"),
+                "{message}"
+            );
+        }
+        let err = backend
+            .confirm_lock_absent(uri, None, LockPart::Retention)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot confirm the Retention of"),
+            "{err}"
+        );
+        for err in [
+            backend
+                .create_multipart_upload(uri, "text/plain", None)
+                .await
+                .unwrap_err(),
+            backend
+                .upload_part(uri, "id", 1, bytes::Bytes::new())
+                .await
+                .unwrap_err(),
+            backend
+                .complete_multipart_upload(uri, "id", &[])
+                .await
+                .unwrap_err(),
+            backend.abort_multipart_upload(uri, "id").await.unwrap_err(),
+        ] {
+            assert!(
+                err.to_string()
+                    .contains("does not support resumable multipart upload"),
+                "{err}"
+            );
+        }
+        assert!(backend.bucket_versioning("b").await.is_err());
+        assert!(backend.bucket_object_lock("b").await.is_err());
+        assert!(!backend.supports_object_versions());
+        assert!(!backend.reports_absent_objects());
+        assert_eq!(backend.min_part_size_bytes(), 0);
+        assert!(backend.object_lock().is_none());
+        assert_eq!(
+            backend.check_encryption(uri, None).await.unwrap(),
+            EncryptionCheck::NotRequested
+        );
+        assert_eq!(
+            backend
+                .verify_retention(
+                    uri,
+                    None,
+                    &RetentionExpectation {
+                        mode: ObjectLockMode::Governance,
+                        retain_until_at_least_unix_secs: 0,
+                        legal_hold: false,
+                    }
+                )
+                .await
+                .unwrap(),
+            RetentionCheck::Unsupported
+        );
+        backend.ensure_bucket("b").await.unwrap();
+    }
+
+    /// The pause before the Nth retry of a busy executable is 10 ms x N, so a
+    /// full set of retries waits 100 ms in all: long enough for an installer
+    /// to finish, short enough not to stall a batch.
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_executable_is_retried_with_a_growing_pause() {
+        let mut busy_left = TEXT_BUSY_RETRIES;
+        let started = tokio::time::Instant::now();
+        retry_text_busy(
+            || {
+                if busy_left > 0 {
+                    busy_left -= 1;
+                    Err(std::io::Error::from_raw_os_error(TEXT_BUSY))
+                } else {
+                    Ok(())
+                }
+            },
+            "tool",
+            "upload",
+        )
+        .await
+        .unwrap();
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(100) && waited <= Duration::from_millis(105),
+            "10 + 20 + 30 + 40 ms expected, waited {waited:?}"
+        );
+    }
+
+    /// A command's deadline is `timeout` from now; a timeout too large for
+    /// the clock saturates to a practically-never deadline (thirty years)
+    /// rather than overflowing.
+    #[tokio::test(start_paused = true)]
+    async fn a_command_deadline_is_the_timeout_from_now_and_saturates() {
+        let now = tokio::time::Instant::now();
+        assert_eq!(
+            command_deadline(Duration::from_secs(300)).duration_since(now),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            command_deadline(Duration::MAX).duration_since(now),
+            Duration::from_secs(30 * 365 * 24 * 60 * 60)
+        );
+    }
+}
+
+/// The stderr evidence of a command backend's read-back (#481) and its
+/// bounds, against real child processes.
+#[cfg(test)]
+#[cfg(unix)]
+mod read_back_evidence_tests {
+    use super::*;
+
+    fn spawn(script: &str) -> tokio::process::Child {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        command.spawn().expect("sh starts")
+    }
+
+    fn within(secs: u64) -> tokio::time::Instant {
+        tokio::time::Instant::now() + Duration::from_secs(secs)
+    }
+
+    /// The failure names the tool's last NON-EMPTY stderr line, however much
+    /// blank output follows it.
+    #[tokio::test]
+    async fn the_error_carries_the_last_non_empty_line_of_stderr() {
+        let mut child = spawn(
+            "echo 'progress 40%' >&2; echo 'fatal: bucket is gone' >&2; printf '\\n   \\n\\n' >&2; exit 3",
+        );
+        let evidence = ReadBackEvidence::collect(&mut child, "s3cmd", "download").unwrap();
+        let status = child.wait().await.unwrap();
+        let error = evidence
+            .classify(format!("exited with {status}"), within(30))
+            .await;
+        let message = error.to_string();
+        assert!(
+            message.ends_with(": fatal: bucket is gone"),
+            "the last non-empty line is the verdict: {message}"
+        );
+        assert!(matches!(error, VtopError::Upload(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_throttle_on_the_last_line_is_classified_as_a_throttle() {
+        let mut child = spawn(
+            "echo 'An error occurred (SlowDown) when calling the GetObject operation' >&2; exit 1",
+        );
+        let evidence = ReadBackEvidence::collect(&mut child, "awscli", "verification").unwrap();
+        let status = child.wait().await.unwrap();
+        let error = evidence.classify(format!("{status}"), within(30)).await;
+        assert!(matches!(error, VtopError::UploadThrottled(_)), "{error:?}");
+    }
+
+    /// A chatty tool can neither block on a full pipe nor grow this process:
+    /// the drain keeps exactly the last 64 KiB.
+    #[tokio::test]
+    async fn only_the_last_64_kib_of_stderr_is_kept() {
+        let mut child = spawn("head -c 300000 /dev/zero | tr '\\0' x >&2");
+        let mut evidence = ReadBackEvidence::collect(&mut child, "mc", "download").unwrap();
+        child.wait().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(30), &mut evidence.drain)
+            .await
+            .expect("the drain reaches EOF once the tool has exited")
+            .unwrap();
+        let kept = evidence.kept.lock().unwrap().len();
+        assert_eq!(kept, 64 * 1024);
+    }
+
+    /// Dropping the evidence stops its drain, so an abandoned read-back leaves
+    /// no task reading a pipe nobody will look at.
+    #[tokio::test]
+    async fn dropping_the_evidence_stops_its_drain() {
+        let token = Arc::new(());
+        let held = Arc::clone(&token);
+        let drain = tokio::spawn(async move {
+            let _held = held;
+            std::future::pending::<()>().await;
+        });
+        let evidence = ReadBackEvidence {
+            drain,
+            kept: Arc::new(Mutex::new(Vec::new())),
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(Arc::strong_count(&token), 2, "the drain is running");
+        drop(evidence);
+        for _ in 0..100 {
+            if Arc::strong_count(&token) == 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the drain task outlived its evidence");
+    }
+}
