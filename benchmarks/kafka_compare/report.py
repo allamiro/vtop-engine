@@ -395,8 +395,11 @@ def _ratio(a: dict[str, Any], b: dict[str, Any]) -> float | None:
     return a["summary"].median / b["summary"].median
 
 
-def write_markdown(rows, env, run_id, csv_rel: str, env_rel: str, images: dict[str, str], doc_path: str) -> None:
+def write_markdown(rows, env, run_id, csv_rel: str, env_rel: str, images: dict[str, str], doc_path: str,
+                   extra_lines: list[str] | None = None) -> None:
     import matplotlib
+
+    from kafka_compare import extra_charts
 
     c = env["comparable"]
     sizes = env["matrix"]["record_sizes"]
@@ -435,10 +438,15 @@ def write_markdown(rows, env, run_id, csv_rel: str, env_rel: str, images: dict[s
     add("- **Same replication contract (rule 3).** Kafka: RF=3, `min.insync.replicas=2`, `acks=all`. VTOP: one "
         "range replicated to three nodes, acknowledged at a write quorum of 2 of 3 (`Durability::Quorum`), "
         "`acks=all` from the client.")
+    if extra_charts.has_profile_cost(env):
+        parity = ("The `fsync-parity` profile (Kafka with an fsync after every message, `flush.messages=1`) is "
+                  "measured for Kafka in the end-to-end runs only, at the same offered rate as the others; see "
+                  "*What each durability profile costs in latency*.")
+    else:
+        parity = "The `fsync-parity` profile is phase 2."
     add(f"- **Profile `{c['profile']}` (rule 4).** Each system as shipped. This is **not** durability parity: "
         "Kafka acknowledges once the in-sync replicas have the batch in their page cache (`flush.messages` "
-        "unset), while a VTOP quorum acknowledgement means two replicas have **fsynced** the append. The "
-        "`fsync-parity` profile is phase 2.")
+        "unset), while a VTOP quorum acknowledgement means two replicas have **fsynced** the append. " + parity)
     add("- **Open-loop latency (rule 6).** Latency comes from fixed offered rates (`--throughput`) at "
         f"{', '.join(f'{p}%' for p in pcts)} of **Kafka's** median saturation for the cell, offered to both "
         "systems. A run more than 5% short of its offered rate is flagged *not sustained*: the tool's throttle "
@@ -526,9 +534,10 @@ def write_markdown(rows, env, run_id, csv_rel: str, env_rel: str, images: dict[s
                 add(f"| {size_label(size)} | {SYSTEM_STYLE[system]['label']} | {_summary_cell(rps)} | "
                     f"{_summary_cell(mib, 2)} |")
         add("")
+    lines += extra_lines or []
     add("## Reading the results")
     add("")
-    add(READING.format(lowest_pct=pcts[0]))
+    add(reading(env).format(lowest_pct=pcts[0]))
     add("")
     add("## Gateway gaps met (rule 10)")
     add("")
@@ -602,6 +611,33 @@ Nothing here measures what VTOP adds over Kafka on this path (fenced epochs, the
 evidence chain; see [COMPARISON.md](../COMPARISON.md)), and nothing here is a failover, archive or crash
 measurement (#597, #598, #599)."""
 
+_PROBE_START = "A separate, unrecorded probe"
+_PROBE_END = "**On the latency chart:**"
+_PARITY_PHRASE = "the `fsync-parity` profile (phase 2) prices the\n   same guarantee on Kafka."
+_RELATIVE_PHRASE = "adding VTOP-relative rates is a phase-2 item."
+
+
+def reading(env: dict[str, Any]) -> str:
+    """READING, with each sentence that says a measurement is missing replaced by what this run has. A run
+    without the data reads exactly as before."""
+    from kafka_compare import extra_charts
+
+    text = READING
+    if extra_charts.has_resources(env):
+        start, end = text.index(_PROBE_START), text.index(_PROBE_END)
+        text = text[:start] + (
+            "This run records each system's CPU seconds and bytes written (*CPU and bytes written*, above), so "
+            "whether the produce path is bound by CPU or by durability round trips can be read from the run's own "
+            "counters rather than from a probe.\n\n") + text[end:]
+    if extra_charts.has_profile_cost(env):
+        text = text.replace(_PARITY_PHRASE, "the `fsync-parity` end-to-end runs (*What each durability profile "
+                                            "costs in latency*) price the\n   same guarantee on Kafka.")
+    if extra_charts.has_e2e(env) and env["matrix"]["e2e"]["load_basis"] == "common":
+        text = text.replace(_RELATIVE_PHRASE, "the end-to-end runs are offered a rate relative to the slower "
+                                              "system's saturation for that reason.")
+    return text
+
+
 def percent(fraction: float) -> str:
     return f"{fraction * 100:g}%"
 
@@ -615,21 +651,35 @@ def known_gaps(env: dict[str, Any]) -> str:
     """The known-gaps list, with the matrix facts read from the run, not typed in."""
     m = env["matrix"]
     sizes, partitions, producers = m["record_sizes"], m["partitions"], m["producers"]
+    from kafka_compare import extra_charts
+
     profile = env["comparable"]["profile"]
+    parity_slice = extra_charts.has_profile_cost(env)
     # #596's full matrix, and which parts of it this run did not cover.
     full = (("10 KiB", 10240 in sizes), ("6 partitions", 6 in partitions), ("4 producers", 4 in producers),
-            ("zstd", False), ("`fsync-parity`", profile == "fsync-parity"))
+            ("zstd", False), ("`fsync-parity`", profile == "fsync-parity" or parity_slice))
     missing = [name for name, covered in full if not covered]
+    only = (f"profile\n  `{profile}` only." if not parity_slice else
+            f"profile\n  `{profile}` in every mode, and `fsync-parity` for Kafka's end-to-end runs only.")
     lines = [
         f"- **Matrix size.** Record sizes {' and '.join(size_label(size) for size in sizes)} only; "
-        f"{_counted(partitions, 'partition')}, {_counted(producers, 'producer')}, no compression, profile\n"
-        f"  `{profile}` only." + (f" #596's full matrix ({', '.join(missing)}) is not run." if missing else ""),
+        f"{_counted(partitions, 'partition')}, {_counted(producers, 'producer')}, no compression, " + only
+        + (f" #596's full matrix ({', '.join(missing)}) is not run." if missing else ""),
     ]
     if max(partitions) == 1:
         lines.append(
             "- **One gateway, one partition.** The gateway runs on the range's leader only; a multi-partition VTOP "
             "topic\n  needs one leader per partition and is not exercised here.")
-    return "\n".join(lines) + "\n" + KNOWN_GAPS_FIXED
+    fixed = KNOWN_GAPS_FIXED
+    if extra_charts.has_e2e(env) or extra_charts.has_resources(env):
+        measured = [what for what, present in (("end-to-end latency", extra_charts.has_e2e(env)),
+                                               ("CPU and bytes written", extra_charts.has_resources(env)))
+                    if present]
+        fixed = fixed.replace(
+            "- **End-to-end latency, CPU and write amplification** (#596 metrics 3 and 4) are not measured yet.",
+            f"- **{' and '.join(measured).capitalize()}** (#596 metrics 3 and 4) are measured at one offered load "
+            "per cell, not as a curve. End-to-end latency has the resolution of a record's `CreateTime`, 1 ms.")
+    return "\n".join(lines) + "\n" + fixed
 
 
 # The gaps that do not depend on the run's matrix: how the harness is built.
@@ -652,23 +702,33 @@ KNOWN_GAPS_FIXED = """\
 SINGLE_VALUED = ("partitions", "producers", "compression", "acks", "profile")
 
 
-def check_drawable(rows: list[dict[str, str]], environment: dict[str, Any]) -> None:
+def check_drawable(rows: list[dict[str, str]], environment: dict[str, Any],
+                   hist: dict[tuple, dict[int, int]] | None = None) -> None:
     """Refuse a run this report would pool or mislabel (#596): one that varies
     along a dimension it does not draw, or holds a value its text does not
     say (it writes "no compression", `acks=all` and the environment's
-    profile), or rows it does not draw at all."""
+    profile), or rows it does not draw at all.
+
+    End-to-end rows are drawn (schema 3), with their histograms; so are Kafka's
+    end-to-end rows under the matrix's extra profiles, the one place a second profile is
+    allowed, because that is the profile latency chart."""
     profile = environment["comparable"].get("profile")
-    for column, said in (("compression", "none"), ("acks", "all"), ("profile", profile)):
-        values = sorted({row[column] for row in rows})
+    extra = schema.plan.extra_profiles(environment["matrix"])
+    main = [row for row in rows if not (row["mode"] == "e2e" and row["system"] == "kafka"
+                                        and row["profile"] in extra)]
+    for column, said, held in (("compression", "none", rows), ("acks", "all", rows), ("profile", profile, main)):
+        values = sorted({row[column] for row in held})
         if values != [said]:
             raise schema.ReportRefused(
                 f"the run's {column} is {', '.join(values)}; this report's text says {column} {said} and "
                 "draws nothing else until the grouped charts do (#600)")
-    if any(row["mode"] == "e2e" for row in rows):
-        raise schema.ReportRefused("the run has end-to-end latency rows, which this report does not draw yet "
-                                   "(#600); refused rather than left out")
+    ok_e2e = [row for row in rows if row["mode"] == "e2e" and row["status"] == "ok"]
+    if any(row["mode"] == "e2e" for row in rows) and (
+            hist is None or any(schema.row_key(row) not in hist for row in ok_e2e)):
+        raise schema.ReportRefused("the run has end-to-end rows without their latency histograms (schema 3's "
+                                   "e2e_hist.csv), so it cannot draw them; refused rather than left out")
     for column in SINGLE_VALUED:
-        values = sorted({row[column] for row in rows})
+        values = sorted({row[column] for row in (main if column == "profile" else rows)})
         if len(values) > 1:
             raise schema.ReportRefused(
                 f"the run has {len(values)} values of {column} ({', '.join(values)}); this report draws one "
@@ -682,8 +742,10 @@ def check_drawable(rows: list[dict[str, str]], environment: dict[str, Any]) -> N
 
 
 def build(run_dir: str, img_dir: str, doc_path: str) -> list[str]:
+    from kafka_compare import extra_charts
+
     run = schema.load_run(run_dir)  # raises ReportRefused before anything is written
-    check_drawable(run.rows, run.environment)
+    check_drawable(run.rows, run.environment, run.hist)
     plt = _setup_matplotlib()
     os.makedirs(img_dir, exist_ok=True)
     os.makedirs(os.path.dirname(os.path.abspath(doc_path)), exist_ok=True)
@@ -704,14 +766,19 @@ def build(run_dir: str, img_dir: str, doc_path: str) -> list[str]:
                                     "offset commits off for both; the tool's "
                                     "fetch rate, which excludes the group join. Same JVM client container for both.",
                                     "kafka-compare-consume-throughput", img_dir)
+    extra_written, extra_files = extra_charts.draw(plt, run, img_dir)
+    written += extra_written
     doc_dir = os.path.dirname(os.path.abspath(doc_path))
     images = {
         key: os.path.relpath(os.path.join(img_dir, f"kafka-compare-{key}.png"), doc_dir)
         for key in ("produce-throughput", "produce-latency", "consume-throughput")
     }
+    images.update({key: os.path.relpath(path, doc_dir) for key, path in extra_files.items()})
     csv_rel = os.path.relpath(os.path.join(run_dir, "results.csv"), doc_dir)
     env_rel = os.path.relpath(os.path.join(run_dir, "environment.json"), doc_dir)
-    write_markdown(run.rows, run.environment, run_id, csv_rel, env_rel, images, doc_path)
+    hist_rel = os.path.relpath(os.path.join(run_dir, schema.E2E_HIST), doc_dir)
+    write_markdown(run.rows, run.environment, run_id, csv_rel, env_rel, images, doc_path,
+                   extra_charts.sections(run, images, hist_rel))
     written.append(doc_path)
     return written
 
@@ -729,9 +796,14 @@ def main(argv: list[str] | None = None) -> int:
                              "crash_report.MIN_OK_CRASHES); lower it to preview a short run, never to commit one")
     args = parser.parse_args(argv)
     try:
-        own = run_outputs.resolve(args.run_dir, REPO, IMG_ROOT)
+        own = run_outputs.resolve(args.run_dir, REPO, IMG_ROOT, allow_latency_run=True)
         img_dir = args.img_dir or (own.img_dir if own else DEFAULT_IMG_DIR)
         doc = args.doc or (own.doc if own else None)
+        is_crash = os.path.isfile(os.path.join(args.run_dir, "crash.csv"))
+        if own and own.latency_run and not is_crash:
+            raise run_outputs.OutputsRefused(
+                f"{args.run_dir}/report.json names latency_run {own.latency_run!r}, which only a crash run may "
+                "(its page draws that run's latencies beside its losses)")
         if os.path.isfile(os.path.join(args.run_dir, "failover.csv")):
             from kafka_compare import failover_report
 
@@ -739,8 +811,11 @@ def main(argv: list[str] | None = None) -> int:
         elif os.path.isfile(os.path.join(args.run_dir, "crash.csv")):
             from kafka_compare import crash_report
 
+            latency = (os.path.join(os.path.dirname(os.path.abspath(args.run_dir)), own.latency_run)
+                       if own and own.latency_run else None)
             written = crash_report.build(args.run_dir, img_dir, doc or DEFAULT_CRASH_DOC, _setup_matplotlib,
-                                         **({} if args.min_ok is None else {"min_ok": args.min_ok}))
+                                         **({} if args.min_ok is None else {"min_ok": args.min_ok}),
+                                         latency_run=latency)
         else:
             written = build(args.run_dir, img_dir, doc or DEFAULT_DOC)
     except (run_outputs.OutputsRefused, schema.ReportRefused) as exc:

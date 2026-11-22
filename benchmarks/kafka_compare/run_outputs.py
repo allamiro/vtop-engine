@@ -17,6 +17,10 @@ other file of the run. A run without one writes the kind's default paths, exactl
 before, so no committed output changes. `--doc` and `--img-dir` on a report's command
 line still win over the file.
 
+A crash run's `report.json` may also name `latency_run`: the id of a throughput run in the same results
+directory whose end-to-end latencies are drawn beside the crash results (#600). Only the Kafka report
+asks for it (`allow_latency_run=True`); every other kind's file is exactly `doc` and `img_dir`.
+
 The paths are checked, not trusted: the page is one `.md` file directly under
 `docs/benchmarks/` (never `index.md`), and the images are a directory UNDER the kind's
 own image directory, which is where `regenerate.py` looks for output no run writes, so
@@ -27,11 +31,14 @@ from __future__ import annotations
 import json
 import os
 import posixpath
+import re
 from typing import NamedTuple
 
 FILE = "report.json"
 DOCS = "docs/benchmarks"
 KEYS = ("doc", "img_dir")
+OPTIONAL = ("latency_run",)
+_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 class OutputsRefused(Exception):
@@ -41,6 +48,7 @@ class OutputsRefused(Exception):
 class Outputs(NamedTuple):
     doc: str  # absolute
     img_dir: str  # absolute
+    latency_run: str | None = None  # a run id, not a path
 
 
 def _clean(value: object, key: str, path: str) -> str:
@@ -52,7 +60,7 @@ def _clean(value: object, key: str, path: str) -> str:
     return value
 
 
-def resolve(run_dir: str, repo: str, img_root: str) -> Outputs | None:
+def resolve(run_dir: str, repo: str, img_root: str, allow_latency_run: bool = False) -> Outputs | None:
     """The run's own output paths, or None when it has no `report.json` (the kind's defaults apply).
 
     `img_root` is the kind's image directory relative to the repository
@@ -65,8 +73,12 @@ def resolve(run_dir: str, repo: str, img_root: str) -> Outputs | None:
             data = json.load(handle)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise OutputsRefused(f"{path} is not readable JSON: {exc}") from exc
-    if not isinstance(data, dict) or sorted(data) != sorted(KEYS):
-        raise OutputsRefused(f"{path} must be an object with exactly the keys {', '.join(KEYS)}, not "
+    allowed = KEYS + (OPTIONAL if allow_latency_run else ())
+    if (not isinstance(data, dict) or any(key not in data for key in KEYS)
+            or any(key not in allowed for key in data)):
+        said = f"exactly the keys {', '.join(KEYS)}" if not allow_latency_run else \
+            f"the keys {', '.join(KEYS)}, and optionally {', '.join(OPTIONAL)}"
+        raise OutputsRefused(f"{path} must be an object with {said}, not "
                              f"{sorted(data) if isinstance(data, dict) else type(data).__name__}")
     doc = _clean(data["doc"], "doc", path)
     img = _clean(data["img_dir"], "img_dir", path)
@@ -76,4 +88,8 @@ def resolve(run_dir: str, repo: str, img_root: str) -> Outputs | None:
     if not img.startswith(img_root + "/"):
         raise OutputsRefused(f"{path}: img_dir is {img!r}; for this kind it must be a directory under "
                              f"{img_root}/, where the drift check looks for output no run writes")
-    return Outputs(os.path.join(repo, *doc.split("/")), os.path.join(repo, *img.split("/")))
+    latency = data.get("latency_run")
+    if "latency_run" in data and (not isinstance(latency, str) or not _RUN_ID.match(latency) or ".." in latency):
+        raise OutputsRefused(f"{path}: latency_run is {latency!r}; it must be the id of a run in the same results "
+                             "directory (one path component of letters, digits, '.', '_' or '-')")
+    return Outputs(os.path.join(repo, *doc.split("/")), os.path.join(repo, *img.split("/")), latency)
