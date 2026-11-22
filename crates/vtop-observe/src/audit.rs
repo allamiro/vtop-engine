@@ -764,6 +764,28 @@ struct FileSink {
     end: Option<u64>,
     /// How long an append waits for another writer's lock before it fails.
     lock_wait: std::time::Duration,
+    /// The file's directory entry has been synced by this sink: the first
+    /// append does it, so a file the open just created survives a crash
+    /// together with the records acknowledged in it.
+    dir_synced: bool,
+}
+
+/// Sync the directory that holds `path`, so a file created in it is not lost
+/// to a crash that keeps the file's data. A file system that cannot sync a
+/// directory is reported, not ignored: an acknowledged record would not be
+/// durable (review of #767).
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// How long an append waits for the lock another process holds on the audit
@@ -846,6 +868,13 @@ impl FileSink {
     }
 
     fn append_locked(&mut self, json: &str, locked: bool) -> std::io::Result<()> {
+        // Before the first record is acknowledged, the file's own directory
+        // entry is made durable; a failure leaves the record unwritten and
+        // the audit frontier behind it (review of #767).
+        if !self.dir_synced {
+            sync_parent_dir(&self.path)?;
+            self.dir_synced = true;
+        }
         let before = self.file.metadata().map(|m| m.len()).ok();
         if before.is_none() || before != self.end {
             // The first append, or another writer appended since: the file
@@ -929,6 +958,7 @@ impl AuditSink {
             needs_newline: false,
             end: None,
             lock_wait: LOCK_WAIT,
+            dir_synced: false,
         });
         Ok(())
     }
@@ -1421,6 +1451,51 @@ mod tests {
             serde_json::from_str::<AuditEvent>(lines[2]).is_ok(),
             "the record after another writer's fragment is a line of its own: {text}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review of #767: the first append syncs the directory that holds the
+    /// file, so a file the open created is not lost to a crash that keeps its
+    /// records; a directory that cannot be synced fails the append.
+    #[test]
+    fn the_first_append_syncs_the_directory_of_the_file() {
+        let dir = std::env::temp_dir().join(format!("vtop-767d-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        let sink = AuditSink::default();
+        sink.open_file(&path).unwrap();
+        let synced = |sink: &AuditSink| {
+            sink.file
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|file| file.dir_synced)
+                .unwrap()
+        };
+        assert!(!synced(&sink), "the open syncs nothing outside the lock");
+        let event = AuditEvent::new(
+            Action::ClusterPropose,
+            Stage::Applied,
+            Actor::replica("meta-1"),
+            Target::new("cluster", None),
+            Outcome::Success,
+        );
+        sink.record(&event).unwrap();
+        assert!(
+            synced(&sink),
+            "the first append left the directory unsynced"
+        );
+        // A directory that is gone cannot be synced: the sync is an error,
+        // not something to skip.
+        #[cfg(unix)]
+        {
+            assert!(sync_parent_dir(&path).is_ok());
+            let missing = dir.join("gone").join("audit.jsonl");
+            assert!(
+                sync_parent_dir(&missing).is_err(),
+                "a directory that cannot be opened was taken as synced"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
