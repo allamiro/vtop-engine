@@ -91,6 +91,11 @@ pub enum Action {
     /// `vtopctl node promote-unproven`: the operator's attestation (#636).
     #[serde(rename = "promotion.attest")]
     PromotionAttest,
+    /// A metadata replica's applied records it owes and cannot re-derive
+    /// (#706): a snapshot install, or a log purged past its audit frontier.
+    /// `params` name the log index range and why.
+    #[serde(rename = "audit.gap")]
+    AuditGap,
     /// A key, state-store, ledger or audit file other local users can read,
     /// accepted only because `security.allow_loose_secret_permissions` is
     /// true (#733). One record per file per process; the target is the file.
@@ -106,7 +111,7 @@ pub enum Action {
 
 impl Action {
     /// Every action, for label sets and tests.
-    pub const ALL: [Action; 14] = [
+    pub const ALL: [Action; 15] = [
         Action::LedgerReplay,
         Action::LedgerPrune,
         Action::LedgerMigrate,
@@ -119,6 +124,7 @@ impl Action {
         Action::NodeRepair,
         Action::NodeReconfigureRange,
         Action::PromotionAttest,
+        Action::AuditGap,
         Action::SecurityOverride,
         Action::NativeSession,
     ];
@@ -137,6 +143,7 @@ impl Action {
             Action::NodeRepair => "node.repair",
             Action::NodeReconfigureRange => "node.reconfigure_range",
             Action::PromotionAttest => "promotion.attest",
+            Action::AuditGap => "audit.gap",
             Action::SecurityOverride => "security.override",
             Action::NativeSession => "native.session",
         }
@@ -214,6 +221,7 @@ impl Action {
                 "operator",
                 "command",
             ],
+            Action::AuditGap => &["from_index", "through_index", "reason"],
             // What the file holds, its mode and who besides the owner can
             // read it: never its contents.
             Action::SecurityOverride => &["file_kind", "mode", "exposed_to", "setting"],
@@ -489,6 +497,10 @@ pub struct Correlation {
     /// through its state machine; none for entries a snapshot brought).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_index: Option<u64>,
+    /// The term of that entry (#706): with the index, the entry's identity,
+    /// the same on every replica.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_term: Option<u64>,
 }
 
 /// One audit record, `audit_version` 1.
@@ -517,6 +529,11 @@ pub struct AuditEvent {
     /// The engine's name, or the node that wrote the record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<String>,
+    /// Delivered again after a crash, a refusing sink or a restart (#706):
+    /// it may duplicate a record the same engine wrote for the same log
+    /// index. Absent means false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replayed: bool,
 }
 
 impl AuditEvent {
@@ -543,7 +560,29 @@ impl AuditEvent {
             after: BTreeMap::new(),
             correlation: Correlation::default(),
             engine: None,
+            replayed: false,
         }
+    }
+
+    /// Time the record at `ms` since the Unix epoch instead of now: an
+    /// applied metadata record takes its entry's `issued_at_ms` (#706), so
+    /// every replica writes the same time. A value chrono cannot represent
+    /// leaves the time as it was.
+    pub fn time_ms(mut self, ms: i64) -> Self {
+        if let Some(at) = chrono::DateTime::from_timestamp_millis(ms) {
+            self.time = at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        }
+        self
+    }
+
+    pub fn log_term(mut self, term: u64) -> Self {
+        self.correlation.log_term = Some(term);
+        self
+    }
+
+    pub fn replayed(mut self, replayed: bool) -> Self {
+        self.replayed = replayed;
+        self
     }
 
     /// Add a parameter, if `name` is on the action's allowlist; the value is
@@ -714,6 +753,165 @@ pub struct Recorded {
 struct FileSink {
     path: PathBuf,
     file: File,
+    /// A write failed part-way and the partial line could not be cut off:
+    /// the next record starts on a new line, so it is not glued to the
+    /// fragment and lost to every reader (review of #767).
+    needs_newline: bool,
+    /// The file's length after this sink's last append; `None` before the
+    /// first. Another length (or `None`) means another writer - a node, a
+    /// `vtopctl` run - may have appended since, so the file's last byte is
+    /// read again under the lock.
+    end: Option<u64>,
+    /// How long an append waits for another writer's lock before it fails.
+    lock_wait: std::time::Duration,
+    /// The file's directory entry has been synced by this sink: the first
+    /// append does it, so a file the open just created survives a crash
+    /// together with the records acknowledged in it.
+    dir_synced: bool,
+}
+
+/// Sync the directory that holds `path`, so a file created in it is not lost
+/// to a crash that keeps the file's data. A file system that cannot sync a
+/// directory is reported, not ignored: an acknowledged record would not be
+/// durable (review of #767).
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// How long an append waits for the lock another process holds on the audit
+/// file. A writer that is paused while it holds the lock must not stop the
+/// node's metadata apply or its start: past this the append fails, the audit
+/// frontier stays behind, and delivery tries again (review of #767).
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Whether the file at `path` is non-empty and its last byte is not a
+/// newline. A file
+/// that cannot be read is assumed whole: a stray newline costs a blank line,
+/// a missing one a record.
+fn ends_inside_a_line(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    // Opened again to read: the append handle is write-only.
+    let Ok(mut reader) = File::open(path) else {
+        return true;
+    };
+    let Ok(len) = reader.seek(SeekFrom::End(0)) else {
+        return true;
+    };
+    if len == 0 {
+        return false;
+    }
+    let mut last = [0_u8; 1];
+    let read = reader
+        .seek(SeekFrom::End(-1))
+        .and_then(|_| reader.read_exact(&mut last));
+    read.is_err() || last[0] != b'\n'
+}
+
+impl FileSink {
+    /// Append one record as one line. A write that fails part-way (a full
+    /// disk) leaves a fragment: it is cut off again, and when it cannot be,
+    /// the next record starts on a new line. Either way every record that
+    /// is reported written is a line of its own that a reader parses.
+    ///
+    /// Other processes may append to the same file (a node and `vtopctl`
+    /// runs), so the append holds an exclusive lock on the file across the
+    /// length check, the write and the cut: without it a cut back to the
+    /// length seen before deleted a record another process appended in
+    /// between (review of #767). Where the file cannot be locked, a failed
+    /// write is never cut; the next record starts on a new line instead.
+    fn append_line(&mut self, json: &str) -> std::io::Result<()> {
+        let locked = self.lock_file()?;
+        let written = self.append_locked(json, locked);
+        if locked {
+            let _ = self.file.unlock();
+        }
+        written
+    }
+
+    /// Take the exclusive lock, waiting at most `lock_wait` for another
+    /// writer to release it. `Ok(false)` when the file cannot be locked at
+    /// all (a file system without locks); an error when another writer holds
+    /// it for the whole wait.
+    fn lock_file(&self) -> std::io::Result<bool> {
+        use std::fs::TryLockError;
+        let deadline = std::time::Instant::now() + self.lock_wait;
+        loop {
+            match self.file.try_lock() {
+                Ok(()) => return Ok(true),
+                Err(TryLockError::Error(_)) => return Ok(false),
+                Err(TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "another process held the lock on {} for {} ms; the record was \
+                                 not written and is retried",
+                                self.path.display(),
+                                self.lock_wait.as_millis()
+                            ),
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        }
+    }
+
+    fn append_locked(&mut self, json: &str, locked: bool) -> std::io::Result<()> {
+        // Before the first record is acknowledged, the file's own directory
+        // entry is made durable; a failure leaves the record unwritten and
+        // the audit frontier behind it (review of #767).
+        if !self.dir_synced {
+            sync_parent_dir(&self.path)?;
+            self.dir_synced = true;
+        }
+        let before = self.file.metadata().map(|m| m.len()).ok();
+        if before.is_none() || before != self.end {
+            // The first append, or another writer appended since: the file
+            // may end inside a line (an earlier run that crashed part-way
+            // through an append, or a writer that could not cut its
+            // fragment off), and the record must not be glued to it. Read
+            // under the lock, so no writer can add a fragment between this
+            // read and the write (review of #767).
+            self.needs_newline = ends_inside_a_line(&self.path);
+        }
+        let mut line = String::with_capacity(json.len() + 2);
+        if self.needs_newline {
+            line.push('\n');
+        }
+        line.push_str(json);
+        line.push('\n');
+        let written = self
+            .file
+            .write_all(line.as_bytes())
+            .and_then(|()| self.file.sync_data());
+        match &written {
+            Ok(()) => {
+                self.needs_newline = false;
+                self.end = self.file.metadata().map(|m| m.len()).ok();
+            }
+            Err(_) => {
+                let cut = locked && before.is_some_and(|len| self.file.set_len(len).is_ok());
+                if cut {
+                    self.end = before;
+                } else {
+                    self.needs_newline = true;
+                    self.end = None;
+                }
+            }
+        }
+        written
+    }
 }
 
 /// The process's sinks and counters. One global ([`record`]); tests build
@@ -751,11 +949,26 @@ impl AuditSink {
             path: path.to_owned(),
             error: e.to_string(),
         })?;
+        // The file's tail is not read here, outside the lock: another
+        // writer could leave a fragment between that read and the first
+        // append. The first append reads it under the lock (`end` is None).
         *self.file.lock().unwrap_or_else(|e| e.into_inner()) = Some(FileSink {
             path: path.to_owned(),
             file,
+            needs_newline: false,
+            end: None,
+            lock_wait: LOCK_WAIT,
+            dir_synced: false,
         });
         Ok(())
+    }
+
+    /// Shorten the wait for another writer's lock, for a test.
+    #[cfg(test)]
+    fn set_lock_wait(&self, wait: std::time::Duration) {
+        if let Some(file) = self.file.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            file.lock_wait = wait;
+        }
     }
 
     /// The file this sink appends to, if any.
@@ -804,10 +1017,7 @@ impl AuditSink {
         }
         let mut guard = self.file.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(sink) = guard.as_mut() {
-            let written = sink
-                .file
-                .write_all(format!("{json}\n").as_bytes())
-                .and_then(|()| sink.file.sync_data());
+            let written = sink.append_line(&json);
             if let Err(e) = written {
                 let path = sink.path.clone();
                 drop(guard);
@@ -1086,6 +1296,287 @@ fn passwd_lookup(text: &str, uid: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review of #767: a file an earlier run left ending inside a
+    /// line - a crash part-way through an append - gets a newline before the
+    /// first record of the next run, which the startup replay writes.
+    #[test]
+    fn a_record_after_a_reopened_torn_file_is_a_line_of_its_own() {
+        let dir = std::env::temp_dir().join(format!("vtop-767r-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        std::fs::write(&path, br#"{"audit_version":1,"aud"#).unwrap();
+        let sink = AuditSink::default();
+        sink.open_file(&path).unwrap();
+        sink.record(&AuditEvent::new(
+            Action::ClusterPropose,
+            Stage::Applied,
+            Actor::replica("meta-1"),
+            Target::new("cluster", None),
+            Outcome::Success,
+        ))
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(
+            serde_json::from_str::<AuditEvent>(lines[1]).is_ok(),
+            "{text}"
+        );
+
+        // A whole file gets no extra line.
+        let clean = dir.join("clean.jsonl");
+        let sink = AuditSink::default();
+        sink.open_file(&clean).unwrap();
+        let event = || {
+            AuditEvent::new(
+                Action::ClusterPropose,
+                Stage::Applied,
+                Actor::replica("meta-1"),
+                Target::new("cluster", None),
+                Outcome::Success,
+            )
+        };
+        sink.record(&event()).unwrap();
+        let sink = AuditSink::default();
+        sink.open_file(&clean).unwrap();
+        sink.record(&event()).unwrap();
+        let text = std::fs::read_to_string(&clean).unwrap();
+        assert_eq!(text.lines().count(), 2, "{text}");
+        assert!(!text.contains("\n\n"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review of #767: a write that failed part-way leaves a fragment the
+    /// next record must not be glued to, or the retried record is lost to
+    /// every reader. A fragment that could not be cut off is followed by a
+    /// newline before the next record.
+    #[test]
+    fn a_record_after_a_torn_write_is_still_a_line_of_its_own() {
+        let dir = std::env::temp_dir().join(format!("vtop-767-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        let sink = AuditSink::default();
+        sink.open_file(&path).unwrap();
+        let event = || {
+            AuditEvent::new(
+                Action::ClusterPropose,
+                Stage::Applied,
+                Actor::replica("meta-1"),
+                Target::new("cluster", None),
+                Outcome::Success,
+            )
+        };
+        sink.record(&event()).unwrap();
+        {
+            let mut guard = sink.file.lock().unwrap();
+            let file_sink = guard.as_mut().unwrap();
+            file_sink
+                .file
+                .write_all(br#"{"audit_version":1,"aud"#)
+                .unwrap();
+            file_sink.needs_newline = true;
+        }
+        sink.record(&event()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(serde_json::from_str::<AuditEvent>(lines[0]).is_ok());
+        assert!(
+            serde_json::from_str::<AuditEvent>(lines[1]).is_err(),
+            "the fragment"
+        );
+        assert!(
+            serde_json::from_str::<AuditEvent>(lines[2]).is_ok(),
+            "the record after the fragment parses: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review of #767: processes that share one audit file (a node
+    /// and `vtopctl` runs) each cut a failed append back to the length they
+    /// saw before it, which deleted a record another process had appended in
+    /// between. An append now holds an exclusive lock on the file across the
+    /// length check, the write and the cut, and starts on a new line when
+    /// another writer left the file inside one. The other writer here is a
+    /// second handle on the file, holding the lock while it appends a
+    /// fragment.
+    #[test]
+    fn an_append_waits_for_another_writer_of_the_same_file() {
+        let dir = std::env::temp_dir().join(format!("vtop-767l-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        let sink = std::sync::Arc::new(AuditSink::default());
+        sink.open_file(&path).unwrap();
+        let event = || {
+            AuditEvent::new(
+                Action::ClusterPropose,
+                Stage::Applied,
+                Actor::replica("meta-1"),
+                Target::new("cluster", None),
+                Outcome::Success,
+            )
+        };
+        sink.record(&event()).unwrap();
+
+        let mut other = OpenOptions::new().append(true).open(&path).unwrap();
+        other.lock().unwrap();
+        let writer = {
+            let sink = std::sync::Arc::clone(&sink);
+            std::thread::spawn(move || sink.record(&event()).map(|_| ()))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let while_locked = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            while_locked.lines().count(),
+            1,
+            "a record was appended while another writer held the file: {while_locked}"
+        );
+        other.write_all(br#"{"audit_version":1,"aud"#).unwrap();
+        other.unlock().unwrap();
+        writer.join().unwrap().unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(
+            serde_json::from_str::<AuditEvent>(lines[0]).is_ok(),
+            "{text}"
+        );
+        assert!(
+            serde_json::from_str::<AuditEvent>(lines[1]).is_err(),
+            "the other writer's fragment: {text}"
+        );
+        assert!(
+            serde_json::from_str::<AuditEvent>(lines[2]).is_ok(),
+            "the record after another writer's fragment is a line of its own: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review of #767: the first append syncs the directory that holds the
+    /// file, so a file the open created is not lost to a crash that keeps its
+    /// records; a directory that cannot be synced fails the append.
+    #[test]
+    fn the_first_append_syncs_the_directory_of_the_file() {
+        let dir = std::env::temp_dir().join(format!("vtop-767d-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        let sink = AuditSink::default();
+        sink.open_file(&path).unwrap();
+        let synced = |sink: &AuditSink| {
+            sink.file
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|file| file.dir_synced)
+                .unwrap()
+        };
+        assert!(!synced(&sink), "the open syncs nothing outside the lock");
+        let event = AuditEvent::new(
+            Action::ClusterPropose,
+            Stage::Applied,
+            Actor::replica("meta-1"),
+            Target::new("cluster", None),
+            Outcome::Success,
+        );
+        sink.record(&event).unwrap();
+        assert!(
+            synced(&sink),
+            "the first append left the directory unsynced"
+        );
+        // A directory that is gone cannot be synced: the sync is an error,
+        // not something to skip.
+        #[cfg(unix)]
+        {
+            assert!(sync_parent_dir(&path).is_ok());
+            let missing = dir.join("gone").join("audit.jsonl");
+            assert!(
+                sync_parent_dir(&missing).is_err(),
+                "a directory that cannot be opened was taken as synced"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review of #767: a writer paused while it holds the file's lock must
+    /// not block the caller for ever. The append fails after the wait, with
+    /// nothing written, and succeeds once the lock is free.
+    #[test]
+    fn an_append_gives_up_on_a_lock_held_too_long() {
+        let dir = std::env::temp_dir().join(format!("vtop-767w-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        let sink = AuditSink::default();
+        sink.open_file(&path).unwrap();
+        sink.set_lock_wait(std::time::Duration::from_millis(100));
+        let event = AuditEvent::new(
+            Action::ClusterPropose,
+            Stage::Applied,
+            Actor::replica("meta-1"),
+            Target::new("cluster", None),
+            Outcome::Success,
+        );
+        let other = OpenOptions::new().append(true).open(&path).unwrap();
+        other.lock().unwrap();
+        let started = std::time::Instant::now();
+        let refused = sink.record(&event);
+        assert!(refused.is_err(), "an append went through a held lock");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the append waited {:?}",
+            started.elapsed()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        other.unlock().unwrap();
+        sink.record(&event).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review of #767: opening the file read its tail and its length
+    /// outside the lock, so another writer could append a fragment between
+    /// the two reads; the first record then matched the remembered length,
+    /// skipped the tail check and was glued to the fragment. Nothing about
+    /// the tail is remembered from the open now: the first append reads it
+    /// under the lock.
+    #[test]
+    fn the_first_append_reads_the_tail_under_the_lock() {
+        let dir = std::env::temp_dir().join(format!("vtop-767o-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        std::fs::write(&path, b"{\"audit_version\":1}\n").unwrap();
+        let sink = AuditSink::default();
+        sink.open_file(&path).unwrap();
+        {
+            let guard = sink.file.lock().unwrap();
+            let file_sink = guard.as_ref().unwrap();
+            assert_eq!(
+                file_sink.end, None,
+                "the length seen at open would let the first append skip the tail check"
+            );
+            assert!(!file_sink.needs_newline);
+        }
+        // The race's outcome: a fragment lands after the open.
+        let mut other = OpenOptions::new().append(true).open(&path).unwrap();
+        other.write_all(br#"{"audit_version":1,"aud"#).unwrap();
+        sink.record(&AuditEvent::new(
+            Action::ClusterPropose,
+            Stage::Applied,
+            Actor::replica("meta-1"),
+            Target::new("cluster", None),
+            Outcome::Success,
+        ))
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(
+            serde_json::from_str::<AuditEvent>(lines[2]).is_ok(),
+            "the first record after a fragment is a line of its own: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use tracing_subscriber::layer::SubscriberExt;
 
     /// Log lines captured in memory.

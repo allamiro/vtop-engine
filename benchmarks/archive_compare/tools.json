@@ -1,0 +1,33 @@
+{
+  "_comment": "The tools of the archive comparison (#746), one entry per registry system. Adding a tool, or a profile of one, is an entry here, a configuration file, a Compose service of the same name in compose.yml, and (for a new system) a product in compare_common/products.toml and a slot in its `archive` family: no code in run.py changes. `profiles` maps a durability profile to its committed configuration file (repo-relative); `extra_configs` are files the tool needs beside it, hashed into the environment block; `group` is the consumer group the offset sampler follows; `dockerfile` is a build the harness runs for a tool the registry's image alone does not give. The order of `profiles` is the order the kind lists them.",
+  "systems": {
+    "connect-lenses": {
+      "service": "connect-lenses",
+      "group": "connect-archive-bench",
+      "profiles": {"exactly-once": "benchmarks/archive_compare/tools/connect-lenses/exactly-once.properties"},
+      "extra_configs": {"worker": "benchmarks/archive_compare/tools/connect-lenses/worker.properties"},
+      "dockerfile": "benchmarks/archive_compare/tools/connect-lenses/Dockerfile",
+      "image_tag": "vtop-connect-lenses:12.1.2",
+      "jvm_flags": "-Xmx1g",
+      "telemetry": "no usage reporting or update check in Kafka Connect or the connector; JMX metrics not exported"
+    },
+    "vtop": {
+      "service": "vtop",
+      "group": "vtop-bench",
+      "profiles": {
+        "strong": "benchmarks/archive_compare/tools/vtop/strong.yaml",
+        "verify-off": "benchmarks/archive_compare/tools/vtop/verify-off.yaml"
+      },
+      "telemetry": "no usage reporting; OpenTelemetry export off (OTEL_SDK_DISABLED=true, no endpoint set)"
+    },
+    "vector": {
+      "service": "vector",
+      "group": "vector-bench",
+      "profiles": {
+        "acks": "benchmarks/archive_compare/tools/vector/acks.yaml",
+        "disk-buffer": "benchmarks/archive_compare/tools/vector/disk-buffer.yaml"
+      },
+      "telemetry": "no usage reporting; API server off (api.enabled: false)"
+    }
+  }
+}

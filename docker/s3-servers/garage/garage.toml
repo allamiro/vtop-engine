@@ -1,0 +1,21 @@
+# Garage for the S3 compatibility matrix (#722): one node, sqlite metadata,
+# replication factor 1. LAB ONLY: the rpc_secret and admin token below are
+# fixed, published values; the loopback bind is the boundary.
+metadata_dir = "/var/lib/garage/meta"
+data_dir = "/var/lib/garage/data"
+db_engine = "sqlite"
+replication_factor = 1
+
+rpc_bind_addr = "[::]:3901"
+rpc_public_addr = "127.0.0.1:3901"
+rpc_secret = "5c1915fa04d0b6739675c61bf5907eb0fe3d9c69850c83820f51b4d25d13868c"
+
+[s3_api]
+# Garage's default region is `garage`; the tests sign for us-east-1.
+s3_region = "us-east-1"
+api_bind_addr = "[::]:3900"
+root_domain = ".s3.garage.localhost"
+
+[admin]
+api_bind_addr = "[::]:3903"
+admin_token = "vtop-lab-admin-token"

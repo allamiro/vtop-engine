@@ -184,6 +184,71 @@ async fn read_returns_records_from_a_non_empty_topic() {
     }
 }
 
+/// A pass that fills its BYTE budget leaves the record that did not fit
+/// unkept; the next pass reads on from it WITHOUT re-assigning the partition.
+/// (A record budget, or bytes landing exactly on the budget, stop the pass
+/// before the next record is polled: 475 bytes is not a multiple of these
+/// 46-to-48-byte records.) A re-assign restarts
+/// every partition's fetcher, and on a 64 MiB budget the pass after it often
+/// read nothing while the fetch restarted. Nothing is skipped or read twice.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn a_pass_that_fills_its_budget_reads_on_without_re_assigning() {
+    let (topic, _cleanup) = fresh_topic("budget", 30).await;
+    let mut cfg = kafka_cfg(&bootstrap(), &unique_group("budget"));
+    cfg.topic_include_regex = format!("^{topic}$");
+    let mut adapter = KafkaSource::new(cfg, TelemetryFormat::Cef).unwrap();
+    let sources = through_warm_up!("discovery", adapter.discover_sources().await);
+    let src = sources
+        .into_iter()
+        .find(|s| s.source_name == topic)
+        .expect("the fresh topic is discovered");
+    let mut offsets = Vec::new();
+    for _ in 0..10 {
+        let reads = through_warm_up!(
+            "a budgeted pass",
+            adapter
+                .read_batch_candidates(&src, 1_000, 475, std::time::Duration::from_secs(5))
+                .await
+        );
+        for read in &reads {
+            let (
+                ProgressMarker::Kafka { start_offset, .. },
+                ProgressMarker::Kafka { end_offset, .. },
+            ) = (&read.progress_start, &read.progress_end)
+            else {
+                panic!("a Kafka read carries Kafka markers");
+            };
+            let bytes: usize = read.records.iter().map(Vec::len).sum();
+            assert!(
+                bytes <= 475,
+                "a pass kept {bytes} bytes over its 475-byte budget"
+            );
+            offsets.push((*start_offset, *end_offset));
+        }
+        if offsets.last().is_some_and(|&(_, end)| end == 29) {
+            break;
+        }
+    }
+    let mut next = 0;
+    for &(start, end) in &offsets {
+        assert_eq!(
+            start, next,
+            "a pass skipped or repeated records: {offsets:?}"
+        );
+        next = end + 1;
+    }
+    assert_eq!(
+        next, 30,
+        "the passes did not reach the end of the topic: {offsets:?}"
+    );
+    assert_eq!(
+        adapter.assignments(),
+        1,
+        "a pass that filled its budget re-assigned the partitions: {offsets:?}"
+    );
+}
+
 /// The core invariant on the Kafka path: a fresh consumer group must NOT advance
 /// past data merely by reading it. Simulates a crash before VERIFIED.
 #[tokio::test]
