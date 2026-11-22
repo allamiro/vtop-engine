@@ -26,7 +26,10 @@ answered (`invoke_ms`, `complete_ms`). An observation that failed
   stale_leader  a deposed leader stops: a node never says it holds epoch E
                 after a lease read that ended earlier reported a newer epoch,
                 when E's lease had a deadline and the observation began after
-                the latest deadline any read reported for E. A lease with no
+                the latest deadline any read reported for E, and the node
+                says so for STALE_PERSIST_MS (2 s): its gauges keep their last
+                value while a scrape cannot take the lease view, so one
+                observation can repeat an old claim. A lease with no
                 deadline (an operator's grant) is not held to this, and an
                 operator's revocation of a live lease is not modelled
   stalled       (only with --stall-ms N) liveness, not safety: the history
@@ -54,6 +57,9 @@ from bisect import bisect_left, bisect_right
 from collections import defaultdict
 
 LISTED = 20
+# How long a deposed leader's claim must persist before stale_leader counts
+# it: longer than a scrape can repeat a cached gauge.
+STALE_PERSIST_MS = 2000
 OPS = ("meta_status", "lease_read", "node_lease")
 
 
@@ -197,19 +203,33 @@ def check(events: list[dict], stall_ms: int | None = None, require_observations:
     prefix_max: list[dict] = []
     for r in by_complete:
         prefix_max.append(r if not prefix_max or r["range_epoch"] > prefix_max[-1]["range_epoch"] else prefix_max[-1])
-    for c in claims:
+    # A data node's gauges keep their last value while a scrape cannot take
+    # the broker's lease view (a try-lock, held through a produce or an
+    # fsync), so one scrape can repeat an old claim (review of #904). A
+    # stale claim counts only when the same node repeats it for
+    # STALE_PERSIST_MS: a deposed leader takes no writes, so its view does
+    # not stay locked that long.
+    stale: dict[tuple, list[dict]] = defaultdict(list)
+    for c in sorted(claims, key=lambda c: c["invoke_ms"]):
         deadline = expiry.get(c["epoch"])
         if deadline is None or c["invoke_ms"] <= deadline:
             continue
         i = bisect_left(completes, c["invoke_ms"])  # reads that ended strictly before
         if i and prefix_max[i - 1]["range_epoch"] > c["epoch"]:
-            r = prefix_max[i - 1]
-            _add(violations, "stale_leader", {
-                "message": f"{c['node']} still acted as the leader of epoch {c['epoch']} at {c['invoke_ms']}, "
-                           f"after its lease's deadline {deadline} and after a read reported epoch "
-                           f"{r['range_epoch']} (ended {r['complete_ms']})",
-                "claim": c, "read": r,
-            })
+            stale[(c.get("node_uuid") or c["node"], c["epoch"])].append(dict(c, _read=prefix_max[i - 1], _deadline=deadline))
+    for (_, epoch), seen in sorted(stale.items(), key=lambda kv: kv[1][0]["invoke_ms"]):
+        first, last = seen[0], seen[-1]
+        if last["invoke_ms"] - first["complete_ms"] < STALE_PERSIST_MS:
+            continue
+        r = first.pop("_read")
+        deadline = first.pop("_deadline")
+        last = {k: v for k, v in last.items() if not k.startswith("_")}
+        _add(violations, "stale_leader", {
+            "message": f"{first['node']} still acted as the leader of epoch {epoch} from {first['invoke_ms']} "
+                       f"to {last['invoke_ms']} ({len(seen)} observations), after its lease's deadline "
+                       f"{deadline} and after a read reported epoch {r['range_epoch']} (ended {r['complete_ms']})",
+            "first_claim": first, "last_claim": last, "read": r,
+        })
 
     # stalled: the history's last stretch has grants and no acting leader.
     if stall_ms is not None and events:

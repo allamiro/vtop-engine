@@ -138,9 +138,17 @@ class Violations(unittest.TestCase):
 
     def test_a_deposed_leader_that_keeps_acting(self):
         # The #641 / pause shape from the lease side: A's lease ran out at
-        # 1000, B was granted epoch 2, and A still says it holds epoch 1.
-        events = clean_failover() + [node(1600, "c1", A, True, 1)]
+        # 1000, B was granted epoch 2, and A still says it holds epoch 1,
+        # for longer than a cached gauge could repeat it.
+        events = clean_failover() + [node(1600, "c1", A, True, 1), node(4000, "c1", A, True, 1)]
         self.assertEqual(self.kinds(events), {"stale_leader"})
+
+    def test_one_late_claim_may_be_a_cached_gauge(self):
+        # A scrape that cannot take the lease view repeats the last value
+        # (review of #904): one such observation, or a few within 2 s, is
+        # not evidence the node still acts.
+        events = clean_failover() + [node(1600, "c1", A, True, 1), node(2000, "c1", A, True, 1)]
+        self.assertTrue(run(events)["valid"], run(events)["violations"])
 
     def test_a_held_epoch_that_disagrees_is_no_claim(self):
         # The broker refuses every request while the two differ.

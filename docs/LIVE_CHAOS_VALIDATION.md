@@ -294,7 +294,7 @@ and `check_history` runs `check_control.py` over what it has written so far
 | `meta_index` | the same for the applied index a read was served at: a linearizable metadata read never goes back in the log |
 | `epoch_leader` | two data nodes acting as the leaseholder of one epoch, or a node acting as the leaseholder of an epoch metadata granted to another |
 | `unknown_grant` | a node acting on an epoch that a lease read begun afterwards does not reach: a grant metadata never made, or lost |
-| `stale_leader` | a deposed leader still acting at its epoch after a read that ended earlier reported a newer one, past the latest deadline any read reported for its lease |
+| `stale_leader` | a deposed leader still acting at its epoch after a read that ended earlier reported a newer one, past the latest deadline any read reported for its lease, and still saying so 2 s later. A data node's gauges keep their last value while a scrape cannot take its lease view, so a single late observation can be a cached one |
 | `coverage` | a scenario that started the recorder ends up with no answered observation of one kind (Raft status, lease read, data node), or the recorder stopped early: a recorder that saw nothing checked nothing |
 
 Its limits: it sees what it polls, by default every 400 ms for a data node,
