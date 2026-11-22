@@ -24,6 +24,7 @@ act, and are refused when it cannot be written.
 | `promotion.attest` | `vtopctl node promote-unproven` (#636); the admin endpoint; every replica | Including a refusal before anything was sent (no `--i-accept-data-loss`). |
 | `node.repair` | `vtopctl node repair` (`params.side: client`); the leader serving the transfer (`params.side: serving`) | The client's outcome; the leader's grant or refusal of the listing that starts a transfer, its refusal of any chunk, and the outcome of a `seal_tail`. |
 | `node.reconfigure_range` | `vtopctl node reconfigure-range` | The thresholds written, or the failure. |
+| `audit.gap` | every metadata replica (#706) | A range of applied records this replica owes and cannot re-derive: `params.from_index`, `through_index` and `reason` (`snapshot_install`, `log_purged`). Outcome `failure`. See "Applied records: at least once" below. |
 | `security.override` | Any `vtopctl` command that reads a key, state-store, ledger or audit file other local users can read, accepted only because `security.allow_loose_secret_permissions` is true (#733) | Once per file per process, outcome `success`. The target is the file; `params` are `file_kind`, `mode`, `exposed_to` and `setting`. See [Secret files](secrets.md#the-override). |
 | `native.session` | A data node's native produce/fetch plane, at the hello | Refusals only, outcome `refused`: a client certificate that chains to the CA but is not the one issued to the principal it asked to act as (its CN is another UUID, or not a UUID), a session with no readable certificate, a principal this node does not serve, a role other than producer or consumer. The actor is the certificate's CN (`source: certificate`) or anonymous; the target is the principal the client asked for; `params` are `role` and `served_principal`; the reason says what happened, what the node did and what to do. Admitted sessions are not recorded: they change no state. |
 
@@ -77,7 +78,10 @@ ever added to version 1, and a reader ignores what it does not know.
 | `correlation.request_id` | Joins the client, edge and applied records of one cluster command (its envelope's request id), and the attempt and outcome of a ledger command. Bootstrap and membership requests carry none on the wire: join their records by time and, for the applied ones, `log_index`. |
 | `correlation.attempt_id` | On an outcome, the `audit_id` of its attempt. |
 | `correlation.trace_id`, `span_id` | The OpenTelemetry trace the command ran in, when export is on (#683): the same ids its JSON log lines carry. |
-| `correlation.log_index` | The metadata log index a cluster command committed at. Dedupe applied records on it. Each replica writes its applied record once, after the entry is applied: a replica that crashes between applying an entry and writing the record, or that catches up by installing a snapshot, writes none for those entries. A follower that redirects a request to the leader writes no edge record; the leader does. |
+| `correlation.log_index` | The metadata log index a cluster command committed at. Dedupe applied records on the engine and this index: a replica delivers each of its applied records at least once (#706), so a crash can repeat one, marked `replayed`. A follower that redirects a request to the leader writes no edge record; the leader does. |
+| `correlation.log_term` | On an applied record, the entry's term (#706). With the index it names the entry, the same on every replica. |
+| `time` | When the record was written. On an applied record of a command, the entry's own `issued_at_ms` as its proposer stamped it, never the replica's clock, so every replica writes the same time (#706). That stamp is the proposer's claim, not checked against any clock. An entry stamped 0 carries no time: `vtopctl meta` sends 0 unless given `--issued-at-ms`, except for `enable-features`, which stamps the current time. Its applied records, membership records and `audit.gap` records are timed by the replica that writes them. |
+| `replayed` | `true` on a record delivered again after a crash, a refusing sink or a restart (#706); it may duplicate one this replica already wrote. Absent means false. |
 | `engine` | The engine's `engine.name`, `meta-<id>` for a metadata node, or a data node's UUID. |
 
 ### What the actor proves
@@ -133,12 +137,55 @@ An older metadata voter cannot decode the entry: it reads kind 40 as a newer
 format ("written by a newer release ... downgrade is not supported"), not as
 corruption. Upgrade every voter before the raise.
 
+### Applied records: at least once
+
+Each metadata replica keeps an audit frontier, `meta.audited`, in its data
+directory: every applied record it owes at or below it was accepted by its
+sinks (#706). The frontier is saved only after delivery, so:
+
+* **A crash** between applying an entry and writing its record no longer
+  loses the record. The node delivers it at its next start, before Raft
+  runs, marked `replayed`.
+* **A sink that refuses** (an audit file on a full disk) does not stop the
+  node or the apply. The frontier stays behind and the records are
+  delivered again, in order and marked `replayed`, at the next apply, by a
+  retry every 10 seconds, and at restart.
+  `vtop_audit_delivery_lag_entries` stays above 0 while that lasts, and a
+  rate-limited warning names the index, the error and what to fix.
+* **What the log no longer holds** cannot be re-derived on that replica. A
+  replica that catches up by installing a snapshot, or whose log was purged
+  past a frontier that fell behind while its sink was failing, writes one
+  `audit.gap` record naming the index range and why, and a warning. The other
+  replicas wrote their own records for those entries: copy their audit files
+  and dedupe on `engine` and `correlation.log_index`.
+
+While the sink refuses, an apply does not try again within the 10-second
+retry interval, and a backlog is delivered at most 256 entries at a time, so
+neither a failing sink nor its recovery stalls the metadata tier. A write to
+the audit file that fails part-way is cut off again, or the next record
+starts on a new line, so a re-delivered record is never glued to a fragment.
+
+`meta.audited` also keeps the highest index a snapshot install brought the
+node past; a replay never reads the log at or below it, because the log there
+may be a branch the snapshot replaced.
+
+If `meta.audited` is damaged, the node refuses to start and names the file.
+Removing it re-pins the frontier at the applied index on the next start:
+the records it still owed are not re-delivered by that node, and the other
+replicas' files hold theirs.
+
+With no `VTOP_AUDIT_LOG`, the log stream is the only sink, and the guarantee
+covers a process crash only: what the log pipeline does after it is outside
+the node. A data directory written by a release before #706 has no
+`meta.audited`: the first start pins it at the applied index and replays
+nothing from before. Older releases ignore the file.
+
 ## Where records go
 
 | Sink | When | Notes |
 |---|---|---|
 | The log stream, target `vtop::audit` | Always | Written whatever `RUST_LOG` or `--log-level` say, never sampled or rate-limited. INFO for `attempt` and `success`, WARN for `failure` and `refused`. The message is `audit: <action> <outcome>` (closed sets, so a pipeline may index it); `summary` says who did it and on what, and `audit_id`, `action`, `outcome` and `actor` sit beside the full record in `record`. A sink's own error line on this target carries `audit_sink_error=true` and no `record`. |
-| An append-only JSONL file | `VTOP_AUDIT_LOG=/path` | One record per line, synced before the command goes on. Created with mode `0600` (an existing file keeps its mode). A set but unwritable path stops the command (or the node) at startup, naming the path. `vtopctl` also refuses an existing file group or other can write, or other users can read outside a closed directory; group read is accepted, for a log shipper (#733, [Secret files](secrets.md)). Rotate it by moving the file away while nothing writes to it (between `vtopctl` runs; for a node, at a restart); `logrotate`'s `copytruncate` can lose a record appended between the copy and the truncate. |
+| An append-only JSONL file | `VTOP_AUDIT_LOG=/path` | One record per line, synced before the command goes on (and the file's directory, once, before the first record, so a file created by the run is not lost to a crash). Created with mode `0600` (an existing file keeps its mode). A set but unwritable path stops the command (or the node) at startup, naming the path. Several processes may append to one file (a node and `vtopctl` runs): each append holds an exclusive lock on the file, so a failed append is cut back without touching another process's record, and a record never starts inside another writer's fragment (a writer from v0.10.1 or earlier takes no lock). An append waits at most 3 seconds for a lock another process holds; after that it fails and is counted as a sink failure, and the node's delivery of applied records tries it again, so a paused writer cannot stop the node. `vtopctl` also refuses an existing file group or other can write, or other users can read outside a closed directory; group read is accepted, for a log shipper (#733, [Secret files](secrets.md)). Rotate it by moving the file away while nothing writes to it (between `vtopctl` runs; for a node, at a restart); `logrotate`'s `copytruncate` can lose a record appended between the copy and the truncate. |
 | The state store's `audit_events` table | The ledger commands | Append only, hash-chained (below). `prune-ledger` never touches it; there is no retention for it yet. |
 
 `vtopctl meta`, `node` and `tier` now install a log subscriber: WARN and
@@ -249,18 +296,31 @@ and the same to the maintenance role that runs `prune-ledger`. See
 |---|---|
 | `vtop_audit_events_total` | `action` (the actions above), `outcome` |
 | `vtop_audit_write_failures_total` | `sink`: `log`, `file`, `ledger` |
+| `vtop_audit_replayed_total` (metadata nodes) | `reason`: `restart`, `retry`, `snapshot` |
+| `vtop_audit_gaps_total` (metadata nodes) | `reason`: `snapshot_install`, `log_purged`, `tail_evicted` |
+| `vtop_audit_delivery_lag_entries` (metadata nodes) | none: applied entries whose records are not delivered yet |
 
 On the engine's `/metrics` (`vtopctl run` with `VTOP_METRICS_ADDR`) and every
 node's. A one-shot `vtopctl` command has no registry: its records are in the
 log, the file and the table. Alert on any increase of
 `vtop_audit_write_failures_total`, and look at a rising
-`vtop_audit_events_total{outcome="refused"}`.
+`vtop_audit_events_total{outcome="refused"}`. On metadata nodes, alert when
+`vtop_audit_delivery_lag_entries` stays above 0 for more than a minute (a
+failing sink), and on any increase of `vtop_audit_gaps_total{reason="log_purged"}`
+(copy the other replicas' audit files for the range the `audit.gap` record
+names). `reason="snapshot_install"` is routine: a node added or replaced
+catches up by snapshot, and its gap names entries it never applied. It is
+worth a look only when no node was added or replaced.
 
 ## Compatibility
 
 * The record, the file and the table are new; no wire format, Raft entry,
   snapshot or manifest changes, and the cluster upgrade procedure is
   unchanged.
+* `meta.audited` (#706) is a new file in a metadata data directory; older
+  releases ignore it. The record gains `replayed` and `correlation.log_term`
+  and the action `audit.gap`, all additions to `audit_version` 1: an older
+  `vtopctl audit list` prints an `audit.gap` record as stored, with a warning.
 * An older engine or node writes no audit records: in a mixed fleet the trail
   is only as complete as its least-upgraded node.
 * An older release opening an upgraded SQLite file or PostgreSQL database
