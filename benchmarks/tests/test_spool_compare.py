@@ -412,10 +412,81 @@ def test_the_drain_resource_window_ends_with_the_throughput_window_not_the_quies
     assert run.usage_end(1000.0, 500.0, 1195.0, 0.5) == 1195.0
 
 
+def _live(offered=100.0, warmup=20.0, measure=100.0, visible_rate=None, batch_lag=5.0, drain_after=None):
+    """A producer that wrote `offered` lines a second from t=0 for warmup+measure seconds, and a tool whose objects
+    became store-visible `batch_lag` seconds behind the writer at `visible_rate` lines a second (the offered rate
+    when None). With `drain_after`, the rest of the backlog is visible that many seconds after the window ends."""
+    total = int((warmup + measure) * offered)
+    written = [(seq, seq / offered) for seq in range(total)]
+    rate = offered if visible_rate is None else visible_rate
+    visible = {}
+    for seq, at in written:
+        if rate >= offered:
+            visible[seq] = at + batch_lag
+        elif seq / rate + batch_lag <= warmup + measure:
+            visible[seq] = seq / rate + batch_lag
+        elif drain_after is not None:
+            visible[seq] = warmup + measure + drain_after
+    return written, visible
+
+
+def _progress(**kw):
+    warmup, measure = kw.get("warmup", 20.0), kw.get("measure", 100.0)
+    written, visible = _live(**kw)
+    return run.live_progress(written, visible, 0.0, warmup, measure), measure
+
+
+def test_the_live_window_opens_after_the_warmup_from_the_tools_start():
+    assert run.window_bounds(1000.0, 120.0, 600.0) == (1120.0, 1720.0)
+
+
+def test_a_tool_that_keeps_up_with_a_batching_delay_sustained_the_rate():
+    # a 60 s batch age is a constant lag, not a falling behind (the warmup outlasts it)
+    progress, measure = _progress(batch_lag=60.0, warmup=120.0)
+    assert progress.visible_rate == pytest.approx(100.0, rel=0.02)
+    assert abs(progress.lag_end - progress.lag_start) <= 100
+    assert run.live_sustained(100.0, progress, measure, 0)
+
+
+def test_a_tool_at_half_the_offered_rate_did_not_sustain_it_even_if_it_drains_later():
+    # The producer logged every line at the offered rate; the tool's objects appeared at half of it and the
+    # rest of the backlog only after the window ended. The old rule (lines the PRODUCER wrote / window) said
+    # sustained; the sink's progress during the window says not.
+    progress, measure = _progress(visible_rate=50.0, drain_after=30.0)
+    written, _visible = _live()
+    producer_rate = len([1 for _seq, at in written if at >= 20.0]) / measure
+    assert producer_rate == pytest.approx(100.0, rel=0.02)
+    assert progress.visible_rate == pytest.approx(50.0, rel=0.1)
+    assert progress.lag_end - progress.lag_start > 100 * measure * 0.3
+    assert not run.live_sustained(100.0, progress, measure, 0)
+
+
+def test_a_tool_whose_lag_grows_while_its_rate_is_barely_under_the_offer_is_not_sustained():
+    progress = run.LiveProgress(visible_rate=97.0, lag_start=500, lag_end=500 + 800)
+    assert not run.live_sustained(100.0, progress, 100.0, 0)  # 800 > 5 % of the 10,000 offered records
+    assert run.live_sustained(100.0, run.LiveProgress(97.0, 500, 500 + 400), 100.0, 0)
+
+
+def test_a_tool_that_made_nothing_visible_in_the_window_has_a_zero_rate():
+    written, _ = _live()
+    progress = run.live_progress(written, {seq: 500.0 for seq, _ in written}, 0.0, 20.0, 100.0)
+    assert progress.visible_rate == 0.0 and not run.live_sustained(100.0, progress, 100.0, 0)
+
+
 def test_a_live_run_that_lost_lines_did_not_sustain_its_rate():
-    assert run.live_sustained(100.0, 100.0, 0)
-    assert not run.live_sustained(100.0, 100.0, 9)  # every line accepted, nine never delivered
-    assert not run.live_sustained(100.0, 10.0, 0)
+    good = run.LiveProgress(100.0, 10, 10)
+    assert run.live_sustained(100.0, good, 100.0, 0)
+    assert not run.live_sustained(100.0, good, 100.0, 9)  # every line accepted, nine never delivered
+    assert not run.live_sustained(100.0, run.LiveProgress(10.0, 10, 10), 100.0, 0)
+
+
+def test_lines_never_made_visible_count_as_lag_not_as_progress():
+    written, visible = _live()
+    for seq in list(visible)[::2]:
+        del visible[seq]  # half the lines are never visible (gaps)
+    progress = run.live_progress(written, visible, 0.0, 20.0, 100.0)
+    assert progress.visible_rate == pytest.approx(50.0, rel=0.05)
+    assert not run.live_sustained(100.0, progress, 100.0, 0)
 
 
 # -------------------------------------------------- resume and incomplete kill schedules (review of #908)

@@ -37,7 +37,7 @@ import tempfile
 import time
 import urllib.request
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 BENCH = os.path.dirname(HERE)
@@ -78,6 +78,7 @@ DEVIATIONS = [
     "Time to store-visible uses the generator's write time and MinIO's LastModified (milliseconds), both on the "
     "Docker VM's clock.",
 ]
+LAG_GROWTH = 0.05  # the live window's allowed lag growth, a share of its offered lines (stats.sustained's tolerance)
 QUIET_SECONDS = 75  # one 60 s batch age and margin: no new object for this long is quiescence
 
 
@@ -581,12 +582,15 @@ class Runner:
             warm = started + float(p.get("warmup_seconds", 120))
             lags = [(result.first_visible[int(seq)] - float(at)) * 1000 for seq, at in written
                     if float(at) >= warm and int(seq) in result.first_visible]
-            measured = [1 for _seq, at in written if float(at) >= warm]
-            achieved = len(measured) / float(p.get("measure_seconds", 600))
-            out.update({"offered_rate": p["rate"], "achieved_rate": f"{achieved:.1f}",
-                        # A tool that lost lines is not sustaining the offered rate, whatever it accepted:
-                        # its latency would be ranked over the surviving records only (review of #908).
-                        "sustained": "true" if live_sustained(float(p["rate"]), achieved, result.gaps) else "false",
+            measure = float(p.get("measure_seconds", 600))
+            progress = live_progress([(int(seq), float(at)) for seq, at in written], result.first_visible, started,
+                                     float(p.get("warmup_seconds", 120)), measure)
+            out.update({"offered_rate": p["rate"], "achieved_rate": f"{progress.visible_rate:.1f}",
+                        # The rate the SINK kept up with (lines that became store-visible in the window), not what
+                        # the open-loop writer logged. A tool that lost lines, or that falls behind and drains
+                        # after the window, is not sustaining the offered rate (reviews of #908 and #925).
+                        "sustained": "true" if live_sustained(float(p["rate"]), progress, measure, result.gaps)
+                        else "false",
                         "visible_p50_ms": f"{stats.percentile(lags, 50):.0f}" if lags else "",
                         "visible_p99_ms": f"{stats.percentile(lags, 99):.0f}" if lags else ""})
         if sampler.errors:
@@ -606,9 +610,47 @@ def without_harness(counts: dict[str, int], harness: dict[str, int]) -> dict[str
     return {method: max(0, counts[method] - harness.get(method, 0)) for method in counts}
 
 
-def live_sustained(offered: float, achieved: float, gaps: int) -> bool:
-    """A live run sustained the offered rate only if the lines were delivered too."""
-    return stats.sustained(offered, achieved) and not gaps
+class LiveProgress(NamedTuple):
+    """What the sink did during the live cell's measured window, from when objects became store-visible."""
+    visible_rate: float  # lines a second that became visible in the store over the window
+    lag_start: int       # lines written but not yet visible, when the window opened
+    lag_end: int         # the same, when it closed
+
+
+def window_bounds(started: float, warmup: float, measure: float) -> tuple[float, float]:
+    """The measured window's start and end, in epoch seconds: `warmup` after the tool's start."""
+    return started + warmup, started + warmup + measure
+
+
+def live_progress(written: list[tuple[int, float]], first_visible: dict[int, float], started: float, warmup: float,
+                  measure: float) -> LiveProgress:
+    """The sink's progress over the measured window: `written` is (seq, epoch seconds) from the writer's log and
+    `first_visible` the store's LastModified of the first object holding each line (the checker's).
+
+    The writer is open-loop, so its log says what was OFFERED, never what the tool delivered; a tool that writes
+    half the offer to the store in the window and drains the rest afterwards must not look as if it kept up
+    (the rule #925 applied to the archive comparison). The rate is the lines that became visible between the
+    window's start and end, and the lag is the lines written so far less the lines visible by then. A line that
+    never became visible is lag, not progress."""
+    start, end = window_bounds(started, warmup, measure)
+    visible_at = sorted(first_visible[seq] for seq, _at in written if seq in first_visible)
+
+    def visible(at: float) -> int:
+        return sum(1 for stamp in visible_at if stamp <= at)
+
+    def lag(at: float) -> int:
+        return sum(1 for _seq, wrote in written if wrote <= at) - visible(at)
+
+    return LiveProgress((visible(end) - visible(start)) / measure, lag(start), lag(end))
+
+
+def live_sustained(offered: float, progress: LiveProgress, measure: float, gaps: int) -> bool:
+    """A live run sustained the offered rate only if the SINK kept up through the measured window and the lines
+    were delivered too: lines became visible at the offered rate (within the shared tolerance) and the lag did not
+    grow by more than that tolerance of the window's offered lines. A tool that drains its backlog after the
+    window ended did not sustain the rate in it."""
+    growth = progress.lag_end - progress.lag_start
+    return stats.sustained(offered, progress.visible_rate) and growth <= offered * measure * LAG_GROWTH and not gaps
 
 
 def live_participants(plan: dict[str, Any]) -> dict[str, set[str]]:
