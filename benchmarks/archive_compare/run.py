@@ -803,7 +803,8 @@ def plan_for(args: argparse.Namespace, recorded: dict[str, Any] | None) -> dict[
             raise plans.PlanRefused("cannot resume with " + "; ".join(disagree) + ": a resume continues the plan "
                                     "the run recorded, so leave these arguments out")
         return plan
-    plan = plans.select(plans.load_plans(os.path.join(HERE, "plans.json")), wanted_name or "smoke")
+    plan = plans.select(plans.load_plans(getattr(args, "plans", None) or os.path.join(HERE, "plans.json")),
+                        wanted_name or "smoke")
     if wanted_tools is not None:
         plan["systems"] = [s for s in plan["systems"] if s in wanted_tools]
     if args.host_class:
@@ -829,6 +830,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--plan", default=None, help="a plan in plans.json: smoke (the default), hosted, full; a "
                         "resume reads the plan the run recorded")
+    parser.add_argument("--plans", default=None, metavar="FILE", help="a plans file other than plans.json, for a "
+                        "scaled-down plan of your own (a run records the plan it ran, so it is judged against it)")
     parser.add_argument("--smoke", action="store_true", help="the same as --plan smoke")
     parser.add_argument("--tools", default=None, help="comma-separated subset of the plan's systems")
     parser.add_argument("--host-class", choices=plans.HOST_CLASSES, default=None,

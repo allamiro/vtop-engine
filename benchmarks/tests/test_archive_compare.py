@@ -699,7 +699,7 @@ def test_the_run_directory_and_cli_shape_match_the_sibling_harnesses():
     source = inspect.getsource(run.main)
     for flag in ("--plan", "--smoke", "--tools", "--host-class", "--run-id", "--resume", "--budget-minutes",
                  "--cooldown-seconds", "--max-hours", "--tool-cpus", "--tool-memory", "--private", "--dry-run",
-                 "--check", "--results", "--no-disk-probe", "--rebuild"):
+                 "--check", "--results", "--no-disk-probe", "--rebuild", "--plans"):
         assert f'"{flag}"' in source, flag
 
 
@@ -753,3 +753,18 @@ def test_no_tool_makes_a_bucket_put_the_tap_would_count_as_the_first_put():
     for rel in TOOLS["vtop"]["profiles"].values():
         assert re.search(r"(?m)^  create_bucket: false\s*$", _read(rel)), rel
     assert "mc mb --ignore-existing" in open(os.path.join(ARCHIVE, "run.py")).read()
+
+
+def test_a_scaled_down_plan_file_can_be_named_and_is_checked_like_a_shipped_one(tmp_path):
+    shipped = json_load(os.path.join(ARCHIVE, "plans.json"))
+    small = {"kind": "archive", "plan_version": 1, "plans": {"mini": dict(shipped["plans"]["smoke"])}}
+    path = tmp_path / "mini.json"
+    path.write_text(json.dumps(small))
+    plan = run.plan_for(_args(plan="mini", plans=str(path)), None)
+    assert plan["name"] == "mini"
+    plans.check_plan(plan, KIND)
+
+
+def json_load(path):
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
