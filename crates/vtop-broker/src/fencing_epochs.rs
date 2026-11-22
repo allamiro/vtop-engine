@@ -1954,9 +1954,6 @@ pub fn install_transferred_history(
         .copied()
         .collect();
     let mut journal = FencingEpochJournal::open_in(env, &path)?;
-    // A repair installs the source's history, so a break an earlier run of
-    // this directory recorded no longer describes it (#881).
-    journal.break_marker().clear()?;
     let existing = journal.entries().to_vec();
     if existing.len() > incoming.len() {
         return Err(BrokerError::EpochJournalCorrupt(format!(
@@ -1980,6 +1977,11 @@ pub fn install_transferred_history(
     for entry in &incoming[existing.len()..] {
         journal.record(entry.epoch, entry.start_offset)?;
     }
+    // A repair installs the source's history, so a break an earlier run of
+    // this directory recorded no longer describes it (#881). The mark goes
+    // last: a refused source, a failed journal write or a crash on the way
+    // leaves the directory refusing, as before the repair (review of #903).
+    journal.break_marker().clear()?;
     Ok(incoming.len())
 }
 
@@ -2374,6 +2376,33 @@ mod tests {
         assert_eq!(second, 2);
         let reopened = FencingEpochJournal::open(&path).expect("reopen");
         assert_eq!(reopened.entries(), &entries[..]);
+    }
+
+    /// #881, review of #903: an install that is refused leaves the broken
+    /// mark in place, and one that completes clears it.
+    #[test]
+    fn a_refused_install_keeps_the_broken_mark_and_a_complete_one_clears_it() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fencing-epochs");
+        install_transferred_history(&Env::real(), &path, &starts(&[(1, 0), (2, 250)]), 500)
+            .expect("first install");
+        let marker = FencingEpochJournal::open_in(&Env::real(), &path)
+            .unwrap()
+            .break_marker();
+        marker.write("a test break").unwrap();
+
+        let refused =
+            install_transferred_history(&Env::real(), &path, &starts(&[(1, 0), (2, 300)]), 500);
+        assert!(refused.is_err());
+        assert_eq!(
+            marker.read().as_deref(),
+            Some("a test break"),
+            "a refused source does not repair the directory"
+        );
+
+        install_transferred_history(&Env::real(), &path, &starts(&[(1, 0), (2, 250)]), 500)
+            .expect("the same history installs");
+        assert_eq!(marker.read(), None, "a complete install clears the mark");
     }
 
     /// A conflicting prior install — same epoch, different start — must fail
