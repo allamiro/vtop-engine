@@ -4,6 +4,7 @@
 //! pairs. The [`crate::raft::network`] adapter opens a short-lived
 //! connection per RPC in this slice (no connection pool yet).
 
+use super::limit::{ConnectionLimit, DEFAULT_MAX_PEER_CONNECTIONS};
 use super::maybe_tls::{judge_dialect, tls_handshake_hint, DialectVerdict, MaybeTls};
 use super::tls::{assert_peer_identity, server_name, TlsMaterial};
 use super::wire::{
@@ -18,6 +19,7 @@ use crate::storage::hardstate::HardState;
 use async_trait::async_trait;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
@@ -60,6 +62,8 @@ pub struct PeerServer {
     local_id: MetaNodeId,
     handler: Arc<dyn PeerRpcHandler>,
     exposure: PlaintextExposure,
+    /// How many connections are served at once (#732, M6).
+    limit: Arc<ConnectionLimit>,
 }
 
 impl PeerServer {
@@ -73,6 +77,7 @@ impl PeerServer {
             local_id,
             handler,
             exposure: PlaintextExposure::LoopbackOnly,
+            limit: Arc::new(ConnectionLimit::meta_peer(DEFAULT_MAX_PEER_CONNECTIONS)),
         })
     }
 
@@ -104,6 +109,7 @@ impl PeerServer {
             local_id,
             handler,
             exposure: PlaintextExposure::LoopbackOnly,
+            limit: Arc::new(ConnectionLimit::meta_peer(DEFAULT_MAX_PEER_CONNECTIONS)),
         }
     }
 
@@ -129,8 +135,36 @@ impl PeerServer {
         server
     }
 
+    /// Serve at most `max` connections at once (#732, M6); the default is
+    /// [`DEFAULT_MAX_PEER_CONNECTIONS`]. A connection over the cap is closed
+    /// at accept and counted on [`PeerServer::connection_limit`].
+    pub fn with_max_connections(mut self, max: usize) -> Self {
+        self.limit = Arc::new(
+            ConnectionLimit::meta_peer(max)
+                .with_handshake_deadline(self.limit.handshake_deadline()),
+        );
+        self
+    }
+
+    /// Close a connection that has not sent its first request within
+    /// `deadline` of accept (default
+    /// [`super::limit::DEFAULT_HANDSHAKE_DEADLINE`]), so a silent socket
+    /// cannot hold a slot.
+    pub fn with_handshake_deadline(mut self, deadline: Duration) -> Self {
+        self.limit = Arc::new(
+            ConnectionLimit::meta_peer(self.limit.max()).with_handshake_deadline(deadline),
+        );
+        self
+    }
+
+    /// The cap and its refusal count, for the node's metrics.
+    pub fn connection_limit(&self) -> Arc<ConnectionLimit> {
+        Arc::clone(&self.limit)
+    }
+
     /// Serve until the listener is closed. Spawns one task per accepted
-    /// connection. Not deterministic under wall-clock scheduling.
+    /// connection, up to the connection cap. Not deterministic under
+    /// wall-clock scheduling.
     pub async fn serve(self, listener: TcpListener) -> TransportResult<()> {
         // CHECKED AT BIND TIME, not per connection: the question is about the
         // address this endpoint is reachable on, and answering it once means a
@@ -160,11 +194,20 @@ impl PeerServer {
         }
         loop {
             let (tcp, peer_addr) = listener.accept().await?;
+            // Over the cap: closed now, before the handshake, and counted.
+            let Some(slot) = self.limit.admit(peer_addr) else {
+                drop(tcp);
+                continue;
+            };
             let acceptor = self.acceptor.clone();
             let handler = Arc::clone(&self.handler);
             let local_id = self.local_id;
+            let limit = Arc::clone(&self.limit);
             tokio::spawn(async move {
-                if let Err(error) = serve_connection(acceptor, tcp, handler, local_id).await {
+                let _slot = slot;
+                if let Err(error) =
+                    serve_connection(acceptor, tcp, handler, local_id, &limit, peer_addr).await
+                {
                     tracing_peer_error(peer_addr, error);
                 }
             });
@@ -223,25 +266,40 @@ async fn serve_connection(
     tcp: TcpStream,
     handler: Arc<dyn PeerRpcHandler>,
     local_id: MetaNodeId,
+    limit: &ConnectionLimit,
+    peer_addr: SocketAddr,
 ) -> TransportResult<()> {
-    // Judged before the handshake or the first frame (#294 slice 6): a peer
-    // speaking the other transport is refused by name instead of failing as
-    // a bad magic here and a reset there.
-    if let DialectVerdict::Refused(message) =
-        judge_dialect(&tcp, "peer", "peer_transport", acceptor.is_some()).await?
-    {
-        return Err(TransportError::CrossMode(message));
-    }
-    let mut stream = match acceptor {
-        Some(acceptor) => MaybeTls::Tls(Box::new(
-            acceptor
-                .accept(tcp)
-                .await
-                .map_err(|error| TransportError::Tls(format!("peer accept handshake: {error}")))?
-                .into(),
-        )),
-        None => MaybeTls::Plain(tcp),
+    // One deadline from accept to the first request (#732): the connection
+    // holds a slot, and one that never speaks must not hold it forever.
+    let deadline = tokio::time::Instant::now() + limit.handshake_deadline();
+    let established = tokio::time::timeout_at(deadline, async {
+        // Judged before the handshake or the first frame (#294 slice 6): a
+        // peer speaking the other transport is refused by name instead of
+        // failing as a bad magic here and a reset there.
+        if let DialectVerdict::Refused(message) =
+            judge_dialect(&tcp, "peer", "peer_transport", acceptor.is_some()).await?
+        {
+            return Err(TransportError::CrossMode(message));
+        }
+        Ok(match acceptor {
+            Some(acceptor) => MaybeTls::Tls(Box::new(
+                acceptor
+                    .accept(tcp)
+                    .await
+                    .map_err(|error| {
+                        TransportError::Tls(format!("peer accept handshake: {error}"))
+                    })?
+                    .into(),
+            )),
+            None => MaybeTls::Plain(tcp),
+        })
+    })
+    .await;
+    let Ok(established) = established else {
+        limit.handshake_expired(peer_addr);
+        return Ok(());
     };
+    let mut stream = established?;
     // Under mTLS: the chain is authenticated, and the CN→MetaNodeId binding
     // must also match the Raft sender claimed in each request's
     // HardState.voted_for.
@@ -250,8 +308,20 @@ async fn serve_connection(
     // check passed, it means there was nothing to check — see
     // `dispatch_peer_rpc`, which is where that distinction is spent.
     let peer_id = peer_id_from_server_stream(&stream)?;
+    let mut first = true;
     loop {
-        let frame = match read_frame(&mut stream).await {
+        let read = if std::mem::take(&mut first) {
+            match tokio::time::timeout_at(deadline, read_frame(&mut stream)).await {
+                Ok(read) => read,
+                Err(_) => {
+                    limit.handshake_expired(peer_addr);
+                    return Ok(());
+                }
+            }
+        } else {
+            read_frame(&mut stream).await
+        };
+        let frame = match read {
             Ok(frame) => frame,
             Err(TransportError::Closed) => return Ok(()),
             Err(error) => return Err(error),
@@ -615,6 +685,40 @@ mod tests {
         assert!(!from_newer_release(&TransportError::ChecksumMismatch));
     }
 
+    /// #732 (M6): the peer plane serves at most `max_peer_connections`; the
+    /// connection over the cap is closed at accept and counted.
+    #[tokio::test]
+    async fn a_peer_connection_over_the_cap_is_closed_and_counted() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server =
+            PeerServer::plaintext(MetaNodeId(1), Arc::new(EchoHandler)).with_max_connections(1);
+        let limit = server.connection_limit();
+        assert_eq!(limit.label(), "meta_peer");
+        let task = tokio::spawn(server.serve(listener));
+        crate::transport::limit::probe::the_second_of_a_cap_of_one_is_closed(addr, &limit).await;
+        task.abort();
+    }
+
+    /// Review of #732: a connection that sends nothing loses its slot at
+    /// the handshake deadline, so silent sockets cannot lock the plane out.
+    #[tokio::test]
+    async fn a_silent_peer_connection_is_closed_at_the_handshake_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = PeerServer::plaintext(MetaNodeId(1), Arc::new(EchoHandler))
+            .with_max_connections(1)
+            .with_handshake_deadline(Duration::from_millis(200));
+        let limit = server.connection_limit();
+        assert_eq!(limit.max(), 1);
+        let task = tokio::spawn(server.serve(listener));
+        crate::transport::limit::probe::a_silent_connection_loses_its_slot_at_the_deadline(
+            addr, &limit,
+        )
+        .await;
+        task.abort();
+    }
+
     #[async_trait]
     impl PeerRpcHandler for EchoHandler {
         async fn handle_vote(&self, request: PeerVoteRequest) -> TransportResult<PeerVoteResponse> {
@@ -899,9 +1003,16 @@ mod tests {
             .write_all(&[0x16, 0x03, 0x01, 0x00, 0x40])
             .await
             .unwrap();
-        let refused = serve_connection(None, tcp, Arc::new(EchoHandler), MetaNodeId(1))
-            .await
-            .unwrap_err();
+        let refused = serve_connection(
+            None,
+            tcp,
+            Arc::new(EchoHandler),
+            MetaNodeId(1),
+            &ConnectionLimit::meta_peer(1),
+            client.local_addr().unwrap(),
+        )
+        .await
+        .unwrap_err();
         let TransportError::CrossMode(message) = refused else {
             panic!("expected a cross-mode refusal, got {refused}")
         };

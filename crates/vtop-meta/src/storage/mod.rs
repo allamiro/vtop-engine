@@ -15,7 +15,7 @@ pub mod membership_log_id;
 pub mod purged;
 pub mod snapshot;
 
-use crate::command::MetadataResponse;
+use crate::command::{MetadataResponse, SUPPORTED_FEATURE_LEVEL};
 use crate::state::MetaStateMachine;
 use crate::wire::CodecError;
 use applied::{AppliedFrontier, AppliedFrontierFile, APPLIED_FILE_NAME};
@@ -52,6 +52,29 @@ pub enum MetaStoreError {
          cannot read it. Upgrade this node: downgrade is not supported"
     )]
     NewerFormat { path: PathBuf, reason: String },
+    /// The directory's recorded feature level - in a snapshot, in a raise
+    /// entry in the log, or in the applied state - is above what this build
+    /// supports. Not corruption and not a kind this build cannot decode (a
+    /// raise adds no command kind at some levels, so the decoders see
+    /// nothing wrong): the level itself says the directory was raised by
+    /// a release that implements more than this one does. Opening it, or
+    /// applying the raise as a rejection, would leave this voter at a level
+    /// the others are not at, and the downgrade policy says an older binary
+    /// refuses a directory it cannot fully understand.
+    #[error(
+        "metadata directory {path} is at feature level {directory_level} ({found}), above the \
+         highest level this binary supports ({supported}). This node did not open or apply it \
+         and changed nothing. Run a newer binary that supports level {directory_level} or \
+         higher on this node: downgrade is not supported"
+    )]
+    NewerFeatureLevel {
+        path: PathBuf,
+        directory_level: u32,
+        supported: u32,
+        /// Where the level was found: "recorded in the newest snapshot",
+        /// "raised by the log entry at index N", and so on.
+        found: String,
+    },
     #[error("unsupported format version {version} in {path}")]
     UnsupportedVersion { path: PathBuf, version: u16 },
     #[error("invalid metadata store usage: {0}")]
@@ -84,6 +107,40 @@ pub(crate) fn codec_corrupt(path: &Path, error: &CodecError) -> MetaStoreError {
         };
     }
     corrupt(path, error.to_string())
+}
+
+/// Refuse a feature level above what this build supports (#743).
+///
+/// `found` says where the level was seen, for the message.
+pub(crate) fn refuse_newer_level(
+    path: &Path,
+    directory_level: u32,
+    supported: u32,
+    found: impl FnOnce() -> String,
+) -> MetaStoreResult<()> {
+    if directory_level > supported {
+        return Err(MetaStoreError::NewerFeatureLevel {
+            path: path.to_path_buf(),
+            directory_level,
+            supported,
+            found: found(),
+        });
+    }
+    Ok(())
+}
+
+/// The first log entry in `entries` that raises the feature level above
+/// `supported`, as `(index, level)`. A raise is the one command that names a
+/// level, and every other command this build decodes is at or below its own
+/// level, so it is the only one the apply and replay paths look for.
+pub(crate) fn first_raise_above(entries: &[MetaLogEntry], supported: u32) -> Option<(u64, u32)> {
+    entries.iter().find_map(|entry| match &entry.payload {
+        MetaLogPayload::Normal(crate::command::MetadataCommand::SetFeatureLevel {
+            feature_level,
+            ..
+        }) if *feature_level > supported => Some((entry.index, *feature_level)),
+        _ => None,
+    })
 }
 
 /// The `UnknownTag` `what`s of enums a later release may extend. On a reader
@@ -215,6 +272,7 @@ pub struct MetaStorageConfig {
 /// The recovered, durable metadata store for one shard of one cluster.
 pub struct MetaStorage {
     env: Env,
+    data_dir: PathBuf,
     hardstate: HardStateFile,
     applied: AppliedFrontierFile,
     purged: PurgedFrontierFile,
@@ -267,6 +325,22 @@ impl MetaStorage {
                     let payload = snapshots.read(&meta)?;
                     let state = MetaStateMachine::decode_snapshot(&payload)
                         .map_err(|error| codec_corrupt(&meta.path, &error))?;
+                    // A snapshot a newer release wrote at a level this build
+                    // does not implement is installed as it is by nothing
+                    // that checks, and the directory would open at a level
+                    // the voters running it do not understand (#743).
+                    refuse_newer_level(
+                        data_dir,
+                        state.feature_level(),
+                        SUPPORTED_FEATURE_LEVEL,
+                        || {
+                            format!(
+                                "recorded in the snapshot {} covering log index {}",
+                                meta.path.display(),
+                                meta.last_index
+                            )
+                        },
+                    )?;
                     (state, meta.membership, meta.last_index, meta.last_term)
                 }
                 None => (MetaStateMachine::new(), MetaMembership::default(), 0, 0),
@@ -297,7 +371,16 @@ impl MetaStorage {
             let last = log.last_index().unwrap_or(last_applied_index);
             let through = replay_through.min(last);
             if through > last_applied_index {
-                for entry in log.read_range(last_applied_index + 1, through + 1)? {
+                let entries = log.read_range(last_applied_index + 1, through + 1)?;
+                // A raise above this build's level, replayed as a rejection,
+                // would open the directory at a level the voters that
+                // accepted it are not at (#743).
+                if let Some((index, level)) = first_raise_above(&entries, SUPPORTED_FEATURE_LEVEL) {
+                    refuse_newer_level(data_dir, level, SUPPORTED_FEATURE_LEVEL, || {
+                        format!("raised by the log entry at index {index}")
+                    })?;
+                }
+                for entry in entries {
                     match &entry.payload {
                         MetaLogPayload::Normal(command) => {
                             state.apply(entry.index, command);
@@ -315,6 +398,7 @@ impl MetaStorage {
 
         Ok(Self {
             env: env.clone(),
+            data_dir: data_dir.to_path_buf(),
             hardstate,
             applied,
             purged,
@@ -401,10 +485,21 @@ impl MetaStorage {
         }
         let mut responses = Vec::new();
         let mut membership_log_id = None;
-        for entry in self
+        let entries = self
             .log
-            .read_range(self.last_applied_index + 1, index + 1)?
-        {
+            .read_range(self.last_applied_index + 1, index + 1)?;
+        // Refused BEFORE anything in the batch is applied: a raise above
+        // this build's level applied as a rejection would leave this voter
+        // at a level the voters that accepted it are not at, and the
+        // directory would keep opening (#743). Nothing is applied and the
+        // applied frontier does not move, so the next open, on a build
+        // that supports the level, applies the same entries.
+        if let Some((raise_index, level)) = first_raise_above(&entries, SUPPORTED_FEATURE_LEVEL) {
+            refuse_newer_level(&self.data_dir, level, SUPPORTED_FEATURE_LEVEL, || {
+                format!("raised by the log entry at index {raise_index}")
+            })?;
+        }
+        for entry in entries {
             match &entry.payload {
                 MetaLogPayload::Normal(command) => {
                     responses.push(self.state.apply(entry.index, command));
@@ -653,5 +748,201 @@ mod closed_enum_review_tests {
             stale.is_empty(),
             "listed but no decoder returns it: {stale:?}"
         );
+    }
+}
+
+/// #743: a directory whose recorded feature level is above this build's is
+/// refused, at open, at snapshot install and at the apply of a raise, with
+/// nothing changed. Equal and lower levels open as before.
+#[cfg(test)]
+mod feature_level_refusal_tests {
+    use super::*;
+    use crate::command::{CommandEnvelope, MetadataCommand, BASELINE_FEATURE_LEVEL};
+    use std::path::Path;
+    use vtop_log::sim::SimStorage;
+
+    const ABOVE: u32 = SUPPORTED_FEATURE_LEVEL + 1;
+
+    fn cluster() -> Uuid {
+        Uuid::from_u128(0x743)
+    }
+
+    fn sim() -> (SimStorage, Env) {
+        let sim = SimStorage::new();
+        sim.create_dir_all(Path::new("/n1"));
+        let env = sim.env(0x743);
+        (sim, env)
+    }
+
+    fn raise(index: u64, level: u32) -> MetaLogEntry {
+        MetaLogEntry {
+            term: 1,
+            index,
+            payload: MetaLogPayload::Normal(MetadataCommand::SetFeatureLevel {
+                env: CommandEnvelope {
+                    request_id: Uuid::from_u128(u128::from(index)),
+                    issued_at_ms: 1_750_000_000_000,
+                },
+                feature_level: level,
+            }),
+        }
+    }
+
+    /// Publish a snapshot of a state recorded at `level` into `/n1`.
+    fn publish_snapshot_at(env: &Env, level: u32) {
+        let payload = MetaStateMachine::at_feature_level_for_test(level)
+            .encode_snapshot()
+            .unwrap();
+        MetaSnapshots::open_in(env, "/n1", cluster())
+            .unwrap()
+            .write(5, 1, MetaMembership::default(), "snap", &payload, None)
+            .unwrap();
+    }
+
+    fn refused(result: MetaStoreResult<MetaStorage>) -> (u32, u32, String) {
+        match result {
+            Err(error @ MetaStoreError::NewerFeatureLevel { .. }) => {
+                let text = error.to_string();
+                let MetaStoreError::NewerFeatureLevel {
+                    directory_level,
+                    supported,
+                    ..
+                } = error
+                else {
+                    unreachable!()
+                };
+                (directory_level, supported, text)
+            }
+            Err(other) => panic!("expected a feature level refusal, got: {other}"),
+            Ok(_) => panic!("a directory above this build's level was opened"),
+        }
+    }
+
+    #[test]
+    fn a_snapshot_above_this_builds_level_is_refused_at_open() {
+        let (_sim, env) = sim();
+        publish_snapshot_at(&env, ABOVE);
+        let (level, supported, text) = refused(MetaStorage::open_in(&env, "/n1", cluster()));
+        assert_eq!((level, supported), (ABOVE, SUPPORTED_FEATURE_LEVEL));
+        // Names both levels and what to do.
+        assert!(text.contains(&format!("feature level {ABOVE}")), "{text}");
+        assert!(
+            text.contains(&format!("supports ({SUPPORTED_FEATURE_LEVEL})")),
+            "{text}"
+        );
+        assert!(text.contains("Run a newer binary"), "{text}");
+        assert!(text.contains("snapshot"), "{text}");
+    }
+
+    #[test]
+    fn a_snapshot_at_this_builds_level_opens() {
+        let (_sim, env) = sim();
+        publish_snapshot_at(&env, SUPPORTED_FEATURE_LEVEL);
+        let opened = MetaStorage::open_in(&env, "/n1", cluster()).unwrap();
+        assert_eq!(opened.state().feature_level(), SUPPORTED_FEATURE_LEVEL);
+        assert_eq!(opened.last_applied(), 5);
+    }
+
+    #[test]
+    fn a_snapshot_below_this_builds_level_opens() {
+        let (_sim, env) = sim();
+        publish_snapshot_at(&env, BASELINE_FEATURE_LEVEL);
+        let opened = MetaStorage::open_in(&env, "/n1", cluster()).unwrap();
+        assert_eq!(opened.state().feature_level(), BASELINE_FEATURE_LEVEL);
+    }
+
+    #[test]
+    fn a_log_raise_above_this_builds_level_is_refused_when_replayed_at_open() {
+        let (_sim, env) = sim();
+        // No applied file: the legacy open replays every durable entry.
+        let mut log = MetaLog::open_in(&env, "/n1", cluster(), MetaLogConfig::default()).unwrap();
+        log.append(&[raise(1, ABOVE)]).unwrap();
+        drop(log);
+        let (level, supported, text) = refused(MetaStorage::open_in(&env, "/n1", cluster()));
+        assert_eq!((level, supported), (ABOVE, SUPPORTED_FEATURE_LEVEL));
+        assert!(text.contains("log entry at index 1"), "{text}");
+    }
+
+    #[test]
+    fn a_raise_above_this_builds_level_is_refused_when_applied_not_turned_into_a_rejection() {
+        let (_sim, env) = sim();
+        let mut storage = MetaStorage::open_in(&env, "/n1", cluster()).unwrap();
+        storage.ensure_raft_applied_frontier().unwrap();
+        // The entries before the raise, and the raise, in one batch.
+        storage
+            .append(&[raise(1, SUPPORTED_FEATURE_LEVEL), raise(2, ABOVE)])
+            .unwrap();
+        let error = storage.apply_through(2).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MetaStoreError::NewerFeatureLevel {
+                    directory_level: ABOVE,
+                    supported: SUPPORTED_FEATURE_LEVEL,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        // Nothing was applied, not even the entry before the raise, and the
+        // frontier did not move: a build that supports the level applies
+        // the same entries.
+        assert_eq!(storage.last_applied(), 0);
+        assert_eq!(storage.state().feature_level(), BASELINE_FEATURE_LEVEL);
+        assert_eq!(storage.log().last_index(), Some(2));
+        drop(storage);
+        // The directory still refuses at the next open only if the raise was
+        // applied before: it was not, so a reopen is at the old frontier.
+        let reopened = MetaStorage::open_in(&env, "/n1", cluster()).unwrap();
+        assert_eq!(reopened.last_applied(), 0);
+    }
+
+    #[test]
+    fn a_raise_to_this_builds_level_is_applied() {
+        let (_sim, env) = sim();
+        let mut storage = MetaStorage::open_in(&env, "/n1", cluster()).unwrap();
+        storage.ensure_raft_applied_frontier().unwrap();
+        storage
+            .append(&[raise(1, SUPPORTED_FEATURE_LEVEL)])
+            .unwrap();
+        storage.apply_through(1).unwrap();
+        assert_eq!(storage.state().feature_level(), SUPPORTED_FEATURE_LEVEL);
+        drop(storage);
+        let reopened = MetaStorage::open_in(&env, "/n1", cluster()).unwrap();
+        assert_eq!(reopened.state().feature_level(), SUPPORTED_FEATURE_LEVEL);
+    }
+
+    #[test]
+    fn installing_a_snapshot_above_this_builds_level_publishes_nothing() {
+        let (_sim, env) = sim();
+        let mut snapshots = MetaSnapshots::open_in(&env, "/n1", cluster()).unwrap();
+        let payload = MetaStateMachine::at_feature_level_for_test(ABOVE)
+            .encode_snapshot()
+            .unwrap();
+        let bytes = snapshot::encode_snapshot_file(
+            cluster(),
+            9,
+            1,
+            &MetaMembership::default(),
+            "from-a-newer-leader",
+            &payload,
+            None,
+        )
+        .unwrap();
+        let error = snapshots.install(&bytes).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MetaStoreError::NewerFeatureLevel {
+                    directory_level: ABOVE,
+                    supported: SUPPORTED_FEATURE_LEVEL,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert_eq!(snapshots.published_count(), 0);
+        let reopened = MetaSnapshots::open_in(&env, "/n1", cluster()).unwrap();
+        assert!(reopened.newest().is_none(), "the refused bytes were kept");
     }
 }

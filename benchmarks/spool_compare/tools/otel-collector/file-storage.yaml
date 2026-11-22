@@ -1,0 +1,50 @@
+# OpenTelemetry Collector contrib 0.165.0, profile `file-storage` (optional fourth
+# system, off in the shipped plans), for the spool comparison (#748). Each setting
+# names its README in open-telemetry/opentelemetry-collector-contrib at v0.165.0.
+# The awss3 exporter is documented as alpha; it is drawn only if this
+# configuration proves stable (#748, open question 1).
+#
+# telemetry: the Collector has no usage reporting; its own metrics are off
+# (`service.telemetry.metrics.level: none`, below).
+
+extensions:
+  # extension/storage/filestorage: receiver offsets and the exporter queue on the tool's own volume.
+  file_storage:
+    directory: /data/storage
+    fsync: true
+
+receivers:
+  # receiver/filelogreceiver: the active file and its rotated names, as every tool.
+  filelog:
+    include:
+      - /spool/file/app.log*
+      - /spool/syslog-spool/app.log*
+    start_at: beginning
+    storage: file_storage
+
+exporters:
+  # exporter/awss3exporter
+  awss3:
+    s3uploader:
+      region: us-east-1
+      s3_bucket: bench
+      s3_prefix: otel
+      endpoint: http://minio:9000
+      s3_force_path_style: true
+      compression: gzip
+    # #744 rule 15: one JSON line per record.
+    marshaler: otlp_json
+    # exporterhelper: a persistent queue (the docs list it as off by default).
+    sending_queue:
+      enabled: true
+      storage: file_storage
+
+service:
+  extensions: [file_storage]
+  telemetry:
+    metrics:
+      level: none
+  pipelines:
+    logs:
+      receivers: [filelog]
+      exporters: [awss3]

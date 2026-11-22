@@ -7,6 +7,8 @@
 pub mod audit;
 mod bucket_versioning;
 pub mod commands;
+#[cfg(test)]
+mod config_corpus;
 pub mod coverage;
 pub mod engine;
 pub mod failpoints;
@@ -17,6 +19,7 @@ pub mod object_lock;
 pub mod otel;
 mod rebuild;
 mod receipts;
+pub mod report;
 pub mod scrub;
 pub mod segment_tools;
 mod spans;
