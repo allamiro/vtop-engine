@@ -185,7 +185,7 @@ the clock the client's acknowledgements are stamped with:
 
 - *kill to first acknowledgement after it*: the first acknowledgement the
   client reports after the kill. It can be a straggler the dead leader sent
-  just before it died (in one run it arrived 1 ms after the kill), so it is not
+  just before it died (in two runs it arrived 1 ms after the kill), so it is not
   the outage.
 - *kill to resume*: the end of the longest silence between acknowledgements
   that ends after the kill. This is the outage the client lived through, and
@@ -200,25 +200,28 @@ run 3 of scenario 26 the new leader logged that its gateway was serving 5.5 s
 after the kill, and the client's first acknowledgement after the silence
 followed 0.3 s later.
 
-**Measured**, three runs of each scenario, every record of every run read back:
+**Measured**, four runs of each scenario (run 4 on the tree with main merged in), every record of every run read back:
 
 | Run | Client | Strategy | Kill to first ack | Kill to resume | Longest silence |
 |---|---|---|---:|---:|---:|
 | 1 | librdkafka 2.8.0 (kcat 1.7.1) | stock | 341 ms | 5,739 ms | 5,393 ms |
 | 2 | librdkafka | stock | 341 ms | 6,558 ms | 6,208 ms |
 | 3 | librdkafka | stock | 338 ms | 5,747 ms | 5,400 ms |
+| 4 | librdkafka | stock | 283 ms | 6,493 ms | 6,202 ms |
 | 1 | Kafka client 4.4.0 (JVM) | `rebootstrap` | 5,645 ms | 5,645 ms | 5,673 ms |
 | 2 | Kafka client 4.4.0 | `rebootstrap` | 5,677 ms | 5,677 ms | 5,677 ms |
 | 3 | Kafka client 4.4.0 | `rebootstrap` | 1 ms | 5,500 ms | 5,499 ms |
+| 4 | Kafka client 4.4.0 | `rebootstrap` | 1 ms | 5,769 ms | 5,767 ms |
 | 1 | Kafka client 4.4.0 | `none` | 5,724 ms | 5,724 ms | 5,738 ms |
 | 2 | Kafka client 4.4.0 | `none` | 5,634 ms | 5,634 ms | 5,661 ms |
 | 3 | Kafka client 4.4.0 | `none` | 5,591 ms | 5,591 ms | 5,630 ms |
+| 4 | Kafka client 4.4.0 | `none` | 5,687 ms | 5,687 ms | 5,705 ms |
 
 Every run: all records acknowledged, none failed, all read back through the
 new leader once and in order, and under 7 s from the kill to the client
 acknowledged again. One earlier attempt of scenario 26 stopped on a harness
 check after the failover (a follower that never changed role was asked for a
-role-change line) and is not counted. In the three runs of scenario 26 the new
+role-change line) and is not counted. In the four runs of scenario 26 the new
 leader's log names no retried set it acknowledged with an original offset, so
 the duplicate check was not exercised by these kills; whether a retry meets it
 depends on where the kill lands.
