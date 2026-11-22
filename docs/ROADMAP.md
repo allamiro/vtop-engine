@@ -1485,6 +1485,30 @@ restore drill, a pilot). Failover and crash-durability measurements against
 Apache Kafka stay open (#597, #599), as does the head-to-head throughput run
 (#596).
 
+### Merged since v0.10.1
+
+Notes for the next release, gathered here until its version-bump PR
+folds them into its section.
+
+- **Applied records are delivered at least once (#706).** Each metadata
+  replica keeps an audit frontier (`meta.audited`, a new file older releases
+  ignore) saved only after its sinks accepted the records, so a crash or a
+  refusing audit file re-delivers them (marked `replayed`, from the log) at
+  the next apply, every 10 seconds and at restart, instead of losing them.
+  Applied records of commands carry the entry's term and are timed by the
+  entry's `issued_at_ms`, so every replica writes the same record. Entries a
+  replica never applied one by one (a snapshot install, a log purged past a
+  frontier that fell behind) get one `audit.gap` record naming the range.
+  New metadata-node metrics: `vtop_audit_replayed_total{reason}`,
+  `vtop_audit_gaps_total{reason}` and `vtop_audit_delivery_lag_entries`. A
+  directory from an older release starts its trail at its applied index.
+- **The audit file is safe to share between processes (#706).** A node and
+  `vtopctl` runs that append to one `VTOP_AUDIT_LOG` take an exclusive lock
+  on the file for each append, so a failed append is cut back without
+  deleting another process's record. A writer from v0.10.1 or earlier takes
+  no lock.
+
+
 **Upgrade note for v0.11.0: the Helm chart turns admin authorization on by
 default (#732, M2).** `meta.adminAuthorization.enabled` now defaults to
 `true`. An existing install that never set it now renders only when
