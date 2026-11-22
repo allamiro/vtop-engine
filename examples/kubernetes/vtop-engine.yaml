@@ -31,6 +31,22 @@ spec:
       # One source pass plus one flush (docs/reference/cli.md, "Stopping
       # vtopctl run").
       terminationGracePeriodSeconds: 120
+      # No automatic replacement of a pod on a node that goes unreachable or
+      # not ready. Kubernetes adds a 300-second toleration for both taints
+      # to every pod, after which it evicts the pod and the Deployment starts
+      # a replacement while the old engine may still be running: Recreate
+      # orders a rollout, not a replacement, and the engine's lock is
+      # host-local, so nothing else stops two engines on one PostgreSQL
+      # ledger. With these tolerations the pod stays until the operator has
+      # fenced the node and deleted the pod (docs/deploy/engine-host-loss.md,
+      # step 1).
+      tolerations:
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001

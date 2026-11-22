@@ -28,7 +28,10 @@ ledger lets the standby rebuild.
 1. **Fence the old host.** Power it off, stop its VM, or, on Kubernetes, make
    sure its pod is gone (a Deployment with one replica and the `Recreate`
    strategy does this for a rollout; for a node that is unreachable, delete
-   the pod forcibly only once the node is known to be down). The engine
+   the pod forcibly only once the node is known to be down; the example
+   Deployment tolerates the unreachable and not-ready taints without a time
+   limit, because the default 300-second toleration would let Kubernetes
+   start a replacement while the old engine might still be running). The engine
    cannot do this for you: its single-instance lock is host-local, and an
    engine on another host cannot see it. It warns about exactly that at every
    start on PostgreSQL. Two engines reading the same sources into the same
