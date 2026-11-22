@@ -376,6 +376,13 @@ ${holder:-none}; see $WORKDIR/logs/produce-after-2.log)"
     sleep 0.5
   done
   log "candidate $SERVING2 serves quorum produce at epoch $SERVING2_EPOCH after the second failover"
+  if [[ "$SERVING2" == "$SERVING" ]]; then
+    # Another candidate held the lease and did not serve, and the restarted
+    # one took the range back (review of #904): liveness and the read-back
+    # still hold, but no other replica's copy was read, so the shape this
+    # step exists for (#261, #641) was not reached. Said, never hidden.
+    log "the second failover came back to candidate $SERVING: no other replica's copy was read"
+  fi
   CHAOS_MAX_OFFSET_GAPS="$SERVING2_EPOCH" CHAOS_READ_HISTORY="$(history_file read)" \
     await_verified_floor "$(emit_client_config_at_epoch "$SERVING2_EPOCH" 3)" \
     "$(candidate_native_addr "$SERVING2")" "$ACKED" "$ACKED"

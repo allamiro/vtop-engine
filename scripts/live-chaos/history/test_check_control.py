@@ -298,6 +298,56 @@ class Recorder(unittest.TestCase):
         dead = record_control.node_lease("c2", "127.0.0.1:1", B)
         self.assertFalse(dead["ok"])
 
+    def test_a_response_cut_short_is_a_failed_observation(self):
+        # A node killed while it answers: the body ends before its
+        # Content-Length (review of #904). The observation fails; it does
+        # not raise and end the polling thread.
+        import http.server
+        import threading
+
+        import record_control
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                self.send_response(200)
+                self.send_header("Content-Length", "1000")
+                self.end_headers()
+                self.wfile.write(b"vtop_broker_lease_active 1\n")
+
+            def log_message(self, *_):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        event = record_control.node_lease("c1", f"127.0.0.1:{server.server_port}", A)
+        self.assertFalse(event["ok"])
+
+    def test_a_raising_observation_does_not_end_the_thread(self):
+        import record_control
+
+        calls = {"n": 0}
+        written = []
+
+        class Sink:
+            def write(self, event):
+                written.append(event)
+                if len(written) >= 2:
+                    record_control.STOP.set()
+
+        def observe():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("boom")
+            return {"op": "node_lease", "n": calls["n"]}
+
+        record_control.STOP.clear()
+        self.addCleanup(record_control.STOP.clear)
+        with redirect_stderr(io.StringIO()):
+            record_control.poll(1, observe, Sink())
+        self.assertEqual([e["n"] for e in written], [2, 3])
+
 
 if __name__ == "__main__":
     unittest.main()

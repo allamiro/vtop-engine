@@ -35,6 +35,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import re
@@ -128,7 +129,9 @@ def node_lease(name: str, addr: str, node_uuid: str) -> dict:
             m = METRIC.match(line)
             if m:
                 values[m.group(1)] = int(float(m.group(2)))
-    except (OSError, ValueError):
+    except (OSError, ValueError, http.client.HTTPException):
+        # A node killed mid-response cuts the body short (IncompleteRead,
+        # review of #904): a failed observation, and the thread goes on.
         ok = False
     event = {"op": "node_lease", "node": name, "node_uuid": node_uuid,
              "invoke_ms": invoke, "complete_ms": now_ms(), "ok": ok}
@@ -147,7 +150,10 @@ def node_lease(name: str, addr: str, node_uuid: str) -> dict:
 def poll(interval_ms: int, observe, sink: Sink) -> None:
     while not STOP.is_set():
         started = time.monotonic()
-        sink.write(observe())
+        try:
+            sink.write(observe())
+        except Exception as err:  # noqa: BLE001 - one bad observation must not end the thread
+            print(f"record_control: an observation failed and polling goes on: {err!r}", file=sys.stderr)
         rest = interval_ms / 1000 - (time.monotonic() - started)
         if rest > 0:
             STOP.wait(rest)
