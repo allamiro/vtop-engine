@@ -9,6 +9,7 @@
 //! the commit frontier under consensus.
 
 pub mod applied;
+pub mod audited;
 pub mod hardstate;
 pub mod log;
 pub mod membership_log_id;
@@ -19,6 +20,7 @@ use crate::command::{MetadataResponse, SUPPORTED_FEATURE_LEVEL};
 use crate::state::MetaStateMachine;
 use crate::wire::CodecError;
 use applied::{AppliedFrontier, AppliedFrontierFile, APPLIED_FILE_NAME};
+use audited::{AuditedFrontierFile, AUDITED_FILE_NAME};
 use hardstate::{HardState, HardStateFile};
 use log::{MetaLog, MetaLogConfig, MetaLogEntry, MetaLogPayload, MetaMembership};
 use membership_log_id::{MembershipLogId, MembershipLogIdFile, MEMBERSHIP_LOG_ID_FILE_NAME};
@@ -291,6 +293,7 @@ pub struct MetaStorage {
     data_dir: PathBuf,
     hardstate: HardStateFile,
     applied: AppliedFrontierFile,
+    audited: AuditedFrontierFile,
     purged: PurgedFrontierFile,
     membership_log_id: MembershipLogIdFile,
     log: MetaLog,
@@ -330,6 +333,7 @@ impl MetaStorage {
         let hardstate =
             HardStateFile::open_in(env, data_dir.join(hardstate::HARD_STATE_FILE_NAME))?;
         let applied = AppliedFrontierFile::open_in(env, data_dir.join(APPLIED_FILE_NAME))?;
+        let audited = AuditedFrontierFile::open_in(env, data_dir.join(AUDITED_FILE_NAME))?;
         let purged = PurgedFrontierFile::open_in(env, data_dir.join(PURGED_FILE_NAME))?;
         let membership_log_id =
             MembershipLogIdFile::open_in(env, data_dir.join(MEMBERSHIP_LOG_ID_FILE_NAME))?;
@@ -417,6 +421,7 @@ impl MetaStorage {
             data_dir: data_dir.to_path_buf(),
             hardstate,
             applied,
+            audited,
             purged,
             membership_log_id,
             log,
@@ -610,6 +615,51 @@ impl MetaStorage {
             index: self.last_applied_index,
             term: self.last_applied_term,
         })
+    }
+
+    /// The audit frontier (#706): every applied audit record this replica
+    /// owes at or below it has been accepted by its sink. `None` before it
+    /// is pinned (a store written by a release before #706).
+    pub fn audited_frontier(&self) -> Option<u64> {
+        self.audited.get()
+    }
+
+    /// Persist the audit frontier. Never above the applied frontier (a record
+    /// cannot be delivered for an entry not yet applied), and a value at or
+    /// below the stored one is a no-op.
+    pub fn save_audited(&mut self, index: u64) -> MetaStoreResult<()> {
+        if index > self.last_applied_index {
+            return Err(MetaStoreError::InvalidConfig(format!(
+                "the audit frontier cannot pass the applied frontier: {index} > {}",
+                self.last_applied_index
+            )));
+        }
+        self.audited.save(index)
+    }
+
+    /// The highest index a snapshot install brought this replica past: its
+    /// audit replay never reads the log at or below it (#706).
+    pub fn audited_floor(&self) -> u64 {
+        self.audited.floor()
+    }
+
+    /// Persist the install floor (never above the applied frontier).
+    pub fn save_audited_floor(&mut self, floor: u64) -> MetaStoreResult<()> {
+        if floor > self.last_applied_index {
+            return Err(MetaStoreError::InvalidConfig(format!(
+                "the audit install floor cannot pass the applied frontier: {floor} > {}",
+                self.last_applied_index
+            )));
+        }
+        self.audited.save_floor(floor)
+    }
+
+    /// Pin the audit frontier at the applied frontier when no file exists:
+    /// a store first opened by a release with #706 starts its audit trail
+    /// here, and replays nothing written before (#706). Its earlier records
+    /// were written, or lost, by the release that applied them.
+    pub fn ensure_audited_frontier(&mut self) -> MetaStoreResult<()> {
+        self.audited.pin(self.last_applied_index)
     }
 
     /// Whether a durable `meta.applied` file is present.

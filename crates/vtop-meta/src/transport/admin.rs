@@ -874,6 +874,9 @@ fn membership_record(
         reason: None,
         request_id: None,
         log_index: None,
+        log_term: None,
+        issued_at_ms: None,
+        replayed: false,
     }
 }
 

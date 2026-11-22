@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import soak_driver  # noqa: E402
+import soak_faults  # noqa: E402
 import soak_profile  # noqa: E402
 from soak_fakelab import FakeLab  # noqa: E402
 
@@ -262,3 +263,58 @@ def test_the_samples_carry_what_the_evaluator_reads(healthy):
     assert full and all(needed <= r.keys() for r in full)
     assert any(r.get("lag") for r in rows)
     assert max(r["lifetime"] for r in rows) >= 3  # kill9 and clock_step each started new processes
+
+
+@pytest.fixture
+def disk_full_profile():
+    """The tiny run with a disk-full fault in its cycle."""
+    p = copy.deepcopy(TINY)
+    p["fault_cycle"] = ["kill9", "enospc", "partition"]
+    p["fault_hold_s"] = {"kill9": 0, "enospc": 1, "partition": 0}
+    return soak_profile.validate(p)
+
+
+def test_a_run_with_a_disk_full_fault_fills_the_work_directory_and_judges_what_the_engine_did(
+    disk_full_profile, tmp_path
+):
+    _, lab, run_dir, _ = run(disk_full_profile, tmp_path)
+    recorded = events(run_dir)
+    landed = next(e for e in recorded if e["kind"] == "fault_end" and e["fault"] == "enospc")
+    probe = next(e for e in recorded if e["kind"] == "fault_probe")
+    assert landed["ok"] and probe["id"] == landed["id"] and probe["engine_enospc_lines"] >= 1
+    assert next(e for e in recorded if e["kind"] == "recovered" and e["id"] == landed["id"])["ok"]
+    verdict_criteria = {c["id"]: c for c in verdict(run_dir)["criteria"]}
+    assert verdict_criteria["enospc_recovered"]["passed"] and verdict_criteria["faults_executed"]["passed"]
+    assert lab.tmpfs is False  # the space was freed
+    assert lab.log.count("mount tmpfs") == 2  # once before the load, as the preflight, and once for the fault
+
+
+def test_the_disk_full_preflight_runs_before_the_load_starts(disk_full_profile, tmp_path):
+    _, lab, _, _ = run(disk_full_profile, tmp_path)
+    assert lab.log.index("mount tmpfs") < lab.log.index("start_producer")
+    assert lab.log.index("unmount tmpfs") < lab.log.index("start_producer")
+
+
+def test_a_host_that_cannot_mount_the_tmpfs_is_refused_before_the_run_begins(disk_full_profile, tmp_path):
+    lab = FakeLab()
+    lab.mount_refused = True
+    code, lab, run_dir, _ = run(disk_full_profile, tmp_path, lab)
+    assert code == 2 and not (run_dir / "verdict.json").exists()
+    assert "start_producer" not in lab.log
+
+
+def test_a_disk_full_fault_the_engine_never_felt_fails_the_run(disk_full_profile, tmp_path, monkeypatch):
+    monkeypatch.setattr(soak_faults, "ENOSPC_LOG_GRACE_S", 1)
+    lab = FakeLab()
+    lab.engine_felt_it = False
+    code, lab, run_dir, _ = run(disk_full_profile, tmp_path, lab)
+    ended = [e for e in events(run_dir) if e["kind"] == "fault_end" and e["fault"] == "enospc"]
+    assert code == 1 and "faults_executed" in failed(run_dir)
+    assert ended and not ended[0]["ok"] and "did not reach it" in ended[0]["detail"]
+    assert lab.tmpfs is False  # lifted although the proof failed
+
+
+def test_a_run_without_a_disk_full_fault_never_mounts_anything(healthy):
+    _, lab, _, _ = healthy
+    assert "enospc" in soak_profile.FAULT_KINDS and "enospc" not in TINY["fault_cycle"]
+    assert "mount tmpfs" not in lab.log
