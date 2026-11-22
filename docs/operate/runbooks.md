@@ -421,10 +421,12 @@ on it answers every fence and promotion probe with no history, so no leader
 gives it a replication session and no promotion counts its offset. The range
 runs with one replica fewer than configured. Nothing is lost by this, but the
 next failure of another replica can leave the range without a quorum.
-Freeing space does not clear it. A restart does, but wrongly: the mark is
-held in memory, and a restarted node reopens the journal without the failed
-write and offers that history again, with nothing to say it may have a hole.
-Repair it instead of restarting it.
+The mark is kept on disk beside the journal, as `fencing-epochs.broken` in
+the replica's data directory, so neither freeing space nor a restart clears
+it: a restarted node logs the ERROR again ("marked broken in an earlier run")
+and keeps refusing. If the disk was too full to take the mark either, the node
+says so in a warning, retries on every fence and append, and writes it as soon
+as space is back. Do not restart it before that warning stops.
 
 **What to check.** The ERROR line on that node (`its epoch history could not
 be written`), its free disk space, and `vtop_broker_follower_connected` on the
@@ -433,8 +435,11 @@ leader, which shows the replica without a session.
 **What to do.** Free space on the replica's data directory, or fix the storage
 fault. Then stop it and rebuild its range from a replica whose history is
 intact with `vtopctl node repair` (see the repair procedure in
-[`PRODUCTION_HA.md`](../PRODUCTION_HA.md)), and start it again. It rejoins
-through an ordinary session and catches up.
+[`PRODUCTION_HA.md`](../PRODUCTION_HA.md)), and start it against the repaired
+directory. The repaired directory carries the source's history and no mark;
+the replica rejoins through an ordinary session and catches up. Do not delete
+`fencing-epochs.broken` by hand to bring the old directory back: the history
+beside it may have the hole the mark is there to refuse.
 
 **When it is safe to ignore.** Never while the range is meant to run at its
 full replication factor. Why the node does not repair itself once space is

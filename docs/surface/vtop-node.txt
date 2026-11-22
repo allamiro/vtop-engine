@@ -1,0 +1,38 @@
+# Generated from the code by scripts/update-surface-snapshots.sh (#719); do not edit by hand. One item per line, sorted.
+vtop-node
+vtop-node data
+vtop-node data --config value=<CONFIG> required
+vtop-node meta
+vtop-node meta --config value=<CONFIG> required
+vtop-node node
+vtop-node node --config value=<CONFIG> required
+vtop-node produce
+vtop-node produce --ack-log value=<ACK_LOG>
+vtop-node produce --acked-file value=<ACKED_FILE>
+vtop-node produce --addr value=<ADDR> required
+vtop-node produce --batch value=<BATCH> default=128
+vtop-node produce --client-config value=<CLIENT_CONFIG> required
+vtop-node produce --durability value=<DURABILITY> default=quorum
+vtop-node produce --fenced-probe flag
+vtop-node produce --first-sequence value=<FIRST_SEQUENCE> default=0
+vtop-node produce --history value=<HISTORY>
+vtop-node produce --rate value=<RATE> default=0
+vtop-node produce --rate-anchor-unix-micros value=<RATE_ANCHOR_UNIX_MICROS>
+vtop-node produce --records value=<RECORDS> required
+vtop-node produce --request-timeout-ms value=<REQUEST_TIMEOUT_MS> default=0
+vtop-node produce --value-bytes value=<VALUE_BYTES> default=128
+vtop-node replica-status
+vtop-node replica-status --addr value=<ADDR> required
+vtop-node replica-status --client-config value=<CLIENT_CONFIG> required
+vtop-node replica-status --server-name value=<SERVER_NAME> default=localhost
+vtop-node seal-active
+vtop-node seal-active --path value=<PATH> required
+vtop-node verify
+vtop-node verify --addr value=<ADDR> required
+vtop-node verify --batch value=<BATCH> default=512
+vtop-node verify --client-config value=<CLIENT_CONFIG> required
+vtop-node verify --dump value=<DUMP>
+vtop-node verify --expect-at-least value=<EXPECT_AT_LEAST> default=0
+vtop-node verify --max-offset-gaps value=<MAX_OFFSET_GAPS> default=0
+vtop-node verify --value-bytes value=<VALUE_BYTES> default=128
+vtop-node verify --verify-content-through value=<VERIFY_CONTENT_THROUGH> default=18446744073709551615

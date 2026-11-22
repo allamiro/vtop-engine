@@ -7,7 +7,6 @@
 //! the batch lifecycle (`crate::spans`), which the tests below pin down.
 
 use vtop_core::errors::VtopError;
-use vtop_core::telemetry;
 use vtop_observe::otel::{self, Process};
 
 /// The engine's default `service.name`.
@@ -30,17 +29,11 @@ pub fn init_tracing(level: &str, json: bool, instance: Option<&str>) -> Result<(
     if otel::metrics_running() {
         // The metrics export reads the engine's registry, which otherwise
         // exists only when `/metrics` is served.
-        match telemetry::init() {
-            Ok(m) => {
-                crate::audit::bind_counters(m);
-                if let Err(e) = otel::register_registry(&m.registry) {
-                    tracing::warn!(error = %e, "OpenTelemetry counters could not be registered");
-                }
-            }
-            Err(e) => tracing::error!(
+        if let Err(e) = crate::metrics_server::init_registry() {
+            tracing::error!(
                 error = %e,
                 "metrics registry failed to initialize; OpenTelemetry metrics will be empty"
-            ),
+            );
         }
     }
     Ok(())
