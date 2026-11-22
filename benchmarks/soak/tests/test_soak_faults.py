@@ -150,3 +150,122 @@ def test_a_shim_that_shifted_the_wrong_amount_fails_the_step(ctx):
     ctx.lab.start_engine = wrong
     with pytest.raises(soak_faults.FaultError, match="from the host's; the step is 3600"):
         soak_faults.inject(ctx, planned("clock_step", 25), 0)
+
+
+# -- enospc -------------------------------------------------------------------
+
+
+def sleeps(ctx):
+    """Make the injector's sleeps visible in the lab's log, in order with its calls."""
+    ctx.sleep = lambda s: ctx.lab.log.append("sleep")
+
+
+def test_enospc_fills_the_work_directory_holds_it_full_and_frees_the_space(ctx):
+    sleeps(ctx)
+    detail = soak_faults.inject(ctx, planned("enospc", 5), 0)
+    log = ctx.lab.log
+    assert log.index("mount tmpfs") < log.index("fill") < log.index("sleep") < log.index("unmount tmpfs")
+    assert log.count("sleep") >= 5  # held for the fault's window, then lifted
+    assert ctx.lab.tmpfs is False
+    assert "ENOSPC" in detail and "writes resumed" in detail
+
+
+def test_enospc_records_what_it_proved_for_the_evaluator(ctx):
+    soak_faults.inject(ctx, planned("enospc", 5), 0)
+    probe = next(e for e in events(ctx) if e["kind"] == "fault_probe")
+    assert probe["id"] == 1 and probe["fault"] == "enospc"
+    assert probe["write_failed_enospc"] is True and probe["writes_resumed"] is True
+    assert probe["engine_enospc_lines"] == 1
+
+
+def test_enospc_starts_with_a_control_write_that_must_work(ctx):
+    ctx.lab.control_fails = True
+    with pytest.raises(soak_faults.FaultError, match="failed before the fault"):
+        soak_faults.inject(ctx, planned("enospc", 5), 0)
+    assert "mount tmpfs" not in ctx.lab.log
+
+
+def test_enospc_that_never_filled_the_directory_is_an_error_and_the_tmpfs_is_lifted(ctx):
+    ctx.lab.fill_lands = False
+    with pytest.raises(soak_faults.FaultError, match="the fault did not land"):
+        soak_faults.inject(ctx, planned("enospc", 5), 0)
+    assert ctx.lab.tmpfs is False and "unmount tmpfs" in ctx.lab.log
+
+
+def test_enospc_whose_write_failed_for_another_reason_is_not_proven(ctx):
+    ctx.lab.fail_text = "sh: can't create /data/work/.soak-probe: Permission denied"
+    with pytest.raises(soak_faults.FaultError, match="not with ENOSPC"):
+        soak_faults.inject(ctx, planned("enospc", 5), 0)
+    assert ctx.lab.tmpfs is False
+
+
+def test_enospc_the_engine_never_felt_is_an_error_after_a_grace_period(ctx):
+    sleeps(ctx)
+    ctx.lab.engine_felt_it = False
+    with pytest.raises(soak_faults.FaultError, match="logged no 'No space left on device'"):
+        soak_faults.inject(ctx, planned("enospc", 5), 0)
+    assert ctx.lab.log.count("sleep") == 5 + soak_faults.ENOSPC_LOG_GRACE_S
+    assert ctx.lab.tmpfs is False
+    assert not [e for e in events(ctx) if e["kind"] == "fault_probe"]
+
+
+def test_enospc_whose_space_is_not_freed_is_an_error(ctx):
+    ctx.lab.unmount_leaves_mount = True
+    with pytest.raises(soak_faults.FaultError, match="mounts after the tmpfs was lifted"):
+        soak_faults.inject(ctx, planned("enospc", 5), 0)
+
+
+def test_enospc_whose_writes_do_not_resume_is_an_error(ctx):
+    ctx.lab.freed_dir_still_refuses = True
+    with pytest.raises(soak_faults.FaultError, match="still fails after the space was freed"):
+        soak_faults.inject(ctx, planned("enospc", 5), 0)
+
+
+def test_enospc_where_the_tmpfs_did_not_mount_is_an_error_not_a_pass(ctx):
+    ctx.lab.mount_refused = True
+    with pytest.raises(soak_faults.soak_lab.LabError, match="permission denied"):
+        soak_faults.inject(ctx, planned("enospc", 5), 0)
+    assert "unmount tmpfs" not in ctx.lab.log and not [e for e in events(ctx) if e["kind"] == "fault_probe"]
+
+
+def test_an_engine_that_exits_while_its_disk_is_full_is_a_finding_not_a_planned_stop(ctx):
+    seconds = {"n": 0}
+
+    def sleep(_):
+        seconds["n"] += 1
+        if seconds["n"] == 2:
+            ctx.lab.engine_running = False  # it dies on its own, mid-hold
+
+    ctx.sleep = sleep
+    with pytest.raises(soak_faults.FaultError, match="exited .* during the .*hold"):
+        soak_faults.inject(ctx, planned("enospc", 5), 0)
+    assert ctx.state.is_down_planned() is False  # the sampler sees this exit as unplanned
+    assert "unmount tmpfs" not in ctx.lab.log  # the mount went with the engine's namespace
+    assert not [e for e in events(ctx) if e["kind"] == "engine_exit"]
+
+
+def test_enospc_with_the_engine_already_down_is_an_error_not_a_pass(ctx):
+    ctx.lab.engine_running = False
+    with pytest.raises(soak_faults.FaultError, match="not running"):
+        soak_faults.inject(ctx, planned("enospc", 5), 0)
+
+
+def test_the_preflight_lays_the_tmpfs_over_the_idle_engine_and_lifts_it(ctx):
+    soak_faults.preflight_enospc(ctx)
+    assert ctx.lab.log == ["mount tmpfs", "unmount tmpfs"]
+
+
+def test_the_preflight_refuses_a_host_that_cannot_mount_or_lift_it(ctx):
+    ctx.lab.mount_refused = True
+    with pytest.raises(soak_faults.soak_lab.LabError, match="permission denied"):
+        soak_faults.preflight_enospc(ctx)
+    ctx.lab.mount_refused = False
+    ctx.lab.unmount_leaves_mount = True
+    with pytest.raises(soak_faults.FaultError, match="could not be lifted"):
+        soak_faults.preflight_enospc(ctx)
+
+
+def test_the_preflight_notices_a_mount_that_did_not_appear(ctx):
+    ctx.lab.work_mount_depth = lambda: 1  # the mount command succeeded and changed nothing
+    with pytest.raises(soak_faults.FaultError, match="did not appear"):
+        soak_faults.preflight_enospc(ctx)
