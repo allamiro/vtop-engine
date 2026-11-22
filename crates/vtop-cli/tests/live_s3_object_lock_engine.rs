@@ -769,9 +769,11 @@ async fn live_a_tier_copy_is_written_and_checked_under_the_lock() {
                 );
             }
 
-            // Clean up: the lab's root credentials may bypass governance.
+            // Clean up: the lab's root credentials may bypass governance; a
+            // role without s3:BypassGovernanceRetention (the AWS leg's) is
+            // refused, and the bucket's lifecycle rule removes the versions.
             for (key, version) in written {
-                client
+                match client
                     .delete_object()
                     .bucket(&bucket)
                     .key(&key)
@@ -779,7 +781,13 @@ async fn live_a_tier_copy_is_written_and_checked_under_the_lock() {
                     .bypass_governance_retention(true)
                     .send()
                     .await
-                    .unwrap_or_else(|e| panic!("cleaning up {key}: {e:?}"));
+                {
+                    Ok(_) => {}
+                    Err(e) if access_denied(&e) => eprintln!(
+                        "{key}: governance bypass refused; left for the bucket's lifecycle rule"
+                    ),
+                    Err(e) => panic!("cleaning up {key}: {e:?}"),
+                }
             }
         },
     )
