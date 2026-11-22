@@ -36,6 +36,11 @@ pub enum Capability {
     ObjectLock,
     /// A locked version cannot be deleted.
     ObjectLockEnforced,
+    /// A governance retention can be cleared by a principal that bypasses
+    /// governance (`PutObjectRetention` with an empty retention and the
+    /// bypass header). VTOP never does this; the live tests do, to tamper
+    /// with a receipt and see the scrub report it.
+    ObjectLockRetentionClear,
     /// `If-None-Match: *` on PUT. Informational: VTOP does not use it (D14).
     ConditionalPut,
 }
@@ -43,7 +48,7 @@ pub enum Capability {
 impl Capability {
     /// Every capability, in the order a server's file and the report list
     /// them.
-    pub const ALL: [Capability; 14] = [
+    pub const ALL: [Capability; 15] = [
         Capability::PutGetHead,
         Capability::PathStyle,
         Capability::VirtualHost,
@@ -57,6 +62,7 @@ impl Capability {
         Capability::Versioning,
         Capability::ObjectLock,
         Capability::ObjectLockEnforced,
+        Capability::ObjectLockRetentionClear,
         Capability::ConditionalPut,
     ];
 
@@ -76,6 +82,7 @@ impl Capability {
             Capability::Versioning => "versioning",
             Capability::ObjectLock => "object_lock",
             Capability::ObjectLockEnforced => "object_lock_enforced",
+            Capability::ObjectLockRetentionClear => "object_lock_retention_clear",
             Capability::ConditionalPut => "conditional_put",
         }
     }
