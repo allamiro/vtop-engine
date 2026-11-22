@@ -762,7 +762,15 @@ struct FileSink {
     /// `vtopctl` run - may have appended since, so the file's last byte is
     /// read again under the lock.
     end: Option<u64>,
+    /// How long an append waits for another writer's lock before it fails.
+    lock_wait: std::time::Duration,
 }
+
+/// How long an append waits for the lock another process holds on the audit
+/// file. A writer that is paused while it holds the lock must not stop the
+/// node's metadata apply or its start: past this the append fails, the audit
+/// frontier stays behind, and delivery tries again (review of #767).
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Whether the file at `path` is non-empty and its last byte is not a
 /// newline. A file
@@ -800,12 +808,41 @@ impl FileSink {
     /// between (review of #767). Where the file cannot be locked, a failed
     /// write is never cut; the next record starts on a new line instead.
     fn append_line(&mut self, json: &str) -> std::io::Result<()> {
-        let locked = self.file.lock().is_ok();
+        let locked = self.lock_file()?;
         let written = self.append_locked(json, locked);
         if locked {
             let _ = self.file.unlock();
         }
         written
+    }
+
+    /// Take the exclusive lock, waiting at most `lock_wait` for another
+    /// writer to release it. `Ok(false)` when the file cannot be locked at
+    /// all (a file system without locks); an error when another writer holds
+    /// it for the whole wait.
+    fn lock_file(&self) -> std::io::Result<bool> {
+        use std::fs::TryLockError;
+        let deadline = std::time::Instant::now() + self.lock_wait;
+        loop {
+            match self.file.try_lock() {
+                Ok(()) => return Ok(true),
+                Err(TryLockError::Error(_)) => return Ok(false),
+                Err(TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "another process held the lock on {} for {} ms; the record was \
+                                 not written and is retried",
+                                self.path.display(),
+                                self.lock_wait.as_millis()
+                            ),
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        }
     }
 
     fn append_locked(&mut self, json: &str, locked: bool) -> std::io::Result<()> {
@@ -891,8 +928,17 @@ impl AuditSink {
             file,
             needs_newline: false,
             end: None,
+            lock_wait: LOCK_WAIT,
         });
         Ok(())
+    }
+
+    /// Shorten the wait for another writer's lock, for a test.
+    #[cfg(test)]
+    fn set_lock_wait(&self, wait: std::time::Duration) {
+        if let Some(file) = self.file.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            file.lock_wait = wait;
+        }
     }
 
     /// The file this sink appends to, if any.
@@ -1375,6 +1421,41 @@ mod tests {
             serde_json::from_str::<AuditEvent>(lines[2]).is_ok(),
             "the record after another writer's fragment is a line of its own: {text}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review of #767: a writer paused while it holds the file's lock must
+    /// not block the caller for ever. The append fails after the wait, with
+    /// nothing written, and succeeds once the lock is free.
+    #[test]
+    fn an_append_gives_up_on_a_lock_held_too_long() {
+        let dir = std::env::temp_dir().join(format!("vtop-767w-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        let sink = AuditSink::default();
+        sink.open_file(&path).unwrap();
+        sink.set_lock_wait(std::time::Duration::from_millis(100));
+        let event = AuditEvent::new(
+            Action::ClusterPropose,
+            Stage::Applied,
+            Actor::replica("meta-1"),
+            Target::new("cluster", None),
+            Outcome::Success,
+        );
+        let other = OpenOptions::new().append(true).open(&path).unwrap();
+        other.lock().unwrap();
+        let started = std::time::Instant::now();
+        let refused = sink.record(&event);
+        assert!(refused.is_err(), "an append went through a held lock");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the append waited {:?}",
+            started.elapsed()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        other.unlock().unwrap();
+        sink.record(&event).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
