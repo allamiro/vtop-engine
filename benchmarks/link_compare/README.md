@@ -45,7 +45,8 @@ python3 benchmarks/compare_common/regenerate.py        # what CI's drift check r
 
 Other flags: `--tools aws-cli,vtop` (a subset), `--host-class`, `--private` (a product with
 `publish_ok = false`; never charted), `--rebuild` (the VTOP image), `--max-hours` (default 48),
-`--keep-lab`, `--lab-prefix` (container and bucket names). A run refuses to start when a tool's configuration
+`--keep-lab`, `--lab-prefix` (container and bucket names), `--vtop-image` (a prebuilt engine image instead of
+building `docker/Dockerfile`, for a laptop smoke; recorded in `environment.json`). A run refuses to start when a tool's configuration
 under `tools/` differs from HEAD: the CSV records the committed file's sha256.
 
 ## What one run does

@@ -493,6 +493,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--private", action="store_true")
     parser.add_argument("--rebuild", action="store_true", help="rebuild the VTOP image")
+    parser.add_argument("--vtop-image", default=None,
+                        help="use this VTOP image instead of building docker/Dockerfile (a smoke on a laptop "
+                             "with a prebuilt engine); its id is recorded like any other")
     parser.add_argument("--lab-prefix", default="vtop-link", help="container and bucket prefix")
     parser.add_argument("--check", default=None, metavar="RUN_DIR")
     parser.add_argument("--keep-lab", action="store_true", help="leave the lab up afterwards")
@@ -532,7 +535,12 @@ def main(argv: list[str] | None = None) -> int:
               "file's hash, so commit it first", file=sys.stderr)
         return 2
     lab.ensure_minio_image()
-    vtop_image = lab.ensure_vtop_image(args.rebuild) if "vtop" in plan["systems"] else "vtop-compare:unused"
+    if "vtop" not in plan["systems"]:
+        vtop_image = "vtop-compare:unused"
+    elif args.vtop_image:
+        vtop_image = args.vtop_image
+    else:
+        vtop_image = lab.ensure_vtop_image(args.rebuild)
     images = {}
     for system in plan["systems"]:
         if system == "vtop":
@@ -548,7 +556,8 @@ def main(argv: list[str] | None = None) -> int:
     comparable = environment.host_facts(probe_disk=plan["host_class"] != "hosted")
     comparable.update({
         "host_class": plan["host_class"], "vtop_commit": environment.git("rev-parse", "HEAD"),
-        "vtop_engine_tree": lab.engine_tree(), "vtop_image_id": images.get("vtop", ""),
+        "vtop_engine_tree": lab.engine_tree(), "vtop_image": vtop_image if "vtop" in plan["systems"] else "",
+        "vtop_image_id": images.get("vtop", ""),
         "tool_images": {system: images[system] for system in plan["systems"]}, "tool_limits": TOOL_LIMITS,
         "middlebox_image": "nicolaka/netshoot:v0.16", "link_profiles": egress_baseline.PROFILES,
         "store_image_id": lab.image_id(lab.MINIO_IMAGE),
