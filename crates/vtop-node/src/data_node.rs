@@ -4969,7 +4969,9 @@ mod stream_wait_tests {
 
     /// A real follower on the replica plane: the stream to it connects the
     /// way a surviving peer's does after a failover.
-    pub(super) async fn live_follower(dir: &Path) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
+    pub(super) async fn live_follower(
+        dir: &Path,
+    ) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
         let (addr, stop, _) = live_follower_with_log(dir).await;
         (addr, stop)
     }

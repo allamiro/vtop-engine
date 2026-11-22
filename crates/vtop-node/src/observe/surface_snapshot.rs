@@ -150,6 +150,10 @@ fn every_collector(dir: &std::path::Path) -> Vec<(&'static str, Box<dyn Collecto
         // emits is exactly its MetaRaftGauges', so the gauges stand in for it.
         ("MetaRaftGauges", Box::new(MetaRaftGauges::new().unwrap())),
         (
+            "KafkaGatewayServingCollector",
+            Box::new(KafkaGatewayServingCollector::new(Arc::new(|| false)).unwrap()),
+        ),
+        (
             "ConnectionLimitCollector",
             Box::new(ConnectionLimitCollector::new(ConnectionLimits::default()).unwrap()),
         ),
