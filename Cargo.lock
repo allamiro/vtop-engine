@@ -4162,6 +4162,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "vtop-broker",
+ "vtop-core",
  "vtop-kafka",
  "vtop-log",
  "vtop-meta",

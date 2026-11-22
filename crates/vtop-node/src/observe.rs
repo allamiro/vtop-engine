@@ -218,6 +218,9 @@ impl NodeObservability {
         // is fatal like a bind failure, never a plaintext endpoint instead.
         let bound = match config.tls.as_ref() {
             Some(tls) => {
+                // The endpoint's key is checked like every other (#732, S1).
+                crate::tls::check_private_key(&tls.key)
+                    .map_err(|error| format!("observability tls: {error}"))?;
                 let settings = vtop_observe::TlsSettings::from_pem_files(
                     &tls.cert,
                     &tls.key,
