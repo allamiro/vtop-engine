@@ -70,7 +70,22 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # A dispatch builds a commit the dispatcher chose, so it only reads the
+      # cache: what a dispatched build writes would be restored by the next tag
+      # build (cache poisoning). A tag push restores and saves as before.
+      - name: Restore the build cache, read only (dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Restore and save the build cache
+        if: github.event_name != 'workflow_dispatch'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -1137,7 +1152,9 @@ jobs:
           provenance: mode=max
           # Per-arch cache scopes so the two builds stop evicting each other.
           cache-from: type=gha,scope=docker-${{ matrix.platform }}
-          cache-to: type=gha,mode=max,scope=docker-${{ matrix.platform }}
+          # Not exported on a dispatch: the layers of a commit the dispatcher
+          # chose must not be restored by a later tag build.
+          cache-to: ${{ github.event_name != 'workflow_dispatch' && format('type=gha,mode=max,scope=docker-{0}', matrix.platform) || '' }}
 
       - name: Export digest
         if: github.event_name != 'workflow_dispatch'

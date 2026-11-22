@@ -86,7 +86,9 @@ All of this runs in the release workflow: on the tag, before anything is
 published (a failure stops the release), and in a dry run, a manual dispatch
 that builds and checks the archives and publishes nothing. A dry run takes a
 tag, or a branch or commit, so the commit about to be tagged can be checked
-before the tag exists.
+before the tag exists. A dry run only reads the build caches (cargo's and
+Docker's layers) and never writes them, so a build of a commit nobody has
+tagged cannot leave anything for a later tag build to restore.
 
 ### The test suite on each platform
 
