@@ -55,20 +55,43 @@ with that misattribution then answers fences as if it were proven:
 it cannot prove is not a replica whose offset may be counted. The answer
 there was to carry the history with the records, never to infer it.
 
-## A gap found while writing this
+## The mark is durable (v0.11.0)
 
-The broken mark lives in memory only. A **restart clears it**: the node
-reopens the journal, drops a torn tail, and offers whatever entries
-survived, with nothing to say a write was lost after them. So today there
-is already an "auto-heal", and it is the unsafe one: it hands out a history
-that may have the hole described above.
+The first version of this change kept the broken mark in memory, so a
+restart cleared it: the node reopened the journal, dropped a torn tail, and
+offered whatever entries survived, with nothing to say a write was lost
+after them. That was an "auto-heal" already, and the unsafe one.
 
-The runbook says to repair rather than restart, and the ERROR line says the
-same. A durable broken marker would close the gap itself: a sidecar written
-when the mark is set, which refuses the history at every open until repair
-removes it, as `CONDEMNED_MARKER` does for a condemned range.
-**Recommended as the first follow-up**, separately from any auto-heal. It
-does not change the refusal; it only makes it survive a restart.
+The mark is now written beside the journal, as `fencing-epochs.broken`. It
+holds the operator message, written the way the journal's sidecars are
+(staged, fsynced, renamed over, the directory fsynced). It is read back when
+the journal is attached at every open, and it refuses the history exactly as
+the in-memory mark does. Only `vtopctl node repair` clears it, because repair
+installs the source's history. A directory with no mark behaves exactly as
+before.
+
+**The full disk that broke the history can refuse the mark too.** The mark
+then stays pending. It is retried whenever the history is consulted (every
+fence and promotion probe) and before every append, at most once a second,
+and a warning says it is pending until it lands. An append needs the space
+the mark needs, so in practice the mark is on disk before the replica can
+take a record after its break.
+
+**A crash before the mark lands leaves no mark, and that is safe.** The
+danger a mark guards against is records taken *after* the failed write,
+under a history that does not describe them. A process that died in the
+window took none. What it reopens is the pre-failure history over a log that
+ends where it ended at the failure: the state ordinary journal recovery after
+a crash mid-write already handles (#648). The test
+`a_crash_before_the_mark_lands_leaves_the_pre_failure_history_over_an_unchanged_log`
+pins this.
+
+**A residual case is not closed.** The mark's write fails, the process keeps
+running and takes records, and it then dies before a retry lands the mark.
+That needs an append to find space where the mark, written just before it,
+did not. Closing it fully means refusing appends until the mark is on disk.
+That is the append gate of option 1 below, a behaviour change left to its
+own decision.
 
 ## Options once space returns
 
@@ -119,10 +142,10 @@ a replica whose history is intact. It is always safe and needs an operator.
 
 ## Recommendation
 
-1. **Now (this PR):** make the break loud, with a log line, a gauge, an
+1. **Done (v0.10.4):** make the break loud, with a log line, a gauge, an
    alert and a runbook, and leave the refusal as it is.
-2. **Next:** persist the broken mark so a restart cannot silently clear it.
-   This is small and closes a real safety gap.
+2. **Done (v0.11.0):** persist the broken mark so a restart cannot silently
+   clear it.
 3. **Then, if a full disk proves common in the field:** gate appends on the
    broken mark, then retry adoption and first-entry writes under the three
    proofs above, with a crash and fault sweep over every storage operation of

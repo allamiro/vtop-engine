@@ -752,6 +752,10 @@ impl InProcessFollower {
         &self,
         mut journal: crate::fencing_epochs::FencingEpochJournal,
     ) {
+        // A break an earlier run persisted is in force before anything reads
+        // or extends this history (#881).
+        self.fencing_epoch_history_broken
+            .attach(journal.break_marker(), &self.replica_name());
         let epoch = self.held_fencing_epoch.load(Ordering::SeqCst);
         let next_offset = self.next_offset();
         if !crate::LocalBroker::attach_epoch_journal_to_log(&mut journal, next_offset) {
@@ -2182,6 +2186,9 @@ impl InProcessFollower {
         &self,
         request: &ReplicaAppendRequest,
     ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
+        // A break whose mark a full disk refused is retried before the next
+        // record can land (#881): an append needs the space the mark does.
+        self.fencing_epoch_history_broken.persist_pending();
         if !self.is_online() {
             return Err((
                 ErrorCode::Overloaded,
@@ -2370,6 +2377,9 @@ impl InProcessFollower {
         &self,
         requests: &[ReplicaAppendRequest],
     ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
+        // A break whose mark a full disk refused is retried before the next
+        // record can land (#881): an append needs the space the mark does.
+        self.fencing_epoch_history_broken.persist_pending();
         if requests.is_empty() {
             return Ok(ReplicaAppendResponse {
                 local_committed_offset: self.replication_status().0,

@@ -256,6 +256,17 @@ jobs:
             exit 1
           fi
 
+      # The build time a build records is the tagged commit's time, not the
+      # clock's (#731). The vendored OpenSSL in vtopctl stores a "built on"
+      # date; with the clock's, every build of one tag differed (the v0.10.3
+      # dry run: vtop-node identical on all six targets, vtopctl different on
+      # each, by that date and the build id and string layout that follow
+      # from it). SOURCE_DATE_EPOCH is what OpenSSL's build reads instead.
+      # The `reproduce` job below sets it the same way; change both together.
+      - name: Pin the recorded build time to the commit
+        shell: bash
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
@@ -313,7 +324,7 @@ jobs:
         run: |
           set -euo pipefail
           docker run --rm \
-            -e TARGET -e CARGO_TERM_COLOR -e RUST_BACKTRACE -e CARGO_INCREMENTAL \
+            -e TARGET -e CARGO_TERM_COLOR -e RUST_BACKTRACE -e CARGO_INCREMENTAL -e SOURCE_DATE_EPOCH \
             -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
             -e CARGO_HOME=/cargo -e RUSTUP_HOME=/rustup \
             -v "${CARGO_HOME:-$HOME/.cargo}:/cargo" \
@@ -367,7 +378,7 @@ jobs:
           # The exact version the toolchain step resolved for the other legs.
           rust_version="$(rustc --version | awk '{ print $2 }')"
           docker run --rm \
-            -e TARGET -e CARGO_TERM_COLOR -e RUST_BACKTRACE -e CARGO_INCREMENTAL \
+            -e TARGET -e CARGO_TERM_COLOR -e RUST_BACKTRACE -e CARGO_INCREMENTAL -e SOURCE_DATE_EPOCH \
             -e RUST_VERSION="$rust_version" -e LIBZ_SYS_STATIC=1 \
             -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
             -v "$GITHUB_WORKSPACE:/src" -w /src \
@@ -840,6 +851,10 @@ jobs:
   # If a run shows drift, pin the input in this file (the `binaries` job and
   # this one together), never repository-wide.
   #
+  # The build time is pinned (SOURCE_DATE_EPOCH, the commit's time): the
+  # first run (v0.10.3's dry run) found every vtopctl different only by the
+  # date its vendored OpenSSL records, and every vtop-node identical.
+  #
   # The build recipes below (macOS, Linux glibc inside manylinux2014, Linux
   # musl inside Alpine, and every matrix `build_image`) are copies of the
   # `binaries` job's, apart from the lines that record the inputs: a change to
@@ -892,6 +907,11 @@ jobs:
             exit 1
           fi
 
+      # As in the `binaries` job: the recorded build time is the commit's.
+      - name: Pin the recorded build time to the commit
+        shell: bash
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ${{ env.BUNDLE_NAME }}-${{ matrix.target }}
@@ -919,6 +939,7 @@ jobs:
           cargo build --release --bin vtop-node --bin vtopctl --target ${{ matrix.target }} --locked
           mkdir -p repro
           {
+            echo "SOURCE_DATE_EPOCH: $SOURCE_DATE_EPOCH"
             echo "rustc: $(rustc --version)"
             echo "cargo: $(cargo --version)"
             echo "macOS: $(sw_vers -productVersion), $(clang --version | head -1)"
@@ -938,8 +959,9 @@ jobs:
           set -euo pipefail
           mkdir -p repro
           echo "image: $BUILD_IMAGE" > repro/inputs.txt
+          echo "SOURCE_DATE_EPOCH: $SOURCE_DATE_EPOCH" >> repro/inputs.txt
           docker run --rm \
-            -e TARGET -e CARGO_TERM_COLOR -e RUST_BACKTRACE -e CARGO_INCREMENTAL \
+            -e TARGET -e CARGO_TERM_COLOR -e RUST_BACKTRACE -e CARGO_INCREMENTAL -e SOURCE_DATE_EPOCH \
             -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
             -e CARGO_HOME=/cargo -e RUSTUP_HOME=/rustup \
             -v "${CARGO_HOME:-$HOME/.cargo}:/cargo" \
@@ -979,10 +1001,11 @@ jobs:
           set -euo pipefail
           mkdir -p repro
           echo "image: $BUILD_IMAGE" > repro/inputs.txt
+          echo "SOURCE_DATE_EPOCH: $SOURCE_DATE_EPOCH" >> repro/inputs.txt
           # The exact version the toolchain step resolved for the other legs.
           rust_version="$(rustc --version | awk '{ print $2 }')"
           docker run --rm \
-            -e TARGET -e CARGO_TERM_COLOR -e RUST_BACKTRACE -e CARGO_INCREMENTAL \
+            -e TARGET -e CARGO_TERM_COLOR -e RUST_BACKTRACE -e CARGO_INCREMENTAL -e SOURCE_DATE_EPOCH \
             -e RUST_VERSION="$rust_version" -e LIBZ_SYS_STATIC=1 \
             -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
             -v "$GITHUB_WORKSPACE:/src" -w /src \
