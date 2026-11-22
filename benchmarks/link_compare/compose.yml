@@ -1,0 +1,185 @@
+# The link comparison's lab (#747): the #477 middlebox in front of the lab
+# MinIO, a calibration probe, and the four tools as one-shot services.
+#
+#   LAB=vtop-link VTOP_IMAGE=vtop-compare:<tree> \
+#     docker compose -p vtop-link -f benchmarks/link_compare/compose.yml up -d minio netem probe
+#   (run.py does this, and runs each tool with `docker compose run`.)
+#
+# The path is the one docker-compose.benchmark.yml's `netem` service built for
+# #477/#483/#663, here in its own project so a link run never shares a
+# middlebox with another lab: every tool dials netem:9200, the middlebox DNATs
+# it onto MinIO's store-side address, and the shaping (lib/netem.py) sits on
+# the middlebox's engine-facing interface, upload on an ifb. Shaped runs need a
+# Linux kernel with ifb (Docker Desktop's has none, #610); the unshaped `lan`
+# profile runs anywhere.
+#
+# Every tool service is in one limit class (#744 rule 12): 2 CPUs, 2 GiB, no
+# swap. tests/test_link_compare.py fails when they differ, and when an image
+# is not the products.toml pin.
+name: vtop-link
+
+services:
+  minio:
+    image: vtop-minio:RELEASE.2025-09-07T16-13-09Z
+    pull_policy: never
+    container_name: ${LAB:-vtop-link}-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      # The store's own request counters, read without a token.
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+      # mc inside this container (bucket creation, the harness read-back).
+      MC_HOST_lab: http://minioadmin:minioadmin@localhost:9000
+    networks:
+      store:
+        ipv4_address: 10.77.47.10
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    security_opt:
+      - no-new-privileges:true
+
+  # The middlebox: the only service with NET_ADMIN (and NET_RAW for iptables).
+  netem:
+    image: nicolaka/netshoot:v0.16@sha256:b09d9b21381f47a79b3cbcb30da25266dc17186ea00ae65e99fdc51396f48e70
+    container_name: ${LAB:-vtop-link}-netem
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN, NET_RAW]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 512m
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    networks:
+      lab:
+        priority: 100
+      store:
+        priority: 10
+        ipv4_address: 10.77.47.2
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        iptables -t nat -A PREROUTING -p tcp --dport 9200 -j DNAT --to-destination 10.77.47.10:9000
+        iptables -t nat -A POSTROUTING -d 10.77.47.10 -j MASQUERADE
+        iperf3 -s -p 5201 -D
+        exec sleep infinity
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  # iperf3 alone through the shaped path: the calibration before and after
+  # every run, and the neighbour flow of the `neighbour` cell (#478).
+  probe:
+    image: nicolaka/netshoot:v0.16@sha256:b09d9b21381f47a79b3cbcb30da25266dc17186ea00ae65e99fdc51396f48e70
+    container_name: ${LAB:-vtop-link}-probe
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 256m
+    command: ["sleep", "infinity"]
+    networks: [lab]
+    depends_on:
+      netem:
+        condition: service_started
+
+  # The seeded files and their sha256 manifest, written once per run.
+  gen:
+    profiles: ["tools"]
+    image: python:3.12.16-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
+    entrypoint: ["python3", "/bench/link_compare/gen.py"]
+    volumes:
+      - files:/data
+      - ../:/bench:ro
+    network_mode: none
+
+  vtop:
+    profiles: ["tools"]
+    image: ${VTOP_IMAGE:-vtop-compare:unset}
+    pull_policy: never
+    cpus: "2"
+    mem_limit: 2g
+    memswap_limit: 2g
+    entrypoint: ["sh", "/cfg/run.sh"]
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      NO_COLOR: "1"
+    volumes:
+      - files:/data:ro
+      - ${TOOL_CFG:-./tools/vtop}:/cfg:ro
+    tmpfs:
+      - /state:uid=10001,gid=10001,mode=0700
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    networks: [lab]
+
+  aws-cli:
+    profiles: ["tools"]
+    image: amazon/aws-cli:2.40.3@sha256:33a16c53ea442e918b58df67301ad76a8fb57082c39f7e78753b898c3f3e87c2
+    cpus: "2"
+    mem_limit: 2g
+    memswap_limit: 2g
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_CONFIG_FILE: /cfg/config
+      AWS_PAGER: ""
+    volumes:
+      - files:/data:ro
+      - ${TOOL_CFG:-./tools/aws-cli}:/cfg:ro
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    networks: [lab]
+
+  rclone:
+    profiles: ["tools"]
+    image: rclone/rclone:1.76.0@sha256:7cbeec24a44f206067597c0368be4de90ae19a64d5113c7d1938bd737a81e466
+    cpus: "2"
+    mem_limit: 2g
+    memswap_limit: 2g
+    environment:
+      RCLONE_CONFIG: /cfg/rclone.conf
+      RCLONE_CONFIG_LAB_ACCESS_KEY_ID: minioadmin
+      RCLONE_CONFIG_LAB_SECRET_ACCESS_KEY: minioadmin
+    volumes:
+      - files:/data:ro
+      - ${TOOL_CFG:-./tools/rclone}:/cfg:ro
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    networks: [lab]
+
+  s5cmd:
+    profiles: ["tools"]
+    image: peakcom/s5cmd:v2.3.0@sha256:2ff939e2ee3c76adcadd78dbfc3e2569b18a3743ed9dcfccb1ec589af7fb9903
+    cpus: "2"
+    mem_limit: 2g
+    memswap_limit: 2g
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+    volumes:
+      - files:/data:ro
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    networks: [lab]
+
+networks:
+  lab: {}
+  store:
+    ipam:
+      config:
+        - subnet: 10.77.47.0/24
+
+volumes:
+  files: {}
