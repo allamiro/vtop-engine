@@ -1,0 +1,19 @@
+diff --git a/crates/vtop-broker/src/replication/mod.rs b/crates/vtop-broker/src/replication/mod.rs
+index 67d15312..14623993 100644
+--- a/crates/vtop-broker/src/replication/mod.rs
++++ b/crates/vtop-broker/src/replication/mod.rs
+@@ -1850,6 +1850,14 @@ impl InProcessFollower {
+                 )
+             })
+         };
++        // RE-INTRODUCED #611 (test build only, scripts/live-chaos/history/reintroduce):
++        // as before #616, a divergence discards everything above this
++        // replica's own known high-water mark, whichever side holds the
++        // acknowledged records: a replica that has not yet learned the
++        // latest mark drops records a quorum acknowledged.
++        let _ = supersedes;
++        let supersedes = true;
++        let divergence = divergence.max(self.cluster_committed.get());
+         // NEVER a dispute below this replica's own high-water mark (#616
+         // regression, found by the promotion crash sweep in the #640 shape).
+         // Everything below the mark is committed, and a committed record is
