@@ -233,16 +233,6 @@ impl LeaderLineage for crate::LocalBroker {
     }
 
     fn read_catch_up(&self, from: u64, max_bytes: usize) -> CatchUpRead {
-        // A v1 frame stores the producer identity MERGED with its epoch, and
-        // the merge is a hash: the log no longer holds the identity a
-        // replica append must carry, so its records cannot be re-sent.
-        if self.segment_format() == crate::SegmentFormat::V1 {
-            return CatchUpRead::Unavailable(
-                "a v1 range stores producer identities merged with their epochs, so its records \
-                 cannot be re-sent as appends"
-                    .to_owned(),
-            );
-        }
         // Lock order: the lease view, then the state, as on the produce
         // path. Held through the read, so every record goes out under an
         // epoch this broker served it under and no grant can move between
@@ -303,25 +293,51 @@ impl LeaderLineage for crate::LocalBroker {
         // oversized group no producer ever sent (#881 soak).
         // And one group must fit one segment: the follower rolls once for a
         // group that does not fit its tail, never splits it (review).
-        let (max_group_bytes, max_group_records) =
-            state
-                .segment
-                .active()
-                .config_v2()
-                .map_or((u64::MAX, u64::MAX), |config| {
-                    (
-                        config.max_group_bytes.min(config.max_segment_bytes),
-                        config.max_segment_records,
-                    )
-                });
+        // A v1 segment has the same three limits, in its own header: read
+        // through `config()` there, or a v1 range's consecutive produces are
+        // merged into one append no follower's append path accepts, and the
+        // catch-up is rebuilt the same way at every reconnect.
+        let active = state.segment.active();
+        let (max_group_bytes, max_group_records) = match active.config_v2() {
+            Some(config) => (
+                config.max_group_bytes.min(config.max_segment_bytes),
+                config.max_segment_records,
+            ),
+            None => {
+                let config = active.config();
+                (
+                    config.max_group_bytes.min(config.max_segment_bytes),
+                    config.max_segment_records,
+                )
+            }
+        };
+        // A v1 frame stores the producer identity MERGED with its epoch, and
+        // the merge is a hash, so the identity a replica append carries is
+        // not in the log: it is recovered below from the producers this
+        // leader has admitted (#599). Taken under the lock; the search is not.
+        let known_producers = (self.segment_format() == crate::SegmentFormat::V1)
+            .then(|| state.producer_epochs.producers());
         drop(state);
         drop(meta);
+        let fetched_records = match known_producers {
+            Some(producers) => match resolve_v1_identities(&fetched.records, &producers) {
+                Ok(records) => records,
+                Err(offset) => {
+                    return CatchUpRead::Unavailable(format!(
+                        "the record at offset {offset} of a v1 range names a producer this \
+                         leader no longer knows, so its identity cannot be re-sent in a \
+                         replica append"
+                    ))
+                }
+            },
+            None => fetched.records,
+        };
         let appends = appends_from_log(
             self.range(),
             fencing_epoch,
             self.node_id(),
             from,
-            &fetched.records,
+            &fetched_records,
             GroupBound {
                 bytes: max_group_bytes,
                 records: max_group_records,
@@ -334,6 +350,58 @@ impl LeaderLineage for crate::LocalBroker {
         }
         CatchUpRead::Appends(appends)
     }
+}
+
+/// The most epochs tried per known producer when a v1 log's merged
+/// identities are resolved (#599), newest first. A producer's epoch is the
+/// session counter a client bumps when it restarts, so the one that wrote a
+/// record not yet on a follower is at or near its current one.
+const V1_IDENTITY_EPOCHS_TRIED: u64 = 256;
+
+/// A v1 range's records with the producer identity and epoch each was
+/// admitted under, for re-sending as replica appends (#599).
+///
+/// A v1 frame holds `storage_producer_id(producer, epoch)` and no epoch. The
+/// hash cannot be inverted, but it can be tested against the producers this
+/// leader's epoch journal knows: it holds each one's current epoch, and a
+/// record not yet on a follower was written by a producer at or near it.
+/// Each distinct stored identity is matched, newest epoch first, to the one
+/// producer and epoch that hashes to it. `Err(offset)` names the first record
+/// whose identity no known producer and epoch accounts for: the caller then
+/// sends nothing, as it did for every v1 range before this.
+pub(crate) fn resolve_v1_identities(
+    records: &[vtop_log::FetchedRecord],
+    producers: &[(Uuid, u64)],
+) -> Result<Vec<vtop_log::FetchedRecord>, u64> {
+    let mut wanted: HashMap<Uuid, Option<(Uuid, u64)>> = records
+        .iter()
+        .map(|fetched| (fetched.record.producer_id, None))
+        .collect();
+    for (producer, current) in producers {
+        let lowest = current.saturating_sub(V1_IDENTITY_EPOCHS_TRIED - 1);
+        for epoch in (lowest..=*current).rev() {
+            if let Some(slot) = wanted.get_mut(&crate::storage_producer_id(*producer, epoch)) {
+                slot.get_or_insert((*producer, epoch));
+            }
+        }
+        if wanted.values().all(Option::is_some) {
+            break;
+        }
+    }
+    records
+        .iter()
+        .map(|fetched| {
+            let (producer_id, producer_epoch) = wanted
+                .get(&fetched.record.producer_id)
+                .copied()
+                .flatten()
+                .ok_or(fetched.offset)?;
+            let mut resolved = fetched.clone();
+            resolved.record.producer_id = producer_id;
+            resolved.record.producer_epoch = producer_epoch;
+            Ok(resolved)
+        })
+        .collect()
 }
 
 /// The most one rebuilt append may carry: what one group of the range may
@@ -1504,7 +1572,9 @@ impl NetworkedReplicaSet {
     /// Plaintext sessions skip the fence: a plaintext replica refuses it,
     /// since it truncates against the caller's word and needs an identified
     /// caller. A plaintext plane does not fail over (`refuse_plaintext_promotion`
-    /// in vtop-node), so it has no deposed leader to reconcile.
+    /// in vtop-node), so it has no deposed leader to reconcile. They do
+    /// catch a follower up from the leader's log (#599), which needs the
+    /// range and the epoch's live grant but not the fence.
     pub fn reconcile_followers_against(&self, leader: std::sync::Weak<dyn LeaderLineage>) -> bool {
         if self.lineage.leader.set(leader).is_err() {
             return false;
@@ -1849,13 +1919,25 @@ impl FollowerDriver {
         stream: &mut MaybeTls<TcpStream>,
         next_request_id: &mut u64,
     ) -> Result<(SessionFence, Option<RangeIdentity>), SessionOutcome> {
-        // Plaintext: see `reconcile_followers_against`.
-        if self.connector.is_none() {
-            return Ok((SessionFence::NotRequired, None));
-        }
         let Some(cell) = self.lineage.leader.get() else {
             return Ok((SessionFence::NotRequired, None));
         };
+        // Plaintext: no fence is sent (see `reconcile_followers_against`),
+        // but the session still needs the range, so the status probe can ask
+        // where the follower is and the leader's log can catch it up (#599).
+        // A leader with no live grant to read it from leaves the session as
+        // it was: no probe, nothing carried from the log.
+        if self.connector.is_none() {
+            let Some(leader) = cell.upgrade() else {
+                return Err(SessionOutcome::Disconnected);
+            };
+            let range = self
+                .lineage
+                .read(leader, self.flow.connect_timeout)
+                .await
+                .map(|lineage| lineage.range);
+            return Ok((SessionFence::NotRequired, range));
+        }
         // The leader is gone: this replica set is being torn down.
         let Some(leader) = cell.upgrade() else {
             return Err(SessionOutcome::Disconnected);
@@ -2133,12 +2215,20 @@ impl FollowerDriver {
                     // while it occupies the retransmission buffer.
                     drain_retransmission_to_pending(pending, retransmission, retransmission_bytes);
                     // What the buffer cannot cover, the log can (#881) -
-                    // to a follower this session fenced, and only to one:
-                    // the fence is what reconciled its log against this
-                    // leader's (#641) and gave it the history the records
-                    // are filed under (#640). An unfenced (plaintext) session
-                    // keeps the buffer-only behaviour it had.
-                    if session_fence == SessionFence::Reconciled {
+                    // to a follower this session fenced: the fence is what
+                    // reconciled its log against this leader's (#641) and
+                    // gave it the history the records are filed under (#640).
+                    //
+                    // A plaintext plane has no fence to send and no
+                    // failover to reconcile after (`reconcile_followers_against`):
+                    // its leader is the only writer its followers have ever
+                    // had, so a follower's log is a prefix of the leader's and
+                    // the append path's base-offset check is all the
+                    // agreement there is to establish. Without the catch-up a
+                    // restarted leader, whose buffer is empty, could never
+                    // reach a follower behind the records it fsynced but never
+                    // got acknowledged (#599).
+                    if session_fence == SessionFence::Reconciled || self.connector.is_none() {
                         if let Err(outcome) = self
                             .catch_up_from_log(
                                 &mut stream,
@@ -4258,6 +4348,159 @@ mod tests {
         assert_eq!(
             broker.read_catch_up(3, CATCH_UP_MAX_BYTES),
             CatchUpRead::UpToDate
+        );
+    }
+
+    /// #923 review (P2): a v1 range's catch-up honours the range's group and
+    /// segment limits. The bounds were read through `config_v2()` only, which
+    /// is `None` for v1, so every consecutive produce of one producer was
+    /// merged into one append that no follower accepts, and the rebuilt
+    /// append was the same at every reconnect.
+    #[test]
+    fn a_v1_catch_up_splits_appends_at_the_ranges_group_and_record_limits() {
+        use vtop_protocol::{Durability, Message, Role, WireFrame};
+        let dir = tempfile::tempdir().unwrap();
+        let range = catch_up_range();
+        // Two records of this size fit one group, three do not (a v1 frame is
+        // two bytes smaller than the v2 frame the estimate is taken from).
+        let record_bytes = vtop_log::RECORD_FRAME_OVERHEAD_BYTES_V2 + 1 + 2;
+        let config = vtop_log::SegmentConfig {
+            max_record_bytes: 64,
+            max_group_bytes: 2 * record_bytes + 8,
+            max_segment_bytes: 1024 * 1024,
+            max_segment_records: 100,
+            index_stride: 2,
+        };
+        let segment = vtop_log::ActiveSegment::create(
+            dir.path().join("range.active"),
+            vtop_log::SegmentDescriptor {
+                segment_id: Uuid::from_u128(9),
+                topic: range.topic.clone(),
+                topic_epoch: range.topic_epoch,
+                lineage: vtop_log::RangeLineage {
+                    range_id: range.range_id,
+                    generation: range.range_generation,
+                    key_range: vtop_log::KeyRange::full(),
+                    parents: Vec::new(),
+                },
+                base_offset: 0,
+            },
+            config,
+        )
+        .unwrap();
+        let epochs = crate::ProducerEpochJournal::open(dir.path().join("epochs")).unwrap();
+        let broker = crate::LocalBroker::new(segment, epochs, range.clone(), 4).unwrap();
+        let producer = Uuid::from_u128(0xB1);
+        for sequence in 0..7_u64 {
+            let frame = WireFrame {
+                request_id: sequence + 1,
+                stream_id: 1,
+                message: Message::ProduceRequest(vtop_protocol::ProduceRequest {
+                    range: range.clone(),
+                    fencing_epoch: 4,
+                    producer_id: producer,
+                    producer_epoch: 1,
+                    first_sequence: sequence,
+                    durability: Durability::LocalFsync,
+                    records: vec![ProduceRecord {
+                        timestamp_millis: 1,
+                        key: b"k".to_vec(),
+                        value: format!("v{sequence}").into_bytes(),
+                    }],
+                }),
+            };
+            assert!(
+                matches!(
+                    broker.handle(Role::Producer, frame).message,
+                    Message::ProduceResponse(_)
+                ),
+                "produce {sequence} is acknowledged"
+            );
+        }
+
+        let CatchUpRead::Appends(appends) = broker.read_catch_up(0, CATCH_UP_MAX_BYTES) else {
+            panic!("a v1 range is caught up from its log")
+        };
+        assert_eq!(
+            appends.iter().map(|a| a.records.len()).sum::<usize>(),
+            7,
+            "every record is carried"
+        );
+        for append in &appends {
+            assert!(
+                append.records.len() <= 2,
+                "an append of {} records exceeds the range's max_group_bytes of {}: the \
+                 follower would refuse it for ever",
+                append.records.len(),
+                config.max_group_bytes
+            );
+            assert_eq!(append.producer_id, producer);
+            assert_eq!(append.producer_epoch, 1);
+        }
+        assert_eq!(
+            appends.iter().map(|a| a.records.len()).collect::<Vec<_>>(),
+            vec![2, 2, 2, 1]
+        );
+    }
+
+    fn v1_record(
+        offset: u64,
+        producer: Uuid,
+        epoch: u64,
+        sequence: u64,
+    ) -> vtop_log::FetchedRecord {
+        vtop_log::FetchedRecord {
+            offset,
+            record: vtop_log::LogRecord {
+                producer_id: crate::storage_producer_id(producer, epoch),
+                producer_epoch: 0,
+                sequence,
+                timestamp_millis: 0,
+                attributes: 0,
+                key: Vec::new(),
+                value: vec![sequence as u8],
+            },
+        }
+    }
+
+    #[test]
+    fn a_v1_record_is_matched_to_the_producer_and_epoch_that_wrote_it() {
+        let (first, second) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let records = [
+            v1_record(7, first, 3, 0),
+            v1_record(8, first, 2, 1),
+            v1_record(9, second, 0, 0),
+        ];
+        let resolved = resolve_v1_identities(&records, &[(first, 3), (second, 0)]).unwrap();
+        let identities: Vec<_> = resolved
+            .iter()
+            .map(|fetched| {
+                (
+                    fetched.offset,
+                    fetched.record.producer_id,
+                    fetched.record.producer_epoch,
+                )
+            })
+            .collect();
+        assert_eq!(
+            identities,
+            vec![(7, first, 3), (8, first, 2), (9, second, 0)]
+        );
+    }
+
+    #[test]
+    fn a_v1_record_no_known_producer_accounts_for_names_its_offset() {
+        let (known, stranger) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let records = [v1_record(4, known, 1, 0), v1_record(5, stranger, 1, 0)];
+        assert_eq!(
+            resolve_v1_identities(&records, &[(known, 1)]).unwrap_err(),
+            5
+        );
+        // An epoch beyond the search is not guessed at either.
+        let records = [v1_record(6, known, 0, 0)];
+        assert_eq!(
+            resolve_v1_identities(&records, &[(known, V1_IDENTITY_EPOCHS_TRIED + 10)]).unwrap_err(),
+            6
         );
     }
 }
