@@ -694,6 +694,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--teardown-flakey", action="store_true", help="remove it again when the run ends")
     parser.add_argument("--host-exec", default=None, metavar="PREFIX",
                         help="how to run powercut.sh as root (default: nothing as root, else 'sudo -n')")
+    parser.add_argument("--host-disk", default=None, metavar="TEXT",
+                        help="name the disk behind Docker's data yourself, for a host (a virtio VM) whose "
+                             "probe cannot; recorded as given")
     parser.add_argument("--node-cpus", type=int, default=2, help="CPUs per node, Kafka and VTOP alike")
     parser.add_argument("--client-cpus", type=int, default=4)
     parser.add_argument("--client-memory", default="4g")
@@ -762,6 +765,7 @@ def main(argv: list[str] | None = None) -> int:
             f"crash loses something is {ca.upper_bound_95(0, matrix['crashes']):.1%} (30 crashes: 9.5 %)")
     limits = phase1.check_equal_limits()
     host = Host(args.data_root, shlex.split(args.host_exec) if args.host_exec is not None else default_host_prefix())
+    disk = args.host_disk or phase1.probe_host_disk()
     status = host.call("status").strip()
     if "flakey-drop" in matrix["crash_modes"] and status != "flakey":
         if args.setup_flakey is None:
@@ -773,7 +777,6 @@ def main(argv: list[str] | None = None) -> int:
         running = sh(["docker", "ps", "-q", "--filter", f"label=com.docker.compose.project={SPEC[system]['project']}"])
         if running.stdout.strip():
             raise SystemExit(f"{SPEC[system]['project']} is already running; stop it first (one system at a time)")
-    disk = phase1.probe_host_disk()
     sh(["docker", "pull", "-q", KAFKA_IMAGE], timeout=1800)
     vtop_image = ensure_image(args.rebuild)
 
