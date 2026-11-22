@@ -119,6 +119,10 @@ def value(rows: Sequence[dict[str, str]], kind: schema.Kind, metric: Metric, gro
             usable.append(float(row[metric.column]))
     if not usable:
         return Value(None, stubs[0] if stubs else "no row", len(selected))
+    if metric.reduce == "sum" and len(usable) < len(selected):
+        # A total over the repetitions that happened is not comparable with a total over all of them: a
+        # tool that completed one of three fault trials would otherwise lose fewer records (review of #906).
+        return Value(None, f"incomplete: {len(usable)} of {len(selected)} runs usable", len(selected))
     if metric.reduce == "sum":
         total = sum(usable)
         return Value(stats.Summary(total, total, total, len(usable)), None, len(selected))
@@ -227,9 +231,17 @@ def standing_sentences(scores: Sequence[Score], names: dict[str, str]) -> list[s
 # ------------------------------------------------------------------- footer
 
 
-def footer_text(env: dict[str, Any], systems: Sequence[str], reg: dict[str, Any]) -> str:
+def recorded_versions(rows: Sequence[dict[str, str]], system: str) -> list[str]:
+    """The versions the run recorded for `system`, in sorted order: what was benchmarked, not what the
+    registry pins today (review of #906)."""
+    return sorted({row["system_version"] for row in rows if row["system"] == system and row.get("system_version")})
+
+
+def footer_text(env: dict[str, Any], systems: Sequence[str], reg: dict[str, Any],
+                rows: Sequence[dict[str, str]] = ()) -> str:
     c = env["comparable"]
-    versions = ", ".join(f"{registry.product(reg, s)['name']} {registry.product(reg, s)['version']}"
+    versions = ", ".join(f"{registry.product(reg, s)['name']} "
+                         f"{'/'.join(recorded_versions(rows, s)) or registry.product(reg, s)['version']}"
                          for s in systems if s != "vtop")
     lines = [
         f"host: {c.get('host_cpu')}, {c.get('host_logical_cpus')} logical CPUs, {c.get('host_os')} | "
@@ -363,7 +375,7 @@ def build(run_dir: str, spec: Report, repo: str, *, doc_path: str | None = None,
     colours.series(order, systems)  # refuses an undrawable composition before anything is written
     doc_path = doc_path or os.path.join(repo, "docs", "benchmarks", f"{spec.doc_name}.md")
     img_dir = img_dir or os.path.join(repo, "docs", "benchmarks", spec.img_dir)
-    footer = footer_text(env, systems, reg)
+    footer = footer_text(env, systems, reg, rows)
     metrics = [m for chart in spec.charts for m in chart.metrics]
     scores = scoreboard(rows, kind, metrics, systems, profiles, spec.group_label)
     plt = setup_matplotlib(f"vtop-{kind.name}-compare")
