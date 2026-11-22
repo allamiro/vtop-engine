@@ -26,6 +26,7 @@ use vtop_log::{SegmentCommitKey, SegmentManifestV2};
 use vtop_meta::command::CommandEnvelope;
 use vtop_meta::MetadataCommand;
 use vtop_upload::base::parse_s3_uri;
+use vtop_upload::base::{BucketFeature, ObjectLockPolicy, RetentionCheck};
 use vtop_upload::{
     cleanup_abandoned, upload_resumable, MultipartFence, MultipartUploadConfig, ObjectChecksum,
     UploadBackend,
@@ -186,6 +187,10 @@ pub struct TierCopyRequest {
     pub issued_at_ms: i64,
     /// When set, large segments upload via resumable multipart.
     pub multipart: Option<MultipartUploadConfig>,
+    /// `upload.object_lock` from the tier's upload config (#684): the copy is
+    /// written under it, and the retention of the exact versions written is
+    /// read back before the evidence is proposed.
+    pub object_lock: Option<vtop_core::config::ObjectLockConfig>,
 }
 
 impl TierCopyRequest {
@@ -281,7 +286,16 @@ pub async fn run_tier_copy(
         .map_err(|error| refuse("segment digest", error))?;
     let manifest_digest = blake3_hex(&manifest_bytes);
 
-    // 2. Versioning preflight: the hardened profile fails closed on any
+    // 2. The Object Lock profile (#684): the backend must write under the
+    //    configured lock, and the bucket must have Object Lock enabled,
+    //    before anything is written. First, because a bucket without Object
+    //    Lock is also refused by the versioning preflight below, with
+    //    advice that would not fix it.
+    if let Some(lock) = &request.object_lock {
+        object_lock_preflight(backend, lock, &request.object_uri).await?;
+    }
+
+    // 2b. Versioning preflight: the hardened profile fails closed on any
     //    backend or bucket that cannot keep immutable versions.
     if request.require_versioning {
         let (bucket, _key) = parse_s3_uri(&request.object_uri)
@@ -356,6 +370,31 @@ pub async fn run_tier_copy(
             "manifest upload",
             "backend returned no immutable version id under --require-versioning",
         ));
+    }
+    // 3b. Under the Object Lock profile, the retention the store kept on the
+    //     exact versions written, judged against what each write asked for.
+    if let Some(lock) = &request.object_lock {
+        let now_secs = unix_now_secs();
+        check_tier_retention(
+            backend,
+            "segment",
+            &request.object_uri,
+            stored_segment.version_id.as_deref(),
+            stored_segment.retention,
+            lock,
+            now_secs,
+        )
+        .await?;
+        check_tier_retention(
+            backend,
+            "manifest",
+            &manifest_uri,
+            stored.version_id.as_deref(),
+            stored.retention,
+            lock,
+            now_secs,
+        )
+        .await?;
     }
 
     // 4. Read-back verification of the STORED bytes. A backend-limited
@@ -486,6 +525,7 @@ pub fn build_request(args: &TierCopyArgs) -> Result<TierCopyRequest, String> {
         request_id,
         issued_at_ms: args.issued_at_ms,
         multipart: None,
+        object_lock: None,
     })
 }
 
@@ -582,24 +622,156 @@ fn derived_tier_copy_request_id(args: &TierCopyArgs, expected_root: &[u8; 32]) -
     Uuid::from_bytes(bytes)
 }
 
-/// `vtopctl tier copy` refuses `upload.object_lock` (#684).
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// The Object Lock checks a tier copy makes before it writes (#684), as the
+/// engine makes them at startup: the backend applies the configured lock to
+/// what it writes, and the target bucket has Object Lock enabled. Unlike the
+/// engine, a bucket whose configuration cannot be read is refused: a tier
+/// copy is one operator command, and it can simply be run again.
+async fn object_lock_preflight(
+    backend: &dyn UploadBackend,
+    lock: &vtop_core::config::ObjectLockConfig,
+    object_uri: &str,
+) -> Result<(), String> {
+    const STEP: &str = "object lock preflight";
+    const DID: &str = "nothing was copied";
+    if !backend
+        .object_lock()
+        .is_some_and(|policy| policy == ObjectLockPolicy::from_config(lock))
+    {
+        return Err(refuse(
+            STEP,
+            format!(
+                "upload.object_lock is set in the --upload-config file, but the {} backend does \
+                 not write under it; {DID}. Use the s3_native backend, which writes every object \
+                 under the configured lock",
+                backend.backend_name()
+            ),
+        ));
+    }
+    let (bucket, _key) = parse_s3_uri(object_uri).map_err(|error| refuse(STEP, error))?;
+    match backend.bucket_object_lock(&bucket).await {
+        Ok(BucketFeature::Enabled) => Ok(()),
+        Ok(BucketFeature::NotEnabled) => Err(refuse(
+            STEP,
+            crate::object_lock::bucket_refusal(&bucket, DID),
+        )),
+        Ok(BucketFeature::NotSupported) => Err(refuse(
+            STEP,
+            crate::object_lock::store_unsupported(&bucket, DID),
+        )),
+        Err(error) => Err(refuse(
+            STEP,
+            crate::object_lock::bucket_unreadable(&bucket, DID, &error),
+        )),
+    }
+}
+
+/// Read the retention of one version a tier copy wrote and judge it against
+/// what the write asked for (#684), never earlier than `now_secs`, as the
+/// engine does before VERIFIED. Any answer but a lock that meets it refuses
+/// the copy, so no evidence is proposed for an object that is not locked as
+/// configured. The objects already written stay in the store.
 ///
-/// The copy goes through the same S3 backend as the engine, which would put
-/// the lock on every cold-tier object, but the tier path never reads a
-/// retention back, so the copy would be recorded as evidence of a lock
-/// nobody checked. Refused, naming the key, until locking a tier copy is
-/// designed; rehydrate and cleanup-abandoned write nothing and accept it.
-pub fn refuse_object_lock_for_tier(upload: &vtop_core::config::UploadConfig) -> Result<(), String> {
-    if upload.object_lock.is_none() {
+/// `requested` is what the write asked for, and for a multipart upload that a
+/// retry found already completed it is the retention persisted by the run
+/// that created it, under that run's profile. It is judged against `lock`,
+/// the profile of this run, too: a copy retried with a stronger mode or a
+/// legal hold must not take the older, weaker lock as its own (review of
+/// #868). The date is left to the persisted retention, as the engine does,
+/// since a session fixes it at creation.
+async fn check_tier_retention(
+    backend: &dyn UploadBackend,
+    what: &str,
+    uri: &str,
+    version_id: Option<&str>,
+    requested: Option<vtop_upload::RequestedRetention>,
+    lock: &vtop_core::config::ObjectLockConfig,
+    now_secs: i64,
+) -> Result<(), String> {
+    const STEP: &str = "object lock check";
+    let Some(version_id) = version_id else {
+        return Err(refuse(
+            STEP,
+            format!(
+                "the store returned no version id for the {what} {uri}, so its retention cannot \
+                 be read on the version written; no evidence was proposed. An Object Lock bucket \
+                 is always versioned: check that the upload config names the right store and \
+                 bucket"
+            ),
+        ));
+    };
+    let Some(requested) = requested else {
+        return Err(refuse(
+            STEP,
+            format!(
+                "the {what} {uri} (version {version_id}) was written without the retention \
+                 upload.object_lock sets (a multipart upload completed by a run without the \
+                 profile); no evidence was proposed. Run the copy again with the same upload \
+                 config"
+            ),
+        ));
+    };
+    if requested.mode != lock.mode || requested.legal_hold != lock.legal_hold {
+        return Err(refuse(
+            STEP,
+            format!(
+                "the {what} {uri} (version {version_id}) was written under mode {} with \
+                 legal_hold={}, not the mode {} with legal_hold={} that upload.object_lock \
+                 sets now (an interrupted copy finished by a run with another profile); no \
+                 evidence was proposed. Remove the object version, or run the copy again with \
+                 the profile it was written under",
+                requested.mode, requested.legal_hold, lock.mode, lock.legal_hold
+            ),
+        ));
+    }
+    let mut expected = requested.expectation();
+    expected.retain_until_at_least_unix_secs =
+        expected.retain_until_at_least_unix_secs.max(now_secs);
+    let found = backend
+        .verify_retention(uri, Some(version_id), &expected)
+        .await
+        .map_err(|error| {
+            refuse(
+                STEP,
+                format!(
+                    "the retention of the {what} {uri} (version {version_id}) could not be read \
+                     ({}); no evidence was proposed. Check the store's health and the \
+                     credentials' s3:GetObjectRetention permission, then run the copy again",
+                    vtop_upload::multipart::redact_urls(&error.to_string())
+                ),
+            )
+        })?;
+    if found.passed() {
         return Ok(());
     }
-    Err(
-        "upload.object_lock is set in the --upload-config file, but vtopctl tier copy does \
-         not check the retention of what it writes; nothing was copied. Remove \
-         upload.object_lock from the tier's --upload-config file (keep a bucket default \
-         retention on the cold-tier bucket if its copies must be locked)"
-            .into(),
-    )
+    if matches!(found, RetentionCheck::Unsupported) {
+        return Err(refuse(
+            STEP,
+            format!(
+                "the {} backend cannot read the retention of the {what} {uri}; no evidence was \
+                 proposed. Use the s3_native backend for a tier under upload.object_lock",
+                backend.backend_name()
+            ),
+        ));
+    }
+    Err(refuse(
+        STEP,
+        format!(
+            "the {what} {uri} (version {version_id}) is not under the requested retention ({}); \
+             no evidence was proposed. Check the bucket's Object Lock configuration and the \
+             credentials' s3:PutObjectRetention permission (and s3:PutObjectLegalHold for a \
+             legal hold), and s3:GetObjectRetention, without which the store answers with no \
+             lock at all",
+            found.describe(&expected)
+        ),
+    ))
 }
 
 /// Dispatch `vtopctl tier` and return a process exit code.
@@ -621,7 +793,7 @@ async fn run_inner(command: TierCommand, json: bool) -> Result<(), String> {
                 .map_err(|error| format!("read {}: {error}", args.upload_config.display()))?;
             let upload_config: vtop_core::config::UploadConfig = serde_yaml::from_str(&upload_text)
                 .map_err(|error| format!("parse {}: {error}", args.upload_config.display()))?;
-            refuse_object_lock_for_tier(&upload_config)?;
+            request.object_lock = upload_config.object_lock.clone();
             request.multipart = multipart_config_from_args(args.as_ref(), &upload_config)?;
             let backend = vtop_upload::build_backend(&upload_config)
                 .await
@@ -779,6 +951,7 @@ mod tests {
             request_id: Uuid::from_u128(0xfeed),
             issued_at_ms: 0,
             multipart: None,
+            object_lock: None,
         }
     }
 
@@ -1364,24 +1537,211 @@ mod tests {
         assert_eq!(std::fs::read(&out).unwrap(), data);
     }
 
-    /// #684: `vtopctl tier copy` would apply `upload.object_lock` to the
-    /// cold-tier copy through the same S3 backend and never check it, so it
-    /// refuses the block, naming the key, until locking a tier copy is
-    /// designed.
-    #[test]
-    fn tier_copy_refuses_an_object_lock_block_naming_the_key() {
-        let mut upload: vtop_core::config::UploadConfig = serde_yaml::from_str(
-            "bucket: cold\nbackend: s3_native\nrequire_object_versioning: true\n\
-             object_lock:\n  mode: governance\n  retain_days: 30\n",
-        )
-        .unwrap();
-        let msg = refuse_object_lock_for_tier(&upload)
-            .expect_err("a tier copy must not write locks it never checks");
-        for part in ["upload.object_lock", "vtopctl tier copy", "--upload-config"] {
-            assert!(msg.contains(part), "{msg:?} should say {part:?}");
+    fn lock_config() -> vtop_core::config::ObjectLockConfig {
+        vtop_core::config::ObjectLockConfig {
+            mode: vtop_core::config::ObjectLockMode::Governance,
+            retain_days: 30,
+            legal_hold: false,
         }
-        upload.object_lock = None;
-        refuse_object_lock_for_tier(&upload).expect("no block, no refusal");
+    }
+
+    fn locked_request(sealed: &Path, root: blake3::Hash) -> TierCopyRequest {
+        TierCopyRequest {
+            object_lock: Some(lock_config()),
+            ..request(sealed, root)
+        }
+    }
+
+    fn locked_backend() -> MockBackend {
+        MockBackend::new().with_object_lock(ObjectLockPolicy::from_config(&lock_config()))
+    }
+
+    const SEGMENT_URI: &str = "s3://tier/native/events.v1/bundle.segment";
+    const MANIFEST_URI: &str = "s3://tier/native/events.v1/bundle.segment.manifest.json";
+
+    /// #684: a tier copy under `upload.object_lock` writes the segment and
+    /// its manifest under the lock and reads the retention of both versions
+    /// back before it proposes the evidence, as the engine does before
+    /// VERIFIED. The `upload.object_lock` block used to be refused outright.
+    #[tokio::test]
+    async fn a_tier_copy_under_object_lock_checks_both_retentions_before_the_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let sealed = seal_bundle(directory.path());
+        let root = sealed_root(&sealed);
+        let backend = locked_backend();
+        let command = run_tier_copy(&backend, &locked_request(&sealed, root))
+            .await
+            .expect("a locked tier copy must succeed");
+        assert!(matches!(
+            command,
+            MetadataCommand::CommitTierEvidence { .. }
+        ));
+        assert_eq!(
+            backend.retention_reads(),
+            vec![SEGMENT_URI.to_owned(), MANIFEST_URI.to_owned()]
+        );
+        assert_eq!(
+            backend.object_lock_config_buckets(),
+            vec!["tier".to_owned()]
+        );
+    }
+
+    /// A store that keeps less than the copy asked for - no retention, another
+    /// mode, an earlier date, no legal hold - refuses the copy after the
+    /// write, naming the object and what was found, and proposes nothing.
+    #[tokio::test]
+    async fn a_tier_copy_whose_store_keeps_less_than_the_lock_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let sealed = seal_bundle(directory.path());
+        let root = sealed_root(&sealed);
+        let held = vtop_core::config::ObjectLockConfig {
+            legal_hold: true,
+            ..lock_config()
+        };
+        for (fault, config) in [
+            (vtop_upload::mock::LockFault::Ignored, lock_config()),
+            (
+                vtop_upload::mock::LockFault::Mode(vtop_core::config::ObjectLockMode::Compliance),
+                lock_config(),
+            ),
+            (
+                vtop_upload::mock::LockFault::ShiftSeconds(-3600),
+                lock_config(),
+            ),
+            (vtop_upload::mock::LockFault::NoLegalHold, held.clone()),
+        ] {
+            let backend = MockBackend::new()
+                .with_object_lock(ObjectLockPolicy::from_config(&config))
+                .with_lock_fault(fault);
+            let request = TierCopyRequest {
+                object_lock: Some(config),
+                ..request(&sealed, root)
+            };
+            let error = run_tier_copy(&backend, &request)
+                .await
+                .expect_err("a copy the store did not lock was accepted");
+            for part in [
+                "refusing at object lock check",
+                "segment",
+                "is not under the requested retention",
+                "no evidence was proposed",
+            ] {
+                assert!(error.contains(part), "{fault:?}: {part:?} missing: {error}");
+            }
+        }
+        // A longer bucket default passes.
+        let backend =
+            locked_backend().with_lock_fault(vtop_upload::mock::LockFault::ShiftSeconds(86_400));
+        run_tier_copy(&backend, &locked_request(&sealed, root))
+            .await
+            .expect("a longer retention than asked for is a lock");
+    }
+
+    /// Review of #868: a copy interrupted after its multipart upload completed
+    /// and retried under a stronger profile gets back the weaker retention the
+    /// first run persisted. That passes the store's check of its own lock, but
+    /// it is not the profile now configured: refused, with no evidence.
+    #[tokio::test]
+    async fn a_retention_persisted_under_a_weaker_profile_is_not_accepted_by_a_stronger_one() {
+        let weak = lock_config();
+        let backend = MockBackend::new().with_object_lock(ObjectLockPolicy::from_config(&weak));
+        let directory = tempfile::tempdir().unwrap();
+        let sealed = seal_bundle(directory.path());
+        let stored = backend
+            .put_object(&sealed, SEGMENT_URI, None)
+            .await
+            .unwrap();
+        let version = stored.version_id.clone().unwrap();
+        let check = |lock: vtop_core::config::ObjectLockConfig| {
+            let (backend, version, retention) = (&backend, version.clone(), stored.retention);
+            async move {
+                check_tier_retention(
+                    backend,
+                    "segment",
+                    SEGMENT_URI,
+                    Some(&version),
+                    retention,
+                    &lock,
+                    unix_now_secs(),
+                )
+                .await
+            }
+        };
+        check(weak.clone())
+            .await
+            .expect("the profile the object was written under is accepted");
+        for stronger in [
+            vtop_core::config::ObjectLockConfig {
+                mode: vtop_core::config::ObjectLockMode::Compliance,
+                ..weak.clone()
+            },
+            vtop_core::config::ObjectLockConfig {
+                legal_hold: true,
+                ..weak.clone()
+            },
+        ] {
+            let error = check(stronger)
+                .await
+                .expect_err("a weaker persisted lock was accepted under a stronger profile");
+            for part in ["refusing at object lock check", "sets now", "no evidence"] {
+                assert!(error.contains(part), "{part:?} missing: {error}");
+            }
+        }
+    }
+
+    /// A retention that cannot be read is no lock either: refused, naming the
+    /// permission to check.
+    #[tokio::test]
+    async fn a_tier_copy_whose_retention_cannot_be_read_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let sealed = seal_bundle(directory.path());
+        let root = sealed_root(&sealed);
+        let backend = locked_backend().with_retention_error("access denied");
+        let error = run_tier_copy(&backend, &locked_request(&sealed, root))
+            .await
+            .expect_err("an unread retention was accepted");
+        for part in ["could not be read", "s3:GetObjectRetention", "no evidence"] {
+            assert!(error.contains(part), "{part:?} missing: {error}");
+        }
+    }
+
+    /// The checks before the write: a backend that does not write under the
+    /// lock, a bucket without Object Lock, a store that does not implement it,
+    /// and a bucket whose configuration cannot be read are each refused with
+    /// nothing written.
+    #[tokio::test]
+    async fn a_tier_copy_under_object_lock_refuses_before_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let sealed = seal_bundle(directory.path());
+        let root = sealed_root(&sealed);
+        let cases = [
+            (MockBackend::new(), "does not write under it"),
+            (
+                locked_backend().without_bucket_object_lock(),
+                "does not have Object Lock enabled",
+            ),
+            (
+                locked_backend().with_object_lock_not_implemented(),
+                "does not implement S3 Object Lock",
+            ),
+            (
+                locked_backend().with_lock_config_errors(1),
+                "could not be read",
+            ),
+        ];
+        for (backend, says) in cases {
+            let error = run_tier_copy(&backend, &locked_request(&sealed, root))
+                .await
+                .expect_err("a copy that cannot be locked was written");
+            assert!(
+                error.contains("refusing at object lock preflight"),
+                "{error}"
+            );
+            assert!(error.contains(says), "{says:?} missing: {error}");
+            assert!(error.contains("nothing was copied"), "{error}");
+            assert_eq!(backend.version_count(SEGMENT_URI), 0, "{error}");
+            assert_eq!(backend.version_count(MANIFEST_URI), 0, "{error}");
+        }
     }
 
     /// One config construction, two callers (#482): the engine builds its
