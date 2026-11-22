@@ -39,6 +39,13 @@ PROXY_PORTS = {"kafka": 19094, "minio": 19000}
 CONTAINER_CONFIG = "/soak/config/config.yaml"
 CONTAINER_CTL = "/soak/ctl"
 SHIM_DIR_IN_IMAGE = "/opt/soak/shims"
+# The engine's work directory in its container (config.yaml's work_dir), the
+# user the image runs the engine as, and the size of the tmpfs the enospc fault
+# lays over the directory.
+WORK_DIR = "/data/work"
+ENGINE_UID = 10001
+ENOSPC_TMPFS_BYTES = 262144
+ENOSPC_TEXT = "No space left on device"
 
 
 class LabError(RuntimeError):
@@ -491,6 +498,88 @@ class Lab:
             "docker stop engine",
         )
         return self.wait_state("engine", lambda s: not s.get("running"), 30, "after SIGTERM")
+
+    # -- the engine's work directory (the enospc fault) ---------------
+
+    def daemon_time(self) -> str:
+        """The Docker daemon's own clock, which stamps the container logs: the
+        point `engine_log_since` counts from, whatever the host's clock says."""
+        result = self.require(self.docker("info", "--format", "{{.SystemTime}}", timeout=30), "docker info")
+        return result.out.strip()
+
+    def engine_log_since(self, since: str) -> str:
+        """What the engine logged from `since` (a `daemon_time`) on."""
+        result = self.docker("logs", "--since", since, self.container("engine"), timeout=120)
+        if not result.ok:
+            raise LabError(f"docker logs engine exit {result.code}: {result.text()[-200:]}")
+        return result.out + "\n" + result.err
+
+    def _engine_mount_ns(self, *argv: str) -> Result:
+        """Run a command in the engine's mount namespace, as root, from a
+        throwaway container that shares the engine's PID namespace. The engine
+        itself has no capabilities and a read-only root, and keeps neither: a
+        mount made here exists for the engine's processes alone, and goes when
+        the engine's container does."""
+        return self.docker(
+            "run",
+            "--rm",
+            "--user",
+            "0",
+            "--privileged",
+            "--network",
+            "none",
+            "--memory",
+            "64m",
+            "--pid",
+            f"container:{self.container('engine')}",
+            "--entrypoint",
+            "nsenter",
+            self.engine_image,
+            "-t",
+            "1",
+            "-m",
+            "--",
+            *argv,
+            timeout=90,
+        )
+
+    def work_mount_depth(self) -> int:
+        """How many mounts are stacked on the engine's work directory: the
+        volume, and a tmpfs over it while the enospc fault holds."""
+        result = self.engine_exec("sh", "-c", f"awk '$5==\"{WORK_DIR}\"' /proc/self/mountinfo | wc -l", timeout=30)
+        if not result.ok:
+            raise LabError(f"reading the engine's mounts exit {result.code}: {result.text()[-200:]}")
+        return int(result.out.strip() or 0)
+
+    def mount_work_tmpfs(self, size_bytes: int = ENOSPC_TMPFS_BYTES) -> None:
+        """Lay a size-limited tmpfs over the work directory, in the engine's
+        mount namespace only. What the volume holds is hidden, not touched, and
+        is there again when the tmpfs goes."""
+        options = f"size={size_bytes},uid={ENGINE_UID},gid={ENGINE_UID},mode=0700"
+        self.require(
+            self._engine_mount_ns("mount", "-t", "tmpfs", "-o", options, "tmpfs", WORK_DIR),
+            f"mounting a {size_bytes} byte tmpfs over {WORK_DIR}",
+        )
+
+    def unmount_work_tmpfs(self) -> None:
+        """Lift the tmpfs. Lazily, because the engine may hold a file open on
+        it; the space is free for new files from the moment the mount is gone."""
+        self.require(self._engine_mount_ns("umount", "-l", WORK_DIR), f"unmounting the tmpfs over {WORK_DIR}")
+
+    def fill_work(self) -> Result:
+        """Write zeros into the work directory until the write fails. The
+        failure is the point: dd exits non-zero with ENOSPC, which is what the
+        fault wants, so the caller reads the text, not the status."""
+        return self.engine_exec("dd", "if=/dev/zero", f"of={WORK_DIR}/.soak-filler", "bs=4096", timeout=120)
+
+    def probe_work_write(self) -> Result:
+        """Append one byte to a file in the work directory, and remove the file
+        afterwards. `dd`, not the shell's `printf`: dash reports a failed write
+        as "I/O error", and the fault must tell a full disk from any other
+        failure by what the kernel said."""
+        probe = f"{WORK_DIR}/.soak-probe"
+        script = f"dd if=/dev/zero of={probe} bs=1 count=1 oflag=append conv=notrunc; rc=$?; rm -f {probe}; exit $rc"
+        return self.engine_exec("sh", "-c", script, timeout=30)
 
     # -- kafka ---------------------------------------------------------
 
