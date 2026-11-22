@@ -42,6 +42,8 @@ on:
       - 'scripts/compat/**'
       - 'scripts/manifest-compat.sh'
       - 'scripts/ledger-compat.sh'
+      - 'scripts/upgrade-compat.sh'
+      - 'scripts/live-chaos/gen-certs.sh'
       - '.github/workflows/compat.yml'
   push:
     branches: [main]
@@ -54,6 +56,8 @@ on:
       - 'scripts/compat/**'
       - 'scripts/manifest-compat.sh'
       - 'scripts/ledger-compat.sh'
+      - 'scripts/upgrade-compat.sh'
+      - 'scripts/live-chaos/gen-certs.sh'
       - '.github/workflows/compat.yml'
   schedule:
     - cron: '23 4 * * *'
@@ -149,10 +153,15 @@ jobs:
       # cells run the same code on SQLite.
       - name: Build vtopctl
         run: cargo build -p vtop-cli --no-default-features --features postgres --bin vtopctl --locked
+      # The segments cell opens a released node's directory with this build's.
+      - name: Build vtop-node
+        run: cargo build -p vtop-node --bin vtop-node --locked
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: compat-head-bin
-          path: target/debug/vtopctl
+          path: |
+            target/debug/vtopctl
+            target/debug/vtop-node
           if-no-files-found: error
           retention-days: 3
 
@@ -170,7 +179,7 @@ jobs:
         with:
           name: compat-head-bin
           path: head
-      - run: chmod +x head/vtopctl
+      - run: chmod +x head/vtopctl head/vtop-node
       # cosign v3: releases are signed in the new Sigstore bundle format,
       # which cosign v2 cannot read (fetch-release.sh refuses a v2). Pinned
       # here rather than left to the installer's default.

@@ -267,6 +267,22 @@ class RegistryCheck(RegistryCase):
         self.assertNotIn("cell ledger is named by no entry", joined)
 
 
+    def test_a_fuzz_target_no_format_names_fails_unless_it_says_why(self):
+        (self.root / "fuzz/fuzz_targets").mkdir(parents=True)
+        (self.root / "fuzz/fuzz_targets/stray.rs").write_text("// a target\n")
+        self.assertIn("fuzz target stray is named by no format", " ".join(self.problems()))
+        (self.root / "scripts/compat/formats.yaml").write_text(
+            REGISTRY.replace("    tag_sets:", "    fuzz: [stray]\n    tag_sets:")
+        )
+        self.assertNotIn("stray", " ".join(self.problems()))
+        (self.root / "scripts/compat/formats.yaml").write_text(
+            REGISTRY + "fuzz_other:\n  stray: not a format decoder\n"
+        )
+        self.assertNotIn("stray", " ".join(self.problems()))
+        (self.root / "scripts/compat/formats.yaml").write_text(REGISTRY + "fuzz_other:\n  stray: ''\n")
+        self.assertIn("fuzz_other stray: needs a why", " ".join(self.problems()))
+
+
 GOLDEN_REGISTRY = REGISTRY.replace(
     "    tag_sets:",
     "    fixtures: [crates/demo/tests/fixtures]\n    tag_sets:",
@@ -546,7 +562,9 @@ class Frozen(GoldenRegistryCase):
         self.assertIn("upgrade and forward cells", joined)
         self.assertIn("no fuzz target", joined)
         waived = FROZEN_BLOCK.format(digest=digest) + "      waive: {cells: a wire format has no released binary, fuzz: a text format}\n"
-        self.registry(no_cells.replace("    tag_sets:", waived + "    tag_sets:"))
+        # The demo fuzz target, no longer in the entry's fuzz list, must still be accounted for.
+        self.registry(no_cells.replace("    tag_sets:", waived + "    tag_sets:")
+                      + "fuzz_other:\n  demo_decode: the frozen entry waives fuzzing in this test\n")
         self.assertEqual(self.problems(), [])
 
     def test_a_frozen_format_with_no_golden_files_is_refused(self):

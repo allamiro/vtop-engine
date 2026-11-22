@@ -39,6 +39,27 @@ pub(crate) struct MetaRaftInner {
 #[derive(Clone)]
 pub struct MetaRaftStore {
     pub(crate) inner: Arc<Mutex<MetaRaftInner>>,
+    /// The applied audit records' delivery cursor (#706). Taken BEFORE
+    /// `inner` wherever both are held; see [`super::audit_delivery`].
+    pub(crate) delivery: Arc<Mutex<super::audit_delivery::DeliveryState>>,
+    pub(crate) progress: Arc<super::audit_delivery::AuditProgress>,
+}
+
+/// A [`MetaRaftStore`] that does not keep it alive.
+pub(crate) struct WeakMetaRaftStore {
+    inner: std::sync::Weak<Mutex<MetaRaftInner>>,
+    delivery: std::sync::Weak<Mutex<super::audit_delivery::DeliveryState>>,
+    progress: std::sync::Weak<super::audit_delivery::AuditProgress>,
+}
+
+impl WeakMetaRaftStore {
+    pub(crate) fn upgrade(&self) -> Option<MetaRaftStore> {
+        Some(MetaRaftStore {
+            inner: self.inner.upgrade()?,
+            delivery: self.delivery.upgrade()?,
+            progress: self.progress.upgrade()?,
+        })
+    }
 }
 
 impl MetaRaftStore {
@@ -60,9 +81,25 @@ impl MetaRaftStore {
         // while discard_stale_log_tail never ran. Heal on every reopen so the
         // recovered log is appendable from last_applied + 1.
         storage.discard_stale_log_tail()?;
+        // The audit frontier (#706). A store a release before #706 wrote has
+        // none: its trail starts at the applied frontier, and nothing is
+        // replayed from before it.
+        storage.ensure_audited_frontier()?;
+        // A crash after an installed snapshot was published but before its
+        // install floor was saved leaves the floor behind; once a local
+        // snapshot is built on top, the stale branch below it would read as
+        // the committed log (review of #767). Recover the floor before Raft
+        // runs, so before any local snapshot.
+        super::audit_delivery::recover_install_floor(&mut storage)?;
+        let delivered = storage
+            .audited_frontier()
+            .unwrap_or_else(|| storage.last_applied());
+        let (delivery, progress) = super::audit_delivery::new_delivery(delivered);
         let last_membership = recover_membership(&storage)?;
         let last_purged = recover_last_purged(&storage);
         Ok(Self {
+            delivery,
+            progress,
             inner: Arc::new(Mutex::new(MetaRaftInner {
                 env: env.clone(),
                 data_dir,
@@ -100,6 +137,15 @@ impl MetaRaftStore {
                 },
             },
         )
+    }
+
+    /// A handle that does not keep the store alive.
+    pub(crate) fn downgrade(&self) -> WeakMetaRaftStore {
+        WeakMetaRaftStore {
+            inner: Arc::downgrade(&self.inner),
+            delivery: Arc::downgrade(&self.delivery),
+            progress: Arc::downgrade(&self.progress),
+        }
     }
 
     pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, MetaRaftInner> {
@@ -242,6 +288,26 @@ pub(crate) fn applied_raft_log_id(storage: &MetaStorage) -> Option<LogId<NodeId>
     Some(raft_log_id(term, raft_index))
 }
 
+/// Say, on stderr, that this node refused a directory, a snapshot or a raise
+/// above the feature level it supports (#743), and what it did about it.
+/// Not rate-limited: it happens once, because the refusal stops this node's
+/// Raft engine (a storage error is fatal to it), and an operator must see
+/// why. This crate has no logger; the process boundary captures stderr.
+pub(crate) fn report_newer_level_refusal(
+    what: &str,
+    data_dir: &Path,
+    error: &crate::MetaStoreError,
+) {
+    if matches!(error, crate::MetaStoreError::NewerFeatureLevel { .. }) {
+        eprintln!(
+            "metadata node refused {what} in {}: {error}. This node's Raft engine stopped \
+             instead of continuing at a level it does not understand; its state was not changed \
+             and it takes no further writes. Upgrade this node, then restart it",
+            data_dir.display()
+        );
+    }
+}
+
 pub(crate) fn read_snapshot_file_bytes(
     inner: &MetaRaftInner,
     path: &Path,
@@ -288,7 +354,10 @@ pub(crate) fn install_snapshot_bytes(
 
     let mut snapshots = MetaSnapshots::open_in(&inner.env, &inner.data_dir, inner.cluster_id)
         .map_err(sto_err_logs)?;
-    snapshots.install(&publish_bytes).map_err(sto_err_logs)?;
+    snapshots.install(&publish_bytes).map_err(|error| {
+        report_newer_level_refusal("a snapshot from the leader", &inner.data_dir, &error);
+        sto_err_logs(error)
+    })?;
     // Full recovery path: newest snapshot + replay limited by durable applied.
     inner.storage =
         MetaStorage::open_with(&inner.env, &inner.data_dir, inner.cluster_id, inner.config)

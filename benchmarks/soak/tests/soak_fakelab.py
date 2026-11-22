@@ -36,6 +36,18 @@ class FakeLab:
         self.skew_marker_value = None
         self.shim_loads = True
         self.kafka_started = "t0"
+        # the engine's work directory: a tmpfs laid over it, and whether it is full
+        self.tmpfs = False
+        self.filled = False
+        self.fill_lands = True  # the filler really fills the tmpfs
+        self.fail_text = "sh: write error: No space left on device"  # what a write to a full directory prints
+        self.control_fails = False  # a write to the work directory fails even before the fault
+        self.engine_felt_it = True  # the engine logs the condition while the directory is full
+        self.mount_refused = False
+        self.unmount_leaves_mount = False
+        self.freed_dir_still_refuses = False  # writes fail after the tmpfs is lifted
+        self.lifted = False
+        self.felt = False
         self.now = None  # a fixed host time, or the wall clock when None
         self._init_run()
 
@@ -112,6 +124,46 @@ class FakeLab:
         if self.cannot_reach_at_all:
             return False
         return True if self.reach_ignores_proxy else self.proxies[name]
+
+    # -- the engine's work directory (enospc) --------------------------
+
+    def daemon_time(self):
+        return "2026-01-01T00:00:00Z"
+
+    def engine_log_since(self, since):
+        self.log.append("log")
+        return "INFO started\nERROR batch failed: No space left on device (os error 28)\n" if self.felt else "INFO ok\n"
+
+    def work_mount_depth(self):
+        return 1 + (1 if self.tmpfs else 0)
+
+    def mount_work_tmpfs(self, size_bytes=None):
+        self.log.append("mount tmpfs")
+        if self.mount_refused:
+            raise soak_lab.LabError("mounting a tmpfs failed (exit 1): permission denied")
+        self.tmpfs = True
+
+    def unmount_work_tmpfs(self):
+        self.log.append("unmount tmpfs")
+        if not self.unmount_leaves_mount:
+            self.tmpfs = False
+        self.filled = False
+        self.felt = False
+        self.lifted = True
+
+    def fill_work(self):
+        self.log.append("fill")
+        if self.tmpfs and self.fill_lands:
+            self.filled = True
+            self.felt = self.engine_felt_it
+        return soak_lab.Result(1, "", "dd: error writing '/data/work/.soak-filler': No space left on device")
+
+    def probe_work_write(self):
+        self.log.append("probe write")
+        full = (self.tmpfs and self.filled) or (self.freed_dir_still_refuses and self.lifted)
+        if self.control_fails or full:
+            return soak_lab.Result(1, "", self.fail_text)
+        return soak_lab.Result(0, "", "")
 
     # -- what a whole run needs ----------------------------------------
 

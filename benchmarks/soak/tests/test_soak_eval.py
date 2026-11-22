@@ -26,6 +26,19 @@ PROFILE = soak_profile.load("ci-smoke")
 PROFILE["criteria"]["trend"] = soak_profile.load("72h")["criteria"]["trend"]
 
 
+def enospc_probe(fault_id, at):
+    """What the injector records when a disk-full fault landed and lifted."""
+    return {
+        "elapsed_s": at,
+        "kind": "fault_probe",
+        "id": fault_id,
+        "fault": "enospc",
+        "write_failed_enospc": True,
+        "engine_enospc_lines": 4,
+        "writes_resumed": True,
+    }
+
+
 def healthy_run(
     profile=PROFILE,
     rss=lambda t, life: 200e6,
@@ -46,6 +59,8 @@ def healthy_run(
         if fault.kind in ("kill9", "clock_step"):
             events.append({"elapsed_s": t + 1, "kind": "engine_exit", "planned": True, "exit_code": 137})
             restarts.append(t + 3)
+        if fault.kind == "enospc":
+            events.append(enospc_probe(fault.id, t + fault.hold_s + 3))
         events.append(
             {"elapsed_s": t + fault.hold_s + 4, "kind": "fault_end", "id": fault.id, "fault": fault.kind, "ok": True}
         )
@@ -590,3 +605,115 @@ def test_the_72h_profile_judges_a_healthy_synthetic_72h_run():
     finals["scrub"]["batches_checked"] = 5000
     v = soak_eval.evaluate(p72, samples, events, finals)
     assert failed(v) == set(), [c for c in v["criteria"] if not c["passed"]]
+
+
+# -- the disk-full fault --------------------------------------------------------
+
+
+def enospc_fault():
+    return next(f for f in soak_profile.build_plan(PROFILE) if f.kind == "enospc")
+
+
+def test_a_run_with_a_disk_full_fault_is_asked_to_show_the_engine_felt_it():
+    v = verdict_of(*healthy_run())
+    criterion = next(c for c in v["criteria"] if c["id"] == "enospc_recovered")
+    assert criterion["passed"] and criterion["observed"] == "1 of 1 disk-full faults clean"
+
+
+def test_a_profile_without_a_disk_full_fault_is_not_asked_for_one():
+    profile = copy.deepcopy(PROFILE)
+    assert "enospc" in profile["fault_cycle"]  # the shipped profile has one; this one is without
+    profile["fault_cycle"] = [k for k in profile["fault_cycle"] if k != "enospc"]
+    v = verdict_of(*healthy_run(profile), profile=profile)
+    assert "enospc_recovered" not in {c["id"] for c in v["criteria"]}
+
+
+def test_a_disk_full_fault_with_no_record_of_what_it_proved_fails():
+    samples, events, finals = healthy_run()
+    events = [e for e in events if e["kind"] != "fault_probe"]
+    v = verdict_of(samples, events, finals)
+    assert failed(v) == {"enospc_recovered"}
+    assert (
+        "no record that a write failed with ENOSPC"
+        in next(c for c in v["criteria"] if c["id"] == "enospc_recovered")["detail"]
+    )
+
+
+def test_a_disk_full_fault_the_engine_never_logged_fails():
+    samples, events, finals = healthy_run()
+    next(e for e in events if e["kind"] == "fault_probe")["engine_enospc_lines"] = 0
+    v = verdict_of(samples, events, finals)
+    assert failed(v) == {"enospc_recovered"}
+    assert (
+        "the engine logged no disk-full condition"
+        in next(c for c in v["criteria"] if c["id"] == "enospc_recovered")["detail"]
+    )
+
+
+def test_a_disk_full_fault_after_which_writes_did_not_resume_fails():
+    samples, events, finals = healthy_run()
+    next(e for e in events if e["kind"] == "fault_probe")["writes_resumed"] = False
+    assert failed(verdict_of(samples, events, finals)) == {"enospc_recovered"}
+
+
+def test_a_disk_full_fault_whose_write_never_failed_fails():
+    samples, events, finals = healthy_run()
+    next(e for e in events if e["kind"] == "fault_probe")["write_failed_enospc"] = False
+    assert failed(verdict_of(samples, events, finals)) == {"enospc_recovered"}
+
+
+def test_a_commit_beyond_a_verification_while_the_disk_was_full_fails_the_fault_as_well():
+    fault = enospc_fault()
+    samples, events, finals = healthy_run()
+    inside = [s for s in samples if fault.at_s + 2 <= s["elapsed_s"] <= fault.at_s + 12]
+    assert len(inside) >= 2
+    for s in inside:
+        s["metrics"][soak_eval.M_COMMITS] = s["metrics"][soak_eval.M_VERIFIED] + 1
+    v = verdict_of(samples, events, finals)
+    assert {"enospc_recovered", "commit_rule"} <= failed(v)
+    assert "commits beyond verifications" in next(c for c in v["criteria"] if c["id"] == "enospc_recovered")["detail"]
+
+
+def _fault_window(samples, events):
+    fault = enospc_fault()
+    start = next(e for e in events if e["kind"] == "fault_start" and e["id"] == fault.id)["elapsed_s"]
+    end = next(e for e in events if e["kind"] == "recovered" and e["id"] == fault.id)["elapsed_s"]
+    return [s for s in samples if start <= s["elapsed_s"] <= end]
+
+
+def test_a_disk_full_window_whose_scrapes_all_failed_is_missing_evidence_not_a_pass():
+    samples, events, finals = healthy_run()
+    window = _fault_window(samples, events)
+    assert len(window) >= 2
+    for s in window:
+        s["metrics"] = None  # the scrape failed; the rest of the sample is still good
+    v = verdict_of(samples, events, finals)
+    assert failed(v) == {"enospc_recovered"}
+    detail = next(c for c in v["criteria"] if c["id"] == "enospc_recovered")["detail"]
+    assert "0 sample(s) in the fault window carried the engine's counters" in detail
+
+
+def test_a_disk_full_window_with_one_sample_carrying_the_counters_is_still_missing_evidence():
+    samples, events, finals = healthy_run()
+    for s in _fault_window(samples, events)[1:]:
+        s["metrics"] = None
+    v = verdict_of(samples, events, finals)
+    assert failed(v) == {"enospc_recovered"}
+    detail = next(c for c in v["criteria"] if c["id"] == "enospc_recovered")["detail"]
+    assert "1 sample(s) in the fault window" in detail
+
+
+def test_a_disk_full_window_with_two_samples_carrying_the_counters_is_judged():
+    samples, events, finals = healthy_run()
+    for s in _fault_window(samples, events)[2:]:
+        s["metrics"] = None
+    assert failed(verdict_of(samples, events, finals)) == set()
+
+
+def test_a_hole_found_by_the_audit_after_the_disk_full_fault_fails_it():
+    fault = enospc_fault()
+    samples, events, finals = healthy_run()
+    audit = next(e for e in events if e["kind"] == "audit" and e["trigger"] == f"fault:{fault.id}")
+    audit["ok"] = False
+    v = verdict_of(samples, events, finals)
+    assert {"enospc_recovered", "zero_coverage_holes"} <= failed(v)

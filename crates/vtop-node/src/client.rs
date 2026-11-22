@@ -660,6 +660,11 @@ pub struct VerifyArgs {
     /// half of a history (#728). Every visible record is listed, beyond
     /// `verify_content_through` too.
     pub dump: Option<PathBuf>,
+    /// The first offset fetched: 0 for a whole range, or the log start of a
+    /// range whose retention (#290) has reclaimed a prefix. A history read
+    /// records it, so the checker does not expect the reclaimed records in
+    /// this read.
+    pub from_offset: u64,
 }
 
 /// A run of visible records at consecutive offsets whose keys carry
@@ -682,7 +687,8 @@ fn key_sequence(key: &[u8]) -> Option<u64> {
     <[u8; 8]>::try_from(key).ok().map(u64::from_be_bytes)
 }
 
-/// Fetch offset 0 → committed HWM, checking offset monotonicity and
+/// Fetch `from_offset` (0 unless retention reclaimed a prefix) → committed
+/// HWM, checking offset monotonicity and
 /// byte-verifying content for the first `verify_content_through` visible
 /// records. The cursor honors `FetchResponse.next_offset`, which is what
 /// makes the wire gap-tolerant; the `max_offset_gaps` budget is what keeps
@@ -693,7 +699,7 @@ fn key_sequence(key: &[u8]) -> Option<u64> {
 pub async fn verify(config: &ClientConfig, args: VerifyArgs) -> Result<i32, String> {
     let mut session = connect(config, &args.addr, Role::Consumer).await?;
     let mut request_id: u64 = 0;
-    let mut next_offset: u64 = 0;
+    let mut next_offset: u64 = args.from_offset;
     let mut records_seen: u64 = 0;
     let mut gaps: u64 = 0;
     let mut runs: Vec<ReadRun> = Vec::new();
@@ -870,6 +876,7 @@ pub async fn verify(config: &ClientConfig, args: VerifyArgs) -> Result<i32, Stri
             ("type", "end".into()),
             ("high_watermark", high_watermark.into()),
             ("records", records_seen.into()),
+            ("start_offset", args.from_offset.into()),
         ]))?;
     }
     if high_watermark < args.expect_at_least {

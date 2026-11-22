@@ -226,6 +226,11 @@ pub enum ErrorCode {
     OffsetOutOfRange = 1,
     CorruptMessage = 2,
     UnknownTopicOrPartition = 3,
+    /// The partition exists and has no leader this node can name right now
+    /// (#751): a candidate that does not hold the range and has not read who
+    /// does. A client retries its metadata, which is what finds the holder
+    /// once the lease names one.
+    LeaderNotAvailable = 5,
     NotLeaderOrFollower = 6,
     RequestTimedOut = 7,
     /// The external cluster (or this node's Kafka listener) could not be
@@ -278,6 +283,14 @@ pub enum ErrorCode {
     MemberIdRequired = 79,
     /// One member over the group's cap.
     GroupMaxSizeReached = 84,
+    /// A request carrying a leader epoch older than the one this node holds
+    /// the range at (#751): the client's metadata is behind a failover. It
+    /// refreshes and finds the new leader; this node never answers it.
+    FencedLeaderEpoch = 74,
+    /// A request carrying a leader epoch newer than the one this node holds
+    /// the range at (#751): this node is the stale one. The client refreshes
+    /// its metadata, as it does for a fenced epoch.
+    UnknownLeaderEpoch = 75,
     /// A request the gateway cannot answer whole: an OffsetFetch naming no
     /// topics for a group that has committed more partitions than one answer
     /// carries — the client names the partitions it wants.
@@ -298,6 +311,7 @@ impl ErrorCode {
             1 => Self::OffsetOutOfRange,
             2 => Self::CorruptMessage,
             3 => Self::UnknownTopicOrPartition,
+            5 => Self::LeaderNotAvailable,
             6 => Self::NotLeaderOrFollower,
             7 => Self::RequestTimedOut,
             8 => Self::BrokerNotAvailable,
@@ -318,6 +332,8 @@ impl ErrorCode {
             46 => Self::DuplicateSequenceNumber,
             47 => Self::InvalidProducerEpoch,
             56 => Self::KafkaStorageError,
+            74 => Self::FencedLeaderEpoch,
+            75 => Self::UnknownLeaderEpoch,
             76 => Self::UnsupportedCompressionType,
             79 => Self::MemberIdRequired,
             84 => Self::GroupMaxSizeReached,
@@ -452,6 +468,61 @@ pub fn frame(body: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+
+    /// #743: the gateway's advertised surface is what clients see in
+    /// ApiVersions, so a range may widen but never narrow, and an API is never
+    /// withdrawn: a client built against a version this gateway once served
+    /// would be refused at the header gate. Narrowing is a one-way change for
+    /// every client (`docs/reference/compatibility.md`, inventory row 22).
+    /// Widening is allowed, and updates this table in the same change.
+    #[test]
+    fn the_advertised_api_ranges_only_widen() {
+        // (api key, first version, last version), as of v0.10.1.
+        const ADVERTISED: &[(i16, i16, i16)] = &[
+            (0, 3, 8),  // Produce
+            (1, 4, 11), // Fetch
+            (2, 1, 5),  // ListOffsets
+            (3, 1, 8),  // Metadata
+            (8, 5, 7),  // OffsetCommit
+            (9, 1, 5),  // OffsetFetch
+            (10, 0, 2), // FindCoordinator
+            (11, 0, 4), // JoinGroup
+            (12, 0, 2), // Heartbeat
+            (13, 0, 2), // LeaveGroup
+            (14, 0, 2), // SyncGroup
+            (22, 0, 1), // InitProducerId
+        ];
+        let now: std::collections::BTreeMap<i16, (i16, i16)> = (0..=i16::MAX)
+            .filter_map(ApiKey::from_i16)
+            .filter(|key| *key != ApiKey::ApiVersions)
+            .map(|key| (key.as_i16(), key.version_range()))
+            .collect();
+        for (key, first, last) in ADVERTISED {
+            let (now_first, now_last) = now
+                .get(key)
+                .copied()
+                .unwrap_or_else(|| panic!("API {key} is no longer served: a withdrawn API"));
+            assert!(
+                now_first <= *first && now_last >= *last,
+                "API {key} narrowed from {first}..={last} to {now_first}..={now_last}: a client \
+                 built for a version it served is now refused"
+            );
+        }
+        let widened: Vec<_> = now
+            .iter()
+            .filter(|(key, range)| {
+                ADVERTISED
+                    .iter()
+                    .find(|(k, _, _)| k == *key)
+                    .is_none_or(|(_, first, last)| (*first, *last) != **range)
+            })
+            .collect();
+        assert!(
+            widened.is_empty(),
+            "the gateway widened or added APIs: {widened:?}. That is allowed; add them to \
+             ADVERTISED so a later narrowing is caught"
+        );
+    }
     use super::*;
 
     fn header_bytes(api_key: i16, api_version: i16, client: Option<&str>) -> Encoder {

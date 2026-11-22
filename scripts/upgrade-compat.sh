@@ -27,12 +27,37 @@
 #   profile `rolling`: adds the #313 threshold keys with small bounds so the
 #     fixture holds sealed segments plus a tail (v0.3.0+ only; older releases
 #     refuse unknown config keys, which is itself the compatibility contract).
+#   profile `rolling-v2`: `rolling`, written in segment format v2
+#     (`segment_format: v2`, a key since v0.5.0): the v2 header, record frames
+#     and chunk sidecar, which the default writer does not produce (#743).
+#
+# UPGRADE_WIRE=old-node-new-client | new-node-old-client runs the NATIVE
+# PROTOCOL across releases instead of the directory (#743): the leader and
+# follower of phase 1 are the OLD binary and `produce`/`verify` are the
+# CURRENT build's (an old node, a new client), or the nodes are the CURRENT
+# build's and the client is the OLD binary's (a new node, an old client:
+# the order a rolling upgrade serves clients in). The script stops after
+# `verify` passes; the directory is not reopened.
+#
+# UPGRADE_STOP_AFTER_OLD=1 stops after phase 2 (the old binary wrote the
+# directory and was stopped) and keeps the directory: that directory, written
+# by a released binary, is what scripts/compat/regenerate-segment-fixtures.sh
+# commits as a fixture. The current build is not started.
 set -euo pipefail
 
 OLD_LABEL="${1:?usage: upgrade-compat.sh <old-label> <old-vtop-node> <new-vtop-node> [profile]}"
 OLD_BIN="${2:?old vtop-node binary}"
 NEW_BIN="${3:?new vtop-node binary}"
 PROFILE="${4:-legacy}"
+# Which binary serves and which one is the client, in phase 1.
+NODE_BIN="$OLD_BIN"
+CLIENT_BIN="$OLD_BIN"
+case "${UPGRADE_WIRE:-}" in
+  "") ;;
+  old-node-new-client) CLIENT_BIN="$NEW_BIN" ;;
+  new-node-old-client) NODE_BIN="$NEW_BIN" ;;
+  *) echo "FAIL: UPGRADE_WIRE is old-node-new-client or new-node-old-client, not ${UPGRADE_WIRE}" >&2; exit 1 ;;
+esac
 [[ -x "$OLD_BIN" ]] || { echo "FAIL: $OLD_BIN is not executable" >&2; exit 1; }
 [[ -x "$NEW_BIN" ]] || { echo "FAIL: $NEW_BIN is not executable" >&2; exit 1; }
 
@@ -99,12 +124,15 @@ range_yaml() {
   echo "  range_generation: 0"
 }
 thresholds_yaml() {
-  if [[ "$PROFILE" == "rolling" ]]; then
+  if [[ "$PROFILE" == "rolling" || "$PROFILE" == "rolling-v2" ]]; then
     # Small bounds so the fixture actually rolls; keys exist from #313 on.
     echo "max_record_bytes: 4096"
     echo "max_group_bytes: 16384"
     echo "max_segment_bytes: 16384"
     echo "max_segment_records: 1000"
+  fi
+  if [[ "$PROFILE" == "rolling-v2" ]]; then
+    echo "segment_format: v2"
   fi
 }
 OLD_LEADER_CFG="$WORKDIR/old-leader.yaml"
@@ -211,18 +239,22 @@ kill_hard() { # <pid>
 }
 
 # --- phase 1: the old release writes a real directory ------------------------
-OLD_FOLLOWER_PID="$(start_node "$OLD_BIN" "$OLD_FOLLOWER_CFG" "old-follower")"
-OLD_PID="$(start_node "$OLD_BIN" "$OLD_LEADER_CFG" "old-node")"
-log "old leader + follower ($OLD_LABEL) ready, producing $RECORDS records"
-"$OLD_BIN" produce --client-config "$CLIENT_CFG" --addr "127.0.0.1:$NATIVE_PORT" \
+OLD_FOLLOWER_PID="$(start_node "$NODE_BIN" "$OLD_FOLLOWER_CFG" "old-follower")"
+OLD_PID="$(start_node "$NODE_BIN" "$OLD_LEADER_CFG" "old-node")"
+log "leader + follower (${UPGRADE_WIRE:-$OLD_LABEL}) ready, producing $RECORDS records"
+"$CLIENT_BIN" produce --client-config "$CLIENT_CFG" --addr "127.0.0.1:$NATIVE_PORT" \
   --records "$RECORDS" --batch "$BATCH" --durability quorum \
   > "$WORKDIR/logs/old-produce.log" 2>&1 \
   || fail "old produce failed: $(tail -3 "$WORKDIR/logs/old-produce.log")"
-"$OLD_BIN" verify --client-config "$CLIENT_CFG" --addr "127.0.0.1:$NATIVE_PORT" \
+"$CLIENT_BIN" verify --client-config "$CLIENT_CFG" --addr "127.0.0.1:$NATIVE_PORT" \
   --expect-at-least "$RECORDS" > "$WORKDIR/logs/old-verify.log" 2>&1 \
-  || fail "the old binary cannot read its own records: $(tail -3 "$WORKDIR/logs/old-verify.log")"
+  || fail "the client cannot read the records its own produce wrote: $(tail -3 "$WORKDIR/logs/old-verify.log")"
+if [[ -n "${UPGRADE_WIRE:-}" ]]; then
+  log "PASS: ${UPGRADE_WIRE}: $RECORDS records produced and verified across the releases"
+  exit 0
+fi
 SEALED_COUNT=$(find "$DATA_DIR" -name '*.segment' | wc -l | tr -d ' ')
-if [[ "$PROFILE" == "rolling" ]]; then
+if [[ "$PROFILE" == "rolling" || "$PROFILE" == "rolling-v2" ]]; then
   [[ "$SEALED_COUNT" -ge 1 ]] \
     || fail "the rolling profile must produce sealed segments; the fixture did not roll"
 fi
@@ -232,6 +264,11 @@ log "old directory written: $SEALED_COUNT sealed segment(s) plus the active tail
 kill_hard "$OLD_PID"
 kill_hard "$OLD_FOLLOWER_PID"
 log "old nodes stopped (SIGKILL — the pre-#280 upgrade path)"
+
+if [[ -n "${UPGRADE_STOP_AFTER_OLD:-}" ]]; then
+  log "UPGRADE_STOP_AFTER_OLD: the directory is $DATA_DIR"
+  exit 0
+fi
 
 # --- phase 2: the current build must open that directory ---------------------
 NEW_PID="$(start_node "$NEW_BIN" "$NEW_CFG" "new-node")"

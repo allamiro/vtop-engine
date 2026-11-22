@@ -15,6 +15,7 @@ kind of secret so that it starts.
 | The state-store secret file | `engine.state_store: { file: ... }` | The connection string; for PostgreSQL it carries the password. |
 | The SQLite ledger, and its `-wal` and `-shm` files | `engine.state_store: "sqlite://..."` | The ledger: which batches were verified and committed. |
 | The audit file | `VTOP_AUDIT_LOG` | The audit trail ([Auditing](auditing.md)). |
+| TLS private keys of `vtop-node` | `tls.key`, `replica_tls.key`, `native_tls.key`, `lease.tls.key`, `observability.tls.key` in a node config | The node's identity on every plane that uses it. |
 
 Each is checked by the process that reads it, before it is read: `vtopctl run`
 and `process-once`, and every `vtopctl` command that opens the ledger or reads
@@ -23,9 +24,14 @@ the keys (`replay`, `migrate`, `prune-ledger`, `scrub`, `audit-coverage`,
 `audit verify`). `vtopctl validate` runs the same check on every file at once
 (below).
 
-Not checked yet: TLS private keys, and the files `vtop-node` reads (its
-`transition_mac_key` file and its own `VTOP_AUDIT_LOG`). The Helm chart
-already mounts the node's Secrets at `0440` with `fsGroup`.
+`vtop-node` checks its TLS private keys when it loads them, at startup,
+before reading them (#732). It reads no engine config, so the override below
+does not apply to it: a refused key must be fixed. The Helm chart mounts the
+node's Secrets at `0440` with `fsGroup`, which is accepted.
+
+Not checked yet: the other files `vtop-node` reads (its own
+`VTOP_AUDIT_LOG`), the engine's `VTOP_METRICS_TLS_KEY`, and `vtopctl`'s
+`client_key`.
 
 The checks need Unix permission bits. On other platforms nothing is checked
 and every file is accepted.
@@ -228,7 +234,9 @@ template {
 
 ```yaml
 manifest:
+  write_version: "0.4"
   mac:
+    active: q4-2026
     keys:
       - { id: q4-2026, file: /vault/secrets/manifest-q4 }
 ```
@@ -295,3 +303,9 @@ ledger in a directory others can enter. Before you upgrade:
 3. Only if a file cannot be fixed yet, set
    `security.allow_loose_secret_permissions: true`. An engine of an earlier
    release ignores the `security` section.
+
+For `vtop-node` (#732): before upgrading a node, make each TLS private key its
+config names owner-only (`chmod 0400`), or `chmod 0700` the directory holding
+it. A key generated with `openssl` under the usual umask is `0644`, which the
+new release refuses. There is no override. Fix every node's keys before the
+rolling upgrade reaches it, or that node will not start.

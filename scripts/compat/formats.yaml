@@ -108,6 +108,7 @@ formats:
       - {file: crates/vtop-cli/src/coverage.rs, name: DIGEST_VERSION, value: '1'}
     fixtures: [crates/vtop-cli/tests/fixtures/ledger-sqlite]
     cells: [digests-audit]
+    fuzz: [ledger_rows]
 
   - id: 5
     name: State ledger, SQLite
@@ -118,6 +119,7 @@ formats:
     state: unfrozen
     constants:
       - {file: crates/vtop-state/src/sqlite_store.rs, name: SQLITE_SCHEMA_VERSION, value: '1'}
+      - {file: crates/vtop-state/src/sqlite_store.rs, name: SQLITE_OPEN_VERSION, value: '1'}
     fixtures: [crates/vtop-cli/tests/fixtures/ledger-sqlite, crates/vtop-cli/tests/fixtures/ledger-v0.9.0]
     cells: [ledger-sqlite]
 
@@ -144,6 +146,7 @@ formats:
     status: evolving; key names frozen
     at_1_0: stable
     state: unfrozen
+    fuzz: [ledger_rows]
     fixtures: [crates/vtop-core/tests/fixtures/markers]
 
   - id: 8
@@ -166,6 +169,7 @@ formats:
     constants:
       - {file: crates/vtop-observe/src/audit.rs, name: AUDIT_VERSION, value: '1'}
     fixtures: [crates/vtop-cli/tests/fixtures/audit/audit-v1.jsonl]
+    fuzz: [audit_record]
 
   - id: 10
     name: Segment log v1 and v2, index, chunk sidecar, commit marker
@@ -190,6 +194,9 @@ formats:
       - {file: crates/vtop-log/src/segment.rs, name: CHUNK_SIDECAR_VERSION, value: '1'}
       - {file: crates/vtop-log/src/segment.rs, name: COMMIT_MAGIC, value: 'b"VTOPCMT1"'}
       - {file: crates/vtop-log/src/segment.rs, name: COMMIT_VERSION, value: '1'}
+    fixtures: [crates/vtop-log/tests/fixtures/segments]
+    fuzz: [segment_codec]
+    cells: [segments]
 
   - id: 11
     name: Retention and truncate intents, producer snapshot
@@ -206,6 +213,9 @@ formats:
       - {file: crates/vtop-log/src/truncate_intent.rs, name: VERSION_V2, value: '2'}
       - {file: crates/vtop-log/src/producer_snapshot.rs, name: MAGIC, value: 'b"VTOPPRD1"'}
       - {file: crates/vtop-log/src/producer_snapshot.rs, name: VERSION, value: '1'}
+    fixtures: [crates/vtop-log/tests/fixtures/segments]
+    fuzz: [segment_codec]
+    cells: [segments]
 
   - id: 12
     name: "Broker journals: fencing epochs, lineage, epoch, kept dispute, committed floor"
@@ -229,6 +239,8 @@ formats:
     one_way:
       - "a kept dispute (v0.8.0, #635): an older binary refuses to start while one is pending"
       - "staged journal and sidecar rewrites through <file>.rewrite (v0.8.0, #640)"
+    fixtures: [crates/vtop-log/tests/fixtures/segments]
+    cells: [segments]
 
   - id: 13
     name: Multipart session (`*.multipart.json`)
@@ -240,6 +252,7 @@ formats:
     constants:
       - {file: crates/vtop-upload/src/multipart.rs, name: SESSION_SCHEMA, value: '1'}
     fixtures: [crates/vtop-upload/tests/fixtures/multipart-session-v0.8.0.json]
+    fuzz: [session_files]
 
   - id: 14
     name: Scrub cursor
@@ -250,6 +263,7 @@ formats:
     state: unfrozen
     constants:
       - {file: crates/vtop-cli/src/scrub.rs, name: CURSOR_VERSION, value: '1'}
+    fuzz: [session_files]
 
   - id: 15
     name: Metadata log chunk and entry frames
@@ -262,8 +276,9 @@ formats:
       - {file: crates/vtop-meta/src/storage/log.rs, name: CHUNK_MAGIC, value: 'b"VTOPMLG1"'}
       - {file: crates/vtop-meta/src/storage/log.rs, name: CHUNK_VERSION, value: '1'}
       - {file: crates/vtop-meta/src/storage/log.rs, name: ENTRY_MAGIC, value: 'b"VTOPMLE1"'}
-    fixtures: [crates/vtop-meta/tests/fixtures/meta]
-    fuzz: [meta_decode]
+    fixtures: [crates/vtop-meta/tests/fixtures/meta, crates/vtop-meta/tests/fixtures/v0.9.0-meta]
+    fuzz: [meta_decode, meta_storage_files]
+    cells: [meta]
     golden: ['fuzz/corpus/meta_decode/golden-frames-*.seed']
 
   - id: 16
@@ -327,8 +342,9 @@ formats:
           COMMAND_KIND_ATTEST_UNPROVEN_PROMOTION: 39
     one_way:
       - "raising the feature level (vtopctl meta enable-features): permanent; a voter older than the level refuses a log that holds its kinds"
-    fixtures: [crates/vtop-meta/tests/fixtures/meta]
+    fixtures: [crates/vtop-meta/tests/fixtures/meta, crates/vtop-meta/tests/fixtures/v0.9.0-meta]
     fuzz: [meta_decode]
+    cells: [meta]
     golden: ['fuzz/corpus/meta_decode/golden-command-*.seed']
 
   - id: 17
@@ -400,13 +416,14 @@ formats:
           CATEGORY_NODE_VERSION: 21
           CATEGORY_PROMOTION_ATTESTATION: 22
     fixtures: [crates/vtop-meta/tests/fixtures/meta]
-    fuzz: [meta_decode]
+    fuzz: [meta_decode, meta_storage_files]
+    cells: [meta]
     golden: ['fuzz/corpus/meta_decode/golden-snapshot-*.seed']
 
   - id: 18
-    name: Metadata hard state, applied, purged, membership log id
+    name: Metadata hard state, applied, purged, membership log id, audit frontier
     class: B
-    marker: "`VTOPMHS1`, `VTOPMAP1`, `VTOPMPG1`, `VTOPMML1`"
+    marker: "`VTOPMHS1`, `VTOPMAP1`, `VTOPMPG1`, `VTOPMML1`, `VTOPMAU1`"
     status: evolving
     at_1_0: "follows #740"
     state: unfrozen
@@ -419,7 +436,11 @@ formats:
       - {file: crates/vtop-meta/src/storage/purged.rs, name: PURGED_VERSION, value: '1'}
       - {file: crates/vtop-meta/src/storage/membership_log_id.rs, name: MEMBERSHIP_LOG_ID_MAGIC, value: 'b"VTOPMML1"'}
       - {file: crates/vtop-meta/src/storage/membership_log_id.rs, name: MEMBERSHIP_LOG_ID_VERSION, value: '1'}
-    fixtures: [crates/vtop-meta/tests/fixtures/meta]
+      - {file: crates/vtop-meta/src/storage/audited.rs, name: AUDITED_MAGIC, value: 'b"VTOPMAU1"'}
+      - {file: crates/vtop-meta/src/storage/audited.rs, name: AUDITED_VERSION, value: '1'}
+    fixtures: [crates/vtop-meta/tests/fixtures/meta, crates/vtop-meta/tests/fixtures/v0.9.0-meta]
+    fuzz: [meta_storage_files]
+    cells: [meta]
 
   - id: 19
     name: Native protocol
@@ -432,6 +453,9 @@ formats:
       - {file: crates/vtop-protocol/src/lib.rs, name: MAGIC, value: 'b"VTPW"'}
       - {file: crates/vtop-protocol/src/lib.rs, name: PROTOCOL_MAJOR, value: '1'}
       - {file: crates/vtop-protocol/src/lib.rs, name: PROTOCOL_MINOR, value: '0'}
+    fixtures: [fuzz/corpus/protocol_frame]
+    fuzz: [protocol_frame]
+    cells: [wire]
 
   - id: 20
     name: Replica protocol negotiation
@@ -462,6 +486,7 @@ formats:
       - {file: crates/vtop-meta/src/transport/wire.rs, name: KIND_PEER_VERSION_RESP, value: '8'}
       - {file: crates/vtop-meta/src/transport/wire.rs, name: KIND_ADMIN_READ_CLUSTER_VERSIONS_REQ, value: '29'}
       - {file: crates/vtop-meta/src/transport/wire.rs, name: KIND_ADMIN_READ_CLUSTER_VERSIONS_RESP, value: '30'}
+    fuzz: [vtpm_frame]
 
   - id: 22
     name: "Kafka gateway: advertised APIs and version ranges"
@@ -470,6 +495,7 @@ formats:
     status: experimental
     at_1_0: experimental
     state: unfrozen
+    fuzz: [kafka_request]
 
   - id: 23
     name: "`config.yaml`"
@@ -491,10 +517,12 @@ formats:
   - id: 25
     name: "`vtopctl` JSON output and exit codes"
     class: D
-    marker: none yet (`report_version` planned)
+    marker: "`report_version` `{REPORT_VERSION}` on every object report"
     status: evolving
     at_1_0: classified at the freeze
     state: unfrozen
+    constants:
+      - {file: crates/vtop-cli/src/report.rs, name: REPORT_VERSION, value: '1'}
     # The command trees: the surface snapshot tests compare against these.
     golden: [docs/surface/vtopctl.txt, docs/surface/vtop-node.txt]
 
@@ -514,6 +542,11 @@ formats:
     status: evolving
     at_1_0: classified at the freeze
     state: unfrozen
+
+# Fuzz targets that are not a persisted or wire format's decoder, and why.
+fuzz_other:
+  detect_record: source-side format detection of a log line (what a source hands the engine), not a persisted format
+  detect_batch: source-side format detection of a batch, not a persisted format
 
 # Constants whose names look like format markers but are not.
 not_formats:

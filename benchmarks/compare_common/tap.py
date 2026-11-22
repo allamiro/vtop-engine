@@ -120,9 +120,16 @@ async def read_head(reader: asyncio.StreamReader) -> bytes | None:
     return head
 
 
+async def _open(gate: asyncio.Event | None) -> None:
+    if gate is not None:
+        await gate.wait()
+
+
 async def pipe_body(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, headers: dict[str, str],
-                    *, until_close: bool = False, mutate: Callable[[bytes], bytes] | None = None) -> int:
-    """Copy one message body framed by `headers`; returns the body bytes copied."""
+                    *, until_close: bool = False, mutate: Callable[[bytes], bytes] | None = None,
+                    gate: asyncio.Event | None = None) -> int:
+    """Copy one message body framed by `headers`; returns the body bytes copied. With a `gate`, nothing is
+    written to `writer` while the gate is closed (a K2 kill is pending)."""
     if "chunked" in headers.get("transfer-encoding", "").lower():
         total = 0
         collected = bytearray() if mutate else None
@@ -138,7 +145,9 @@ async def pipe_body(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, 
                         break
                 if collected is not None:
                     body = mutate(bytes(collected))
+                    await _open(gate)
                     writer.write(f"{len(body):x}\r\n".encode() + body + b"\r\n")
+                await _open(gate)
                 writer.write(b"0\r\n" + trailer)
                 return total
             chunk = await reader.readexactly(size + 2)
@@ -146,12 +155,14 @@ async def pipe_body(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, 
             if collected is not None:
                 collected.extend(chunk[:-2])
             else:
+                await _open(gate)
                 writer.write(size_line + chunk)
                 await writer.drain()
     if "content-length" in headers:
         remaining = int(headers["content-length"])
         if mutate:
             body = mutate(await reader.readexactly(remaining))
+            await _open(gate)
             writer.write(body)
             return len(body)
         total = remaining
@@ -159,12 +170,14 @@ async def pipe_body(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, 
             chunk = await reader.read(min(remaining, 1 << 16))
             if not chunk:
                 raise asyncio.IncompleteReadError(b"", remaining)
+            await _open(gate)
             writer.write(chunk)
             await writer.drain()
             remaining -= len(chunk)
         return total
     if until_close:
         body = await reader.read()
+        await _open(gate)
         writer.write(mutate(body) if mutate else body)
         return len(body)
     return 0
@@ -303,6 +316,9 @@ class Tap:
                 return False
         status_line, response_headers = parse_head(response_head)
         status = int(status_line.split(" ")[1])
+        # A response already on its way waits too while a K2 kill is pending: the store is not to answer the
+        # tool during the barrier, whichever request it belongs to (review of #908).
+        await self.gate.wait()
         client_writer.write(response_head)
         mutate = None
         key = urllib.parse.unquote(url.path)
@@ -322,7 +338,7 @@ class Tap:
             close_framed = "content-length" not in response_headers and \
                 "chunked" not in response_headers.get("transfer-encoding", "").lower()
             response_bytes = await pipe_body(upstream_reader, client_writer, response_headers,
-                                             until_close=close_framed, mutate=mutate)
+                                             until_close=close_framed, mutate=mutate, gate=self.gate)
         await client_writer.drain()
         delivered = self.clock()
         row.update({"status": status, "req_bytes": request_bytes, "resp_bytes": response_bytes,

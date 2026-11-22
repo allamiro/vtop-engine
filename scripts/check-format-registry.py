@@ -15,6 +15,8 @@ fails when:
 * the highest tag of a listed tag set (command kinds, snapshot value tags,
   key categories) differs from the registry's;
 * the registry names something the sources no longer hold;
+* a fuzz target in fuzz/fuzz_targets is named by no entry's ``fuzz`` list and
+  is not in ``fuzz_other`` with a reason;
 * an entry names a compatibility cell that scripts/compat/expected.yaml does
   not list, or that file lists a cell no entry names;
 * a format constant, or a tag, is declared twice in one file (in two
@@ -665,6 +667,27 @@ def check_source(root: pathlib.Path, registry: dict) -> list[str]:
                 problems.append(
                     f"{label}: cell {cell} is not a cell of {EXPECTED} (scripts/compat/cell.sh runs "
                     "the cells that file lists)"
+                )
+    # Every fuzz target is some format's decoder, or says why it is not
+    # (`fuzz_other`): a target added without a registry row fails here, so the
+    # fuzz coverage the page claims is the coverage there is.
+    named_targets = {t for entry in registry.get("formats") or [] for t in entry.get("fuzz") or []}
+    other_targets = registry.get("fuzz_other") or {}
+    for target, why in sorted(other_targets.items()):
+        if not str(why or "").strip():
+            problems.append(f"fuzz_other {target}: needs a why")
+        if not (root / "fuzz/fuzz_targets" / f"{target}.rs").is_file():
+            problems.append(f"fuzz_other {target}: fuzz target {target} does not exist")
+        if target in named_targets:
+            problems.append(f"fuzz target {target} is both a format's and in fuzz_other")
+    targets_dir = root / "fuzz/fuzz_targets"
+    if targets_dir.is_dir():
+        for path in sorted(targets_dir.glob("*.rs")):
+            if path.stem not in named_targets and path.stem not in other_targets:
+                problems.append(
+                    f"fuzz target {path.stem} is named by no format in {REGISTRY}: add it to the "
+                    "`fuzz` list of the format whose decoder it exercises, or to `fuzz_other` with "
+                    "a reason"
                 )
     for cell in sorted(matrix_cells - named_cells):
         problems.append(

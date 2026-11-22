@@ -49,6 +49,10 @@ resources:
 # only here: a real deployment keeps the chart's defaults, which are sized
 # for a network, not for a CI runner sharing a core with a compiler.
 meta:
+  # Admin authorization is on by default (#732, M2). The smoke test's
+  # vtopctl certificate carries this CN (scripts/k8s-smoke.sh).
+  adminAuthorization:
+    operatorCommonNames: [operator]
   timers:
     electionTimeoutMinMs: 1500
     electionTimeoutMaxMs: 3000
