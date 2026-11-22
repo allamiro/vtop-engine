@@ -1,0 +1,24 @@
+A metadata data directory written by the released v0.9.0 vtop-node, not by
+the code under test (#706).
+
+Release asset: vtop-engine-0.9.0-aarch64-apple-darwin.tar.gz
+SHA256SUMS line: b239a770464226b03df94b38e53eeadc58dffceb0e56fc56f5bcec50559710fa  ./vtop-engine-0.9.0-aarch64-apple-darwin.tar.gz
+Binaries: vtop-node 0.9.0 and vtopctl 0.9.0 from that asset.
+
+Written by one metadata node (node_id 1, cluster_id
+00000000-0000-0000-0000-0000000c1a55, plaintext peer and admin planes on
+loopback), then stopped with SIGTERM:
+
+  vtopctl meta init --members 1
+  vtopctl meta register-node --node-uuid cccccccc-0000-0000-0000-000000000001 \
+      --addr 10.0.0.1:9200 --request-id 00000000-0000-0000-0000-000000000901
+  vtopctl meta enable-features --level 7 \
+      --request-id 00000000-0000-0000-0000-000000000902
+  vtopctl meta create-topic --name fixture \
+      --topic-uuid 00000000-0000-0000-0000-0000000000a1 \
+      --root-range-uuid 00000000-0000-0000-0000-0000000000b1 \
+      --issued-at-ms 1750000000000 \
+      --request-id 00000000-0000-0000-0000-000000000903
+
+Applied through index 5, term 1. No snapshot (below the snapshot interval)
+and no meta.audited file: v0.9.0 has none.

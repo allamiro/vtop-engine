@@ -1,0 +1,55 @@
+# The S3 compatibility matrix's Garage leg (#722). Garage v2.5.0, one node.
+# AGPL-3.0: run unmodified as a CI test service, never distributed or linked
+# (docs/operate/s3-compatibility-matrix.md). Garage documents bucket
+# versioning and Object Lock as missing, so it is the matrix's real-server
+# test of VTOP's refusals. The image has no shell: setup.sh beside this file
+# drives /garage through `docker compose exec` to give the node a layout and
+# import the lab key before the shared bootstrap creates the buckets.
+# LAB-ONLY credentials; the loopback bind is the boundary.
+name: vtop-s3-garage
+
+services:
+  server:
+    # dxflrs/garage:v2.5.0 (amd64), pinned by digest (D7).
+    image: dxflrs/garage:v2.5.0@sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5
+    ports:
+      - "127.0.0.1:3900:3900"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    pids_limit: 512
+    mem_limit: 1g
+    read_only: true
+    tmpfs: [/tmp]
+    volumes:
+      - ./garage.toml:/etc/garage.toml:ro
+      - meta:/var/lib/garage/meta
+      - data:/var/lib/garage/data
+
+  init:
+    # amazon/aws-cli 2.40.3, pinned by digest (D7, D8).
+    image: amazon/aws-cli:2.40.3@sha256:33a16c53ea442e918b58df67301ad76a8fb57082c39f7e78753b898c3f3e87c2
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    pids_limit: 256
+    mem_limit: 256m
+    read_only: true
+    tmpfs: [/tmp]
+    entrypoint: ["/bin/sh", "/bootstrap.sh"]
+    environment:
+      HOME: /tmp
+      S3_ENDPOINT: http://server:3900
+      AWS_ACCESS_KEY_ID: GK0123456789abcdef01234567
+      AWS_SECRET_ACCESS_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      # Garage has no Object Lock: the locked bucket is not made.
+      CREATE_LOCKED: "false"
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+    volumes:
+      - ../init/bootstrap.sh:/bootstrap.sh:ro
+    depends_on: [server]
+
+volumes:
+  meta:
+  data:

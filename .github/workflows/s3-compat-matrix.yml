@@ -1,0 +1,339 @@
+name: s3 compat matrix
+
+# The live S3 tests (#722) against the S3 servers docker/s3-servers/ describes,
+# each judged against its capability file (tests/s3-compat/servers/<id>.yaml)
+# so that a server that lacks a feature is expected to refuse, and a quirk that
+# gets fixed upstream or a regression in VTOP shows up as an unexpected result.
+#
+# Who runs which servers:
+# - ci.yml calls this workflow on a pull request (and on a push to main) with
+#   the lab's MinIO alone, when its `minio` path filter matches: the same
+#   per-PR cost as the single MinIO job it replaced (#707).
+# - Nightly (03:47 UTC) and on dispatch it runs every server, over whatever
+#   main holds.
+# - A pull request that changes this file, a server's compose file, the lab
+#   script or a capability file runs every server on its own head: the
+#   schedule and dispatch run only from main, so this is the one way a change
+#   to a server's setup is proven before it merges. ci.yml's filter leaves
+#   those files out, so such a pull request does not run MinIO twice.
+#
+# The test binaries are built once and each leg runs them against its own
+# server, so a leg needs no Rust toolchain and the matrix costs one build.
+# A server whose file says `gating: false` is new to the matrix (D11): its
+# results are still recorded and its differences still shown in the leg's
+# summary, but it cannot fail the run. Promoting one is a one-line change here
+# and in its file, after ten consecutive runs that matched.
+
+on:
+  workflow_call:
+    inputs:
+      servers:
+        description: 'JSON list of server ids to test, e.g. ["minio"]; each must be in the LEGS table below'
+        required: true
+        type: string
+  schedule:
+    # 03:47 UTC: off the hour, and clear of the other nightlies.
+    - cron: "47 3 * * *"
+  pull_request:
+    paths:
+      - '.github/workflows/s3-compat-matrix.yml'
+      - 'docker/s3-servers/**'
+      - 'scripts/s3-lab.sh'
+      - 'tests/s3-compat/**'
+  workflow_dispatch:
+    inputs:
+      servers:
+        description: 'JSON list of server ids to test; empty runs all of them'
+        required: false
+        type: string
+        default: ''
+
+# A nightly queues behind another rather than cancelling it. A call from ci.yml
+# or a dispatch gets a group of its own: inside a called workflow
+# `github.workflow` is the caller's name, so a shared name could deadlock
+# against ci.yml's group.
+concurrency:
+  group: s3-compat-matrix-${{ github.event_name == 'schedule' && 'nightly' || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  servers:
+    name: which servers
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      include: ${{ steps.pick.outputs.include }}
+    steps:
+      - name: Pick the requested servers
+        id: pick
+        env:
+          REQUESTED: ${{ inputs.servers }}
+          # One line per server: its id, whether it gates, and the leg's
+          # timeout in minutes. `gating` must equal the `gating:` line of the
+          # server's capability file; the leg's first step fails if it does
+          # not. continue-on-error is decided before any step runs, so it
+          # cannot be read from the file there.
+          #
+          # MinIO is BUILT from source (docker/minio/Dockerfile; no registry
+          # serves its images, #507), which is most of its leg's time. The
+          # others are pulled, pinned by digest, and start in seconds:
+          # measured locally at under a minute of tests each, so twenty
+          # minutes is generous. versity and cloudserver are the second wave.
+          LEGS: |
+            minio 1 30
+            rustfs 0 20
+            garage 0 20
+            seaweedfs 0 20
+            versity 0 20
+            cloudserver 0 20
+        run: |
+          set -euo pipefail
+          rows=$(printf '%s\n' "$LEGS" | grep -Ev '^[[:space:]]*(#|$)')
+          if [ -z "$REQUESTED" ]; then
+            requested=$(printf '%s\n' "$rows" | awk '{print $1}' | jq -R . | jq -cs .)
+          else
+            requested=$(printf '%s' "$REQUESTED" | jq -c 'if type == "array" then [.[] | tostring] else error("not a list") end') \
+              || { echo "::error::servers must be a JSON list such as [\"minio\",\"garage\"]; got: $REQUESTED"; exit 1; }
+          fi
+          if [ "$(printf '%s' "$requested" | jq length)" -eq 0 ]; then
+            echo "::error::servers is an empty list; name at least one"
+            exit 1
+          fi
+          include=$(printf '%s\n' "$rows" \
+            | jq -R 'split(" ") | map(select(. != "")) | {server: .[0], gating: (.[1] == "1"), timeout: (.[2] | tonumber)}' \
+            | jq -cs --argjson want "$requested" '[.[] | select(.server as $s | $want | index($s))]')
+          # A server nobody listed would otherwise be dropped from the matrix
+          # without a word, and its absence read as a pass.
+          unknown=$(jq -cn --argjson want "$requested" --argjson have "$include" '$want - [$have[].server]')
+          if [ "$unknown" != "[]" ]; then
+            echo "::error::no leg is defined for $unknown; defined: $(printf '%s\n' "$rows" | awk '{print $1}' | paste -sd, -)"
+            exit 1
+          fi
+          echo "testing S3 servers: $(printf '%s' "$include" | jq -r '[.[].server] | join(", ")')"
+          echo "include=$include" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build the live S3 test binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+
+      # Restored everywhere, saved only on main (by the nightly), so a pull
+      # request never writes a cache entry of its own.
+      - id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-s3-compat-${{ hashFiles('**/Cargo.lock') }}
+
+      # The engine tests build vtop-cli, which compiles librdkafka.
+      - name: Install librdkafka build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang libssl-dev libsasl2-dev libcurl4-openssl-dev zlib1g-dev pkg-config
+
+      # Line tables only: a backtrace still names the line, and the artifact
+      # every leg downloads is a fraction of the size.
+      - name: Build the live test binaries
+        env:
+          CARGO_PROFILE_DEV_DEBUG: line-tables-only
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/s3-compat-bin"
+          mkdir -p "$out"
+          build() {
+            cargo test --locked --no-run --message-format=json "$@" |
+              jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null)
+                | "\(.target.name) \(.executable)"'
+          }
+          {
+            build -p vtop-upload --test live_s3_verification --test transport_conformance \
+              --test live_s3_multipart_resume --test live_s3_object_lock --test live_s3_probes
+            build -p vtop-cli --test live_s3_object_lock_engine --test live_s3_verification_receipts
+          } | while read -r name exe; do
+            cp "$exe" "$out/$name"
+          done
+          ls -la "$out"
+          test "$(find "$out" -type f | wc -l)" -eq 7
+          # The anti-tamper suite (docs/reference/tamper-evidence.md) and the
+          # server-side encryption suite (live_s3_sse) are not capability
+          # cases: they need the lab's MinIO, its root credentials, its Object
+          # Lock bucket and, for SSE-KMS, its static KMS key, so they are kept
+          # apart from the binaries every leg runs and only the minio leg
+          # runs them.
+          lab="$RUNNER_TEMP/s3-tamper-bin"
+          mkdir -p "$lab"
+          {
+            build -p vtop-cli --test live_s3_tamper
+            build -p vtop-upload --test live_s3_sse
+          } | while read -r name exe; do
+            cp "$exe" "$lab/$name"
+          done
+          test -x "$lab/live_s3_tamper"
+          test -x "$lab/live_s3_sse"
+
+      - name: Save the build cache (main only)
+        if: github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-s3-compat-${{ hashFiles('**/Cargo.lock') }}
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: s3-compat-binaries
+          path: ${{ runner.temp }}/s3-compat-bin
+          retention-days: 1
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: s3-tamper-binary
+          path: ${{ runner.temp }}/s3-tamper-bin
+          retention-days: 1
+          if-no-files-found: error
+
+  # One leg per server, each on its own runner, with nothing shared but the
+  # binaries. A leg whose server's file says `gating: false` cannot fail the
+  # run (D11): its results are still written, summarised and uploaded, and a
+  # difference from its file still shows in the summary. `gating` is stated
+  # here because continue-on-error is decided before any step runs; the first
+  # step fails the leg if it disagrees with the file.
+  leg:
+    name: s3 compat (${{ matrix.server }})
+    needs: [servers, build]
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ !matrix.gating }}
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.servers.outputs.include) }}
+    env:
+      RESULTS: ${{ github.workspace }}/s3-compat-out/results-${{ matrix.server }}.jsonl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: The leg's gating agrees with the capability file
+        run: |
+          set -euo pipefail
+          file=$(scripts/s3-lab.sh gating "${{ matrix.server }}")
+          if [ "$file" != "${{ matrix.gating }}" ]; then
+            echo "::error file=tests/s3-compat/servers/${{ matrix.server }}.yaml::gating is $file in the file but ${{ matrix.gating }} in s3-compat-matrix.yml's LEGS table; change both together"
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: s3-compat-binaries
+          path: ${{ runner.temp }}/s3-compat-bin
+
+      # Built before it is started, so a failed build reads as a build
+      # failure rather than as a store that never came up.
+      - name: Build the server's image, if it is built
+        run: |
+          chmod +x "$RUNNER_TEMP"/s3-compat-bin/*
+          scripts/s3-lab.sh build "${{ matrix.server }}"
+
+      - name: Start the server and create its buckets
+        run: scripts/s3-lab.sh up "${{ matrix.server }}"
+
+      # What each results line names: the server's release, its image digest
+      # (a built image's local id), and the PR's head commit rather than the
+      # merge commit GITHUB_SHA names on a pull request.
+      - name: Label the results
+        run: |
+          set -euo pipefail
+          scripts/s3-lab.sh label "${{ matrix.server }}" >> "$GITHUB_ENV"
+          echo "VTOP_TEST_COMMIT=${{ github.event.pull_request.head.sha || github.sha }}" >> "$GITHUB_ENV"
+
+      - name: Run the live S3 tests
+        run: scripts/s3-lab.sh test "${{ matrix.server }}" "$RUNNER_TEMP/s3-compat-bin" "$RESULTS"
+
+      # D13: the verification and Object Lock write tests again, with the SDK
+      # computing checksums only when an operation requires one, a setting
+      # many deployments use with third-party stores. Recorded beside the
+      # leg's results, not instead of them.
+      - name: Run them again with AWS_REQUEST_CHECKSUM_CALCULATION=when_required
+        if: always()
+        env:
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+        run: |
+          scripts/s3-lab.sh test "${{ matrix.server }}" "$RUNNER_TEMP/s3-compat-bin" \
+            "${RESULTS%/*}/when_required-${{ matrix.server }}.jsonl" \
+            live_s3_verification transport_conformance live_s3_object_lock live_s3_object_lock_engine
+
+      # The anti-tamper suite against the lab's MinIO (docs/reference/
+      # tamper-evidence.md): a bucket-write attacker against signed
+      # manifests, Object Lock, versioning, receipts and the coverage audit.
+      # MinIO only, and gating there: it is not judged by a capability file.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: matrix.server == 'minio'
+        with:
+          name: s3-tamper-binary
+          path: ${{ runner.temp }}/s3-tamper-bin
+
+      - name: Run the anti-tamper suite (minio only)
+        if: matrix.server == 'minio'
+        run: |
+          set -euo pipefail
+          set -a
+          . docker/s3-servers/minio/server.env
+          set +a
+          export AWS_REGION=us-east-1
+          chmod +x "$RUNNER_TEMP/s3-tamper-bin/live_s3_tamper"
+          "$RUNNER_TEMP/s3-tamper-bin/live_s3_tamper" --ignored --test-threads=1
+
+      # Server-side encryption (SSE-S3, SSE-KMS, encrypted multipart and the
+      # verification of encrypted objects), which the single MinIO job this
+      # matrix replaced ran. MinIO only: it needs the lab's static KMS key
+      # (MINIO_KMS_SECRET_KEY in docker/s3-servers/minio/compose.yml).
+      - name: Run the server-side encryption suite (minio only)
+        if: matrix.server == 'minio'
+        run: |
+          set -euo pipefail
+          set -a
+          . docker/s3-servers/minio/server.env
+          set +a
+          export AWS_REGION=us-east-1
+          chmod +x "$RUNNER_TEMP/s3-tamper-bin/live_s3_sse"
+          "$RUNNER_TEMP/s3-tamper-bin/live_s3_sse" --ignored --test-threads=1
+
+      - name: Summarise the results
+        if: always()
+        run: |
+          scripts/s3-lab.sh summary "${{ matrix.server }}" "$RESULTS" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo
+            echo "With AWS_REQUEST_CHECKSUM_CALCULATION=when_required:"
+            echo
+            scripts/s3-lab.sh summary "${{ matrix.server }}" "${RESULTS%/*}/when_required-${{ matrix.server }}.jsonl"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: s3-compat-results-${{ matrix.server }}
+          path: ${{ github.workspace }}/s3-compat-out/
+          if-no-files-found: ignore
+
+      - name: Server logs on failure
+        if: failure()
+        run: scripts/s3-lab.sh logs "${{ matrix.server }}" || true
