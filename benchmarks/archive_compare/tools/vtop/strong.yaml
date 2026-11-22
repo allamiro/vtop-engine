@@ -1,0 +1,67 @@
+# VTOP, profile `strong` (the default commit rule), for the archive comparison (#746).
+# Every setting names the page it comes from: docs/configure/reference.md (the
+# reference for every config.yaml key), docs/install/kafka.md and examples/config.yaml
+# at the commit under test.
+#
+# telemetry: VTOP has no usage reporting; OpenTelemetry export runs only when an
+# OTEL_EXPORTER_OTLP_*ENDPOINT is set, and the compose file sets
+# OTEL_SDK_DISABLED=true (crates/vtop-observe/src/otel/settings.rs).
+#
+# commit rule: the Kafka offset is committed only after the batch is VERIFIED
+# (docs/install/kafka.md, `enable_auto_commit` must be false).
+
+engine:
+  name: archive-bench
+  tenant: bench
+  # docs/configure/reference.md "engine.state_store": SQLite on the tool's own data volume,
+  # the same volume class as every other tool's state.
+  state_store: "sqlite:///data/state/vtop-state.db"
+  work_dir: /data/work
+  work_retention_seconds: 86400
+  work_max_bytes: 10737418240
+  log_level: INFO
+
+batching:
+  # #744 rule 15: about 32 MiB or 60 s per object, whichever first; records unbounded.
+  # docs/configure/reference.md "batching.max_bytes", "batching.max_batch_age_seconds".
+  max_records: 100000000
+  max_bytes: 33554432
+  max_batch_age_seconds: 60
+  # The shipped default (examples/config.yaml "max_concurrent_batches").
+  max_concurrent_batches: 8
+
+compression:
+  # #744 rule 15: gzip at the tool's documented default level (examples/config.yaml
+  # "compression": the code default is gzip level 6).
+  type: gzip
+  level: 6
+
+sources:
+  kafka:
+    # docs/configure/reference.md "sources.kafka": one topic, a group of its own, from the start.
+    enabled: true
+    bootstrap_servers:
+      - kafka:9092
+    consumer_group: vtop-bench
+    topic_include_regex: "^bench$"
+    auto_offset_reset: earliest
+    # Must be false: offsets commit only after VERIFIED (the commit rule).
+    enable_auto_commit: false
+
+upload:
+  # docs/configure/reference.md "upload": the native S3 backend against the lab MinIO.
+  # In crash and fault cells `minio` resolves to the S3 tap, which forwards to the store.
+  backend: s3_native
+  bucket: bench
+  prefix: "vtop/"
+  endpoint_url: http://minio:9000
+  region: us-east-1
+  force_path_style: true
+  # The lab store is plaintext (examples/config.yaml "verify_tls": the explicit lab opt-out).
+  verify_tls: false
+  create_bucket: true
+  # The default: VERIFIED needs a digest derived from stored content.
+  require_strong_verification: true
+
+partitioning:
+  template: "source={source}/format={format}/"
