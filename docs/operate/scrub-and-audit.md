@@ -12,7 +12,8 @@ run beside a live engine. They check the guarantees described on
 
 Both exit non-zero when they find a problem, so a cron job or a Kubernetes Job
 fails visibly. Neither repairs anything: the remedy for a finding is a restore
-from a replica or backup, or recording the loss.
+from a replica or backup, or recording the loss. The steps, and what each
+finding costs, are in [Disaster recovery](disaster-recovery.md).
 
 ## Coverage audit
 

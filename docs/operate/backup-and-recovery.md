@@ -4,7 +4,8 @@ The engine recovers from its own crashes by itself. What it cannot recover
 without help is a lost ledger or lost objects, so those are what you back up.
 This page gives the commands for backing up and restoring the ledger on SQLite
 and on PostgreSQL, the recovery targets, and the drill that CI runs against
-each procedure and what it measured.
+each procedure and what it measured. When there is no backup, or the bucket or
+a whole region is lost, see [Disaster recovery](disaster-recovery.md).
 
 ## What the engine recovers by itself
 
@@ -340,13 +341,16 @@ kept as a workflow artifact, and into the run's summary.
   of your own.
 - **The object store.** The drill's bucket is a local directory that the
   disaster does not touch. Backing up and restoring the archive is the store's
-  job (versioning, replication).
+  job (versioning, replication); a lost bucket and a lost region are drilled
+  in [Disaster recovery](disaster-recovery.md).
 - **A source that keeps its position outside the ledger.** The drill reads a
   file, whose position the engine seeds from the ledger. A Kafka source keeps
   its consumer group's offsets in the broker, which a restore of the ledger
-  does not move, so the restored ledger and the group can disagree. That is
-  not drilled: run `audit-coverage` after a restore, and do not treat the
-  restore as complete until it passes.
+  does not move, so the restored ledger and the group can disagree. The
+  [region drill](disaster-recovery.md#a-region-is-lost) restores an older
+  ledger under a newer group: the engine sees the group ahead of the ledger,
+  resumes from the ledger and says so, with no hole. Run `audit-coverage`
+  after a restore, and do not treat the restore as complete until it passes.
 - **A source that deletes after commit.** With `delete_after_commit` the engine
   removes bytes it has committed. A restore to a ledger older than a deletion
   cannot bring those bytes back from the source; the archive still holds the

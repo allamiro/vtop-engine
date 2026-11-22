@@ -309,6 +309,9 @@ jobs:
               - 'scripts/compat/cells/*.sh'
               - 'scripts/ledger-compat.sh'
               - 'scripts/restore-drill.sh'
+              # The disaster-recovery drills (#735): executable shell that
+              # gates the runbooks' claims, and the Python their checks run.
+              - 'scripts/dr-drill/**'
               # The live-chaos harness is executable shell that gates every
               # distributed-systems claim this project makes, and it was
               # unlinted: a change to lib.sh — sourced by every scenario —
@@ -1320,6 +1323,20 @@ jobs:
             scripts/live-chaos/gen-certs.sh \
             scripts/live-chaos/scenarios/*.sh \
             scripts/live-chaos/engine/*.sh
+
+      # The disaster-recovery drills (#735). `-P scripts/dr-drill` resolves
+      # the drills' `source` of their shared library, for the reason the
+      # live-chaos step above gives.
+      - name: shellcheck (disaster-recovery drills)
+        run: |
+          docker run --rm -v "$PWD:/mnt" -w /mnt \
+            koalaman/shellcheck:v0.11.0 -x -P scripts/dr-drill \
+            scripts/dr-drill/*.sh
+
+      # The drills trust these checks to find a missing record, a duplicate and
+      # an altered response; this proves they can.
+      - name: disaster-recovery drill helpers (unit tests)
+        run: python3 -m unittest discover -s scripts/dr-drill -p 'test_*.py' -v
 
       - name: bats
         run: |

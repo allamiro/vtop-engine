@@ -43,7 +43,8 @@ Object Lock failure is also an `object_lock_check_failed` event.
 **What to do.** Fix the store or whatever rewrites objects in the bucket. Then
 run [`vtopctl scrub`](scrub-and-audit.md#scrub) over the affected time range to
 confirm what is stored verifies. A replay writes the batch again; nothing has
-to be re-sent by hand.
+to be re-sent by hand. The steps, and what the drill measured, are in
+[Disaster recovery](disaster-recovery.md#verification-fails).
 
 **When it is safe to ignore.** Never on a production archive. One failure
 that the replay then verifies still means the store returned something other

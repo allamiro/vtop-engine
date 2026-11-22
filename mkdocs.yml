@@ -196,6 +196,7 @@ nav:
       - S3 Object Lock: OBJECT_LOCK_DEPLOYMENT.md
       - Upgrades: operate/upgrades.md
       - Backup and recovery: operate/backup-and-recovery.md
+      - Disaster recovery: operate/disaster-recovery.md
       - Troubleshooting: operate/troubleshooting.md
   - Reference:
       - reference/index.md

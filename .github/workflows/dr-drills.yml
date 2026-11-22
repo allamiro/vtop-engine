@@ -1,0 +1,138 @@
+name: disaster-recovery drills
+
+# The disaster-recovery runbooks (docs/operate/disaster-recovery.md), run for
+# real (#735). Each drill starts its lab out of real parts (the `vtopctl`
+# built here, MinIO, PostgreSQL, Kafka), injects one disaster, follows the
+# runbook's documented steps and checks the outcome against the page's pass
+# criteria and bounds: no hole where the design promises none, an exactly
+# reported loss where it does not, and RPO and RTO inside the numbers the page
+# states. The drills are scripts/dr-drill/<drill>.sh; each refuses to run when
+# the page lists different bounds.
+#
+# Heavy: each drill builds `vtopctl` and starts containers, so this workflow
+# never runs on a pull request. The scripts are shellchecked, and their helpers
+# unit-tested, by the `shell` job in ci.yml.
+#
+#   schedule           every drill, nightly at 03:47 UTC
+#   workflow_dispatch  every drill, or the ones named
+
+on:
+  schedule:
+    - cron: "47 3 * * *"
+  workflow_dispatch:
+    inputs:
+      drills:
+        description: "all, or comma-separated: ledger-lost, bucket-lost, region-lost, disk-full, verification-failed, key-rotation"
+        required: false
+        default: all
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dr-drills-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  choose:
+    name: choose the drills
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      drills: ${{ steps.drills.outputs.drills }}
+    steps:
+      # A name nobody defined is an error, so a typo does not run nothing and
+      # pass.
+      - name: Choose the drills
+        id: drills
+        env:
+          INPUT_DRILLS: ${{ inputs.drills }}
+        run: |
+          set -euo pipefail
+          all='["ledger-lost","bucket-lost","region-lost","disk-full","verification-failed","key-rotation"]'
+          want="${INPUT_DRILLS:-all}"
+          if [ "$want" = all ]; then
+            drills="$all"
+          else
+            drills=$(jq -c --arg want "$want" '[.[] | select(. as $n | ($want | split(",") | index($n)))]' <<< "$all")
+            for name in $(tr ',' ' ' <<< "$want"); do
+              jq -e --arg n "$name" 'index($n)' <<< "$all" > /dev/null \
+                || { echo "::error::no drill named '$name'; drills: $(jq -r 'join(", ")' <<< "$all")"; exit 1; }
+            done
+          fi
+          echo "drills: $drills"
+          echo "drills=$drills" >> "$GITHUB_OUTPUT"
+
+  drill:
+    name: drill (${{ matrix.drill }})
+    needs: choose
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      # One drill failing must not hide the result of another.
+      fail-fast: false
+      matrix:
+        drill: ${{ fromJSON(needs.choose.outputs.drills) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+
+      # Restore only, from the kafka-integration job's entry, as the engine
+      # crash sweep does: the same dependencies in the same profile, so only
+      # what the PostgreSQL feature adds, and vtop-cli, compile, and this
+      # workflow adds no cache entry of its own.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-kafka-it-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install librdkafka build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang libssl-dev libsasl2-dev libcurl4-openssl-dev zlib1g-dev pkg-config sqlite3
+
+      # The Kafka source and the PostgreSQL ledger the drills run on.
+      - name: Build vtopctl
+        run: cargo build -p vtop-cli --features postgres --locked --bin vtopctl
+
+      # Pulled before the drill so that its measurements do not include it.
+      - name: Pull the images
+        run: |
+          docker pull postgres:18
+          docker pull apache/kafka:4.3.1
+
+      # Built from source, as the lab's compose file builds it: the upstream
+      # images are withdrawn.
+      - name: Build the lab's MinIO
+        run: docker compose build minio
+
+      - name: Run the drill
+        env:
+          # Every helper container shares the runner's network, so the stores
+          # reach each other and the drill reaches them on 127.0.0.1.
+          DR_DRILL_NETWORK: host
+          DR_DRILL_WORKDIR: ${{ runner.temp }}/dr-drill-${{ matrix.drill }}
+        run: scripts/dr-drill/${{ matrix.drill }}.sh target/debug/vtopctl
+
+      - name: Keep the measurements and logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dr-drill-${{ matrix.drill }}
+          path: |
+            ${{ runner.temp }}/dr-drill-${{ matrix.drill }}/result.json
+            ${{ runner.temp }}/dr-drill-${{ matrix.drill }}/logs
+            ${{ runner.temp }}/dr-drill-${{ matrix.drill }}/*.yaml
+          if-no-files-found: ignore
+          retention-days: 30

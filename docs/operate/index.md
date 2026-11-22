@@ -83,6 +83,16 @@ archive is complete, then the procedures you will need less often.
 
     [:octicons-arrow-right-24: Backup and recovery](backup-and-recovery.md)
 
+-   **Disaster recovery**
+
+    ---
+
+    A lost ledger with no backup, a lost bucket, a lost region, a full disk,
+    failed verification and a key rotation: what the engine rebuilds, what it
+    cannot, the steps, and the drills that run them.
+
+    [:octicons-arrow-right-24: Disaster recovery](disaster-recovery.md)
+
 -   **Troubleshooting**
 
     ---
