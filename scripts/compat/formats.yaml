@@ -40,6 +40,7 @@ formats:
       - {file: crates/vtop-core/src/manifest.rs, name: CANONICAL_VERSIONS, value: '["0.4"]'}
     fixtures: [crates/vtop-core/tests/fixtures/manifests]
     fuzz: [manifest_parse]
+    cells: [manifest]
     one_way:
       - "manifest.write_version: \"0.4\" (operator setting, v0.10.0): readers before v0.8.0 report a 0.4 manifest as tampered"
 
@@ -71,6 +72,8 @@ formats:
     at_1_0: stable, read forever
     constants:
       - {file: crates/vtop-cli/src/coverage.rs, name: DIGEST_VERSION, value: '1'}
+    fixtures: [crates/vtop-cli/tests/fixtures/ledger-sqlite]
+    cells: [digests-audit]
 
   - id: 5
     name: State ledger, SQLite
@@ -80,6 +83,8 @@ formats:
     at_1_0: stable
     constants:
       - {file: crates/vtop-state/src/sqlite_store.rs, name: SQLITE_SCHEMA_VERSION, value: '1'}
+    fixtures: [crates/vtop-cli/tests/fixtures/ledger-sqlite]
+    cells: [ledger-sqlite]
 
   - id: 6
     name: State ledger, PostgreSQL
@@ -92,6 +97,7 @@ formats:
       - {file: crates/vtop-state/src/pg_store.rs, name: MIN_SCHEMA_VERSION, value: '3'}
       - {file: crates/vtop-state/src/pg_store.rs, name: SCHEMA_MARKER_PREFIX, value: '"-- vtop-state-schema "'}
       - {file: crates/vtop-state/src/pg_store.rs, name: STATE_ADDED_SINCE_FIRST_SCHEMA, value: '"superseded"'}
+    cells: [ledger-postgres]
     one_way:
       - "schema marker 3 (vtopctl migrate, v0.8.0, #567): v0.7.0 refuses the database once a SUPERSEDED row exists"
 
@@ -108,6 +114,8 @@ formats:
     marker: "`audit_version` column"
     status: evolving
     at_1_0: stable
+    fixtures: [crates/vtop-cli/tests/fixtures/ledger-sqlite/v0.10.1]
+    cells: [digests-audit]
 
   - id: 9
     name: Audit record (JSONL)
@@ -454,4 +462,5 @@ not_formats:
   - {file: crates/vtop-meta/src/transport/maybe_tls.rs, name: FRAME_MAGIC_FIRST, why: "the first byte the VTPW and VTPM magics share, used to tell plaintext from TLS"}
   - {file: crates/vtop-kafka/src/records.rs, name: MAGIC_V2, why: "the Kafka record batch's magic byte: Kafka's format, not VTOP's"}
   - {file: crates/vtop-observe/src/otel/settings.rs, name: PROTOCOL, why: "the OTLP export protocol name"}
+  - {file: crates/vtop-s3-testkit/src/case.rs, name: SERVER_VERSION_ENV, why: "the name of the environment variable that labels a live S3 test run with the server release it ran against (#722): a test-support setting, not a format"}
   - {file: crates/vtop-core/src/secret_file.rs, name: TMPFS_MAGIC, why: "Linux's statfs number for tmpfs (linux/magic.h), used to recognise a Kubernetes secret mount: the kernel's, not VTOP's"}

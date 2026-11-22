@@ -25,9 +25,12 @@
 
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
-    Registry, TextEncoder,
+    TextEncoder,
 };
 use std::sync::OnceLock;
+// prometheus's own registry cannot list what is in it; this one can, so the
+// surface snapshot (#719) sees every family registered below.
+use vtop_surface::Registry;
 
 /// Pipeline stages, used as a bounded `stage` label.
 pub const STAGES: [&str; 7] = [

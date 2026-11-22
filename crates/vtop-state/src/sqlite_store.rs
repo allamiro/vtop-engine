@@ -1517,6 +1517,67 @@ mod tests {
         assert_eq!(mode, 0o600, "the link's target was created {mode:04o}");
     }
 
+    /// A transition whose conditional write keeps matching no row while this
+    /// process still holds the claim (another writer moving the row between
+    /// the read and the write, every time) is retried `MAX_CONFLICT_RETRIES`
+    /// times with a pause that grows by 5 ms each attempt, then refused with
+    /// the count: never reported as a lost claim, never retried forever
+    /// (#729, surviving mutants of the retry loop).
+    #[tokio::test]
+    async fn a_conflict_that_never_clears_is_retried_with_a_growing_pause_then_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("conflict.db").display());
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        store
+            .save_batch_state(&test_battery::sample_record("b-conflict"))
+            .await
+            .unwrap();
+        // Every UPDATE of a row is skipped and counts no row, which is what
+        // the store sees when the row's state moved under its write.
+        store
+            .execute_raw(
+                "CREATE TRIGGER t_conflict BEFORE UPDATE ON batches \
+                 BEGIN SELECT RAISE(IGNORE); END",
+            )
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            store.update_batch_state("b-conflict", BatchState::Failed, &BatchPatch::default()),
+        )
+        .await
+        .expect("the conflict was retried without end");
+        let elapsed = started.elapsed();
+        let message = result.unwrap_err().to_string();
+        let attempts = MAX_CONFLICT_RETRIES + 1;
+        assert!(
+            message.contains(&format!("after {attempts} attempts")),
+            "{message}"
+        );
+        // 5 ms, 10 ms, ... before each retry: at least 5 * (1 + ... + MAX).
+        let floor = 5 * u64::from(MAX_CONFLICT_RETRIES * (MAX_CONFLICT_RETRIES + 1) / 2);
+        assert!(
+            elapsed >= std::time::Duration::from_millis(floor),
+            "retried after {elapsed:?}, under the {floor} ms the growing pause adds up to"
+        );
+        assert_eq!(
+            store.get_state("b-conflict").await.unwrap(),
+            BatchState::Batching,
+            "the refused write changed the row"
+        );
+    }
+
+    /// The test-only raw SQL hook reports a statement SQLite refuses; a test
+    /// that installs a trigger through it would otherwise pass on a trigger
+    /// that never existed.
+    #[tokio::test]
+    async fn execute_raw_reports_a_statement_sqlite_refuses() {
+        let store = SqliteStateStore::connect("sqlite::memory:").await.unwrap();
+        assert!(store.execute_raw("NOT A STATEMENT").await.is_err());
+        store.execute_raw("SELECT 1").await.unwrap();
+    }
+
     /// #557: two handles on one database file stand for two engines.
     #[tokio::test]
     async fn sqlite_fences_an_engine_that_lost_its_claim() {
