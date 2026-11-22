@@ -181,7 +181,16 @@ class Lab:
         return self.ports[key]
 
     def up_base(self) -> None:
-        self.compose("up", "-d", "--wait", "kafka", "store", timeout=900)
+        try:
+            self.compose("up", "-d", "--wait", "kafka", "store", timeout=900)
+        except RuntimeError as exc:
+            if "No such image" not in str(exc):
+                raise
+            # An image was pruned between the check and the start (a shared host): make it again, once.
+            log(f"an image went missing ({str(exc)[-160:]}); pulling or building it again")
+            self.down()
+            ensure_tool_images([self.system], registry.load(), False)
+            self.compose("up", "-d", "--wait", "kafka", "store", timeout=900)
         self.compose("run", "--rm", "-T", "volume-init")
         self.compose("run", "--rm", "-T", "topic-init", timeout=300)
         self.compose("up", "-d", "commits")
