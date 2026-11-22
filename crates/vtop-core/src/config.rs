@@ -4617,6 +4617,9 @@ streams:
                 sasl_username: None,
                 sasl_password_env: None,
                 ssl_ca_location: None,
+                ssl_certificate_location: None,
+                ssl_key_location: None,
+                ssl_key_password_env: None,
             }
         }
         let unset = kafka_plaintext_warning(&kafka(None, &["kafka-1:9092", "localhost:9092"]))
