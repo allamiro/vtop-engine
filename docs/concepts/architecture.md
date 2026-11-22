@@ -37,8 +37,9 @@ or replay what was in flight, and the coverage audit reads it to prove the
 archive has no holes.
 
 - **SQLite:** a local file. The simplest choice for one engine on one host.
-- **PostgreSQL:** survives the loss of the engine's host. Needs a build with
-  `--features postgres`, a separate migration identity, and TLS with
+- **PostgreSQL:** survives the loss of the engine's host. Needs a `vtopctl`
+  with the `postgres` feature (the container image has it; the release
+  binaries do not), a separate migration identity, and TLS with
   `sslmode=verify-full` for a remote database.
 
 Committed rows can be pruned; the pruned rows are written to digest files
