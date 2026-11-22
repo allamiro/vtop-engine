@@ -674,6 +674,42 @@ def test_a_commit_beyond_a_verification_while_the_disk_was_full_fails_the_fault_
     assert "commits beyond verifications" in next(c for c in v["criteria"] if c["id"] == "enospc_recovered")["detail"]
 
 
+def _fault_window(samples, events):
+    fault = enospc_fault()
+    start = next(e for e in events if e["kind"] == "fault_start" and e["id"] == fault.id)["elapsed_s"]
+    end = next(e for e in events if e["kind"] == "recovered" and e["id"] == fault.id)["elapsed_s"]
+    return [s for s in samples if start <= s["elapsed_s"] <= end]
+
+
+def test_a_disk_full_window_whose_scrapes_all_failed_is_missing_evidence_not_a_pass():
+    samples, events, finals = healthy_run()
+    window = _fault_window(samples, events)
+    assert len(window) >= 2
+    for s in window:
+        s["metrics"] = None  # the scrape failed; the rest of the sample is still good
+    v = verdict_of(samples, events, finals)
+    assert failed(v) == {"enospc_recovered"}
+    detail = next(c for c in v["criteria"] if c["id"] == "enospc_recovered")["detail"]
+    assert "0 sample(s) in the fault window carried the engine's counters" in detail
+
+
+def test_a_disk_full_window_with_one_sample_carrying_the_counters_is_still_missing_evidence():
+    samples, events, finals = healthy_run()
+    for s in _fault_window(samples, events)[1:]:
+        s["metrics"] = None
+    v = verdict_of(samples, events, finals)
+    assert failed(v) == {"enospc_recovered"}
+    detail = next(c for c in v["criteria"] if c["id"] == "enospc_recovered")["detail"]
+    assert "1 sample(s) in the fault window" in detail
+
+
+def test_a_disk_full_window_with_two_samples_carrying_the_counters_is_judged():
+    samples, events, finals = healthy_run()
+    for s in _fault_window(samples, events)[2:]:
+        s["metrics"] = None
+    assert failed(verdict_of(samples, events, finals)) == set()
+
+
 def test_a_hole_found_by_the_audit_after_the_disk_full_fault_fails_it():
     fault = enospc_fault()
     samples, events, finals = healthy_run()
