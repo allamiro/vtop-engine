@@ -310,6 +310,9 @@ cleanup() {
     done < "$WORKDIR/pids"
   fi
   wait 2>/dev/null || true
+  # A script that mounts or stops something undoes it here, before the work
+  # directory goes (the engine sweep's faults, #725).
+  if declare -F chaos_extra_cleanup > /dev/null; then chaos_extra_cleanup || true; fi
   if [[ "${CHAOS_KEEP:-0}" != "1" && "${WORKDIR_GENERATED:-0}" == "1" ]]; then
     rm -rf "$WORKDIR"
   elif [[ -n "${WORKDIR:-}" ]]; then
@@ -959,10 +962,25 @@ ${reads_ok} reads answered, ${reads_failed} failed; holders observed:${observed:
 # refusal would prove nothing. And the failure must name fencing — accepting
 # any failed produce would let a connection refused or a TLS mismatch pass as
 # a fencing proof.
+#
+# The optional 4th argument records the attempt in the scenario's history
+# (#728) as a batch the checker must never find visible (`--fenced-probe`:
+# a `Fenced` answer on its own does not say whether the batch was appended
+# first, so the client records it as unknown unless told the target is
+# fenced). The record carries a producer sequence no other producer in a
+# scenario reaches (FENCED_PROBE_SEQUENCE), so if it ever surfaced it could
+# not pass for one of the stream's own records. The sequence cannot change
+# the answer: the broker checks the range's fencing epoch before it looks at
+# sequences.
+FENCED_PROBE_SEQUENCE=1099511627776 # 2^40
 assert_fenced_produce() {
-  local addr="$1" epoch="$2" message="$3"
+  local addr="$1" epoch="$2" message="$3" history="${4:-}"
+  local record=()
+  [[ -n "$history" ]] \
+    && record=(--history "$history" --fenced-probe --first-sequence "$FENCED_PROBE_SEQUENCE")
   if "$VTOP_NODE" produce --client-config "$(emit_client_config_at_epoch "$epoch")" \
     --addr "$addr" --records 1 --batch 1 --durability quorum \
+    ${record[@]+"${record[@]}"} \
     > "$WORKDIR/logs/fenced-produce.log" 2>&1; then
     fail "$message"
   fi
@@ -1066,6 +1084,11 @@ await_verified_floor() {
   # markers); zero, the default and every v1 scenario, keeps the dense
   # contract where any skipped offset is a lost record.
   [[ -n "${CHAOS_MAX_OFFSET_GAPS:-}" ]] && bound+=(--max-offset-gaps "$CHAOS_MAX_OFFSET_GAPS")
+  # CHAOS_READ_HISTORY names a history file (#728): every attempt that reads
+  # to the high watermark records what it saw there, including the attempts
+  # that come up short of the floor. Those are real reads of committed data,
+  # and the checker holds them to the same rules as the last one.
+  [[ -n "${CHAOS_READ_HISTORY:-}" ]] && bound+=(--dump "$CHAOS_READ_HISTORY")
   while :; do
     if "$VTOP_NODE" verify --client-config "$cfg" --addr "$addr" \
       --expect-at-least "$floor" ${bound[@]+"${bound[@]}"} \
@@ -1077,6 +1100,39 @@ await_verified_floor() {
 (see $WORKDIR/logs/verify-after-failover.log)"
     sleep 0.5
   done
+}
+
+# --- operation histories (#728) ----------------------------------------------
+# A scenario's clients record what they did and saw — `produce --history`, one
+# line per batch invoked and answered; `verify --dump`, every record a read
+# found — under $WORKDIR/history, and check_history holds the whole history to
+# the replicated log's promises: every acknowledged record read back once, at
+# its acknowledged offset, in order, and nothing visible that no producer
+# could have written (a fenced leader's refused batch included). See
+# scripts/live-chaos/history/check_history.py for the rules.
+
+# history_file <name> — the path one client appends its history to.
+history_file() {
+  mkdir -p "$WORKDIR/history" || fail "cannot create $WORKDIR/history"
+  printf '%s/history/%s.jsonl\n' "$WORKDIR" "$1"
+}
+
+# check_history — check every history file the scenario
+# recorded. The summary is kept in logs/history-check.json either way.
+check_history() {
+  local files=("$WORKDIR"/history/*.jsonl) report="$WORKDIR/logs/history-check.json"
+  [[ -e "${files[0]}" ]] || fail "no history was recorded under $WORKDIR/history"
+  if ! python3 "$SCRIPT_DIR/history/check_history.py" "${files[@]}" \
+    > "$report" 2>&1; then
+    cat "$report" >&2
+    fail "the operation history breaks the log's promises (see $report)"
+  fi
+  log "history checked: $(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(d["acknowledged_records"], "acknowledged records over", d["reads"],
+      "read(s); batches", d["batches"], "; high watermark", d["high_watermark"])
+' "$report")"
 }
 
 # assert_metric_present <addr> <metric-name> — the scrape contract, checked

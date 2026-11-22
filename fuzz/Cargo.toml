@@ -115,6 +115,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "meta_decode"
+path = "fuzz_targets/meta_decode.rs"
+test = false
+doc = false
+bench = false
+
 # Detach from the parent workspace: cargo-fuzz builds this crate on its own with
 # instrumentation flags that must not touch the main workspace build.
 [workspace]

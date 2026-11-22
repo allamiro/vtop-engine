@@ -27,16 +27,22 @@ Built with [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz)
 | `protocol_frame` | `vtop_protocol::decode_frame` and the streaming `read_frame` (VTPW), every message kind | never panics; a frame that decodes and re-encodes decodes to itself. The input is decoded as sent and with its checksum repaired, so the per-kind message decoders see hostile payloads. Seeds: one valid frame per message family |
 | `kafka_request` | the Kafka gateway's request path: `RequestHeader::decode`, then the body decoder the header's api key and version pick (`decode_metadata`, `decode_produce`, `decode_fetch`, `decode_list_offsets`, `decode_init_producer_id`, the group APIs), whole-body consumption, and each batch of a produce request's RECORDS field (`RecordBatch::decode`); the raw input also as a RECORDS field, with each batch's CRC-32C repaired | never panics. Seeds: every served api at its lowest and highest served version |
 | `segment_codec` | a segment directory restored onto the simulated disk: `SegmentReader::open_in` and a fetch, `verify_sealed_segment_in`, `chunk_proof_in`, `ActiveSegment::recover_in`, and the startup scan `SegmentSet::open_in`; so the v1 and v2 headers and record frames, the index, the `VTOPCHK1` chunk sidecar, the `VTOPCMT1` commit marker, the manifest and the producer sidecar | never panics. The input is a file bundle (below). Seeds: v1 and v2, sealed (keyed and unkeyed) and active |
-| `meta_storage_files` | a metadata data directory restored onto the simulated disk: `HardStateFile` (`VTOPMHS1`), the applied, purged and membership frontiers (`VTOPMAP1`, `VTOPMPG1`, `VTOPMML1`), `MetaLog` chunks and entry frames (`VTOPMLG1`, `VTOPMLE1`), `MetaSnapshots` (`VTOPMSN1`, open and `install`), and `MetaStorage::open_in`, the recovery that replays them | never panics. The input is a file bundle. The command and snapshot payload decoders are `meta_decode`'s (#706); here they run only as recovery calls them. Seeds: a log with a hard state, and a directory holding every file |
+| `meta_storage_files` | a metadata data directory restored onto the simulated disk: `HardStateFile` (`VTOPMHS1`), the applied, purged and membership frontiers (`VTOPMAP1`, `VTOPMPG1`, `VTOPMML1`), `MetaLog` chunks and entry frames (`VTOPMLG1`, `VTOPMLE1`), `MetaSnapshots` (`VTOPMSN1`, open and `install`), and `MetaStorage::open_in`, the recovery that replays them | never panics. The input is a file bundle. The command and snapshot payload decoders are `meta_decode`'s; here they run only as recovery calls them. Seeds: a log with a hard state, and a directory holding every file |
+| `meta_decode` | the metadata tier's payload decoders, selected by the input's first byte: `MetadataCommand::decode`, `MetadataResponse::decode`, `MetaMembership::decode`, `MetaStateMachine::decode_snapshot`, and the log entry frame through `MetaLog::open_in` (frames as written to a chunk, the first frame again with its checksum repaired, and an entry kind with its payload in a valid frame) | never panics. A value that decodes encodes, decodes to itself and encodes to the same bytes again. A log entry the log reads is the value its payload decoder gives, and a payload that decoder refuses is refused by the log as corruption or as a newer release's record (`NewerFormat`), never read and never an I/O error. Seeds: the golden vectors of `crates/vtop-meta/tests/codec_golden.rs` (`golden-*`), one value of every command and response kind, the membership shapes, snapshot payloads and entry frames, and an unknown command kind (`newer-*`) |
 | `vtpm_frame` | `VtpmFrame::decode` and the streaming `read_frame` (the metadata peer and admin transport), then the payload decoder of the frame's kind | never panics; a decoded frame re-encodes to its own bytes. Decoded as sent and with the checksum repaired. Seeds: a frame of every kind, most with a real payload |
 | `ledger_rows` | `vtop_cli::coverage::parse_digest` (the `ledger-digest-*.jsonl` prune digest), `BatchRecord` and `ProgressMarker` JSON per line, and the coverage audit (`audit`, `unit_ranges`, `rotation_unproven`) over what parses | never panics; a row and a marker that read write back to text that reads the same. Seeds: a digest `write_digest` wrote, its rows, and the markers written before #578 and before the tail fingerprint |
 | `session_files` | the multipart upload session (`MultipartSession` JSON) and the scrub cursor (`vtop_cli::scrub::parse_cursor`) | never panics; a session round-trips. Seeds: the v0.8.0 session fixture, a completed session with an Object Lock retention (#684), two cursors |
 | `audit_record` | `vtop_observe::audit::read_record` per line | never panics; a newer version or an unknown value stays `Unknown`, not-JSON stays `Malformed`, a v1 record round-trips. Seeds: `audit-v1.jsonl`, its lines, a newer version, an unknown action, a torn line |
 
-`meta_decode` (the metadata command and snapshot payload decoders, and the
-frames #706 adds) is #706's target. The workflows list the targets with
-`cargo fuzz list`, so it is fuzzed nightly as soon as its `[[bin]]` entry
-lands.
+`meta_decode` is selected by the first byte of its input: `0` command, `1`
+response, `2` membership, `3` snapshot payload, `4` log entry frames, `5` an
+entry kind and its payload. The frames of the metadata transport are
+`vtpm_frame`'s, and the store's files as a whole (the log chunks, snapshot
+file, hard state and frontiers, and the recovery that replays them) are
+`meta_storage_files`'s. A metadata command or response kind a later release
+adds is covered by `meta_decode` as soon as the encoder has a value of it:
+`vtop-meta/src/fuzz_seeds.rs` writes a seed per entry of its `every_command`
+and `every_response` lists, and a test fails when a committed seed is stale.
 
 ### File bundles
 
@@ -86,6 +92,7 @@ they stay in step with the code:
 | `vtpm_frame` | `cargo test -p vtop-meta --lib -- --ignored write_fuzz_seeds` | `the_committed_fuzz_seeds_decode` (vtop-meta) |
 | `segment_codec` | `cargo test -p vtop-log --test fuzz_seeds -- --ignored write_fuzz_seeds` | `the_committed_fuzz_seeds_open` (vtop-log) |
 | `meta_storage_files` | `cargo test -p vtop-meta --test fuzz_seeds -- --ignored write_fuzz_seeds` | `the_committed_fuzz_seeds_open` (vtop-meta) |
+| `meta_decode` | `cargo test -p vtop-meta --lib -- --ignored write_fuzz_seeds` (every command and response kind, memberships, snapshots, entry frames) and `cargo test -p vtop-meta --test codec_golden -- --ignored write_golden_fuzz_seeds` (the golden vectors) | `the_committed_fuzz_seeds_are_what_this_build_writes` (vtop-meta lib) and `the_committed_golden_fuzz_seeds_are_the_pinned_vectors_and_decode` (`codec_golden`) |
 | `ledger_rows` | `cargo test -p vtop-cli --lib -- --ignored write_fuzz_seeds` (plus the hand-copied `marker-*` seeds) | the CI seed replay |
 | `kafka_batch` | `scripts/gen-kafka-fixtures.sh` (the gzip and zstd batches the pinned JVM producer writes) | the CI seed replay |
 
