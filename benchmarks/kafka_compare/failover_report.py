@@ -769,7 +769,8 @@ READING = """\
   refused, or a 30 s request timeout). Part of every VTOP window is that client's behaviour, not the cluster's."""
 
 NOT_MEASURED = """\
-- **The Kafka client path on VTOP** (see the first finding): not re-measured after #751 closed the gap. No VTOP number on this page is a Kafka client's.
+- **The Kafka client path on VTOP** (see the first finding): not re-measured after #751 closed the gap. \
+No VTOP number on this page is a Kafka client's.
 - **#597's other faults:** `kill -9` of the metadata leader alone (F2) and of a follower (F5). In both
   co-located clusters the partition leader is often also the metadata leader; the per-repetition table says
   when it was.
