@@ -246,6 +246,35 @@ pub async fn read_head(file: &mut tokio::fs::File) -> std::io::Result<Vec<u8>> {
     Ok(head)
 }
 
+/// Open `path` for reading, only if it is a regular file.
+///
+/// A source's file can be swapped, between the engine's looks at it, for a
+/// FIFO or a device by anyone who can write in its directory. An ordinary
+/// open of a FIFO with no writer blocks until one appears, and the engine
+/// opens files on its commit path and its read pipeline, so one swap would
+/// stop archiving for the source. The open here does not wait (`O_NONBLOCK`,
+/// which a regular file ignores), and the descriptor is judged before it is
+/// handed back: anything but a regular file is an error.
+pub(crate) fn open_regular(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
 /// The file now at `path` - its metadata and first bytes, through ONE open
 /// descriptor - for judging a commit or a rewind against it. `None` when it
 /// cannot be opened or read.
@@ -261,7 +290,7 @@ pub fn probe_with_tail(
     tail: Option<(u64, u64)>,
 ) -> Option<(std::fs::Metadata, Vec<u8>, Vec<u8>)> {
     use std::io::{Seek, SeekFrom};
-    let mut file = std::fs::File::open(path).ok()?;
+    let mut file = open_regular(path).ok()?;
     let metadata = file.metadata().ok()?;
     let mut head = Vec::with_capacity(ContentFingerprint::MAX_LEN);
     (&mut file)
@@ -336,7 +365,7 @@ pub fn proves(file: &std::fs::File, identity: &Identity<'_>) -> bool {
 /// [`proves`] for the file now at `path`. A path that cannot be opened is
 /// not proven to be anything.
 pub fn proves_at_path(path: &std::path::Path, identity: &Identity<'_>) -> bool {
-    std::fs::File::open(path).is_ok_and(|file| proves(&file, identity))
+    open_regular(path).is_ok_and(|file| proves(&file, identity))
 }
 
 /// Up to `len` bytes of `file` from `from`, read at an offset so the
@@ -525,6 +554,45 @@ impl Generations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A FIFO swapped in at a source's path is refused, not waited for: an
+    /// ordinary open of one with no writer never returns.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_at_the_path_is_refused_not_waited_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("app.log");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success());
+        let (sent, received) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = sent.send((
+                probe(&path).is_none(),
+                proves_at_path(
+                    &path,
+                    &Identity {
+                        inode: 0,
+                        contents: &[],
+                        tails: &[],
+                        min_len: 0,
+                    },
+                ),
+            ));
+        });
+        assert_eq!(
+            received.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok((true, false)),
+            "opening a FIFO must neither block nor be taken for a file"
+        );
+        // A regular file still opens.
+        let file = dir.path().join("regular.log");
+        std::fs::write(&file, b"line\n").unwrap();
+        assert!(open_regular(&file).is_ok());
+    }
 
     fn seen(inode: Option<u64>, size: u64) -> Option<Observed> {
         Some(Observed {

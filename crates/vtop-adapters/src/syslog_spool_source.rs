@@ -402,8 +402,8 @@ impl SyslogSpoolSource {
         last_seen: Option<Observed>,
         cut: Option<(u64, Option<u64>)>,
     ) -> Result<SpoolSlice, SpoolReadError> {
-        let mut file = tokio::fs::File::open(&path)
-            .await
+        let mut file = continuity::open_regular(Path::new(&path))
+            .map(tokio::fs::File::from_std)
             .map_err(SpoolReadError::before_judged)?;
         let mut opened = Self::seen_of(
             &file
@@ -979,7 +979,7 @@ impl SourceAdapter for SyslogSpoolSource {
         // same descriptor supplies both identity and length even if rotation
         // races this check. Old markers have no inode and retain their former
         // size-only behavior; `None` never means identity was verified.
-        let mut file = tokio::fs::File::open(path).await?;
+        let mut file = continuity::open_regular(Path::new(path)).map(tokio::fs::File::from_std)?;
         let metadata = file.metadata().await?;
         let current_inode = inode_of(&metadata);
         if marker_inode.is_some() && marker_inode != &current_inode {

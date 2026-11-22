@@ -2644,8 +2644,8 @@ impl FileSource {
         // "read the bytes" and "stat the path" would otherwise mix the old
         // file's offsets with the NEW file's identity (#65). The descriptor is
         // judged before any byte is read.
-        let mut file = tokio::fs::File::open(&path)
-            .await
+        let mut file = continuity::open_regular(Path::new(&path))
+            .map(tokio::fs::File::from_std)
             .map_err(SliceError::before_judged)?;
         let mut opened =
             Self::identity_of(&file.metadata().await.map_err(SliceError::before_judged)?);
@@ -3967,7 +3967,7 @@ impl SourceAdapter for FileSource {
             } else if is_symlink {
                 Some(Compared::Kept(Kept::Symlink))
             } else {
-                Some(match std::fs::File::open(Path::new(path)) {
+                Some(match continuity::open_regular(Path::new(path)) {
                     Ok(file) => {
                         let md = file.metadata().ok();
                         candidate.mtime = md.as_ref().and_then(|md| md.modified().ok());
