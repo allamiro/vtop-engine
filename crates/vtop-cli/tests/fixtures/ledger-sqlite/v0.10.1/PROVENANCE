@@ -1,0 +1,15 @@
+# Written by scripts/compat/regenerate-fixtures.sh v0.10.1 aarch64-unknown-linux-gnu.
+tag: v0.10.1
+asset: vtop-engine-0.10.1-aarch64-unknown-linux-gnu.tar.gz
+asset_sha256: 173aa74cd79af1d20dc0a6d6b831eab800e83e87926942b1e9be3ff9dd0f82f0
+binary: vtopctl
+command: >-
+  scripts/compat/ledger-scenario.sh /bin-under-test/vtopctl: process-once --source file
+  (good store, failing store twice, good store), prune-ledger --older-than-days 0
+  --limit 1, process-once with a failing store, then a WAL checkpoint
+input: >-
+  app.log in this directory: eleven lines, appended between the runs
+files:
+  app.log: 8a4462a4d0a7ef8bd48cc19e663acbfbe9115114dea3e0c1c61c28214d41a53f
+  ledger-digests/ledger-digest-24363bc6ac0b4bbdf2119de89a684399.jsonl: dd3cc6c445a40d84555c23d88b960e4616a147c3790bf1f55b64655927eab1e7
+  state.db: cead3e77ce760ecc4307b79680b6107fc58489c943b58b3f0dce904f5fcd70c6
