@@ -178,6 +178,7 @@ impl AnyHeader {
 /// Version-selected commitment over the encoded record frames: the v1 linear
 /// digest or the v2 chunk-tree builder. The hasher is boxed because its
 /// in-place state dwarfs the builder's.
+#[derive(Clone)]
 enum ContentAccumulator {
     V1(Box<blake3::Hasher>),
     V2(proof::ChunkTreeBuilder),
@@ -559,6 +560,17 @@ impl ActiveSegment {
         self.content_bytes
     }
 
+    /// Whether a failed write poisoned this value (#881).
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Whether this value's file was sealed underneath it: a roll that failed
+    /// after its rename leaves the tail in this state (#881).
+    pub(crate) fn is_sealed(&self) -> bool {
+        self.sealed
+    }
+
     /// Durably commit every accepted append with one storage barrier.
     pub fn commit(&mut self) -> VtopLogResult<u64> {
         self.ensure_writable()?;
@@ -904,23 +916,35 @@ impl ActiveSegment {
     /// The record bodies stay in one file; no WAL or second data copy is made.
     /// A v2 segment seals without a commit statement; use [`Self::seal_v2`]
     /// to attach one.
-    pub fn seal(self) -> VtopLogResult<SegmentReader> {
+    pub fn seal(mut self) -> VtopLogResult<SegmentReader> {
+        self.seal_in_place()
+    }
+
+    /// [`Self::seal`] without giving the segment up, so a caller can keep
+    /// serving from it when sealing fails (#881).
+    ///
+    /// A failure BEFORE the rename leaves this value exactly the tail it was
+    /// — its accumulator is finalized from a copy, so a later seal still
+    /// derives the same root — possibly poisoned, if the commit that sealing
+    /// starts with is what failed. The sidecars a failed seal already wrote
+    /// stay beside the `.active` file, which is the shape a crash at the same
+    /// point leaves and discovery already accepts; the next seal overwrites
+    /// them atomically. A failure AFTER the rename leaves it marked sealed and
+    /// renamed to its sealed path: it refuses writes but still reads, through
+    /// the handle it already holds, the records it held.
+    pub(crate) fn seal_in_place(&mut self) -> VtopLogResult<SegmentReader> {
         match self.header {
             AnyHeader::V1(_) => self.seal_v1(),
-            AnyHeader::V2(_) => self.seal_v2(None),
+            AnyHeader::V2(_) => self.seal_v2_in_place(None),
         }
     }
 
-    fn seal_v1(mut self) -> VtopLogResult<SegmentReader> {
+    fn seal_v1(&mut self) -> VtopLogResult<SegmentReader> {
         self.check_sealable()?;
         let AnyHeader::V1(header) = &self.header else {
             unreachable!("seal_v1 is only dispatched for v1 segments");
         };
-        let (_, root) = std::mem::replace(
-            &mut self.accumulator,
-            ContentAccumulator::for_header(&self.header),
-        )
-        .finalize();
+        let (_, root) = self.accumulator.clone().finalize();
         let manifest = SegmentManifest {
             format: FORMAT_NAME.to_owned(),
             version: FORMAT_VERSION,
@@ -941,6 +965,10 @@ impl ActiveSegment {
     /// Seal a v2 segment, optionally signing a [`CommitStatementV1`] with the
     /// supplied runtime key. Without a key the manifest carries no statement.
     pub fn seal_v2(mut self, key: Option<&SegmentCommitKey>) -> VtopLogResult<SegmentReader> {
+        self.seal_v2_in_place(key)
+    }
+
+    fn seal_v2_in_place(&mut self, key: Option<&SegmentCommitKey>) -> VtopLogResult<SegmentReader> {
         if matches!(self.header, AnyHeader::V1(_)) {
             return Err(LogError::InvalidDescriptor(
                 "a v1 segment cannot carry a v2 commit statement; use seal()".to_owned(),
@@ -950,11 +978,7 @@ impl ActiveSegment {
         let AnyHeader::V2(header) = &self.header else {
             unreachable!("v1 segments were rejected above");
         };
-        let (leaves, root) = std::mem::replace(
-            &mut self.accumulator,
-            ContentAccumulator::for_header(&self.header),
-        )
-        .finalize();
+        let (leaves, root) = self.accumulator.clone().finalize();
         let mut manifest = SegmentManifestV2 {
             format: FORMAT_NAME.to_owned(),
             version: FORMAT_VERSION_V2,
@@ -1034,13 +1058,17 @@ impl ActiveSegment {
         Ok(paths)
     }
 
-    fn publish_sealed(mut self, paths: SegmentPaths) -> VtopLogResult<SegmentReader> {
+    fn publish_sealed(&mut self, paths: SegmentPaths) -> VtopLogResult<SegmentReader> {
         self.env
             .storage
             .rename(&self.path, &paths.segment)
             .map_err(|source| io_error(&self.path, source))?;
-        sync_parent(self.env.storage.as_ref(), &paths.segment)?;
+        // The file is sealed on disk from here, whatever fails next, so this
+        // value says so too: it must never append to a sealed file, and its
+        // path must name the file it still holds open.
         self.sealed = true;
+        self.path = paths.segment.clone();
+        sync_parent(self.env.storage.as_ref(), &paths.segment)?;
         SegmentReader::open_in(&self.env, paths.segment)
     }
 
@@ -1909,7 +1937,8 @@ pub fn roll_in(
     active: ActiveSegment,
     successor_id: Uuid,
 ) -> VtopLogResult<(SegmentReader, ActiveSegment)> {
-    roll_in_with(env, active, successor_id, None)
+    let mut active = active;
+    roll_in_with(env, &mut active, successor_id, None)
 }
 
 /// A successor configuration for a reconfiguring roll (#314), in the format
@@ -1929,9 +1958,15 @@ pub(crate) enum SuccessorConfig {
 /// descriptor, format, producer frontier and sidecar handling are byte-for-
 /// byte the inheritance path, because the one subtle part of rolling — the
 /// CLONED-not-taken producer maps below — must not exist twice.
+///
+/// The predecessor is BORROWED, not consumed (#881): on success the caller
+/// drops it for the successor; on failure the caller still holds it, either
+/// unchanged (the seal failed before its rename) or sealed and still
+/// readable (a step after the rename failed), so a range never loses its
+/// tail to a failed roll. See [`ActiveSegment::seal_in_place`].
 pub(crate) fn roll_in_with(
     env: &Env,
-    active: ActiveSegment,
+    active: &mut ActiveSegment,
     successor_id: Uuid,
     config_override: Option<SuccessorConfig>,
 ) -> VtopLogResult<(SegmentReader, ActiveSegment)> {
@@ -2005,7 +2040,7 @@ pub(crate) fn roll_in_with(
     let states = active.producer_states.clone();
     let epochs = active.producer_epochs.clone();
 
-    let sealed = active.seal()?;
+    let sealed = active.seal_in_place()?;
     if !frontier.is_empty() {
         write_atomic(env, &successor_paths.producers, &frontier.encode()?)?;
     }

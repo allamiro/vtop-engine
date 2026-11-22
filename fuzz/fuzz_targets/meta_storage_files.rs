@@ -10,7 +10,7 @@
 //! onto the simulated disk. Each file is opened by its own reader, then the
 //! whole directory goes through `MetaStorage::open_in`, the node's startup
 //! path. The metadata command and snapshot payload decoders behind them are
-//! #706's `meta_decode` target; they run here only as recovery calls them.
+//! the `meta_decode` target's; they run here only as recovery calls them.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;

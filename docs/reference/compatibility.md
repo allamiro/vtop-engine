@@ -120,10 +120,21 @@ What is tested today:
   a restart ([`scripts/upgrade-compat.sh`](../../scripts/upgrade-compat.sh)).
 - The metadata tier rolls from the newest release to the current build, one
   voter at a time (live-chaos scenario 22).
+- A metadata voter's directory (the Raft log, the snapshot, the applied,
+  purged and hard-state files), written by the published `vtop-node` of
+  v0.8.0, v0.9.0 and v0.10.1 at the highest feature level each accepts, must
+  open under the current build: the same applied index, voter set, feature
+  level and record generations the release reported, a read-only open that
+  rewrites nothing, and a new write that survives a reopen
+  (`released_meta_dirs` in `vtop-meta`; the fixtures carry a `PROVENANCE`).
+  [`scripts/compat/cells/meta.sh`](../../scripts/compat/cells/meta.sh) runs
+  the same live, in both directions, against a released binary.
 - The released `vtopctl` of v0.7.0 and later is run over a manifest archive
   the current build wrote: v0.8.0 and later must verify it, and v0.7.0 must
   report the documented self-hash failure
-  ([`scripts/manifest-compat.sh`](../../scripts/manifest-compat.sh)).
+  ([`scripts/manifest-compat.sh`](../../scripts/manifest-compat.sh), run by the
+  [Compat workflow](../../.github/workflows/compat.yml) on the published,
+  signature-checked release binaries).
 - **The state ledger and its digests, in the compatibility matrix** (the
   `ledger-sqlite`, `digests-audit` and `ledger-postgres` cells of
   [`scripts/compat/expected.yaml`](../../scripts/compat/expected.yaml)). For
@@ -150,10 +161,31 @@ What is tested today:
 
 In 0.x, downgrade is not supported, except where the matrix records a
 result for a pair of releases. The rules below are the target; each applies
-to a pair once the matrix records a downgrade result for it. Today it
-records them for these formats, against the **previous release** (the older
-releases down to v0.7.0 are run too, and what they do is recorded, not
-promised):
+to a pair once the matrix records a downgrade result for it.
+
+- **Between patches of one minor:** supported in both directions.
+- **From minor N to N-1:** supported **until the first one-way step**. The
+  release notes of N list its one-way steps. What the matrix checks is one
+  sentence: *the older binary either works correctly on the newer state, or
+  exits non-zero with a message that says the state is newer, and changes
+  nothing.* It never misreads, never panics and never rewrites.
+- **A one-way step is always gated by an operator action:** raising a
+  feature level, running `vtopctl migrate` for a PostgreSQL marker bump,
+  setting a write version. No binary takes one on its own on first open. A
+  future exception needs a written sign-off in that release's notes. Each
+  one-way step is justified in its pull request and has a refusal test. (The
+  SQLite ledger has no such gate yet; see the change rules.)
+- **After a feature level is raised,** the metadata tier can go back only by
+  restoring a backup taken before the raise. The ledger's restore is
+  documented and drilled
+  ([#734](https://github.com/allamiro/vtop-engine/issues/734),
+  [Backup and recovery](../operate/backup-and-recovery.md)); the metadata
+  tier's is not, so there is no tested way back after a raise, and there is no
+  export tool.
+
+Today the matrix records downgrade results for these formats, against the
+**previous release** (the older releases down to v0.7.0 are run too, and
+what they do is recorded, not promised):
 
 | Format | The previous release, on what the current build wrote | Recorded in |
 |---|---|---|
@@ -176,8 +208,8 @@ What an older binary does with newer data, by case:
 | A nullable ledger column | Names its own columns, ignores the new one and writes `NULL` in the rows it inserts. A later release reads `NULL` as unknown. | Supported. No marker bump, and the column is never dropped. Only N-1 shares a PostgreSQL ledger with N. | Yes: `sealed_at` (#626) against the previous release, SQLite on every pull request and PostgreSQL nightly (`ledger-sqlite`, `ledger-postgres`, forward) |
 | A Kafka progress marker with a `topic_id` | Ignores the key. It resumes a partition from the newest committed row, as it always did, and its pruning keeps that row. | Supported: an optional field in an unhashed document, read as unknown when absent. | No |
 | A ledger row in a state, or of a source type, N-1 does not know | Fails closed. | One-way: needs a marker or version bump, so the refusal comes at startup and not mid-run. | No |
-| A `0.4` manifest | v0.8.0 and later verify it; v0.7.0 and earlier report it as tampered. | The documented cutoff. Archives are never rewritten; set `write_version: "0.3"` to stop writing more. | Yes: v0.7.0, and v0.8.0 and later (`manifest-compat`) |
-| A metadata log entry or snapshot record from a raised feature level | The voter refuses to start, saying *newer format*, and changes nothing. Today that holds for a new command kind, log entry kind, value tag or key category; other enum values inside records are reported as corrupt until [#763](https://github.com/allamiro/vtop-engine/pull/763). | One-way at the raise, which is operator-gated and permanent. The notes say which level first puts a new kind in the log. | No |
+| A `0.4` manifest | v0.8.0 and later verify it; v0.7.0 and earlier report it as tampered. | The documented cutoff. Archives are never rewritten; set `write_version: "0.3"` to stop writing more. | Yes: v0.7.0, and v0.8.0 and later (the `manifest` cell of the Compat workflow) |
+| A metadata log entry or snapshot record from a raised feature level | The voter refuses to start, saying *newer format*, and changes nothing. Today that holds for a new command kind, log entry kind, value tag or key category; other enum values inside records are reported as corrupt until [#763](https://github.com/allamiro/vtop-engine/pull/763). A raise whose level a release does not support is not such a record: the command is one it decodes, and it applies it as a rejection. | One-way at the raise, which is operator-gated and permanent. The notes say which level first puts a new kind in the log. | Partly. Level 8 is the highest raise today and adds no kind: v0.10.1 reads it, and v0.8.0 and v0.9.0 (level 7) open the directory and take writes: they report level 3 while the raise is still in the log (they apply it as a rejection) and level 8 once it is inside a snapshot (they install the snapshot as it is), so the downgrade is silent, not refused. No release writes a kind an older one cannot decode yet, so the refusal has no live case (`meta.sh` takes `refuse` for the release that adds one) |
 | A segment v2 directory | Every release since v0.5.0 reads v2. | Supported. A later segment version follows [reader first](#reader-first). | No |
 
 ## Deprecation

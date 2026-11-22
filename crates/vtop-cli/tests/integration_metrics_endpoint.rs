@@ -140,6 +140,11 @@ fn populated() -> String {
             .with_label_values(&["default", mode])
             .set(0);
     }
+    for mode in telemetry::SERVER_SIDE_ENCRYPTION_MODES {
+        m.server_side_encryption_mode
+            .with_label_values(&["default", mode])
+            .set(0);
+    }
     for r in telemetry::RECEIPT_WRITE_RESULTS {
         m.verification_receipts_total
             .with_label_values(&["default", r])
@@ -183,6 +188,23 @@ fn the_object_lock_metrics_are_exported() {
     }
 }
 
+/// The server-side encryption mode gauge, under its name, with `mode` from
+/// its closed set: an alert on a fleet that is not writing encrypted objects
+/// reads it.
+#[test]
+fn the_server_side_encryption_mode_gauge_is_exported() {
+    let text = populated();
+    assert!(
+        text.contains("# TYPE vtop_server_side_encryption_mode gauge"),
+        "{text}"
+    );
+    for mode in ["none", "sse-s3", "sse-kms"] {
+        let series =
+            format!(r#"vtop_server_side_encryption_mode{{mode="{mode}",tenant="default"}}"#);
+        assert!(text.contains(&series), "missing {series}:\n{text}");
+    }
+}
+
 #[test]
 fn every_metric_the_dashboards_query_is_exported() {
     let text = populated();
@@ -193,6 +215,22 @@ fn every_metric_the_dashboards_query_is_exported() {
              renaming a metric silently blanks its panels"
         );
     }
+}
+
+/// The shipped alert `VtopBucketVersioningPaused` reads this gauge: it is
+/// exported from startup, at zero, so the rule sees the first bucket the
+/// engine stops writing to.
+#[test]
+fn the_bucket_versioning_pause_gauge_is_exported_for_its_alert() {
+    let text = populated();
+    assert!(
+        text.contains("# TYPE vtop_bucket_versioning_paused gauge"),
+        "missing vtop_bucket_versioning_paused"
+    );
+    assert!(
+        text.lines().any(|l| l == "vtop_bucket_versioning_paused 0"),
+        "the gauge starts at zero"
+    );
 }
 
 /// Histograms must expose `_bucket`, or `histogram_quantile()` returns nothing

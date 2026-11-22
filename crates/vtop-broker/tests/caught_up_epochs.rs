@@ -622,3 +622,93 @@ fn a_refused_append_group_leaves_no_record_filed_outside_the_lineage() {
         "the record at 10 is epoch 20's, as R files it; 21 begins at the tail"
     );
 }
+
+/// #881: a full disk at an epoch-journal write breaks a replica's history
+/// for good, and that used to be silent: the soak's data-1 sat out every
+/// later epoch ("no epoch history this leader can compare") with nothing in
+/// its own log to say why. The refusal is deliberate and unchanged; the
+/// break is now reported.
+///
+/// Invariant: the first failed journal write marks the history broken, says
+/// what happened, what the replica now does and what to do (free space, then
+/// `vtopctl node repair`), and the replica still answers with no history -
+/// even once space is back.
+#[test]
+fn a_full_disk_at_an_epoch_journal_write_breaks_the_history_loudly_and_keeps_refusing() {
+    use vtop_log::sim::{FaultPlan, SimStorage};
+
+    let dir = tempfile::tempdir().unwrap();
+    let meta = MetaFencingEpoch::new(OLD_EPOCH);
+    let node = InProcessFollower::new(
+        Uuid::from_u128(0xA1),
+        segment_at(dir.path()),
+        ProducerEpochJournal::open(dir.path().join("epochs")).unwrap(),
+        range_identity(),
+        OLD_EPOCH,
+        meta.clone(),
+        ClusterCommittedOffset::new(0),
+    )
+    .unwrap();
+    // The journal on a disk the test can fill.
+    let sim = SimStorage::new();
+    sim.create_dir_all(Path::new("/journal"));
+    let env = sim.env(0x5eed_0881);
+    node.set_fencing_epoch_journal(
+        FencingEpochJournal::open_in(&env, "/journal/fencing-epochs").unwrap(),
+    );
+    // A record under the history, so the replica holds something a leader
+    // would need that history to judge.
+    node.apply_append(&ReplicaAppendRequest {
+        range: range_identity(),
+        fencing_epoch: OLD_EPOCH,
+        leader_node_id: Uuid::from_u128(0xA2),
+        expected_base_offset: 0,
+        producer_id: Uuid::from_u128(0xB1),
+        producer_epoch: 1,
+        first_sequence: 0,
+        records: vec![ProduceRecord {
+            timestamp_millis: 1,
+            key: b"k".to_vec(),
+            value: b"v0".to_vec(),
+        }],
+    })
+    .unwrap();
+    assert!(!node.epoch_history_broken());
+    assert!(!node.epoch_starts().is_empty(), "precondition: a history");
+
+    // The disk fills; the next grant's adoption cannot be recorded.
+    sim.set_fault(FaultPlan::FailOpsFrom {
+        op: sim.op_count(),
+        kind: std::io::ErrorKind::StorageFull,
+    });
+    meta.set(C_EPOCH);
+    node.adopt_fencing_epoch(C_EPOCH);
+
+    assert!(
+        node.epoch_history_broken(),
+        "the failed write must break the history"
+    );
+    let reason = node
+        .epoch_history_broken_reason()
+        .expect("a broken history says why");
+    for needed in [
+        "epoch history could not be written",
+        "recording an adopted epoch",
+        "no leader gives it a replication session",
+        "Free space",
+        "vtopctl node repair",
+    ] {
+        assert!(reason.contains(needed), "{needed:?} missing from: {reason}");
+    }
+
+    // The refusal itself is unchanged: no history to offer, so no leader
+    // can reconcile against it or count it.
+    assert!(node.epoch_starts().is_empty());
+
+    // Space back is not a repair: it stays broken until an operator acts.
+    sim.set_fault(FaultPlan::None);
+    meta.set(R_EPOCH);
+    node.adopt_fencing_epoch(R_EPOCH);
+    assert!(node.epoch_history_broken());
+    assert!(node.epoch_starts().is_empty());
+}
