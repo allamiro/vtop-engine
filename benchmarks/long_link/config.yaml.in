@@ -1,0 +1,36 @@
+# The engine configuration of one rig run; run.sh fills the @...@ fields.
+engine:
+  name: long-link
+  tenant: default
+  state_store: "sqlite:///r/state/vtop.db"
+  work_dir: /r/work
+  log_level: INFO
+batching:
+  max_records: 1000000
+  max_bytes: @MAX_BYTES@
+  max_batch_age_seconds: 10
+  max_concurrent_batches: 8
+compression:
+  type: zstd
+  level: 3
+checksum:
+  algorithm: @CHECKSUM@
+sources:
+  kafka:
+    enabled: true
+    bootstrap_servers: ["vtop-longlink-kafka:9092"]
+    consumer_group: "g-@NAME@"
+    topic_include_regex: "^@TOPIC@$"
+    topic_exclude_regex: "^__.*"
+    auto_offset_reset: earliest
+    enable_auto_commit: false
+upload:
+  backend: s3_native
+  bucket: "b-@NAME@"
+  prefix: ""
+  endpoint_url: http://vtop-longlink-minio:9000
+  region: us-east-1
+  force_path_style: true
+  verify_tls: false
+  create_bucket: true
+  require_strong_verification: @STRONG@

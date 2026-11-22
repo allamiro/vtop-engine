@@ -1,0 +1,37 @@
+# Written by scripts/compat/regenerate-segment-fixtures.sh v0.3.1 aarch64-unknown-linux-gnu.
+tag: v0.3.1
+asset: vtop-engine-0.3.1-aarch64-unknown-linux-gnu.tar.gz
+asset_sha256: df3ef315d037781faaee32d4f661b6a8f4c44fa8844a88e405f63722563d5682
+binary: vtop-node
+command: >-
+  scripts/upgrade-compat.sh with UPGRADE_STOP_AFTER_OLD=1 and UPGRADE_RECORDS=300,
+  once per profile (rolling): a leader and a follower of the
+  release, vtop-node produce --records 300 --batch 64 --durability quorum,
+  both stopped with SIGKILL; the leader's data directory
+input: >-
+  300 synthetic records of vtop-node produce, in topic upgrade.v1
+files:
+  rolling/epochs: e47dcf810b996ad74c72b270d9db5b519a08ab5ade5087237050d36536611e9f
+  rolling/fencing-epochs: ba3334576e4d86d2f82559c081d1915c8fa7cdd0ddf3ea7827b3aa8e6f57b04d
+  rolling/range-00000000000000000000.commit: 9b0a65277a2c4f9b8b6e2028e1235430d21f641e58c1d48dd642708cbd17fa85
+  rolling/range-00000000000000000000.index: dafb5ed993a3c136af35586b7fb44f071e17fa6037582beb17ac3a29c432cc83
+  rolling/range-00000000000000000000.manifest.json: 30c63f0e884b1cb0c03fbcbbef4bb8108f2b6515cdfcb5b208f9bc5a1d3e519f
+  rolling/range-00000000000000000000.segment: 1c1223e1b63416e140ee79a70e7b8070aedb694685e668c31278f6758a219f2a
+  rolling/range-00000000000000000064.commit: bb404fb909b780619e5b3aa822eda7654cd1f274b0ab237c1aeb9023f13e2793
+  rolling/range-00000000000000000064.index: 6ad5c708eb7538f270499f583c0e71f68c3ad3122ad71bc819e1789bb9bc61b1
+  rolling/range-00000000000000000064.manifest.json: ab0525288ae7bb01d2c2949ee1fcac70ce6fdb6afa3e00a64b95ebb50d72ce31
+  rolling/range-00000000000000000064.producers: 0999db37f8b9b4ba1de651d294153bb64d31dc97728df241db4a137918091e82
+  rolling/range-00000000000000000064.segment: fdfb4e03bb5c9c875c768cb4bc62229c21f440492cd8630806db8579460027bb
+  rolling/range-00000000000000000128.commit: e935e9eae8c9e658f759ad1806de713fa264889ada41e599a86c7c1efae78ec3
+  rolling/range-00000000000000000128.index: 08116718bcdbc899ecfdd98f15cc06e2e86ce5f3fecb74e4d1e2b5fb1dd64ac5
+  rolling/range-00000000000000000128.manifest.json: 5b795557f87f5329a1f249f337181f4d4666542ab55712b4e5d17af05e6ac4fb
+  rolling/range-00000000000000000128.producers: 803479315c42f884a50fd658a5d30cca3e3d1c79a390a6cc5d9c475635831b1d
+  rolling/range-00000000000000000128.segment: ca3a3ddc1fd848c488f7b5abd867324a835a38409960e2d9d2f741d9cd39d660
+  rolling/range-00000000000000000192.commit: aa39bc8b533128e3ff43696eea4523f8ef66dfbe1298b193951a568e5d7d38ab
+  rolling/range-00000000000000000192.index: b5e6bcd0f867f8e1337e1d1c978cef0ff9c02ee05f4ba030c7351462b06ff1ff
+  rolling/range-00000000000000000192.manifest.json: a9cb7b11f20aafb841ac3e5df5c3e229b152009c2add74dc7471be85d9d959f1
+  rolling/range-00000000000000000192.producers: 99c4afb9a0f2c61e892a9fb9e0947dbe7168bac6de6f7b017caa081ccbe6cb1f
+  rolling/range-00000000000000000192.segment: a433590c65482209963c989d873e85dd2d3d4f2586d33eaa6428a28a9901d8ae
+  rolling/range-00000000000000000256.active: 90badd713a93549a5260fab8950538634075b74ca745de3baa0934f10e5aa46c
+  rolling/range-00000000000000000256.commit: 78a0c5cf5fa94ece0ec63de223065e1b71a6ff088a77b0fc09e5be4e8d5a5843
+  rolling/range-00000000000000000256.producers: 870e759538f7601a9819e247bce6c3ada19d93bed18b188652bb95beab6716e6

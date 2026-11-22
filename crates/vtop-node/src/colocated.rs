@@ -333,3 +333,106 @@ observability:
         config.validate().unwrap();
     }
 }
+
+/// The config corpus of `vtop-node` (#743): every node config the repository
+/// commits, and every node config fragment its documentation shows, parses
+/// under this build. The engine's and `vtopctl`'s corpus is
+/// `vtop-cli`'s `config_corpus`; the node's types live in this binary, so its
+/// files are read here.
+#[cfg(test)]
+mod config_corpus {
+    use super::*;
+    use crate::config::{DataNodeConfig, MetaNodeConfig, ObservabilityConfig};
+    use serde_yaml::Value;
+    use std::path::{Path, PathBuf};
+
+    fn root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    fn top_level_keys(value: &Value) -> Vec<String> {
+        match value {
+            Value::Mapping(map) => map
+                .keys()
+                .filter_map(|key| key.as_str().map(str::to_owned))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// A node config file, by its shape: a co-located node has `meta` and
+    /// `data`, a data node a `role`, a metadata node a `node_id`.
+    fn check_node_config(name: &str, text: &str) {
+        let value: Value = serde_yaml::from_str(text)
+            .unwrap_or_else(|error| panic!("{name} is not YAML: {error}"));
+        let keys = top_level_keys(&value);
+        let has = |key: &str| keys.iter().any(|k| k == key);
+        if has("meta") && has("data") {
+            let config: ColocatedNodeConfig = serde_yaml::from_str(text)
+                .unwrap_or_else(|error| panic!("{name} is not a co-located node config: {error}"));
+            config
+                .validate()
+                .unwrap_or_else(|error| panic!("{name} does not validate: {error}"));
+        } else if has("role") {
+            serde_yaml::from_str::<DataNodeConfig>(text)
+                .unwrap_or_else(|error| panic!("{name} is not a data node config: {error}"));
+        } else if has("node_id") {
+            serde_yaml::from_str::<MetaNodeConfig>(text)
+                .unwrap_or_else(|error| panic!("{name} is not a metadata node config: {error}"));
+        } else {
+            panic!("{name} is a YAML file of no node config shape (keys {keys:?})");
+        }
+    }
+
+    #[test]
+    fn the_committed_node_configs_parse() {
+        let dir = root().join("benchmarks/kafka_compare/vtop");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("benchmark node configs") {
+            let path = entry.expect("entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read");
+            check_node_config(&path.display().to_string(), &text);
+            checked += 1;
+        }
+        assert!(checked >= 6, "only {checked} node configs were found");
+    }
+
+    /// The `observability:` blocks the node docs show are what the node accepts.
+    #[test]
+    fn the_node_observability_snippets_parse() {
+        let path = root().join("docs/NODE_OBSERVABILITY.md");
+        let text = std::fs::read_to_string(&path).expect("docs/NODE_OBSERVABILITY.md");
+        let mut checked = 0;
+        let mut body: Option<Vec<&str>> = None;
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            match &mut body {
+                None if trimmed == "```yaml" => body = Some(Vec::new()),
+                Some(lines) if trimmed == "```" => {
+                    let snippet = lines.join("\n");
+                    let value: Value = serde_yaml::from_str(&snippet).expect("YAML");
+                    if top_level_keys(&value) == ["observability"] {
+                        let observability = value.get("observability").expect("observability");
+                        serde_yaml::from_value::<ObservabilityConfig>(observability.clone())
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "an observability snippet does not parse: {error}\n{snippet}"
+                                )
+                            });
+                        checked += 1;
+                    }
+                    body = None;
+                }
+                Some(lines) => lines.push(line),
+                None => {}
+            }
+        }
+        assert!(
+            checked >= 2,
+            "only {checked} observability snippets were found"
+        );
+    }
+}
