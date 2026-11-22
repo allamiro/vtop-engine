@@ -20,6 +20,53 @@ promises, and the rules for changing one, are in the
 [compatibility policy](../reference/compatibility.md); which releases get
 fixes is in [Versioning and support](../SUPPORT.md).
 
+## Upgrading from v0.10.2 to v0.10.3
+
+v0.10.3 fixes where a Kafka partition resumes, makes the `localfs` backend
+fsync before a write is reported done, unsticks a source under a long
+directory, binds a native client certificate to the principal it acts as,
+and adds encryption at rest through S3 server-side encryption. The full notes are in
+[v0.10.3](../ROADMAP.md#v0103--a-kafka-resume-that-survives-a-recreated-topic-durable-local-writes-and-client-certificates-bound-to-their-principal)
+in the roadmap.
+
+- **Reissue native client certificates whose CN is not the node's
+  `principal_id`, before upgrading a data node.** A v0.10.3 data node admits
+  a native TLS session only when the client certificate's Common Name is its
+  `principal_id` (#854). Compare each client's
+  `openssl x509 -noout -subject -in <cert>` with the node's `principal_id` and
+  reissue the ones that differ with `CN=<principal_id>`. A v0.10.2 node does
+  not read the CN, so reissue first, then upgrade. A refused client gets
+  `Unauthorized`, and the node writes a `native.session` audit record naming
+  the CN it saw. A plaintext native plane is unaffected.
+- **On PostgreSQL, run v0.10.3's `vtopctl migrate` before its engines
+  start.** It adds two partial indexes on the Kafka rows of `batches` that
+  pruning uses; the schema marker stays 3. `CREATE INDEX` blocks writes to
+  `batches` while it builds, so on a large ledger run it in a quiet window.
+  Until it runs, pruning is correct and slower. SQLite creates the indexes on
+  connect.
+- **Kafka sources need nothing.** New ledger rows record the topic's id
+  (`topic_id`) and a partition resumes from the highest committed end of the
+  topic's current id; rows written before the upgrade keep the old rule until
+  rows with the id exist (#855). An older engine ignores the field.
+- **Sources under long paths.** A name over 200 bytes is now shortened, so a
+  replay of a range archived under a name of 201 to about 241 bytes writes a
+  new object instead of reusing the old one: a duplicate, never a loss (#851).
+- **`localfs` writes are slower**, by an fsync of the file and its
+  directories (#827).
+- **Upgrade every engine before setting `upload.server_side_encryption`
+  (#856).** A v0.10.2 engine ignores the key without a word and writes
+  objects unencrypted, so keep a bucket default encryption as the floor.
+  Objects written before the mode was set stay as they were, and `vtopctl
+  scrub` reports each as a mismatch. With `sse-kms` the identity needs
+  `kms:GenerateDataKey` and `kms:Decrypt`.
+- **Otherwise a drop-in replacement.** Replace the binaries in any order;
+  v0.10.2 and v0.10.3 engines, voters and data nodes can run side by side,
+  apart from the native client certificates above. No schema marker, wire
+  format or cluster feature level changes, and no one-way step is added. The
+  one new key is `upload.server_side_encryption`.
+- **Helm chart 0.6.2** (`appVersion` 0.10.3). No template or values change.
+- Downgrade is not supported.
+
 ## Upgrading from v0.10.1 to v0.10.2
 
 v0.10.2 fixes the size of the batches `vtopctl run` seals, recovers a replay
@@ -205,9 +252,9 @@ need no reader upgrade: a reader that does not know them never fetches them. Old
 none, so turn on `vtopctl scrub --require-receipts` only once every engine
 writes them; see [Verification receipts](verification-receipts.md).
 
-## Secret-file permissions (next release, #733)
+## Secret-file permissions (v0.10.2, #733)
 
-Engines of the next release refuse to start when a manifest key file, the
+Engines of v0.10.2 and later refuse to start when a manifest key file, the
 `engine.state_store` secret file, the SQLite ledger (or its `-wal` or `-shm`
 file) or the `VTOP_AUDIT_LOG` file can be read or written by other local
 users, where earlier releases started. A `0644` ledger inside a `0700` data
@@ -232,6 +279,6 @@ The rule, the mounting recipes and the
   [deployment sequence](../POSTGRES_DEPLOYMENT.md#deployment-sequence).
 - Run the new release's `vtopctl validate` against each engine's config,
   where the engine runs: it reports what the new engine would refuse at
-  startup (from the next release, the
+  startup (since v0.10.2, the
   [secret-file permissions](secrets.md) too).
 - Stop each engine with SIGTERM and let its shutdown flush finish.

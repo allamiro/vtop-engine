@@ -1049,17 +1049,25 @@ mod tests {
 
     /// Defect 1 (#752, D7): the thread that leads a group is answered as
     /// soon as ITS group is flushed, not after it has gone on to flush every
-    /// group that queued behind it. Six producers keep the queue busy for
-    /// 600 ms, each re-joining 5 ms after its answer, so the queue is never
-    /// empty when a group ends. Before the fix the first leader kept
-    /// leading until a lull, which here never comes before the producers
-    /// stop: its own append, flushed in the first 20 ms, was answered after
-    /// about 600 ms, and in a node after up to the gateway's 30 s produce
-    /// timeout. Groups hold three requests, so the six producers form two
-    /// cohorts that keep each other's groups queued.
+    /// group that queued behind it. Six producers keep the queue busy, each
+    /// re-joining 5 ms after its answer, so the queue is never empty when a
+    /// group ends. Before the fix the first leader kept leading until a
+    /// lull, which here never comes before the producers stop: its own
+    /// append, flushed in the first group, was answered only after every
+    /// group the run flushed, and in a node after up to the gateway's 30 s
+    /// produce timeout. Groups hold three requests, so the six producers
+    /// form two cohorts that keep each other's groups queued.
+    ///
+    /// Judged by how many groups had finished when the first leader was
+    /// answered, not by a wall-clock bound: the runners' sleep and wake-up
+    /// granularity differs (a macOS runner overshoots a 20 ms sleep by
+    /// enough to fail a 100 ms bound, #724), while the defect shows as
+    /// every group of the run finishing before the leader is answered.
     #[test]
     fn the_leader_is_answered_before_it_starts_another_group() {
         const GROUP: Duration = Duration::from_millis(20);
+        // Groups the run must flush for the test to mean anything.
+        const BUSY: u64 = 10;
         // Three requests a group: six producers form two cohorts, and the
         // one answered at the end of a group re-joins while the other's
         // group runs, so the queue is never empty when a group ends.
@@ -1073,11 +1081,14 @@ mod tests {
         let first_flush_started = Arc::new(std::sync::Barrier::new(2));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flushes = Arc::new(AtomicU64::new(0));
+        // Groups whose flush has finished.
+        let finished = Arc::new(AtomicU64::new(0));
 
         let leader = {
             let coord = Arc::clone(&coord);
             let first_flush_started = Arc::clone(&first_flush_started);
             let flushes = Arc::clone(&flushes);
+            let finished = Arc::clone(&finished);
             thread::spawn(move || {
                 let started = Instant::now();
                 coord.enqueue_and_wait(QueuedProduce::new(1, 1, sample_request(1)), |batch| {
@@ -1085,9 +1096,12 @@ mod tests {
                         first_flush_started.wait();
                     }
                     thread::sleep(GROUP);
-                    answer(batch)
+                    let answers = answer(batch);
+                    finished.fetch_add(1, Ordering::SeqCst);
+                    answers
                 });
-                started.elapsed()
+                // How many groups had finished when this leader was answered.
+                (finished.load(Ordering::SeqCst), started.elapsed())
             })
         };
         first_flush_started.wait();
@@ -1096,6 +1110,7 @@ mod tests {
                 let coord = Arc::clone(&coord);
                 let stop = Arc::clone(&stop);
                 let flushes = Arc::clone(&flushes);
+                let finished = Arc::clone(&finished);
                 thread::spawn(move || {
                     while !stop.load(Ordering::SeqCst) {
                         coord.enqueue_and_wait(
@@ -1103,7 +1118,9 @@ mod tests {
                             |batch| {
                                 flushes.fetch_add(1, Ordering::SeqCst);
                                 thread::sleep(GROUP);
-                                answer(batch)
+                                let answers = answer(batch);
+                                finished.fetch_add(1, Ordering::SeqCst);
+                                answers
                             },
                         );
                         thread::sleep(Duration::from_millis(5));
@@ -1111,23 +1128,32 @@ mod tests {
                 })
             })
             .collect();
-        thread::sleep(Duration::from_millis(600));
+        // Run until the producers have flushed enough groups, however long
+        // a runner's sleeps take to get there.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while finished.load(Ordering::SeqCst) < BUSY && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
         stop.store(true, Ordering::SeqCst);
-        let leader_latency = leader.join().unwrap();
+        let (finished_when_answered, leader_latency) = leader.join().unwrap();
         for producer in producers {
             producer.join().unwrap();
         }
+        let total = finished.load(Ordering::SeqCst);
         assert!(
-            flushes.load(Ordering::SeqCst) >= 10,
-            "the producers must have kept the queue busy for the test to mean anything: {} \
-             flushes",
-            flushes.load(Ordering::SeqCst)
+            total >= BUSY,
+            "the producers must have kept the queue busy for the test to mean anything: \
+             {total} groups flushed in 20 s"
         );
+        // Its own group, and at most one more another leader finished
+        // before this thread was scheduled to return. Leading on would have
+        // finished every group of the run first.
         assert!(
-            leader_latency < GROUP * 2 + Duration::from_millis(60),
-            "the first leader's own append was flushed in its first {GROUP:?} group, and it \
-             was answered after {leader_latency:?}: it kept leading the groups queued behind \
-             it instead of answering itself"
+            finished_when_answered <= 2,
+            "the first leader's own append was flushed in the first group, and it was \
+             answered only after {finished_when_answered} of the run's {total} groups had \
+             finished ({leader_latency:?}): it kept leading the groups queued behind it \
+             instead of answering itself"
         );
     }
 
