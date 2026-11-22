@@ -596,7 +596,7 @@ def test_every_command_the_readme_shows_parses_and_the_full_run_fits_its_own_cap
         runs.append((args, matrix, hours))
     smoke, full, resume = runs
     assert smoke[1]["smoke"] and not full[1]["smoke"]
-    # the documented one-hour command: 14 crashes of three configurations in power-loss mode, about an hour
-    assert full[1]["crashes"] == 14 and full[1]["crash_modes"] == ["flakey-drop"]
+    # the documented one-hour command: 12 crashes of three configurations in power-loss mode, about an hour
+    assert full[1]["crashes"] == 12 and full[1]["crash_modes"] == ["flakey-drop"]
     assert 0.8 <= full[2] <= 1.25, full[2]
     assert resume[0].resume == "<run-id>"

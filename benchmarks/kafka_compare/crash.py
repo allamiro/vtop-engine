@@ -2,7 +2,7 @@
 """Acknowledged records that survive a crash of the whole replica set, VTOP vs Apache Kafka (#599).
 
     python3 benchmarks/kafka_compare/crash.py --smoke                  # 12 crashes, about 20 minutes
-    python3 benchmarks/kafka_compare/crash.py --setup-flakey 10240 --crashes 14 --modes flakey-drop  # ~1 hour
+    python3 benchmarks/kafka_compare/crash.py --setup-flakey 10240 --crashes 12 --modes flakey-drop  # ~1 hour
 
 For every (crash number, configuration, crash mode): a fresh three-node cluster on empty data
 directories, one producer at a fixed rate with `acks=all` and the idempotent producer on, a trigger

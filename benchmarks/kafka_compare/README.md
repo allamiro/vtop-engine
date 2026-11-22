@@ -250,21 +250,21 @@ acknowledged records that are missing afterwards, for Kafka as shipped, Kafka ma
 # The short profile: 2 crashes per cell, both modes, SIGKILL and power-loss, about 20 minutes on a 4-vCPU VM.
 python3 benchmarks/kafka_compare/crash.py --smoke --setup-flakey 8192
 
-# The full run on a dedicated Linux host (see below): 3 configurations x 14 power-loss crashes, projected at 0.97 h.
+# The full run on a dedicated Linux host (see below): 3 configurations x 12 power-loss crashes, projected at 0.96 h.
 python3 benchmarks/kafka_compare/crash.py --setup-flakey 10240 --teardown-flakey \
-    --crashes 14 --modes flakey-drop --max-hours 1.5
+    --crashes 12 --modes flakey-drop --max-hours 1.5
 
 # What a run directory still owes, whatever its state (exit 0 when complete, 2 listing the missing crashes), and
 # the way to continue an interrupted one.
 python3 benchmarks/kafka_compare/crash.py --check benchmarks/kafka_compare/results/<run-id>
-python3 benchmarks/kafka_compare/crash.py --resume <run-id> --crashes 14 --modes flakey-drop
+python3 benchmarks/kafka_compare/crash.py --resume <run-id> --crashes 12 --modes flakey-drop
 ```
 
 The projection (`crash_schema.projected_seconds`, checked against `--max-hours` before any container starts, and again
 before every crash) uses per-crash timings measured on the smoke run: a Kafka crash takes about 46 s and a VTOP crash
 about 21 s beyond its trigger (mean 40 s in the default window), so a crash index of the three configurations takes
-about 4 minutes and 14 of them about an hour; the full length was not run. The issue's 30 crashes per configuration
-are `--crashes 30` (2.1 h), and a `sigkill` control for them doubles that.
+about 4 minutes and 12 of them about an hour; the full length was not run. The issue's 30 crashes per configuration
+are `--crashes 30` (2.4 h), and a `sigkill` control for them doubles that.
 
 **The host.** One Linux machine with Docker Engine (Compose v2), a user in the `docker` group with passwordless
 `sudo` (the harness runs only `crash/powercut.sh` through `sudo -n`; run it as root and git will want
@@ -346,7 +346,7 @@ holds each crash's three node logs (as they died and after the restart) and a su
 run through `crash_schema.load_crash_run(run_dir, min_ok=N)`, which refuses a partial, mixed-environment or
 unfinished run, a row that is `ok` while its canary did not behave, and fewer than `N` ok crashes in any cell, by name.
 `crash_analysis.upper_bound_95(0, n)` gives the exact binomial bound to print beside every "0 of n": 13.9 % at 20
-crashes, 9.5 % at 30. The issue's plan asks for 30 crashes per configuration (about 2 hours: `--crashes 30`).
+crashes, 9.5 % at 30. The issue's plan asks for 30 crashes per configuration (2.4 h projected: `--crashes 30`).
 
 ## Known gaps
 
