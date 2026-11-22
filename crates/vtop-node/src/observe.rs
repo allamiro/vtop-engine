@@ -780,10 +780,12 @@ pub struct BrokerCollector {
     meta_fencing_epoch: IntGaugeVec,
     lease_active: IntGaugeVec,
     boundary_pending: IntGaugeVec,
+    epoch_history_broken: IntGaugeVec,
 
     follower_durable_offset: IntGaugeVec,
     follower_lag_records: IntGaugeVec,
     follower_connected: IntGaugeVec,
+    follower_below_catch_up_horizon: IntGaugeVec,
     retention: RetentionGauges,
     /// Refresh and read-out under one lock, as in `CandidateCollector`: an
     /// overlapping scrape that read no retention snapshot must not reset the
@@ -857,6 +859,13 @@ impl BrokerCollector {
                  refuses and the cluster HWM gauge shows the durable floor meanwhile (#240)",
                 &["topic", "range"],
             )?,
+            epoch_history_broken: gauge_vec(
+                "broker_epoch_history_broken",
+                "1 while this replica's epoch history is broken: a journal write failed (a full \
+                 disk, say), so it answers every fence with no history and gets no replication \
+                 session until `vtopctl node repair` (#881)",
+                &["topic", "range"],
+            )?,
             follower_durable_offset: gauge_vec(
                 "broker_follower_durable_offset",
                 "Highest offset each follower has acknowledged as durable",
@@ -870,6 +879,13 @@ impl BrokerCollector {
             follower_connected: gauge_vec(
                 "broker_follower_connected",
                 "1 while the leader holds a live replication stream to the follower",
+                &["follower"],
+            )?,
+            follower_below_catch_up_horizon: gauge_vec(
+                "broker_follower_below_catch_up_horizon",
+                "1 while the follower is durable only below this leader's log start: retention \
+                 reclaimed the records it lacks, so no append can catch it up and it needs a \
+                 rebuild (#881)",
                 &["follower"],
             )?,
             retention: RetentionGauges::new()?,
@@ -962,11 +978,13 @@ impl BrokerCollector {
             &self.cluster_committed,
             &self.held_fencing_epoch,
             &self.boundary_pending,
+            &self.epoch_history_broken,
             &self.meta_fencing_epoch,
             &self.lease_active,
             &self.follower_durable_offset,
             &self.follower_lag_records,
             &self.follower_connected,
+            &self.follower_below_catch_up_horizon,
             &self.group_commit_last_batch_records,
             &self.group_commit_last_batch_bytes,
             &self.group_commit_enabled,
@@ -1017,6 +1035,9 @@ impl BrokerCollector {
         self.boundary_pending
             .with_label_values(&range)
             .set(i64::from(self.broker.boundary_pending()));
+        self.epoch_history_broken
+            .with_label_values(&range)
+            .set(i64::from(self.broker.epoch_history_broken()));
         let held = self.broker.held_fencing_epoch();
         self.held_fencing_epoch
             .with_label_values(&range)
@@ -1055,6 +1076,13 @@ impl BrokerCollector {
                     .with_label_values(&[&label])
                     .set(i64::from(
                         replicas.follower_connected(*node).unwrap_or(false),
+                    ));
+                self.follower_below_catch_up_horizon
+                    .with_label_values(&[&label])
+                    .set(i64::from(
+                        replicas
+                            .follower_below_catch_up_horizon(*node)
+                            .unwrap_or(false),
                     ));
             }
         }
@@ -1183,6 +1211,7 @@ pub struct FollowerCollector {
     cluster_committed: IntGaugeVec,
     meta_fencing_epoch: IntGaugeVec,
     online: IntGaugeVec,
+    epoch_history_broken: IntGaugeVec,
     retention: RetentionGauges,
     /// Refresh and read-out under one lock, as in `CandidateCollector`: an
     /// overlapping scrape that read no retention snapshot must not reset the
@@ -1222,6 +1251,13 @@ impl FollowerCollector {
                 "1 while this follower accepts replication appends",
                 &["topic", "range"],
             )?,
+            epoch_history_broken: gauge_vec(
+                "broker_epoch_history_broken",
+                "1 while this replica's epoch history is broken: a journal write failed (a full \
+                 disk, say), so it answers every fence with no history and gets no replication \
+                 session until `vtopctl node repair` (#881)",
+                &["topic", "range"],
+            )?,
             retention: RetentionGauges::new()?,
             scrape: std::sync::Mutex::new(()),
         })
@@ -1234,6 +1270,7 @@ impl FollowerCollector {
             &self.cluster_committed,
             &self.meta_fencing_epoch,
             &self.online,
+            &self.epoch_history_broken,
         ];
         members.extend(self.retention.members());
         members
@@ -1263,6 +1300,9 @@ impl FollowerCollector {
         self.online
             .with_label_values(&range)
             .set(i64::from(self.follower.is_online()));
+        self.epoch_history_broken
+            .with_label_values(&range)
+            .set(i64::from(self.follower.epoch_history_broken()));
         self.retention
             .refresh(&range, self.follower.retention_stats().snapshot());
         self.retention.refresh_log_start(
@@ -1331,6 +1371,12 @@ pub trait ReplicaObservation: Send + Sync {
     /// The first offset the replica holds (#571).
     fn log_start(&self) -> LogStart {
         LogStart::NoRole
+    }
+
+    /// Whether the replica's epoch history is broken (#881): `None` with no
+    /// role installed. An atomic load on every role, so never blocks.
+    fn epoch_history_broken(&self) -> Option<bool> {
+        None
     }
 
     /// Everything the authorization gauges are derived from, AS ONE
@@ -1412,6 +1458,10 @@ impl ReplicaObservation for LocalBroker {
     fn log_start(&self) -> LogStart {
         Self::try_log_start_offset(self).map_or(LogStart::Busy, LogStart::At)
     }
+
+    fn epoch_history_broken(&self) -> Option<bool> {
+        Some(Self::epoch_history_broken(self))
+    }
 }
 
 impl ReplicaObservation for InProcessFollower {
@@ -1441,6 +1491,10 @@ impl ReplicaObservation for InProcessFollower {
 
     fn log_start(&self) -> LogStart {
         Self::try_log_start_offset(self).map_or(LogStart::Busy, LogStart::At)
+    }
+
+    fn epoch_history_broken(&self) -> Option<bool> {
+        Some(Self::epoch_history_broken(self))
     }
 }
 
@@ -1485,6 +1539,7 @@ pub struct CandidateCollector {
     lease_active: IntGaugeVec,
     leading: IntGaugeVec,
     boundary_pending: IntGaugeVec,
+    epoch_history_broken: IntGaugeVec,
     retention: RetentionGauges,
     /// Serializes refresh-plus-collect (#411 review): the coherent-pair
     /// guarantee on `leading`/`lease_active` holds within one refresh, but
@@ -1551,6 +1606,13 @@ impl CandidateCollector {
                  beside broker_candidate_leading — 0 on a replica that does not lead.",
                 &["topic", "range"],
             )?,
+            epoch_history_broken: gauge_vec(
+                "broker_epoch_history_broken",
+                "1 while this replica's epoch history is broken: a journal write failed (a full \
+                 disk, say), so it answers every fence with no history and gets no replication \
+                 session until `vtopctl node repair` (#881)",
+                &["topic", "range"],
+            )?,
             retention: RetentionGauges::new()?,
             scrape: std::sync::Mutex::new(()),
         })
@@ -1566,6 +1628,7 @@ impl CandidateCollector {
             &self.lease_active,
             &self.leading,
             &self.boundary_pending,
+            &self.epoch_history_broken,
         ];
         members.extend(self.retention.members());
         members
@@ -1591,6 +1654,13 @@ impl CandidateCollector {
         self.retention.refresh(&range, self.view.retention());
         self.retention
             .refresh_log_start(&range, self.view.log_start());
+        // No role installed keeps the last reading: a break does not clear
+        // across a role switch, since the journal belongs to the directory.
+        if let Some(broken) = self.view.epoch_history_broken() {
+            self.epoch_history_broken
+                .with_label_values(&range)
+                .set(i64::from(broken));
+        }
         // ONE observation of the role rather than an ownership question
         // followed by three answers, so a transition cannot land in the middle
         // of a scrape and have it publish half of each role (review; the
@@ -3128,6 +3198,43 @@ mod tests {
             text.contains(r#"vtop_broker_lease_active{range="00000000-0000-0000-0000-000000000007",topic="telemetry"} 1"#),
             "a live leaseholder must read as leased: {text}"
         );
+    }
+
+    /// #881: a replica whose epoch history broke (here: a full disk at the
+    /// journal write that records its next epoch) exports it, so the alert
+    /// can name the replica that will get no session until it is repaired.
+    #[test]
+    fn a_broken_epoch_history_is_exported() {
+        use vtop_log::sim::{FaultPlan, SimStorage};
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Arc::new(open_broker(dir.path()));
+        let sim = SimStorage::new();
+        sim.create_dir_all(std::path::Path::new("/journal"));
+        broker.set_fencing_epoch_journal(
+            vtop_broker::fencing_epochs::FencingEpochJournal::open_in(
+                &sim.env(0x881),
+                "/journal/fencing-epochs",
+            )
+            .unwrap(),
+        );
+        let registry = Registry::new_custom(Some("vtop".into()), None).unwrap();
+        registry
+            .register(Box::new(
+                BrokerCollector::new(Arc::clone(&broker), None, Vec::new()).unwrap(),
+            ))
+            .unwrap();
+        let series = r#"vtop_broker_epoch_history_broken{range="00000000-0000-0000-0000-000000000007",topic="telemetry"}"#;
+        let text = scrape(&registry);
+        assert!(text.contains(&format!("{series} 0")), "{text}");
+
+        sim.set_fault(FaultPlan::FailOpsFrom {
+            op: sim.op_count(),
+            kind: std::io::ErrorKind::StorageFull,
+        });
+        broker.adopt_fencing_epoch(5);
+        assert!(broker.epoch_history_broken());
+        let text = scrape(&registry);
+        assert!(text.contains(&format!("{series} 1")), "{text}");
     }
 
     /// The one that matters most: after a steal, metadata's lease is live for

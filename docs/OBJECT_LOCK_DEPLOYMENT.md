@@ -197,6 +197,7 @@ Each refusal says what happened, what the engine did, and what to do:
 | First batch for a templated bucket without Object Lock (`object_lock_bucket_refused`, `result="bucket_not_locked"`) | the same, with `the batch was not uploaded and will be replayed` | As it says. Nothing was written to the bucket. |
 | Startup, a store that does not implement Object Lock (it answers `GetObjectLockConfiguration` with HTTP 501 `NotImplemented`) | `the store does not implement S3 Object Lock (it answered GetObjectLockConfiguration for bucket X with "not implemented"); the engine did not start. No bucket setting can change that: use a store that implements S3 Object Lock, or remove upload.object_lock` | As it says. A templated bucket on such a store fails its first batch with the same words (`result="store_unsupported"`). |
 | Startup, a literal bucket without versioning (the profile requires `upload.require_object_versioning`) | `bucket X does not have versioning enabled, so the store would not keep the manifest versions the hardened profile pins; the engine did not start. Enable versioning on the bucket (PutBucketVersioning with Status=Enabled; if the store cannot enable it, use a store that keeps object versions), or set upload.require_object_versioning: false` | A bucket created with Object Lock has versioning on, so this names a different bucket or a store that does not keep it. A store that answers `GetBucketVersioning` with 501 is refused with `the store does not implement S3 bucket versioning`. The Object Lock check runs first, so a store without either is refused for Object Lock. A versioning check the store could not answer is a WARN at startup (`the versioning of bucket X could not be read ...; the engine started anyway`), and an ERROR `bucket_versioning_refused` at a batch. |
+| A running engine, the bucket's versioning suspended or turned off (`upload.require_object_versioning`) | ERROR `bucket_versioning_paused`: `a manifest PUT to bucket X returned no object version to pin, so the bucket no longer keeps versions ...` (or `an object PUT ... returned no object version, and the store says the bucket's versioning is not enabled`, or, at the first upload to a bucket, `the store says bucket X does not have versioning enabled`) `...; upload.require_object_versioning is set, so the engine stopped writing to the bucket: nothing in it commits, each batch for it fails before writing anything and is replayed, and the bucket's versioning is checked again in 5s (then at most every 60s), and writing resumes once it is Enabled. To resume, re-enable versioning on bucket X (PutBucketVersioning with Status=Enabled), or set upload.require_object_versioning: false` | The bucket's state, not a transient failure: the batch in flight writes at most its object (or its object and manifest), and nothing more is written until a check finds versioning `Enabled` (INFO `bucket_versioning_resumed`). A check that finds it still off is the same ERROR at most once a minute per bucket, with a `suppressed` count. `vtop_bucket_versioning_paused` counts the paused buckets, and the alert `VtopBucketVersioningPaused` pages after 5 minutes. |
 | Bucket check could not be made | WARN at startup: `the Object Lock configuration of bucket X could not be read (...); the engine started anyway, and the bucket is checked again before the first upload to it`; at a batch, the same with `the batch was not uploaded and will be replayed` (`result="error"`) | Grant `s3:GetBucketObjectLockConfiguration`, or check the store's health. |
 | Startup, a backend that does not apply the lock | `upload.object_lock is set, but the X upload backend does not apply it ...` | Use `s3_native`. |
 | Written object or manifest without the lock (`object_lock_check_failed`, `result` = `missing`, `mode_mismatch`, `too_short` or `legal_hold_missing`) | `object X (version V) is not under the requested retention (expected governance until at least D, found ...); the batch was marked failed and will be replayed; check the bucket's Object Lock configuration and the credentials' s3:PutObjectRetention permission, and s3:GetObjectRetention, without which the store answers a HEAD with no lock at all` | Fix the store or the credentials. The replay writes the batch again. |
@@ -265,6 +266,17 @@ loss rolled back. Budget for these objects, and size them with
 ([observability/README.md](../observability/README.md)). The startup WARN
 under `compliance` says so.
 
+`vtopctl audit-coverage` lists these objects (#774): the ones a failed,
+replay-required or superseded attempt uploaded and no committed row names,
+with a count and the recorded size per source, and the gauges
+`vtop_coverage_audit_unreferenced_objects` and
+`vtop_coverage_audit_unreferenced_object_bytes{source_type}` in its metrics
+file. It reads the ledger and the prune digests, makes no store request, and
+deletes nothing, so under Object Lock the list is what the retention is paid
+on. It cannot find an object whose ledger row a power loss rolled back: no
+row names it. See [Scrub and coverage
+audit](operate/scrub-and-audit.md#objects-no-committed-row-names).
+
 A replay that finds its object unlocked, its lock ended, in the other mode
 or without the configured legal hold writes one more locked object and
 leaves the old one (#709). The old one is unlocked or elapsed, so it can be
@@ -273,6 +285,12 @@ mode: a compliance lock stays until its date. A crash between that fresh
 object's upload and its ledger write, or a restart after a fallback whose
 manifest failed, writes one more; these are counted as `fallback_*` in
 `vtop_object_key_decisions_total`.
+
+A replay on a command backend (`awscli`, `minio`, `s3cmd`) adopts the object
+an earlier attempt uploaded when it verifies (#773), but those backends cannot
+run the profile (the configuration is refused), so adoption never applies to
+a locked bucket and changes nothing in the list above: under Object Lock only
+`s3_native` writes, and a replay there names its object by content as before.
 
 Incomplete multipart uploads are not objects and are not locked. The
 abandoned-session sweep and an `AbortIncompleteMultipartUpload` lifecycle rule

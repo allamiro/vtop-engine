@@ -810,6 +810,22 @@ number, because each of them produces a plausible result:
   flow, and an index that flatters VTOP by exactly the missing stretch. Two
   intervals that meet at a boundary are contiguous, to within the rounding
   iperf3 prints its interval bounds at.
+- **The stream is laid out on the sender's window, and the goodput is the
+  receiver's (#610).** The interval stream is the sender's. On iperf 3.21 it
+  covers exactly `end.sum_sent.seconds`, the last measured interval ending
+  there. `end.sum_received.seconds` is the server's own clock, which runs on
+  until the flow's tail has drained the bottleneck queue and crossed the
+  one-way delay. That made it 0.14–0.19 s longer on the 10 Mbit/s, 100 ms,
+  one-BDP link, measured on a GitHub-hosted runner. The stream used to be laid
+  out on the receiver's window, which left the window's opening uncovered, so
+  the coverage check refused the run. The check passed only when iperf3's first
+  measured interval happened to reach back across the omit restart.
+  So the stream's origin, the window it must cover, and the contended window
+  `close()` places all come from the sender's length, recorded as
+  `sender_seconds` beside `measured_seconds` for each phase. The competitor
+  sends nothing while its tail drains, so the drain is not contended time.
+  Goodput stays received bytes over the receiver's seconds. A report without a
+  sender summary is refused by name.
 
 A contended run adds roughly `2 x (window + 3 s)` of wall clock beyond the
 engine's `duration_seconds` — the two solo windows, each with its omitted
@@ -891,6 +907,50 @@ middlebox as claimed. On macOS, run the pair in a Linux VM with a stock
 kernel. The runner must then run on that VM's kernel too, for example in a
 container with the docker socket mounted, or the competitor's stamps are read
 against another kernel's clock.
+
+A GitHub-hosted runner also has `ifb` (#610). `.github/workflows/competitor-pair.yml`
+runs scenarios 22 and 23 there, a few repetitions with the order alternated. It
+runs on `workflow_dispatch` only and takes about an hour, so it is never part of
+the default CI path. It loads `ifb` and the qdiscs the middlebox installs from the
+runner's stock modules (and tries `linux-modules-extra` once if they are missing),
+and fails in seconds, naming the module, if the kernel lacks one. Its last step
+writes a bundle (`competitor_pair_report.py --bundle`) of the tables and each
+accepted half's `summary.json` and `metrics.csv`, so a result is committed from
+the run's own files and no figure is typed.
+
+The runner is a shared, noisy host, so a pair it produces is a comparison between
+the two halves of one job, not an absolute. The runs are recorded in
+[`measurements/610-competitor-pair-hosted-runner/`](measurements/610-competitor-pair-hosted-runner/).
+
+Two earlier runs (kernel 7.0.0-1019-azure) produced no pair. Every capped half and
+all but one uncapped half were refused, because the competitor's stream was
+missing the window's first 0.100–0.169 s. The refused runs' raw reports show the
+cause (`record.json`, `refusal.cause`). The stream is the sender's and covers
+exactly `end.sum_sent.seconds`. The harness laid it into a window of
+`end.sum_received.seconds`, the receiver's clock, which is longer by the time the
+flow's tail takes to drain the queue (0.143–0.191 s measured). A window passed
+only when iperf3's first interval happened to straddle the omit restart and cover
+the gap. The stream is now placed on the sender's own window and the goodput stays
+the receiver's bytes over the receiver's seconds. A hole inside the sender's own
+window is still refused.
+
+After that fix, run 44796334506 (kernel 7.0.0-1016-aws, Intel Xeon 6975P-C, ifb
+from the stock modules, calibration 9.572–9.573 Mbit/s) accepted all 6 halves, 3
+complete pairs, none refused. The medians over the three pairs, from
+`pair-run-44796334506/pair_record.json`, against each run's own solo windows
+(9.562–9.564 Mbit/s, solo windows within 0.02% of each other):
+
+| | competitor beside VTOP | share of its solo goodput | VTOP's committed-body rate | Jain's index |
+|---|---|---|---|---|
+| uncapped (scenario 22) | 6.631 Mbit/s | 69.33% | 2.282 Mbit/s | 0.807 |
+| capped at 256 KiB/s (scenario 23) | 7.513 Mbit/s | 78.55% | 1.641 Mbit/s | 0.708 |
+
+The cap gave the competitor 0.678–1.253 Mbit/s more in every pair. Jain's index is
+lower with the cap because VTOP's rate is lower: the index measures how equal the
+two rates are, not how well the link is used. The uncapped share here (65–71%) is
+higher than on the two azure runs' one accepted half (53%) and on #481's Lima VM
+(49%), on a different host and CPU, so compare the halves of one pair with each
+other and not with those.
 
 **Recorded** in [`measurements/481-egress-ceiling/`](measurements/481-egress-ceiling/)
 (local `results/` are never committed, so that directory is the record:

@@ -1,0 +1,172 @@
+{
+ "runs": [
+  {
+   "order": 1,
+   "repetition": 1,
+   "scenario": "22",
+   "run_id": "competing-flow-bulk-uncapped-20261111T014504Z-az77w2",
+   "runner_exit_code": 2,
+   "emulator_validation_mbps": 9.573,
+   "competitor_alone_before_mbps": 9.564,
+   "competitor_alone_before_measured_seconds": 120.169,
+   "seeded_bytes_first_cycle": 8067459,
+   "contended_window_measured_seconds": 120.104,
+   "contended_stream_hole_seconds": [
+    0.0,
+    0.103
+   ],
+   "runner_output": [
+    "[bench] the competing flow's stream says nothing about 0.000-0.103s of its 120.104s measured window. The receiver's total is spread across the span VTOP was measured over in proportion to the stream's bytes, so every second of the window has to be in the stream: a missing one leaves its bytes out of the proportion and hands them to the seconds that remain, whichever side of VTOP's span the hole sits on. Rerun with the lab's own iperf3 (the netshoot middlebox) and check the middlebox was not starved of CPU while it was reporting; this is a report with a hole in it, not a scenario knob",
+    "[bench] runner_mode=container: the engine runs inside the compose stack (profile `containerized` must be up)",
+    "[bench] emulator calibration: 9.573 Mbit/s through the shaped path (configured 10.0 Mbit/s)",
+    "[bench] scenario=competing-flow-bulk-uncapped run_id=competing-flow-bulk-uncapped-20261111T014504Z-az77w2",
+    "[bench] results -> /home/runner/work/_temp/pair/results/competing-flow-bulk-uncapped-20261111T014504Z-az77w2",
+    "[bench] netem on vtop-bench-netem: 100 ms round trip ±0 ms, 0.0% loss (random), 10000 kbit/s bottleneck at 1.0x BDP",
+    "[bench] competitor alone before: 9.564 Mbit/s over 120.169s on the empty link",
+    "[bench] seeded 250 files (8067459 bytes) format=jsonl size=small",
+    "[bench] competitor beside VTOP: bulk for 120s (+3s ramp)",
+    "[bench] netem removed from vtop-bench-netem"
+   ]
+  },
+  {
+   "order": 2,
+   "repetition": 1,
+   "scenario": "23",
+   "run_id": "competing-flow-bulk-capped-20261111T015228Z-m10zlt",
+   "runner_exit_code": 2,
+   "emulator_validation_mbps": 9.573,
+   "competitor_alone_before_mbps": 9.564,
+   "competitor_alone_before_measured_seconds": 120.169,
+   "seeded_bytes_first_cycle": 9104960,
+   "contended_window_measured_seconds": 120.169,
+   "contended_stream_hole_seconds": [
+    0.0,
+    0.168
+   ],
+   "runner_output": [
+    "[bench] the competing flow's stream says nothing about 0.000-0.168s of its 120.169s measured window. The receiver's total is spread across the span VTOP was measured over in proportion to the stream's bytes, so every second of the window has to be in the stream: a missing one leaves its bytes out of the proportion and hands them to the seconds that remain, whichever side of VTOP's span the hole sits on. Rerun with the lab's own iperf3 (the netshoot middlebox) and check the middlebox was not starved of CPU while it was reporting; this is a report with a hole in it, not a scenario knob",
+    "[bench] runner_mode=container: the engine runs inside the compose stack (profile `containerized` must be up)",
+    "[bench] emulator calibration: 9.573 Mbit/s through the shaped path (configured 10.0 Mbit/s)",
+    "[bench] scenario=competing-flow-bulk-capped run_id=competing-flow-bulk-capped-20261111T015228Z-m10zlt",
+    "[bench] results -> /home/runner/work/_temp/pair/results/competing-flow-bulk-capped-20261111T015228Z-m10zlt",
+    "[bench] netem on vtop-bench-netem: 100 ms round trip ±0 ms, 0.0% loss (random), 10000 kbit/s bottleneck at 1.0x BDP",
+    "[bench] competitor alone before: 9.564 Mbit/s over 120.169s on the empty link",
+    "[bench] seeded 250 files (9104960 bytes) format=jsonl size=small",
+    "[bench] competitor beside VTOP: bulk for 120s (+3s ramp)",
+    "[bench] netem removed from vtop-bench-netem"
+   ]
+  },
+  {
+   "order": 3,
+   "repetition": 2,
+   "scenario": "23",
+   "run_id": "competing-flow-bulk-capped-20261111T015949Z-052xyx",
+   "runner_exit_code": 2,
+   "emulator_validation_mbps": 9.571,
+   "competitor_alone_before_mbps": 9.564,
+   "competitor_alone_before_measured_seconds": 120.167,
+   "seeded_bytes_first_cycle": 8780942,
+   "contended_window_measured_seconds": 120.169,
+   "contended_stream_hole_seconds": [
+    0.0,
+    0.169
+   ],
+   "runner_output": [
+    "[bench] the competing flow's stream says nothing about 0.000-0.169s of its 120.169s measured window. The receiver's total is spread across the span VTOP was measured over in proportion to the stream's bytes, so every second of the window has to be in the stream: a missing one leaves its bytes out of the proportion and hands them to the seconds that remain, whichever side of VTOP's span the hole sits on. Rerun with the lab's own iperf3 (the netshoot middlebox) and check the middlebox was not starved of CPU while it was reporting; this is a report with a hole in it, not a scenario knob",
+    "[bench] runner_mode=container: the engine runs inside the compose stack (profile `containerized` must be up)",
+    "[bench] emulator calibration: 9.571 Mbit/s through the shaped path (configured 10.0 Mbit/s)",
+    "[bench] scenario=competing-flow-bulk-capped run_id=competing-flow-bulk-capped-20261111T015949Z-052xyx",
+    "[bench] results -> /home/runner/work/_temp/pair/results/competing-flow-bulk-capped-20261111T015949Z-052xyx",
+    "[bench] netem on vtop-bench-netem: 100 ms round trip ±0 ms, 0.0% loss (random), 10000 kbit/s bottleneck at 1.0x BDP",
+    "[bench] competitor alone before: 9.564 Mbit/s over 120.167s on the empty link",
+    "[bench] seeded 250 files (8780942 bytes) format=jsonl size=small",
+    "[bench] competitor beside VTOP: bulk for 120s (+3s ramp)",
+    "[bench] netem removed from vtop-bench-netem"
+   ]
+  },
+  {
+   "order": 4,
+   "repetition": 2,
+   "scenario": "22",
+   "run_id": "competing-flow-bulk-uncapped-20261111T020711Z-n2x0es",
+   "runner_exit_code": 2,
+   "emulator_validation_mbps": 9.575,
+   "competitor_alone_before_mbps": 9.564,
+   "competitor_alone_before_measured_seconds": 120.166,
+   "seeded_bytes_first_cycle": 8394986,
+   "contended_window_measured_seconds": 120.1,
+   "contended_stream_hole_seconds": [
+    0.0,
+    0.1
+   ],
+   "runner_output": [
+    "[bench] the competing flow's stream says nothing about 0.000-0.100s of its 120.1s measured window. The receiver's total is spread across the span VTOP was measured over in proportion to the stream's bytes, so every second of the window has to be in the stream: a missing one leaves its bytes out of the proportion and hands them to the seconds that remain, whichever side of VTOP's span the hole sits on. Rerun with the lab's own iperf3 (the netshoot middlebox) and check the middlebox was not starved of CPU while it was reporting; this is a report with a hole in it, not a scenario knob",
+    "[bench] runner_mode=container: the engine runs inside the compose stack (profile `containerized` must be up)",
+    "[bench] emulator calibration: 9.575 Mbit/s through the shaped path (configured 10.0 Mbit/s)",
+    "[bench] scenario=competing-flow-bulk-uncapped run_id=competing-flow-bulk-uncapped-20261111T020711Z-n2x0es",
+    "[bench] results -> /home/runner/work/_temp/pair/results/competing-flow-bulk-uncapped-20261111T020711Z-n2x0es",
+    "[bench] netem on vtop-bench-netem: 100 ms round trip ±0 ms, 0.0% loss (random), 10000 kbit/s bottleneck at 1.0x BDP",
+    "[bench] competitor alone before: 9.564 Mbit/s over 120.166s on the empty link",
+    "[bench] seeded 250 files (8394986 bytes) format=jsonl size=small",
+    "[bench] competitor beside VTOP: bulk for 120s (+3s ramp)",
+    "[bench] netem removed from vtop-bench-netem"
+   ]
+  },
+  {
+   "order": 5,
+   "repetition": 3,
+   "scenario": "22",
+   "run_id": "competing-flow-bulk-uncapped-20261111T021438Z-oxmqbh",
+   "runner_exit_code": 2,
+   "emulator_validation_mbps": 9.573,
+   "competitor_alone_before_mbps": 9.564,
+   "competitor_alone_before_measured_seconds": 120.166,
+   "seeded_bytes_first_cycle": 8334624,
+   "contended_window_measured_seconds": 120.154,
+   "contended_stream_hole_seconds": [
+    0.0,
+    0.154
+   ],
+   "runner_output": [
+    "[bench] the competing flow's stream says nothing about 0.000-0.154s of its 120.154s measured window. The receiver's total is spread across the span VTOP was measured over in proportion to the stream's bytes, so every second of the window has to be in the stream: a missing one leaves its bytes out of the proportion and hands them to the seconds that remain, whichever side of VTOP's span the hole sits on. Rerun with the lab's own iperf3 (the netshoot middlebox) and check the middlebox was not starved of CPU while it was reporting; this is a report with a hole in it, not a scenario knob",
+    "[bench] runner_mode=container: the engine runs inside the compose stack (profile `containerized` must be up)",
+    "[bench] emulator calibration: 9.573 Mbit/s through the shaped path (configured 10.0 Mbit/s)",
+    "[bench] scenario=competing-flow-bulk-uncapped run_id=competing-flow-bulk-uncapped-20261111T021438Z-oxmqbh",
+    "[bench] results -> /home/runner/work/_temp/pair/results/competing-flow-bulk-uncapped-20261111T021438Z-oxmqbh",
+    "[bench] netem on vtop-bench-netem: 100 ms round trip ±0 ms, 0.0% loss (random), 10000 kbit/s bottleneck at 1.0x BDP",
+    "[bench] competitor alone before: 9.564 Mbit/s over 120.166s on the empty link",
+    "[bench] seeded 250 files (8334624 bytes) format=jsonl size=small",
+    "[bench] competitor beside VTOP: bulk for 120s (+3s ramp)",
+    "[bench] netem removed from vtop-bench-netem"
+   ]
+  },
+  {
+   "order": 6,
+   "repetition": 3,
+   "scenario": "23",
+   "run_id": "competing-flow-bulk-capped-20261111T022204Z-hqoq9x",
+   "runner_exit_code": 2,
+   "emulator_validation_mbps": 9.575,
+   "competitor_alone_before_mbps": 9.564,
+   "competitor_alone_before_measured_seconds": 120.169,
+   "seeded_bytes_first_cycle": 8191057,
+   "contended_window_measured_seconds": 120.168,
+   "contended_stream_hole_seconds": [
+    0.0,
+    0.168
+   ],
+   "runner_output": [
+    "[bench] the competing flow's stream says nothing about 0.000-0.168s of its 120.168s measured window. The receiver's total is spread across the span VTOP was measured over in proportion to the stream's bytes, so every second of the window has to be in the stream: a missing one leaves its bytes out of the proportion and hands them to the seconds that remain, whichever side of VTOP's span the hole sits on. Rerun with the lab's own iperf3 (the netshoot middlebox) and check the middlebox was not starved of CPU while it was reporting; this is a report with a hole in it, not a scenario knob",
+    "[bench] runner_mode=container: the engine runs inside the compose stack (profile `containerized` must be up)",
+    "[bench] emulator calibration: 9.575 Mbit/s through the shaped path (configured 10.0 Mbit/s)",
+    "[bench] scenario=competing-flow-bulk-capped run_id=competing-flow-bulk-capped-20261111T022204Z-hqoq9x",
+    "[bench] results -> /home/runner/work/_temp/pair/results/competing-flow-bulk-capped-20261111T022204Z-hqoq9x",
+    "[bench] netem on vtop-bench-netem: 100 ms round trip ±0 ms, 0.0% loss (random), 10000 kbit/s bottleneck at 1.0x BDP",
+    "[bench] competitor alone before: 9.564 Mbit/s over 120.169s on the empty link",
+    "[bench] seeded 250 files (8191057 bytes) format=jsonl size=small",
+    "[bench] competitor beside VTOP: bulk for 120s (+3s ramp)",
+    "[bench] netem removed from vtop-bench-netem"
+   ]
+  }
+ ]
+}

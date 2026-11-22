@@ -119,10 +119,21 @@ What is tested today:
   a restart ([`scripts/upgrade-compat.sh`](../../scripts/upgrade-compat.sh)).
 - The metadata tier rolls from the newest release to the current build, one
   voter at a time (live-chaos scenario 22).
+- A metadata voter's directory (the Raft log, the snapshot, the applied,
+  purged and hard-state files), written by the published `vtop-node` of
+  v0.8.0, v0.9.0 and v0.10.1 at the highest feature level each accepts, must
+  open under the current build: the same applied index, voter set, feature
+  level and record generations the release reported, a read-only open that
+  rewrites nothing, and a new write that survives a reopen
+  (`released_meta_dirs` in `vtop-meta`; the fixtures carry a `PROVENANCE`).
+  [`scripts/compat/cells/meta.sh`](../../scripts/compat/cells/meta.sh) runs
+  the same live, in both directions, against a released binary.
 - The released `vtopctl` of v0.7.0 and later is run over a manifest archive
   the current build wrote: v0.8.0 and later must verify it, and v0.7.0 must
   report the documented self-hash failure
-  ([`scripts/manifest-compat.sh`](../../scripts/manifest-compat.sh)).
+  ([`scripts/manifest-compat.sh`](../../scripts/manifest-compat.sh), run by the
+  [Compat workflow](../../.github/workflows/compat.yml) on the published,
+  signature-checked release binaries).
 
 ## Downgrade
 
@@ -143,19 +154,22 @@ it.
   one-way step is justified in its pull request and has a refusal test. (The
   SQLite ledger has no such gate yet; see the change rules.)
 - **After a feature level is raised,** the metadata tier can go back only by
-  restoring a backup taken before the raise. That restore will be documented
-  and drilled with the backup work
-  ([#734](https://github.com/allamiro/vtop-engine/issues/734)); until then
-  there is no tested way back after a raise, and there is no export tool.
+  restoring a backup taken before the raise. The ledger's restore is
+  documented and drilled
+  ([#734](https://github.com/allamiro/vtop-engine/issues/734),
+  [Backup and recovery](../operate/backup-and-recovery.md)); the metadata
+  tier's is not, so there is no tested way back after a raise, and there is no
+  export tool.
 
 What an older binary does with newer data, by case:
 
 | Newer data | The N-1 binary | Policy (target) | Tested today |
 |---|---|---|---|
 | A nullable ledger column | Names its own columns, ignores the new one and writes `NULL` in the rows it inserts. A later release reads `NULL` as unknown. | Supported. No marker bump, and the column is never dropped. Only N-1 shares a PostgreSQL ledger with N. | No |
+| A Kafka progress marker with a `topic_id` | Ignores the key. It resumes a partition from the newest committed row, as it always did, and its pruning keeps that row. | Supported: an optional field in an unhashed document, read as unknown when absent. | No |
 | A ledger row in a state, or of a source type, N-1 does not know | Fails closed. | One-way: needs a marker or version bump, so the refusal comes at startup and not mid-run. | No |
-| A `0.4` manifest | v0.8.0 and later verify it; v0.7.0 and earlier report it as tampered. | The documented cutoff. Archives are never rewritten; set `write_version: "0.3"` to stop writing more. | Yes: v0.7.0, and v0.8.0 and later (`manifest-compat`) |
-| A metadata log entry or snapshot record from a raised feature level | The voter refuses to start, saying *newer format*, and changes nothing. Today that holds for a new command kind, log entry kind, value tag or key category; other enum values inside records are reported as corrupt until [#763](https://github.com/allamiro/vtop-engine/pull/763). | One-way at the raise, which is operator-gated and permanent. The notes say which level first puts a new kind in the log. | No |
+| A `0.4` manifest | v0.8.0 and later verify it; v0.7.0 and earlier report it as tampered. | The documented cutoff. Archives are never rewritten; set `write_version: "0.3"` to stop writing more. | Yes: v0.7.0, and v0.8.0 and later (the `manifest` cell of the Compat workflow) |
+| A metadata log entry or snapshot record from a raised feature level | The voter refuses to start, saying *newer format*, and changes nothing. Today that holds for a new command kind, log entry kind, value tag or key category; other enum values inside records are reported as corrupt until [#763](https://github.com/allamiro/vtop-engine/pull/763). A raise whose level a release does not support is not such a record: the command is one it decodes, and it applies it as a rejection. | One-way at the raise, which is operator-gated and permanent. The notes say which level first puts a new kind in the log. | Partly. Level 8 is the highest raise today and adds no kind: v0.10.1 reads it, and v0.8.0 and v0.9.0 (level 7) open the directory and take writes: they report level 3 while the raise is still in the log (they apply it as a rejection) and level 8 once it is inside a snapshot (they install the snapshot as it is), so the downgrade is silent, not refused. No release writes a kind an older one cannot decode yet, so the refusal has no live case (`meta.sh` takes `refuse` for the release that adds one) |
 | A segment v2 directory | Every release since v0.5.0 reads v2. | Supported. A later segment version follows [reader first](#reader-first). | No |
 
 ## Deprecation
@@ -206,7 +220,21 @@ What an older binary does with newer data, by case:
 
 Every persisted and wire format, its version marker, its class and its
 status now and at 1.0. The progress-marker JSON key names `path` and
-`end_byte` are frozen as they are: PostgreSQL indexes read them.
+`end_byte`, and for a Kafka marker `topic`, `partition`, `consumer_group`,
+`end_offset` and `topic_id`, are frozen as they are: PostgreSQL indexes read
+them.
+
+The Kafka marker's `topic_id` (the broker's UUID for the topic, base64url
+without padding) is optional and **ledger only**: a manifest never carries it
+(`for_manifest` clears it, as for a file marker's fingerprints), so manifests
+are byte for byte what every released reader verifies. A row written before
+the field existed has none and reads as unknown, and so does a row written
+against a broker that gives topics no id (before Kafka 2.8) or did not answer.
+The ledger resumes a Kafka partition from the highest committed end among the
+rows of one topic id; rows with no id keep the older rule (the newest row), and
+the two kinds are never ranked against each other. An older release ignores the
+key, resumes by the older rule and prunes by it; going back to it restores
+that rule and the duplicate it allows after a failed source commit.
 
 The table is generated from the format registry,
 [`scripts/compat/formats.yaml`](../../scripts/compat/formats.yaml), which also
@@ -229,7 +257,7 @@ table differs from what the registry generates. Edit the registry and run
 | 4 | Ledger digest (`ledger-digest-*.jsonl`) | `vtop_ledger_digest` `1` | A | evolving | stable, read forever |
 | 5 | State ledger, SQLite | `PRAGMA user_version` `1` | B | evolving | stable |
 | 6 | State ledger, PostgreSQL | schema marker `3` | B | evolving | stable |
-| 7 | Progress markers (ledger, digests, manifests) | none: optional fields | B | evolving; key names frozen | stable |
+| 7 | Progress markers (ledger, digests, manifests) | none: optional fields (Kafka `topic_id`: ledger only, never in a manifest) | B | evolving; key names frozen | stable |
 | 8 | `audit_events` table and hash chain | `audit_version` column | B | evolving | stable |
 | 9 | Audit record (JSONL) | `audit_version` `1` | B | evolving | stable |
 | 10 | Segment log v1 and v2, index, chunk sidecar, commit marker | `VTOPSEG1`, `VTOPREC1`, `VTOPIDX1`; `VTOPSEG2`, `VTOPREC2`; `VTOPCHK1`; `VTOPCMT1` | B | v1 stable, v2 evolving | v1 stable; v2's status and the release that makes it the default writer are decided in their own issue |

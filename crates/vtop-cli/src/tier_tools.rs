@@ -418,6 +418,27 @@ pub async fn run_tier_copy(
         ));
     }
 
+    // The manifest is verified the way the segment was, not only read back:
+    // `verify_object` is where a backend judges how the object was STORED, and
+    // with `upload.server_side_encryption` set in the --upload-config file the
+    // s3_native backend fails an object the store reports unencrypted, or under
+    // another key. Without this, a store or proxy that encrypts the segment and
+    // drops the encryption on the manifest would still yield evidence. The
+    // manifest is small, so the extra HEAD and read-back are cheap. Passing is
+    // required; a backend-limited pass is enough here, because the byte
+    // equality below is what proves the content.
+    let manifest_verification = backend
+        .verify_object(
+            &manifest_uri,
+            manifest_bytes.len() as u64,
+            Some(ObjectChecksum::new("blake3", &manifest_digest)),
+        )
+        .await
+        .map_err(|error| refuse("manifest verify", error))?;
+    if !manifest_verification.passed {
+        return Err(refuse("manifest verify", manifest_verification.message));
+    }
+
     // `verify_object` is required to hash the actual stored body (or use a
     // storage-service-computed checksum) for a non-limited success. Because
     // the local file already passed the root-pinned segment verifier, exact
@@ -1309,6 +1330,120 @@ mod tests {
         }
     }
 
+    /// A store (or a proxy in front of it) that keeps the segment as asked but
+    /// drops the encryption on the manifest: its verification of the manifest
+    /// fails the way the s3_native backend's does for an object it reports
+    /// unencrypted. Everything else is the mock's.
+    struct ManifestStoredUnencrypted(MockBackend);
+
+    #[async_trait]
+    impl UploadBackend for ManifestStoredUnencrypted {
+        async fn put_object(
+            &self,
+            local_path: &Path,
+            object_uri: &str,
+            checksum: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::StoredObject, VtopError> {
+            self.0.put_object(local_path, object_uri, checksum).await
+        }
+        async fn put_manifest(
+            &self,
+            local_path: &Path,
+            manifest_uri: &str,
+            checksum: Option<ObjectChecksum<'_>>,
+        ) -> Result<StoredManifest, VtopError> {
+            self.0
+                .put_manifest(local_path, manifest_uri, checksum)
+                .await
+        }
+        async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {
+            self.0.head_object(object_uri).await
+        }
+        async fn get_object(&self, object_uri: &str) -> Result<Vec<u8>, VtopError> {
+            self.0.get_object(object_uri).await
+        }
+        async fn get_object_bounded(
+            &self,
+            object_uri: &str,
+            max_bytes: usize,
+        ) -> Result<Vec<u8>, VtopError> {
+            self.0.get_object_bounded(object_uri, max_bytes).await
+        }
+        async fn verify_object(
+            &self,
+            object_uri: &str,
+            expected_size: u64,
+            expected: Option<ObjectChecksum<'_>>,
+        ) -> Result<VerificationResult, VtopError> {
+            if object_uri.ends_with(".manifest.json") {
+                return Ok(VerificationResult::failed(
+                    "encryption at rest missing: the store reports no server-side encryption \
+                     on the stored object",
+                ));
+            }
+            self.0
+                .verify_object(object_uri, expected_size, expected)
+                .await
+        }
+        async fn delete_object(&self, object_uri: &str) -> Result<(), VtopError> {
+            self.0.delete_object(object_uri).await
+        }
+        async fn bucket_versioning(
+            &self,
+            bucket: &str,
+        ) -> Result<vtop_upload::BucketFeature, VtopError> {
+            self.0.bucket_versioning(bucket).await
+        }
+        fn backend_name(&self) -> &'static str {
+            "manifest-unencrypted"
+        }
+        fn supports_object_versions(&self) -> bool {
+            self.0.supports_object_versions()
+        }
+        fn supports_checksum_verification(&self) -> bool {
+            true
+        }
+        fn supports_multipart(&self) -> bool {
+            false
+        }
+        async fn get_object_pinned(
+            &self,
+            object_uri: &str,
+            version_id: &str,
+            max_bytes: usize,
+        ) -> Result<Vec<u8>, VtopError> {
+            self.0
+                .get_object_pinned(object_uri, version_id, max_bytes)
+                .await
+        }
+    }
+
+    /// Review of the encryption-at-rest change: the tier copy verified the
+    /// segment through `verify_object` but only read the manifest back, so a
+    /// store that dropped the encryption on the manifest alone still produced
+    /// CommitTierEvidence. A manifest that fails verification must refuse.
+    #[tokio::test]
+    async fn tier_copy_refuses_a_manifest_the_store_reports_unencrypted() {
+        let directory = tempfile::tempdir().unwrap();
+        let sealed = seal_bundle(directory.path());
+        let root = sealed_root(&sealed);
+        // The same request against the plain mock succeeds, so the refusal
+        // below is the manifest verification and nothing else.
+        run_tier_copy(&MockBackend::new(), &request(&sealed, root))
+            .await
+            .expect("the plain mock copies");
+        let error = run_tier_copy(
+            &ManifestStoredUnencrypted(MockBackend::new()),
+            &request(&sealed, root),
+        )
+        .await
+        .expect_err("an unencrypted manifest must not yield evidence");
+        assert!(
+            error.contains("manifest verify") && error.contains("encryption at rest missing"),
+            "{error}"
+        );
+    }
+
     #[tokio::test]
     async fn tier_copy_multipart_path_still_pins_versions_and_commits_evidence() {
         let directory = tempfile::tempdir().unwrap();
@@ -1569,6 +1704,7 @@ mod tests {
             max_egress_bytes_per_second: None,
             max_concurrency_ceiling: None,
             object_lock: None,
+            server_side_encryption: Default::default(),
         };
         let state_dir = PathBuf::from("/work");
         // The engine path: from_upload, no overrides.
