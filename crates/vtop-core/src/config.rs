@@ -981,6 +981,13 @@ pub struct UploadConfig {
     /// floor and drain older engines first (docs/OBJECT_LOCK_DEPLOYMENT.md).
     #[serde(default)]
     pub object_lock: Option<ObjectLockConfig>,
+    /// Server-side encryption at rest for every object, manifest and receipt
+    /// write (`s3_native` only; any other backend is refused at load when a
+    /// mode other than `none` is set). `none`, the default, sends no
+    /// encryption header and checks nothing, exactly as before the key
+    /// existed. See [`ServerSideEncryptionConfig`].
+    #[serde(default)]
+    pub server_side_encryption: ServerSideEncryptionConfig,
     /// Byte size of each multipart part (except possibly the last). Used by
     /// resumable uploads for large sealed segments (#191). Default 8 MiB.
     /// Real S3 requires at least 5 MiB for non-final parts; mock/local tests
@@ -1117,6 +1124,119 @@ pub struct ObjectLockConfig {
     /// `s3:PutObjectLegalHold` removes it. Default false.
     #[serde(default)]
     pub legal_hold: bool,
+}
+
+/// How `upload.server_side_encryption` asks the store to encrypt what it
+/// writes. SSE-C (a key the client supplies on every request) is not a mode:
+/// VTOP never holds an object key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum ServerSideEncryptionMode {
+    /// No encryption header; nothing is checked. The default.
+    #[default]
+    #[serde(rename = "none")]
+    None,
+    /// `x-amz-server-side-encryption: AES256`, with keys the store manages.
+    #[serde(rename = "sse-s3")]
+    SseS3,
+    /// `x-amz-server-side-encryption: aws:kms`, optionally with a key id.
+    #[serde(rename = "sse-kms")]
+    SseKms,
+}
+
+impl ServerSideEncryptionMode {
+    /// The config spelling, and the `mode` label of
+    /// `vtop_server_side_encryption_mode`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::SseS3 => "sse-s3",
+            Self::SseKms => "sse-kms",
+        }
+    }
+
+    /// The value S3 uses on the wire (`x-amz-server-side-encryption`), and
+    /// reports back on a HEAD; `None` for `none`.
+    pub fn as_s3(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::SseS3 => Some("AES256"),
+            Self::SseKms => Some("aws:kms"),
+        }
+    }
+}
+
+impl fmt::Display for ServerSideEncryptionMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The most characters `upload.server_side_encryption.kms_key_id` accepts.
+/// A key ARN is well under this; the bound only refuses a pasted blob.
+pub const MAX_KMS_KEY_ID_LEN: usize = 2048;
+
+/// `upload.server_side_encryption`. Unknown keys are refused: a misspelled
+/// key in an encryption policy must not fall back to "not encrypted".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ServerSideEncryptionConfig {
+    /// `none` (default), `sse-s3` or `sse-kms`.
+    #[serde(default)]
+    pub mode: ServerSideEncryptionMode,
+    /// `sse-kms` only, optional: the KMS key (id, key ARN, alias or alias
+    /// ARN). Absent, the request names no key and the store uses its default
+    /// KMS key (on AWS, the account's AWS-managed `aws/s3` key).
+    #[serde(default)]
+    pub kms_key_id: Option<String>,
+    /// `sse-kms` only: ask S3 to use an S3 Bucket Key, which cuts the KMS
+    /// request cost of a busy bucket. Default false.
+    #[serde(default)]
+    pub bucket_key: bool,
+}
+
+impl ServerSideEncryptionConfig {
+    /// Whether any encryption is asked for.
+    pub fn is_requested(&self) -> bool {
+        self.mode != ServerSideEncryptionMode::None
+    }
+
+    /// The block's own rules, independent of the backend. Each refusal names
+    /// the keys involved.
+    pub fn validate(&self) -> Result<(), VtopError> {
+        match self.mode {
+            ServerSideEncryptionMode::None | ServerSideEncryptionMode::SseS3 => {
+                if self.kms_key_id.is_some() || self.bucket_key {
+                    let key = if self.kms_key_id.is_some() {
+                        "upload.server_side_encryption.kms_key_id"
+                    } else {
+                        "upload.server_side_encryption.bucket_key"
+                    };
+                    return Err(VtopError::Config(format!(
+                        "{key} is set, but upload.server_side_encryption.mode is \"{}\": \
+                         a KMS key and a bucket key apply to \"sse-kms\" only. Set \
+                         mode: sse-kms or remove the key",
+                        self.mode
+                    )));
+                }
+            }
+            ServerSideEncryptionMode::SseKms => {
+                if let Some(id) = &self.kms_key_id {
+                    if id.is_empty()
+                        || id.len() > MAX_KMS_KEY_ID_LEN
+                        || id.chars().any(|c| c.is_whitespace() || c.is_control())
+                    {
+                        return Err(VtopError::Config(format!(
+                            "upload.server_side_encryption.kms_key_id is empty, longer than \
+                             {MAX_KMS_KEY_ID_LEN} characters, or contains whitespace: give a \
+                             KMS key id, key ARN or alias, or remove the key to use the \
+                             store's default KMS key"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Redundancy / forward-error-correction policy for an egress path (#480).
@@ -1295,6 +1415,39 @@ impl UploadConfig {
         } else {
             EgressTuning::default()
         }
+    }
+
+    /// `upload.server_side_encryption`'s rules, on `UploadConfig` and called
+    /// from `build_backend` as well as [`VtopConfig::validate`], for the
+    /// reason [`Self::validate_object_lock`] is. A mode other than `none` is
+    /// refused on every backend but `s3_native`, which is the only one that
+    /// puts the encryption headers on each write and reads the store's answer
+    /// back; the others would write plaintext while the config says
+    /// otherwise. An unknown backend name is left to `build_backend`.
+    pub fn validate_server_side_encryption(&self) -> Result<(), VtopError> {
+        let sse = &self.server_side_encryption;
+        sse.validate()?;
+        if !sse.is_requested() {
+            return Ok(());
+        }
+        let why = match self.backend.as_str() {
+            "s3cmd" | "awscli" | "minio" => Some(
+                "it shells out to an external CLI, which sends the request itself; VTOP cannot \
+                 add the encryption headers to it or read back how the object was stored",
+            ),
+            "localfs" => Some("it writes plain files to a local directory"),
+            "mock" | "mock_fail" | "mock_limited" => Some("it keeps objects in memory"),
+            _ => None,
+        };
+        if let Some(why) = why {
+            return Err(VtopError::Config(format!(
+                "upload.server_side_encryption.mode is \"{}\", but the {} backend cannot \
+                 write an encrypted object: {why}. Nothing was built. Only s3_native supports \
+                 it; use s3_native or set mode: none",
+                sse.mode, self.backend
+            )));
+        }
+        Ok(())
     }
 
     /// The S3 Object Lock profile's own rules (#684), on `UploadConfig` and
@@ -1894,6 +2047,7 @@ impl VtopConfig {
         // UploadConfig itself and every consumer runs them.
         self.upload.validate_transports()?;
         self.upload.validate_object_lock()?;
+        self.upload.validate_server_side_encryption()?;
         if self.upload.multipart_part_size_bytes == 0 {
             return Err(VtopError::Config(
                 "upload.multipart_part_size_bytes must be > 0".into(),
@@ -4197,6 +4351,101 @@ upload:
         // The default: no block, and none of the rules above applies, even
         // with create_bucket set and versioning off.
         object_lock_config("  create_bucket: true\n").expect("valid as before");
+    }
+
+    #[test]
+    fn a_server_side_encryption_block_parses_every_mode_and_refuses_the_rest() {
+        let default = object_lock_config("  create_bucket: true\n").expect("valid as before");
+        assert_eq!(
+            default.upload.server_side_encryption.mode,
+            ServerSideEncryptionMode::None,
+            "no block is no encryption"
+        );
+        assert!(!default.upload.server_side_encryption.is_requested());
+
+        for (block, mode, key, bucket_key) in [
+            ("mode: none", ServerSideEncryptionMode::None, None, false),
+            ("mode: sse-s3", ServerSideEncryptionMode::SseS3, None, false),
+            // No key id is a mode of its own: the store's default KMS key.
+            ("mode: sse-kms", ServerSideEncryptionMode::SseKms, None, false),
+            (
+                "mode: sse-kms\n    kms_key_id: arn:aws:kms:eu-west-1:111122223333:key/abc\n    bucket_key: true",
+                ServerSideEncryptionMode::SseKms,
+                Some("arn:aws:kms:eu-west-1:111122223333:key/abc"),
+                true,
+            ),
+        ] {
+            let cfg = object_lock_config(&format!("  server_side_encryption:\n    {block}\n"))
+                .unwrap_or_else(|e| panic!("{block}: {e}"));
+            let sse = &cfg.upload.server_side_encryption;
+            assert_eq!(sse.mode, mode, "{block}");
+            assert_eq!(sse.kms_key_id.as_deref(), key, "{block}");
+            assert_eq!(sse.bucket_key, bucket_key, "{block}");
+        }
+
+        for (block, names) in [
+            ("mode: sse-c", "sse-c"),
+            (
+                "mode: sse-s3\n    kms_key_id: k",
+                "upload.server_side_encryption.kms_key_id",
+            ),
+            (
+                "mode: sse-s3\n    bucket_key: true",
+                "upload.server_side_encryption.bucket_key",
+            ),
+            ("kms_key_id: k", "upload.server_side_encryption.kms_key_id"),
+            (
+                "mode: sse-kms\n    kms_key_id: \"\"",
+                "upload.server_side_encryption.kms_key_id",
+            ),
+            (
+                "mode: sse-kms\n    kms_key_id: \"a b\"",
+                "upload.server_side_encryption.kms_key_id",
+            ),
+            ("mode: sse-kms\n    kms_key: k", "kms_key"),
+        ] {
+            let msg = object_lock_config(&format!("  server_side_encryption:\n    {block}\n"))
+                .expect_err(block);
+            assert!(msg.contains(names), "{block}: {msg}");
+        }
+    }
+
+    #[test]
+    fn server_side_encryption_is_refused_at_load_on_every_backend_but_s3_native() {
+        for backend in [
+            "localfs",
+            "s3cmd",
+            "awscli",
+            "minio",
+            "mock",
+            "mock_fail",
+            "mock_limited",
+        ] {
+            for mode in ["sse-s3", "sse-kms"] {
+                let msg = object_lock_config(&format!(
+                    "  backend: {backend}\n  local_path: /tmp/x\n  server_side_encryption:\n    mode: {mode}\n"
+                ))
+                .expect_err(backend);
+                assert!(
+                    msg.contains("upload.server_side_encryption")
+                        && msg.contains(backend)
+                        && msg.contains("s3_native"),
+                    "[{backend} {mode}] {msg}"
+                );
+            }
+            // The default is not a request: `none` is accepted anywhere. (The
+            // block's own rule, not a whole config: a command backend also
+            // needs a binary path, which is not what is under test.)
+            let upload: UploadConfig = serde_yaml::from_str(&format!(
+                "bucket: b\nbackend: {backend}\nserver_side_encryption:\n  mode: none\n"
+            ))
+            .unwrap();
+            upload
+                .validate_server_side_encryption()
+                .unwrap_or_else(|e| panic!("[{backend}] mode none is accepted: {e}"));
+        }
+        object_lock_config("  backend: s3_native\n  server_side_encryption:\n    mode: sse-s3\n")
+            .expect("s3_native honours it");
     }
 
     #[test]

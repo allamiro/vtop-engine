@@ -79,7 +79,7 @@ archive is complete, then the procedures you will need less often.
 
     ---
 
-    What the engine recovers by itself, and what you must back up.
+    What to back up, the commands to restore the ledger, and the RPO and RTO a drill measures.
 
     [:octicons-arrow-right-24: Backup and recovery](backup-and-recovery.md)
 
