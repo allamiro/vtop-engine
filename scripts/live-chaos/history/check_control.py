@@ -13,7 +13,7 @@ answered (`invoke_ms`, `complete_ms`). An observation that failed
   lease_holder  one holder per lease epoch, across every lease read
   lease_order   lease reads are linearizable: a read that begins after
                 another read ended never reports an older range fencing
-                epoch. The epoch only ever grows, so this real-time order is
+                epoch, nor "not found" for a range a read already found. The epoch only ever grows, so this real-time order is
                 exactly what a linearizable history of reads allows
   meta_index    the same for the applied index each read was served at: a
                 linearizable metadata read never goes back in the log
@@ -118,7 +118,8 @@ def check(events: list[dict], stall_ms: int | None = None, require_observations:
     violations: dict[str, list] = defaultdict(list)
     ok = [e for e in events if e["ok"]]
     status = [e for e in ok if e["op"] == "meta_status"]
-    reads = [e for e in ok if e["op"] == "lease_read" and e.get("found", True)]
+    answered = [e for e in ok if e["op"] == "lease_read"]
+    reads = [e for e in answered if e.get("found", True)]
     nodes = [e for e in ok if e["op"] == "node_lease"]
 
     # --- meta_leader: one Raft leader per term ------------------------------
@@ -152,8 +153,13 @@ def check(events: list[dict], stall_ms: int | None = None, require_observations:
             })
 
     # --- lease_order and meta_index: linearizable reads ---------------------
-    _monotonic(reads, "range_epoch", "lease_order", "range fencing epoch", violations)
-    _monotonic(reads, "applied_index", "meta_index", "applied index", violations)
+    # A "not found" answer is a read too (review of #904): it is ordered as
+    # an epoch below every real one, so a range that was found and then is
+    # not is a read going back, and its applied index is held to the same
+    # order as every other read's.
+    ordered = [dict(r, _epoch=r.get("range_epoch") if r.get("found", True) else -1) for r in answered]
+    _monotonic(ordered, "_epoch", "lease_order", "range fencing epoch (-1: not found)", violations)
+    _monotonic(answered, "applied_index", "meta_index", "applied index", violations)
 
     # --- the data plane's claims ---------------------------------------------
     claims = [n for n in nodes if n.get("active") and n.get("epoch") is not None

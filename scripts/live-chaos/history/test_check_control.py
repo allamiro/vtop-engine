@@ -120,6 +120,15 @@ class Violations(unittest.TestCase):
         events = [read(0, 5, B, index=50), read(100, 4, A, index=60)]
         self.assertIn("lease_order", self.kinds(events))
 
+    def test_a_range_not_found_after_it_was_found(self):
+        # Review of #904: an answered "not found" is a read too.
+        gone = dict(read(100, 0, index=0), found=False, range_epoch=None)
+        self.assertEqual(self.kinds([read(0, 5, B, index=50), gone]), {"lease_order", "meta_index"})
+
+    def test_not_found_before_the_range_exists_is_valid(self):
+        early = dict(read(0, 0, index=1), found=False, range_epoch=None)
+        self.assertTrue(run([early, read(100, 1, A, index=10)])["valid"])
+
     def test_an_applied_index_going_back(self):
         events = [read(0, 5, B, index=60), read(100, 5, B, index=50)]
         self.assertEqual(self.kinds(events), {"meta_index"})

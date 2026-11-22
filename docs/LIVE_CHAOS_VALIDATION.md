@@ -290,7 +290,7 @@ and `check_history` runs `check_control.py` over what it has written so far
 |---|---|
 | `meta_leader` | two metadata nodes Leader in one Raft term, or a committed vote naming another leader for the term |
 | `lease_holder` | one lease epoch read with two holders |
-| `lease_order` | a lease read that began after another ended reporting an older range fencing epoch. The epoch only grows, so this real-time order is exactly what a linearizable history of reads allows |
+| `lease_order` | a lease read that began after another ended reporting an older range fencing epoch, or "not found" for a range a read already found. The epoch only grows, so this real-time order is exactly what a linearizable history of reads allows |
 | `meta_index` | the same for the applied index a read was served at: a linearizable metadata read never goes back in the log |
 | `epoch_leader` | two data nodes acting as the leaseholder of one epoch, or a node acting as the leaseholder of an epoch metadata granted to another |
 | `unknown_grant` | a node acting on an epoch that a lease read begun afterwards does not reach: a grant metadata never made, or lost |
