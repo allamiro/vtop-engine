@@ -65,6 +65,9 @@ class Kind(NamedTuple):
     forbidden: Callable[[str, str, str], str | None] | None = None
     # One row -> its problems (kind-specific rules), or an empty list.
     check_row: Callable[[dict[str, str]], list[str]] | None = None
+    # One ok row -> why it cannot be added to or ranked against other runs' totals, or None. The row stays in
+    # the CSV with its observed counts; a report leaves it out of comparative totals and says so.
+    unusable: Callable[[dict[str, str]], str | None] | None = None
     rotate_systems: bool = False
 
     @property
