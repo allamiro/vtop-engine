@@ -119,7 +119,7 @@ jobs:
       - name: Seed the fuzz lockfile from the workspace
         run: cp Cargo.lock fuzz/Cargo.lock
       # The matrix is whatever the crate declares, so a target added to
-      # fuzz/Cargo.toml (#706's meta_decode, for one) runs here with no edit.
+      # fuzz/Cargo.toml (meta_decode, for one) runs here with no edit.
       - name: List the targets
         id: targets
         run: |

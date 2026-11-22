@@ -1072,3 +1072,153 @@ fn sim_injected_storage_errors_surface_poison_and_stay_recoverable() {
         }
     }
 }
+
+/// A disk that fills during a roll, at every storage operation of the roll,
+/// and stays full until it is freed (#881, finding 1).
+///
+/// The cluster soak filled a follower's data directory while its tail was
+/// due to roll. The failed roll left the range with no tail, and every later
+/// call panicked — `/metrics` included — until the process was restarted,
+/// even after the disk was freed. A full disk is an operational condition,
+/// not a programming error: the range must keep answering (with an error
+/// where it cannot write), and must append again once space is back,
+/// without a restart and without losing or reordering a record.
+#[test]
+fn sim_a_roll_that_hits_a_full_disk_fails_closed_and_recovers_once_space_is_freed() {
+    sweep_roll_under_full_disk(&build_rolled_range);
+}
+
+/// The same sweep over a v2 range: its seal publishes a chunk sidecar and a
+/// richer manifest, so it has more steps a full disk can land on.
+#[test]
+fn sim_a_v2_roll_that_hits_a_full_disk_fails_closed_and_recovers_once_space_is_freed() {
+    sweep_roll_under_full_disk(&build_rolled_range_v2);
+}
+
+fn sweep_roll_under_full_disk(build: &dyn Fn(&Env) -> SegmentSet) {
+    // Clean run: find the next append that rolls, and the storage
+    // operations that append issues.
+    let (rolling_sequence, roll_start, roll_end) = {
+        let sim = SimStorage::new();
+        sim.create_dir_all(Path::new(ROOT));
+        let env = sim.env(SEED);
+        let mut set = build(&env);
+        loop {
+            let sequence = set.next_offset();
+            let sealed_before = set.sealed().len();
+            let start = sim.op_count();
+            set.append_group(
+                &[range_record(sequence)],
+                Durability::Fsync,
+                Uuid::from_u128(50_000 + sequence as u128),
+            )
+            .unwrap();
+            if set.sealed().len() > sealed_before {
+                break (sequence, start, sim.op_count());
+            }
+        }
+    };
+    assert!(
+        roll_end > roll_start,
+        "the rolling append must touch storage"
+    );
+
+    for op in roll_start..roll_end {
+        let context = format!("disk full from op={op} seed={SEED:#x}");
+        let sim = SimStorage::new();
+        sim.create_dir_all(Path::new(ROOT));
+        let env = sim.env(SEED);
+        let mut set = build(&env);
+        while set.next_offset() < rolling_sequence {
+            let sequence = set.next_offset();
+            set.append_group(
+                &[range_record(sequence)],
+                Durability::Fsync,
+                Uuid::from_u128(50_000 + sequence as u128),
+            )
+            .unwrap();
+        }
+        let base = set.base_offset();
+
+        // The disk fills at `op` and stays full.
+        sim.set_fault(FaultPlan::FailOpsFrom {
+            op,
+            kind: std::io::ErrorKind::StorageFull,
+        });
+        let first = set.append_group(
+            &[range_record(rolling_sequence)],
+            Durability::Fsync,
+            Uuid::from_u128(60_000),
+        );
+        let acked = match first {
+            Ok(outcomes) => {
+                assert_eq!(outcomes[0].offset(), rolling_sequence, "{context}");
+                rolling_sequence + 1
+            }
+            Err(_) => rolling_sequence,
+        };
+
+        // Still full. Every accessor answers instead of panicking, and the
+        // range still describes exactly what it acknowledged.
+        assert_eq!(set.base_offset(), base, "{context}");
+        assert_eq!(set.next_offset(), acked, "{context}");
+        assert_eq!(set.committed_offset(), acked, "{context}");
+        let _ = set.fetch_through(0, usize::MAX, usize::MAX, acked);
+        let _ = set.sealed().len();
+        let _ = set.active().next_offset();
+        assert!(
+            set.append_group(
+                &[range_record(acked)],
+                Durability::Fsync,
+                Uuid::from_u128(60_001),
+            )
+            .is_err(),
+            "a write to a full disk must fail ({context})"
+        );
+        assert!(set.commit().is_err() || set.committed_offset() == acked);
+        assert_eq!(set.next_offset(), acked, "{context}");
+
+        // Space is freed. The same set appends again — no reopen, no restart —
+        // at exactly the frontier it acknowledged, and keeps rolling.
+        sim.set_fault(FaultPlan::None);
+        let resumed_to = acked + 12;
+        for sequence in acked..resumed_to {
+            let outcomes = set
+                .append_group(
+                    &[range_record(sequence)],
+                    Durability::Fsync,
+                    Uuid::from_u128(70_000 + sequence as u128),
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "append {sequence} must succeed once space is freed ({context}): {error}"
+                    )
+                });
+            assert_eq!(outcomes[0].offset(), sequence, "{context}");
+        }
+        assert_eq!(set.committed_offset(), resumed_to, "{context}");
+        let read_back = |set: &mut SegmentSet, context: &str| {
+            let batch = set
+                .fetch_through(0, usize::MAX, usize::MAX, resumed_to)
+                .unwrap_or_else(|error| panic!("read must succeed ({context}): {error}"));
+            assert_eq!(batch.records.len() as u64, resumed_to, "{context}");
+            for (index, fetched) in batch.records.iter().enumerate() {
+                assert_eq!(fetched.offset, index as u64, "{context}");
+                assert_eq!(
+                    fetched.record.value,
+                    range_record(index as u64).value,
+                    "{context}"
+                );
+            }
+        };
+        read_back(&mut set, &context);
+        drop(set);
+
+        // And what it left on disk is a range that opens cleanly.
+        let mut reopened = SegmentSet::open_in(&env, Path::new(ROOT))
+            .unwrap_or_else(|error| panic!("the range must reopen ({context}): {error}"))
+            .unwrap_or_else(|| panic!("the range disappeared ({context})"));
+        assert_eq!(reopened.next_offset(), resumed_to, "{context}");
+        read_back(&mut reopened, &format!("{context}, reopened"));
+    }
+}

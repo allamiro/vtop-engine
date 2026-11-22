@@ -1,0 +1,21 @@
+# Written by scripts/compat/regenerate-meta-fixtures.sh v0.10.1 aarch64-unknown-linux-gnu.
+tag: v0.10.1
+asset: vtop-engine-0.10.1-aarch64-unknown-linux-gnu.tar.gz
+asset_sha256: 173aa74cd79af1d20dc0a6d6b831eab800e83e87926942b1e9be3ff9dd0f82f0
+binary: vtop-node
+command: >-
+  scripts/compat/meta-scenario.sh with LEVEL=max and ENTRIES=5100: one voter
+  of the release on plaintext loopback (vtop-node meta), vtopctl meta init,
+  register-node three times, create-topic, enable-features up to the highest
+  level the release accepts (8), 5100 register-node re-registrations of
+  one node; the voter stopped with SIGKILL; its data directory
+input: >-
+  synthetic nodes, one topic and the fixed ids in meta-scenario.sh
+files:
+  data/log-00000000000000000001.vmlog: d622b91c6c6386870c06505854410578c4eeca8db67d79acfa6115294c15a6bd
+  data/meta.applied: 010f6a32094bd2e75ec6c4e10b68f51f7554ce06e3b75f7cb94b6e52eac9aa30
+  data/meta.hardstate: 9653b8b877575266817bb1f532821a7aacff7592cafb762c3c4461fe864a5fcc
+  data/meta.membership_log_id: 485d4290af140a9a6c283c1536e2c5778345a466547612c1093d61aeca7d0445
+  data/meta.purged: 739986be4c4569fbca3c34e11ab3e9757cf7b617098f41d0f8a43227f1913208
+  data/snapshot-00000000000000005000-00000000000000000001.vmsnap: fd6b417e121c77b92a14ad1c30303a1fb0d0596685f62f1ec38d5c16665f50c5
+  expect.txt: 85bdd83842b4a55df2448451014a6b5faa32082775f85ca964c54e2207599b27

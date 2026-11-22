@@ -6,8 +6,10 @@
 //! tracing caches each callsite's interest globally, and a concurrent test
 //! that hits the callsite first with no subscriber can hide the event.
 //!
-//! - the templated-bucket refusal: `bucket_versioning_refused`, ERROR, with
-//!   the bucket and the batch id, in three parts;
+//! - the templated-bucket refusal: `bucket_versioning_paused`, ERROR, with
+//!   the bucket and the batch id, in three parts (the engine stops writing to
+//!   a bucket that does not keep versions and checks it again on a backoff,
+//!   rather than asking the store at every batch);
 //! - a versioning check the store could not answer at startup: a WARN saying
 //!   the engine started anyway and checks again at the first upload.
 #![cfg(unix)]
@@ -40,7 +42,7 @@ async fn the_versioning_events_carry_what_an_operator_needs() {
         let (logs, _guard) = Logs::capture();
         let out = engine.process_once(SourceType::File).await.unwrap();
         assert!(!out[0].committed);
-        let event = logs.events("bucket_versioning_refused");
+        let event = logs.events("bucket_versioning_paused");
         assert_eq!(event.len(), 1, "{}", logs.raw());
         assert_eq!(text(&event[0], "bucket"), "telemetry-raw");
         assert_eq!(text(&event[0], "batch_id"), out[0].batch_id);
@@ -48,9 +50,10 @@ async fn the_versioning_events_carry_what_an_operator_needs() {
         assert_says(
             &text(&event[0], "message"),
             &[
-                "bucket telemetry-raw does not have versioning enabled",
-                "the batch was not uploaded and will be replayed",
-                "Enable versioning on the bucket",
+                "the store says bucket telemetry-raw does not have versioning enabled",
+                "the engine stopped writing to the bucket",
+                "each batch for it fails before writing anything and is replayed",
+                "re-enable versioning on bucket telemetry-raw",
             ],
         );
     }

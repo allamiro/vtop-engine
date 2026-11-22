@@ -98,6 +98,7 @@ pub fn file_config(
             max_egress_bytes_per_second: None,
             max_concurrency_ceiling: None,
             object_lock: None,
+            server_side_encryption: Default::default(),
         },
         partitioning: PartitioningConfig {
             template: DEFAULT_TEMPLATE.into(),
@@ -171,6 +172,7 @@ pub fn pipeline<'a>(
         config,
         manifest_keyring: Arc::new(config.resolve_manifest_keyring().unwrap()),
         versioned_buckets: std::sync::Arc::default(),
+        versioning_pauses: std::sync::Arc::default(),
         provisioned_buckets: std::sync::Arc::default(),
         key_notices: std::sync::Arc::default(),
         locked_buckets: std::sync::Arc::default(),
