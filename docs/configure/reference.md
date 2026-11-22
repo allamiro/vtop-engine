@@ -60,7 +60,7 @@ Default column means the key is unset unless you set it.
 | `max_batch_age_seconds` | `60` | Seal a batch this old. |
 | `source_poll_wait_ms` | `250` | Longest a read pass waits for data. Paid once per pass on the Kafka plane; file and spool reads do not wait. |
 | `idle_poll_interval_ms` | `2000` | Pause between cycles, only after a cycle that read nothing. |
-| `max_concurrent_batches` | `8` | Batches in the verify phase (compress, checksum, upload, manifest, verify) at once. Source commits stay serial. Zero is refused. Not a memory ceiling. |
+| `max_concurrent_batches` | `8` | Batches in the verify phase (compress, checksum, upload, manifest, verify) at once, across cycles: the engine reads on while they are on the wire. Source commits stay serial and in read order. Reading pauses while sealed batches hold this many times `max_bytes`, or number twice this many. Zero is refused. |
 | `adaptive_width.enabled` | `false` | Let the upload width follow the store's throttles: `max_concurrent_batches` becomes the ceiling, a throttled cycle halves the width and a clean one adds one. |
 | `adaptive_width.min_width` | `1` | The width the controller never goes below. |
 
@@ -203,7 +203,7 @@ The Kafka releases the source is tested against are listed in
 | `topic_exclude_regex` | `^__.*` | Topics to skip. |
 | `auto_offset_reset` | `earliest` | Kafka `auto.offset.reset` for a partition with no committed offset. |
 | `enable_auto_commit` | `false` | Must be `false`; `true` is refused. Offsets are committed only after verification. |
-| `security_protocol` | - | Kafka `security.protocol`. |
+| `security_protocol` | - | Kafka `security.protocol`. Unset is librdkafka's `plaintext`. Unset, `plaintext` or `sasl_plaintext` with a bootstrap server that is not a loopback address is warned about on every start and by `vtopctl validate` (#732). |
 | `sasl_mechanism` | - | Kafka `sasl.mechanism`. GSSAPI needs a build with `--features kafka-gssapi`. |
 | `sasl_username` | - | Kafka `sasl.username`. |
 | `sasl_password_env` | - | Name of the environment variable holding the SASL password. |
@@ -228,7 +228,7 @@ The Kafka releases the source is tested against are listed in
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | Read syslog spool files written by rsyslog or syslog-ng. |
-| `paths` | **Required** in the block | Glob patterns of spool files. |
+| `paths` | **Required** in the block | Glob patterns of spool files. Each batch's marker records the earliest and latest time its lines start with, when they start with an RFC 3339 or RFC 5424 timestamp ([limitations](../reference/limitations.md)). |
 
 ## `upload`
 

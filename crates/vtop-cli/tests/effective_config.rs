@@ -54,9 +54,11 @@ fn validate_without_flag_remains_byte_identical_and_default_is_always_present() 
             dir.path().join("config.yaml").display()
         )
     );
+    // The one field `--json` gained in v0.11.0 (#743): `report_version`, the
+    // version of this report's shape. Nothing else about it changed.
     assert_eq!(
         run(dir.path(), true, false).stdout,
-        b"{\"status\":\"ok\",\"warnings\":[]}\n"
+        b"{\"report_version\":1,\"status\":\"ok\",\"warnings\":[]}\n"
     );
     let out = run(dir.path(), true, true);
     assert!(

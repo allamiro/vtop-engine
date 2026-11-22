@@ -54,7 +54,7 @@ without editing a scenario:
 | `CHAOS_META_ADMIN_BASE_PORT` | `9200` | Metadata admin ports are this base plus node ID. |
 | `CHAOS_REPLICA_BASE_PORT` | `9300` | Replica ports are this base plus replica number. |
 | `CHAOS_NATIVE_PORT` | `9400` | Native producer/fetch port. |
-| `CHAOS_KAFKA_BASE_PORT` | `9420` | Kafka gateway listeners (#225): kafka-0 for scenario 16's standalone, kafka-1 for scenario 17's leader, kafka-2 for scenario 18's, kafka-3 for scenarios 19 and 20, kafka-4 and kafka-5 for scenario 21's two partitions. |
+| `CHAOS_KAFKA_BASE_PORT` | `9420` | Kafka gateway listeners (#225): kafka-0 for scenario 16's standalone, kafka-1 for scenario 17's leader, kafka-2 for scenario 18's, kafka-3 for scenarios 19 and 20, kafka-4 and kafka-5 for scenario 21's two partitions, kafka-5 again for scenario 25's. |
 | `CHAOS_META_METRICS_BASE_PORT` | `9500` | Metadata `/metrics` ports are this base plus node ID (#224). |
 | `CHAOS_DATA_METRICS_BASE_PORT` | `9600` | Data-plane `/metrics` ports: base+0 for the leader, base+1/2 for followers. |
 | `CHAOS_TOPIC_UUID` | `aaaaaaaa-…-b1` | Metadata's UUID for the topic, distinct from the wire-level topic name. |
@@ -115,7 +115,7 @@ checks is a gate that silently stops working.
 | `11-admin-authorization` | Admin transport authorization enforced by the running binary over real mTLS (#238) | An operator certificate retains the full surface; a data-node certificate is refused membership changes (and the refusal says so), may still read, and can still acquire its **own** range lease — so the policy does not break the failover path. |
 | `12-data-replica-replacement` | A data replica is lost permanently; a fresh node joins, is repaired from a survivor, and the dead replica is retired (#242) | The replica set committed is the one placement computed; `vtopctl node repair` populates the newcomer byte-for-byte and the artifact verifies independently; retirement is **refused before** the replacement proof commits and accepted after; every previously acknowledged record remains readable. |
 | `13-orderly-shutdown` | The range leader and a follower are stopped with SIGTERM instead of SIGKILL (#280) | The signal is handled within a deadline (an ignored SIGTERM fails the scenario); the departing leader releases its range lease so the replacement acquires it without waiting out the lease deadline; every acknowledged record is readable after the handoff; both stopping nodes write their final commit boundary; the stopped leader's sealed artifact verifies offline. |
-| `14-candidate-failover` | Three identical candidate configs; the range leader is SIGKILLed mid-hold (#284) | Exactly one candidate takes the range from ONE config shape — the winner is not scripted; quorum produce lands at the winner's own native address; after the kill a SURVIVOR takes the range with no process started, no config rewritten, and no port moved — the promotion appears in its log as a role change, not a restart; quorum produce resumes at the new epoch on the survivor's own address; every record acknowledged before the kill is intact; the survivor serves within 3 s (`CHAOS_PROMOTION_SERVE_LIMIT_MS`) of the lease changing hands, at a write quorum of replica streams, and logs that it serves with 1 of 2 streams connected (#750: it used to wait its whole 10 s deadline for the killed leader's stream). |
+| `14-candidate-failover` | Three identical candidate configs; the range leader is SIGKILLed mid-hold (#284) | Exactly one candidate takes the range from ONE config shape — the winner is not scripted; quorum produce lands at the winner's own native address; after the kill a SURVIVOR takes the range with no process started, no config rewritten, and no port moved — the promotion appears in its log as a role change, not a restart; quorum produce resumes at the new epoch on the survivor's own address; every record acknowledged before the kill is intact; the survivor serves within 3 s (`CHAOS_PROMOTION_SERVE_LIMIT_MS`) of the lease changing hands, at a write quorum of replica streams, and logs that it serves with 1 of 2 streams connected (#750: it used to wait its whole 10 s deadline for the killed leader's stream). The producers, every read and who led are recorded, and both history checkers pass (#728). |
 | `15-plaintext-lab` | The whole cluster on loopback without a certificate: every plane `transport: plaintext` (#294) | The lab boots and serves; a leased replicated leader is refused on a plaintext replica plane, naming the knob to turn (`replica_transport: tls`); a plaintext listener off loopback is refused, naming the way out; the warnings are on the log. |
 | `16-kafka-gateway` | A standalone node serves Kafka's wire protocol beside its native plane (#225), exercised with nothing but bash and `/dev/tcp` | ApiVersions v0 answers with the served keys; Metadata v1 names the range's topic behind the gateway; a version outside the served range is refused by closing the connection; the ready line names the listener and the node warns that the protocol carries no vtop identity. |
 | `17-kafka-stock-client` | librdkafka (`kcat`) against the gateway on a leader with two followers; one follower is `SIGKILL`ed while ONE paced producer is mid-stream (#225 acceptance) | 20,000 keyed records produced with `acks=all` by one process, every delivery a quorum acknowledgement; the kill lands after a watermark floor and before the stream ends (the scenario fails if the producer had already finished); the same process finishes with no failed delivery and the watermark reaches 20,000; the same client reads everything back byte-exact and in order from `-o beginning`; the surviving follower's committed offset covers every acknowledgement; the leader's and the follower's sealed segments pass `vtopctl segment verify`. |
@@ -124,8 +124,9 @@ checks is a gate that silently stops working.
 | `20-kafka-offsets-resume` | a group's committed offset is a cursor on the metadata plane (#457 slice 2b): on a three-node data plane under a lease from a three-node metadata plane, a stock group consumer (`kcat -G`) reads the first half of the records and leaves, committing; `vtopctl meta group-cursor` reads the position back from the plane as an unpinned cursor at exactly that offset; a second consumer under the same group resumes at record N/2+1 and reads the rest byte-exact; the cursor then stands at N, and the leader's log names no refused commit. | the durable-store acceptance the issue asks for: commit, restart, resume — with the position living on the plane between the two consumers, not in the gateway |
 | `21-kafka-two-partitions` | two members of one group over two partitions, one each (#457 slice 4b): two standalone gateways, each leading one Kafka partition of the same topic and naming the other in `kafka.partitions`; a stock group (`kcat -G`, range assignor) of two members finds the one coordinator the topology elects, is assigned one partition each, and each member reads only the records produced to its partition — byte-exact, no overlap. Standalone: commits are refused by name (no metadata plane), as scenario 19; the assignment is the criterion. | the remaining in-flight acceptance of #457: two members, two partitions, one each |
 | `22-meta-rolling-upgrade` | a rolling upgrade of the metadata tier (#554): three voters start on the PREVIOUS release (`CHAOS_OLD_VTOP_NODE`) and are replaced one at a time by this build; after each replacement a write must commit within the progress deadline and every voter must reach the leader's applied index; with two voters replaced and the third still on the previous release, a leader on this build refuses `enable-features --level 8` and the refusal names the old voter as closing the connection without answering the version question (#706; while the old voter leads it is restarted, still on the previous release, until a node on this build does); once all are upgraded `vtopctl meta enable-features --level 4` raises the feature level, a voter restarted on the raised log reopens, and a lower level leaves 4 in force. Skips (exit 77, reported as SKIP by `run-all.sh`) without an old binary; CI's upgrade job runs it against the newest release tag. Against v0.6.0, raising the level with one voter still old leaves that voter unable to append (`applied 5, the leader 7`) - the failure this scenario catches, and the reason the leader gates new kinds. Then (#634) `vtopctl meta node-versions --level 8` lists the registered nodes and finds none a raise waits for (placeholders with no range and no report are not counted), `enable-features --level 7` raises the report level on the metadata tier alone, and a static range runs with one follower on the previous release and one on this build behind a leader on this build: the leader opens each session with a version hello, the old follower answers it as every release before the handshake does, and both followers must reach every acknowledged record, with no protocol error in the old follower's log. | the mixed-version check #554 asks for: the gate holds against a real previous release, not only a simulated one; and #634's: a new leader falls back to the old replica protocol against a real previous-release follower |
-| `23-acked-suffix-failover` | The #611 shape on three candidates over TLS: one follower C is SIGKILLed after a shared prefix, so the leader L and the other follower R alone acknowledge the next records; L is SIGKILLed mid-stream; R is frozen (SIGSTOP) and C restarted so C takes the lease first; R is thawed to answer C's fence; then L restarts so R has a follower that holds its tail (a new leader does not stream a lagging follower up from its log, #341). Both followers' committed offsets must cover the shared prefix before C is killed, so what C lacks is exactly the suffix. `CHAOS_611_SEED` picks the lagging follower and how much suffix is acknowledged before L dies, in [`CHAOS_611_BATCH`, `CHAOS_611_SUFFIX_MAX`] (defaults 20 and 2000); `CHAOS_611_SHARED` (default 200) sizes the prefix. | C, which lacks acknowledged records, never logs a role change to leader, and R takes the range at an epoch newer than both L's and the one C was refused at; C's refusal by R's answer (Raft §5.4.1) is reported; quorum produce resumes on the candidate that serves; every record acknowledged before the kill reads back byte-exact from it. When L returns holding records past R's tail that nobody acknowledged, nothing fences it and no quorum forms (#641): the scenario reports it and exits 77 (SKIP), never PASS. It also exits 77 when C comes back holding every acknowledged record, since the shape was then not reached. Candidates carry `lease.admin_peers` for all three metadata nodes, so a metadata leader change mid-run does not strand the lease agents. |
+| `23-acked-suffix-failover` | The #611 shape on three candidates over TLS: one follower C is SIGKILLed after a shared prefix, so the leader L and the other follower R alone acknowledge the next records; L is SIGKILLed mid-stream; R is frozen (SIGSTOP) and C restarted so C takes the lease first; R is thawed to answer C's fence; then L restarts so R has a follower that holds its tail (a new leader does not stream a lagging follower up from its log, #341). Both followers' committed offsets must cover the shared prefix before C is killed, so what C lacks is exactly the suffix. `CHAOS_611_SEED` picks the lagging follower and how much suffix is acknowledged before L dies, in [`CHAOS_611_BATCH`, `CHAOS_611_SUFFIX_MAX`] (defaults 20 and 2000); `CHAOS_611_SHARED` (default 200) sizes the prefix. | C, which lacks acknowledged records, never logs a role change to leader, and R takes the range at an epoch newer than both L's and the one C was refused at; C's refusal by R's answer (Raft §5.4.1) is reported; quorum produce resumes on the candidate that serves; every record acknowledged before the kill reads back byte-exact from it. When L returns holding records past R's tail that nobody acknowledged, nothing fences it and no quorum forms (#641): the scenario reports it and exits 77 (SKIP), never PASS. It also exits 77 when C comes back holding every acknowledged record, since the shape was then not reached. Candidates carry `lease.admin_peers` for all three metadata nodes, so a metadata leader change mid-run does not strand the lease agents. The producers, every read and who led are recorded, and both history checkers pass (#728). |
 | `24-kafka-replicated-partitions` | Two Kafka partitions of one topic, each a range with a leader and two followers, the leaders on different hosts and every host a replica of both under one certificate (#596: the shape of the Kafka comparison's multi-partition cells). Each leader lists both partitions in `kafka.partitions`. ONE idempotent librdkafka producer (`enable.idempotence=true`, `acks=all`) lets its partitioner spread keyed records over both, then a `kcat -G` group consumer reads them. No metadata plane, as in the benchmark. | Both partitions are written, and their watermarks sum to the records produced. librdkafka's own debug lines show it acquired exactly one producer id from one leader and wrote every batch of BOTH partitions under it, so the other leader accepted an id it did not mint. The group reads exactly the input, each record once, each partition in produced order. A follower of each range committed every acknowledged record (`replica-status`). |
+| `25-group-commit-under-kill` | Group commit on (`group_commit: {enabled: true}`, #752) on a leader with two followers; FOUR idempotent librdkafka producers (`kcat`, `enable.idempotence=true`, `acks=all`) stream keyed records through the gateway concurrently; the leader is `SIGKILL`ed mid-stream and restarted from the same config. `CHAOS_GROUP_COMMIT_DELAY_MS` (default 2) sets the window so sharing is reliable on a loopback lab; `CHAOS_GC_RECORDS` (default 4,000 per producer) sizes the streams. | The leader logs that group commit is on and exports `vtop_broker_group_commit_enabled` 1. Before the kill `vtop_broker_group_commit_requests_total` exceeds `vtop_broker_group_commits_total` (requests shared barriers). Every producer finishes with no failed delivery and no fatal error; the watermark is exactly the records sent; each producer's records read back byte-exact and in the order it sent them, no key twice and none missing; the restarted leader seals groups again; both followers committed every record. |
 
 Scenario 07 skews a Raft **voter**. Skew on a lease **proposer** (a data node)
 is a different path and is covered deterministically, not live, in
@@ -260,11 +261,113 @@ The checker's own tests (`test_check_history.py`, run in the live-chaos job
 before the scenarios) build histories by hand, clean ones and ones shaped like
 #611, #261 and #641, and pin the verdict on each.
 
-Scenarios 04 and 09 record and check histories. What this does not cover yet,
-and #728 still asks for: metadata and lease operations (one leader per epoch,
-linearizable lease grants), a nemesis campaign of many hours, and showing the
-checker fail on a live run with each of #611, #640, #641 and #261
-re-introduced into the code rather than into a hand-built history.
+Scenarios 04, 09, 14 and 23 record and check data-plane histories.
+
+### Who led: control-plane histories
+
+The data-plane history says what the clients wrote and read. A second
+recorder, `scripts/live-chaos/history/record_control.py`, says who led. It
+polls until the scenario checks the history, and stamps every observation
+with the wall-clock instants it was asked for and answered (`invoke_ms`,
+`complete_ms`), so observations can be ordered in real time:
+
+- `meta_status`: `vtopctl meta status` against each metadata node: its Raft
+  term, its server state, and its vote (term, voted-for, committed);
+- `lease_read`: `vtopctl meta range-lease`, the linearizable read of the
+  range's lease, rotated over the metadata nodes: the range's fencing epoch,
+  the lease's holder, epoch and deadline, and the applied index it was served
+  at;
+- `node_lease`: each data node's own `/metrics`: whether it is the authorized
+  leaseholder (`vtop_broker_lease_active`) and at which epoch.
+
+A failed observation (a killed node, a frozen one, a metadata group
+mid-election) is recorded as failed and is evidence of nothing.
+`control_history_start` in `lib.sh` starts it, the scenario's exit stops it,
+and `check_history` runs `check_control.py` over what it has written so far
+(a scenario that goes on is checked again later), keeping the summary in
+`logs/control-check.json`:
+
+| Check | What fails it |
+|---|---|
+| `meta_leader` | two metadata nodes Leader in one Raft term, or a committed vote naming another leader for the term |
+| `lease_holder` | one lease epoch read with two holders |
+| `lease_order` | a lease read that began after another ended reporting an older range fencing epoch, or "not found" for a range a read already found. The epoch only grows, so this real-time order is exactly what a linearizable history of reads allows |
+| `meta_index` | the same for the applied index a read was served at: a linearizable metadata read never goes back in the log |
+| `epoch_leader` | two data nodes acting as the leaseholder of one epoch, or a node acting as the leaseholder of an epoch metadata granted to another |
+| `unknown_grant` | a node acting on an epoch that a lease read begun afterwards does not reach: a grant metadata never made, or lost |
+| `stale_leader` | a deposed leader still acting at its epoch after a read that ended earlier reported a newer one, past the latest deadline any read reported for its lease, and still saying so 2 s later. A data node's gauges keep their last value while a scrape cannot take its lease view, so a single late observation can be a cached one |
+| `coverage` | a scenario that started the recorder ends up with no answered observation of one kind (Raft status, lease read, data node), or the recorder stopped early: a recorder that saw nothing checked nothing |
+
+Its limits: it sees what it polls, by default every 400 ms for a data node,
+500 ms for a lease read and 2 s for a node's Raft status
+(`CHAOS_CONTROL_NODE_MS`, `CHAOS_CONTROL_LEASE_MS`, `CHAOS_CONTROL_STATUS_MS`;
+each `vtopctl` call is a process and a TLS handshake, and the scenarios run on
+two CPUs), so a violation shorter than that can fall between two
+observations. A lease with no deadline (an
+operator's grant) is not held to `stale_leader`, and an operator's
+revocation of a live lease is not modelled; no scenario does either.
+`stale_leader` compares a data node's deadline with the recorder's clock,
+which is sound on one host and not across hosts with skewed clocks.
+
+Scenarios 14 and 23 record the control plane from the moment the candidates
+start. In 23, should the candidate that lacks acknowledged records lead after
+all, the scenario reads what it serves into the history and runs the
+checkers before it fails, so the history is the first to judge the run.
+
+### The checkers against the bugs they exist for
+
+The unit tests feed the checkers hand-built histories shaped like each bug.
+`scripts/live-chaos/history/reintroduce/run.sh <bug> [runs]` does the live
+half: it copies the tree, applies a patch from that directory that undoes
+the bug's fix, builds `vtop-node` and `vtopctl` from the copy, runs the
+scenarios that reach the bug's shape against that build with this tree's
+scenarios and checkers, and runs both checkers over each run's histories
+whatever the scenario's own verdict. It exits 0 when a checker flagged a
+run. The patches never ship: they are applied to a copy, and only this
+script runs the build they make.
+
+| Bug | The patch undoes | Scenarios |
+|---|---|---|
+| #611 | #616: a fence discards a suffix the candidate merely lacks | 23 |
+| #641 | #649: a returning deposed leader's sessions open unfenced | 23 |
+| #261 | #263: a diverged replica is not reconciled at the fence, and acks the new leader's records over its own | 23 |
+| #640 | #648: a follower files caught-up records under its own adopted epoch | 14, 23 |
+
+What the runs showed, on 2026-11-22 (debug builds of this branch, in a
+two-CPU Linux container): **no run reached a bug's shape, so the checkers
+have not yet been shown to fail on a live run with a bug re-introduced.**
+That part of #728 stays open.
+
+| Bug | Runs | What happened |
+|---|---|---|
+| #611 | 13 of scenario 23 | 11 passed; 2 stopped at the producer's 30-second wait for a long suffix, before any read. The #611 window is an acknowledged record above the surviving follower's known high-water mark, and in every run R had learned the mark of every acknowledged record before L died, so the patched fence discarded nothing acknowledged. |
+| #641 | 12 of scenario 23 | Every run passed. The shape needs L to return holding records past R's tail; in these runs L's tail equalled R's every time, so there was nothing for an unfenced session to keep. (An unpatched run that day did reach it, with seed 604: L 20 records past R, and the scenario skipped as #641's guard requires.) |
+| #261 | 12 of scenario 23 | As #641: the diverged suffix the patch leaves unreconciled never existed. |
+| #640 | 3 each of scenarios 14 and 23 | Every run passed. The shape needs a follower to catch up records an older epoch wrote after adopting a newer one, then a second failover; neither scenario produces that sequence. With `--stall-ms`, the control checker would report the stall it causes. |
+
+What would close it: a scenario that holds a follower's commit marks back
+while the leader acknowledges (a delivery shim on the replica plane, for
+#611), one that returns the deposed leader with an in-flight suffix on
+purpose rather than by timing (#641, #261), and two failovers around a
+catch-up (#640); or many runs of the existing ones, which the campaign
+workflow's `reintroduce` input runs.
+
+### The long campaign
+
+`scripts/live-chaos/history/campaign.sh` runs the scenarios that hold a
+nemesis (04 and 09 kill, 05 fills a disk, 06 partitions, 07 skews a clock,
+14 kills, 23 kills and freezes) one after another with a fresh seed each,
+until `CAMPAIGN_HOURS` (default 24) is up. Each run is judged by its own
+assertions and, where it records histories, by both checkers; the campaign
+writes one line per run to `runs.jsonl` and a `summary.json`, keeps the work
+directory of every run that failed, and exits 1 if any did.
+
+It runs from `.github/workflows/chaos-campaign.yml`, on `workflow_dispatch`
+only: never on a pull request or a schedule. A hosted job stops at six
+hours, so the total is split into legs that run side by side (24 hours as six
+legs of four hours by default), and a report job sums them. The same
+workflow, given `reintroduce`, runs the re-introduction runner instead. No
+24-hour campaign has been run yet: that is the maintainer's to start.
 
 ## Engine crash sweep (#725)
 
@@ -348,7 +451,7 @@ leg reads one file written once.
 |---|---|---|
 | The commit rule at the source: the source's committed position never passes the end of the highest range the ledger records as VERIFIED | safety | Kafka: the group's committed offset, read from the broker (`kafka-consumer-groups.sh`), against the ledger, at the kill and again after the restart. "No committed offset" counts only when the broker said so (the offsets table without one, or the group not found); a query that failed or timed out, which the tool reports with exit status 0, is retried three times and then fails the check. File: the file's committed position is in the engine and the ledger is its durable record, so the position is the ledger's cursor (the highest SOURCE_COMMITTED end byte); that comparison cannot fail by itself, so the next two rows are what bites for a file |
 | The commit rule in the ledger: no SOURCE_COMMITTED row lacks what the VERIFIED write leaves (the verification class, which only `mark_verified` sets, the object and the manifest) | safety | the ledger read at the kill and after the restart: SQLite opened read-only, so the WAL the kill left is not checkpointed; PostgreSQL through `psql` in the server's container |
-| The order, whatever the source: at the kill the newest live ledger row is in the state the failpoint sits beside (the table above), so the engine reached the source commit only with the batch VERIFIED | safety | `KILL_STATE` in `sweep_checks.py`, a unit test holds it equal to the state table in `tests/failpoints.rs` and to the points the engine defines |
+| The order, whatever the source: at the kill a ledger row is in the state the failpoint sits beside (the table above), the newest live one when batches did not overlap, so the engine reached the source commit only with the batch VERIFIED | safety | `KILL_STATE` in `sweep_checks.py`, a unit test holds it equal to the state table in `tests/failpoints.rs` and to the points the engine defines |
 | No hole | safety | `vtopctl audit-coverage --check-storage` passes, `vtopctl scrub` is clean, and every produced record is found in the objects the store holds, copied out with `mc` and counted by the harness, not by the engine |
 | Duplicates only where the at-least-once window is open | safety | the extra copies are counted against the table below |
 | The restart commits every record and stops cleanly | liveness | bounded poll on the group's committed offset and the ledger, then `SIGTERM` and exit 0 |
@@ -358,8 +461,13 @@ leg reads one file written once.
 | `before_insert` to `after_ledger_checksummed`, and `mid_object_put` | 0 | no object of the batch is in the store yet; the replay builds it from the source |
 | every later point | one batch (`ENGINE_SWEEP_BATCH_RECORDS`, 20) | the store holds the batch's object while its range is uncommitted; a replay that cannot rebuild the same bytes writes a second object ([ARCHITECTURE](ARCHITECTURE.md) section 13, item 3) |
 
-The sweep runs one batch at a time (`batching.max_concurrent_batches: 1`), so
-the batch the kill interrupts is the only one in flight.
+The sweep runs one batch at a time through upload and verification
+(`batching.max_concurrent_batches: 1`). Batches stay in flight across cycles
+([ARCHITECTURE](ARCHITECTURE.md) section 5.2), so a batch read after the one
+the kill interrupts can already be VERIFIED and waiting for it to commit; the
+order check therefore accepts the failpoint's state on any row, not only the
+newest. Such a waiting row is committed by recovery, not replayed, so the
+extra copies allowed stay at one batch.
 
 **Running it.**
 

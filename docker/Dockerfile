@@ -45,7 +45,9 @@ RUN cargo chef prepare --recipe-path recipe.json
 # touch Cargo.toml or Cargo.lock — which is nearly every commit.
 FROM chef AS builder
 COPY --from=planner /build/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
+# The same features as the build below, or this layer caches dependencies the
+# build then compiles again.
+RUN cargo chef cook --release --recipe-path recipe.json --features vtop-cli/postgres
 
 COPY . .
 # --locked: the image must build exactly the dependency set in Cargo.lock; a
@@ -55,7 +57,13 @@ COPY . .
 # Helm chart runs `vtop-node node`, so every pod exec'd a binary that was not
 # there. Anyone reaching for the container — which is what a Kubernetes
 # deployment does — got the operator CLI and no engine.
-RUN cargo build --release --locked --bin vtopctl --bin vtop-node
+#
+# `vtop-cli/postgres`: the image's vtopctl can open a PostgreSQL state store
+# (`postgres://`, TLS through rustls, no system library added) as well as
+# SQLite, so a PostgreSQL ledger does not need a source build. The default
+# Kafka source stays in; failpoints, Kerberos and the other test or opt-in
+# features stay out.
+RUN cargo build --release --locked --bin vtopctl --bin vtop-node --features vtop-cli/postgres
 
 # ---- Runtime stage ---------------------------------------------------------
 FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS runtime

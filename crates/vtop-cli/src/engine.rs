@@ -11,13 +11,13 @@
 //! crash-recoverable, and `commit_progress` is invoked on the source adapter
 //! only after the batch reaches `VERIFIED`.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use futures::StreamExt;
+use tracing::instrument::WithSubscriber;
 use tracing::Instrument;
 use vtop_adapters::base::{DiscoveredSource, ReadResult, SourceAdapter};
 use vtop_adapters::file_source::ArchivedEnd;
@@ -179,6 +179,133 @@ pub struct Pipeline<'a> {
     /// was not locked as configured (#709), owned by [`Engine`] and shared
     /// like `key_notices`.
     pub lock_fallbacks: Arc<LockFallbacks>,
+    /// Object keys a multipart upload is in progress for, in this process
+    /// (review of #895), and the keys the abandoned-session sweep is working
+    /// on. Batches now upload while the run loop goes on, so the sweep can
+    /// run beside a live upload; it skips these, whatever their session's
+    /// age, and an upload waits for a key the sweep holds. A key has one
+    /// owner at a time: an upload of a key another upload holds waits for it
+    /// too (a superseded window still uploading, and the replay of its range
+    /// that names the same key).
+    pub active_multipart: ActiveMultipart,
+}
+
+/// See [`Pipeline::active_multipart`].
+pub type ActiveMultipart = Arc<std::sync::Mutex<ActiveKeys>>;
+
+/// The keys of [`ActiveMultipart`]: uploads in progress, and the keys the
+/// sweep holds while it aborts their sessions. Both are decided under one
+/// lock, so a key is never both, and neither holds a key twice.
+#[derive(Debug, Default)]
+pub struct ActiveKeys {
+    live: std::collections::HashSet<String>,
+    sweeping: std::collections::HashSet<String>,
+}
+
+/// Take up to `most` of the permits owed to a narrower width off `debt`, and
+/// say how many were taken.
+fn repay_slot_debt(debt: &AtomicUsize, most: usize) -> usize {
+    let mut owed = debt.load(Ordering::Acquire);
+    loop {
+        let take = owed.min(most);
+        if take == 0 {
+            return 0;
+        }
+        match debt.compare_exchange(owed, owed - take, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return take,
+            Err(now) => owed = now,
+        }
+    }
+}
+
+/// Wait for an upload slot. A permit that comes back while the width is
+/// narrower than the permits in existence goes to the first task waiting for
+/// one, and `forget_permits` cannot take it back from there: so the task
+/// withdraws it itself, and waits again, until the permits left match the
+/// width (review of #895).
+async fn acquire_upload_slot(
+    slots: &Arc<tokio::sync::Semaphore>,
+    debt: &AtomicUsize,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    loop {
+        let permit = Arc::clone(slots).acquire_owned().await.ok()?;
+        if repay_slot_debt(debt, 1) == 1 {
+            permit.forget();
+            continue;
+        }
+        return Some(permit);
+    }
+}
+
+/// Owns one object key's multipart session until dropped, however the upload
+/// ends: the session file, the upload id and what is done with them after a
+/// failure are one writer's at a time.
+///
+/// Two uploads of a key can be live at once: a window is superseded while it
+/// is still uploading, its range is read again, and the replacement names the
+/// same derived key (same source, range and bytes, filed under the same hour)
+/// and so the same session file. The second waits here for the first to end,
+/// failure settling included, and then finds the object (probe) or the
+/// session the first left (resume).
+struct LiveMultipart {
+    keys: ActiveMultipart,
+    key: String,
+}
+
+impl LiveMultipart {
+    /// Takes `key`, once no other upload owns it and the sweep is not working
+    /// on it. The sweep holds a key for one abort request, so that wait is
+    /// short; an upload holds it for as long as the upload takes.
+    async fn start(keys: &ActiveMultipart, key: &str) -> Self {
+        loop {
+            {
+                let mut active = keys.lock().unwrap();
+                if !active.sweeping.contains(key) && !active.live.contains(key) {
+                    active.live.insert(key.to_owned());
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Self {
+            keys: Arc::clone(keys),
+            key: key.to_owned(),
+        }
+    }
+}
+
+impl Drop for LiveMultipart {
+    fn drop(&mut self) {
+        self.keys.lock().unwrap().live.remove(&self.key);
+    }
+}
+
+/// What the sweep holds on a key while it aborts the key's session: no upload
+/// of the key starts until it is dropped.
+struct SweepingKey {
+    keys: ActiveMultipart,
+    key: String,
+}
+
+impl SweepingKey {
+    /// `None` when an upload of `key` is live.
+    fn claim(keys: &ActiveMultipart, key: &str) -> Option<Self> {
+        let mut active = keys.lock().unwrap();
+        if active.live.contains(key) {
+            return None;
+        }
+        active.sweeping.insert(key.to_owned());
+        Some(Self {
+            keys: Arc::clone(keys),
+            key: key.to_owned(),
+        })
+    }
+}
+
+impl Drop for SweepingKey {
+    fn drop(&mut self) {
+        self.keys.lock().unwrap().sweeping.remove(&self.key);
+    }
 }
 
 /// Rate limit for the object-key notices a setting repeats on every batch
@@ -700,7 +827,7 @@ impl<'a> Pipeline<'a> {
         stream: Option<&StreamConfig>,
     ) -> Result<BatchOutcome, VtopError> {
         match self
-            .process_until_verified(source, read, stream, Utc::now(), None)
+            .process_until_verified(source, read, stream, Utc::now(), Utc::now(), None)
             .await?
         {
             VerifyStep::Finished(outcome) => Ok(outcome),
@@ -728,12 +855,19 @@ impl<'a> Pipeline<'a> {
     /// attempt's instant, so the window is filed under the same hour and
     /// names the same key; what the rebuild came to is counted once its key
     /// is decided.
+    ///
+    /// `queued_at` is when the window was handed to the pipeline, in the order
+    /// the windows were sealed. It is the ledger row's `created_at`, which a
+    /// restart's cursor lookups sort by: taken here, after the batch has
+    /// waited for an upload slot, two windows of one unit could be stamped in
+    /// the reverse of their seal order (review of #895).
     async fn process_until_verified(
         &self,
         source: &DiscoveredSource,
         read: ReadResult,
         stream: Option<&StreamConfig>,
         sealed_at: chrono::DateTime<Utc>,
+        queued_at: chrono::DateTime<Utc>,
         rebuild: Option<RecordedWindow>,
     ) -> Result<VerifyStep, VtopError> {
         if read.is_empty() {
@@ -761,7 +895,7 @@ impl<'a> Pipeline<'a> {
         // otherwise carry it in its own future, on the stack of whoever polls
         // it (see `commands::dispatch`).
         Box::pin(
-            self.verify_traced(trace, source, read, stream, sealed_at, rebuild)
+            self.verify_traced(trace, source, read, stream, (sealed_at, queued_at), rebuild)
                 .instrument(span),
         )
         .await
@@ -774,7 +908,7 @@ impl<'a> Pipeline<'a> {
         source: &DiscoveredSource,
         read: ReadResult,
         stream: Option<&StreamConfig>,
-        sealed_at: chrono::DateTime<Utc>,
+        (sealed_at, queued_at): (chrono::DateTime<Utc>, chrono::DateTime<Utc>),
         rebuild: Option<RecordedWindow>,
     ) -> Result<VerifyStep, VtopError> {
         let started = Instant::now();
@@ -807,7 +941,7 @@ impl<'a> Pipeline<'a> {
         // The ledger and the adapter commit keep `read.progress_end` as it is.
         let window = window_marker(&read);
         let batch_id = vtop_core::batch::build_batch_id(&source.source_name, &window);
-        let now = Utc::now().to_rfc3339();
+        let now = queued_at.to_rfc3339();
         trace.record("batch_id", batch_id.as_str());
         trace.record("tenant", tenant.as_str());
         trace.record("format", format.as_str());
@@ -1371,6 +1505,20 @@ impl<'a> Pipeline<'a> {
                     .inc();
             }
         };
+        // A derived key has one uploader at a time. A window superseded while
+        // it uploads goes on uploading, and the replay of its range names the
+        // same derived key (same source, range, bytes and hour), so the same
+        // multipart session file. The key is taken before the check below, so
+        // the replay waits for that upload to end and then finds its object
+        // (reuse) or the session it left (resume); it never writes the
+        // session beside it, or deletes it under it.
+        let mp_cfg = MultipartUploadConfig::from_upload(&self.config.upload, work_dir.clone());
+        let mut owned_key: Option<LiveMultipart> = None;
+        if let Ok(derived) = &derived_object_uri {
+            if mp_cfg.should_multipart(self.backend.as_ref(), compressed.size_bytes) {
+                owned_key = Some(LiveMultipart::start(&self.active_multipart, derived).await);
+            }
+        }
         // Whether the object is the one an earlier attempt recorded and this
         // replay adopted (#773), not one the key names.
         let mut adopted = false;
@@ -1779,6 +1927,12 @@ impl<'a> Pipeline<'a> {
             },
         };
         metrics.object_reused = reused;
+        // Held only for the key the bytes are sent under: an object that is
+        // already there sends nothing, and an attempt key is named by this
+        // batch alone (taken below, once it is known to be sent).
+        if reused || owned_key.as_ref().is_some_and(|k| k.key != object_uri) {
+            owned_key = None;
+        }
 
         // ONE PUT, OR RESUMABLE MULTIPART above the threshold (#482). The
         // retransmission unit for a single put is the whole batch — a lost
@@ -1793,14 +1947,15 @@ impl<'a> Pipeline<'a> {
         // resumed for THIS object identity carries THIS content — the
         // resume re-checks every kept part against the local bytes, so a
         // re-derived batch (a new digest) never adopts a stale session. It
-        // does NOT fence against a concurrent writer to the same object
-        // key. An attempt key has one writer by construction; a derived key
-        // is named by its content digest, so two writers of it write the
-        // same bytes (#626), which is the property that stands in for the
-        // lease `tier` holds. A replay of the same bytes after a failed
+        // does NOT fence against a writer in another process. An attempt
+        // key has one writer by construction; a derived key is named by its
+        // content digest, so two writers of it write the same bytes (#626),
+        // which is the property that stands in for the lease `tier` holds.
+        // Within this process a key has one uploader at a time (see
+        // `LiveMultipart`), so a superseded window's upload and the replay of
+        // its range never share a session file. A replay of the same bytes after a failed
         // attempt or a crash resumes the session that attempt left under the
         // derived key (#668), and sends only the parts it is missing.
-        let mp_cfg = MultipartUploadConfig::from_upload(&self.config.upload, work_dir.clone());
         let t = Instant::now();
         let multipart_used =
             !reused && mp_cfg.should_multipart(self.backend.as_ref(), compressed.size_bytes);
@@ -1823,6 +1978,9 @@ impl<'a> Pipeline<'a> {
         let upload_result = if reused {
             None
         } else if multipart_used {
+            if owned_key.is_none() {
+                owned_key = Some(LiveMultipart::start(&self.active_multipart, &object_uri).await);
+            }
             let result = multipart::upload_resumable_with_report(
                 self.backend.as_ref(),
                 &mp_cfg,
@@ -1874,6 +2032,9 @@ impl<'a> Pipeline<'a> {
             }
             fail!(format!("object upload failed: {e}"));
         }
+        // The session is settled (completed, kept or aborted): the key is
+        // free for the next upload of it.
+        drop(owned_key);
         // The hardened profile: an object PUT that returned no version is
         // the first sign of a bucket whose versioning was suspended under
         // the running engine. A multipart upload recovered after its
@@ -1932,6 +2093,50 @@ impl<'a> Pipeline<'a> {
             tracing::info!(batch_id, uri = %object_uri, "object_uploaded");
         }
         trace.end();
+
+        // The object's check needs nothing from the manifest, so it is sent
+        // now and runs while the manifest is built, written and recorded:
+        // on a long link that is one round trip to the store fewer per
+        // batch. Its answer is still required, and judged exactly as before,
+        // before VERIFIED; a batch that fails first drops the check. It is
+        // sent only after OBJECT_UPLOADED is recorded, so it can never be
+        // the evidence for an upload the ledger does not know of.
+        let object_check = {
+            let backend = Arc::clone(&self.backend);
+            let uri = object_uri.clone();
+            let size = compressed.size_bytes;
+            let expected = object_checksum
+                .clone()
+                .map(|hex| (algo.as_str().to_owned(), hex));
+            // The answer is counted here, as it arrives, not where the batch
+            // joins the task: a batch that fails first (its manifest upload,
+            // say) never joins it, and a throttle the store answered the
+            // check with must still reach the width controller (#102).
+            let (attempts, throttles) = (Arc::clone(&self.attempts), Arc::clone(&self.throttles));
+            let labels = (
+                tenant.clone(),
+                source.source_type.as_str().to_owned(),
+                format.extension().to_owned(),
+            );
+            AbortOnDrop(tokio::spawn(
+                async move {
+                    let expected = expected
+                        .as_ref()
+                        .map(|(algorithm, hex)| ObjectChecksum::new(algorithm, hex));
+                    let started = Instant::now();
+                    let answer = note_store_request(
+                        backend.verify_object(&uri, size, expected).await,
+                        "object_verify",
+                        [labels.0.as_str(), labels.1.as_str(), labels.2.as_str()],
+                        &attempts,
+                        &throttles,
+                    );
+                    (answer, started.elapsed())
+                }
+                .in_current_span()
+                .with_current_subscriber(),
+            ))
+        };
 
         // ---- Build + upload manifest ------------------------------------
         trace.begin(Stage::UploadManifest);
@@ -2073,19 +2278,14 @@ impl<'a> Pipeline<'a> {
         // 2) the stored object matches size + checksum,
         // A throttled verification is the store asking for less traffic too
         // (review): counted like an upload, so the cycle's verdict sees it.
-        let obj_v = note_store_request(
-            self.backend
-                .verify_object(&object_uri, compressed.size_bytes, object_ck)
-                .await,
-            "object_verify",
-            [
-                tenant.as_str(),
-                source.source_type.as_str(),
-                format.extension(),
-            ],
-            &self.attempts,
-            &self.throttles,
-        )?;
+        // `verify_ms` counts the object check's whole duration once, though
+        // most of it ran beside the manifest upload, not only the part left
+        // to wait for here.
+        let waiting = Instant::now();
+        let (object_answer, object_check_took) = object_check.join().await;
+        let object_check_waited = waiting.elapsed();
+        // Counted by the task (attempt and throttle) when it answered.
+        let obj_v = object_answer?;
         if !obj_v.passed {
             if let Some(mx) = telemetry::metrics() {
                 mx.verification_failures_total
@@ -2245,7 +2445,8 @@ impl<'a> Pipeline<'a> {
                 fail!("stored manifest batch binding failed".to_string());
             }
         }
-        metrics.verify_ms = t.elapsed().as_millis() as u64;
+        metrics.verify_ms = (t.elapsed().saturating_sub(object_check_waited) + object_check_took)
+            .as_millis() as u64;
         let backend_limited = obj_v.backend_limited || man_v.backend_limited;
         trace.record(
             "verification_result",
@@ -2730,7 +2931,14 @@ impl PendingBuffer {
             vtop_core::event_time::earliest(self.first_timestamp.take(), read.first_timestamp);
         self.last_timestamp =
             vtop_core::event_time::latest(self.last_timestamp.take(), read.last_timestamp);
-        self.latest_end = Some(read.progress_end);
+        // A spool marker's received-time range likewise covers every read of
+        // the window, not only the last one's lines. The times are not part
+        // of the range the adapter settles a commit by.
+        let mut end = read.progress_end;
+        if let Some(prev) = &self.latest_end {
+            end.widen_received_times(prev);
+        }
+        self.latest_end = Some(end);
         if self
             .rebuild_end
             .is_some_and(|end| self.end_position() > Some(end))
@@ -3018,11 +3226,35 @@ impl WidthController {
     }
 }
 
+/// A spawned task that is cancelled when its handle is dropped.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl AbortOnDrop<(Result<vtop_upload::VerificationResult, VtopError>, Duration)> {
+    /// The check's answer and how long it took; a task that ended abnormally
+    /// is a failed request.
+    async fn join(mut self) -> (Result<vtop_upload::VerificationResult, VtopError>, Duration) {
+        (&mut self.0).await.unwrap_or_else(|e| {
+            (
+                Err(VtopError::Upload(format!(
+                    "object check ended abnormally: {e}"
+                ))),
+                Duration::ZERO,
+            )
+        })
+    }
+}
+
 /// The full engine: config, streams, state store, upload backend, adapters.
 pub struct Engine {
     pub config: VtopConfig,
     pub streams: StreamsConfig,
-    pub store: Box<dyn StateStore>,
+    pub store: Arc<dyn StateStore>,
     pub backend: Arc<dyn UploadBackend>,
     pub adapters: HashMap<SourceType, Box<dyn SourceAdapter>>,
     /// Runtime-only manifest keys (#685), resolved from their environment
@@ -3053,6 +3285,7 @@ pub struct Engine {
     /// Process-wide Object Lock fallback memory (#709); see
     /// [`Pipeline::lock_fallbacks`].
     lock_fallbacks: Arc<LockFallbacks>,
+    active_multipart: ActiveMultipart,
     /// Per-source accumulation buffers, keyed by `(source_type, source_name)`.
     pending: HashMap<(SourceType, String), PendingBuffer>,
     /// Set by a read cycle that returned any records; drives the adaptive
@@ -3086,10 +3319,135 @@ pub struct Engine {
     /// The clock a drained window's seal instant is read from. `Utc::now`,
     /// except in tests that replay a window in another hour.
     seal_clock: SealClock,
+    /// Batches sealed and handed to the pipeline whose outcome this engine
+    /// has not yet acted on, per source type, in the order they were sealed.
+    /// They are carried through upload and verification by tasks that
+    /// outlive the cycle that sealed them, so reading goes on while earlier
+    /// batches are still on the wire; commits are applied from the front of
+    /// the queue only, so a batch still commits after IT is VERIFIED and
+    /// after every batch sealed before it has settled.
+    inflight: HashMap<SourceType, VecDeque<InFlight>>,
+    /// Upload slots: at most this many batches are between seal and VERIFIED
+    /// at once, whichever cycle sealed them. Sized to the upload width.
+    upload_slots: Arc<tokio::sync::Semaphore>,
+    /// The width `upload_slots` currently stands for.
+    upload_slots_size: usize,
+    /// Requests and throttles the width controller last saw (#102).
+    width_seen: (u64, u64),
+    /// Permits still to be withdrawn after the width narrowed while they
+    /// were in use. Shared with the batch tasks: a permit handed to a waiting
+    /// task is withdrawn there, so a narrower width holds for the batches
+    /// already queued behind the slots as well as for the next ones.
+    upload_slots_debt: Arc<AtomicUsize>,
     /// Exclusive work-dir lock held for the engine's lifetime (#66).
     /// Held only by [`Engine::new_exclusive`] instances; empty for read-only
     /// construction (#66).
     _instance_locks: Vec<InstanceLock>,
+}
+
+/// One sealed batch between seal and settlement; see [`Engine::inflight`].
+struct InFlight {
+    /// The unit (Kafka partition, file at its inode) the window was read from.
+    unit: String,
+    window: Box<RecordedWindow>,
+    /// The window's uncompressed bytes, held in memory until it settles.
+    bytes: usize,
+    /// A window of the same unit sealed BEFORE this one did not reach
+    /// VERIFIED and was handed back: this window's range is read again, so it
+    /// must not commit. If it verifies it is held, as an in-cycle hold was
+    /// (#626 PR 2); if it fails, it hands nothing back (the rewind below it
+    /// covers it).
+    superseded: bool,
+    /// Set once this window's failure has been acted on.
+    failure_handled: bool,
+    task: Option<tokio::task::JoinHandle<Result<VerifyStep, VtopError>>>,
+    result: Option<Result<VerifyStep, VtopError>>,
+}
+
+/// How long [`Engine::wait_for_inflight`] waits.
+enum Wait {
+    /// Every batch task of the source type.
+    All,
+    /// Until any one has finished, or the limit has passed.
+    Any(Option<Duration>),
+}
+
+/// A batch task's result; a task that panicked or was cancelled is an error
+/// before VERIFIED, whose range is handed back like any other.
+fn joined(
+    result: Result<Result<VerifyStep, VtopError>, tokio::task::JoinError>,
+) -> Result<VerifyStep, VtopError> {
+    result.unwrap_or_else(|e| {
+        Err(VtopError::Other(format!(
+            "batch task ended abnormally: {e}"
+        )))
+    })
+}
+
+impl InFlight {
+    fn failed(&self) -> bool {
+        match &self.result {
+            Some(Ok(VerifyStep::Finished(outcome))) => outcome.final_state == BatchState::Failed,
+            Some(Ok(VerifyStep::Verified(_))) | None => false,
+            Some(Err(_)) => true,
+        }
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // A batch task outliving its engine would go on writing the ledger
+        // of an engine that is gone. Cut it off, as dropping the engine's
+        // future cut off a batch before tasks carried them: whatever it had
+        // reached is recovered or re-read on the next start, as after a crash.
+        for queue in self.inflight.values() {
+            for entry in queue {
+                if let Some(task) = &entry.task {
+                    task.abort();
+                }
+            }
+        }
+    }
+}
+
+/// [`Pipeline`]'s context, owned, so a batch task can carry it.
+#[derive(Clone)]
+struct OwnedPipeline {
+    store: Arc<dyn StateStore>,
+    backend: Arc<dyn UploadBackend>,
+    config: Arc<VtopConfig>,
+    manifest_keyring: Arc<ManifestKeyring>,
+    versioned_buckets: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// The engine's bucket-versioning pauses (#883), shared, so a batch task
+    /// and the engine see one pause per bucket.
+    versioning_pauses: Arc<crate::bucket_versioning::VersioningPauses>,
+    throttles: Arc<AtomicU64>,
+    attempts: Arc<AtomicU64>,
+    provisioned_buckets: ProvisionedBuckets,
+    key_notices: Arc<KeyNotices>,
+    locked_buckets: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    lock_fallbacks: Arc<LockFallbacks>,
+    active_multipart: ActiveMultipart,
+}
+
+impl OwnedPipeline {
+    fn pipeline(&self) -> Pipeline<'_> {
+        Pipeline {
+            store: self.store.as_ref(),
+            backend: Arc::clone(&self.backend),
+            config: &self.config,
+            manifest_keyring: Arc::clone(&self.manifest_keyring),
+            versioned_buckets: Arc::clone(&self.versioned_buckets),
+            versioning_pauses: Arc::clone(&self.versioning_pauses),
+            throttles: Arc::clone(&self.throttles),
+            attempts: Arc::clone(&self.attempts),
+            provisioned_buckets: Arc::clone(&self.provisioned_buckets),
+            key_notices: Arc::clone(&self.key_notices),
+            locked_buckets: Arc::clone(&self.locked_buckets),
+            lock_fallbacks: Arc::clone(&self.lock_fallbacks),
+            active_multipart: Arc::clone(&self.active_multipart),
+        }
+    }
 }
 
 /// Where a drained window's seal instant comes from; see
@@ -3425,10 +3783,12 @@ impl Engine {
             config.batching.adaptive_width.min_width,
             config.upload.max_concurrency_ceiling,
         );
+        let upload_slots = Arc::new(tokio::sync::Semaphore::new(width.width().max(1)));
+        let upload_slots_size = width.width().max(1);
         Ok(Self {
             config,
             streams,
-            store,
+            store: Arc::from(store),
             backend,
             adapters,
             manifest_keyring,
@@ -3441,6 +3801,7 @@ impl Engine {
             key_notices: Arc::default(),
             locked_buckets: Arc::default(),
             lock_fallbacks: Arc::default(),
+            active_multipart: Arc::default(),
             pending: HashMap::new(),
             cycle_had_data: false,
             cycle_had_failure: false,
@@ -3450,6 +3811,11 @@ impl Engine {
             unsettled: Vec::new(),
             recorded: RecordedWindows::default(),
             seal_clock: Arc::new(Utc::now),
+            inflight: HashMap::new(),
+            upload_slots,
+            upload_slots_size,
+            width_seen: (0, 0),
+            upload_slots_debt: Arc::new(AtomicUsize::new(0)),
             _instance_locks: Vec::new(),
         })
     }
@@ -3512,6 +3878,24 @@ impl Engine {
         }
     }
 
+    fn owned_pipeline(&self) -> OwnedPipeline {
+        OwnedPipeline {
+            store: Arc::clone(&self.store),
+            backend: Arc::clone(&self.backend),
+            config: Arc::new(self.config.clone()),
+            manifest_keyring: Arc::clone(&self.manifest_keyring),
+            versioned_buckets: Arc::clone(&self.versioned_buckets),
+            versioning_pauses: Arc::clone(&self.versioning_pauses),
+            throttles: Arc::clone(&self.throttles),
+            attempts: Arc::clone(&self.attempts),
+            provisioned_buckets: Arc::clone(&self.provisioned_buckets),
+            key_notices: Arc::clone(&self.key_notices),
+            locked_buckets: Arc::clone(&self.locked_buckets),
+            lock_fallbacks: Arc::clone(&self.lock_fallbacks),
+            active_multipart: Arc::clone(&self.active_multipart),
+        }
+    }
+
     fn pipeline(&self) -> Pipeline<'_> {
         Pipeline {
             store: self.store.as_ref(),
@@ -3526,6 +3910,7 @@ impl Engine {
             key_notices: Arc::clone(&self.key_notices),
             locked_buckets: Arc::clone(&self.locked_buckets),
             lock_fallbacks: Arc::clone(&self.lock_fallbacks),
+            active_multipart: Arc::clone(&self.active_multipart),
         }
     }
 
@@ -3853,6 +4238,17 @@ impl Engine {
         source_type: &SourceType,
         force_flush: bool,
     ) -> Result<Vec<BatchOutcome>, VtopError> {
+        // Backpressure: while the batches in flight hold the byte budget, read
+        // nothing more; wait for one of them to finish and act on it.
+        if !force_flush && self.inflight_is_full(source_type) {
+            self.wait_for_inflight(source_type, Wait::Any(None)).await;
+            self.observe_width();
+            // A narrower width is withdrawn from the slots here too, not only
+            // once reading starts again.
+            let limit = self.upload_width();
+            self.resize_upload_slots(limit);
+            return self.settle_inflight(adapter, source_type).await;
+        }
         let sources = adapter.discover_sources().await?;
         // How long ONE PASS may wait for data. Whether that is paid once or
         // once per source is the adapter's business, not this loop's: the
@@ -4222,146 +4618,357 @@ impl Engine {
         if let Some(mx) = telemetry::metrics() {
             mx.upload_width.set(limit as i64);
         }
-        let throttles_before = self.throttles.load(Ordering::Relaxed);
-        // A cycle that ISSUED no upload probes nothing (review): idle polling
-        // after a throttle must not walk the width back up, and neither may a
-        // cycle whose batches all failed before reaching the store.
-        let attempts_before = self.attempts.load(Ordering::Relaxed);
-        let pipeline = self.pipeline();
-        // buffer_unordered keeps `limit` verifies in flight and yields each as
-        // it finishes, so a slow upload never holds up the ones behind it.
-        // `work` is MOVED into the futures rather than iterated by reference.
-        // Cloning each ReadResult here would duplicate every payload before
-        // buffer_unordered bounds anything, so with max_bytes at 100 MiB and a
-        // concurrency of 8 the queue alone could hold ~800 MiB of avoidable
-        // copies — the clone is not bounded by the concurrency limit, only the
-        // execution is.
+        self.resize_upload_slots(limit);
+
+        // ---- Hand the sealed windows to the pipeline -------------------
         //
-        // Each result travels with the order its window was read in and the
-        // marker its batch STARTED at: commits are applied in read order (see
-        // below), and a batch that does not reach VERIFIED must hand its range
-        // back to the source (see the rewind below), by when the `ReadResult`
-        // that held the marker has been consumed.
+        // Each window is carried to VERIFIED (or FAILED) by a task of its
+        // own, which waits for one of `limit` upload slots shared by every
+        // cycle. The task does NOT end the cycle: reading goes on while it is
+        // on the wire, so a long round trip to the store is paid once per
+        // pipeline depth rather than once per cycle. What it decides is acted
+        // on by `settle_inflight`, in the order the windows were sealed.
         //
-        // It also carries what the window was (#626): if it does not reach
-        // VERIFIED, its range, seal instant and the digest an earlier attempt
-        // recorded are remembered, so the re-read rebuilds it under the same
-        // key.
-        let mut verified: Vec<(usize, Box<RecordedWindow>, Result<VerifyStep, VtopError>)> =
-            futures::stream::iter(work.into_iter().enumerate().map(
-                |(order, (source, read, stream, sealed_at, rebuild))| {
-                    let pipeline = &pipeline;
-                    let window = Box::new(RecordedWindow {
-                        start: read.progress_start.clone(),
-                        end: read.progress_end.clone(),
-                        sealed_at: Some(sealed_at),
-                        digest: rebuild.as_ref().and_then(|w| w.digest.clone()),
-                        object_uri: rebuild.as_ref().and_then(|w| w.object_uri.clone()),
-                        batch_id: None,
-                        record_count: Some(read.records.len() as u64),
-                        bounded: false,
-                    });
+        // `work` is MOVED into the tasks rather than iterated by reference:
+        // cloning each ReadResult would duplicate every payload.
+        //
+        // Each entry carries the marker its batch STARTED at and what the
+        // window was (#626): a batch that does not reach VERIFIED hands its
+        // range back to the source, and is remembered so the re-read
+        // rebuilds it under the same key.
+        if !work.is_empty() {
+            let owned = self.owned_pipeline();
+            let queue = self.inflight.entry(source_type.clone()).or_default();
+            for (source, read, stream, sealed_at, rebuild) in work {
+                // Stamped here, in seal order: a task that starts after a
+                // later window's must not file its row after it.
+                let queued_at = Utc::now();
+                let window = Box::new(RecordedWindow {
+                    start: read.progress_start.clone(),
+                    end: read.progress_end.clone(),
+                    sealed_at: Some(sealed_at),
+                    digest: rebuild.as_ref().and_then(|w| w.digest.clone()),
+                    object_uri: rebuild.as_ref().and_then(|w| w.object_uri.clone()),
+                    batch_id: None,
+                    record_count: Some(read.records.len() as u64),
+                    bounded: false,
+                });
+                let bytes = read.records.iter().map(Vec::len).sum();
+                let owned = owned.clone();
+                let slots = Arc::clone(&self.upload_slots);
+                let slot_debt = Arc::clone(&self.upload_slots_debt);
+                // The task carries the cycle's span and subscriber, as the
+                // future polled inside the cycle did.
+                let task = tokio::spawn(
                     async move {
+                        let _slot = acquire_upload_slot(&slots, &slot_debt).await;
+                        let pipeline = owned.pipeline();
                         let step = pipeline
                             .process_until_verified(
                                 &source,
                                 read,
                                 stream.as_ref(),
                                 sealed_at,
+                                queued_at,
                                 rebuild,
                             )
                             .await;
-                        (order, window, step)
+                        step
                     }
-                },
-            ))
-            .buffer_unordered(limit)
-            .collect()
-            .await;
-        // Verification finishes in whatever order the store answers, but the
-        // commits are applied in the order the windows were READ. When a
-        // rotation seals the old file's window and starts a new one in the
-        // same cycle, both are in flight at once; committing the new file's
-        // window first would leave the OLD one as the most recent commit, and
-        // the restart seed (the newest committed row's inode) would then name a
-        // file that is no longer there and re-read the live one from byte 0.
-        verified.sort_by_key(|(order, _, _)| *order);
-
-        // The cycle's verdict for the width controller (#102): any throttle
-        // in it halves the next width; none grows it by one.
-        if self.config.batching.adaptive_width.enabled
-            && self.attempts.load(Ordering::Relaxed) > attempts_before
-        {
-            let throttled = self.throttles.load(Ordering::Relaxed) > throttles_before;
-            let before = self.width.width();
-            let after = self.width.observe_cycle(throttled);
-            if after != before {
-                tracing::info!(
-                    from = before,
-                    to = after,
-                    throttled,
-                    "upload_width_adjusted"
+                    .in_current_span()
+                    .with_current_subscriber(),
                 );
+                queue.push_back(InFlight {
+                    unit: unit_key(&window.start),
+                    window,
+                    bytes,
+                    superseded: false,
+                    failure_handled: false,
+                    task: Some(task),
+                    result: None,
+                });
             }
         }
 
-        // Do NOT bail on the first error. Verify runs concurrently, so by the
-        // time one batch fails, others may already be persisted as VERIFIED —
-        // and their buffers have been drained from `pending`. Returning early
-        // would drop those VerifiedBatch values without committing source
-        // progress, leaving them verified-but-uncommitted until a restart ran
-        // recovery.
-        //
-        // So: commit every batch that succeeded, then report the first error.
-        // Nothing verified is abandoned, and the caller still sees the failure.
-        //
-        // A batch that did NOT reach VERIFIED is a different matter, and the
-        // read head is the reason. Adapters advance their read position when
-        // they READ, not when the batch commits, so a failed batch's records
-        // are already behind the head: left alone, the next cycle reads on
-        // from the end of the failed range, and the first later range to
-        // verify commits PAST it. The failed bytes are then never archived,
-        // and the restart that was supposed to repair this clamps its rewind
-        // to the committed point (#552). Each such range is therefore handed
-        // back to its source here, immediately, so the very next read starts
-        // at the first byte that has not been archived.
+        self.export_inflight();
+        if force_flush {
+            // A forced flush (`process-once`, the shutdown flush) returns
+            // only once every batch of this source type has settled.
+            self.wait_for_inflight(source_type, Wait::All).await;
+        } else if records_read == 0 {
+            // Nothing new this pass: wait for a batch to finish rather than
+            // poll the source again at once, but no longer than one poll
+            // wait. An empty pass is often a source between fetches, not an
+            // idle one, and the batches on the wire must not hold up the next
+            // read for longer than the source itself would have.
+            self.wait_for_inflight(source_type, Wait::Any(Some(max_wait)))
+                .await;
+        }
+
+        self.observe_width();
+        self.settle_inflight(adapter, source_type).await
+    }
+
+    /// The width controller's verdict (#102) on every request answered since
+    /// it last looked: any throttle halves the next width; none grows it by
+    /// one. Batch tasks answer between cycles now, so the baseline is the
+    /// last observation, not the start of this cycle: a throttle that landed
+    /// while the source was polled, or during the run loop's backoff, is
+    /// counted all the same. No request answered probes nothing (review):
+    /// idle polling after a throttle must not walk the width back up.
+    fn observe_width(&mut self) {
+        let attempts = self.attempts.load(Ordering::Relaxed);
+        let throttles = self.throttles.load(Ordering::Relaxed);
+        let (attempts_seen, throttles_seen) = self.width_seen;
+        if !self.config.batching.adaptive_width.enabled || attempts <= attempts_seen {
+            return;
+        }
+        self.width_seen = (attempts, throttles);
+        let throttled = throttles > throttles_seen;
+        let before = self.width.width();
+        let after = self.width.observe_cycle(throttled);
+        if after != before {
+            tracing::info!(
+                from = before,
+                to = after,
+                throttled,
+                "upload_width_adjusted"
+            );
+        }
+    }
+
+    /// Publish how many sealed batches have not settled, across source types.
+    fn export_inflight(&self) {
+        if let Some(mx) = telemetry::metrics() {
+            let n: usize = self.inflight.values().map(VecDeque::len).sum();
+            mx.sealed_batches_in_flight.set(n as i64);
+        }
+    }
+
+    /// Whether the batches of `source_type` that have not settled hold the
+    /// in-flight budget: `width × max_bytes` uncompressed bytes, or `2 ×
+    /// width` batches. The count bounds what the bytes do not see (review):
+    /// Kafka tombstones and empty values carry no payload, but each batch
+    /// still holds its records, markers and a task, and behind a stalled
+    /// upload the bytes alone would let the whole backlog queue up.
+    fn inflight_is_full(&self, source_type: &SourceType) -> bool {
+        let batches = self.inflight.get(source_type).map_or(0, VecDeque::len);
+        batches >= self.upload_width().max(1).saturating_mul(2)
+            || self.inflight_bytes(source_type) >= self.inflight_byte_budget()
+    }
+
+    /// Bytes held by the batches of `source_type` that have not settled.
+    fn inflight_bytes(&self, source_type: &SourceType) -> usize {
+        self.inflight
+            .get(source_type)
+            .map_or(0, |q| q.iter().map(|e| e.bytes).sum())
+    }
+
+    /// How many uncompressed bytes may be between seal and settlement before
+    /// the engine stops reading: one full batch per upload slot.
+    fn inflight_byte_budget(&self) -> usize {
+        self.upload_width()
+            .max(1)
+            .saturating_mul(self.config.batching.max_bytes.max(1))
+    }
+
+    /// Make `upload_slots` stand for `width` (#102: the controller can move
+    /// it between cycles). Permits in use when it narrows are withdrawn as
+    /// they come back.
+    fn resize_upload_slots(&mut self, width: usize) {
+        let width = width.max(1);
+        if width > self.upload_slots_size {
+            let grow = width - self.upload_slots_size;
+            let repaid = repay_slot_debt(&self.upload_slots_debt, grow);
+            self.upload_slots.add_permits(grow - repaid);
+        } else if width < self.upload_slots_size {
+            self.upload_slots_debt
+                .fetch_add(self.upload_slots_size - width, Ordering::AcqRel);
+        }
+        self.upload_slots_size = width;
+        // The free permits go now; the ones in use, and the ones a waiting
+        // task is about to be handed, are withdrawn by the task that takes
+        // them (`acquire_upload_slot`). The debt is claimed before the
+        // permits are forgotten, so a task repaying it meanwhile cannot make
+        // more be withdrawn than were owed.
+        let owed = repay_slot_debt(&self.upload_slots_debt, usize::MAX);
+        if owed > 0 {
+            let taken = self.upload_slots.forget_permits(owed);
+            self.upload_slots_debt
+                .fetch_add(owed - taken, Ordering::AcqRel);
+        }
+    }
+
+    /// Wait for the batch tasks of `source_type`: all of them, or until any
+    /// one has finished (bounded by `Wait::Any`'s limit, if it has one).
+    async fn wait_for_inflight(&mut self, source_type: &SourceType, wait: Wait) {
+        match wait {
+            Wait::All => {
+                // Each handle stays in its entry until its task has
+                // finished (review of #895): a forced flush cancelled
+                // mid-wait (a second stop) must leave every running task
+                // where `Drop for Engine` can abort it.
+                if let Some(queue) = self.inflight.get_mut(source_type) {
+                    for entry in queue.iter_mut() {
+                        if let Some(task) = entry.task.as_mut() {
+                            let result = task.await;
+                            entry.task = None;
+                            entry.result = Some(joined(result));
+                        }
+                    }
+                }
+            }
+            Wait::Any(limit) => {
+                // On the join handles themselves (review of #895): a
+                // notification sent by the task before it returned could be
+                // taken by a waiter that then found the task not yet
+                // finished and waited again, for ever.
+                let Some(queue) = self.inflight.get_mut(source_type) else {
+                    return;
+                };
+                let (at, running): (Vec<usize>, Vec<_>) = queue
+                    .iter_mut()
+                    .enumerate()
+                    .filter_map(|(i, e)| e.task.as_mut().map(|t| (i, t)))
+                    .unzip();
+                if running.is_empty() {
+                    return;
+                }
+                let any = futures::future::select_all(running);
+                let finished = match limit {
+                    Some(limit) => tokio::time::timeout(limit, any).await.ok(),
+                    None => Some(any.await),
+                };
+                if let Some((result, which, rest)) = finished {
+                    drop(rest);
+                    let entry = &mut queue[at[which]];
+                    entry.task = None;
+                    entry.result = Some(joined(result));
+                }
+            }
+        }
+    }
+
+    /// Act on what the batch tasks of `source_type` have decided, in the
+    /// order their windows were sealed.
+    ///
+    /// The commit rule, per batch: SOURCE_COMMITTED only after IT reached
+    /// VERIFIED. Two more rules keep the source's committed point from
+    /// passing a range that is not archived:
+    ///
+    /// - Commits are applied from the FRONT of the queue only. A batch that
+    ///   verified waits until every batch sealed before it has settled, so
+    ///   commits land in read order exactly as they did when a cycle waited
+    ///   for all of its batches: the Kafka frontier and a file's restart seed
+    ///   (the newest committed row) only ever move forward.
+    /// - A batch that does not reach VERIFIED hands its range back to its
+    ///   source at once, before the next read, and every later window of the
+    ///   same unit is SUPERSEDED: it may still be uploading, but the source
+    ///   reads its range again, so it must not commit. A superseded window
+    ///   that verifies is held, as an in-cycle hold was (#626 PR 2), and
+    ///   settles once the re-read has committed through its end; one that
+    ///   fails hands nothing back, because the rewind below it already covers
+    ///   it, and handing back its higher start would move the read head
+    ///   forward over the range below. Only the lowest failed start of a
+    ///   unit is ever rewound to.
+    ///
+    /// Do NOT bail on the first error: batches that verified must still be
+    /// committed; the first error is reported after.
+    async fn settle_inflight(
+        &mut self,
+        adapter: &mut dyn SourceAdapter,
+        source_type: &SourceType,
+    ) -> Result<Vec<BatchOutcome>, VtopError> {
+        let Some(mut queue) = self.inflight.remove(source_type) else {
+            return Ok(Vec::new());
+        };
+        for entry in queue.iter_mut() {
+            if entry.task.as_ref().is_some_and(|t| t.is_finished()) {
+                if let Some(task) = entry.task.take() {
+                    entry.result = Some(joined(task.await));
+                }
+            }
+        }
+
         let mut outcomes = Vec::new();
         let mut first_err: Option<VtopError> = None;
         let mut rewinds: Vec<ProgressMarker> = Vec::new();
         let mut handed_back: Vec<RecordedWindow> = Vec::new();
-        // Per unit (a file at its inode, a Kafka partition), where the first
-        // window that did not reach VERIFIED this cycle starts. A window of
-        // the same unit read after it must not commit (review of #626 PR 2):
-        // a rebuilt window and the bytes after it are two windows of one unit
-        // in the same cycle, and committing the later one would move the
-        // source's committed point past the failed range, so the rewind below
-        // would be clamped to that point and the failed bytes never archived.
-        let mut failed_from: HashMap<String, i128> = HashMap::new();
-        for (_, window, step) in &verified {
-            let failed = match step {
-                Ok(VerifyStep::Finished(outcome)) => outcome.final_state == BatchState::Failed,
-                Ok(VerifyStep::Verified(_)) => false,
-                Err(_) => true,
-            };
-            if failed {
-                let at = start_position(&window.start);
-                failed_from
-                    .entry(unit_key(&window.start))
-                    .and_modify(|first| *first = (*first).min(at))
-                    .or_insert(at);
+
+        // Failures first, wherever they are in the queue: the read head is
+        // past them, and the next read must start at their first byte.
+        for i in 0..queue.len() {
+            if queue[i].failure_handled || !queue[i].failed() {
+                continue;
             }
-        }
-        for (_, mut window, step) in verified {
-            let started_at = window.start.clone();
-            let step = match step {
-                Ok(VerifyStep::Verified(v))
-                    if failed_from
-                        .get(&unit_key(&window.start))
-                        .is_some_and(|first| start_position(&window.start) > *first) =>
+            queue[i].failure_handled = true;
+            if queue[i].superseded {
+                tracing::debug!(
+                    source = queue[i].window.source(),
+                    range = %queue[i].window.range(),
+                    "a superseded window did not reach VERIFIED; the rewind below it covers it"
+                );
+                continue;
+            }
+            // Only windows of the same unit AND content generation: a
+            // same-inode replacement whose fingerprint proves it another
+            // file keeps its own rewind, since the old content's rewind is
+            // refused once its bytes are gone (review of #891).
+            let unit = queue[i].unit.clone();
+            let content = queue[i].window.start.content_fingerprint().cloned();
+            for later in queue.iter_mut().skip(i + 1) {
+                if later.unit == unit
+                    && !proven_other(content.as_ref(), later.window.start.content_fingerprint())
                 {
+                    later.superseded = true;
+                }
+            }
+            let entry = &mut queue[i];
+            rewinds.push(entry.window.start.clone());
+            if let Some(Ok(VerifyStep::Finished(outcome))) = &entry.result {
+                // The digest of an object this attempt uploaded, as the
+                // ledger recorded it: the object a rebuild of the window
+                // compares itself with.
+                match self.store.get_batch(&outcome.batch_id).await {
+                    Ok(Some(row)) => {
+                        if let Some(digest) =
+                            crate::rebuild::recorded_digest(row.object_sha256.as_deref())
+                        {
+                            entry.window.digest = Some(digest);
+                            // The key goes with its digest (#773).
+                            entry.window.object_uri =
+                                crate::rebuild::recorded_object_uri(row.object_uri.as_deref());
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::debug!(
+                        batch_id = %outcome.batch_id,
+                        error = %e,
+                        "could not read the failed batch's row; its replay is judged on \
+                         its range alone"
+                    ),
+                }
+                entry.window.batch_id = Some(outcome.batch_id.clone());
+            }
+            // An error before VERIFIED (a ledger write that failed, say):
+            // whether the ledger holds a row is unknown, and re-reading the
+            // range costs a duplicate at worst where skipping it costs the
+            // data (#627). Remembered from memory.
+            handed_back.push((*entry.window).clone());
+            self.recorded.remember((*entry.window).clone());
+        }
+
+        // Then commits, from the front only.
+        while queue.front().is_some_and(|e| e.result.is_some()) {
+            let Some(mut entry) = queue.pop_front() else {
+                break;
+            };
+            let window = entry.window;
+            match entry.result.take() {
+                Some(Ok(VerifyStep::Verified(v))) if entry.superseded => {
                     // Held VERIFIED, as recovery holds a row above a range
-                    // being read again (#624): it settles once the source has
-                    // committed through its end, which only the failed
+                    // being read again (#624): it settles once the source
+                    // has committed through its end, which only the failed
                     // range's re-read can bring about.
                     let committed_at_hold = adapter.committed_through(&window.end);
                     tracing::warn!(
@@ -4369,8 +4976,8 @@ impl Engine {
                         batch_id = %v.batch_id,
                         source = window.source(),
                         range = %window.range(),
-                        "batch {} of {} is VERIFIED, but an earlier range of the same source failed \
-                         this cycle; its source commit is held back so the failed range is read \
+                        "batch {} of {} is VERIFIED, but an earlier range of the same source \
+                         failed; its source commit is held back so the failed range is read \
                          again rather than skipped, and it is committed once that range is; \
                          nothing to do unless the earlier range keeps failing (see its error)",
                         v.batch_id,
@@ -4382,49 +4989,13 @@ impl Engine {
                         committed_at_hold,
                     ));
                     outcomes.push(Pipeline::hold_verified(v));
-                    continue;
                 }
-                step => step,
-            };
-            match step {
-                Ok(VerifyStep::Finished(outcome)) => {
-                    if outcome.final_state == BatchState::Failed {
-                        rewinds.push(started_at);
-                        // The digest of an object this attempt uploaded, as
-                        // the ledger recorded it: the object a rebuild of
-                        // the window compares itself with.
-                        match self.store.get_batch(&outcome.batch_id).await {
-                            Ok(Some(row)) => {
-                                if let Some(digest) =
-                                    crate::rebuild::recorded_digest(row.object_sha256.as_deref())
-                                {
-                                    window.digest = Some(digest);
-                                    // The key goes with its digest (#773).
-                                    window.object_uri = crate::rebuild::recorded_object_uri(
-                                        row.object_uri.as_deref(),
-                                    );
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(e) => tracing::debug!(
-                                batch_id = %outcome.batch_id,
-                                error = %e,
-                                "could not read the failed batch's row; its replay is judged on \
-                                 its range alone"
-                            ),
-                        }
-                        window.batch_id = Some(outcome.batch_id.clone());
-                        handed_back.push((*window).clone());
-                        self.recorded.remember(*window);
-                    }
-                    outcomes.push(outcome);
-                }
-                Ok(VerifyStep::Verified(v)) => {
+                Some(Ok(VerifyStep::Verified(v))) => {
                     let batch_id = v.batch_id.clone();
                     match self.pipeline().commit_verified(adapter, v).await {
                         Ok(outcome) => {
-                            // The source commit failed: the row stays VERIFIED,
-                            // and a later pass retries it (#624).
+                            // The source commit failed: the row stays
+                            // VERIFIED, and a later pass retries it (#624).
                             if !outcome.committed {
                                 self.unsettled
                                     .push(Unsettled::commit_failed(&batch_id, source_type));
@@ -4435,8 +5006,8 @@ impl Engine {
                             // Already VERIFIED and durable (the source may
                             // have committed, the ledger write did not); a
                             // later pass retries it (#624), and recovery
-                            // after a restart. Keep going so siblings still
-                            // commit.
+                            // after a restart. Keep going so the batches
+                            // after it still commit.
                             tracing::error!(batch_id, error = %e, "commit failed after verify");
                             self.unsettled
                                 .push(Unsettled::commit_failed(&batch_id, source_type));
@@ -4444,30 +5015,20 @@ impl Engine {
                         }
                     }
                 }
-                Err(e) => {
-                    // An error before the batch was VERIFIED (a ledger write
-                    // that failed, say — the FAILED write of `fail!` included).
-                    // Whether the ledger holds a row for it is unknown, and
-                    // re-reading the range costs a duplicate at worst where
-                    // skipping it costs the data.
-                    //
-                    // This is where the running path parts from recovery, which
-                    // never rewinds on a decision the ledger did not record
-                    // (#123). At startup the read head sits at the committed
-                    // point, at or below every uncommitted range, so a withheld
-                    // rewind there leaves the range ahead of the head. Here the
-                    // head is already PAST the range: withheld, the next cycle
-                    // reads on, a later batch commits past it, and the restart
-                    // that marks the row for replay clamps its rewind to that
-                    // commit — the range is never archived (#627).
-                    rewinds.push(started_at);
-                    // Remembered from memory: the ledger may hold no row.
-                    handed_back.push((*window).clone());
-                    self.recorded.remember(*window);
+                Some(Ok(VerifyStep::Finished(outcome))) => outcomes.push(outcome),
+                Some(Err(e)) => {
                     first_err.get_or_insert(e);
                 }
+                None => {}
             }
         }
+        if !queue.is_empty() {
+            // Batches still on the wire: come straight back for them.
+            self.cycle_had_data = true;
+        }
+        self.inflight.insert(source_type.clone(), queue);
+        self.export_inflight();
+
         if !rewinds.is_empty() {
             self.cycle_had_failure = true;
         }
@@ -5744,7 +6305,11 @@ impl Engine {
             &self.config.upload,
             std::path::PathBuf::from(&self.config.engine.work_dir),
         );
-        match multipart::cleanup_abandoned(self.backend.as_ref(), &mp_cfg).await {
+        let keys = Arc::clone(&self.active_multipart);
+        let claim = move |key: &str| {
+            SweepingKey::claim(&keys, key).map(|held| Box::new(held) as multipart::SweepClaim)
+        };
+        match multipart::cleanup_abandoned_except(self.backend.as_ref(), &mp_cfg, &claim).await {
             Ok(0) => 0,
             Ok(aborted) => {
                 if let Some(mx) = telemetry::metrics() {
@@ -6952,6 +7517,7 @@ mod tests {
     use super::*;
     use crate::testkit::file_config;
     use std::io::Write;
+    use std::sync::atomic::AtomicBool;
     use vtop_core::config::StreamsConfig;
 
     /// #559: a buffered window spans several reads; its event-time range is
@@ -7001,6 +7567,66 @@ mod tests {
             drained.last_timestamp.as_deref(),
             Some("2026-01-01T10:30:00.000Z")
         );
+    }
+
+    /// A buffered spool window's marker carries the earliest and latest line
+    /// times of all its reads, so its manifest does not describe only the
+    /// last read's lines.
+    #[test]
+    fn a_buffered_spool_window_keeps_the_earliest_and_latest_line_time() {
+        let source = DiscoveredSource {
+            source_type: SourceType::SyslogSpool,
+            source_name: "/spool".into(),
+            format: vtop_core::types::TelemetryFormat::Syslog,
+        };
+        let mut buf = PendingBuffer::new("default", source, BatchLimits::default());
+        let marker = |start: u64, end: u64, lo: Option<&str>, hi: Option<&str>| {
+            ProgressMarker::SyslogSpool {
+                spool_id: "spool".into(),
+                path: "/spool".into(),
+                inode: Some(7),
+                start_byte: start,
+                end_byte: end,
+                received_time_start: lo.map(str::to_owned),
+                received_time_end: hi.map(str::to_owned),
+                file_size: Some(300),
+                content_fingerprint: None,
+            }
+        };
+        let read = |start: u64, end: u64, lo: Option<&str>, hi: Option<&str>| ReadResult {
+            records: vec![b"r".to_vec()],
+            progress_start: marker(start, start, None, None),
+            progress_end: marker(start, end, lo, hi),
+            first_timestamp: None,
+            last_timestamp: None,
+            verbatim: false,
+        };
+        buf.append(read(
+            0,
+            100,
+            Some("2026-11-14T10:00:00Z"),
+            Some("2026-11-14T10:30:00Z"),
+        ));
+        buf.append(read(
+            100,
+            200,
+            Some("2026-11-14T09:00:00Z"),
+            Some("2026-11-14T09:05:00Z"),
+        ));
+        buf.append(read(200, 300, None, None));
+        let drained = buf.drain().unwrap();
+        let window = window_marker(&drained);
+        assert_eq!(window.range_token(), "b0-300");
+        let ProgressMarker::SyslogSpool {
+            received_time_start,
+            received_time_end,
+            ..
+        } = window
+        else {
+            unreachable!()
+        };
+        assert_eq!(received_time_start.as_deref(), Some("2026-11-14T09:00:00Z"));
+        assert_eq!(received_time_end.as_deref(), Some("2026-11-14T10:30:00Z"));
     }
 
     /// #66: a mutating engine is single-instance per state store AND work dir;
@@ -7360,7 +7986,7 @@ mod tests {
             .with_timezone(&Utc);
         let step = engine
             .pipeline()
-            .process_until_verified(&source, read, None, drained, None)
+            .process_until_verified(&source, read, None, drained, Utc::now(), None)
             .await
             .unwrap();
         let VerifyStep::Verified(verified) = step else {
@@ -7373,6 +7999,96 @@ mod tests {
             "filed under the hour processing reached it, not the hour it was \
              drained in (2020-01-02 03:59:59.900): {}",
             verified.object_uri
+        );
+    }
+
+    /// Review of #895: a window's ledger row is stamped with the instant it
+    /// was handed to the pipeline, not the instant its task won an upload
+    /// slot. Tasks start in any order, and a restart's cursor lookups sort
+    /// rows by `created_at`: two windows of one file, the later one's task
+    /// running first, must still be filed in the order they were sealed.
+    #[tokio::test]
+    async fn a_window_is_filed_when_it_was_queued_not_when_its_task_ran() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "one\ntwo\n").unwrap();
+        let cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        let engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let source = DiscoveredSource {
+            source_type: SourceType::File,
+            source_name: "in".into(),
+            format: vtop_core::types::TelemetryFormat::Raw,
+        };
+        let window = |start: u64, end: u64, line: &[u8]| {
+            let marker = |at: u64| ProgressMarker::File {
+                path: input.to_string_lossy().into_owned(),
+                inode: None,
+                start_byte: at,
+                end_byte: end,
+                file_size: 8,
+                mtime: String::new(),
+                content_fingerprint: None,
+                tail_fingerprint: None,
+                ctime: None,
+            };
+            ReadResult {
+                records: vec![line.to_vec()],
+                progress_start: marker(start),
+                progress_end: marker(start),
+                first_timestamp: None,
+                last_timestamp: None,
+                verbatim: false,
+            }
+        };
+        let queued = |at: &str| {
+            chrono::DateTime::parse_from_rfc3339(at)
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        let (first_at, second_at) = (
+            queued("2026-03-04T05:00:00.000000000Z"),
+            queued("2026-03-04T05:00:00.000000100Z"),
+        );
+        // The later window's task runs first.
+        for (read, at) in [
+            (window(4, 8, b"two"), second_at),
+            (window(0, 4, b"one"), first_at),
+        ] {
+            engine
+                .pipeline()
+                .process_until_verified(&source, read, None, at, at, None)
+                .await
+                .unwrap();
+        }
+        let mut rows = engine.store.list_batches().await.unwrap();
+        rows.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        let order: Vec<_> = rows
+            .iter()
+            .map(|r| (r.created_at.clone(), r.progress_start.range_token()))
+            .collect();
+        assert_eq!(rows.len(), 2, "{order:?}");
+        // The store keeps a fixed-width spelling of the instant.
+        let stamped = |row: &BatchRecord| {
+            chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        assert_eq!(stamped(&rows[0]), first_at, "{order:?}");
+        assert_eq!(stamped(&rows[1]), second_at, "{order:?}");
+        assert!(
+            rows[0].progress_start.range_token() != rows[1].progress_start.range_token(),
+            "{order:?}"
+        );
+        assert!(
+            start_position(&rows[0].progress_start) < start_position(&rows[1].progress_start),
+            "the earlier window is filed first: {order:?}"
         );
     }
 
@@ -7502,7 +8218,7 @@ mod tests {
             .collect();
 
         let (logs, _guard) = CapturedLogs::start_at(tracing::Level::INFO);
-        let outcomes = engine.run_source(SourceType::File, false).await.unwrap();
+        let outcomes = run_until_settled(&mut engine, SourceType::File).await;
         assert_eq!(outcomes.len(), 1, "the threshold sealed one batch");
         let outcome = &outcomes[0];
         assert!(outcome.committed, "the batch committed");
@@ -8014,6 +8730,720 @@ mod tests {
         );
     }
 
+    /// A mock store whose object puts can be held at a gate, and refused
+    /// once, by a piece of the object key (a range token such as `b0-14`):
+    /// several batches of one file are then in flight at once, and settle in
+    /// the order a test chooses.
+    struct GatedObjects {
+        inner: Arc<vtop_upload::MockBackend>,
+        gates: std::sync::Mutex<Vec<(String, Arc<tokio::sync::Semaphore>)>>,
+        refused: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl GatedObjects {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: Arc::new(vtop_upload::MockBackend::new()),
+                gates: std::sync::Mutex::new(Vec::new()),
+                refused: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        /// Hold every object put whose key contains `part` until the gate
+        /// returned is opened (`add_permits`).
+        fn gate(&self, part: &str) -> Arc<tokio::sync::Semaphore> {
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            self.gates
+                .lock()
+                .unwrap()
+                .push((part.to_owned(), Arc::clone(&gate)));
+            gate
+        }
+
+        /// Refuse the next object put whose key contains `part`.
+        fn refuse_once(&self, part: &str) {
+            self.refused.lock().unwrap().push(part.to_owned());
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl UploadBackend for GatedObjects {
+        async fn put_object(
+            &self,
+            local_path: &std::path::Path,
+            object_uri: &str,
+            checksum: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::StoredObject, VtopError> {
+            let gate = self
+                .gates
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(part, _)| object_uri.contains(part.as_str()))
+                .map(|(_, gate)| Arc::clone(gate));
+            if let Some(gate) = gate {
+                drop(gate.acquire().await.unwrap());
+            }
+            let refuse = {
+                let mut refused = self.refused.lock().unwrap();
+                match refused.iter().position(|p| object_uri.contains(p.as_str())) {
+                    Some(i) => {
+                        refused.remove(i);
+                        true
+                    }
+                    None => false,
+                }
+            };
+            if refuse {
+                return Err(VtopError::Upload(format!(
+                    "test: put of {object_uri} refused"
+                )));
+            }
+            self.inner
+                .put_object(local_path, object_uri, checksum)
+                .await
+        }
+        async fn put_manifest(
+            &self,
+            local_path: &std::path::Path,
+            manifest_uri: &str,
+            checksum: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::StoredManifest, VtopError> {
+            self.inner
+                .put_manifest(local_path, manifest_uri, checksum)
+                .await
+        }
+        async fn head_object(&self, uri: &str) -> Result<vtop_upload::ObjectHead, VtopError> {
+            self.inner.head_object(uri).await
+        }
+        async fn get_object(&self, uri: &str) -> Result<Vec<u8>, VtopError> {
+            self.inner.get_object(uri).await
+        }
+        async fn get_object_bounded(&self, uri: &str, max: usize) -> Result<Vec<u8>, VtopError> {
+            self.inner.get_object_bounded(uri, max).await
+        }
+        async fn verify_object(
+            &self,
+            uri: &str,
+            size: u64,
+            expected: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::VerificationResult, VtopError> {
+            self.inner.verify_object(uri, size, expected).await
+        }
+        async fn delete_object(&self, uri: &str) -> Result<(), VtopError> {
+            self.inner.delete_object(uri).await
+        }
+        fn backend_name(&self) -> &'static str {
+            "gated"
+        }
+        fn supports_checksum_verification(&self) -> bool {
+            true
+        }
+        fn supports_multipart(&self) -> bool {
+            false
+        }
+        fn reports_absent_objects(&self) -> bool {
+            true
+        }
+    }
+
+    /// A file of `lines` lines of seven bytes ("line N\n", N < 10), read two
+    /// lines per batch, by an engine on a [`GatedObjects`] store.
+    async fn pipelined_file_engine(
+        dir: &std::path::Path,
+        lines: usize,
+    ) -> (Engine, Arc<GatedObjects>, std::path::PathBuf) {
+        let input = dir.join("in.log");
+        let body: String = (1..=lines).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(&input, body).unwrap();
+        let mut cfg = file_config(
+            dir.join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.max_records = 2;
+        cfg.batching.max_batch_age_seconds = 3_600;
+        cfg.batching.idle_poll_interval_ms = 20;
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let store = GatedObjects::new();
+        engine.backend = store.clone();
+        (engine, store, input)
+    }
+
+    /// Unforced passes until every batch they sealed has settled: a pass
+    /// returns what settled in it, and a batch sealed by one settles in a
+    /// later one once its task is done. Errors are passed over, as the run
+    /// loop does.
+    async fn run_until_settled(engine: &mut Engine, source_type: SourceType) -> Vec<BatchOutcome> {
+        let mut outcomes = Vec::new();
+        for _ in 0..500 {
+            if let Ok(mut settled) = engine.run_source(source_type.clone(), false).await {
+                outcomes.append(&mut settled);
+            }
+            if engine.inflight.values().all(VecDeque::is_empty) {
+                return outcomes;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("batches still in flight after 500 passes: {outcomes:?}");
+    }
+
+    /// Review of #895: batches whose records carry no payload (Kafka
+    /// tombstones, empty values) add nothing to the in-flight bytes, so behind
+    /// a stalled upload the byte budget alone would let the whole backlog
+    /// queue up. The count bound stops reading at twice the width.
+    #[tokio::test]
+    async fn sealed_batches_stop_reading_at_twice_the_width_whatever_their_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, store, _input) = pipelined_file_engine(dir.path(), 9).await;
+        engine.config.batching.max_concurrent_batches = 2;
+        engine.config.batching.max_records = 1;
+        // Every object put waits: nothing settles while the passes run.
+        let gate = store.gate("");
+        // A full queue makes the next pass wait for a batch to finish, which
+        // never happens here: stop at the bound rather than wait.
+        for _ in 0..8 {
+            if engine.inflight_is_full(&SourceType::File) {
+                break;
+            }
+            engine.run_source(SourceType::File, false).await.unwrap();
+        }
+        let queued = engine
+            .inflight
+            .get(&SourceType::File)
+            .map_or(0, VecDeque::len);
+        assert_eq!(
+            queued, 4,
+            "sealed batches kept queueing behind a stalled upload: {queued} with a width of 2"
+        );
+        gate.add_permits(1_000);
+        engine.run_source(SourceType::File, true).await.unwrap();
+        for _ in 0..20 {
+            let _ = engine.run_source(SourceType::File, true).await;
+        }
+        let len = std::fs::metadata(dir.path().join("in.log")).unwrap().len() as i128;
+        assert_committed_without_a_gap("after the stall", &engine, len).await;
+    }
+
+    /// Review of #895: batch tasks answer between cycles, so a throttle can
+    /// land while the source is polled or the run loop backs off. The width
+    /// controller judges everything answered since it last looked (#102),
+    /// not only what a cycle saw between two of its own reads.
+    #[tokio::test]
+    async fn a_throttle_answered_between_cycles_still_narrows_the_width() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, _store, _input) = pipelined_file_engine(dir.path(), 0).await;
+        engine.config.batching.adaptive_width.enabled = true;
+        engine.config.batching.adaptive_width.min_width = 1;
+        let before = engine.upload_width();
+        // A batch task's request was answered with a throttle after the last
+        // cycle ended.
+        engine.attempts.fetch_add(1, Ordering::Relaxed);
+        engine.throttles.fetch_add(1, Ordering::Relaxed);
+        engine.run_source(SourceType::File, false).await.unwrap();
+        assert!(
+            engine.upload_width() < before,
+            "a throttle answered between cycles left the width at {} (was {before})",
+            engine.upload_width()
+        );
+    }
+
+    /// Review of #895: a wait for any batch to finish returns when one has,
+    /// on a multi-threaded runtime too. Waiting on a notification the task
+    /// sent before it returned could miss the completion and wait for ever;
+    /// the wait is on the join handles now. Many rounds, each with tasks that
+    /// finish while the engine is already waiting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn waiting_for_any_batch_returns_once_one_has_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, _store, input) = pipelined_file_engine(dir.path(), 0).await;
+        let marker = ProgressMarker::File {
+            path: input.to_string_lossy().into_owned(),
+            inode: None,
+            start_byte: 0,
+            end_byte: 1,
+            file_size: 1,
+            mtime: String::new(),
+            content_fingerprint: None,
+            tail_fingerprint: None,
+            ctime: None,
+        };
+        for round in 0..200u64 {
+            let task = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_micros(round % 7 * 50)).await;
+                Ok(VerifyStep::Finished(BatchOutcome {
+                    batch_id: format!("b{round}"),
+                    final_state: BatchState::Discovered,
+                    committed: false,
+                    record_count: 0,
+                    object_uri: None,
+                    metrics: None,
+                }))
+            });
+            engine
+                .inflight
+                .entry(SourceType::File)
+                .or_default()
+                .push_back(InFlight {
+                    unit: unit_key(&marker),
+                    window: Box::new(RecordedWindow {
+                        start: marker.clone(),
+                        end: marker.clone(),
+                        sealed_at: None,
+                        digest: None,
+                        object_uri: None,
+                        batch_id: None,
+                        record_count: Some(0),
+                        bounded: false,
+                    }),
+                    bytes: 0,
+                    superseded: false,
+                    failure_handled: false,
+                    task: Some(task),
+                    result: None,
+                });
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                engine.wait_for_inflight(&SourceType::File, Wait::Any(None)),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: a finished batch was never seen"));
+            engine.inflight.get_mut(&SourceType::File).unwrap().clear();
+        }
+    }
+
+    /// Review of #895: a forced flush cancelled while it waits on a batch (a
+    /// second stop abandons the shutdown flush) leaves the batch's task in
+    /// its entry, so dropping the engine still aborts it. Taken out of the
+    /// entry before the wait, the task was detached and went on writing after
+    /// the engine was gone.
+    #[tokio::test]
+    async fn a_cancelled_flush_leaves_its_batches_for_the_engine_to_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, store, _input) = pipelined_file_engine(dir.path(), 2).await;
+        let _gate = store.gate("");
+        let flush = engine.run_source(SourceType::File, true);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), flush)
+                .await
+                .is_err(),
+            "the flush waits on the held upload"
+        );
+        assert!(
+            Arc::strong_count(&store) > 2,
+            "the batch task holds the store"
+        );
+        drop(engine);
+        for _ in 0..100 {
+            if Arc::strong_count(&store) == 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!(
+            "a batch task outlived its engine after the flush was cancelled: the store \
+             still has {} owners",
+            Arc::strong_count(&store)
+        );
+    }
+
+    /// Review of #895: the abandoned-multipart sweep can run while a batch
+    /// is still uploading, so a session whose upload is live in this process
+    /// is never swept, however old its file says it is.
+    #[tokio::test]
+    async fn the_multipart_sweep_skips_a_session_whose_upload_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let input = dir.path().join("idle.log");
+        std::fs::write(&input, "").unwrap();
+        let cfg = file_config(
+            work.to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        let mut engine = Engine::new(cfg.clone(), StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let backend = Arc::new(vtop_upload::MockBackend::new().with_part_fault(
+            2,
+            vtop_upload::PartFault::Reset,
+            usize::MAX,
+        ));
+        engine.backend = backend.clone();
+        let mut mp_cfg = MultipartUploadConfig::from_upload(&cfg.upload, work.clone());
+        mp_cfg.part_size_bytes = 1_000;
+        mp_cfg.part_attempts = 1;
+        let data = vec![7_u8; 3_000];
+        let file = dir.path().join("live");
+        std::fs::write(&file, &data).unwrap();
+        let digest = vtop_core::checksum::sha256_bytes(&data);
+        let fence = MultipartFence {
+            expected_segment_generation: 0,
+            fencing_epoch: 0,
+            content_digest_hex: digest.clone(),
+            content_digest_algorithm: "sha256".into(),
+            byte_length: 3_000,
+        };
+        let uri = "s3://telemetry-data/live.raw".to_owned();
+        multipart::upload_resumable(
+            backend.as_ref(),
+            &mp_cfg,
+            &file,
+            &uri,
+            Some(ObjectChecksum::new("sha256", &digest)),
+            fence.clone(),
+        )
+        .await
+        .expect_err("part 2 fails");
+        let path = work.join(multipart::session_file_name(&uri, &fence));
+        let mut session = multipart::load_session(&path).unwrap();
+        session.updated_at_unix_secs = 1;
+        multipart::save_session(&path, &session).unwrap();
+
+        // As old as a session gets, but its upload is live in this process.
+        let live = LiveMultipart::start(&engine.active_multipart, &uri).await;
+        assert_eq!(engine.sweep_abandoned_multipart().await, 0);
+        assert!(path.exists(), "a live upload's session was swept");
+        assert!(backend.has_pending_multipart(&session.object_uri, &session.upload_id));
+
+        drop(live);
+        assert_eq!(engine.sweep_abandoned_multipart().await, 1);
+        assert!(
+            !path.exists(),
+            "an abandoned session was kept once its upload ended"
+        );
+    }
+
+    /// Review of #895: the sweep holds a key from the moment it finds it not
+    /// live until its session is aborted and deleted. An upload of that key
+    /// waits for it rather than resuming the session under the abort, and a
+    /// live upload is never claimed.
+    #[tokio::test]
+    async fn an_upload_waits_for_a_key_the_sweep_holds() {
+        let keys = ActiveMultipart::default();
+        let uri = "s3://bucket/key.segment";
+
+        let live = LiveMultipart::start(&keys, uri).await;
+        assert!(
+            SweepingKey::claim(&keys, uri).is_none(),
+            "a live upload's key was claimed by the sweep"
+        );
+        drop(live);
+
+        let held = SweepingKey::claim(&keys, uri).expect("a key no upload holds");
+        let waiting = {
+            let keys = Arc::clone(&keys);
+            tokio::spawn(async move {
+                let _live = LiveMultipart::start(&keys, uri).await;
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !waiting.is_finished(),
+            "an upload started on a key the sweep was aborting"
+        );
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the upload went on once the sweep let go")
+            .unwrap();
+        assert!(keys.lock().unwrap().live.is_empty());
+    }
+
+    /// Review of #892: a key has one uploader at a time. A second upload of it
+    /// (the replay of a superseded window, which names the same derived key)
+    /// waits until the first lets go, and different keys do not wait.
+    #[tokio::test]
+    async fn a_second_upload_of_a_live_key_waits_for_the_first() {
+        let keys = ActiveMultipart::default();
+        let uri = "s3://bucket/key.segment";
+        let first = LiveMultipart::start(&keys, uri).await;
+        drop(LiveMultipart::start(&keys, "s3://bucket/other.segment").await);
+        let second = {
+            let keys = Arc::clone(&keys);
+            tokio::spawn(async move { drop(LiveMultipart::start(&keys, uri).await) })
+        };
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !second.is_finished(),
+            "two uploads of one key were live at once"
+        );
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("the second upload went on once the first ended")
+            .unwrap();
+        assert!(keys.lock().unwrap().live.is_empty());
+    }
+
+    /// The upload slots follow the width the controller chooses (#102). A
+    /// narrower width withdraws permits as they come back, so batches
+    /// already holding a slot are never cut off and never exceed the old
+    /// width; a wider one adds them at once.
+    #[tokio::test]
+    async fn the_upload_slots_follow_the_width_held_permits_included() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "").unwrap();
+        let mut cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.max_concurrent_batches = 4;
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let slots = Arc::clone(&engine.upload_slots);
+        assert_eq!(slots.available_permits(), 4);
+
+        // Three batches hold a slot when the width drops to two.
+        let held = Arc::clone(&slots).acquire_many_owned(3).await.unwrap();
+        engine.resize_upload_slots(2);
+        assert_eq!(
+            slots.available_permits(),
+            0,
+            "a narrower width must not leave a free slot while three are held"
+        );
+        drop(held);
+        // The next cycle withdraws what came back above the new width.
+        engine.resize_upload_slots(2);
+        assert_eq!(slots.available_permits(), 2);
+
+        engine.resize_upload_slots(5);
+        assert_eq!(slots.available_permits(), 5);
+        engine.resize_upload_slots(1);
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    /// Review of #895: permits that come back while batches are queued behind
+    /// the slots go to the waiting tasks, so a narrower width has to be
+    /// enforced where they take them. Four batches hold the slots and four
+    /// wait; the width drops to one; as the four finish, one waiting batch
+    /// runs at a time, not four.
+    #[tokio::test]
+    async fn a_narrower_width_holds_for_batches_already_waiting_for_a_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "").unwrap();
+        let mut cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.max_concurrent_batches = 4;
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let slots = Arc::clone(&engine.upload_slots);
+        let debt = Arc::clone(&engine.upload_slots_debt);
+        let held = Arc::clone(&slots).acquire_many_owned(4).await.unwrap();
+        let running = Arc::new(AtomicUsize::new(0));
+        let mut waiting = Vec::new();
+        for _ in 0..4 {
+            let (slots, debt, running) =
+                (Arc::clone(&slots), Arc::clone(&debt), Arc::clone(&running));
+            waiting.push(tokio::spawn(async move {
+                let _slot = acquire_upload_slot(&slots, &debt).await;
+                running.fetch_add(1, Ordering::SeqCst);
+                // Holds its slot until the test ends.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(running.load(Ordering::SeqCst), 0);
+
+        engine.resize_upload_slots(1);
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            running.load(Ordering::SeqCst),
+            1,
+            "the queued batches ran at the old width"
+        );
+        for task in waiting {
+            task.abort();
+        }
+    }
+
+    /// A batch task does not outlive its engine: dropping the engine (a test,
+    /// or a run abandoned mid-flush) aborts the tasks, which then release
+    /// what they held, as dropping the engine's future did when batches were
+    /// polled inside the cycle. A restart recovers them as after a crash.
+    #[tokio::test]
+    async fn dropping_the_engine_aborts_its_batch_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, store, _input) = pipelined_file_engine(dir.path(), 2).await;
+        let _gate = store.gate("b0-14");
+        engine.run_source(SourceType::File, false).await.unwrap();
+        assert!(
+            engine.inflight.values().any(|q| !q.is_empty()),
+            "the window waits at the gate"
+        );
+        let held_by_tasks = Arc::strong_count(&store);
+        assert!(
+            held_by_tasks > 2,
+            "the batch task holds the store: {held_by_tasks}"
+        );
+        drop(engine);
+        for _ in 0..100 {
+            if Arc::strong_count(&store) == 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!(
+            "the batch task outlived its engine: the store still has {} owners",
+            Arc::strong_count(&store)
+        );
+    }
+
+    /// The ledger states of the file batches that start at `start`.
+    async fn states_of_range(engine: &Engine, start: u64) -> Vec<BatchState> {
+        engine
+            .store
+            .list_batches()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|b| {
+                matches!(b.progress_start, ProgressMarker::File { start_byte, .. } if start_byte == start)
+            })
+            .map(|b| b.state)
+            .collect()
+    }
+
+    /// Runs passes of `source_type` until the ledger holds `n` batches that
+    /// did not reach VERIFIED, and returns them: a window sealed in one pass
+    /// stays in flight across cycles, and settles in a later one.
+    async fn passes_until_failed(
+        engine: &mut Engine,
+        source_type: &SourceType,
+        n: usize,
+    ) -> Vec<BatchRecord> {
+        for _ in 0..200 {
+            let failed: Vec<_> = engine
+                .store
+                .list_batches()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|b| matches!(b.state, BatchState::Failed | BatchState::ReplayRequired))
+                .collect();
+            if failed.len() >= n {
+                return failed;
+            }
+            let _ = engine.run_source(source_type.clone(), false).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("{n} batches never failed");
+    }
+
+    /// Run passes until the batch at `start` reaches `state` (the batch
+    /// tasks run between passes), or fail after a bound.
+    async fn pass_until(engine: &mut Engine, start: u64, state: BatchState) {
+        for _ in 0..200 {
+            if states_of_range(engine, start).await.contains(&state) {
+                return;
+            }
+            let _ = engine.run_source(SourceType::File, false).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!(
+            "the batch at byte {start} never reached {state:?}: {:?}",
+            states_of_range(engine, start).await
+        );
+    }
+
+    /// Pipelining: a batch on the wire does not stop the engine reading,
+    /// sealing and uploading the windows after it; but a window that
+    /// verifies first does NOT commit before the one sealed before it.
+    #[tokio::test]
+    async fn a_window_verified_while_an_earlier_one_is_on_the_wire_commits_after_it() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, store, input) = pipelined_file_engine(dir.path(), 6).await;
+        let first = store.gate("b0-14");
+
+        // The first window waits at the gate; the second and third are read,
+        // sealed, uploaded and verified behind it.
+        pass_until(&mut engine, 14, BatchState::Verified).await;
+        pass_until(&mut engine, 28, BatchState::Verified).await;
+        engine.run_source(SourceType::File, false).await.unwrap();
+        assert!(
+            committed_file_ranges(&engine).await.is_empty(),
+            "nothing may commit while the window below it is still on the wire"
+        );
+        let below = states_of_range(&engine, 0).await;
+        assert!(
+            below.len() == 1
+                && !matches!(below[0], BatchState::Verified | BatchState::SourceCommitted),
+            "the first window is still on the wire: {below:?}"
+        );
+
+        first.add_permits(1_000);
+        engine.run_source(SourceType::File, true).await.unwrap();
+        let inode = std::fs::metadata(&input).unwrap().ino();
+        assert_eq!(
+            committed_file_ranges(&engine).await,
+            vec![
+                (Some(inode), 0, 14, Some(2)),
+                (Some(inode), 14, 28, Some(2)),
+                (Some(inode), 28, 42, Some(2)),
+            ],
+            "every window commits, each once, in read order"
+        );
+    }
+
+    /// A window that fails AFTER the windows read behind it verified: they
+    /// are held, the failed range is read again, and nothing is skipped.
+    #[tokio::test]
+    async fn an_earlier_window_failing_behind_verified_ones_holds_them_and_loses_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, store, input) = pipelined_file_engine(dir.path(), 6).await;
+        let first = store.gate("b0-14");
+        store.refuse_once("b0-14");
+        pass_until(&mut engine, 14, BatchState::Verified).await;
+        pass_until(&mut engine, 28, BatchState::Verified).await;
+
+        first.add_permits(1_000);
+        for _ in 0..6 {
+            let _ = engine.run_source(SourceType::File, true).await;
+        }
+        let len = std::fs::metadata(&input).unwrap().len() as i128;
+        assert_committed_without_a_gap("earlier window failed last", &engine, len).await;
+        assert!(
+            engine.inflight.values().all(VecDeque::is_empty),
+            "every batch settled"
+        );
+    }
+
+    /// The later window fails first, and is handed back; then the earlier
+    /// one fails. The read head must land at the EARLIER start: rewinding
+    /// to the later one last would skip the range between them.
+    #[tokio::test]
+    async fn two_windows_of_one_file_failing_out_of_order_rewind_to_the_lower_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, store, input) = pipelined_file_engine(dir.path(), 6).await;
+        let first = store.gate("b0-14");
+        store.refuse_once("b0-14");
+        store.refuse_once("b14-28");
+        pass_until(&mut engine, 14, BatchState::ReplayRequired).await;
+
+        first.add_permits(1_000);
+        for _ in 0..8 {
+            let _ = engine.run_source(SourceType::File, true).await;
+        }
+        let len = std::fs::metadata(&input).unwrap().len() as i128;
+        assert_committed_without_a_gap("later window failed first", &engine, len).await;
+    }
+
     /// Two windows of one unit sealed in the same pass (the buffered one by
     /// overflow, the new one by its threshold), and both fail. The read head
     /// must be handed back to the LOWER start: handing back each start in
@@ -8059,13 +9489,10 @@ mod tests {
             write!(f, "line 2\nline 3\n").unwrap();
         }
         // This pass seals [0, 7) and [7, 21), and the store refuses both.
-        let failed = engine.run_source(source_type.clone(), false).await;
-        let failed = failed.unwrap_or_default();
+        // They stay in flight across cycles, so they settle in a later pass.
+        let failed = passes_until_failed(&mut engine, &source_type, 2).await;
         assert_eq!(
-            failed
-                .iter()
-                .filter(|o| o.final_state == BatchState::Failed)
-                .count(),
+            failed.len(),
             2,
             "both windows of the pass failed: {failed:?}"
         );
@@ -8126,17 +9553,10 @@ mod tests {
                 .unwrap();
             write!(f, "{}{}", line('b'), line('c')).unwrap();
         }
-        // The old content's rewind is refused (its bytes are gone), so the
-        // pass reports an error; what matters is what the ledger holds.
-        let _ = engine.run_source(SourceType::File, false).await;
-        let failed: Vec<_> = engine
-            .store
-            .list_batches()
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|b| matches!(b.state, BatchState::Failed | BatchState::ReplayRequired))
-            .collect();
+        // The old content's rewind is refused (its bytes are gone), so a
+        // pass reports an error; what matters is what the ledger holds. The
+        // windows stay in flight across cycles and settle in a later pass.
+        let failed = passes_until_failed(&mut engine, &SourceType::File, 2).await;
         assert_eq!(
             failed.len(),
             2,
@@ -8581,7 +10001,7 @@ mod tests {
     /// once: the ledger of a full disk or an unreachable PostgreSQL, for one
     /// write (#627).
     struct FaultyLedger {
-        inner: Box<dyn StateStore>,
+        inner: Arc<dyn StateStore>,
         armed: std::sync::Mutex<Vec<LedgerWrite>>,
     }
 
@@ -8591,8 +10011,8 @@ mod tests {
             let stand_in = vtop_state::connect_state_store("sqlite::memory:")
                 .await
                 .unwrap();
-            let inner = std::mem::replace(&mut engine.store, stand_in);
-            engine.store = Box::new(FaultyLedger {
+            let inner = std::mem::replace(&mut engine.store, Arc::from(stand_in));
+            engine.store = Arc::new(FaultyLedger {
                 inner,
                 armed: std::sync::Mutex::new(writes.to_vec()),
             });
@@ -9243,7 +10663,7 @@ mod tests {
             .unwrap();
         let mock = Arc::new(vtop_upload::MockBackend::new().with_throttled_manifest_puts(1));
         engine.backend = mock.clone();
-        let first = engine.run_source(SourceType::File, false).await.unwrap();
+        let first = run_until_settled(&mut engine, SourceType::File).await;
         assert_eq!(first.len(), 1, "sealed by its age: {first:?}");
         assert_eq!(first[0].final_state, BatchState::Failed);
         let orphan = engine
@@ -9256,7 +10676,7 @@ mod tests {
             .unwrap();
         let n = std::fs::metadata(&input).unwrap().len();
         append_line(&input, "line 3");
-        let second = engine.run_source(SourceType::File, false).await.unwrap();
+        let second = run_until_settled(&mut engine, SourceType::File).await;
         assert_eq!(second.len(), 2, "{second:?}");
         assert!(second.iter().all(|o| o.committed), "{second:?}");
         assert_eq!(second[0].object_uri.as_deref(), Some(orphan.as_str()));
@@ -13226,6 +14646,159 @@ mod tests {
         );
     }
 
+    /// A mock store whose manifest writes take `delay`, and which records
+    /// when each object check started and each manifest write ended.
+    struct SlowManifests {
+        inner: Arc<vtop_upload::MockBackend>,
+        delay: Duration,
+        /// Answer the object check with a throttle, and refuse the manifest.
+        throttle_check_refuse_manifest: bool,
+        object_checks: std::sync::Mutex<Vec<Instant>>,
+        manifest_puts: std::sync::Mutex<Vec<Instant>>,
+    }
+
+    #[async_trait::async_trait]
+    impl UploadBackend for SlowManifests {
+        async fn put_object(
+            &self,
+            local_path: &std::path::Path,
+            object_uri: &str,
+            checksum: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::StoredObject, VtopError> {
+            self.inner
+                .put_object(local_path, object_uri, checksum)
+                .await
+        }
+        async fn put_manifest(
+            &self,
+            local_path: &std::path::Path,
+            manifest_uri: &str,
+            checksum: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::StoredManifest, VtopError> {
+            tokio::time::sleep(self.delay).await;
+            if self.throttle_check_refuse_manifest {
+                return Err(VtopError::Upload(format!("test: {manifest_uri} refused")));
+            }
+            let stored = self
+                .inner
+                .put_manifest(local_path, manifest_uri, checksum)
+                .await;
+            self.manifest_puts.lock().unwrap().push(Instant::now());
+            stored
+        }
+        async fn head_object(&self, uri: &str) -> Result<vtop_upload::ObjectHead, VtopError> {
+            self.inner.head_object(uri).await
+        }
+        async fn get_object(&self, uri: &str) -> Result<Vec<u8>, VtopError> {
+            self.inner.get_object(uri).await
+        }
+        async fn get_object_bounded(&self, uri: &str, max: usize) -> Result<Vec<u8>, VtopError> {
+            self.inner.get_object_bounded(uri, max).await
+        }
+        async fn verify_object(
+            &self,
+            uri: &str,
+            size: u64,
+            expected: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::VerificationResult, VtopError> {
+            if !uri.ends_with(".manifest.json") {
+                self.object_checks.lock().unwrap().push(Instant::now());
+                if self.throttle_check_refuse_manifest {
+                    return Err(VtopError::UploadThrottled(format!("test: {uri} throttled")));
+                }
+            }
+            self.inner.verify_object(uri, size, expected).await
+        }
+        async fn delete_object(&self, uri: &str) -> Result<(), VtopError> {
+            self.inner.delete_object(uri).await
+        }
+        fn backend_name(&self) -> &'static str {
+            "slow-manifests"
+        }
+        fn supports_checksum_verification(&self) -> bool {
+            true
+        }
+        fn supports_multipart(&self) -> bool {
+            false
+        }
+        fn reports_absent_objects(&self) -> bool {
+            true
+        }
+    }
+
+    /// The object's check is sent beside the manifest write, not after it:
+    /// on a long link the manifest PUT and the object HEAD then cost one
+    /// round trip, not two. The batch still verifies and commits.
+    #[tokio::test]
+    async fn the_object_check_runs_while_the_manifest_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "line 1\nline 2\n").unwrap();
+        let cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let store = Arc::new(SlowManifests {
+            inner: Arc::new(vtop_upload::MockBackend::new()),
+            delay: Duration::from_millis(300),
+            throttle_check_refuse_manifest: false,
+            object_checks: std::sync::Mutex::new(Vec::new()),
+            manifest_puts: std::sync::Mutex::new(Vec::new()),
+        });
+        engine.backend = store.clone();
+        let outcomes = engine.process_once(SourceType::File).await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].committed, "the batch committed: {outcomes:?}");
+        let checked = store.object_checks.lock().unwrap().clone();
+        let written = store.manifest_puts.lock().unwrap().clone();
+        assert_eq!(checked.len(), 1, "one object check: {checked:?}");
+        assert_eq!(written.len(), 1, "one manifest write: {written:?}");
+        assert!(
+            checked[0] < written[0],
+            "the object check was sent only after the manifest write ended"
+        );
+    }
+
+    /// Review of #892: a throttle the store answered the object check with
+    /// is counted for the width controller (#102) even when the batch fails
+    /// first, at its manifest upload, and never joins the check's task.
+    #[tokio::test]
+    async fn a_throttled_object_check_counts_though_the_manifest_upload_failed_first() {
+        let _serial = THROTTLE_TESTS.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "line 1\n").unwrap();
+        let cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        engine.backend = Arc::new(SlowManifests {
+            inner: Arc::new(vtop_upload::MockBackend::new()),
+            delay: Duration::from_millis(100),
+            throttle_check_refuse_manifest: true,
+            object_checks: std::sync::Mutex::new(Vec::new()),
+            manifest_puts: std::sync::Mutex::new(Vec::new()),
+        });
+        let before = engine.throttles.load(Ordering::Relaxed);
+        let outcomes = engine.process_once(SourceType::File).await.unwrap();
+        assert_eq!(outcomes[0].final_state, BatchState::Failed, "{outcomes:?}");
+        assert_eq!(
+            engine.throttles.load(Ordering::Relaxed) - before,
+            1,
+            "the object check's throttle was dropped with its task"
+        );
+    }
+
     /// A versioned store whose bucket versioning can be suspended under a
     /// running engine. Suspended, it still stores what is put (S3 keeps a
     /// `null` version) but returns no version id, and GetBucketVersioning
@@ -13814,6 +15387,254 @@ mod tests {
             engine.upload_width(),
             2,
             "and the width controller halved the next cycle's width on it"
+        );
+    }
+
+    /// A multipart store that holds the first part of one object's upload at
+    /// a gate and refuses the creation of another's once, and counts what
+    /// reaches the held object while that part waits.
+    struct HeldMultipart {
+        inner: Arc<vtop_upload::MockBackend>,
+        /// The piece of the object key whose first part waits.
+        hold: String,
+        gate: Arc<tokio::sync::Semaphore>,
+        taken: AtomicBool,
+        waiting: AtomicBool,
+        /// Refuse the next `create_multipart_upload` whose key contains this.
+        refuse_create: std::sync::Mutex<Option<String>>,
+        /// Requests for the held object made while its first part waits: a
+        /// second writer of the same session.
+        intruders: AtomicUsize,
+    }
+
+    impl HeldMultipart {
+        fn note(&self, uri: &str) {
+            if uri.contains(&self.hold) && self.waiting.load(Ordering::SeqCst) {
+                self.intruders.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl UploadBackend for HeldMultipart {
+        async fn put_object(
+            &self,
+            local_path: &std::path::Path,
+            object_uri: &str,
+            checksum: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::StoredObject, VtopError> {
+            self.inner
+                .put_object(local_path, object_uri, checksum)
+                .await
+        }
+        async fn put_manifest(
+            &self,
+            local_path: &std::path::Path,
+            manifest_uri: &str,
+            checksum: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::StoredManifest, VtopError> {
+            self.inner
+                .put_manifest(local_path, manifest_uri, checksum)
+                .await
+        }
+        async fn head_object(&self, uri: &str) -> Result<vtop_upload::ObjectHead, VtopError> {
+            self.inner.head_object(uri).await
+        }
+        async fn get_object(&self, uri: &str) -> Result<Vec<u8>, VtopError> {
+            self.inner.get_object(uri).await
+        }
+        async fn get_object_bounded(&self, uri: &str, max: usize) -> Result<Vec<u8>, VtopError> {
+            self.inner.get_object_bounded(uri, max).await
+        }
+        async fn verify_object(
+            &self,
+            uri: &str,
+            size: u64,
+            expected: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::VerificationResult, VtopError> {
+            self.inner.verify_object(uri, size, expected).await
+        }
+        async fn delete_object(&self, uri: &str) -> Result<(), VtopError> {
+            self.inner.delete_object(uri).await
+        }
+        fn backend_name(&self) -> &'static str {
+            "held-multipart"
+        }
+        fn supports_checksum_verification(&self) -> bool {
+            true
+        }
+        fn supports_multipart(&self) -> bool {
+            true
+        }
+        fn reports_absent_objects(&self) -> bool {
+            true
+        }
+        async fn create_multipart_upload(
+            &self,
+            object_uri: &str,
+            content_type: &str,
+            checksum: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::CreatedUpload, VtopError> {
+            self.note(object_uri);
+            let refused = {
+                let mut refuse = self.refuse_create.lock().unwrap();
+                if refuse.as_deref().is_some_and(|p| object_uri.contains(p)) {
+                    refuse.take();
+                    true
+                } else {
+                    false
+                }
+            };
+            if refused {
+                return Err(VtopError::Upload(format!(
+                    "test: creating the upload of {object_uri} refused"
+                )));
+            }
+            self.inner
+                .create_multipart_upload(object_uri, content_type, checksum)
+                .await
+        }
+        async fn upload_part(
+            &self,
+            object_uri: &str,
+            upload_id: &str,
+            part_number: u32,
+            data: bytes::Bytes,
+        ) -> Result<vtop_upload::UploadedPart, VtopError> {
+            if object_uri.contains(&self.hold) {
+                if self.taken.swap(true, Ordering::SeqCst) {
+                    self.note(object_uri);
+                } else {
+                    self.waiting.store(true, Ordering::SeqCst);
+                    drop(self.gate.acquire().await.unwrap());
+                    self.waiting.store(false, Ordering::SeqCst);
+                }
+            }
+            self.inner
+                .upload_part(object_uri, upload_id, part_number, data)
+                .await
+        }
+        async fn complete_multipart_upload(
+            &self,
+            object_uri: &str,
+            upload_id: &str,
+            parts: &[vtop_upload::UploadedPart],
+        ) -> Result<vtop_upload::StoredObject, VtopError> {
+            self.note(object_uri);
+            self.inner
+                .complete_multipart_upload(object_uri, upload_id, parts)
+                .await
+        }
+        async fn abort_multipart_upload(
+            &self,
+            object_uri: &str,
+            upload_id: &str,
+        ) -> Result<(), VtopError> {
+            self.note(object_uri);
+            self.inner
+                .abort_multipart_upload(object_uri, upload_id)
+                .await
+        }
+    }
+
+    /// Review of #892: an earlier window fails while a later one is still
+    /// uploading a multipart object. The later window is superseded, its range
+    /// is read again, and the replacement names the same derived key (same
+    /// range, same bytes), so the same multipart session file. The replacement
+    /// must wait for the upload still running rather than write the session
+    /// beside it (a shared checkpoint file, an upload id, a delete under the
+    /// other's feet), then find what it left. Nothing commits before it is
+    /// VERIFIED, and the ranges tile the file.
+    #[tokio::test]
+    async fn a_replay_waits_for_the_superseded_multipart_upload_of_its_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = multipart_engine_config(dir.path(), "multipart-supersede-892");
+        cfg.batching.max_records = 20;
+        cfg.batching.max_concurrent_batches = 4;
+        cfg.batching.idle_poll_interval_ms = 20;
+        cfg.upload.multipart_max_parallelism = 1;
+        // No hour in the key: both attempts name it whatever the clock says.
+        cfg.partitioning.template = "tenant={tenant}/source={source}/format={format}".into();
+        let line = std::fs::read_to_string(dir.path().join("in.log"))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .len() as u64
+            + 1;
+        let (first, second) = (
+            format!("b0-{}-", 20 * line),
+            format!("b{}-{}-", 20 * line, 40 * line),
+        );
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let store = Arc::new(HeldMultipart {
+            inner: Arc::new(vtop_upload::MockBackend::new()),
+            hold: second,
+            gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            taken: AtomicBool::new(false),
+            waiting: AtomicBool::new(false),
+            refuse_create: std::sync::Mutex::new(Some(first)),
+            intruders: AtomicUsize::new(0),
+        });
+        engine.backend = store.clone();
+
+        // The first window's upload is refused and the second's waits at the
+        // gate. The first fails, the second is superseded, and the next pass
+        // reads both ranges again: the queue holds the superseded window and
+        // the replays of both.
+        let mut caught_up = false;
+        for _ in 0..300 {
+            let _ = engine.run_source(SourceType::File, false).await;
+            let queued = engine
+                .inflight
+                .get(&SourceType::File)
+                .map_or(0, VecDeque::len);
+            if queued == 3 {
+                caught_up = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(caught_up, "the replay never caught up to the held upload");
+        for _ in 0..30 {
+            let _ = engine.run_source(SourceType::File, false).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(store.waiting.load(Ordering::SeqCst), "the upload is held");
+        assert_eq!(
+            store.intruders.load(Ordering::SeqCst),
+            0,
+            "the replay used the multipart session of an upload still running"
+        );
+        assert!(
+            committed_file_ranges(&engine).await.is_empty(),
+            "nothing commits while the front of the queue is not VERIFIED"
+        );
+
+        store.gate.add_permits(1_000);
+        run_until_settled(&mut engine, SourceType::File).await;
+        assert_eq!(
+            store.intruders.load(Ordering::SeqCst),
+            0,
+            "a request reached the held object while its first part waited"
+        );
+        let len = std::fs::metadata(dir.path().join("in.log")).unwrap().len();
+        // The superseded window verified and was held; it settles once the
+        // replay has committed through its end, so its range is in the ledger
+        // twice, and every byte of the file is covered.
+        let mut ranges: Vec<_> = committed_file_ranges(&engine)
+            .await
+            .iter()
+            .map(|&(_, start, end, _)| (start, end))
+            .collect();
+        ranges.dedup();
+        assert_eq!(ranges, vec![(0, 20 * line), (20 * line, len)]);
+        assert_committed_without_a_gap("after the replay", &engine, len.into()).await;
+        assert!(
+            engine.active_multipart.lock().unwrap().live.is_empty(),
+            "an upload's key was left held"
         );
     }
 

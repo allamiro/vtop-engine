@@ -14,3 +14,6 @@ __pycache__/
 # Written by gen-h3-certs.sh (the container must run as the key's owner),
 # and the place an operator puts their own lab credentials. Never committed.
 .env
+
+# The long-link rig's runs, logs and ledgers (benchmarks/long_link/README.md).
+long_link/work/

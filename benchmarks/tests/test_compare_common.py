@@ -539,7 +539,7 @@ async def _fake_store(reader, writer, delay=0.0, body=b"hello world"):
         length = int(headers.get("content-length", "0"))
         if length:
             await reader.readexactly(length)
-        await asyncio.sleep(delay)
+        await asyncio.sleep(delay(_line) if callable(delay) else delay)
         answer = b"" if _line.startswith("HEAD") else body
         writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + answer)
         await writer.drain()
@@ -617,6 +617,32 @@ def test_k2_trigger_fires_after_the_response_not_before():
 
     # The store answers after 100 ms: a kill before the answer would show in the order of events.
     asyncio.run(_with_tap(test, delay=0.1))
+
+
+def test_k2_holds_a_response_already_in_flight_until_the_kill_returns():
+    async def test(t, port, events):
+        t.arm("K2", 1, "tool-1")
+        release = asyncio.Event()
+
+        async def kill(container):
+            events.append("kill-start")
+            await release.wait()
+            events.append("kill-end")
+
+        t.kill = kill
+        # The GET is already at the store (it answers after 0.5 s) when the PUT, answered at once, starts the
+        # kill: the GET's answer must not reach the tool before the kill has returned (review of #908).
+        get = asyncio.ensure_future(_client(port, [("GET", "/b/a", b"")]))
+        await asyncio.sleep(0.1)
+        put = asyncio.ensure_future(_client(port, [("PUT", "/b/b", b"x")]))
+        await asyncio.sleep(0.8)
+        assert events == ["kill-start"] and t.gets == []
+        assert not get.done()
+        release.set()
+        assert await get == [b"hello world"]
+        await put
+
+    asyncio.run(_with_tap(test, delay=lambda line: 0.5 if line.startswith("GET") else 0.0))
 
 
 def test_k2_holds_every_other_request_until_the_kill_returns():
