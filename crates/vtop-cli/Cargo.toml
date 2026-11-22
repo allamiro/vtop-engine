@@ -107,6 +107,13 @@ name = "integration_kafka_auth"
 path = "../../tests/integration_kafka_auth.rs"
 required-features = ["kafka"]
 
+# The same Kafka source against a three-broker cluster whose partition leader
+# is stopped and started mid-read (#721, scripts/kafka-cluster.sh).
+[[test]]
+name = "integration_kafka_cluster"
+path = "../../tests/integration_kafka_cluster.rs"
+required-features = ["kafka"]
+
 # Every failpoint kills the real binary where it says it does (#725).
 [[test]]
 name = "failpoints"

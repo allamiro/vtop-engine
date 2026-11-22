@@ -1,0 +1,32 @@
+# The soak's layer over a built engine image (#726): the wall-clock shim the
+# clock_step fault loads, and the entrypoint that loads it.
+#
+#   docker build -f docker/Dockerfile -t vtop-engine:local .
+#   python3 benchmarks/soak/soak_driver.py --build-engine-from vtop-engine:local ...
+#
+# The driver builds this itself from a temporary context: realtime-skew.c is
+# the source live-chaos scenario 07 embeds, extracted at build time so there
+# is one copy of the shim. The shim is built here against the same Debian the
+# engine image runs, because an LD_PRELOAD shim must match the libc it loads
+# into; an engine image built on another base needs the stage changed.
+ARG ENGINE_IMAGE
+
+# Pinned by digest, as docker/Dockerfile pins its runtime stage.
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS shim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY realtime-skew.c /src/realtime-skew.c
+# One shim per clock step the profile uses, named skew+3600.so, skew-3600.so.
+ARG SKEW_SECONDS="3600 -3600"
+RUN set -eu; mkdir /shims; \
+    for s in $SKEW_SECONDS; do \
+      gcc -shared -fPIC -O2 -DVTOP_SKEW_SECONDS="$s" \
+        -o "/shims/skew$(printf '%+d' "$s").so" /src/realtime-skew.c -ldl; \
+    done
+
+FROM ${ENGINE_IMAGE}
+USER root
+COPY --from=shim /shims /opt/soak/shims
+COPY --chmod=755 soak-entrypoint.sh /usr/local/bin/soak-entrypoint.sh
+USER vtop
