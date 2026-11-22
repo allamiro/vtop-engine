@@ -456,8 +456,29 @@ mod tests {
         let path = dir.path().join("state.db");
         let conn = format!("sqlite://{}", path.display());
         migrate_state_store(&conn).await.unwrap();
+        // The migration itself creates the ledger (#729): `vtopctl migrate`
+        // that returned without opening the file would leave nothing.
+        assert!(path.exists(), "the migration did not create {conn}");
         let store = connect_state_store(&conn).await.unwrap();
         assert!(store.list_batches().await.unwrap().is_empty());
+    }
+
+    // As `factory_rejects_postgres_without_the_feature`, for the explicit
+    // migration: either spelling of a PostgreSQL URI is refused with the
+    // reason, never opened as a SQLite path (#729).
+    #[cfg(not(feature = "postgres"))]
+    #[tokio::test]
+    async fn migration_rejects_postgres_without_the_feature() {
+        for conn in [
+            "postgres://vtop@pg:5432/vtop",
+            "postgresql://vtop@pg:5432/vtop",
+        ] {
+            let msg = migrate_state_store(conn).await.unwrap_err().to_string();
+            assert!(
+                msg.contains("PostgreSQL") && msg.contains("feature"),
+                "unexpected error for {conn}: {msg}"
+            );
+        }
     }
 
     // Only meaningful WITHOUT the postgres feature: with it, a postgres:// URI

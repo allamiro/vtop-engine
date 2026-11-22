@@ -170,6 +170,7 @@ nav:
       - deploy/index.md
       - Single engine with SQLite: deploy/single-node.md
       - Single engine with PostgreSQL: deploy/postgresql.md
+      - Losing the engine's host: deploy/engine-host-loss.md
       - PostgreSQL in depth: POSTGRES_DEPLOYMENT.md
       - Several engines (HA): deploy/ha.md
       - Kubernetes with Helm: deploy/kubernetes.md
@@ -202,8 +203,10 @@ nav:
       - Archive path: reference/archive-path.md
       - Known limitations: reference/limitations.md
       - Compatibility and upgrade policy: reference/compatibility.md
+      - "Deprecations: commands, flags and metrics": deprecations.md
       - Data-safety register: reference/data-safety-register.md
       - Component status: reference/component-status.md
+      - 1.0 release gate: reference/release-gate.md
       - Tamper evidence: reference/tamper-evidence.md
       - Protocol (normative draft): VTOP_PROTOCOL_DRAFT.md
       - Design documents:
@@ -224,6 +227,7 @@ nav:
       - Metadata saturation research: METADATA_SATURATION_RESEARCH.md
       - Live chaos validation: LIVE_CHAOS_VALIDATION.md
       - Engine soak validation: SOAK_VALIDATION.md
+      - Cluster soak validation: CLUSTER_SOAK_VALIDATION.md
   - Roadmap and releases:
       - Roadmap: ROADMAP.md
       - Versioning and support: SUPPORT.md

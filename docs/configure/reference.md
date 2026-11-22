@@ -203,11 +203,14 @@ The Kafka releases the source is tested against are listed in
 | `topic_exclude_regex` | `^__.*` | Topics to skip. |
 | `auto_offset_reset` | `earliest` | Kafka `auto.offset.reset` for a partition with no committed offset. |
 | `enable_auto_commit` | `false` | Must be `false`; `true` is refused. Offsets are committed only after verification. |
-| `security_protocol` | - | Kafka `security.protocol`. |
+| `security_protocol` | - | Kafka `security.protocol`. Unset is librdkafka's `plaintext`. Unset, `plaintext` or `sasl_plaintext` with a bootstrap server that is not a loopback address is warned about on every start and by `vtopctl validate` (#732). |
 | `sasl_mechanism` | - | Kafka `sasl.mechanism`. GSSAPI needs a build with `--features kafka-gssapi`. |
 | `sasl_username` | - | Kafka `sasl.username`. |
 | `sasl_password_env` | - | Name of the environment variable holding the SASL password. |
 | `ssl_ca_location` | - | Kafka `ssl.ca.location`. |
+| `ssl_certificate_location` | - | Mutual TLS: the PEM client certificate (`ssl.certificate.location`). Set with `ssl_key_location`, and only with `security_protocol` `SSL` or `SASL_SSL`. See [Kafka brokers](../install/kafka.md#mutual-tls). |
+| `ssl_key_location` | - | Mutual TLS: the PEM key of the client certificate (`ssl.key.location`). |
+| `ssl_key_password_env` | - | Name of the environment variable holding the client key's passphrase, for an encrypted key. |
 
 ### `sources.file`
 
@@ -225,7 +228,7 @@ The Kafka releases the source is tested against are listed in
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | Read syslog spool files written by rsyslog or syslog-ng. |
-| `paths` | **Required** in the block | Glob patterns of spool files. |
+| `paths` | **Required** in the block | Glob patterns of spool files. Each batch's marker records the earliest and latest time its lines start with, when they start with an RFC 3339 or RFC 5424 timestamp ([limitations](../reference/limitations.md)). |
 
 ## `upload`
 
