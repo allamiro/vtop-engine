@@ -106,8 +106,8 @@ ROW_COLUMNS = (
 )
 
 # What a row's state is at the instant each failpoint kills the engine, for
-# the first batch (the sweep runs one batch at a time and kills on the first
-# hit): the state before the transition a `before_` point sits in front of,
+# the batch that hit it first: the state before the transition a `before_`
+# point sits in front of,
 # the state a `after_` point sits behind. `None`: no row yet. The same table
 # crates/vtop-cli/tests/failpoints.rs pins against the in-repo build.
 KILL_STATE = {
@@ -252,6 +252,17 @@ def kill_state(point: str, ledger: dict) -> tuple[bool, str]:
     seen = ledger.get("newest_state")
     if seen == expected:
         return True, f"{point}: the newest live ledger row is {expected or 'absent'}, as it must be"
+    # Batches stay in flight across cycles (docs/ARCHITECTURE.md section 5.2),
+    # so the batch that hit the point is not always the newest: a window read
+    # after it can already be uploading, or VERIFIED and waiting for it to
+    # commit. The point is where it says when SOME row is in the state it
+    # sits beside. Whether a commit ran ahead of its batch's VERIFIED is the
+    # commit-rule check's to answer, from the group's offset and the ledger.
+    if expected is not None and ledger.get("states", {}).get(expected, 0) > 0:
+        return True, (
+            f"{point}: a ledger row is {expected}, as it must be; the newest is {seen}, a batch "
+            f"read after the one at the point"
+        )
     what = "no live row" if seen is None else f"a {seen} row"
     want = "no row yet" if expected is None else f"a {expected} row"
     return False, (

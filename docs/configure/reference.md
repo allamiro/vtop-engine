@@ -60,7 +60,7 @@ Default column means the key is unset unless you set it.
 | `max_batch_age_seconds` | `60` | Seal a batch this old. |
 | `source_poll_wait_ms` | `250` | Longest a read pass waits for data. Paid once per pass on the Kafka plane; file and spool reads do not wait. |
 | `idle_poll_interval_ms` | `2000` | Pause between cycles, only after a cycle that read nothing. |
-| `max_concurrent_batches` | `8` | Batches in the verify phase (compress, checksum, upload, manifest, verify) at once. Source commits stay serial. Zero is refused. Not a memory ceiling. |
+| `max_concurrent_batches` | `8` | Batches in the verify phase (compress, checksum, upload, manifest, verify) at once, across cycles: the engine reads on while they are on the wire. Source commits stay serial and in read order. Reading pauses while sealed batches hold this many times `max_bytes`, or number twice this many. Zero is refused. |
 | `adaptive_width.enabled` | `false` | Let the upload width follow the store's throttles: `max_concurrent_batches` becomes the ceiling, a throttled cycle halves the width and a clean one adds one. |
 | `adaptive_width.min_width` | `1` | The width the controller never goes below. |
 
