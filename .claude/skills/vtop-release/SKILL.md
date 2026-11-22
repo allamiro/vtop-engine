@@ -13,7 +13,7 @@ Ground truth: `.github/workflows/release.yml` (a push of a `v*` tag publishes), 
 2. **Squash-merge the bump PR, then tag the merge commit.** The tag must point at the commit whose `Cargo.toml` says the version: `release.yml` fails the run if the tag and the workspace version differ (the "Derive version" step).
 3. **Never re-tag a published release.** The signatures name the tag (`.../release.yml@refs/tags/vX.Y.Z`), the image and archives were built from it, and users verified against it. A bad release is fixed forward with the next patch version. Do not delete, move or re-push a `v*` tag, and do not replace or edit a release's assets.
    - The one precedent for moving a tag is v0.7.0, and nothing had been published: its first run (on the bump commit `af867f7`) was cancelled when GitHub retired the macOS runner the workflow named (#608), and the tag was cut again on `6c8f386` (#609) after two `workflow_dispatch` dry-runs. The first GitHub release for v0.7.0 came from the second run. That is a reason to dry-run first (below), not a licence to move tags.
-4. **Downgrade is not supported and not tested** (`docs/ROADMAP.md`, "Versioning"). Say so in every upgrade note; never imply a rollback path.
+4. **Downgrade is supported only where the compatibility matrix records it** (`docs/reference/compatibility.md`, "Downgrade"; `docs/ROADMAP.md`, "Versioning"): the forward cells for the ledgers, digests and audit trail against the previous release. Say in every upgrade note which one-way steps the release takes and that nothing else is tested; never imply a rollback path beyond the recorded cells.
 5. **A patch release changes no format.** No new marker, default, feature level or one-way step (`docs/reference/compatibility.md`, "Change rules within 1.x"). A fix that needs one waits for the next minor; in 0.x, a patch that cannot avoid one says so in its notes as a one-way change.
 6. **Bug-only release rule.** A milestone can be declared bug-only: v0.9.0 is ("only issues labelled bug, and the PRs that fix them. Features and measurements go to v0.10.0"). While such a milestone is open: merge only a PR that fixes a bug in it; hold every feature PR (the ones for the next milestone say "do not merge until v0.9.0 is tagged"); an issue that is a feature in disguise moves to the next milestone instead of holding the tag. After the tag, features merge. Check `gh api "repos/allamiro/vtop-engine/issues?milestone=N&state=open"` for N empty and every PR in it merged before cutting the bump.
 
@@ -31,8 +31,8 @@ Branch from `origin/main` (`release/vX.Y.Z-bump` was used for 0.8.0, `release/0.
 
 | File | Change |
 |---|---|
-| `Cargo.toml` | `[workspace.package] version`, and the `version =` on the ten `vtop-*` path dependencies (eleven edits). Nothing else. |
-| `Cargo.lock` | `cargo update --workspace`. The diff must be exactly the **twelve** `vtop-*` entries and no third-party package; if anything else moved, revert it. Then `cargo check --workspace --locked`. |
+| `Cargo.toml` | `[workspace.package] version`, and the `version =` on the eleven `vtop-*` path dependencies (twelve edits; `vtop-s3-testkit`, a never-published test crate, carries one because cargo deny refuses a versionless path dependency). Nothing else. |
+| `Cargo.lock` | `cargo update --workspace`. The diff must be exactly the **thirteen** `vtop-*` entries and no third-party package; if anything else moved, revert it. Then `cargo check --workspace --locked`. |
 | `helm/vtop/Chart.yaml` | `appVersion: "X.Y.Z"` (it must track the workspace version; GHCR tags follow it). The chart's own `version` follows its contract, not the app: **patch** bump when no template or values changed since the last tag, **minor** when they did (a values-contract change). Check with `git diff vPREV..origin/main --stat -- helm/vtop/templates helm/vtop/values.yaml helm/vtop/ci`. Add the matching comment line above `version:` (0.5.1 for 0.8.0: "no template or values change — the bump carries appVersion 0.8.0"). Nothing in CI ties `appVersion` to `Cargo.toml`, so review it by eye. |
 | `docs/ROADMAP.md` | A section for the release (below), and the forward section renamed to the next release. |
 | `SECURITY.md` | **Minor releases only:** the "Supported versions" row becomes `X.Y.x` (only the latest minor receives security fixes). `scripts/check-security-policy.py` fails the docs build until it matches `Cargo.toml`. |
@@ -50,7 +50,7 @@ Branch from `origin/main` (`release/vX.Y.Z-bump` was used for 0.8.0, `release/0.
 - **Deprecations**, each with its row in the deprecation table on `docs/reference/compatibility.md` (surface, deprecated in, earliest removal, replacement). In 1.x a notice runs at least two minors before removal.
 - **New keys older engines silently ignore.** Most `config.yaml` sections have no `deny_unknown_fields`, so an older engine ignores a new key without a word (the cluster-plane role configs refuse them instead). List each, say whether ignoring it is harmless, and tell operators to upgrade every engine before relying on it. Do not write the list from the diff by hand: `python3 scripts/config-keys-since.py vPREV origin/main` prints it, ready to paste under the ROADMAP section. It diffs the schema of `crates/vtop-core/src/config.rs` between the two refs (`config.yaml` and `streams.yaml` keys), marks a key in a section that rejects unknown keys as refused (release-gating), quotes the sentence of `docs/configure/reference.md` that says what an older engine does, and says "harmless while unset" only where the reference gives the key a default. A key marked "decide before release" is one the reference does not speak of: read it, then either add the sentence to the reference or say in the notes what an older engine loses. A key it marks required must be called out as a config change.
 - **Known open**: issues that did not make it, by number, so the notes do not promise them.
-- **Downgrade is not supported.**
+- **Downgrade**: only what the compatibility matrix records for the previous release (the ledger, digests and audit trail); the release's one-way steps, listed; nothing else is promised.
 
 Also retire a stale "Next release" block at the top of the file if what it describes has shipped.
 
@@ -133,7 +133,7 @@ Also: the image's `latest` tag moved (only for a non-pre-release), `helm/vtop/Ch
 
 - [ ] Milestone empty or deliberately moved; the bug-only rule respected.
 - [ ] `scripts/check-data-safety-register.py --quiet-days` passes; the quiet-period days are in the bump PR body.
-- [ ] Bump PR touches only Cargo.toml (11 edits), Cargo.lock (12 `vtop-*` entries), Chart.yaml, ROADMAP.md, CITATION.cff, the README BibTeX version, the install pages and the upgrades page, and status sentences the release made stale.
+- [ ] Bump PR touches only Cargo.toml (12 edits), Cargo.lock (13 `vtop-*` entries), Chart.yaml, ROADMAP.md, CITATION.cff, the README BibTeX version, the install pages and the upgrades page, and status sentences the release made stale.
 - [ ] `python3 scripts/check-release-versions.py` passes; the status sentences were re-read against the milestone and the code.
 - [ ] Chart version bump matches whether templates or values changed.
 - [ ] ROADMAP: upgrade order, one-way changes with reasons, silently ignored keys (the output of `scripts/config-keys-since.py vPREV origin/main`, every "decide before release" line settled), known open, no downgrade.

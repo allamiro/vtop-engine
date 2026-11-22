@@ -1,0 +1,122 @@
+# One VTOP archive engine on Kubernetes (#739): a Deployment of exactly one
+# replica with the Recreate strategy, so a rollout stops the old pod before
+# it starts the new one, and two engines never read the same sources. The
+# ledger is PostgreSQL and the store is S3, so a pod or node that is lost is
+# replaced by a new pod with an empty work directory; see
+# docs/deploy/engine-host-loss.md for what happens then.
+#
+# The image must have a vtopctl built with the `postgres` feature. Release
+# images up to and including v0.10.2 do not (docs/install/container.md); set
+# VERSION to a later release, or build docker/Dockerfile from a tree that
+# enables it, and push it to your registry. The ConfigMap holds config.yaml;
+# the Secret holds VTOP_STATE_STORE and the S3 credentials.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vtop-engine
+  labels:
+    app.kubernetes.io/name: vtop-engine
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vtop-engine
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vtop-engine
+    spec:
+      # One source pass plus one flush (docs/reference/cli.md, "Stopping
+      # vtopctl run").
+      terminationGracePeriodSeconds: 120
+      # No automatic replacement of a pod on a node that goes unreachable or
+      # not ready. Kubernetes adds a 300-second toleration for both taints
+      # to every pod, after which it evicts the pod and the Deployment starts
+      # a replacement while the old engine may still be running: Recreate
+      # orders a rollout, not a replacement, and the engine's lock is
+      # host-local, so nothing else stops two engines on one PostgreSQL
+      # ledger. With these tolerations the pod stays until the operator has
+      # fenced the node and deleted the pod (docs/deploy/engine-host-loss.md,
+      # step 1).
+      tolerations:
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: engine
+          # VERSION: see the header. v0.10.2 and earlier cannot open a
+          # PostgreSQL ledger.
+          image: ghcr.io/allamiro/vtop-engine:VERSION
+          args: ["run"]
+          env:
+            - name: VTOP_CONFIG
+              value: /etc/vtop/config.yaml
+            - name: VTOP_METRICS_ADDR
+              value: 0.0.0.0:9090
+          envFrom:
+            - secretRef:
+                name: vtop-engine-secrets
+          ports:
+            - name: metrics
+              containerPort: 9090
+          # /healthz answers 200 while the process serves requests; /readyz
+          # answers 200 once the engine's metrics registry is up, which says
+          # the process started, not that recovery has finished
+          # (docs/operate/monitoring.md).
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 10
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/vtop
+              readOnly: true
+            - name: work
+              mountPath: /data/work
+            # The image's entrypoint requires /data/state to be writable; a
+            # PostgreSQL ledger keeps nothing there.
+            - name: state
+              mountPath: /data/state
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: vtop-engine-config
+        # Scratch: staged batches and multipart sessions. Losing it with the
+        # pod is the case docs/deploy/engine-host-loss.md drills.
+        - name: work
+          emptyDir: {}
+        - name: state
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

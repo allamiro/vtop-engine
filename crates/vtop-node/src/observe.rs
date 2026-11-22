@@ -37,7 +37,7 @@
 use crate::config::ObservabilityConfig;
 use prometheus::core::{Collector, Desc};
 use prometheus::proto::MetricFamily;
-use prometheus::{IntGauge, IntGaugeVec, Opts, Registry};
+use prometheus::{IntGauge, IntGaugeVec, Opts};
 use std::sync::Arc;
 use uuid::Uuid;
 use vtop_broker::memory_budget::BudgetRejectReason;
@@ -50,6 +50,8 @@ use vtop_broker::{
 use vtop_log::{RecoveryReport, RetentionBlocked};
 use vtop_meta::{OpenraftConsensus, RaftObservation, RaftServerState};
 use vtop_observe::{Readiness, ReadinessGate};
+// Keeps what is registered in it, for the surface snapshot (#719).
+use vtop_surface::Registry;
 
 /// A live readiness condition evaluated at request time.
 ///
@@ -2242,6 +2244,10 @@ impl Collector for SegmentRecoveryCollector {
     }
 }
 
+// The command tree and every family the node exports, against docs/surface/ (#719).
+#[cfg(test)]
+mod surface_snapshot;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3313,6 +3319,47 @@ mod tests {
         });
         broker.adopt_fencing_epoch(5);
         assert!(broker.epoch_history_broken());
+        let text = scrape(&registry);
+        assert!(text.contains(&format!("{series} 1")), "{text}");
+    }
+
+    /// #881 follow-up: the break survives a restart, so the gauge does too.
+    #[test]
+    fn a_broken_epoch_history_is_still_exported_after_a_restart() {
+        use vtop_log::sim::{FaultPlan, SimStorage};
+        let sim = SimStorage::new();
+        sim.create_dir_all(std::path::Path::new("/journal"));
+        let env = sim.env(0x882);
+        let journal = || {
+            vtop_broker::fencing_epochs::FencingEpochJournal::open_in(
+                &env,
+                "/journal/fencing-epochs",
+            )
+            .unwrap()
+        };
+        let series = r#"vtop_broker_epoch_history_broken{range="00000000-0000-0000-0000-000000000007",topic="telemetry"}"#;
+
+        let dir = tempfile::tempdir().unwrap();
+        let broker = open_broker(dir.path());
+        broker.set_fencing_epoch_journal(journal());
+        sim.set_fault(FaultPlan::FailOp {
+            op: sim.op_count(),
+            kind: std::io::ErrorKind::StorageFull,
+        });
+        broker.adopt_fencing_epoch(5);
+        assert!(broker.epoch_history_broken());
+        drop(broker);
+
+        // The restarted node: a fresh broker over the same journal.
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Arc::new(open_broker(dir.path()));
+        broker.set_fencing_epoch_journal(journal());
+        let registry = Registry::new_custom(Some("vtop".into()), None).unwrap();
+        registry
+            .register(Box::new(
+                BrokerCollector::new(Arc::clone(&broker), None, Vec::new()).unwrap(),
+            ))
+            .unwrap();
         let text = scrape(&registry);
         assert!(text.contains(&format!("{series} 1")), "{text}");
     }
