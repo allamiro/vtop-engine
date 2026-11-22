@@ -1212,9 +1212,9 @@ regenerate scripts read `HEAD`, so a run that is not committed is not regenerate
 
 | issue | `cp -r` (from `/tmp/aws-in`) | `report.json` (`doc` / `img_dir` under `docs/benchmarks/`) | writes |
 |---|---|---|---|
-| #596 throughput and latency | `v0110-596-c6i4x` to `benchmarks/kafka_compare/results/` | `kafka-comparison-aws-v0.11.0.md` / `img/aws-v0.11.0` | the same, plus `img/aws-v0.11.0/kafka-compare-*` |
+| #596 throughput and latency | `v0110-596-c6i4x` to `benchmarks/kafka_compare/results/` (it holds `results.csv`, `e2e_hist.csv` and `environment.json`) | `kafka-comparison-aws-v0.11.0.md` / `img/aws-v0.11.0` | the same, plus `img/aws-v0.11.0/kafka-compare-*`: throughput, latency, consume, `e2e-cdf`, `resources` and `profile-latency` |
 | #597 failover | `failover-v0110-c6i4x` to `benchmarks/kafka_compare/results/` | `kafka-failover-aws-v0.11.0.md` / `img/aws-v0.11.0` | the same, plus `img/aws-v0.11.0/kafka-failover-*` |
-| #599 whole-replica-set crash | `crash-v0110-c6i4x` to `benchmarks/kafka_compare/results/` | none: the default `kafka-crash.md` and `img/kafka-crash-*` | `kafka-crash.md`, `img/kafka-crash-loss.*`, `img/kafka-crash-drop-gap.*` |
+| #599 whole-replica-set crash | `crash-v0110-c6i4x` to `benchmarks/kafka_compare/results/` | `kafka-crash.md` / `img/aws-v0.11.0`, plus `"latency_run": "v0110-596-c6i4x"` (the #596 run on the same host: its end-to-end latency of the three configurations is drawn beside the crash loss; without the key the page is the loss alone and `img_dir` is not needed) | `kafka-crash.md`, `img/aws-v0.11.0/kafka-crash-loss.*`, `kafka-crash-drop-gap.*` and `kafka-crash-vs-latency.*` |
 | #746 archive, store kills | `archive-store-kills-v0110` to `benchmarks/archive_compare/results/` | `archive-comparison-store-kills.md` / `archive/img/store-kills` | the same, plus `archive/img/store-kills/*` |
 | #746 archive, time kills and fault | `archive-time-kills-fault-v0110` to `benchmarks/archive_compare/results/` | `archive-comparison-time-kills-fault.md` / `archive/img/time-kills-fault` | the same, plus `archive/img/time-kills-fault/*` |
 | #747 link | `link-hosted-v0110` to `benchmarks/link_compare/results/` | none: `link-comparison.md`, `link/img/` | `link-comparison.md`, `link/img/*` |
@@ -1259,7 +1259,12 @@ What a refusal means on the day:
   (`crash_report.MIN_OK_CRASHES`): the harness's `refused` and `failed` rows are kept, and ten of the planned twelve
   must be ok. `report.py <dir> --min-ok N` previews a shorter run without committing it.
 - A Kafka throughput run that varies partitions, producers, compression or profile is refused by name until the
-  grouped charts draw that dimension (#600); the default one-partition, one-producer run is drawn.
+  grouped charts draw that dimension (#600); the default one-partition, one-producer run is drawn, with its
+  end-to-end rows (and Kafka's `fsync-parity` ones) and resources when it recorded them. A run whose matrix has the
+  end-to-end mode but whose `e2e_hist.csv` is missing or disagrees with the CSV, or whose matrix asks for resources
+  and has an ok row without them, is refused by name. A crash run whose `report.json` names a `latency_run` is
+  refused when that run is on another host, kernel, node limits or Kafka image, or lacks a configuration the crash
+  run measured.
 - A comparison run whose plan did not run a chart's cells (the hosted plans run correctness cells only) draws the
   charts it has and names the others on the page ("Not run in this plan, so not drawn").
 

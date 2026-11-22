@@ -55,16 +55,25 @@ the limits stated before the result was known.
 
 ### #596 throughput and latency, VTOP gateway against Apache Kafka
 
-- **Command:** `python3 benchmarks/kafka_compare/run.py --run-id v0110-596-c6i4x`. **FILL:** the command as run, if
-  it differs, and the run's duration.
+- **Command:** `python3 benchmarks/kafka_compare/run.py --run-id v0110-596-c6i4x`, which records, besides the
+  throughput and latency runs, the end-to-end latency distribution and the CPU and bytes written of every measured
+  run (`--no-e2e` and `--no-resources` leave them out). **FILL:** the command as run, if it differs, and the run's
+  duration.
 - **Generated page:** **FILL:** link `kafka-comparison-aws-v0.11.0.md` once it exists. It holds produce throughput at
   saturation, produce latency at 25, 50 and 75 percent of Kafka's saturation, and consume throughput, each with the
-  minimum and maximum across the repetitions.
+  minimum and maximum across the repetitions; the end-to-end latency distribution (a CDF per record size, for VTOP,
+  Kafka as shipped and Kafka with an fsync on every message, all offered one rate: half of the slower system's
+  saturation); CPU seconds per GiB delivered and bytes written per byte delivered; and what each durability
+  profile costs in latency, as bars.
 - **Headline:** **FILL:** where Kafka is faster, where VTOP is, and the reason where the code supports one (the page
   prints its own list). Quote only what the generated page prints.
-- **Limits.** One partition, one producer, no compression, profile `defaults` only, 100 B and 1 KiB records: the
-  issue's full matrix (10 KiB, six partitions, four producers, `zstd`, `fsync-parity`, end-to-end latency, CPU and
-  write amplification) is not run. Under `defaults` a Kafka acknowledgement does not wait for an fsync and a VTOP
+- **Limits.** One partition, one producer, no compression, 100 B and 1 KiB records: the issue's full matrix (10 KiB,
+  six partitions, four producers, `zstd`) is not run. The throughput and fixed-rate cells run under profile
+  `defaults` only; Kafka's `fsync-parity` is measured in the end-to-end stage alone, at one offered load, so the
+  profile's latency cost is read at that load and its throughput cost is not measured. End-to-end latency has 1 ms
+  resolution and is read at one load. The CPU and bytes-written figures are the three nodes' summed cgroup counters
+  over each run, with no per-node breakdown and no memory figure; the windows add about 6 s of wall time per run,
+  outside the timed part. Under `defaults` a Kafka acknowledgement does not wait for an fsync and a VTOP
   quorum acknowledgement does, so a speed difference is also a difference in the guarantee. VTOP runs as a static
   leader with two followers (no metadata plane). The perf tools report latency in whole milliseconds.
 
@@ -87,7 +96,8 @@ the limits stated before the result was known.
 - **Generated page:** **FILL:** link `kafka-crash.md`. Per configuration (Kafka as shipped, Kafka with an fsync on
   every message, VTOP as shipped): acknowledged records, records lost, crashes that lost records, and, beside every
   cell that lost nothing, the exact binomial upper bound on the chance that a crash loses something. Charts: records
-  lost per crash, and the gap between the kill and the drop.
+  lost per crash, the gap between the kill and the drop, and, beside the loss, each configuration's end-to-end
+  latency at the common rate from the #596 run on the same host.
 - **Headline:** **FILL:** from the loss table. A configuration with no loss is stated with its bound, never as proof.
 - **Limits.** Twelve crashes per configuration, in power-loss mode only. With none lost in twelve, the 95 percent
   upper bound on the chance that a crash loses something is 22.1 percent; twenty crashes would give 13.9 percent and
@@ -150,7 +160,7 @@ decides, with the generated page open. Until a row's **Result** is filled, nothi
 | [#596](https://github.com/allamiro/vtop-engine/issues/596) throughput and latency | the run above, raw CSV, generated charts, an honest write-up | one command runs both clusters, a full run's CSVs are committed, the charts are generated from them, and the write-up includes the cells where Kafka is faster. The issue's full matrix is not covered (see the limits): the maintainer decides whether the run is "at least one full run" or what is carried over | **FILL** |
 | [#597](https://github.com/allamiro/vtop-engine/issues/597) failover | the failover run | per-kill rows, the timeline and the unavailability box plot generated from them, and zero acknowledged-record loss asserted for both systems (the harness exits non-zero on a loss) | **FILL** |
 | [#599](https://github.com/allamiro/vtop-engine/issues/599) whole-replica-set crash | the crash run | a repeatable script, documented hardware, per-crash rows, and a chart of records lost per profile generated from them. The issue asks for at least 20 crashes and this run has 12: the maintainer decides whether 12 and its stated bound are enough or whether to extend the run | **FILL** |
-| [#600](https://github.com/allamiro/vtop-engine/issues/600) charts and report | every generated page above, produced by `report.py` including the new crash report | the report regenerates every image from the committed CSVs with no drift in CI, and the refusals are covered by tests. The charts the issue lists that no harness produces yet (end-to-end latency CDF, CPU and bytes written, the profile's latency cost beside the crash chart) are not drawn | **FILL** |
+| [#600](https://github.com/allamiro/vtop-engine/issues/600) charts and report | every generated page above, produced by `report.py` including the new crash report | the report regenerates every image from the committed CSVs with no drift in CI, and the refusals are covered by tests. The issue's end-to-end latency CDF, CPU and bytes written, and the profile's latency cost beside the crash chart are drawn from the #596 and #599 runs, the last only when the crash run's `report.json` names the #596 run (see the ingest steps) | **FILL** |
 | [#722](https://github.com/allamiro/vtop-engine/issues/722) S3 servers and AWS S3 | the `s3-aws` results | the AWS leg of the compatibility matrix is filled from the result files | **FILL** |
 | [#726](https://github.com/allamiro/vtop-engine/issues/726) 72-hour soak | the soak evidence | the soak passed its criteria, with the evidence attached to the release | **FILL** |
 | [#736](https://github.com/allamiro/vtop-engine/issues/736) sizing guidance | the section below, derived from these numbers | each figure in the guidance is a number printed on a generated page above, with the tested limit beside it | **FILL** |
