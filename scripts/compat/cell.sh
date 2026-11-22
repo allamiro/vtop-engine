@@ -40,10 +40,10 @@ case "$CELL:$DIRECTION" in
     MANIFEST_COMPAT_KEEP=1 MANIFEST_COMPAT_WORKDIR="$WORKDIR" \
       exec "$here/../manifest-compat.sh" "$HEAD/vtopctl" "$TAG" "$RELEASED/vtopctl" "$EXPECT"
     ;;
-  ledger-sqlite:forward)
-    [[ "$EXPECT" == pass ]] || fail "the ledger cell expects pass, not $EXPECT"
-    LEDGER_COMPAT_KEEP=1 LEDGER_COMPAT_WORKDIR="$WORKDIR" \
-      exec "$here/../ledger-compat.sh" "$HEAD/vtopctl" "$TAG" "$RELEASED/vtopctl"
+  ledger-sqlite:* | digests-audit:* | ledger-postgres:*)
+    # Each cell script takes the directories, and keeps its own logs.
+    exec "$here/cells/$CELL.sh" "$TAG" "$DIRECTION" "$EXPECT" "$RELEASED" "$HEAD" \
+      "$WORKDIR/$CELL-$DIRECTION" "$MESSAGE"
     ;;
   *) fail "no cell $CELL with direction $DIRECTION" ;;
 esac

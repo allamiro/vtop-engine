@@ -4059,7 +4059,9 @@ dependencies = [
  "vtop-meta",
  "vtop-observe",
  "vtop-protocol",
+ "vtop-s3-testkit",
  "vtop-state",
+ "vtop-surface",
  "vtop-upload",
 ]
 
@@ -4084,6 +4086,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "vtop-surface",
  "zstd",
 ]
 
@@ -4163,6 +4166,7 @@ dependencies = [
  "vtop-meta",
  "vtop-observe",
  "vtop-protocol",
+ "vtop-surface",
 ]
 
 [[package]]
@@ -4195,6 +4199,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
+ "vtop-surface",
 ]
 
 [[package]]
@@ -4205,6 +4210,18 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "vtop-s3-testkit"
+version = "0.10.4"
+dependencies = [
+ "futures",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -4222,6 +4239,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vtop-core",
+]
+
+[[package]]
+name = "vtop-surface"
+version = "0.10.4"
+dependencies = [
+ "clap",
+ "prometheus",
 ]
 
 [[package]]
@@ -4250,6 +4275,7 @@ dependencies = [
  "tokio",
  "tracing",
  "vtop-core",
+ "vtop-s3-testkit",
 ]
 
 [[package]]
