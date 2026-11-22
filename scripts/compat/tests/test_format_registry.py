@@ -253,6 +253,18 @@ class RegistryCheck(unittest.TestCase):
         self.assertIn("fuzz target gone does not exist", joined)
 
 
+    def test_a_cell_the_matrix_does_not_run_fails_and_so_does_one_no_format_names(self):
+        (self.root / "scripts/compat/expected.yaml").write_text("cells:\n  ledger:\n    since: v0.9.0\n    directions: [upgrade]\n")
+        self.assertIn("cell ledger is named by no entry", " ".join(self.problems()))
+        (self.root / "scripts/compat/formats.yaml").write_text(
+            REGISTRY.replace("    tag_sets:", "    cells: [ledger, gone]\n    tag_sets:")
+        )
+        joined = " ".join(self.problems())
+        self.assertIn("cell gone is not a cell of", joined)
+        self.assertNotIn("cell ledger is not a cell", joined)
+        self.assertNotIn("cell ledger is named by no entry", joined)
+
+
 class TheRepository(unittest.TestCase):
     def test_registry_names_every_format(self):
         self.assertEqual(registry_check.check_source(ROOT, registry_check.load(ROOT)), [])

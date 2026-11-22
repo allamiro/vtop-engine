@@ -155,6 +155,25 @@ class Matrix(unittest.TestCase):
             self.assertEqual(cell["source"], "release")
 
 
+    def test_only_newest_can_name_the_directions_it_limits(self):
+        cells = dict(EXPECTED["cells"], ledger={
+            "since": "v0.7.0", "directions": ["upgrade", "forward"], "only_newest": ["forward"],
+        })
+        expected = dict(EXPECTED, cells=cells)
+        got = sorted((c["direction"], c["tag"]) for c in select.matrix(expected, TAGS, "full") if c["cell"] == "ledger")
+        self.assertEqual(got, [("forward", "v0.9.0"), ("upgrade", "v0.7.0"), ("upgrade", "v0.8.0"), ("upgrade", "v0.9.0")])
+
+    def test_a_nightly_only_cell_runs_in_the_full_matrix_and_never_on_a_pull_request(self):
+        cells = dict(EXPECTED["cells"], heavy={
+            "since": "v0.9.0", "directions": ["forward"], "source": "build", "nightly_only": True,
+        })
+        expected = dict(EXPECTED, cells=cells)
+        full = [c for c in select.matrix(expected, TAGS, "full") if c["cell"] == "heavy"]
+        self.assertEqual([c["tag"] for c in full], ["v0.9.0"])
+        self.assertEqual({c["source"] for c in full}, {"build"})
+        self.assertEqual([c for c in select.matrix(expected, TAGS, "pr") if c["cell"] == "heavy"], [])
+
+
 class Validation(unittest.TestCase):
     def check_refused(self, expected, needle):
         with self.assertRaises(select.ExpectedError) as caught:
@@ -227,6 +246,20 @@ class Validation(unittest.TestCase):
         self.check_refused(
             dict(EXPECTED, cells={"manifest": {"since": "v0.7.0", "directions": ["forward"],
                                                "only_newest": "yes"}}, exceptions=[]),
+            "only_newest",
+        )
+
+    def test_an_unknown_source_is_refused(self):
+        self.check_refused(
+            dict(EXPECTED, cells={"manifest": {"since": "v0.7.0", "directions": ["forward"], "source": "dream"}},
+                 exceptions=[]),
+            "dream",
+        )
+
+    def test_only_newest_may_name_only_the_cells_directions(self):
+        self.check_refused(
+            dict(EXPECTED, cells={"manifest": {"since": "v0.7.0", "directions": ["forward"],
+                                               "only_newest": ["upgrade"]}}, exceptions=[]),
             "only_newest",
         )
 

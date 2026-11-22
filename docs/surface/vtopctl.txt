@@ -1,0 +1,367 @@
+# Generated from the code by scripts/update-surface-snapshots.sh (#719); do not edit by hand. One item per line, sorted.
+vtopctl
+vtopctl --json flag global
+vtopctl --log-level value=<LOG_LEVEL> global
+vtopctl audit
+vtopctl audit list
+vtopctl audit list --action value=<ACTION>
+vtopctl audit list --actor value=<ACTOR>
+vtopctl audit list --config value=<CONFIG>
+vtopctl audit list --file value=<FILE>
+vtopctl audit list --limit value=<LIMIT> default=100
+vtopctl audit list --outcome value=<OUTCOME>
+vtopctl audit list --since value=<SINCE>
+vtopctl audit list --target value=<TARGET>
+vtopctl audit list --until value=<UNTIL>
+vtopctl audit verify
+vtopctl audit verify --config value=<CONFIG> required
+vtopctl audit-coverage
+vtopctl audit-coverage --check-storage flag
+vtopctl audit-coverage --config value=<CONFIG> required
+vtopctl audit-coverage --digest-dir value=<DIGEST_DIR>
+vtopctl audit-coverage --metrics-file value=<METRICS_FILE>
+vtopctl audit-coverage --orphans-after value=<ORPHANS_AFTER>
+vtopctl audit-coverage --orphans-limit value=<ORPHANS_LIMIT> default=200
+vtopctl discover
+vtopctl discover --config value=<CONFIG> required
+vtopctl list-batches
+vtopctl list-batches --config value=<CONFIG> required
+vtopctl meta
+vtopctl meta add-learner
+vtopctl meta add-learner --config value=<CONFIG> required
+vtopctl meta add-learner --node-id value=<NODE_ID> required
+vtopctl meta cancel-rebalance
+vtopctl meta cancel-rebalance --config value=<CONFIG> required
+vtopctl meta cancel-rebalance --expected-placement-generation value=<EXPECTED_PLACEMENT_GENERATION> required
+vtopctl meta cancel-rebalance --issued-at-ms value=<ISSUED_AT_MS> default=0
+vtopctl meta cancel-rebalance --range-uuid value=<RANGE_UUID> required
+vtopctl meta cancel-rebalance --request-id value=<REQUEST_ID>
+vtopctl meta cancel-rebalance --segment-uuid value=<SEGMENT_UUID> required
+vtopctl meta cancel-rebalance --topic-uuid value=<TOPIC_UUID> required
+vtopctl meta cancel-retention
+vtopctl meta cancel-retention --config value=<CONFIG> required
+vtopctl meta cancel-retention --expected-generation value=<EXPECTED_GENERATION> required
+vtopctl meta cancel-retention --issued-at-ms value=<ISSUED_AT_MS> default=0
+vtopctl meta cancel-retention --range-uuid value=<RANGE_UUID> required
+vtopctl meta cancel-retention --request-id value=<REQUEST_ID>
+vtopctl meta cancel-retention --segment-uuid value=<SEGMENT_UUID> required
+vtopctl meta cancel-retention --topic-uuid value=<TOPIC_UUID> required
+vtopctl meta change-membership
+vtopctl meta change-membership --config value=<CONFIG> required
+vtopctl meta change-membership --retain-removed-as-learners flag
+vtopctl meta change-membership --voters value=<VOTERS> multiple required
+vtopctl meta commit-replacement-proof
+vtopctl meta commit-replacement-proof --config value=<CONFIG> required
+vtopctl meta commit-replacement-proof --content-root value=<CONTENT_ROOT> required
+vtopctl meta commit-replacement-proof --destination-node-uuid value=<DESTINATION_NODE_UUID> required
+vtopctl meta commit-replacement-proof --expected-length-bytes value=<EXPECTED_LENGTH_BYTES> required
+vtopctl meta commit-replacement-proof --expected-segment-generation value=<EXPECTED_SEGMENT_GENERATION> required
+vtopctl meta commit-replacement-proof --fencing-epoch value=<FENCING_EPOCH> required
+vtopctl meta commit-replacement-proof --issued-at-ms value=<ISSUED_AT_MS> default=0
+vtopctl meta commit-replacement-proof --range-uuid value=<RANGE_UUID> required
+vtopctl meta commit-replacement-proof --request-id value=<REQUEST_ID>
+vtopctl meta commit-replacement-proof --segment-uuid value=<SEGMENT_UUID> required
+vtopctl meta commit-replacement-proof --source-node-uuid value=<SOURCE_NODE_UUID> required
+vtopctl meta commit-replacement-proof --topic-uuid value=<TOPIC_UUID> required
+vtopctl meta commit-replacement-proof --verified-term value=<VERIFIED_TERM> required
+vtopctl meta commit-replacement-proof --verifier-node-uuid value=<VERIFIER_NODE_UUID> required
+vtopctl meta commit-segment-placement
+vtopctl meta commit-segment-placement --config value=<CONFIG> required
+vtopctl meta commit-segment-placement --expected-placement-generation value=<EXPECTED_PLACEMENT_GENERATION>
+vtopctl meta commit-segment-placement --expected-segment-generation value=<EXPECTED_SEGMENT_GENERATION> required
+vtopctl meta commit-segment-placement --issued-at-ms value=<ISSUED_AT_MS> default=0
+vtopctl meta commit-segment-placement --range-uuid value=<RANGE_UUID> required
+vtopctl meta commit-segment-placement --replica-node value=<REPLICA_NODES> multiple required
+vtopctl meta commit-segment-placement --replication-factor value=<REPLICATION_FACTOR> required
+vtopctl meta commit-segment-placement --request-id value=<REQUEST_ID>
+vtopctl meta commit-segment-placement --segment-uuid value=<SEGMENT_UUID> required
+vtopctl meta commit-segment-placement --topic-uuid value=<TOPIC_UUID> required
+vtopctl meta commit-tier-evidence
+vtopctl meta commit-tier-evidence --backend-id value=<BACKEND_ID> required
+vtopctl meta commit-tier-evidence --byte-length value=<BYTE_LENGTH> required
+vtopctl meta commit-tier-evidence --config value=<CONFIG> required
+vtopctl meta commit-tier-evidence --content-root value=<CONTENT_ROOT> required
+vtopctl meta commit-tier-evidence --expected-generation value=<EXPECTED_GENERATION> required
+vtopctl meta commit-tier-evidence --fencing-epoch value=<FENCING_EPOCH> required
+vtopctl meta commit-tier-evidence --issued-at-ms value=<ISSUED_AT_MS> default=0
+vtopctl meta commit-tier-evidence --manifest-core-digest value=<MANIFEST_CORE_DIGEST> required
+vtopctl meta commit-tier-evidence --manifest-version-id value=<MANIFEST_VERSION_ID>
+vtopctl meta commit-tier-evidence --object-uri value=<OBJECT_URI> required
+vtopctl meta commit-tier-evidence --object-version-id value=<OBJECT_VERSION_ID>
+vtopctl meta commit-tier-evidence --range-uuid value=<RANGE_UUID> required
+vtopctl meta commit-tier-evidence --request-id value=<REQUEST_ID>
+vtopctl meta commit-tier-evidence --segment-uuid value=<SEGMENT_UUID> required
+vtopctl meta commit-tier-evidence --topic-uuid value=<TOPIC_UUID> required
+vtopctl meta commit-tier-evidence --verified-term value=<VERIFIED_TERM> required
+vtopctl meta commit-tier-evidence --verifier-node-uuid value=<VERIFIER_NODE_UUID> required
+vtopctl meta confirm-replica-retired
+vtopctl meta confirm-replica-retired --config value=<CONFIG> required
+vtopctl meta confirm-replica-retired --expected-segment-generation value=<EXPECTED_SEGMENT_GENERATION> required
+vtopctl meta confirm-replica-retired --issued-at-ms value=<ISSUED_AT_MS> default=0
+vtopctl meta confirm-replica-retired --range-uuid value=<RANGE_UUID> required
+vtopctl meta confirm-replica-retired --request-id value=<REQUEST_ID>
+vtopctl meta confirm-replica-retired --retiring-node-uuid value=<RETIRING_NODE_UUID> required
+vtopctl meta confirm-replica-retired --segment-uuid value=<SEGMENT_UUID> required
+vtopctl meta confirm-replica-retired --topic-uuid value=<TOPIC_UUID> required
+vtopctl meta confirm-retention-expired
+vtopctl meta confirm-retention-expired --config value=<CONFIG> required
+vtopctl meta confirm-retention-expired --expected-generation value=<EXPECTED_GENERATION> required
+vtopctl meta confirm-retention-expired --issued-at-ms value=<ISSUED_AT_MS> default=0
+vtopctl meta confirm-retention-expired --range-uuid value=<RANGE_UUID> required
+vtopctl meta confirm-retention-expired --request-id value=<REQUEST_ID>
+vtopctl meta confirm-retention-expired --segment-uuid value=<SEGMENT_UUID> required
+vtopctl meta confirm-retention-expired --topic-uuid value=<TOPIC_UUID> required
+vtopctl meta create-topic
+vtopctl meta create-topic --config value=<CONFIG> required
+vtopctl meta create-topic --issued-at-ms value=<ISSUED_AT_MS> default=0
+vtopctl meta create-topic --name value=<NAME> required
+vtopctl meta create-topic --request-id value=<REQUEST_ID>
+vtopctl meta create-topic --root-range-uuid value=<ROOT_RANGE_UUID> required
+vtopctl meta create-topic --topic-uuid value=<TOPIC_UUID> required
+vtopctl meta enable-features
+vtopctl meta enable-features --config value=<CONFIG> required
+vtopctl meta enable-features --level value=<LEVEL> required
+vtopctl meta enable-features --request-id value=<REQUEST_ID>
+vtopctl meta get-placement
+vtopctl meta get-placement --config value=<CONFIG> required
+vtopctl meta get-placement --for-replication-factor value=<FOR_REPLICATION_FACTOR>
+vtopctl meta get-placement --range-uuid value=<RANGE_UUID> required
+vtopctl meta get-placement --segment-uuid value=<SEGMENT_UUID> required
+vtopctl meta get-placement --topic-uuid value=<TOPIC_UUID> required
+vtopctl meta group-cursor
+vtopctl meta group-cursor --cluster-id value=<CLUSTER_ID>
+vtopctl meta group-cursor --config value=<CONFIG> required
+vtopctl meta group-cursor --group-name value=<GROUP_NAME>
+vtopctl meta group-cursor --group-uuid value=<GROUP_UUID>
+vtopctl meta group-cursor --range-uuid value=<RANGE_UUID> required
+vtopctl meta group-cursor --topic-uuid value=<TOPIC_UUID> required
+vtopctl meta init
+vtopctl meta init --config value=<CONFIG> required
+vtopctl meta init --members value=<MEMBERS> multiple required
+vtopctl meta mark-segment-verified
+vtopctl meta mark-segment-verified --config value=<CONFIG> required
+vtopctl meta mark-segment-verified --content-root value=<CONTENT_ROOT> required
+vtopctl meta mark-segment-verified --expected-generation value=<EXPECTED_GENERATION> required
+vtopctl meta mark-segment-verified --issued-at-ms value=<ISSUED_AT_MS> default=0
+vtopctl meta mark-segment-verified --range-uuid value=<RANGE_UUID> required
+vtopctl meta mark-segment-verified --request-id value=<REQUEST_ID>
+vtopctl meta mark-segment-verified --segment-uuid value=<SEGMENT_UUID> required
+vtopctl meta mark-segment-verified --topic-uuid value=<TOPIC_UUID> required
+vtopctl meta membership
+vtopctl meta membership --config value=<CONFIG> required
+vtopctl meta node-versions
+vtopctl meta node-versions --config value=<CONFIG> required
+vtopctl meta node-versions --level value=<LEVEL>
+vtopctl meta plan-replica-retirement
+vtopctl meta plan-replica-retirement --config value=<CONFIG> required
+vtopctl meta plan-replica-retirement --expected-segment-generation value=<EXPECTED_SEGMENT_GENERATION> required
+vtopctl meta plan-replica-retirement --fencing-epoch value=<FENCING_EPOCH> required
+vtopctl meta plan-replica-retirement --issued-at-ms value=<ISSUED_AT_MS> default=0
+vtopctl meta plan-replica-retirement --range-uuid value=<RANGE_UUID> required
+vtopctl meta plan-replica-retirement --request-id value=<REQUEST_ID>
+vtopctl meta plan-replica-retirement --retiring-node-uuid value=<RETIRING_NODE_UUID> required
+vtopctl meta plan-replica-retirement --segment-uuid value=<SEGMENT_UUID> required
+vtopctl meta plan-replica-retirement --topic-uuid value=<TOPIC_UUID> required
+vtopctl meta plan-retention
+vtopctl meta plan-retention --config value=<CONFIG> required
+vtopctl meta plan-retention --expected-generation value=<EXPECTED_GENERATION> required
+vtopctl meta plan-retention --fencing-epoch value=<FENCING_EPOCH> required
+vtopctl meta plan-retention --issued-at-ms value=<ISSUED_AT_MS> default=0
+vtopctl meta plan-retention --range-uuid value=<RANGE_UUID> required
+vtopctl meta plan-retention --request-id value=<REQUEST_ID>
+vtopctl meta plan-retention --segment-uuid value=<SEGMENT_UUID> required
+vtopctl meta plan-retention --topic-uuid value=<TOPIC_UUID> required
+vtopctl meta propose-rebalance
+vtopctl meta propose-rebalance --config value=<CONFIG> required
+vtopctl meta propose-rebalance --expected-placement-generation value=<EXPECTED_PLACEMENT_GENERATION> required
+vtopctl meta propose-rebalance --from-node-uuid value=<FROM_NODE_UUID> required
+vtopctl meta propose-rebalance --issued-at-ms value=<ISSUED_AT_MS> default=0
+vtopctl meta propose-rebalance --range-uuid value=<RANGE_UUID> required
+vtopctl meta propose-rebalance --request-id value=<REQUEST_ID>
+vtopctl meta propose-rebalance --segment-uuid value=<SEGMENT_UUID> required
+vtopctl meta propose-rebalance --to-node-uuid value=<TO_NODE_UUID> required
+vtopctl meta propose-rebalance --topic-uuid value=<TOPIC_UUID> required
+vtopctl meta range-lease
+vtopctl meta range-lease --config value=<CONFIG> required
+vtopctl meta range-lease --range-uuid value=<RANGE_UUID> required
+vtopctl meta range-lease --topic-uuid value=<TOPIC_UUID> required
+vtopctl meta register-node
+vtopctl meta register-node --addr value=<ADDR> required
+vtopctl meta register-node --config value=<CONFIG> required
+vtopctl meta register-node --expected-generation value=<EXPECTED_GENERATION>
+vtopctl meta register-node --issued-at-ms value=<ISSUED_AT_MS> default=0
+vtopctl meta register-node --node-uuid value=<NODE_UUID> required
+vtopctl meta register-node --request-id value=<REQUEST_ID>
+vtopctl meta register-sealed-segment
+vtopctl meta register-sealed-segment --base-offset value=<BASE_OFFSET> required
+vtopctl meta register-sealed-segment --config value=<CONFIG> required
+vtopctl meta register-sealed-segment --content-root value=<CONTENT_ROOT> required
+vtopctl meta register-sealed-segment --expected-range-generation value=<EXPECTED_RANGE_GENERATION> required
+vtopctl meta register-sealed-segment --issued-at-ms value=<ISSUED_AT_MS> default=0
+vtopctl meta register-sealed-segment --next-offset value=<NEXT_OFFSET> required
+vtopctl meta register-sealed-segment --range-uuid value=<RANGE_UUID> required
+vtopctl meta register-sealed-segment --request-id value=<REQUEST_ID>
+vtopctl meta register-sealed-segment --sealed-by-epoch value=<SEALED_BY_EPOCH> required
+vtopctl meta register-sealed-segment --segment-generation value=<SEGMENT_GENERATION> required
+vtopctl meta register-sealed-segment --segment-uuid value=<SEGMENT_UUID> required
+vtopctl meta register-sealed-segment --topic-uuid value=<TOPIC_UUID> required
+vtopctl meta replica-set
+vtopctl meta replica-set --config value=<CONFIG> required
+vtopctl meta replica-set --range-uuid value=<RANGE_UUID> required
+vtopctl meta replica-set --topic-uuid value=<TOPIC_UUID> required
+vtopctl meta set-node-placement-attrs
+vtopctl meta set-node-placement-attrs --config value=<CONFIG> required
+vtopctl meta set-node-placement-attrs --expected-generation value=<EXPECTED_GENERATION> required
+vtopctl meta set-node-placement-attrs --failure-domain value=<FAILURE_DOMAIN> required
+vtopctl meta set-node-placement-attrs --issued-at-ms value=<ISSUED_AT_MS> default=0
+vtopctl meta set-node-placement-attrs --node-uuid value=<NODE_UUID> required
+vtopctl meta set-node-placement-attrs --placement-weight value=<PLACEMENT_WEIGHT> required
+vtopctl meta set-node-placement-attrs --request-id value=<REQUEST_ID>
+vtopctl meta set-node-state
+vtopctl meta set-node-state --config value=<CONFIG> required
+vtopctl meta set-node-state --expected-generation value=<EXPECTED_GENERATION> required
+vtopctl meta set-node-state --issued-at-ms value=<ISSUED_AT_MS> default=0
+vtopctl meta set-node-state --node-uuid value=<NODE_UUID> required
+vtopctl meta set-node-state --request-id value=<REQUEST_ID>
+vtopctl meta set-node-state --state value=<STATE> required
+vtopctl meta set-replica-set
+vtopctl meta set-replica-set --config value=<CONFIG> required
+vtopctl meta set-replica-set --expected-generation value=<EXPECTED_GENERATION> required
+vtopctl meta set-replica-set --members value=<MEMBERS> multiple required
+vtopctl meta set-replica-set --range-uuid value=<RANGE_UUID> required
+vtopctl meta set-replica-set --request-id value=<REQUEST_ID>
+vtopctl meta set-replica-set --topic-uuid value=<TOPIC_UUID> required
+vtopctl meta set-retention-policy
+vtopctl meta set-retention-policy --allow-unarchived-deletion flag
+vtopctl meta set-retention-policy --config value=<CONFIG> required
+vtopctl meta set-retention-policy --expected-generation value=<EXPECTED_GENERATION>
+vtopctl meta set-retention-policy --issued-at-ms value=<ISSUED_AT_MS> default=0
+vtopctl meta set-retention-policy --request-id value=<REQUEST_ID>
+vtopctl meta set-retention-policy --topic-uuid value=<TOPIC_UUID> required
+vtopctl meta status
+vtopctl meta status --config value=<CONFIG> required
+vtopctl meta transitions
+vtopctl meta transitions --config value=<CONFIG> required
+vtopctl meta transitions --from-epoch value=<FROM_EPOCH> default=1
+vtopctl meta transitions --limit value=<LIMIT> default=256
+vtopctl meta transitions --mac-key-env value=<MAC_KEY_ENV>
+vtopctl meta transitions --range-uuid value=<RANGE_UUID> required
+vtopctl meta transitions --replica-timeout-ms value=<REPLICA_TIMEOUT_MS> default=5000
+vtopctl meta transitions --replicas value=<REPLICAS>
+vtopctl meta transitions --topic-uuid value=<TOPIC_UUID> required
+vtopctl migrate
+vtopctl migrate --config value=<CONFIG> required
+vtopctl node
+vtopctl node promote-unproven
+vtopctl node promote-unproven --i-accept-data-loss flag
+vtopctl node promote-unproven --meta-config value=<META_CONFIG> required
+vtopctl node promote-unproven --operator value=<OPERATOR>
+vtopctl node promote-unproven --range value=<RANGE> required
+vtopctl node promote-unproven --replica value=<REPLICA> required
+vtopctl node promote-unproven --request-id value=<REQUEST_ID>
+vtopctl node promote-unproven --topic value=<TOPIC> required
+vtopctl node reconfigure-range
+vtopctl node reconfigure-range --data-dir value=<DATA_DIR> required
+vtopctl node reconfigure-range --max-group-bytes value=<MAX_GROUP_BYTES>
+vtopctl node reconfigure-range --max-record-bytes value=<MAX_RECORD_BYTES>
+vtopctl node reconfigure-range --max-segment-bytes value=<MAX_SEGMENT_BYTES>
+vtopctl node reconfigure-range --max-segment-records value=<MAX_SEGMENT_RECORDS>
+vtopctl node repair
+vtopctl node repair --config value=<CONFIG> required
+vtopctl node repair --fencing-epoch value=<FENCING_EPOCH> required
+vtopctl node repair --from value=<FROM> required
+vtopctl node repair --into value=<INTO> required
+vtopctl node repair --seal-tail flag
+vtopctl node repair --timeout-seconds value=<TIMEOUT_SECONDS> default=30
+vtopctl node status
+vtopctl node status --config value=<CONFIG> required
+vtopctl node status --timeout-seconds value=<TIMEOUT_SECONDS> default=5
+vtopctl process-once
+vtopctl process-once --config value=<CONFIG> required
+vtopctl process-once --source value=<SOURCE> values=kafka,file,syslog required
+vtopctl prune-ledger
+vtopctl prune-ledger --config value=<CONFIG> required
+vtopctl prune-ledger --digest-dir value=<DIGEST_DIR>
+vtopctl prune-ledger --limit value=<LIMIT> default=500
+vtopctl prune-ledger --older-than-days value=<OLDER_THAN_DAYS> required
+vtopctl receipt
+vtopctl receipt --file value=<FILE> required
+vtopctl replay
+vtopctl replay --batch-id value=<BATCH_ID>
+vtopctl replay --config value=<CONFIG> required
+vtopctl run
+vtopctl run --config value=<CONFIG> required
+vtopctl scrub
+vtopctl scrub --check-retention flag
+vtopctl scrub --concurrency value=<CONCURRENCY> default=4
+vtopctl scrub --config value=<CONFIG> required
+vtopctl scrub --cursor-file value=<CURSOR_FILE>
+vtopctl scrub --digest-dir value=<DIGEST_DIR>
+vtopctl scrub --limit value=<LIMIT>
+vtopctl scrub --max-bytes-per-sec value=<MAX_BYTES_PER_SEC>
+vtopctl scrub --max-objects-per-sec value=<MAX_OBJECTS_PER_SEC>
+vtopctl scrub --metrics-file value=<METRICS_FILE>
+vtopctl scrub --require-receipts flag
+vtopctl scrub --sample value=<SAMPLE>
+vtopctl scrub --seed value=<SEED>
+vtopctl segment
+vtopctl segment prove-chunk
+vtopctl segment prove-chunk --index value=<N> required
+vtopctl segment prove-chunk --segment value=<PATH> required
+vtopctl segment verify
+vtopctl segment verify --expect-manifest-digest value=<HEX>
+vtopctl segment verify --expect-root value=<HEX>
+vtopctl segment verify --key-env value=<VAR> multiple
+vtopctl segment verify --key-file value=<PATH> multiple
+vtopctl segment verify --key-id value=<ID> multiple
+vtopctl segment verify --require value=<REQUIRE> values=self,root,auth default=self
+vtopctl segment verify <PATH> multiple required position=1
+vtopctl segment verify-chunk
+vtopctl segment verify-chunk --chunk-count value=<N> required
+vtopctl segment verify-chunk --chunk-file value=<PATH> required
+vtopctl segment verify-chunk --chunk-size value=<N> required
+vtopctl segment verify-chunk --index value=<N> required
+vtopctl segment verify-chunk --proof-file value=<PATH> required
+vtopctl segment verify-chunk --root value=<HEX> required
+vtopctl status
+vtopctl status --config value=<CONFIG> required
+vtopctl tier
+vtopctl tier cleanup-abandoned
+vtopctl tier cleanup-abandoned --multipart-state-dir value=<MULTIPART_STATE_DIR> required
+vtopctl tier cleanup-abandoned --upload-config value=<UPLOAD_CONFIG> required
+vtopctl tier copy
+vtopctl tier copy --commit-key-env value=<COMMIT_KEY_ENV>
+vtopctl tier copy --commit-key-id value=<COMMIT_KEY_ID> default=
+vtopctl tier copy --expected-generation value=<EXPECTED_GENERATION> required
+vtopctl tier copy --expected-root value=<EXPECTED_ROOT> required
+vtopctl tier copy --fencing-epoch value=<FENCING_EPOCH> required
+vtopctl tier copy --issued-at-ms value=<ISSUED_AT_MS> default=0
+vtopctl tier copy --meta-config value=<META_CONFIG> required
+vtopctl tier copy --multipart-max-parallelism value=<MULTIPART_MAX_PARALLELISM>
+vtopctl tier copy --multipart-part-size-bytes value=<MULTIPART_PART_SIZE_BYTES>
+vtopctl tier copy --multipart-state-dir value=<MULTIPART_STATE_DIR>
+vtopctl tier copy --multipart-threshold-bytes value=<MULTIPART_THRESHOLD_BYTES>
+vtopctl tier copy --object-uri value=<OBJECT_URI> required
+vtopctl tier copy --range-uuid value=<RANGE_UUID> required
+vtopctl tier copy --request-id value=<REQUEST_ID>
+vtopctl tier copy --require-versioning value=<BOOL> values=true,false default=true
+vtopctl tier copy --segment value=<SEGMENT> required
+vtopctl tier copy --segment-uuid value=<SEGMENT_UUID> required
+vtopctl tier copy --topic-uuid value=<TOPIC_UUID> required
+vtopctl tier copy --upload-config value=<UPLOAD_CONFIG> required
+vtopctl tier copy --verified-term value=<VERIFIED_TERM> default=0
+vtopctl tier copy --verifier-node-uuid value=<VERIFIER_NODE_UUID> required
+vtopctl tier rehydrate
+vtopctl tier rehydrate --digest-algorithm value=<DIGEST_ALGORITHM> default=blake3
+vtopctl tier rehydrate --expected-digest value=<EXPECTED_DIGEST> required
+vtopctl tier rehydrate --expected-size value=<EXPECTED_SIZE> required
+vtopctl tier rehydrate --object-uri value=<OBJECT_URI> required
+vtopctl tier rehydrate --object-version-id value=<OBJECT_VERSION_ID> required
+vtopctl tier rehydrate --output value=<OUTPUT> required
+vtopctl tier rehydrate --upload-config value=<UPLOAD_CONFIG> required
+vtopctl validate
+vtopctl validate --config value=<CONFIG> required
+vtopctl validate --print-effective flag
+vtopctl verify-manifest
+vtopctl verify-manifest --config value=<CONFIG> required
+vtopctl verify-manifest --manifest value=<MANIFEST> required
