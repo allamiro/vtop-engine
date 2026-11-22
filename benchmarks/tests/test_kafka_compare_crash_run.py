@@ -404,6 +404,26 @@ def test_the_default_host_prefix_is_sudo_unless_root():
     assert crash.default_host_prefix(euid=1000) == ["sudo", "-n"]
 
 
+def test_the_flush_override_is_layered_for_kafka_fsync_parity_only():
+    parity = os.path.join("crash", "compose.kafka.fsync-parity.yml")
+    assert parity in crash.compose_files("kafka", "kafka-fsync-parity")
+    assert parity not in crash.compose_files("kafka", "kafka-defaults")
+    # teardown runs both systems with the crash's configuration; VTOP has no flush override
+    assert crash.compose_files("vtop", "kafka-fsync-parity") == list(crash.SPEC["vtop"]["files"])
+    assert all(isinstance(name, str) for name in crash.compose_files("vtop", None))
+
+
+def test_a_cleanup_that_fails_does_not_end_the_run_or_change_the_row():
+    b = FakeBackend()
+
+    def broken():
+        raise RuntimeError("docker is gone")
+
+    b.cleanup = broken
+    row = crash.run_crash(b, params(), "kafka-defaults", "sigkill", 1, 20.0)
+    assert row["status"] == "ok"
+
+
 def test_kafka_topic_creation_carries_the_profile():
     defaults = crash.topic_create_args("kafka-defaults")
     parity = crash.topic_create_args("kafka-fsync-parity")

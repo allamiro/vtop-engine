@@ -145,6 +145,16 @@ class Host:
         return done.stdout
 
 
+def compose_files(system: str, config: str | None) -> list[str]:
+    """The Compose files of a system for a configuration: the base, the crash override, and for Kafka's
+    fsync-parity the flush override. `config` may be another system's (teardown runs both systems with
+    the crash's configuration): the flush override belongs to Kafka only."""
+    files = list(SPEC[system]["files"])
+    if system == "kafka" and config == "kafka-fsync-parity":
+        files.append(SPEC["kafka"]["parity_file"])
+    return files
+
+
 def topic_create_args(config: str) -> list[str]:
     args = ["--create", "--topic", TOPIC, "--partitions", "1", "--replication-factor", "3",
             "--config", "min.insync.replicas=2"]
@@ -199,7 +209,10 @@ def run_crash(b: Any, p: Params, config: str, mode: str, crash: int, trigger_aft
             b.save_logs(config, mode, crash, {k: row.get(k) for k in ("status", "note", "acked", "acked_lost")})
         except Exception as exc:
             log(f"saving the logs of {config}/{mode}/{crash} failed: {exc}")
-        b.cleanup()
+        try:
+            b.cleanup()
+        except Exception as exc:  # the next crash's reset removes what is left; this one's row stands
+            log(f"cleaning up after {config}/{mode}/{crash} failed: {exc}")
     return row
 
 
@@ -361,12 +374,8 @@ class DockerBackend:
     # --- compose
     def compose(self, system: str, *args: str, timeout: float = 600, config: str | None = None,
                 check: bool = True) -> subprocess.CompletedProcess:
-        spec = SPEC[system]
-        files = list(spec["files"])
-        if config == "kafka-fsync-parity":
-            files.append(spec["parity_file"])
-        command = ["docker", "compose", "-p", spec["project"]]
-        for name in files:
+        command = ["docker", "compose", "-p", SPEC[system]["project"]]
+        for name in compose_files(system, config):
             command += ["-f", os.path.join(HERE, name)]
         return sh([*command, *args], timeout=timeout, cwd=HERE, check=check, env={
             "VTOP_IMAGE": self.ctx["vtop_image"], "KAFKA_IMAGE": KAFKA_IMAGE,

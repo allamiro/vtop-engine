@@ -360,6 +360,10 @@ jobs:
               # no second chance to get it right before people see it. Lint it
               # on the pull request instead.
               - 'scripts/release-notes.sh'
+              # The host-level half of the whole-replica-set crash benchmark
+              # (#599): it runs as root against a device-mapper device, so a
+              # slip in it is not a test failure but a damaged filesystem.
+              - 'benchmarks/kafka_compare/crash/*.sh'
               - '.github/workflows/**'
 
             # `scripts/live-chaos/run-all.sh`. The harness drives real
@@ -1305,7 +1309,8 @@ jobs:
             scripts/traffic-snapshot.sh scripts/test-progress.sh \
             scripts/check-naming.sh scripts/check-egress-claims.sh \
             scripts/check-failpoints-absent.sh scripts/kafka-broker.sh \
-            scripts/kafka-cluster.sh scripts/update-surface-snapshots.sh
+            scripts/kafka-cluster.sh scripts/update-surface-snapshots.sh \
+            benchmarks/kafka_compare/crash/*.sh
 
       # `-P scripts/live-chaos/scenarios` resolves the scenarios' dynamic
       # `source "$(dirname …)/../lib.sh"`. Without it every scenario reports
