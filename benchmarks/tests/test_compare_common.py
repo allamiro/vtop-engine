@@ -162,6 +162,14 @@ def test_checker_counts_a_partial_last_line_as_torn_and_reads_a_wrapped_value():
     assert result.present_unique == 1 and result.torn_keys == ["t"]
 
 
+def test_checker_counts_a_json_record_cut_after_its_id_as_torn():
+    cut = b'{"id":"' + checker.make_id("tst1", 1).encode() + b'","pad":"'
+    result = checker.check(checker.Snapshot({"t": cut}, {}, []), [1], "tst1")
+    assert result.torn_keys == ["t"]
+    whole = checker.check(checker.Snapshot({"t": _obj([_line(1)])}, {}, []), [1], "tst1")
+    assert whole.torn_keys == [] and whole.present_unique == 1
+
+
 def test_checker_counts_another_runs_ids_as_unexpected():
     snapshot = checker.Snapshot({"k": _obj([_line(1, tag="zzz9")])}, {}, [])
     assert checker.check(snapshot, [1], "tst1").unexpected == 1
@@ -397,10 +405,36 @@ def test_tool_failure_is_recorded_not_retried_by_the_harness(tmp_path):
 
     runner.run_plan(str(tmp_path), KIND, env, _describe, execute, log=lambda m: None)
     rows = schema.read_rows(os.path.join(str(tmp_path), "testkind.csv"), KIND)
-    assert len(calls) == len(rows) == 15
+    # Review of #908: a tool whose smoke failed or was refused is not timed; its performance cells are refused
+    # without running (7 of the 15 planned runs ran).
+    assert len(rows) == 15 and len(calls) == 7
     vector = [r for r in rows if r["system"] == "vector"]
-    assert {r["status"] for r in vector} == {"failed"} and vector[0]["note"] == "vector: sink error: 503"
+    smoke = [r for r in vector if r["cell"] == "smoke"]
+    assert [r["status"] for r in smoke] == ["failed"] and smoke[0]["note"] == "vector: sink error: 503"
+    drains = [r for r in vector if r["cell"] == "drain"]
+    assert {r["status"] for r in drains} == {"refused"} and "smoke did not pass" in drains[0]["note"]
     assert [r["status"] for r in rows if r["system"] == "connect-lenses" and r["cell"] == "smoke"] == ["refused"]
+    assert {r["status"] for r in rows if r["system"] == "connect-lenses" and r["cell"] == "drain"} == {"refused"}
+    assert {r["status"] for r in rows if r["system"] == "vtop"} == {"ok"}
+
+
+def test_a_failed_smoke_read_on_a_resume_still_gates_the_performance_cells(tmp_path):
+    env = make_env()
+    calls = []
+
+    def first(item):
+        if item.cell == "smoke" and item.system == "vtop":
+            raise runner.ToolFailed("records lost")
+        calls.append(item)
+        return {"records_per_sec": 1, "gaps": 0}
+
+    out = runner.run_plan(str(tmp_path), KIND, env, _describe, first, budget_minutes=0.5,
+                          clock=iter(range(0, 100000, 60)).__next__, log=lambda m: None)
+    assert out.stopped_by_budget
+    runner.run_plan(str(tmp_path), KIND, env, _describe, first, log=lambda m: None)
+    rows = schema.read_rows(os.path.join(str(tmp_path), "testkind.csv"), KIND)
+    assert {r["status"] for r in rows if r["system"] == "vtop" and r["cell"] == "drain"} == {"refused"}
+    assert not [c for c in calls if c.system == "vtop"]
 
 
 def test_a_harness_fault_writes_no_row(tmp_path):
