@@ -814,6 +814,120 @@ impl<'a> Pipeline<'a> {
         }
     }
 
+    /// The tenant a window is filed under: its stream's, else the engine's.
+    fn window_tenant(&self, stream: Option<&StreamConfig>) -> String {
+        stream
+            .map(|s| s.tenant.clone())
+            .unwrap_or_else(|| self.config.engine.tenant.clone())
+    }
+
+    /// Format precedence: explicit stream config > content detection.
+    /// Detection lets one pipeline handle CEF/JSON/JSONL/syslog/text without
+    /// per-source configuration and keeps the object extension + manifest
+    /// `format` accurate.
+    fn window_format(
+        &self,
+        source: &DiscoveredSource,
+        read: &ReadResult,
+        stream: Option<&StreamConfig>,
+    ) -> vtop_core::types::TelemetryFormat {
+        match stream.map(|s| s.format.clone()) {
+            Some(f) => f,
+            None => {
+                let detected = vtop_core::detect::detect_batch(&read.records);
+                tracing::info!(
+                    source = %source.source_name,
+                    format = %detected,
+                    "format_detected"
+                );
+                detected
+            }
+        }
+    }
+
+    /// The ledger row a window is born with: BATCHING, over the range it
+    /// reads, owned by this engine.
+    #[allow(clippy::too_many_arguments)]
+    fn batching_record(
+        &self,
+        source: &DiscoveredSource,
+        read: &ReadResult,
+        tenant: &str,
+        format: &vtop_core::types::TelemetryFormat,
+        batch_id: &str,
+        sealed_at: chrono::DateTime<Utc>,
+        now: &str,
+    ) -> BatchRecord {
+        BatchRecord {
+            batch_id: batch_id.to_owned(),
+            tenant: tenant.to_owned(),
+            source_type: source.source_type.clone(),
+            source_name: source.source_name.clone(),
+            format: format.clone(),
+            state: BatchState::Batching,
+            progress_start: read.progress_start.clone(),
+            progress_end: read.progress_end.clone(),
+            object_uri: None,
+            manifest_uri: None,
+            object_sha256: None,
+            manifest_sha256: None,
+            manifest_version_id: None,
+            object_size_bytes: None,
+            verification_class: None,
+            // Recorded with the row's first write (#626): a replay of this
+            // range after a restart reads it back and files its object
+            // under the same hour, so it names the same key.
+            sealed_at: Some(sealed_at.to_rfc3339()),
+            record_count: Some(read.records.len() as i64),
+            error_message: None,
+            // Ownership (#93): this engine claims the batch at birth, leased so
+            // a crashed engine's work is reclaimable and a live one's is not.
+            owner: Some(self.config.engine.name.clone()),
+            lease_expires_at: Some(
+                (Utc::now() + chrono::Duration::seconds(LEASE_TTL_SECS)).to_rfc3339(),
+            ),
+            created_at: now.to_owned(),
+            updated_at: now.to_owned(),
+        }
+    }
+
+    /// Write a sealed window's ledger row (BATCHING) at the moment it is
+    /// handed to the pipeline, in the order the windows were sealed, before
+    /// its task can compete for an upload slot. Tasks start in any order: a
+    /// later window's can win the slot, reach VERIFIED and wait for the
+    /// earlier one to settle, and a crash then would leave recovery a
+    /// VERIFIED range with no row for the range below it, which it would
+    /// commit, moving the source past data no row records (review of #924).
+    ///
+    /// Returns the window's format, which the task is handed so the row is
+    /// not written twice; `None` for an empty read, which has no row.
+    async fn record_queued(
+        &self,
+        source: &DiscoveredSource,
+        read: &ReadResult,
+        stream: Option<&StreamConfig>,
+        sealed_at: chrono::DateTime<Utc>,
+        queued_at: chrono::DateTime<Utc>,
+    ) -> Result<Option<vtop_core::types::TelemetryFormat>, VtopError> {
+        if read.is_empty() {
+            return Ok(None);
+        }
+        let tenant = self.window_tenant(stream);
+        let format = self.window_format(source, read, stream);
+        let batch_id = vtop_core::batch::build_batch_id(&source.source_name, &window_marker(read));
+        let record = self.batching_record(
+            source,
+            read,
+            &tenant,
+            &format,
+            &batch_id,
+            sealed_at,
+            &queued_at.to_rfc3339(),
+        );
+        self.store.save_batch_state(&record).await?;
+        Ok(Some(format))
+    }
+
     /// Run a [`ReadResult`] all the way through the state machine. Source
     /// progress is committed only if (and after) verification passes.
     ///
@@ -827,7 +941,7 @@ impl<'a> Pipeline<'a> {
         stream: Option<&StreamConfig>,
     ) -> Result<BatchOutcome, VtopError> {
         match self
-            .process_until_verified(source, read, stream, Utc::now(), Utc::now(), None)
+            .process_until_verified(source, read, stream, Utc::now(), Utc::now(), None, None)
             .await?
         {
             VerifyStep::Finished(outcome) => Ok(outcome),
@@ -861,6 +975,11 @@ impl<'a> Pipeline<'a> {
     /// restart's cursor lookups sort by: taken here, after the batch has
     /// waited for an upload slot, two windows of one unit could be stamped in
     /// the reverse of their seal order (review of #895).
+    ///
+    /// `recorded` is the format [`Pipeline::record_queued`] decided when it
+    /// wrote the window's ledger row: the row exists already, and is not
+    /// written again. `None` writes it here, as the first thing the batch does.
+    #[allow(clippy::too_many_arguments)]
     async fn process_until_verified(
         &self,
         source: &DiscoveredSource,
@@ -869,6 +988,7 @@ impl<'a> Pipeline<'a> {
         sealed_at: chrono::DateTime<Utc>,
         queued_at: chrono::DateTime<Utc>,
         rebuild: Option<RecordedWindow>,
+        recorded: Option<vtop_core::types::TelemetryFormat>,
     ) -> Result<VerifyStep, VtopError> {
         if read.is_empty() {
             return Ok(VerifyStep::Finished(BatchOutcome {
@@ -895,13 +1015,22 @@ impl<'a> Pipeline<'a> {
         // otherwise carry it in its own future, on the stack of whoever polls
         // it (see `commands::dispatch`).
         Box::pin(
-            self.verify_traced(trace, source, read, stream, (sealed_at, queued_at), rebuild)
-                .instrument(span),
+            self.verify_traced(
+                trace,
+                source,
+                read,
+                stream,
+                (sealed_at, queued_at),
+                rebuild,
+                recorded,
+            )
+            .instrument(span),
         )
         .await
     }
 
     /// [`Pipeline::process_until_verified`] inside its batch's span.
+    #[allow(clippy::too_many_arguments)]
     async fn verify_traced(
         &self,
         mut trace: BatchTrace,
@@ -910,27 +1039,15 @@ impl<'a> Pipeline<'a> {
         stream: Option<&StreamConfig>,
         (sealed_at, queued_at): (chrono::DateTime<Utc>, chrono::DateTime<Utc>),
         rebuild: Option<RecordedWindow>,
+        recorded: Option<vtop_core::types::TelemetryFormat>,
     ) -> Result<VerifyStep, VtopError> {
         let started = Instant::now();
 
-        let tenant = stream
-            .map(|s| s.tenant.clone())
-            .unwrap_or_else(|| self.config.engine.tenant.clone());
-        // Format precedence: explicit stream config > content detection.
-        // Detection lets one pipeline handle CEF/JSON/JSONL/syslog/text without
-        // per-source configuration and keeps the object extension + manifest
-        // `format` accurate.
-        let format = match stream.map(|s| s.format.clone()) {
-            Some(f) => f,
-            None => {
-                let detected = vtop_core::detect::detect_batch(&read.records);
-                tracing::info!(
-                    source = %source.source_name,
-                    format = %detected,
-                    "format_detected"
-                );
-                detected
-            }
+        let tenant = self.window_tenant(stream);
+        let already_recorded = recorded.is_some();
+        let format = match recorded {
+            Some(format) => format,
+            None => self.window_format(source, &read, stream),
         };
         // Optional path rename (e.g. app_events -> app) for the object key.
         let s3_source = stream
@@ -947,6 +1064,11 @@ impl<'a> Pipeline<'a> {
         trace.record("format", format.as_str());
 
         // ---- DISCOVERED -> BATCHING (persisted) -------------------------
+        // Built while `read` is whole; written below unless the window's
+        // row was written when it was queued (`record_queued`).
+        let unwritten_row = (!already_recorded).then(|| {
+            self.batching_record(source, &read, &tenant, &format, &batch_id, sealed_at, &now)
+        });
         let mut batch = TelemetryBatch {
             batch_id: batch_id.clone(),
             tenant: tenant.clone(),
@@ -965,44 +1087,15 @@ impl<'a> Pipeline<'a> {
             verbatim: read.verbatim,
         };
 
-        let record = BatchRecord {
-            batch_id: batch_id.clone(),
-            tenant: tenant.clone(),
-            source_type: source.source_type.clone(),
-            source_name: source.source_name.clone(),
-            format: format.clone(),
-            state: BatchState::Batching,
-            progress_start: read.progress_start.clone(),
-            progress_end: read.progress_end.clone(),
-            object_uri: None,
-            manifest_uri: None,
-            object_sha256: None,
-            manifest_sha256: None,
-            manifest_version_id: None,
-            object_size_bytes: None,
-            verification_class: None,
-            // Recorded with the row's first write (#626): a replay of this
-            // range after a restart reads it back and files its object
-            // under the same hour, so it names the same key.
-            sealed_at: Some(sealed_at.to_rfc3339()),
-            record_count: Some(batch.records.len() as i64),
-            error_message: None,
-            // Ownership (#93): this engine claims the batch at birth, leased so
-            // a crashed engine's work is reclaimable and a live one's is not.
-            owner: Some(self.config.engine.name.clone()),
-            lease_expires_at: Some(
-                (Utc::now() + chrono::Duration::seconds(LEASE_TTL_SECS)).to_rfc3339(),
-            ),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        };
         // Ledger-write time is accumulated across the WHOLE pipeline (~8
         // writes per batch): it was the unmeasured gap between staged time and
         // total_ms (#87), and an unmeasured stage is where regressions hide.
         let mut state_write = Duration::ZERO;
-        let t_write = Instant::now();
-        self.store.save_batch_state(&record).await?;
-        state_write += t_write.elapsed();
+        if let Some(record) = &unwritten_row {
+            let t_write = Instant::now();
+            self.store.save_batch_state(record).await?;
+            state_write += t_write.elapsed();
+        }
         tracing::info!(batch_id, source = %source.source_name, "batch_started");
 
         // The record count `fail!` reports. Declared here, before the macro,
@@ -4654,6 +4747,29 @@ impl Engine {
                     bounded: false,
                 });
                 let bytes = read.records.iter().map(Vec::len).sum();
+                // The row is written HERE, in seal order, before any task can
+                // win an upload slot (see `Pipeline::record_queued`). A write
+                // that fails is the window's failure, settled like any other
+                // before VERIFIED: its range is handed back to the source.
+                let recorded = owned
+                    .pipeline()
+                    .record_queued(&source, &read, stream.as_ref(), sealed_at, queued_at)
+                    .await;
+                let recorded = match recorded {
+                    Ok(format) => format,
+                    Err(e) => {
+                        queue.push_back(InFlight {
+                            unit: unit_key(&window.start),
+                            window,
+                            bytes,
+                            superseded: false,
+                            failure_handled: false,
+                            task: None,
+                            result: Some(Err(e)),
+                        });
+                        continue;
+                    }
+                };
                 let owned = owned.clone();
                 let slots = Arc::clone(&self.upload_slots);
                 let slot_debt = Arc::clone(&self.upload_slots_debt);
@@ -4671,6 +4787,7 @@ impl Engine {
                                 sealed_at,
                                 queued_at,
                                 rebuild,
+                                recorded,
                             )
                             .await;
                         step
@@ -7986,7 +8103,7 @@ mod tests {
             .with_timezone(&Utc);
         let step = engine
             .pipeline()
-            .process_until_verified(&source, read, None, drained, Utc::now(), None)
+            .process_until_verified(&source, read, None, drained, Utc::now(), None, None)
             .await
             .unwrap();
         let VerifyStep::Verified(verified) = step else {
@@ -8063,7 +8180,7 @@ mod tests {
         ] {
             engine
                 .pipeline()
-                .process_until_verified(&source, read, None, at, at, None)
+                .process_until_verified(&source, read, None, at, at, None, None)
                 .await
                 .unwrap();
         }
@@ -9270,6 +9387,56 @@ mod tests {
         for task in waiting {
             task.abort();
         }
+    }
+
+    /// Review of #924: a window's ledger row is written when the window is
+    /// handed to the pipeline, in seal order, not when its task first runs.
+    /// Tasks start in any order, so with one upload slot the later window's
+    /// can win it and verify while the earlier one has no row; a crash then
+    /// leaves recovery a VERIFIED range and nothing recording the range
+    /// below it, and it commits the source past that range. Here every slot
+    /// is held, so no task can start: both rows must exist all the same.
+    #[tokio::test]
+    async fn a_window_has_its_ledger_row_before_its_task_has_an_upload_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, _store, _input) = pipelined_file_engine(dir.path(), 4).await;
+        let held = Arc::clone(&engine.upload_slots)
+            .acquire_many_owned(engine.upload_slots_size as u32)
+            .await
+            .unwrap();
+        for _ in 0..500 {
+            engine.run_source(SourceType::File, false).await.unwrap();
+            if engine.inflight.values().map(VecDeque::len).sum::<usize>() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let queued: usize = engine.inflight.values().map(VecDeque::len).sum();
+        assert!(queued >= 2, "two windows are waiting for a slot: {queued}");
+        let rows = engine.store.list_incomplete_batches().await.unwrap();
+        assert_eq!(
+            rows.len(),
+            queued,
+            "every window waiting for an upload slot has a ledger row"
+        );
+        assert!(
+            rows.iter().all(|row| row.state == BatchState::Batching),
+            "{:?}",
+            rows.iter().map(|row| row.state).collect::<Vec<_>>()
+        );
+        // Released, the windows run to the end on the rows they have.
+        drop(held);
+        let outcomes = run_until_settled(&mut engine, SourceType::File).await;
+        assert!(
+            !outcomes.is_empty() && outcomes.iter().all(|o| o.committed),
+            "{outcomes:?}"
+        );
+        assert!(engine
+            .store
+            .list_incomplete_batches()
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     /// A batch task does not outlive its engine: dropping the engine (a test,
