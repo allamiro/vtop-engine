@@ -295,9 +295,12 @@ and runs `check_control.py` over what it wrote, keeping the summary in
 | `unknown_grant` | a node acting on an epoch that a lease read begun afterwards does not reach: a grant metadata never made, or lost |
 | `stale_leader` | a deposed leader still acting at its epoch after a read that ended earlier reported a newer one, past the latest deadline any read reported for its lease |
 
-Its limits: it sees what it polls, every 250 ms for a data node and 300 ms for
-a lease read by default (`CHAOS_CONTROL_*_MS`), so a violation shorter than
-that can fall between two observations. A lease with no deadline (an
+Its limits: it sees what it polls, by default every 400 ms for a data node,
+500 ms for a lease read and 2 s for a node's Raft status
+(`CHAOS_CONTROL_NODE_MS`, `CHAOS_CONTROL_LEASE_MS`, `CHAOS_CONTROL_STATUS_MS`;
+each `vtopctl` call is a process and a TLS handshake, and the scenarios run on
+two CPUs), so a violation shorter than that can fall between two
+observations. A lease with no deadline (an
 operator's grant) is not held to `stale_leader`, and an operator's
 revocation of a live lease is not modelled; no scenario does either.
 `stale_leader` compares a data node's deadline with the recorder's clock,

@@ -1161,9 +1161,9 @@ control_history_start() {
   python3 "$SCRIPT_DIR/history/record_control.py" \
     --out "$WORKDIR/history/control/control.jsonl" --vtopctl "$VTOPCTL" \
     --topic "$TOPIC_UUID" --range "$RANGE_ID" \
-    --lease-interval-ms "${CHAOS_CONTROL_LEASE_MS:-300}" \
-    --status-interval-ms "${CHAOS_CONTROL_STATUS_MS:-1000}" \
-    --node-interval-ms "${CHAOS_CONTROL_NODE_MS:-250}" \
+    --lease-interval-ms "${CHAOS_CONTROL_LEASE_MS:-500}" \
+    --status-interval-ms "${CHAOS_CONTROL_STATUS_MS:-2000}" \
+    --node-interval-ms "${CHAOS_CONTROL_NODE_MS:-400}" \
     "${args[@]}" > "$WORKDIR/logs/control-recorder.log" 2>&1 &
   CONTROL_RECORDER_PID=$!
   echo "$CONTROL_RECORDER_PID" >> "$WORKDIR/pids"
