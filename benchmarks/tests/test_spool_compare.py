@@ -347,7 +347,7 @@ def test_first_object_after_each_restart():
     assert run.first_object_after(listing, [base + 40]) == ""
 
 
-@pytest.mark.parametrize("name", ["hosted-crash", "full"])
+@pytest.mark.parametrize("name", ["smoke", "hosted-crash", "full"])
 def test_every_put_trigger_is_reachable_with_whole_32_mib_objects(name):
     # Fluent Bit and Vector upload one object per 32 MiB: the backlog must hold at least
     # kills x the largest Nth PUT of them, or a trigger can never fire (review of #908).

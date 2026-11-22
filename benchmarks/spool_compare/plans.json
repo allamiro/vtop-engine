@@ -4,7 +4,7 @@
   "_comment": "What each spool run owes (#748). `minutes_per_run` is an estimate per system run, not a measurement; `python3 -m compare_common.plan spool_compare/plans.json <name>` prints the projection. Variant keys other than source and rotation are per-variant parameters. Lines are 200 bytes plus the newline.",
   "plans": {
     "smoke": {
-      "_comment": "Minutes on a laptop or a hosted runner: proves the stack, the generator's rotations, the checker and a rotation kill end to end on tiny data. Correctness only.",
+      "_comment": "Minutes on a laptop or a hosted runner: proves the stack, the generator's rotations, the checker, a rotation kill and a kill through the S3 tap (K2, after the first PUT) end to end on small data. Correctness only.",
       "host_class": "laptop",
       "systems": [
         "fluent-bit",
@@ -63,6 +63,29 @@
             "seconds_range": [
               2.0,
               6.0
+            ],
+            "timeout_minutes": 10
+          }
+        },
+        {
+          "cell": "crash-K2",
+          "repetitions": 1,
+          "minutes_per_run": 4,
+          "variants": [
+            {
+              "source": "file",
+              "rotation": "rename"
+            }
+          ],
+          "params": {
+            "records": 400000,
+            "rotate_bytes": 16777216,
+            "seed": 748,
+            "kills_per_run": 1,
+            "kill_seed": 748,
+            "n_range": [
+              1,
+              1
             ],
             "timeout_minutes": 10
           }
