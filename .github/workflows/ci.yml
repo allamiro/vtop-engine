@@ -1357,6 +1357,12 @@ jobs:
         run: python -m unittest discover -s scripts/tests -p 'test_check_threat_map.py' -v
       - name: threat map (every named control and test exists)
         run: python scripts/check-threat-map.py
+      # The 1.0 release gate (#741) names tests and CI jobs too, so a rename
+      # fails here for the same reason. This checkout is shallow, so the
+      # merged pull requests, runs and issues are checked by the docs
+      # workflow, which has the history and the API.
+      - name: release gate (every named file, test and CI job exists)
+        run: python scripts/check-release-gate.py --no-history
 
   # Kafka was entirely untested in CI, which is how a P0 shipped: every read
   # returned zero records (a subscribe() per read forced a rebalance that
