@@ -639,6 +639,51 @@ async fn tier_backend(bucket: &str) -> std::sync::Arc<dyn vtop_upload::UploadBac
     vtop_upload::build_backend(&upload).await.unwrap()
 }
 
+/// The refusal on a store without Object Lock or versioning (#722; Garage),
+/// for `vtopctl tier copy`: the command checks the store before it writes,
+/// so it refuses, in words, with nothing copied. Against the plain bucket:
+/// such a store has no locked one.
+async fn tier_copy_refused_before_writing(capability: Capability, at: RefusalAt) {
+    assert_eq!(
+        at,
+        RefusalAt::Startup,
+        "a tier copy refuses before it writes, which the capability file calls startup"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let (sealed, root) = seal_segment(dir.path());
+    let (bucket, step, parts): (String, &str, &[&str]) = match capability {
+        Capability::ObjectLock | Capability::ObjectLockEnforced => (
+            plain_bucket(),
+            "object lock preflight",
+            &[
+                "the store does not implement S3 Object Lock",
+                "nothing was copied",
+                "remove upload.object_lock",
+            ],
+        ),
+        Capability::Versioning => (
+            locked_bucket(),
+            "versioning preflight",
+            &["versioning", "nothing was copied"],
+        ),
+        other => panic!("no refusal is asserted for {other}"),
+    };
+    let object_uri = format!("s3://{bucket}/vtop-it-722-tier-refusal/bundle.segment");
+    let err = vtop_cli::tier_tools::run_tier_copy(
+        tier_backend(&bucket).await.as_ref(),
+        &tier_request(&sealed, root, &object_uri),
+    )
+    .await
+    .expect_err("a tier copy must not write to a store without the capability");
+    assert!(
+        err.contains(&format!("refusing at {step}")),
+        "{err:?} should say {step:?}"
+    );
+    for part in parts {
+        assert!(err.contains(part), "{err:?} should say {part:?}");
+    }
+}
+
 /// #684 for the cluster plane's cold tier: `vtopctl tier copy` with
 /// `upload.object_lock` writes the segment and its manifest under the lock
 /// and checks both retentions before it proposes the evidence; the store,
@@ -648,10 +693,11 @@ async fn tier_backend(bucket: &str) -> std::sync::Arc<dyn vtop_upload::UploadBac
 #[ignore = "requires an S3-compatible endpoint with Object Lock"]
 async fn live_a_tier_copy_is_written_and_checked_under_the_lock() {
     // Needs Object Lock and versioning on the server; a server whose
-    // capability file says it lacks them records the case as not applicable
-    // instead of failing it (the S3 compatibility matrix, #722).
+    // capability file says it lacks them has the tier copy refuse before it
+    // writes, and that refusal is what the case asserts there (the S3
+    // compatibility matrix, #722).
     let live = LiveS3::from_env();
-    live.case(
+    live.case_with_refusal(
         "tier.copy.written_and_checked_under_the_lock",
         &[Capability::ObjectLock, Capability::Versioning],
         || async {
@@ -749,6 +795,7 @@ async fn live_a_tier_copy_is_written_and_checked_under_the_lock() {
                     .unwrap_or_else(|e| panic!("cleaning up {key}: {e:?}"));
             }
         },
+        tier_copy_refused_before_writing,
     )
     .await;
 }
