@@ -179,6 +179,9 @@ def test_snapshot_reads_a_mirror_and_mc_timestamps(tmp_path):
     snap = checker.snapshot_from_dir(str(tmp_path), listing, ["u"])
     assert snap.objects == {"p/x.gz": b"abc"}
     assert snap.last_modified["p/x.gz"] == pytest.approx(1795341600.123457, abs=1e-5)
+    for text, frac in (("2026-11-22T10:00:00.25Z", 0.25), ("2026-11-22T10:00:00Z", 0.0),
+                       ("2026-11-22T10:00:00.5+00:00", 0.5), ("2026-11-22T10:00:00.1234Z", 0.1234)):
+        assert checker.parse_time(text) == pytest.approx(1795341600 + frac, abs=1e-6), text
 
 
 # --------------------------------------------------------------- 2-3 registry
