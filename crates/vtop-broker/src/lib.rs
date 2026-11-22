@@ -287,6 +287,14 @@ impl ProducerEpochJournal {
         self.current.get(&producer_id).copied()
     }
 
+    /// Every producer this journal has admitted, with its current epoch.
+    pub(crate) fn producers(&self) -> Vec<(Uuid, u64)> {
+        self.current
+            .iter()
+            .map(|(producer, epoch)| (*producer, *epoch))
+            .collect()
+    }
+
     /// Fence older sessions before any record for a newer epoch can be acked.
     pub fn accept(&mut self, producer_id: Uuid, epoch: u64) -> BrokerResult<()> {
         if self.poisoned {
