@@ -37,7 +37,7 @@
 use crate::config::ObservabilityConfig;
 use prometheus::core::{Collector, Desc};
 use prometheus::proto::MetricFamily;
-use prometheus::{IntGauge, IntGaugeVec, Opts, Registry};
+use prometheus::{IntGauge, IntGaugeVec, Opts};
 use std::sync::Arc;
 use uuid::Uuid;
 use vtop_broker::memory_budget::BudgetRejectReason;
@@ -50,6 +50,8 @@ use vtop_broker::{
 use vtop_log::{RecoveryReport, RetentionBlocked};
 use vtop_meta::{OpenraftConsensus, RaftObservation, RaftServerState};
 use vtop_observe::{Readiness, ReadinessGate};
+// Keeps what is registered in it, for the surface snapshot (#719).
+use vtop_surface::Registry;
 
 /// A live readiness condition evaluated at request time.
 ///
@@ -190,6 +192,9 @@ impl NodeObservability {
         // is fatal like a bind failure, never a plaintext endpoint instead.
         let bound = match config.tls.as_ref() {
             Some(tls) => {
+                // The endpoint's key is checked like every other (#732, S1).
+                crate::tls::check_private_key(&tls.key)
+                    .map_err(|error| format!("observability tls: {error}"))?;
                 let settings = vtop_observe::TlsSettings::from_pem_files(
                     &tls.cert,
                     &tls.key,
@@ -804,6 +809,8 @@ pub struct BrokerCollector {
     group_commit_bytes: CounterFamily,
     group_commit_sync_nanos: CounterFamily,
     group_commit_queue_wait_nanos: CounterFamily,
+    group_commit_overloaded: CounterFamily,
+    group_commit_split_groups: CounterFamily,
     produce_phase_seconds: CounterFamily,
     memory_rejections: CounterFamily,
     backpressure_nanos: CounterFamily,
@@ -921,6 +928,19 @@ impl BrokerCollector {
                 "broker_group_commit_queue_wait_nanoseconds_total",
                 "Nanoseconds the longest-waiting request of each group waited to join it, \
                  summed over groups (one wait per group, not per request)",
+                &[],
+            )?,
+            group_commit_overloaded: CounterFamily::new(
+                "broker_group_commit_overloaded_total",
+                "Produce requests answered Overloaded (retryable, nothing appended) because \
+                 the group-commit queue was full",
+                &[],
+            )?,
+            group_commit_split_groups: CounterFamily::new(
+                "broker_group_commit_split_groups_total",
+                "Commit groups the log refused as a whole for something one member caused \
+                 (a sequence, fencing or size refusal) and re-ran request by request, so \
+                 only that member failed",
                 &[],
             )?,
             produce_phase_seconds: CounterFamily::new(
@@ -1138,6 +1158,11 @@ impl BrokerCollector {
                     &self.group_commit_queue_wait_nanos,
                     metrics.queue_wait_nanos_total(),
                 ),
+                (&self.group_commit_overloaded, metrics.overloaded_total()),
+                (
+                    &self.group_commit_split_groups,
+                    metrics.split_groups_total(),
+                ),
             ] {
                 families.push(family.family([(Vec::new(), total)]));
             }
@@ -1170,6 +1195,8 @@ impl BrokerCollector {
             &self.group_commit_bytes.desc,
             &self.group_commit_sync_nanos.desc,
             &self.group_commit_queue_wait_nanos.desc,
+            &self.group_commit_overloaded.desc,
+            &self.group_commit_split_groups.desc,
             &self.produce_phase_seconds.desc,
             &self.memory_rejections.desc,
             &self.backpressure_nanos.desc,
@@ -2161,6 +2188,10 @@ impl Collector for SegmentRecoveryCollector {
         collect_all(&self.members())
     }
 }
+
+// The command tree and every family the node exports, against docs/surface/ (#719).
+#[cfg(test)]
+mod surface_snapshot;
 
 #[cfg(test)]
 mod tests {
@@ -3233,6 +3264,47 @@ mod tests {
         });
         broker.adopt_fencing_epoch(5);
         assert!(broker.epoch_history_broken());
+        let text = scrape(&registry);
+        assert!(text.contains(&format!("{series} 1")), "{text}");
+    }
+
+    /// #881 follow-up: the break survives a restart, so the gauge does too.
+    #[test]
+    fn a_broken_epoch_history_is_still_exported_after_a_restart() {
+        use vtop_log::sim::{FaultPlan, SimStorage};
+        let sim = SimStorage::new();
+        sim.create_dir_all(std::path::Path::new("/journal"));
+        let env = sim.env(0x882);
+        let journal = || {
+            vtop_broker::fencing_epochs::FencingEpochJournal::open_in(
+                &env,
+                "/journal/fencing-epochs",
+            )
+            .unwrap()
+        };
+        let series = r#"vtop_broker_epoch_history_broken{range="00000000-0000-0000-0000-000000000007",topic="telemetry"}"#;
+
+        let dir = tempfile::tempdir().unwrap();
+        let broker = open_broker(dir.path());
+        broker.set_fencing_epoch_journal(journal());
+        sim.set_fault(FaultPlan::FailOp {
+            op: sim.op_count(),
+            kind: std::io::ErrorKind::StorageFull,
+        });
+        broker.adopt_fencing_epoch(5);
+        assert!(broker.epoch_history_broken());
+        drop(broker);
+
+        // The restarted node: a fresh broker over the same journal.
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Arc::new(open_broker(dir.path()));
+        broker.set_fencing_epoch_journal(journal());
+        let registry = Registry::new_custom(Some("vtop".into()), None).unwrap();
+        registry
+            .register(Box::new(
+                BrokerCollector::new(Arc::clone(&broker), None, Vec::new()).unwrap(),
+            ))
+            .unwrap();
         let text = scrape(&registry);
         assert!(text.contains(&format!("{series} 1")), "{text}");
     }

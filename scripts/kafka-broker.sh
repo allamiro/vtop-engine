@@ -21,10 +21,12 @@
 #   sasl-plaintext  a SASL_PLAINTEXT listener on 9092 with PLAIN, SCRAM-SHA-256
 #                   and SCRAM-SHA-512 enabled; user `vtop`
 #   sasl-ssl        the same SASL listener over TLS (SASL_SSL)
+#   mtls            an SSL listener on 9092 that requires a client certificate
+#                   signed by the script's CA (mutual TLS); client-env prints
+#                   the client certificate and key
 # Every mode also has an unpublished PLAINTEXT listener on 9094 inside the
 # container, which this script uses to create the seed topic and the SCRAM
 # users, so none of its own calls depends on the credentials under test.
-# Mutual TLS is not offered: the engine cannot present a client certificate.
 #
 # Environment:
 #   KAFKA_BROKER_NAME     container name (default vtop-kafka-broker)
@@ -107,10 +109,13 @@ admin_port() {
 
 # Certificates for the TLS modes, made with openssl on the host: a CA, a
 # server certificate it signed (names: localhost, the advertised host, the
-# container name, 127.0.0.1), and a second CA that signed nothing, for the test
-# that gives a client the wrong authority. The broker reads the PEM keystore
-# (key then certificate); the tests read ca.pem and other-ca.pem. Test
-# material, valid for a week, never reused between runs.
+# container name, 127.0.0.1), and a second CA, for the test that gives a client
+# the wrong authority. For mutual TLS, a client certificate the CA signed
+# (client.pem, client.key; client-keystore.pem for the broker's own tools) and
+# one the second CA signed (other-client.pem, other-client.key), which the
+# broker must refuse. The broker reads the PEM keystore (key then
+# certificate); the tests read the rest. Test material, valid for a week,
+# never reused between runs.
 make_certs() {
   command -v openssl >/dev/null 2>&1 || die "openssl is needed to make the broker's certificates"
   # Only a directory this script made is ever emptied, so a KAFKA_CERT_DIR
@@ -135,19 +140,34 @@ make_certs() {
       -days 7 -extfile broker.ext -out broker.crt 2>/dev/null
     openssl pkcs8 -topk8 -nocrypt -in broker.key -out broker.pk8
     cat broker.pk8 broker.crt >broker.pem
-    rm -f broker.csr broker.ext broker.key broker.pk8 broker.crt ca.srl ca.key other-ca.key
+    printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=clientAuth\n' >client.ext
+    local ca
+    for ca in ca other-ca; do
+      local out=client
+      [ "$ca" = other-ca ] && out=other-client
+      openssl req -newkey rsa:2048 -nodes -subj "/CN=vtop-engine" \
+        -keyout "$out.key" -out "$out.csr" 2>/dev/null
+      openssl x509 -req -in "$out.csr" -CA "$ca.pem" -CAkey "$ca.key" -CAcreateserial \
+        -days 7 -extfile client.ext -out "$out.pem" 2>/dev/null
+    done
+    openssl pkcs8 -topk8 -nocrypt -in client.key -out client.pk8
+    cat client.pk8 client.pem >client-keystore.pem
+    rm -f broker.csr broker.ext broker.key broker.pk8 broker.crt client.ext client.csr \
+      other-client.csr client.pk8 ca.srl other-ca.srl ca.key other-ca.key
   )
-  # The broker runs as another user, and reads the mount.
+  # The broker runs as another user, and reads the mount. The client keys are
+  # the engine's to read only, as a deployment keeps them.
   chmod 755 "$CERT_DIR"
   chmod 644 "$CERT_DIR"/*.pem
+  chmod 600 "$CERT_DIR"/client.key "$CERT_DIR"/other-client.key
 }
 
 cmd_up() {
   local image="${1:-}" mode="${2:-plain}"
   [ -n "$image" ] || die "usage: $0 up <image> [mode]"
   case "$mode" in
-    plain | tls | sasl-plaintext | sasl-ssl) ;;
-    *) die "unknown mode '$mode'; known: plain, tls, sasl-plaintext, sasl-ssl" ;;
+    plain | tls | mtls | sasl-plaintext | sasl-ssl) ;;
+    *) die "unknown mode '$mode'; known: plain, tls, mtls, sasl-plaintext, sasl-ssl" ;;
   esac
   if is_redpanda "$image" && [ "$mode" != plain ]; then
     die "a Redpanda broker is started in plain mode only, not '$mode'"
@@ -187,7 +207,7 @@ cmd_up() {
         # underscore in a setting's name into a dot, and SASL_SSL has one.
         local client_protocol
         case "$mode" in
-          tls) client_protocol=SSL ;;
+          tls | mtls) client_protocol=SSL ;;
           sasl-plaintext) client_protocol=SASL_PLAINTEXT ;;
           sasl-ssl) client_protocol=SASL_SSL ;;
         esac
@@ -198,15 +218,26 @@ cmd_up() {
         ;;
     esac
     case "$mode" in
-      tls | sasl-ssl)
+      tls | mtls | sasl-ssl)
         make_certs
         args+=(
           -v "$CERT_DIR:$CERTS_IN_BROKER:ro"
           -e "KAFKA_SSL_KEYSTORE_TYPE=PEM"
           -e "KAFKA_SSL_KEYSTORE_LOCATION=$CERTS_IN_BROKER/broker.pem"
-          -e "KAFKA_SSL_CLIENT_AUTH=none"
         )
         ;;
+    esac
+    case "$mode" in
+      # The client listener only: the admin listener is plaintext, and the
+      # controller's is its own.
+      mtls)
+        args+=(
+          -e "KAFKA_LISTENER_NAME_CLIENT_SSL_CLIENT_AUTH=required"
+          -e "KAFKA_LISTENER_NAME_CLIENT_SSL_TRUSTSTORE_TYPE=PEM"
+          -e "KAFKA_LISTENER_NAME_CLIENT_SSL_TRUSTSTORE_LOCATION=$CERTS_IN_BROKER/ca.pem"
+        )
+        ;;
+      tls | sasl-ssl) args+=(-e "KAFKA_SSL_CLIENT_AUTH=none") ;;
     esac
     case "$mode" in
       sasl-*)
@@ -294,13 +325,18 @@ create_scram_users() {
 write_client_properties() {
   local mode="$1" mechanism="$2" file=/tmp/vtop-client.properties lines=()
   case "$mode" in
-    tls) lines+=("security.protocol=SSL") ;;
+    tls | mtls) lines+=("security.protocol=SSL") ;;
     sasl-plaintext) lines+=("security.protocol=SASL_PLAINTEXT") ;;
     sasl-ssl) lines+=("security.protocol=SASL_SSL") ;;
   esac
   case "$mode" in
-    tls | sasl-ssl)
+    tls | mtls | sasl-ssl)
       lines+=("ssl.truststore.type=PEM" "ssl.truststore.location=$CERTS_IN_BROKER/ca.pem")
+      ;;
+  esac
+  case "$mode" in
+    mtls)
+      lines+=("ssl.keystore.type=PEM" "ssl.keystore.location=$CERTS_IN_BROKER/client-keystore.pem")
       ;;
   esac
   case "$mode" in
@@ -390,7 +426,7 @@ cmd_client_env() {
   echo "VTOP_TEST_KAFKA=$ADVERTISED_HOST:9092"
   case "$mode" in
     plain) return ;;
-    tls) echo "VTOP_TEST_KAFKA_SECURITY_PROTOCOL=SSL" ;;
+    tls | mtls) echo "VTOP_TEST_KAFKA_SECURITY_PROTOCOL=SSL" ;;
     sasl-plaintext) echo "VTOP_TEST_KAFKA_SECURITY_PROTOCOL=SASL_PLAINTEXT" ;;
     sasl-ssl) echo "VTOP_TEST_KAFKA_SECURITY_PROTOCOL=SASL_SSL" ;;
   esac
@@ -407,9 +443,17 @@ cmd_client_env() {
       ;;
   esac
   case "$mode" in
-    tls | sasl-ssl)
+    tls | mtls | sasl-ssl)
       echo "VTOP_TEST_KAFKA_SSL_CA=$CERT_DIR/ca.pem"
       echo "VTOP_TEST_KAFKA_SSL_OTHER_CA=$CERT_DIR/other-ca.pem"
+      ;;
+  esac
+  case "$mode" in
+    mtls)
+      echo "VTOP_TEST_KAFKA_SSL_CERT=$CERT_DIR/client.pem"
+      echo "VTOP_TEST_KAFKA_SSL_KEY=$CERT_DIR/client.key"
+      echo "VTOP_TEST_KAFKA_SSL_OTHER_CERT=$CERT_DIR/other-client.pem"
+      echo "VTOP_TEST_KAFKA_SSL_OTHER_KEY=$CERT_DIR/other-client.key"
       ;;
   esac
 }

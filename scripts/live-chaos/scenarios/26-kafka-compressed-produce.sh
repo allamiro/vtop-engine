@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 25 — compressed produce from a stock client (#596): librdkafka, as `kcat`,
+# 26 — compressed produce from a stock client (#596): librdkafka, as `kcat`,
 # produces through the gateway on a standalone node with each codec the
 # gateway serves (gzip, zstd), and the same client reads every record back
 # byte-exact and in order. The gateway decompresses each batch and stores
@@ -23,7 +23,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 require_binaries
 
 KCAT="$(command -v kcat || command -v kafkacat || true)"
-[[ -n "$KCAT" ]] || fail "scenario 25 needs kcat, librdkafka's client: brew install kcat / apt-get install kafkacat"
+[[ -n "$KCAT" ]] || fail "scenario 26 needs kcat, librdkafka's client: brew install kcat / apt-get install kafkacat"
 init_workdir
 
 # kafka-0 of the lib's port families (scenario 16's; scenarios run one at a

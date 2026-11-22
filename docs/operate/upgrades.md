@@ -7,9 +7,12 @@ every upgrade.
   newest patch of each released minor series (v0.2 onwards) opens under the
   current build, serves its records byte for byte, and still serves them after
   a restart ([`scripts/upgrade-compat.sh`](../../scripts/upgrade-compat.sh)).
-- **Downgrades are not supported.** A newer release may write data an older
-  one cannot read, and nothing tests that path. Going back means a fresh
-  directory, or a verified backup taken before the upgrade.
+- **Downgrades are not supported**, except for what the
+  [compatibility matrix](../reference/compatibility.md#downgrade) records for
+  the previous release: the state ledger, its prune digests and the audit
+  trail. A newer release may write data an older one cannot read, and nothing
+  else tests that path. Going back means a fresh directory, or a verified
+  backup taken before the upgrade.
 
 The source for this page is the release notes in the [roadmap](../ROADMAP.md);
 read the section for the release you are moving to. What each format
@@ -230,7 +233,13 @@ or set `image.tag: "0.8.0"`.
 ### 2. Then raise the cluster feature level
 
 Cluster plane only. v0.7.0 supports feature levels up to 5 and v0.8.0 up to 7.
-Raising is permanent: there is no lowering.
+Raising is permanent: there is no lowering. v0.11.0 and later refuse to open,
+or to install a snapshot or apply a raise from, a metadata directory recorded
+at a level above the one they support. The message names both levels and says
+to run a newer binary; the directory is left as it was. Releases before
+v0.11.0 do not have this check: v0.8.0 and v0.9.0, for example, open a level-8
+directory and report level 3 or 8 depending on where the raise sits, so keep
+every voter on a release that supports the level before you raise it.
 
 ```bash
 # What every registered node reports it runs.

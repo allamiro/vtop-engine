@@ -148,13 +148,26 @@ suite keeps the bug fixed without a fuzzer.
 `mutants.out/outcomes.json`, computes `caught / (caught + missed + timeout)`
 (unviable mutants, which do not compile, are left out), lists every mutant
 the tests missed, and fails below `MUTANTS_MIN_SCORE`, set in the job.
-`detect.rs` and `batch.rs` stay in the report-only job. The nightly workflow
-also runs a report-only mutation job over the verify, recovery and
-file-continuity code in `vtop-upload`, `vtop-adapters` and `vtop-state`; that
-scope joins the gate once it has a measured score.
+`detect.rs` and `batch.rs` stay in the report-only job.
+
+The nightly workflow mutates the verify, recovery and file-continuity code in
+`vtop-upload`, `vtop-adapters` and `vtop-state`, one job per crate:
+
+| Leg | Files | Measured (nightly, then this change) | Nightly |
+|---|---|---|---|
+| `vtop-state` (recovery: claims, fences, the ledger) | `store.rs`, `fence.rs`, `sqlite_store.rs` | 0.786, 0.763, 0.831, then 0.929, 0.947, 0.944 | **gated** at 0.87, 0.89, 0.89 |
+| `vtop-upload` (verify) | `base.rs`, `multipart.rs` | 0.641, 0.708 | report only |
+| `vtop-adapters` (file continuity) | `continuity.rs`, `rotated.rs`, `file_source.rs` | 0.759, 0.765, 0.741 | report only |
+
+A gated leg fails the nightly run when any of its files scores below its own
+threshold (`scripts/mutants-gate.py --file-min-score FILE=SCORE`), and lists
+every mutant the tests missed. The report-only legs are below the 0.80 floor,
+so a gate there would fail every night; each joins the gate when tests bring
+it to 0.85, at its measured score minus 5 points. A pull request that changes
+the nightly workflow runs the gated leg in full and lists the others.
 
 Thresholds (the maintainer's rule on #729): each gate is the file's measured
-score minus 5 points, and never below 0.80. `state_machine.rs` and
+score minus 5 points, rounded down to two places, and never below 0.80. `state_machine.rs` and
 `replay.rs` measured 22 of 22 caught (1.00) but are gated at 0.90 until the
 nightly runs show no flaky timeouts, since a mutant that times out on a
 loaded runner counts as not caught; then their gate goes to 1.00.

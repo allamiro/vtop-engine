@@ -9,6 +9,50 @@ what each release does **not** yet do.
 
 ---
 
+## Next release — a broken epoch history survives a restart
+
+- **A broken epoch history survives a restart (#881 follow-up).** When a write
+  to a data node replica's fencing-epoch journal fails (a full disk, above
+  all), the replica's history is marked broken: it answers every fence with
+  no history and gets no replication session (v0.10.4 made that loud, with an
+  ERROR line, `vtop_broker_epoch_history_broken` and `VtopEpochHistoryBroken`).
+  The mark is now also written to disk, as `fencing-epochs.broken` beside the
+  journal, so a restart keeps refusing; before, a restart cleared it and
+  offered the surviving history as if it were whole. `vtopctl node repair`
+  clears it. A mark a full disk refuses is retried on every fence and append
+  until it lands. [Design note](EPOCH_HISTORY_AFTER_A_FAILED_WRITE.md).
+  **Upgrade note: a behaviour change.** A replica whose history broke stays
+  out of its range across restarts until it is repaired, where a restart
+  used to bring it back. A directory that never broke is unaffected. Before
+  restarting each data node onto this release, check
+  `vtop_broker_epoch_history_broken`: a replica that broke under v0.10.4 has
+  no mark on disk, so a restart onto any release forgets its break, as
+  v0.10.4's own restart would. Repair such a replica rather than restarting
+  it. An older binary
+  ignores the file, so downgrading drops the protection, not the data.
+
+## Next minor release, v0.11.0 — group commit is wired into the data node
+
+- **[#752](https://github.com/allamiro/vtop-engine/issues/752)** — group
+  commit is wired into the data node, **off by default**. A leader,
+  candidate or standalone node's `group_commit:` section
+  (`enabled`, `max_delay_ms`, `max_records`, `max_bytes`,
+  `max_pending_requests`) makes concurrent produce requests on a range share
+  one fsync and one replication round; each is still acknowledged only after
+  the group's local fsync, the quorum ack and the commit advance. The window
+  defaults to 0 (natural batching), so a lone request pays nothing. A node
+  logs its settings at INFO when it is on, refuses invalid settings at
+  startup (a window of a second or more, a zero bound, a group the replica
+  plane could not frame in one append, and the section enabled on a follower;
+  a follower accepts a disabled section and logs that it ignores it), and
+  exports `vtop_broker_group_commit_overloaded_total` and
+  `vtop_broker_group_commit_split_groups_total` beside the existing
+  `vtop_broker_group_commit_*` series. Live-chaos scenario 25 kills the leader
+  under four idempotent `acks=all` producers. Nothing changes for a config
+  without the section. The default turns on only after the single- and
+  two-producer A/B shows no regression; until then the gain for the Kafka
+  comparison is unmeasured.
+
 ## v0.1.0 — a range that fails over
 
 Metadata leases, a lease agent on the data node, verified promotion, and the
@@ -1064,7 +1108,7 @@ against the gateway but send gzip, snappy and lz4 uncompressed: librdkafka
 2.8.0 logs "Broker does not support compression type gzip: not compressing
 batch", because its feature check wants protocol versions below the
 gateway's Produce v3 floor. Those batches are stored as sent (live-chaos
-scenario 25). The gateway's unit tests decode gzip and zstd batches the
+scenario 26). The gateway's unit tests decode gzip and zstd batches the
 pinned Java producer wrote (`scripts/gen-kafka-fixtures.sh`).
 
 **Manifest format evolution (#671).** v0.8.0's readers check a
@@ -1252,8 +1296,9 @@ mode_mismatch. The deployment profile is
   mixed fleet still stalls on such a range until it is upgraded.
 - **Objects from failed attempts are locked too,** and under `compliance`
   nobody can remove them before the date: storage cost, said at startup.
-- **`vtopctl tier copy` refuses the block;** locking cold-tier copies is a
-  separate decision.
+- **`vtopctl tier copy` locks cold-tier copies** under the block and reads
+  both retentions back before it proposes the evidence; it used to refuse
+  the block.
 - **Proven against MinIO only** (RELEASE.2025-09-07, the lab's build). AWS S3
   behaviour is taken from its documentation (the integrity header a locked
   write needs, the permissions a HEAD needs to return the lock headers), not
@@ -1430,7 +1475,8 @@ A patch release: no schema, wire format, feature level, config key or one-way st
 ## v0.11.0 and beyond
 
 The theme is **the gateway at the speed its durability allows, and the road
-to 1.0**: wire group commit into the data node's quorum write (#752) and let a
+to 1.0**: turn group commit on by default for the data node's quorum write
+(#752; it is wired and off until the A/B gates hold) and let a
 Kafka client follow a failover through a candidate node (#751); finish the
 format inventory and the tested upgrade and downgrade matrix (#743); and work
 the criteria in #714 that must be met before VTOP is called anything but a
@@ -1451,10 +1497,12 @@ changing one, the deprecation notice and the path to 1.0 are in the
 tested** (#291): CI proves a data directory written by the newest patch of
 each released minor series (v0.2+) opens under the current build, serves
 byte-exactly, and still serves after a restart; newly published tags join that
-matrix automatically. **Downgrades are not supported** — a newer release's
-directory may hold artifacts an older release cannot interpret, and nothing
-tests that path; going back means a fresh directory or a verified backup
-taken before the upgrade.
+matrix automatically. **Downgrades are not supported**, except for what the
+[compatibility matrix](reference/compatibility.md#downgrade) records for the
+previous release (the state ledger, its prune digests and the audit trail): a
+newer release's directory may hold artifacts an older release cannot
+interpret, and nothing else tests that path; going back means a fresh
+directory or a verified backup taken before the upgrade.
 
 Which releases get fixes, what a 0.x minor may break, and what 1.x will
 commit to are in [Versioning and support](SUPPORT.md).
