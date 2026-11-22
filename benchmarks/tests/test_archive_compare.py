@@ -502,6 +502,7 @@ def test_pins_match_products_toml():
     docker = _read(TOOLS["connect-lenses"]["dockerfile"])
     lenses = registry.product(reg, "connect-lenses")
     assert f"FROM {lenses['image']}" in docker
+    assert all("@sha256:" in line for line in docker.splitlines() if line.startswith("FROM "))  # every base by digest
     assert f"--checksum=sha256:{lenses['archive_sha256']}" in docker and lenses["archive_url"] in docker
     assert TOOLS["connect-lenses"]["image_tag"] == f"vtop-connect-lenses:{lenses['version']}"
 
