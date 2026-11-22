@@ -4095,6 +4095,7 @@ name = "vtop-kafka"
 version = "0.10.4"
 dependencies = [
  "async-trait",
+ "rdkafka",
  "sha2 0.11.1",
  "tempfile",
  "thiserror 2.0.21",
