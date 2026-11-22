@@ -606,6 +606,7 @@ mod tests {
             max_egress_bytes_per_second: None,
             max_concurrency_ceiling: None,
             object_lock: None,
+            server_side_encryption: Default::default(),
         }
     }
 
