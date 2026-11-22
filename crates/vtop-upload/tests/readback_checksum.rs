@@ -133,6 +133,78 @@ async fn an_altered_read_back_is_a_failed_verification_not_an_io_error() {
 }
 
 #[tokio::test]
+async fn an_altered_multipart_read_back_is_a_failed_verification_not_an_io_error() {
+    // The SHA-256 arm: S3 returns no whole-object SHA-256 for a multipart
+    // upload (the HEAD here carries none), so the engine hashes the stored body
+    // itself, through the same classifier as the BLAKE3 arm.
+    let uri = "s3://telemetry-raw/x/vtop-src-b0-10-abc.raw";
+    let digest = digest_bytes(ChecksumAlgorithm::Sha256, BODY).unwrap();
+
+    let store = backend(store_serving(b"pXyload").await).await;
+    let result = store
+        .verify_object(
+            uri,
+            BODY.len() as u64,
+            Some(ObjectChecksum::new("sha256", &digest)),
+        )
+        .await
+        .expect(
+            "a body that fails its checksum is a verdict, not an error the engine cannot classify",
+        );
+    assert!(
+        !result.passed,
+        "an altered read-back must not verify: {}",
+        result.message
+    );
+    assert!(
+        result.message.to_ascii_lowercase().contains("checksum"),
+        "the message says why: {}",
+        result.message
+    );
+}
+
+#[tokio::test]
+async fn an_intact_multipart_read_back_still_verifies() {
+    let uri = "s3://telemetry-raw/x/vtop-src-b0-10-abc.raw";
+    let digest = digest_bytes(ChecksumAlgorithm::Sha256, BODY).unwrap();
+
+    let store = backend(store_serving(BODY).await).await;
+    let result = store
+        .verify_object(
+            uri,
+            BODY.len() as u64,
+            Some(ObjectChecksum::new("sha256", &digest)),
+        )
+        .await
+        .unwrap();
+    assert!(result.passed, "{}", result.message);
+    assert!(
+        result.message.contains("read-back"),
+        "the read-back path ran, not the service checksum: {}",
+        result.message
+    );
+}
+
+#[tokio::test]
+async fn a_multipart_read_back_that_drops_mid_body_is_still_an_error() {
+    let uri = "s3://telemetry-raw/x/vtop-src-b0-10-abc.raw";
+    let digest = digest_bytes(ChecksumAlgorithm::Sha256, BODY).unwrap();
+
+    let store = backend(store_serving_with_length(b"pay", BODY.len()).await).await;
+    let outcome = store
+        .verify_object(
+            uri,
+            BODY.len() as u64,
+            Some(ObjectChecksum::new("sha256", &digest)),
+        )
+        .await;
+    assert!(
+        outcome.is_err(),
+        "a truncated read is an error, not a verdict: {outcome:?}"
+    );
+}
+
+#[tokio::test]
 async fn an_intact_read_back_still_verifies() {
     let uri = "s3://telemetry-raw/x/vtop-src-b0-10-abc.raw";
     let digest = digest_bytes(ChecksumAlgorithm::Blake3, BODY).unwrap();
