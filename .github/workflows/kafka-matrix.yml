@@ -12,6 +12,9 @@ name: kafka matrix
 # A leg is one broker and one listener, a "variant":
 #   plain          PLAINTEXT, the whole live suite (every release)
 #   tls            SSL, the whole suite, then the TLS refusal tests
+#   mtls           SSL with a required client certificate (mutual TLS), the
+#                  whole suite presenting one, then the TLS refusal tests and
+#                  the client-certificate refusal tests (oldest and newest)
 #   sasl-ssl       SASL_SSL with SCRAM-SHA-512, the whole suite, then the SASL
 #                  and TLS refusal tests (every release)
 #   sasl-plain     SASL_PLAINTEXT with PLAIN, the same (oldest and newest
@@ -19,9 +22,8 @@ name: kafka matrix
 #   sasl-scram256  SASL_PLAINTEXT with SCRAM-SHA-256, the same (oldest and newest)
 #   sasl-scram512  SASL_PLAINTEXT with SCRAM-SHA-512, the same (oldest and newest)
 # The refusal tests (tests/integration_kafka_auth.rs) present a wrong password,
-# an unknown user, no credentials, no CA and another CA, and need the broker to
-# refuse each. Mutual TLS is not a variant: `sources.kafka` has no client
-# certificate or key setting.
+# an unknown user, no credentials, no CA and another CA, no client certificate
+# and one another CA signed, and need the broker to refuse each.
 #
 # Who runs which legs:
 # - ci.yml calls this workflow on a pull request (and on a push to main) with
@@ -32,11 +34,13 @@ name: kafka matrix
 # - Nightly (03:17 UTC) and on dispatch it runs all of them, over whatever
 #   main holds, so a change outside the PR filter is still tested on every
 #   release and listener within a day.
-# - A pull request that changes this file or the broker script runs all of
-#   them on its own head: the schedule and dispatch run only from main, so
-#   this is the one way a new pin is proven before it merges. ci.yml's `kafka`
-#   filter leaves both files out, so such a pull request does not also run
-#   3.7.2 a second time through the call.
+# - A pull request that changes this file or the broker script runs, on its
+#   own head, every broker's plain variant (the schedule and dispatch run only
+#   from main, so this is the one way a new pin is proven before it merges) and
+#   the oldest and newest Apache release through every listener. The rest of
+#   the listeners wait for the nightly: all of them on every PR was 31 legs, and
+#   the runners are shared. ci.yml's `kafka` filter leaves both files out, so
+#   such a pull request does not also run 3.7.2 a second time through the call.
 #
 # The test binaries are built once and each leg runs them against its own
 # broker, so a leg needs no Rust toolchain and the matrix costs one build. The
@@ -74,7 +78,7 @@ on:
         type: string
         default: ''
       variants:
-        description: 'JSON list of listener variants (plain, tls, sasl-ssl, sasl-plain, sasl-scram256, sasl-scram512); empty runs all of them'
+        description: 'JSON list of listener variants (plain, tls, mtls, sasl-ssl, sasl-plain, sasl-scram256, sasl-scram512); empty runs all of them'
         required: false
         type: string
         default: ''
@@ -102,6 +106,10 @@ jobs:
         env:
           REQUESTED: ${{ inputs.brokers }}
           REQUESTED_VARIANTS: ${{ inputs.variants }}
+          # A pull request that runs this workflow directly, because it changed
+          # the workflow or the broker script (ci.yml's call always names its
+          # brokers): a smaller set than the nightly's, see the header.
+          PR_PROOF: ${{ github.event_name == 'pull_request' && inputs.brokers == '' && inputs.variants == '' }}
           # One line per broker: the name a leg and the docs know it by, the
           # image pinned by digest, and the version `kafka-broker.sh version`
           # must print for it. The Apache lines are the multi-arch index of
@@ -132,6 +140,7 @@ jobs:
           VARIANTS: |
             plain          plain           -              all
             tls            tls             -              all
+            mtls           mtls            -              edge
             sasl-ssl       sasl-ssl        SCRAM-SHA-512  all
             sasl-plain     sasl-plaintext  PLAIN          edge
             sasl-scram256  sasl-plaintext  SCRAM-SHA-256  edge
@@ -172,13 +181,16 @@ jobs:
           pins_json=$(printf '%s\n' "$pinned" | jq -R 'split(" ") | map(select(. != "")) | {id: .[0], image: .[1], reported: .[2]}' | jq -cs .)
           variants_json=$(printf '%s\n' "$variants" | jq -R 'split(" ") | map(select(. != "")) | {name: .[0], mode: .[1], mechanism: .[2], scope: .[3]}' | jq -cs .)
           include=$(jq -cn --argjson pins "$pins_json" --argjson variants "$variants_json" \
-            --argjson wantb "$want_brokers" --argjson wantv "$want_variants" '
+            --argjson wantb "$want_brokers" --argjson wantv "$want_variants" \
+            --argjson pr "${PR_PROOF:-false}" '
             ($pins | map(select(.id | startswith("redpanda") | not))) as $apache
             | [ $pins[] | select(.id as $i | $wantb | index($i)) | . as $p
                 | ($p.id | startswith("redpanda")) as $redpanda
+                | ($p.id == $apache[0].id or $p.id == $apache[-1].id) as $edge
                 | $variants[] | select(.name as $n | $wantv | index($n))
                 | select(if $redpanda then .name == "plain"
-                         else (.scope == "all" or $p.id == $apache[0].id or $p.id == $apache[-1].id) end)
+                         elif $pr then (.name == "plain" or $edge)
+                         else (.scope == "all" or $edge) end)
                 | {kafka: $p.id, image: $p.image, reported: $p.reported,
                    variant: .name, mode: .mode, mechanism: .mechanism,
                    suite: (if $redpanda then "smoke" else "full" end)} ]')
@@ -340,10 +352,12 @@ jobs:
             exit 1
           fi
       # The other half of an authenticated leg: the broker must refuse a wrong
-      # password, an unknown user, a client with no credentials, no CA and
-      # another CA. `sasl_` tests need a SASL listener and `tls_` tests a TLS
-      # one; a listener that has both runs both. Each prefix's count is
-      # checked against the binary's own list.
+      # password, an unknown user, a client with no credentials, no CA,
+      # another CA, no client certificate and one another CA signed. `sasl_`
+      # tests need a SASL listener, `tls_` tests a TLS one and `client_cert_`
+      # tests one that requires a client certificate; a listener runs every
+      # prefix it has. Each prefix's count is checked against the binary's
+      # own list.
       - name: Run the refusal tests
         if: matrix.mode != 'plain'
         env:
@@ -353,7 +367,8 @@ jobs:
           chmod +x dist/integration_kafka_auth
           prefixes=""
           case "$MODE" in sasl-*) prefixes="$prefixes sasl_" ;; esac
-          case "$MODE" in tls | sasl-ssl) prefixes="$prefixes tls_" ;; esac
+          case "$MODE" in tls | mtls | sasl-ssl) prefixes="$prefixes tls_" ;; esac
+          case "$MODE" in mtls) prefixes="$prefixes client_cert_" ;; esac
           for prefix in $prefixes; do
             expected=$(dist/integration_kafka_auth --ignored --list "$prefix" | grep -c ': test$' || true)
             if [ "$expected" -eq 0 ]; then

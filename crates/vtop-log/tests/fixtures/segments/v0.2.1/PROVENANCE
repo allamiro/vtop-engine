@@ -1,0 +1,17 @@
+# Written by scripts/compat/regenerate-segment-fixtures.sh v0.2.1 aarch64-unknown-linux-gnu.
+tag: v0.2.1
+asset: vtop-engine-0.2.1-aarch64-unknown-linux-gnu.tar.gz
+asset_sha256: f869a1604aeb22966a99c063fc45333854ecb60f507b30ae855ce5281a6892ff
+binary: vtop-node
+command: >-
+  scripts/upgrade-compat.sh with UPGRADE_STOP_AFTER_OLD=1 and UPGRADE_RECORDS=300,
+  once per profile (legacy): a leader and a follower of the
+  release, vtop-node produce --records 300 --batch 64 --durability quorum,
+  both stopped with SIGKILL; the leader's data directory
+input: >-
+  300 synthetic records of vtop-node produce, in topic upgrade.v1
+files:
+  legacy/epochs: e47dcf810b996ad74c72b270d9db5b519a08ab5ade5087237050d36536611e9f
+  legacy/fencing-epochs: ba3334576e4d86d2f82559c081d1915c8fa7cdd0ddf3ea7827b3aa8e6f57b04d
+  legacy/range-00000000000000000000.active: cee36de0013d3da79bbac9b6c1eb512ba0229a7561bb413638775b4024ac4977
+  legacy/range-00000000000000000000.commit: b971c3c345c436786ab5ef36862ef7549654cc35b2616db66b8480982e5e8e1d

@@ -26,6 +26,7 @@
 
 use std::io::Write;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use vtop_s3_testkit::{Capability, LiveS3, S3Settings};
 use vtop_upload::s3_native::{S3NativeBackend, S3NativeConfig};
 use vtop_upload::{
     upload_resumable, BucketFeature, LockPart, MultipartFence, MultipartUploadConfig,
@@ -35,25 +36,29 @@ use vtop_upload::{
 
 const MIB: usize = 1024 * 1024;
 
-fn endpoint() -> String {
-    std::env::var("VTOP_TEST_S3_ENDPOINT")
-        .expect("VTOP_TEST_S3_ENDPOINT must name the live endpoint")
+/// How to reach the store, from `VTOP_TEST_S3_*` (#722), read once.
+fn settings() -> S3Settings {
+    static SETTINGS: std::sync::OnceLock<S3Settings> = std::sync::OnceLock::new();
+    SETTINGS
+        .get_or_init(|| LiveS3::from_env().settings.clone())
+        .clone()
 }
 
 fn locked_bucket() -> String {
-    std::env::var("VTOP_TEST_S3_LOCKED_BUCKET").unwrap_or_else(|_| "telemetry-locked".into())
+    settings().locked_bucket
 }
 
 fn plain_bucket() -> String {
-    std::env::var("VTOP_TEST_S3_BUCKET").unwrap_or_else(|_| "telemetry-raw".into())
+    settings().bucket
 }
 
 async fn backend(lock: Option<ObjectLockPolicy>) -> S3NativeBackend {
+    let s = settings();
     S3NativeBackend::new(&S3NativeConfig {
-        region: "us-east-1".into(),
-        endpoint_url: Some(endpoint()),
-        force_path_style: true,
-        verify_tls: false,
+        region: s.region,
+        endpoint_url: s.endpoint,
+        force_path_style: s.force_path_style,
+        verify_tls: s.verify_tls,
         transport: "tcp_tls".into(),
         tuning: Default::default(),
         max_egress_bytes_per_second: None,
@@ -69,14 +74,16 @@ async fn backend(lock: Option<ObjectLockPolicy>) -> S3NativeBackend {
 /// A client straight to the store, for what the backend has no call for:
 /// deleting one version, a legal hold, listing versions.
 async fn s3_client() -> aws_sdk_s3::Client {
-    let shared = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(aws_config::Region::new("us-east-1"))
-        .endpoint_url(endpoint())
-        .load()
-        .await;
+    let s = settings();
+    let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(aws_config::Region::new(s.region));
+    if let Some(endpoint) = s.endpoint {
+        loader = loader.endpoint_url(endpoint);
+    }
+    let shared = loader.load().await;
     aws_sdk_s3::Client::from_conf(
         aws_sdk_s3::config::Builder::from(&shared)
-            .force_path_style(true)
+            .force_path_style(s.force_path_style)
             .build(),
     )
 }
@@ -153,226 +160,271 @@ async fn clean_up(client: &aws_sdk_s3::Client, bucket: &str, prefix: &str) {
 #[tokio::test]
 #[ignore = "requires an S3-compatible endpoint with Object Lock"]
 async fn live_the_preflight_tells_a_locked_bucket_from_a_plain_one() {
-    let backend = backend(None).await;
-    assert_eq!(
-        backend.bucket_object_lock(&locked_bucket()).await.unwrap(),
-        BucketFeature::Enabled,
-        "{} was created with Object Lock",
-        locked_bucket()
-    );
-    assert_eq!(
-        backend.bucket_object_lock(&plain_bucket()).await.unwrap(),
-        BucketFeature::NotEnabled,
-        "{} was created without Object Lock: the store's answer is a definite no",
-        plain_bucket()
-    );
+    let live = LiveS3::from_env();
+    live.case(
+        "object_lock.the_preflight_tells_locked_from_plain",
+        &[Capability::ObjectLock],
+        || async {
+            let backend = backend(None).await;
+            assert_eq!(
+                backend.bucket_object_lock(&locked_bucket()).await.unwrap(),
+                BucketFeature::Enabled,
+                "{} was created with Object Lock",
+                locked_bucket()
+            );
+            assert_eq!(
+                backend.bucket_object_lock(&plain_bucket()).await.unwrap(),
+                BucketFeature::NotEnabled,
+                "{} was created without Object Lock: the store's answer is a definite no",
+                plain_bucket()
+            );
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
 #[ignore = "requires an S3-compatible endpoint with Object Lock"]
 async fn live_every_write_path_lands_under_the_lock_it_asked_for() {
-    let bucket = locked_bucket();
-    let prefix = unique("writes");
-    let client = s3_client().await;
-    let retain = Duration::from_secs(4);
-    for (mode, legal_hold) in [
-        (ObjectLockMode::Governance, false),
-        (ObjectLockMode::Compliance, false),
-        (ObjectLockMode::Governance, true),
-    ] {
-        let locked = backend(Some(ObjectLockPolicy::with_retention_for_tests(
-            mode, retain, legal_hold,
-        )))
-        .await;
-        let body = b"locked bytes";
-        let f = file(body);
-        let sha = vtop_core::checksum::sha256_bytes(body);
-        let b3 = vtop_core::checksum::blake3_bytes(body);
-        let tag = format!("{mode}-{legal_hold}");
-        let writes = [
-            (
-                "sha256 object",
-                locked
-                    .put_object(
-                        f.path(),
-                        &format!("s3://{bucket}/{prefix}/{tag}/sha.raw"),
-                        Some(ObjectChecksum::new("sha256", &sha)),
-                    )
-                    .await
-                    .map(|s| (s.version_id, s.retention, "sha.raw")),
-            ),
-            (
-                "blake3 object",
-                locked
-                    .put_object(
-                        f.path(),
-                        &format!("s3://{bucket}/{prefix}/{tag}/b3.raw"),
-                        Some(ObjectChecksum::new("blake3", &b3)),
-                    )
-                    .await
-                    .map(|s| (s.version_id, s.retention, "b3.raw")),
-            ),
-            (
-                "manifest",
-                locked
-                    .put_manifest(
-                        f.path(),
-                        &format!("s3://{bucket}/{prefix}/{tag}/m.json"),
-                        Some(ObjectChecksum::new("sha256", &sha)),
-                    )
-                    .await
-                    .map(|s| (s.version_id, s.retention, "m.json")),
-            ),
-        ];
-        for (what, written) in writes {
-            let (version, asked, name) = written
-                .unwrap_or_else(|e| panic!("[{tag}] the store accepts a locked {what}: {e}"));
-            let asked = asked.unwrap_or_else(|| panic!("[{tag}] {what}: the lock asked for"));
-            let uri = format!("s3://{bucket}/{prefix}/{tag}/{name}");
-            let found = locked
-                .verify_retention(&uri, version.as_deref(), &asked.expectation())
-                .await
-                .unwrap();
-            assert_eq!(
-                found,
-                RetentionCheck::Ok {
-                    retain_until_unix_secs: asked.retain_until_unix_secs
-                },
-                "[{tag}] {what}: the store keeps exactly the date asked for"
-            );
-        }
-    }
-    tokio::time::sleep(retain + Duration::from_secs(2)).await;
-    clean_up(&client, &bucket, &prefix).await;
+    let live = LiveS3::from_env();
+    live.case(
+        "object_lock.every_write_path_lands_locked",
+        &[Capability::ObjectLock, Capability::Versioning],
+        || async {
+            let bucket = locked_bucket();
+            let prefix = unique("writes");
+            let client = s3_client().await;
+            let retain = Duration::from_secs(4);
+            for (mode, legal_hold) in [
+                (ObjectLockMode::Governance, false),
+                (ObjectLockMode::Compliance, false),
+                (ObjectLockMode::Governance, true),
+            ] {
+                let locked = backend(Some(ObjectLockPolicy::with_retention_for_tests(
+                    mode, retain, legal_hold,
+                )))
+                .await;
+                let body = b"locked bytes";
+                let f = file(body);
+                let sha = vtop_core::checksum::sha256_bytes(body);
+                let b3 = vtop_core::checksum::blake3_bytes(body);
+                let tag = format!("{mode}-{legal_hold}");
+                let writes = [
+                    (
+                        "sha256 object",
+                        locked
+                            .put_object(
+                                f.path(),
+                                &format!("s3://{bucket}/{prefix}/{tag}/sha.raw"),
+                                Some(ObjectChecksum::new("sha256", &sha)),
+                            )
+                            .await
+                            .map(|s| (s.version_id, s.retention, "sha.raw")),
+                    ),
+                    (
+                        "blake3 object",
+                        locked
+                            .put_object(
+                                f.path(),
+                                &format!("s3://{bucket}/{prefix}/{tag}/b3.raw"),
+                                Some(ObjectChecksum::new("blake3", &b3)),
+                            )
+                            .await
+                            .map(|s| (s.version_id, s.retention, "b3.raw")),
+                    ),
+                    (
+                        "manifest",
+                        locked
+                            .put_manifest(
+                                f.path(),
+                                &format!("s3://{bucket}/{prefix}/{tag}/m.json"),
+                                Some(ObjectChecksum::new("sha256", &sha)),
+                            )
+                            .await
+                            .map(|s| (s.version_id, s.retention, "m.json")),
+                    ),
+                ];
+                for (what, written) in writes {
+                    let (version, asked, name) = written.unwrap_or_else(|e| {
+                        panic!("[{tag}] the store accepts a locked {what}: {e}")
+                    });
+                    let asked =
+                        asked.unwrap_or_else(|| panic!("[{tag}] {what}: the lock asked for"));
+                    let uri = format!("s3://{bucket}/{prefix}/{tag}/{name}");
+                    let found = locked
+                        .verify_retention(&uri, version.as_deref(), &asked.expectation())
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        found,
+                        RetentionCheck::Ok {
+                            retain_until_unix_secs: asked.retain_until_unix_secs
+                        },
+                        "[{tag}] {what}: the store keeps exactly the date asked for"
+                    );
+                }
+            }
+            tokio::time::sleep(retain + Duration::from_secs(2)).await;
+            clean_up(&client, &bucket, &prefix).await;
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
 #[ignore = "requires an S3-compatible endpoint with Object Lock"]
 async fn live_a_locked_version_survives_delete_and_overwrite_and_reports_elapsed_after() {
-    let bucket = locked_bucket();
-    let prefix = unique("worm");
-    let key = format!("{prefix}/obj.raw");
-    let uri = format!("s3://{bucket}/{key}");
-    let client = s3_client().await;
-    let retain = Duration::from_secs(4);
-    let locked = backend(Some(ObjectLockPolicy::with_retention_for_tests(
-        ObjectLockMode::Governance,
-        retain,
-        false,
-    )))
-    .await;
-    let original = b"the archived bytes";
-    let f = file(original);
-    let sha = vtop_core::checksum::sha256_bytes(original);
-    let stored = locked
-        .put_object(f.path(), &uri, Some(ObjectChecksum::new("sha256", &sha)))
-        .await
-        .unwrap();
-    let version = stored
-        .version_id
-        .clone()
-        .expect("a locked bucket versions every write");
-    let asked = stored.retention.unwrap();
+    let live = LiveS3::from_env();
+    live.case(
+        "object_lock.a_locked_version_survives_delete_and_overwrite",
+        &[
+            Capability::Versioning,
+            Capability::ObjectLock,
+            Capability::ObjectLockEnforced,
+        ],
+        || async {
+            let bucket = locked_bucket();
+            let prefix = unique("worm");
+            let key = format!("{prefix}/obj.raw");
+            let uri = format!("s3://{bucket}/{key}");
+            let client = s3_client().await;
+            let retain = Duration::from_secs(4);
+            let locked = backend(Some(ObjectLockPolicy::with_retention_for_tests(
+                ObjectLockMode::Governance,
+                retain,
+                false,
+            )))
+            .await;
+            let original = b"the archived bytes";
+            let f = file(original);
+            let sha = vtop_core::checksum::sha256_bytes(original);
+            let stored = locked
+                .put_object(f.path(), &uri, Some(ObjectChecksum::new("sha256", &sha)))
+                .await
+                .unwrap();
+            let version = stored
+                .version_id
+                .clone()
+                .expect("a locked bucket versions every write");
+            let asked = stored.retention.unwrap();
 
-    // Delete the version, as a caller that does not bypass governance.
-    let refused = client
-        .delete_object()
-        .bucket(&bucket)
-        .key(&key)
-        .version_id(&version)
-        .send()
-        .await;
-    assert!(
-        refused.is_err(),
-        "a version under retention cannot be deleted"
-    );
+            // Delete the version, as a caller that does not bypass governance.
+            let refused = client
+                .delete_object()
+                .bucket(&bucket)
+                .key(&key)
+                .version_id(&version)
+                .send()
+                .await;
+            assert!(
+                refused.is_err(),
+                "a version under retention cannot be deleted"
+            );
 
-    // Overwrite the key: a new version; the locked one is intact.
-    let other = file(b"other bytes, same size");
-    locked.put_object(other.path(), &uri, None).await.unwrap();
-    // A plain delete: only a delete marker.
-    locked.delete_object(&uri).await.unwrap();
-    let pinned = locked
-        .get_object_pinned(&uri, &version, 1024)
-        .await
-        .unwrap();
-    assert_eq!(
-        pinned, original,
-        "the locked version still holds the archived bytes"
-    );
-    assert!(locked
-        .verify_retention(&uri, Some(&version), &asked.expectation())
-        .await
-        .unwrap()
-        .passed());
+            // Overwrite the key: a new version; the locked one is intact.
+            let other = file(b"other bytes, same size");
+            locked.put_object(other.path(), &uri, None).await.unwrap();
+            // A plain delete: only a delete marker.
+            locked.delete_object(&uri).await.unwrap();
+            let pinned = locked
+                .get_object_pinned(&uri, &version, 1024)
+                .await
+                .unwrap();
+            assert_eq!(
+                pinned, original,
+                "the locked version still holds the archived bytes"
+            );
+            assert!(locked
+                .verify_retention(&uri, Some(&version), &asked.expectation())
+                .await
+                .unwrap()
+                .passed());
 
-    // Once it ends, the store still reports the mode and the past date.
-    tokio::time::sleep(retain + Duration::from_secs(2)).await;
-    let now = RetentionExpectation {
-        mode: ObjectLockMode::Governance,
-        retain_until_at_least_unix_secs: unix_now(),
-        legal_hold: false,
-    };
-    assert_eq!(
-        locked
-            .verify_retention(&uri, Some(&version), &now)
-            .await
-            .unwrap(),
-        RetentionCheck::TooShort {
-            retain_until_unix_secs: asked.retain_until_unix_secs
+            // Once it ends, the store still reports the mode and the past date.
+            tokio::time::sleep(retain + Duration::from_secs(2)).await;
+            let now = RetentionExpectation {
+                mode: ObjectLockMode::Governance,
+                retain_until_at_least_unix_secs: unix_now(),
+                legal_hold: false,
+            };
+            assert_eq!(
+                locked
+                    .verify_retention(&uri, Some(&version), &now)
+                    .await
+                    .unwrap(),
+                RetentionCheck::TooShort {
+                    retain_until_unix_secs: asked.retain_until_unix_secs
+                },
+                "an ended retention reads as ended (scrub: elapsed), not as missing"
+            );
+            clean_up(&client, &bucket, &prefix).await;
         },
-        "an ended retention reads as ended (scrub: elapsed), not as missing"
-    );
-    clean_up(&client, &bucket, &prefix).await;
+    )
+    .await;
 }
 
 #[tokio::test]
 #[ignore = "requires an S3-compatible endpoint with Object Lock"]
 async fn live_a_multipart_object_carries_the_lock_its_create_asked_for() {
-    let bucket = locked_bucket();
-    let prefix = unique("multipart");
-    let uri = format!("s3://{bucket}/{prefix}/big.raw");
-    let client = s3_client().await;
-    let retain = Duration::from_secs(4);
-    let locked = backend(Some(ObjectLockPolicy::with_retention_for_tests(
-        ObjectLockMode::Governance,
-        retain,
-        false,
-    )))
-    .await;
-    let data: Vec<u8> = (0..11 * MIB).map(|i| (i % 253) as u8).collect();
-    let f = file(&data);
-    let digest = vtop_core::checksum::sha256_bytes(&data);
-    let state = tempfile::tempdir().unwrap();
-    let upload: vtop_core::config::UploadConfig = serde_json::from_str(
-        r#"{"bucket":"b","multipart_part_size_bytes":5242880,"multipart_threshold_bytes":5242880}"#,
-    )
-    .unwrap();
-    let cfg = MultipartUploadConfig::from_upload(&upload, state.path().to_path_buf());
-    let stored = upload_resumable(
-        &locked,
-        &cfg,
-        f.path(),
-        &uri,
-        Some(ObjectChecksum::new("sha256", &digest)),
-        MultipartFence {
-            expected_segment_generation: 0,
-            fencing_epoch: 0,
-            content_digest_hex: digest.clone(),
-            content_digest_algorithm: "sha256".into(),
-            byte_length: data.len() as u64,
+    let live = LiveS3::from_env();
+    live.case(
+        "object_lock.a_multipart_object_carries_its_lock",
+        &[
+            Capability::Multipart,
+            Capability::Versioning,
+            Capability::ObjectLock,
+        ],
+        || async {
+            let bucket = locked_bucket();
+            let prefix = unique("multipart");
+            let uri = format!("s3://{bucket}/{prefix}/big.raw");
+            let client = s3_client().await;
+            let retain = Duration::from_secs(4);
+            let locked = backend(Some(ObjectLockPolicy::with_retention_for_tests(
+                ObjectLockMode::Governance,
+                retain,
+                false,
+            )))
+            .await;
+            let data: Vec<u8> = (0..11 * MIB).map(|i| (i % 253) as u8).collect();
+            let f = file(&data);
+            let digest = vtop_core::checksum::sha256_bytes(&data);
+            let state = tempfile::tempdir().unwrap();
+            let upload: vtop_core::config::UploadConfig =
+                serde_json::from_value(serde_json::json!({
+                    "bucket": "b",
+                    "multipart_part_size_bytes": 5 * MIB,
+                    "multipart_threshold_bytes": 5 * MIB,
+                }))
+                .unwrap();
+            let cfg = MultipartUploadConfig::from_upload(&upload, state.path().to_path_buf());
+            let stored = upload_resumable(
+                &locked,
+                &cfg,
+                f.path(),
+                &uri,
+                Some(ObjectChecksum::new("sha256", &digest)),
+                MultipartFence {
+                    expected_segment_generation: 0,
+                    fencing_epoch: 0,
+                    content_digest_hex: digest.clone(),
+                    content_digest_algorithm: "sha256".into(),
+                    byte_length: data.len() as u64,
+                },
+            )
+            .await
+            .expect("the store accepts a locked multipart upload");
+            let asked = stored.retention.expect("the create asked for the lock");
+            assert!(locked
+                .verify_retention(&uri, stored.version_id.as_deref(), &asked.expectation())
+                .await
+                .unwrap()
+                .passed());
+            tokio::time::sleep(retain + Duration::from_secs(2)).await;
+            clean_up(&client, &bucket, &prefix).await;
         },
     )
-    .await
-    .expect("the store accepts a locked multipart upload");
-    let asked = stored.retention.expect("the create asked for the lock");
-    assert!(locked
-        .verify_retention(&uri, stored.version_id.as_deref(), &asked.expectation())
-        .await
-        .unwrap()
-        .passed());
-    tokio::time::sleep(retain + Duration::from_secs(2)).await;
-    clean_up(&client, &bucket, &prefix).await;
+    .await;
 }
 
 /// Review of #757 (#709): against a real store, `confirm_lock_absent` says a
@@ -381,55 +433,63 @@ async fn live_a_multipart_object_carries_the_lock_its_create_asked_for() {
 #[tokio::test]
 #[ignore = "requires an S3-compatible endpoint with Object Lock"]
 async fn live_an_absent_lock_is_confirmed_and_a_present_one_is_not() {
-    let bucket = locked_bucket();
-    let prefix = unique("confirm");
-    let client = s3_client().await;
-    let plain = backend(None).await;
-    let unlocked_uri = format!("s3://{bucket}/{prefix}/unlocked.raw");
-    let f = file(b"written without a lock");
-    let unlocked = plain
-        .put_object(f.path(), &unlocked_uri, None)
-        .await
-        .unwrap();
-    for part in [LockPart::Retention, LockPart::LegalHold] {
-        assert!(
-            plain
-                .confirm_lock_absent(&unlocked_uri, unlocked.version_id.as_deref(), part)
+    let live = LiveS3::from_env();
+    live.case(
+        "object_lock.an_absent_lock_is_confirmed_and_a_present_one_is_not",
+        &[Capability::ObjectLock],
+        || async {
+            let bucket = locked_bucket();
+            let prefix = unique("confirm");
+            let client = s3_client().await;
+            let plain = backend(None).await;
+            let unlocked_uri = format!("s3://{bucket}/{prefix}/unlocked.raw");
+            let f = file(b"written without a lock");
+            let unlocked = plain
+                .put_object(f.path(), &unlocked_uri, None)
                 .await
-                .unwrap_or_else(|e| panic!("{part:?} of an unlocked version: {e}")),
-            "{part:?}: an unlocked version has none"
-        );
-    }
+                .unwrap();
+            for part in [LockPart::Retention, LockPart::LegalHold] {
+                assert!(
+                    plain
+                        .confirm_lock_absent(&unlocked_uri, unlocked.version_id.as_deref(), part)
+                        .await
+                        .unwrap_or_else(|e| panic!("{part:?} of an unlocked version: {e}")),
+                    "{part:?}: an unlocked version has none"
+                );
+            }
 
-    let retain = Duration::from_secs(4);
-    let locked = backend(Some(ObjectLockPolicy::with_retention_for_tests(
-        ObjectLockMode::Governance,
-        retain,
-        true,
-    )))
+            let retain = Duration::from_secs(4);
+            let locked = backend(Some(ObjectLockPolicy::with_retention_for_tests(
+                ObjectLockMode::Governance,
+                retain,
+                true,
+            )))
+            .await;
+            let locked_uri = format!("s3://{bucket}/{prefix}/locked.raw");
+            let bytes = b"written under a lock and a hold";
+            let f = file(bytes);
+            let sha = vtop_core::checksum::sha256_bytes(bytes);
+            let stored = locked
+                .put_object(
+                    f.path(),
+                    &locked_uri,
+                    Some(ObjectChecksum::new("sha256", &sha)),
+                )
+                .await
+                .unwrap();
+            for part in [LockPart::Retention, LockPart::LegalHold] {
+                assert!(
+                    !locked
+                        .confirm_lock_absent(&locked_uri, stored.version_id.as_deref(), part)
+                        .await
+                        .unwrap_or_else(|e| panic!("{part:?} of a locked version: {e}")),
+                    "{part:?}: a locked, held version has it"
+                );
+            }
+
+            tokio::time::sleep(retain + Duration::from_secs(2)).await;
+            clean_up(&client, &bucket, &prefix).await;
+        },
+    )
     .await;
-    let locked_uri = format!("s3://{bucket}/{prefix}/locked.raw");
-    let bytes = b"written under a lock and a hold";
-    let f = file(bytes);
-    let sha = vtop_core::checksum::sha256_bytes(bytes);
-    let stored = locked
-        .put_object(
-            f.path(),
-            &locked_uri,
-            Some(ObjectChecksum::new("sha256", &sha)),
-        )
-        .await
-        .unwrap();
-    for part in [LockPart::Retention, LockPart::LegalHold] {
-        assert!(
-            !locked
-                .confirm_lock_absent(&locked_uri, stored.version_id.as_deref(), part)
-                .await
-                .unwrap_or_else(|e| panic!("{part:?} of a locked version: {e}")),
-            "{part:?}: a locked, held version has it"
-        );
-    }
-
-    tokio::time::sleep(retain + Duration::from_secs(2)).await;
-    clean_up(&client, &bucket, &prefix).await;
 }

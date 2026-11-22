@@ -309,6 +309,8 @@ await_pod_running() { # <namespace> <pod> <seconds> [old-uid] — a NEW pod, Run
 mkdir -p "$CERTS"
 mkcert() { # cn san out
   openssl ecparam -name prime256v1 -genkey -noout -out "$CERTS/$3-key.pem" 2>/dev/null
+  # Owner-only: vtop-node refuses a key other users can read (#732).
+  chmod 600 "$CERTS/$3-key.pem"
   openssl req -new -key "$CERTS/$3-key.pem" -subj "/CN=$1" -out "$CERTS/$3.csr" 2>/dev/null
   printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth,clientAuth\nsubjectAltName=DNS:%s\n' "$2" > "$CERTS/$3.ext"
   openssl x509 -req -in "$CERTS/$3.csr" -CA "$CERTS/ca.pem" -CAkey "$CERTS/ca-key.pem" \

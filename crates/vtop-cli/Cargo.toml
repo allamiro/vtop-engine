@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
 description = "VTOP Engine runtime and the `vtopctl` command-line interface."
 
 [lib]
@@ -49,7 +50,6 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-anyhow = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
 uuid = { workspace = true }
@@ -60,6 +60,11 @@ bytes = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The multipart part type a test store passes through.
+bytes = { workspace = true }
+# The surface snapshot (#719): the vtopctl command tree and the engine's
+# metric families, against docs/surface/.
+vtop-surface = { workspace = true, features = ["clap"] }
 # The in-memory span exporter the trace tests assert against (#683).
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
@@ -71,6 +76,8 @@ aws-sdk-s3 = { workspace = true }
 # `PgStateStore::execute_raw` resets the Postgres ledger between the recovery
 # tests that run on one when VTOP_TEST_POSTGRES is set (#664).
 vtop-state = { workspace = true, features = ["test-support"] }
+# Which S3 server a live test runs against, and what it expects of it (#722).
+vtop-s3-testkit = { workspace = true }
 # ledger_v0_9_0 re-roots the paths in a ledger the released v0.9.0 wrote
 # (#626), with SQL, before this build opens it.
 sqlx = { workspace = true }

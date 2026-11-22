@@ -1207,6 +1207,19 @@ impl Consensus for OpenraftConsensus {
         // later raise is attributed like any audited command, and must be
         // judged on the members exactly as a bare one is.
         if let MetadataCommand::SetFeatureLevel { feature_level, .. } = command.subject() {
+            // A level above this build's is never proposed (#743). In the
+            // log it would be applied by this leader as a refusal to
+            // continue: the entry would stop this node's own Raft engine,
+            // and every voter on this release with it.
+            if *feature_level > crate::command::SUPPORTED_FEATURE_LEVEL {
+                return Err(ConsensusError::Refused(format!(
+                    "feature level {feature_level} is above the highest level this node \
+                     supports ({}); nothing was proposed and the log is unchanged. Run \
+                     the metadata tier on a release that supports level {feature_level}, \
+                     then raise it",
+                    crate::command::SUPPORTED_FEATURE_LEVEL
+                )));
+            }
             self.judge_members_for(*feature_level).await?;
         }
         // The feature gate (#554), judged before the command is replicated.

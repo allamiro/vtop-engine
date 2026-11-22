@@ -80,6 +80,8 @@ jobs:
             rust:
               - 'crates/**'
               - 'tests/**'
+              # Read by the surface snapshot tests (#719).
+              - 'docs/surface/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'deny.toml'
@@ -123,7 +125,10 @@ jobs:
               - 'crates/vtop-observe/**'
               - 'crates/vtop-protocol/**'
               - 'crates/vtop-state/**'
+              - 'crates/vtop-surface/**'
               - 'crates/vtop-upload/**'
+              # A dev-dependency of vtop-cli's tests (#722).
+              - 'crates/vtop-s3-testkit/**'
               - 'tests/**'
               # Executed by the job's seeding step, and its output is what the
               # test asserts on.
@@ -151,7 +156,10 @@ jobs:
               - 'crates/vtop-observe/**'
               - 'crates/vtop-protocol/**'
               - 'crates/vtop-state/**'
+              - 'crates/vtop-surface/**'
               - 'crates/vtop-upload/**'
+              - 'crates/vtop-s3-testkit/**'
+              - 'tests/s3-compat/**'
               - 'docker/minio/**'
               - 'docker-compose.yml'
               - 'Cargo.toml'
@@ -174,6 +182,7 @@ jobs:
             postgres:
               - 'crates/vtop-state/**'
               - 'crates/vtop-core/**'
+              - 'crates/vtop-surface/**'
               - 'crates/vtop-cli/Cargo.toml'
               - 'crates/vtop-cli/tests/postgres_migrate_restore.rs'
               - 'tests/integration_state_recovery.rs'
@@ -200,6 +209,7 @@ jobs:
               - 'crates/vtop-observe/**'
               - 'crates/vtop-protocol/**'
               - 'crates/vtop-state/**'
+              - 'crates/vtop-surface/**'
               - 'crates/vtop-upload/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
@@ -235,6 +245,12 @@ jobs:
             # and the output itself (a hand edit to a generated file is drift).
             benchmark_charts:
               - 'benchmarks/kafka_compare/**'
+              # The cross-product comparisons (#744): shared code, every
+              # <kind>_compare package and its committed runs, and their tests.
+              - 'benchmarks/compare_common/**'
+              - 'benchmarks/*_compare/**'
+              - 'benchmarks/tests/test_compare_*.py'
+              - 'benchmarks/tests/test_*_compare.py'
               - 'docs/benchmarks/**'
               # The README's evidence charts: their generator and test, the
               # measurements they are drawn from, the output, and the README
@@ -290,6 +306,7 @@ jobs:
               # (#743); scripts/tests/fetch-release.bats proves each check
               # can fail.
               - 'scripts/compat/*.sh'
+              - 'scripts/compat/cells/*.sh'
               - 'scripts/ledger-compat.sh'
               - 'scripts/restore-drill.sh'
               # The live-chaos harness is executable shell that gates every
@@ -326,6 +343,7 @@ jobs:
               # The check that no shipped build carries the failpoints
               # feature (#725), listed here and in the shellcheck step.
               - 'scripts/check-failpoints-absent.sh'
+              - 'scripts/update-surface-snapshots.sh'
               - 'scripts/tests/**'
               # The test-progress runner: developer tooling, but shell that people
               # will paste and rely on, so it is linted like the rest — listed here
@@ -398,6 +416,7 @@ jobs:
             file_source:
               - 'crates/vtop-adapters/**'
               - 'crates/vtop-core/**'
+              - 'crates/vtop-surface/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '.cargo/**'
@@ -514,6 +533,39 @@ jobs:
             docker run --rm --entrypoint "$binary" vtop-engine:ci --version \
               || { echo "::error::$binary is missing from the image or will not run"; exit 1; }
           done
+
+      # The image's vtopctl opens a PostgreSQL state store (D6 of the component
+      # status page): a PostgreSQL ledger needs no source build. A build
+      # without the `postgres` feature refuses a postgres:// URL by name
+      # ("configuration error: ... lacks the `postgres` feature"), before it
+      # dials anything; this one gets as far as the state store, dialing a
+      # port nothing listens on.
+      - name: The image's vtopctl opens a PostgreSQL state store
+        run: |
+          set -euo pipefail
+          config="$RUNNER_TEMP/pg-config.yaml"
+          sed 's|^  state_store: "sqlite:///data/state/vtop-state.db"$|  state_store: { env: VTOP_STATE_STORE }|' \
+            examples/config.yaml > "$config"
+          grep -q '^  state_store: { env: VTOP_STATE_STORE }$' "$config" \
+            || { echo "::error::examples/config.yaml no longer has the state_store line this check replaces"; exit 1; }
+          chmod 644 "$config"
+          if out=$(docker run --rm -v "$config:/tmp/pg-config.yaml:ro" \
+              -e VTOP_STATE_STORE='postgresql://vtop:unused@127.0.0.1:1/vtop?sslmode=verify-full' \
+              --entrypoint vtopctl vtop-engine:ci migrate --config /tmp/pg-config.yaml 2>&1); then
+            echo "$out"
+            echo "::error::vtopctl migrate succeeded against a port nothing listens on"
+            exit 1
+          fi
+          echo "$out"
+          if grep -q -e 'lacks the .postgres. feature' -e 'requires a build with --features postgres' <<<"$out"; then
+            echo "::error::the image's vtopctl is built without the postgres feature"
+            exit 1
+          fi
+          # Seen locally: "state store error: pool timed out while waiting
+          # for an open connection", after the pool's 30 s connect timeout.
+          grep -q 'state store error' <<<"$out" \
+            || { echo "::error::vtopctl migrate failed before dialing PostgreSQL"; exit 1; }
+          echo "the image's vtopctl dials a PostgreSQL state store"
 
       # The TOOLS, not only the binaries. `vtop-node` itself went missing from
       # this image and shipped in a release (#281) because nothing asserted its
@@ -744,6 +796,49 @@ jobs:
           echo "rendered $manifests manifests"
           test "$manifests" -ge 5
 
+      # Admin authorization is on by default (#732, M2). Asserted on the
+      # rendered configs and the install notes, not the exit code: a chart
+      # that dropped the policy would render as cleanly as one that kept it.
+      - name: Admin authorization is on by default, and the opt-out is said
+        run: |
+          set -euo pipefail
+          for values in default-values.yaml separated-values.yaml replicated-values.yaml; do
+            helm template vtop helm/vtop -f "helm/vtop/ci/$values" > /tmp/authz.yaml
+            grep -qE '^\s*operator_common_names: \["operator"\]$' /tmp/authz.yaml \
+              || { echo "::error::$values: the rendered config does not carry the admin policy with the named operator"; exit 1; }
+          done
+          # No operator at all: only when asked for by name, rendered as the
+          # strictest policy (nobody may), never as no policy.
+          helm template vtop helm/vtop -f helm/vtop/ci/default-values.yaml \
+            --set-json 'meta.adminAuthorization.operatorCommonNames=[]' \
+            --set meta.adminAuthorization.allowNoOperators=true > /tmp/authz-none.yaml
+          grep -qE '^\s*operator_common_names: \[\]$' /tmp/authz-none.yaml \
+            || { echo "::error::allowNoOperators did not render the empty (nobody may) policy"; exit 1; }
+          # The lab opt-out renders no policy, and the install notes say so.
+          helm template vtop helm/vtop -f helm/vtop/ci/plaintext-values.yaml > /tmp/authz-off.yaml
+          if grep -q 'admin_authorization:' /tmp/authz-off.yaml; then
+            echo "::error::the opt-out still rendered an admin policy"; exit 1
+          fi
+          # `helm template` does not render NOTES.txt and `helm install
+          # --dry-run` needs a cluster, so the notes are rendered as an
+          # ordinary template from a copy of the chart. They are not YAML, so
+          # helm exits non-zero after printing them under --debug.
+          rm -rf /tmp/notes-chart && cp -r helm/vtop /tmp/notes-chart
+          cp /tmp/notes-chart/templates/NOTES.txt /tmp/notes-chart/templates/notes-check.txt
+          notes() {
+            helm template vtop /tmp/notes-chart "$@" --debug \
+              --show-only templates/notes-check.txt 2>&1 || true
+          }
+          notes -f helm/vtop/ci/plaintext-values.yaml | grep -q 'WARNING: admin authorization is OFF' \
+            || { echo "::error::the co-located notes do not warn about the opt-out"; exit 1; }
+          notes -f helm/vtop/ci/separated-values.yaml --set meta.adminAuthorization.enabled=false \
+            | grep -q 'WARNING: admin authorization is OFF' \
+            || { echo "::error::the separated notes do not warn about the opt-out"; exit 1; }
+          if notes -f helm/vtop/ci/default-values.yaml | grep -q 'WARNING: admin authorization is OFF'; then
+            echo "::error::the notes warn about an opt-out that was not made"; exit 1
+          fi
+          echo "admin authorization renders on by default; the opt-out renders no policy and is warned about"
+
       # A secret file from an external manager (#733) goes in through
       # extraVolumes as a whole Secret volume at defaultMode 0400 (256), which
       # the kubelet makes 0440 under the chart's fsGroup: the form the archive
@@ -861,7 +956,11 @@ jobs:
             fi
             echo "refused because: $expected"
           }
-          refuses "any identities"
+          # The operator CN is supplied in both cases below: admin
+          # authorization is on by default (#732, M2) and refuses an empty
+          # operator list, so without it a case could be refused for that
+          # instead of for what it names.
+          refuses "any identities" --set 'meta.adminAuthorization.operatorCommonNames={operator}'
           # Every other identity supplied, so rendering REACHES the TLS check
           # instead of aborting earlier. The first version of this step set only
           # cluster.id and stopped at the nodeUuids length check — helm exits
@@ -869,6 +968,7 @@ jobs:
           # the contract it names. A regression that silently stopped refusing
           # TLS would have sailed through it.
           refuses "TLS secret names" \
+            --set 'meta.adminAuthorization.operatorCommonNames={operator}' \
             --set cluster.id=11111111-2222-3333-4444-555555555555 \
             --set 'data.nodeUuids={aaaaaaaa-0000-0000-0000-0000000000a1,aaaaaaaa-0000-0000-0000-0000000000a2,aaaaaaaa-0000-0000-0000-0000000000a3}' \
             --set data.range.topic=telemetry \
@@ -912,6 +1012,14 @@ jobs:
             -f helm/vtop/ci/default-values.yaml --set transport.peer=mtls
           refuses_because "transport.admin is plaintext but meta.adminAuthorization.enabled is true" \
             -f helm/vtop/ci/plaintext-values.yaml --set meta.adminAuthorization.enabled=true
+          # Admin authorization is on by default (#732, M2): with no operator
+          # named, no certificate could bootstrap the cluster, so the chart
+          # refuses rather than rendering a policy nobody can use, on both
+          # shapes. Nothing falls back to an open admin plane.
+          refuses_because "meta.adminAuthorization.operatorCommonNames is empty" \
+            -f helm/vtop/ci/default-values.yaml --set-json 'meta.adminAuthorization.operatorCommonNames=[]'
+          refuses_because "meta.adminAuthorization.operatorCommonNames is empty" \
+            -f helm/vtop/ci/separated-values.yaml --set-json 'meta.adminAuthorization.operatorCommonNames=[]'
           # A replicated range is candidates, and the node refuses a candidate
           # on a plaintext replica plane; the chart refuses first.
           refuses_because "transport.replica is plaintext but data.topology is replicated" \
@@ -1281,12 +1389,12 @@ jobs:
             koalaman/shellcheck:v0.11.0 docker/*.sh scripts/release-notes.sh \
             scripts/k8s-smoke.sh scripts/k8s-forward.sh scripts/e2e-smoke.sh \
             scripts/upgrade-compat.sh \
-            scripts/manifest-compat.sh scripts/ledger-compat.sh scripts/compat/*.sh \
+            scripts/manifest-compat.sh scripts/ledger-compat.sh scripts/compat/*.sh scripts/compat/cells/*.sh \
             scripts/restore-drill.sh \
             scripts/traffic-snapshot.sh scripts/test-progress.sh \
             scripts/check-naming.sh scripts/check-egress-claims.sh \
             scripts/check-failpoints-absent.sh scripts/kafka-broker.sh \
-            scripts/kafka-cluster.sh
+            scripts/kafka-cluster.sh scripts/update-surface-snapshots.sh
 
       # `-P scripts/live-chaos/scenarios` resolves the scenarios' dynamic
       # `source "$(dirname …)/../lib.sh"`. Without it every scenario reports
@@ -1300,7 +1408,8 @@ jobs:
             scripts/live-chaos/run-all.sh \
             scripts/live-chaos/gen-certs.sh \
             scripts/live-chaos/scenarios/*.sh \
-            scripts/live-chaos/engine/*.sh
+            scripts/live-chaos/engine/*.sh \
+            scripts/live-chaos/soak/*.sh
 
       - name: bats
         run: |
@@ -1319,6 +1428,10 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The parent too: the surface check below compares with HEAD^1,
+          # which on a pull request is the base the merge commit was made on.
+          fetch-depth: 2
 
       - name: naming check (no commercial mark outside the prior-art files)
         run: bash scripts/check-naming.sh
@@ -1340,6 +1453,11 @@ jobs:
         run: python -m unittest discover -s scripts/compat/tests -p 'test_format_registry.py' -v
       - name: format registry (every magic and version constant has an entry)
         run: python scripts/check-format-registry.py
+      # The upgrade-compat job's checkout is shallow, and scenario 22 reads the
+      # newest release's source from its tag, so that job must fetch the tag.
+      # Checked here, because the upgrade job runs only when its paths change.
+      - name: the upgrade job fetches the tag scenario 22 reads
+        run: python -m unittest discover -s scripts/compat/tests -p 'test_upgrade_job.py' -v
       # The list of config keys an older engine silently ignores, which a
       # release's notes carry (#743). It reads the schema out of config.rs
       # and the reference page, so its tests run against fixture refs and
@@ -1347,6 +1465,18 @@ jobs:
       # longer understands fails here, not on release day.
       - name: the list of new config keys can fail (fixture refs and this tree's schema)
         run: python -m unittest discover -s scripts/tests -p 'test_config_keys_since.py' -v
+
+      # The operator-facing surface (#719). `cargo test` already fails when
+      # docs/surface/ drifts from the code; this asks every command, flag,
+      # value, metric or label the change removes or renames for its row in
+      # docs/deprecations.md. HEAD^1 is the base: on a pull request HEAD is
+      # the merge commit, so lines main gained since the branch point are on
+      # both sides and do not read as removals; on a push to main it is the
+      # commit before.
+      - name: the surface check can fail for each removal it exists to catch
+        run: python -m unittest discover -s scripts/tests -p 'test_check_surface_deprecations.py' -v
+      - name: surface removals carry a deprecation entry
+        run: python scripts/check-surface-deprecations.py --base HEAD^1
 
       # The threat map (#732): every threat in docs/SECURITY_MODEL.md section 17
       # names a control and a test, and each must still exist. It lives in this
@@ -1357,6 +1487,12 @@ jobs:
         run: python -m unittest discover -s scripts/tests -p 'test_check_threat_map.py' -v
       - name: threat map (every named control and test exists)
         run: python scripts/check-threat-map.py
+      # The 1.0 release gate (#741) names tests and CI jobs too, so a rename
+      # fails here for the same reason. This checkout is shallow, so the
+      # merged pull requests, runs and issues are checked by the docs
+      # workflow, which has the history and the API.
+      - name: release gate (every named file, test and CI job exists)
+        run: python scripts/check-release-gate.py --no-history
 
   # Kafka was entirely untested in CI, which is how a P0 shipped: every read
   # returned zero records (a subscribe() per read forced a rebalance that
@@ -1519,9 +1655,28 @@ jobs:
           docker compose run --rm minio-init
 
       # One test thread: the tests share the store, and the multipart ones
-      # count the requests a forwarder in front of it sees.
+      # count the requests a forwarder in front of it sees. The server and
+      # what it is expected to do come from tests/s3-compat/servers/minio.yaml
+      # (#722); every case appends a results line to VTOP_TEST_S3_RESULTS.
+      # What each results line names: the MinIO release the lab builds, the
+      # local image's id (it is built, not pulled, so it has no registry
+      # digest), and the PR's head commit rather than the merge commit
+      # GITHUB_SHA names on a pull request.
+      - name: Label the S3 compatibility results
+        run: |
+          set -euo pipefail
+          release=$(sed -n 's/^ARG MINIO_RELEASE=//p' docker/minio/Dockerfile)
+          image=$(docker compose config --format json | jq -r '.services.minio.image')
+          {
+            echo "VTOP_TEST_S3_SERVER_VERSION=RELEASE.${release//:/-}"
+            echo "VTOP_TEST_S3_IMAGE_DIGEST=$(docker image inspect --format '{{.Id}}' "$image")"
+            echo "VTOP_TEST_COMMIT=${{ github.event.pull_request.head.sha || github.sha }}"
+          } >> "$GITHUB_ENV"
+
       - name: Run the live S3 tests
         env:
+          VTOP_TEST_S3_SERVER: minio
+          VTOP_TEST_S3_RESULTS: ${{ runner.temp }}/s3-compat/results-minio.jsonl
           VTOP_TEST_S3_ENDPOINT: http://127.0.0.1:9000
           AWS_ACCESS_KEY_ID: minioadmin
           AWS_SECRET_ACCESS_KEY: minioadmin
@@ -1545,6 +1700,8 @@ jobs:
       # manifests, Object Lock, versioning, receipts and the coverage audit.
       - name: Run the live engine tests
         env:
+          VTOP_TEST_S3_SERVER: minio
+          VTOP_TEST_S3_RESULTS: ${{ runner.temp }}/s3-compat/results-minio.jsonl
           VTOP_TEST_S3_ENDPOINT: http://127.0.0.1:9000
           AWS_ACCESS_KEY_ID: minioadmin
           AWS_SECRET_ACCESS_KEY: minioadmin
@@ -1554,6 +1711,37 @@ jobs:
             --test live_s3_verification_receipts \
             --test live_s3_tamper \
             -- --ignored --test-threads=1
+
+      # Every case, and any whose outcome is not what minio.yaml says, in the
+      # job summary; the lines themselves as an artifact (#722, D6).
+      - name: Summarise the S3 compatibility results
+        if: always()
+        env:
+          RESULTS: ${{ runner.temp }}/s3-compat/results-minio.jsonl
+        run: |
+          set -euo pipefail
+          if [ ! -s "$RESULTS" ]; then
+            echo "No results were written (the tests did not reach a case)." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "### S3 compatibility: minio"
+            echo
+            echo "| case | outcome | expectation | method |"
+            echo "|---|---|---|---|"
+            jq -r '"| \(.case) | \(.outcome) | \(.expectation) | \(.method // "-") |"' "$RESULTS"
+            echo
+            jq -r 'select(.expected == false)
+              | "\(if .outcome == "unexpected_pass" then "UNEXPECTED PASS" else "UNEXPECTED FAIL" end) \(.case) (\(.deciding_capability // "every capability"), expected \(.expectation)): edit tests/s3-compat/servers/\(.server).yaml or fix the cause"' "$RESULTS"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the S3 compatibility results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: s3-compat-results-minio
+          path: ${{ runner.temp }}/s3-compat/results-minio.jsonl
+          if-no-files-found: ignore
 
       # minio-init ran as a one-off `compose run` container, removed when it
       # exited; its output is in the "Start MinIO" step above.
@@ -1646,6 +1834,12 @@ jobs:
       - name: Test the history checker
         run: python3 -m unittest discover -s scripts/live-chaos/history -p 'test_*.py'
 
+      # The cluster soak's profiles and evaluator (#727): its 7-day run is a
+      # maintainer's, on a host; the rules that judge it are pinned here
+      # against fabricated runs. Pure Python; seconds.
+      - name: Test the cluster soak's evaluator
+        run: python3 -m unittest discover -s scripts/live-chaos/soak -p 'test_*.py'
+
       # CHAOS_WORKDIR is what makes the logs survive to be uploaded. Scenarios
       # delete workdirs they generated themselves, so an artifact pointed at
       # the default `/tmp/vtop-chaos.*` collects nothing and the upload passes
@@ -1684,6 +1878,12 @@ jobs:
   # exact compatibility claim `open_range` makes), v0.3.0 writes rolled
   # sealed segments. Downgrade is NOT tested and NOT supported — stated in
   # ROADMAP.md rather than left as an untested assumption.
+  # The metadata tier rolled from the newest release to HEAD (#554). The data
+  # directories every released minor wrote are the `segments` cell of the
+  # compatibility matrix (compat.yml, #743), which runs each release's
+  # PUBLISHED vtop-node, checked against its SHA256SUMS and Sigstore bundle,
+  # instead of a build of its tag from source: a pull request replays the
+  # newest minor and the nightly run every minor since v0.2.
   upgrade-compat:
     name: upgrade compat (old directories open under HEAD)
     needs: changes
@@ -1692,10 +1892,6 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          # The whole point is building OTHER releases: the worktrees below
-          # check out release tags, which a shallow clone does not have.
-          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
@@ -1706,34 +1902,6 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-upgrade-${{ hashFiles('**/Cargo.lock') }}
-      # The tag list is DERIVED, not hardcoded: the newest patch release of
-      # every minor series since the native data plane shipped (v0.2+ — the
-      # v0.1.x CLI predates the produce/verify surface this script drives).
-      # A new release therefore joins the matrix the moment its tag exists,
-      # so the immediately preceding release — the upgrade path most
-      # operators actually take — cannot silently fall out of coverage.
-      # FINALS ONLY, stated as a policy rather than a sort subtlety (#409):
-      # a suffixed tag (v0.5.0-rc1) must never beat its final in last-wins,
-      # and the glob admits every major so v1.0.0 joins the day it exists.
-      # The finals pattern guards inside awk, not as a grep stage (review):
-      # under pipefail a matchless grep would kill the assignment before the
-      # friendly no-tags guard below could speak; awk exits clean on none.
-      - name: Select the released tags to replay
-        id: tags
-        run: |
-          set -euo pipefail
-          tags="$(git tag --list 'v[0-9]*' --sort=version:refname \
-            | awk -F. '/^v[0-9]+\.[0-9]+\.[0-9]+$/ && ($1 "." $2) != "v0.1" { latest[$1 "." $2] = $0 } END { for (m in latest) print latest[m] }' \
-            | sort -V | tr '\n' ' ')"
-          [[ -n "${tags// /}" ]] || { echo "no release tags found"; exit 1; }
-          echo "list=$tags" >> "$GITHUB_OUTPUT"
-          echo "replaying: $tags"
-      # Release tags are immutable, so their builds are cached essentially
-      # forever: after the first run this job pays only the HEAD build.
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: target-old
-          key: ${{ runner.os }}-upgrade-old-tags-${{ steps.tags.outputs.list }}
 
       - name: Build HEAD vtop-node
         run: cargo build -p vtop-node --bin vtop-node
@@ -1742,40 +1910,32 @@ jobs:
       - name: Build HEAD vtopctl
         run: cargo build -p vtop-cli --no-default-features --bin vtopctl
 
-      - name: Build the released tags
-        run: |
-          set -euo pipefail
-          for tag in ${{ steps.tags.outputs.list }}; do
-            if [[ -x "target-old/$tag/debug/vtop-node" ]]; then
-              echo "$tag build cached"
-              continue
-            fi
-            git worktree add "../wt-$tag" "$tag"
-            (cd "../wt-$tag" && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-old/$tag" \
-              cargo build -p vtop-node --bin vtop-node)
-            git worktree remove --force "../wt-$tag"
-          done
+      # cosign v3: releases are signed in the new Sigstore bundle format
+      # (see compat.yml).
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: 'v3.0.2'
 
-      - name: Each released directory opens under HEAD
+      # The newest PUBLISHED final release, whatever tag is newest: a tag
+      # whose release is still being built has no archive to run yet.
+      - name: Fetch and check the newest release
+        id: newest
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          port=9700
-          for tag in ${{ steps.tags.outputs.list }}; do
-            # The rolling profile's threshold keys exist from v0.3.0 (#313);
-            # older releases refuse unknown config keys, which is itself the
-            # compatibility contract, so they replay the legacy single-file
-            # shape — the exact claim open_range makes. A NUMERIC compare
-            # states that rule (#409); the glob it replaces enumerated digit
-            # ranges and would have been silently outgrown at v0.10.
-            profile=legacy
-            IFS=. read -r maj min _ <<< "${tag#v}"
-            if (( maj > 0 || min >= 3 )); then profile=rolling; fi
-            UPGRADE_KEEP=1 UPGRADE_WORKDIR="$GITHUB_WORKSPACE/upgrade-$tag" \
-            UPGRADE_NATIVE_PORT="$port" \
-              scripts/upgrade-compat.sh "$tag" \
-                "target-old/$tag/debug/vtop-node" target/debug/vtop-node "$profile"
-            port=$((port + 20))
-          done
+          tag="$(gh release list --limit 100 --json tagName,isDraft,isPrerelease \
+            --jq '.[] | select((.isDraft or .isPrerelease) | not) | .tagName' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
+          [[ -n "$tag" ]] || { echo "no published release found"; exit 1; }
+          dir="$(scripts/compat/fetch-release.sh "$tag" released x86_64-unknown-linux-gnu)"
+          # Scenario 22 reads the release's feature level, and whether it
+          # answers the version question, from its tag's source (`git show
+          # "$tag:..."`), and the checkout above is shallow with no tags:
+          # fetch that one tag and its tree, not the whole history.
+          git fetch --no-tags --depth=1 origin "+refs/tags/$tag:refs/tags/$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
 
       # The metadata tier rolled from the newest release to HEAD, one voter at
       # a time, the way the chart rolls it (#554): every mixed step must keep
@@ -1783,12 +1943,13 @@ jobs:
       # upgrading from the immediately preceding release is the supported
       # path. Plaintext on loopback - the transport is not what is under test.
       - name: The metadata tier rolls from the newest release to HEAD
+        env:
+          NEWEST_DIR: ${{ steps.newest.outputs.dir }}
         run: |
           set -euo pipefail
-          newest="$(tr ' ' '\n' <<< "${{ steps.tags.outputs.list }}" | grep . | tail -1)"
           CHAOS_PROFILE=debug CHAOS_TRANSPORT=plaintext CHAOS_KEEP=1 \
             CHAOS_WORKDIR="$GITHUB_WORKSPACE/upgrade-meta" \
-            CHAOS_OLD_VTOP_NODE="target-old/$newest/debug/vtop-node" \
+            CHAOS_OLD_VTOP_NODE="$NEWEST_DIR/vtop-node" \
             scripts/live-chaos/scenarios/22-meta-rolling-upgrade.sh
 
       - name: Upload fixture logs
@@ -1797,7 +1958,6 @@ jobs:
         with:
           name: upgrade-compat-logs
           path: |
-            upgrade-v*/logs
             upgrade-meta/logs
           if-no-files-found: ignore
           retention-days: 7
@@ -2395,7 +2555,7 @@ jobs:
         # without this line the pipe into tee would hide a failing test.
         run: |
           set -o pipefail
-          python -m pytest -rs tests/test_kafka_compare_report.py tests/test_kafka_compare_regenerate.py tests/test_kafka_compare_failover.py tests/test_kafka_compare_footer.py tests/test_kafka_compare_colours.py tests/test_readme_charts.py tests/test_benchmark_charts_job.py | tee "$RUNNER_TEMP/chart-tests.log"
+          python -m pytest -rs tests/test_kafka_compare_report.py tests/test_kafka_compare_regenerate.py tests/test_kafka_compare_failover.py tests/test_kafka_compare_footer.py tests/test_kafka_compare_colours.py tests/test_readme_charts.py tests/test_benchmark_charts_job.py tests/test_compare_reports.py | tee "$RUNNER_TEMP/chart-tests.log"
           if grep -E "SKIPPED.*(matplotlib|PIL)" "$RUNNER_TEMP/chart-tests.log"; then
             echo "::error::A chart test skipped for want of matplotlib or Pillow, in the one job that installs them."
             exit 1
@@ -2411,6 +2571,18 @@ jobs:
             echo "::error::Committed benchmark charts or reports differ from what the committed CSVs produce. Run 'python3 -m pip install --require-hashes -r benchmarks/kafka_compare/requirements-report.txt && python3 benchmarks/kafka_compare/regenerate.py' and commit the result."
             echo "$drift"
             git diff --stat -- docs/benchmarks/
+            exit 1
+          fi
+      # The cross-product comparisons (#744): every committed run under
+      # benchmarks/<kind>_compare/results/ through its kind's report.py. A kind
+      # with no committed run yet is skipped, and must then have no output.
+      - name: Regenerate the cross-product comparison reports and fail on drift
+        run: |
+          python3 benchmarks/compare_common/regenerate.py
+          drift="$(git status --porcelain -- docs/benchmarks/)"
+          if [ -n "$drift" ]; then
+            echo "::error::Committed comparison charts or reports differ from what the committed CSVs produce. Run 'python3 -m pip install --require-hashes -r benchmarks/kafka_compare/requirements-report.txt && python3 benchmarks/compare_common/regenerate.py' and commit the result."
+            echo "$drift"
             exit 1
           fi
       - name: Redraw the README's charts and fail on drift

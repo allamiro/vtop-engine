@@ -15,6 +15,10 @@ fails when:
 * the highest tag of a listed tag set (command kinds, snapshot value tags,
   key categories) differs from the registry's;
 * the registry names something the sources no longer hold;
+* a fuzz target in fuzz/fuzz_targets is named by no entry's ``fuzz`` list and
+  is not in ``fuzz_other`` with a reason;
+* an entry names a compatibility cell that scripts/compat/expected.yaml does
+  not list, or that file lists a cell no entry names;
 * a format constant, or a tag, is declared twice in one file (in two
   modules): the registry names a constant by file and name, so it could not
   tell which declaration it records;
@@ -47,6 +51,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 REGISTRY = pathlib.Path("scripts/compat/formats.yaml")
+EXPECTED = pathlib.Path("scripts/compat/expected.yaml")
 PAGE = pathlib.Path("docs/reference/compatibility.md")
 BEGIN = "<!-- inventory:begin -->"
 END = "<!-- inventory:end -->"
@@ -274,6 +279,14 @@ def check_source(root: pathlib.Path, registry: dict) -> list[str]:
     claimed_constants: dict[tuple[str, str], str] = {}
     claimed_magics: set[tuple[str, str]] = set()
     seen_ids = set()
+    named_cells: set[str] = set()
+    expected_path = root / EXPECTED
+    matrix_cells: set[str] = set()
+    if expected_path.is_file():
+        import yaml  # PyYAML, pinned in scripts/compat/requirements.txt
+
+        with open(expected_path, encoding="utf-8") as handle:
+            matrix_cells = set((yaml.safe_load(handle) or {}).get("cells") or {})
     for entry in registry.get("formats") or []:
         label = f"format {entry.get('id')} ({entry.get('name')})"
         for key in ("id", "name", "class", "marker", "status", "at_1_0"):
@@ -332,6 +345,39 @@ def check_source(root: pathlib.Path, registry: dict) -> list[str]:
         for target in entry.get("fuzz") or []:
             if not (root / "fuzz/fuzz_targets" / f"{target}.rs").is_file():
                 problems.append(f"{label}: fuzz target {target} does not exist")
+        for cell in entry.get("cells") or []:
+            named_cells.add(cell)
+            if cell not in matrix_cells:
+                problems.append(
+                    f"{label}: cell {cell} is not a cell of {EXPECTED} (scripts/compat/cell.sh runs "
+                    "the cells that file lists)"
+                )
+    # Every fuzz target is some format's decoder, or says why it is not
+    # (`fuzz_other`): a target added without a registry row fails here, so the
+    # fuzz coverage the page claims is the coverage there is.
+    named_targets = {t for entry in registry.get("formats") or [] for t in entry.get("fuzz") or []}
+    other_targets = registry.get("fuzz_other") or {}
+    for target, why in sorted(other_targets.items()):
+        if not str(why or "").strip():
+            problems.append(f"fuzz_other {target}: needs a why")
+        if not (root / "fuzz/fuzz_targets" / f"{target}.rs").is_file():
+            problems.append(f"fuzz_other {target}: fuzz target {target} does not exist")
+        if target in named_targets:
+            problems.append(f"fuzz target {target} is both a format's and in fuzz_other")
+    targets_dir = root / "fuzz/fuzz_targets"
+    if targets_dir.is_dir():
+        for path in sorted(targets_dir.glob("*.rs")):
+            if path.stem not in named_targets and path.stem not in other_targets:
+                problems.append(
+                    f"fuzz target {path.stem} is named by no format in {REGISTRY}: add it to the "
+                    "`fuzz` list of the format whose decoder it exercises, or to `fuzz_other` with "
+                    "a reason"
+                )
+    for cell in sorted(matrix_cells - named_cells):
+        problems.append(
+            f"{EXPECTED}: cell {cell} is named by no entry of {REGISTRY}: a compatibility cell "
+            "belongs to the format it records"
+        )
     for item in registry.get("not_formats") or []:
         if not item.get("why"):
             problems.append(f"not_formats {item.get('name')}: needs a why")
