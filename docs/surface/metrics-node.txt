@@ -53,6 +53,7 @@ vtop_broker_sessions_accepted_total counter role
 vtop_broker_sessions_active gauge role
 vtop_broker_sessions_refused_total counter reason
 vtop_kafka_requests_refused_total counter api,reason
+vtop_listener_connections_refused_total counter plane,reason
 vtop_meta_group_cursor_offset gauge group,range,topic
 vtop_meta_group_cursor_series_truncated gauge
 vtop_meta_raft_last_applied_index gauge
