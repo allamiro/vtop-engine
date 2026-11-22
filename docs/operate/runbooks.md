@@ -33,17 +33,21 @@ Object Lock failure is also an `object_lock_check_failed` event.
 
 **What to check.**
 
-- The engine's log lines for the batch id, and `vtopctl list-batches --config
-  <file>` for its state.
+- The engine's log lines for the batch id (the ERROR line `batch failed`
+  carries it). `vtopctl list-batches --config <file>` lists every batch's
+  state, record count and source but not its id; `vtopctl --json list-batches
+  --config <file>` adds each batch's `batch_id` and `object_uri`. On a large
+  ledger, filter it (`| jq '.[] | select(.state == "failed")'`).
 - The object store: is it healthy, is something else writing to the bucket,
   does it return the bytes it was given?
 - Whether the failure repeats for the same stream (the alert's labels) or
   across all of them.
 
 **What to do.** Fix the store or whatever rewrites objects in the bucket. Then
-run [`vtopctl scrub`](scrub-and-audit.md#scrub) over the affected time range to
-confirm what is stored verifies. A replay writes the batch again; nothing has
-to be re-sent by hand. The steps, and what the drill measured, are in
+run [`vtopctl scrub`](scrub-and-audit.md#scrub) to confirm what is stored
+verifies: a full pass, or `--sample N` for a spot check (`scrub` has no time
+range; `--limit` with `--cursor-file` walks the archive a slice at a time). A
+replay writes the batch again; nothing has to be re-sent by hand. The steps, and what the drill measured, are in
 [Disaster recovery](disaster-recovery.md#verification-fails).
 
 **When it is safe to ignore.** Never on a production archive. One failure
@@ -360,7 +364,8 @@ purpose: an unexpected change to versioning is a tampering signal (see
 the bucket named in the ERROR line.
 
 **What to do.** Re-enable versioning on the bucket (PutBucketVersioning with
-Status=Enabled). The engine resumes within about two minutes (its next
+Status=Enabled; on S3, `aws s3api put-bucket-versioning --bucket <bucket>
+--versioning-configuration Status=Enabled`). The engine resumes within about two minutes (its next
 check comes at most 60 s after the last, and the batch that makes it at most
 60 s after that) and replays what failed meanwhile; nothing to restart. If the bucket is meant to run without
 versioning, set `upload.require_object_versioning: false` and restart, which
@@ -434,11 +439,27 @@ be written`), its free disk space, and `vtop_broker_follower_connected` on the
 leader, which shows the replica without a session.
 
 **What to do.** Free space on the replica's data directory, or fix the storage
-fault. Then stop it and rebuild its range from a replica whose history is
-intact with `vtopctl node repair` (see the repair procedure in
-[`PRODUCTION_HA.md`](../PRODUCTION_HA.md)), and start it against the repaired
-directory. The repaired directory carries the source's history and no mark;
-the replica rejoins through an ordinary session and catches up. Do not delete
+fault. Then stop the data node (`repair` refuses a live range) and rebuild its
+range from a replica whose history is intact:
+
+```bash
+vtopctl node repair --config node-client.yaml \
+  --from <node uuid of the leader or another intact replica> \
+  --into <the stopped replica's data directory> \
+  --fencing-epoch <the range's current epoch> --seal-tail
+```
+
+`node-client.yaml` is the node client config of
+[`vtopctl node status`](../NODE_OBSERVABILITY.md#vtopctl-node-status). `--from`
+is a registered node UUID, not a path (`vtopctl meta replica-set --config
+<meta client yaml> --topic-uuid ... --range-uuid ...` lists the range's
+replicas, and `vtopctl node status` shows how far each has got).
+`--fencing-epoch` is the epoch metadata granted the range's current leader:
+`vtopctl meta transitions --config <meta client yaml> --topic-uuid ...
+--range-uuid ...` lists the range's epochs (the example under "What it can
+lose" in [`PRODUCTION_HA.md`](../PRODUCTION_HA.md) reads it from the last
+`ATTESTED` line). Start the node again against the repaired directory. It carries the source's history and no mark; the replica
+rejoins through an ordinary session and catches up. Do not delete
 `fencing-epochs.broken` by hand to bring the old directory back: the history
 beside it may have the hole the mark is there to refuse.
 
