@@ -405,11 +405,11 @@ jobs:
       - name: Gate or report the score
         if: env.RUN_IN_FULL == 'true'
         env:
-          GATES: ${{ steps.args.outputs.gates }}
+          GATE_ARGS: ${{ steps.args.outputs.gates }}
         run: |
           if [ -n "$GATE" ]; then
             # shellcheck disable=SC2086
-            python3 scripts/mutants-gate.py $GATES \
+            python3 scripts/mutants-gate.py $GATE_ARGS \
               --outcomes mutants.out/outcomes.json \
               --title "Mutation testing (gated): $PACKAGE" \
               --summary "$GITHUB_STEP_SUMMARY"
