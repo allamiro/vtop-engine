@@ -340,6 +340,24 @@ def test_live_rate_is_half_the_slowest_tools_median_drain_rate(tmp_path):
         run.live_rate(str(tmp_path), item, 0.5)
 
 
+def test_live_rate_counts_only_the_profiles_that_run_the_live_cell(tmp_path):
+    # Review of #908: Vector drains under `acks` (100 lines/s) and `disk-buffer` (1000), but only `acks` is
+    # offered live load; pooling them would put the median at 550 and overload the 100 lines/s profile.
+    run_dir = str(tmp_path)
+    variant = {"source": "file", "rotation": "rename"}
+    base = {"cell": "drain", "status": "ok", **variant}
+    rows = [dict(base, system="vector", profile="acks", lines_per_sec="100"),
+            dict(base, system="vector", profile="disk-buffer", lines_per_sec="1000"),
+            dict(base, system="vtop", profile="strong", lines_per_sec="1000")]
+    for row in rows:
+        schema.append_row(os.path.join(run_dir, "spool.csv"), KIND, row)
+    item = plans.Planned("vector", "acks", "live", 1, variant, {}, "performance")
+    plan = {"systems": ["vector", "vtop"], "profiles": {"vector": ["acks", "disk-buffer"], "vtop": ["strong"]},
+            "cells": [{"cell": "drain"}, {"cell": "live", "profiles": {"vector": ["acks"]}}]}
+    assert run.live_participants(plan) == {"vector": {"acks"}, "vtop": {"strong"}}
+    assert run.live_rate(run_dir, item, 0.5, None, run.live_participants(plan)) == 50.0
+
+
 def test_first_object_after_each_restart():
     listing = [{"lastModified": "2026-11-22T00:00:10Z"}, {"lastModified": "2026-11-22T00:00:30Z"}]
     base = checker.parse_time("2026-11-22T00:00:00Z")

@@ -474,7 +474,8 @@ class Runner:
         with sampler:
             started = tool.start_tool()
             if item.cell == "live":
-                rate = live_rate(self.run_dir, item, float(p.get("live_fraction", 0.5)), p.get("rate"))
+                rate = live_rate(self.run_dir, item, float(p.get("live_fraction", 0.5)), p.get("rate"),
+                                 live_participants(self.env.get("plan") or {}))
                 p = dict(p, rate=rate)
                 seconds = float(p.get("warmup_seconds", 120)) + float(p.get("measure_seconds", 600))
                 tool.gen("/live", {"rate": rate, "seconds": seconds})
@@ -610,10 +611,21 @@ def live_sustained(offered: float, achieved: float, gaps: int) -> bool:
     return stats.sustained(offered, achieved) and not gaps
 
 
-def live_rate(run_dir: str, item: plans.Planned, fraction: float, fixed: Any = None) -> float:
+def live_participants(plan: dict[str, Any]) -> dict[str, set[str]]:
+    """The profiles each system runs in the plan's live cell: the cell's own list, else the plan's."""
+    for cell in plan.get("cells") or []:
+        if cell.get("cell") == "live":
+            return {system: set(plans.cell_profiles(plan, cell, system)) for system in plan.get("systems") or []}
+    return {}
+
+
+def live_rate(run_dir: str, item: plans.Planned, fraction: float, fixed: Any = None,
+              participants: dict[str, set[str]] | None = None) -> float:
     """The live cell's offered rate: `fraction` of the SLOWEST system's median drain rate for the same variant
-    in this run (#748: an offer above a tool's capacity measures its queue, not its latency). A plan may fix
-    `rate` instead (the smoke and hosted plans, which have no drain cell)."""
+    in this run (#748: an offer above a tool's capacity measures its queue, not its latency). Only the
+    profiles that run the live cell count (`participants`: system -> its live profiles; Vector's `disk-buffer`
+    drains but is not offered load, so its rate must not lift the median of a profile that is, review of
+    #908). A plan may fix `rate` instead (the smoke and hosted plans, which have no drain cell)."""
     if fixed is not None:
         return float(fixed)
     path = os.path.join(run_dir, f"{KIND.name}.csv")
@@ -621,7 +633,8 @@ def live_rate(run_dir: str, item: plans.Planned, fraction: float, fixed: Any = N
     by_system: dict[str, list[float]] = {}
     for row in rows:
         if (row["cell"] == "drain" and row["status"] == "ok" and row["source"] == item.variant["source"]
-                and row["rotation"] == item.variant["rotation"] and row["lines_per_sec"]):
+                and row["rotation"] == item.variant["rotation"] and row["lines_per_sec"]
+                and (not participants or row["profile"] in participants.get(row["system"], ()))):
             by_system.setdefault(row["system"], []).append(float(row["lines_per_sec"]))
     if not by_system:
         raise runner.CellRefused("no drain result for this variant in the run, so the live rate cannot be derived; "
