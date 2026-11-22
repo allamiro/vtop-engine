@@ -100,7 +100,7 @@ REPORT = creport.Report(
                       f"Each tool's best point of a tuned grid of {GRID_SIZE} points over its own knobs, the same "
                       "grid size for every tool, re-run on all files.",
                       (M("tuned", "goodput, fraction of the link", "goodput_fraction", "higher",
-                         ("defaults", "tuned"), digits=2),)),
+                         ("defaults", "tuned"), digits=2, ranked=False),)),
     ),
     group_label=group_label,
     notes=("## Reading this\n\n"

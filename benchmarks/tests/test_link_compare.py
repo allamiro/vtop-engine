@@ -349,3 +349,34 @@ def test_both_flows_of_the_jain_index_come_from_the_same_counters_over_the_same_
         link.window_mbps(samples, "vtb-store", 5.2, 5.8)
     source = inspect.getsource(link_run.neighbour)
     assert "with_tool.bytes" not in source and source.count("window_mbps") >= 2
+
+
+def test_a_failed_smoke_fails_the_run_and_the_check(tmp_path, capsys):
+    run = fixture.write_run(str(tmp_path), plan_name="smoke", host_class="laptop")
+    rows = schema.read_rows(os.path.join(run, "link.csv"), KIND)
+    assert link_run.smoke_failures(rows) == [] and link_run.check_run(run) == 0
+    path = os.path.join(run, "link.csv")
+    with open(path) as handle:
+        text = handle.read()
+    lines = text.splitlines(keepends=True)
+    broken = lines[1].replace(",ok,", ",failed,", 1).replace(",,", ",0 of 4 files committed,", 1)
+    with open(path, "w") as handle:
+        handle.writelines([lines[0], broken] + lines[2:])
+    assert link_run.smoke_failures(schema.read_rows(path, KIND))
+    assert link_run.check_run(run) == 2
+    assert "smoke failed" in capsys.readouterr().out
+
+
+def test_tuned_results_are_drawn_but_never_ranked(tmp_path):
+    from compare_common import report as creport
+
+    tuned = [m for chart in link_report.REPORT.charts for m in chart.metrics if "tuned" in m.cells]
+    assert tuned and all(not m.ranked for m in tuned)
+    ranked = [m for chart in link_report.REPORT.charts for m in chart.metrics if m.ranked]
+    assert all("tuned" not in m.cells for m in ranked)
+    rows, env = schema.load_run(fixture.write_run(str(tmp_path)), KIND)
+    systems = list(link.SYSTEMS)
+    profiles = {s: creport.primary_profile(env["plan"], s) for s in systems}
+    scores = creport.scoreboard(rows, KIND, ranked, systems, profiles, link_report.group_label)
+    assert scores and not any("best of grid" in score.group for score in scores)
+    assert "if m.ranked" in inspect.getsource(creport.build)  # the page's scoreboard takes ranked metrics only

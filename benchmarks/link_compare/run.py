@@ -504,6 +504,12 @@ def telemetry_lines() -> dict[str, str]:
     return out
 
 
+def smoke_failures(rows: list[dict[str, str]]) -> list[str]:
+    """Every smoke row that is not ok: the end-to-end path is broken, and the run's exit status says so."""
+    return [f"{row['system']}: {row['status']} ({row['note']})" for row in rows
+            if row["cell"] == "smoke" and row["status"] != "ok"]
+
+
 def check_run(run_dir: str) -> int:
     try:
         env = schema.read_environment(run_dir)
@@ -519,7 +525,10 @@ def check_run(run_dir: str) -> int:
         print(f"problem: {problem}")
     for key in missing:
         print(f"missing: {key}")
-    return 0 if not (problems or extra or missing) else 2
+    failed = smoke_failures(rows)
+    for line in failed:
+        print(f"smoke failed: {line}")
+    return 0 if not (problems or extra or missing or failed) else 2
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -640,6 +649,10 @@ def main(argv: list[str] | None = None) -> int:
     environment.save(run_dir, env)
     log(f"{outcome.done} runs done, {outcome.skipped} already there, {outcome.remaining} remaining; "
         f"results in {os.path.relpath(run_dir, REPO)}")
+    failed = smoke_failures(schema.read_rows(os.path.join(run_dir, "link.csv"), KIND))
+    if failed:
+        log("the smoke failed, so nothing else this run measured can be trusted: " + "; ".join(failed))
+        return 4
     return 0 if outcome.remaining == 0 else 3
 
 
