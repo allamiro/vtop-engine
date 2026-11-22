@@ -625,6 +625,133 @@ jobs:
             docker run --rm -e EXPECTED_VERSION -v "$dir:/a:ro" -v "$smoke:/smoke.sh:ro" "$image" sh /smoke.sh
           done
 
+      # The archive against a live broker (#724). The round trip above never
+      # touches Kafka, and the Kafka source is the path scripts/e2e-smoke.sh
+      # exists for: its ingestion once shipped broken with every test green,
+      # because nothing ran the built engine against a broker. This runs the
+      # ARCHIVE's vtopctl on this runner (x86_64 or aarch64, glibc or musl)
+      # against a single-node Kafka: 200 records in, archived to a local
+      # directory, and then the consumer group's committed offset must be the
+      # end of the topic. The engine commits an offset only after the batch is
+      # VERIFIED, so a group at 200 is the proof the whole path ran; the
+      # coverage audit and the scrub then check the ledger and every object.
+      # Linux only: the macOS runners have no Docker. Inline, not a script, so
+      # a dispatch dry-run of an older tag runs it too.
+      - name: Smoke the archive against Kafka (Linux, #724)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          ARCHIVE: ${{ steps.pkg.outputs.artifact }}
+          # The broker the kafka-integration job runs; a multi-arch index,
+          # pinned by digest.
+          KAFKA_IMAGE: apache/kafka:4.3.1@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837
+        run: |
+          set -euo pipefail
+          x="$RUNNER_TEMP/kafka-smoke"
+          rm -rf "$x" && mkdir -p "$x/archive" "$x/out" "$x/work"
+          tar -xzf "$ARCHIVE" -C "$x/archive"
+          A="$x/archive/$(basename "$ARCHIVE" .tar.gz)"
+          docker run -d --name vtop-smoke-kafka -p 127.0.0.1:9092:9092 \
+            -e KAFKA_NODE_ID=1 \
+            -e KAFKA_PROCESS_ROLES=broker,controller \
+            -e KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
+            -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 \
+            -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
+            -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+            -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+            -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+            -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
+            -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
+            -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
+            "$KAFKA_IMAGE" >/dev/null
+          trap 'docker rm -f vtop-smoke-kafka >/dev/null 2>&1 || true' EXIT
+          k() { docker exec -i vtop-smoke-kafka "$@"; }
+          bin=/opt/kafka/bin
+          up=false
+          for _ in $(seq 1 60); do
+            if k "$bin/kafka-topics.sh" --bootstrap-server localhost:9092 --list >/dev/null 2>&1; then
+              up=true
+              break
+            fi
+            sleep 2
+          done
+          "$up" || { echo "::error::the broker did not come up"; docker logs --tail 50 vtop-smoke-kafka; exit 1; }
+          k "$bin/kafka-topics.sh" --bootstrap-server localhost:9092 --create \
+            --topic smoke_events --partitions 1 --replication-factor 1
+          i=1
+          while [ "$i" -le 200 ]; do
+            printf 'CEF:0|VTOP|smoke|1.0|100|event %d|3|src=10.0.0.1 cnt=%d\n' "$i" "$i"
+            i=$((i + 1))
+          done >"$x/events.cef"
+          k "$bin/kafka-console-producer.sh" --bootstrap-server localhost:9092 \
+            --topic smoke_events <"$x/events.cef"
+          # A fresh broker creates the group coordinator lazily, and until it
+          # exists a consumer gets NotCoordinator (see ci.yml's kafka
+          # integration job); one read under a throwaway group creates it.
+          k "$bin/kafka-console-consumer.sh" --bootstrap-server localhost:9092 \
+            --topic smoke_events --group smoke-warmup --from-beginning \
+            --max-messages 1 --timeout-ms 30000 >/dev/null
+          cat >"$x/config.yaml" <<CONFIG
+          engine:
+            name: smoke
+            tenant: default
+            state_store: "sqlite://$x/state.db"
+            work_dir: $x/work
+            log_level: warn
+          batching:
+            max_records: 1000
+            max_bytes: 1048576
+            max_batch_age_seconds: 1
+          compression:
+            type: gzip
+            level: 6
+          checksum:
+            algorithm: sha256
+          sources:
+            kafka:
+              enabled: true
+              bootstrap_servers: ["localhost:9092"]
+              consumer_group: vtop-smoke
+              topic_include_regex: "^smoke_events$"
+              topic_exclude_regex: "^__.*"
+              auto_offset_reset: earliest
+              enable_auto_commit: false
+          upload:
+            backend: localfs
+            local_path: $x/out
+            bucket: smoke
+            prefix: ""
+          CONFIG
+          "$A/vtopctl" --version
+          "$A/vtopctl" validate --config "$x/config.yaml"
+          # One cycle may end before the batch seals or the group settles;
+          # a few cycles drain the topic.
+          offset=none
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            "$A/vtopctl" process-once --source kafka --config "$x/config.yaml" \
+              || echo "process-once cycle $attempt failed; running another"
+            offset="$(k "$bin/kafka-consumer-groups.sh" --bootstrap-server localhost:9092 \
+              --describe --group vtop-smoke 2>/dev/null | awk '$2 == "smoke_events" {print $4}')"
+            [ "$offset" = 200 ] && break
+            sleep 2
+          done
+          [ "$offset" = 200 ] || { echo "::error::the group's committed offset is ${offset:-none}, not 200"; exit 1; }
+          echo "consumer group vtop-smoke committed offset 200 of 200"
+          "$A/vtopctl" audit-coverage --check-storage --config "$x/config.yaml"
+          "$A/vtopctl" scrub --config "$x/config.yaml"
+          # Every record is in an archived object, once: the objects the
+          # ledger names, unpacked, hold the 200 input lines (sorted, since
+          # several cycles may have made several batches).
+          uris="$("$A/vtopctl" list-batches --json --config "$x/config.yaml" \
+            | sed -n 's|^ *"object_uri": "s3://\(.*\)",\{0,1\}$|\1|p')"
+          [ -n "$uris" ] || { echo "::error::the ledger names no archived object"; exit 1; }
+          while IFS= read -r uri; do
+            gzip -dc "$x/out/$uri"
+          done <<<"$uris" | sort >"$x/archived.sorted"
+          sort "$x/events.cef" | cmp -s - "$x/archived.sorted" \
+            || { echo "::error::the archived objects do not hold the 200 records exactly once"; exit 1; }
+          echo "the archived objects hold the 200 records, each once"
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ env.BUNDLE_NAME }}-${{ matrix.target }}

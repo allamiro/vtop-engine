@@ -73,6 +73,19 @@ arm64 and x86_64). The other distributions and macOS releases named above are
 expected to work by the same symbol versions and deployment target, but are
 not run.
 
+Each Linux archive also runs against a live broker on its own runner (Ubuntu
+24.04, x86_64 or aarch64): its `vtopctl` reads 200 records from a
+single-node Kafka 4.3.1, archives them, and the consumer group's committed
+offset must then be the end of the topic. The engine commits an offset only
+after the batch is verified, so this is the archive running the Kafka path
+end to end, the path `scripts/e2e-smoke.sh` checks in the container image;
+the coverage audit and a scrub follow. The macOS runners have no Docker, so
+the macOS archives run the file round trip only.
+
+All of this runs in the release workflow: on the tag, before anything is
+published (a failure stops the release), and in a dry run, a manual dispatch
+that builds and checks the archives and publishes nothing.
+
 ### The test suite on each platform
 
 Besides the archives, the workspace's test suite (`cargo test --workspace`,
