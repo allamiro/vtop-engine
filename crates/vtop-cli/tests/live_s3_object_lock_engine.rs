@@ -647,97 +647,108 @@ async fn tier_backend(bucket: &str) -> std::sync::Arc<dyn vtop_upload::UploadBac
 #[tokio::test]
 #[ignore = "requires an S3-compatible endpoint with Object Lock"]
 async fn live_a_tier_copy_is_written_and_checked_under_the_lock() {
-    let dir = tempfile::tempdir().unwrap();
-    let (sealed, root) = seal_segment(dir.path());
-    let client = s3_client().await;
+    // Needs Object Lock and versioning on the server; a server whose
+    // capability file says it lacks them records the case as not applicable
+    // instead of failing it (the S3 compatibility matrix, #722).
+    let live = LiveS3::from_env();
+    live.case(
+        "tier.copy.written_and_checked_under_the_lock",
+        &[Capability::ObjectLock, Capability::Versioning],
+        || async {
+            let dir = tempfile::tempdir().unwrap();
+            let (sealed, root) = seal_segment(dir.path());
+            let client = s3_client().await;
 
-    // A bucket without Object Lock: refused, nothing written.
-    let plain = plain_bucket();
-    let prefix = format!("vtop-it-684-tier-{}", unix_now());
-    let refused = vtop_cli::tier_tools::run_tier_copy(
-        tier_backend(&plain).await.as_ref(),
-        &tier_request(
-            &sealed,
-            root,
-            &format!("s3://{plain}/{prefix}/bundle.segment"),
-        ),
-    )
-    .await
-    .expect_err("a tier copy to a bucket without Object Lock was written");
-    assert!(
-        refused.contains(&format!(
-            "bucket {plain} does not have Object Lock enabled; nothing was copied"
-        )),
-        "{refused}"
-    );
-    let listed = client
-        .list_object_versions()
-        .bucket(&plain)
-        .prefix(&prefix)
-        .send()
-        .await
-        .unwrap();
-    assert!(listed.versions().is_empty(), "{listed:?}");
-
-    // A locked bucket: written, checked, and locked in the store.
-    let bucket = locked_bucket();
-    let object_uri = format!("s3://{bucket}/{prefix}/bundle.segment");
-    let before = unix_now();
-    let command = vtop_cli::tier_tools::run_tier_copy(
-        tier_backend(&bucket).await.as_ref(),
-        &tier_request(&sealed, root, &object_uri),
-    )
-    .await
-    .expect("a locked tier copy must succeed");
-    let vtop_meta::MetadataCommand::CommitTierEvidence {
-        object_version_id,
-        manifest_version_id,
-        ..
-    } = command
-    else {
-        panic!("not tier evidence: {command:?}");
-    };
-    let written = [
-        (
-            format!("{prefix}/bundle.segment"),
-            object_version_id.expect("the segment's version"),
-        ),
-        (
-            format!("{prefix}/bundle.segment.manifest.json"),
-            manifest_version_id.expect("the manifest's version"),
-        ),
-    ];
-    for (key, version) in &written {
-        let head = client
-            .head_object()
-            .bucket(&bucket)
-            .key(key)
-            .version_id(version)
-            .send()
+            // A bucket without Object Lock: refused, nothing written.
+            let plain = plain_bucket();
+            let prefix = format!("vtop-it-684-tier-{}", unix_now());
+            let refused = vtop_cli::tier_tools::run_tier_copy(
+                tier_backend(&plain).await.as_ref(),
+                &tier_request(
+                    &sealed,
+                    root,
+                    &format!("s3://{plain}/{prefix}/bundle.segment"),
+                ),
+            )
             .await
-            .unwrap();
-        assert_eq!(
-            head.object_lock_mode().map(|m| m.as_str()),
-            Some("GOVERNANCE"),
-            "{key}"
-        );
-        let until = head.object_lock_retain_until_date().unwrap().secs();
-        assert!(
-            until >= before + 86_400 && until <= unix_now() + 86_400 + 1,
-            "{key} is retained one day from its write: {until}"
-        );
-    }
+            .expect_err("a tier copy to a bucket without Object Lock was written");
+            assert!(
+                refused.contains(&format!(
+                    "bucket {plain} does not have Object Lock enabled; nothing was copied"
+                )),
+                "{refused}"
+            );
+            let listed = client
+                .list_object_versions()
+                .bucket(&plain)
+                .prefix(&prefix)
+                .send()
+                .await
+                .unwrap();
+            assert!(listed.versions().is_empty(), "{listed:?}");
 
-    // Clean up: the lab's root credentials may bypass governance.
-    for (key, version) in written {
-        client
-            .delete_object()
-            .bucket(&bucket)
-            .key(&key)
-            .version_id(version)
-            .bypass_governance_retention(true)
-            .send()
+            // A locked bucket: written, checked, and locked in the store.
+            let bucket = locked_bucket();
+            let object_uri = format!("s3://{bucket}/{prefix}/bundle.segment");
+            let before = unix_now();
+            let command = vtop_cli::tier_tools::run_tier_copy(
+                tier_backend(&bucket).await.as_ref(),
+                &tier_request(&sealed, root, &object_uri),
+            )
             .await
-            .unwrap_or_else(|e| panic!("cleaning up {key}: {e:?}"));
-    }
+            .expect("a locked tier copy must succeed");
+            let vtop_meta::MetadataCommand::CommitTierEvidence {
+                object_version_id,
+                manifest_version_id,
+                ..
+            } = command
+            else {
+                panic!("not tier evidence: {command:?}");
+            };
+            let written = [
+                (
+                    format!("{prefix}/bundle.segment"),
+                    object_version_id.expect("the segment's version"),
+                ),
+                (
+                    format!("{prefix}/bundle.segment.manifest.json"),
+                    manifest_version_id.expect("the manifest's version"),
+                ),
+            ];
+            for (key, version) in &written {
+                let head = client
+                    .head_object()
+                    .bucket(&bucket)
+                    .key(key)
+                    .version_id(version)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    head.object_lock_mode().map(|m| m.as_str()),
+                    Some("GOVERNANCE"),
+                    "{key}"
+                );
+                let until = head.object_lock_retain_until_date().unwrap().secs();
+                assert!(
+                    until >= before + 86_400 && until <= unix_now() + 86_400 + 1,
+                    "{key} is retained one day from its write: {until}"
+                );
+            }
+
+            // Clean up: the lab's root credentials may bypass governance.
+            for (key, version) in written {
+                client
+                    .delete_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .version_id(version)
+                    .bypass_governance_retention(true)
+                    .send()
+                    .await
+                    .unwrap_or_else(|e| panic!("cleaning up {key}: {e:?}"));
+            }
+        },
+    )
+    .await;
 }
