@@ -175,7 +175,13 @@ services:
     networks: [lab]
 
 networks:
-  lab: {}
+  # Both subnets are pinned: Docker's own pools run out on a busy host, and
+  # lib/netem.py finds the middlebox's engine-facing interface as the one NOT on
+  # 10.77.x (the store side), so the lab side must be outside it.
+  lab:
+    ipam:
+      config:
+        - subnet: ${LINK_LAB_SUBNET:-10.251.47.0/24}
   store:
     ipam:
       config:
