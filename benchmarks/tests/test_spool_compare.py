@@ -373,3 +373,19 @@ def test_nothing_is_timed_or_crashed_for_a_system_whose_smoke_did_not_pass(tmp_p
     assert driver.smoke_failed(item._replace(cell="smoke")) is None
     with pytest.raises(runner.CellRefused, match="did not pass its smoke"):
         driver.execute(item)
+
+
+def test_the_harness_polling_is_taken_out_of_the_tools_request_counts():
+    # Review of #908: quiescence polls list the same store whose counters are the tool's request cost.
+    counts = {"PUT": 40, "GET": 0, "HEAD": 3, "LIST": 61, "POST": 0, "DELETE": 0, "OTHER": 0}
+    unit = {"PUT": 0, "GET": 0, "HEAD": 1, "LIST": 1, "POST": 0, "DELETE": 0, "OTHER": 0}
+    polls = 60
+    harness = {method: n * polls for method, n in unit.items()}
+    assert run.without_harness(counts, harness) == {"PUT": 40, "GET": 0, "HEAD": 0, "LIST": 1, "POST": 0,
+                                                    "DELETE": 0, "OTHER": 0}
+
+
+def test_a_live_run_that_lost_lines_did_not_sustain_its_rate():
+    assert run.live_sustained(100.0, 100.0, 0)
+    assert not run.live_sustained(100.0, 100.0, 9)  # every line accepted, nine never delivered
+    assert not run.live_sustained(100.0, 10.0, 0)

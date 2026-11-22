@@ -143,6 +143,7 @@ class Lab:
                     "DOCKER_SOCKET": "/var/run/docker.sock", "HARNESS_IMAGE": lab.HARNESS_IMAGE}
         self.profiles = ["--profile", system] + (["--profile", "tap"] if tap else [])
         self.ports: dict[str, int] = {}
+        self.polls = 0  # the harness's own listings, taken out of the store's request counts
         self.files = [COMPOSE]
         subnet = os.environ.get("VTOP_LAB_SUBNET")
         if subnet:
@@ -239,6 +240,7 @@ class Lab:
         return time.time()
 
     def listing(self, prefix: str) -> list[dict[str, Any]]:
+        self.polls += 1
         out = self.mc(f"mc ls --json --recursive lab/{BUCKET}/{prefix}/ || true")
         return [entry for entry in (json.loads(line) for line in out.splitlines() if line.strip())
                 if entry.get("type") == "file"]
@@ -518,6 +520,17 @@ class Runner:
             entries = quiesce(lambda: tool.listing(prefix), tool.running, quiet=QUIET_SECONDS, timeout=timeout)
             ended = time.time()
         after = tool.request_counts() if before is not None else None
+        harness_requests = None
+        if before is not None:
+            # The harness's own listings (quiescence polling) hit the same store whose counters are the tool's
+            # request cost. One idle listing is measured now; the polls are taken out at that price. The price
+            # of a poll grows with the objects listed, so this is an upper bound on the harness's share and the
+            # tool's LIST count can be understated, never inflated by the run's length (review of #908).
+            idle_before = tool.request_counts()
+            tool.listing(prefix)
+            tool.polls -= 1
+            unit = store.requests_by_method(idle_before, tool.request_counts())
+            harness_requests = {method: unit[method] * tool.polls for method in unit}
         state = tool.gen("/state")
         expected = range(0, int(state["next_seq"]))
         snap = tool.snapshot(prefix, tempfile.mkdtemp(prefix="snap-", dir=logs))
@@ -541,7 +554,9 @@ class Runner:
             source_bytes = result.present_unique * line_bytes
             usage = cgroup.window(sampler.samples, started, ended)
             gib = source_bytes / 2**30
-            per = store.per_gib(store.requests_by_method(before, after), source_bytes)
+            counts = store.requests_by_method(before, after)
+            counts = without_harness(counts, harness_requests)
+            per = store.per_gib(counts, source_bytes)
             sizes = result.object_sizes or [0]
             out.update({"window_seconds": f"{window:.1f}", "lines_per_sec": f"{result.present_unique / window:.1f}",
                         "mib_per_sec": f"{source_bytes / 2**20 / window:.2f}", "source_bytes": source_bytes,
@@ -560,12 +575,24 @@ class Runner:
             measured = [1 for _seq, at in written if float(at) >= warm]
             achieved = len(measured) / float(p.get("measure_seconds", 600))
             out.update({"offered_rate": p["rate"], "achieved_rate": f"{achieved:.1f}",
-                        "sustained": "true" if stats.sustained(float(p["rate"]), achieved) else "false",
+                        # A tool that lost lines is not sustaining the offered rate, whatever it accepted:
+                        # its latency would be ranked over the surviving records only (review of #908).
+                        "sustained": "true" if live_sustained(float(p["rate"]), achieved, result.gaps) else "false",
                         "visible_p50_ms": f"{stats.percentile(lags, 50):.0f}" if lags else "",
                         "visible_p99_ms": f"{stats.percentile(lags, 99):.0f}" if lags else ""})
         if sampler.errors:
             out["note"] = f"{len(sampler.errors)} cgroup samples failed: {sampler.errors[0][:120]}"
         return out
+
+
+def without_harness(counts: dict[str, int], harness: dict[str, int]) -> dict[str, int]:
+    """The tool's request counts: the store's, less the harness's own polling, never below zero."""
+    return {method: max(0, counts[method] - harness.get(method, 0)) for method in counts}
+
+
+def live_sustained(offered: float, achieved: float, gaps: int) -> bool:
+    """A live run sustained the offered rate only if the lines were delivered too."""
+    return stats.sustained(offered, achieved) and not gaps
 
 
 def live_rate(run_dir: str, item: plans.Planned, fraction: float, fixed: Any = None) -> float:
