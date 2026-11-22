@@ -179,6 +179,9 @@ def test_snapshot_reads_a_mirror_and_mc_timestamps(tmp_path):
     snap = checker.snapshot_from_dir(str(tmp_path), listing, ["u"])
     assert snap.objects == {"p/x.gz": b"abc"}
     assert snap.last_modified["p/x.gz"] == pytest.approx(1795341600.123457, abs=1e-5)
+    # MinIO prints as few fractional digits as it needs, and none at all on a whole second.
+    assert checker.parse_time("2026-11-22T10:00:00.45Z") == pytest.approx(1795341600.45)
+    assert checker.parse_time("2026-11-22T10:00:00Z") == 1795341600.0
 
 
 # --------------------------------------------------------------- 2-3 registry
