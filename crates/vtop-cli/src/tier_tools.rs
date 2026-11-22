@@ -373,7 +373,7 @@ pub async fn run_tier_copy(
     }
     // 3b. Under the Object Lock profile, the retention the store kept on the
     //     exact versions written, judged against what each write asked for.
-    if request.object_lock.is_some() {
+    if let Some(lock) = &request.object_lock {
         let now_secs = unix_now_secs();
         check_tier_retention(
             backend,
@@ -381,6 +381,7 @@ pub async fn run_tier_copy(
             &request.object_uri,
             stored_segment.version_id.as_deref(),
             stored_segment.retention,
+            lock,
             now_secs,
         )
         .await?;
@@ -390,6 +391,7 @@ pub async fn run_tier_copy(
             &manifest_uri,
             stored.version_id.as_deref(),
             stored.retention,
+            lock,
             now_secs,
         )
         .await?;
@@ -676,12 +678,21 @@ async fn object_lock_preflight(
 /// engine does before VERIFIED. Any answer but a lock that meets it refuses
 /// the copy, so no evidence is proposed for an object that is not locked as
 /// configured. The objects already written stay in the store.
+///
+/// `requested` is what the write asked for, and for a multipart upload that a
+/// retry found already completed it is the retention persisted by the run
+/// that created it, under that run's profile. It is judged against `lock`,
+/// the profile of this run, too: a copy retried with a stronger mode or a
+/// legal hold must not take the older, weaker lock as its own (review of
+/// #868). The date is left to the persisted retention, as the engine does,
+/// since a session fixes it at creation.
 async fn check_tier_retention(
     backend: &dyn UploadBackend,
     what: &str,
     uri: &str,
     version_id: Option<&str>,
     requested: Option<vtop_upload::RequestedRetention>,
+    lock: &vtop_core::config::ObjectLockConfig,
     now_secs: i64,
 ) -> Result<(), String> {
     const STEP: &str = "object lock check";
@@ -707,6 +718,19 @@ async fn check_tier_retention(
             ),
         ));
     };
+    if requested.mode != lock.mode || requested.legal_hold != lock.legal_hold {
+        return Err(refuse(
+            STEP,
+            format!(
+                "the {what} {uri} (version {version_id}) was written under mode {} with \
+                 legal_hold={}, not the mode {} with legal_hold={} that upload.object_lock \
+                 sets now (an interrupted copy finished by a run with another profile); no \
+                 evidence was proposed. Remove the object version, or run the copy again with \
+                 the profile it was written under",
+                requested.mode, requested.legal_hold, lock.mode, lock.legal_hold
+            ),
+        ));
+    }
     let mut expected = requested.expectation();
     expected.retain_until_at_least_unix_secs =
         expected.retain_until_at_least_unix_secs.max(now_secs);
@@ -1611,6 +1635,58 @@ mod tests {
         run_tier_copy(&backend, &locked_request(&sealed, root))
             .await
             .expect("a longer retention than asked for is a lock");
+    }
+
+    /// Review of #868: a copy interrupted after its multipart upload completed
+    /// and retried under a stronger profile gets back the weaker retention the
+    /// first run persisted. That passes the store's check of its own lock, but
+    /// it is not the profile now configured: refused, with no evidence.
+    #[tokio::test]
+    async fn a_retention_persisted_under_a_weaker_profile_is_not_accepted_by_a_stronger_one() {
+        let weak = lock_config();
+        let backend = MockBackend::new().with_object_lock(ObjectLockPolicy::from_config(&weak));
+        let directory = tempfile::tempdir().unwrap();
+        let sealed = seal_bundle(directory.path());
+        let stored = backend
+            .put_object(&sealed, SEGMENT_URI, None)
+            .await
+            .unwrap();
+        let version = stored.version_id.clone().unwrap();
+        let check = |lock: vtop_core::config::ObjectLockConfig| {
+            let (backend, version, retention) = (&backend, version.clone(), stored.retention);
+            async move {
+                check_tier_retention(
+                    backend,
+                    "segment",
+                    SEGMENT_URI,
+                    Some(&version),
+                    retention,
+                    &lock,
+                    unix_now_secs(),
+                )
+                .await
+            }
+        };
+        check(weak.clone())
+            .await
+            .expect("the profile the object was written under is accepted");
+        for stronger in [
+            vtop_core::config::ObjectLockConfig {
+                mode: vtop_core::config::ObjectLockMode::Compliance,
+                ..weak.clone()
+            },
+            vtop_core::config::ObjectLockConfig {
+                legal_hold: true,
+                ..weak.clone()
+            },
+        ] {
+            let error = check(stronger)
+                .await
+                .expect_err("a weaker persisted lock was accepted under a stronger profile");
+            for part in ["refusing at object lock check", "sets now", "no evidence"] {
+                assert!(error.contains(part), "{part:?} missing: {error}");
+            }
+        }
     }
 
     /// A retention that cannot be read is no lock either: refused, naming the
