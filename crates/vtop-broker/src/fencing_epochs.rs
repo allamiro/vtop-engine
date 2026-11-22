@@ -105,6 +105,82 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use vtop_log::env::{Env, OpenMode, StorageFile};
 
+/// Whether a replica's epoch history is broken, and why (#881).
+///
+/// Broken means a write to the epoch journal failed, so the vector this
+/// replica would offer may have a hole: it must not be reconciled against,
+/// and the replica answers every fence and promotion probe with no history
+/// at all. That refusal is deliberate and stays; what this type adds is that
+/// it is no longer silent. The first failure prints one ERROR line naming
+/// the replica, what failed, what the replica now does, and what an operator
+/// must do; the reason is kept for the exporter's
+/// `vtop_broker_epoch_history_broken` gauge and for anyone who asks.
+#[derive(Debug, Default)]
+pub struct EpochHistoryHealth {
+    broken: std::sync::atomic::AtomicBool,
+    reason: std::sync::Mutex<Option<String>>,
+}
+
+impl EpochHistoryHealth {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the history is broken.
+    pub fn is_broken(&self) -> bool {
+        self.broken.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The operator message the break was reported with, if it is broken.
+    pub fn reason(&self) -> Option<String> {
+        self.reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Mark the history broken because `what` failed, with `error` if the
+    /// failure carried one. Idempotent; only the first break is reported, so
+    /// a replica that keeps failing does not repeat itself.
+    pub(crate) fn mark(
+        &self,
+        replica: &ReplicaName<'_>,
+        what: &str,
+        error: Option<&dyn std::fmt::Display>,
+    ) {
+        if self.broken.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let cause = match error {
+            Some(error) => format!("{what}: {error}"),
+            None => what.to_owned(),
+        };
+        let message = format!(
+            "replica {} of range {}/{}: its epoch history could not be written ({cause}). \
+             The history may now have a hole, so this replica answers every fence and \
+             promotion probe with no history: no leader gives it a replication session and no \
+             promotion counts its offset, and it stays out of the range until it is repaired. \
+             Free space on its data directory (or fix the storage fault), then stop it and \
+             run `vtopctl node repair` against a replica whose history is intact. Do not just \
+             restart it: a restart reopens the journal without the failed write and forgets \
+             that the history may have a hole (#881)",
+            replica.node_id, replica.topic, replica.range_id
+        );
+        eprintln!("error: {message}");
+        *self
+            .reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(message);
+    }
+}
+
+/// Which replica an [`EpochHistoryHealth`] message is about.
+pub(crate) struct ReplicaName<'a> {
+    pub(crate) node_id: uuid::Uuid,
+    pub(crate) topic: &'a str,
+    pub(crate) range_id: uuid::Uuid,
+}
+
 const MAGIC: &[u8; 8] = b"VTOPFNC1";
 const VERSION: u16 = 1;
 /// The same layout as [`VERSION`], with a kept dispute recorded beside the
@@ -450,13 +526,14 @@ impl FencingEpochJournal {
     /// record, the seed is lineage nobody authorized.
     pub(crate) fn seed_attested_history_in(
         journal: &std::sync::Mutex<Option<FencingEpochJournal>>,
-        broken: &std::sync::atomic::AtomicBool,
+        broken: &EpochHistoryHealth,
+        replica: &ReplicaName<'_>,
         epoch: u64,
     ) -> BrokerResult<bool> {
         let mut guard = journal
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if broken.load(std::sync::atomic::Ordering::SeqCst) {
+        if broken.is_broken() {
             return Err(BrokerError::EpochJournalCorrupt(
                 "this replica's epoch history is broken; an attested history cannot be written \
                  over it"
@@ -468,8 +545,8 @@ impl FencingEpochJournal {
                 "no epoch journal is attached to this replica".to_owned(),
             ));
         };
-        journal.seed_attested_history(epoch).inspect_err(|_| {
-            broken.store(true, std::sync::atomic::Ordering::SeqCst);
+        journal.seed_attested_history(epoch).inspect_err(|error| {
+            broken.mark(replica, "writing an attested history", Some(error));
         })
     }
 
@@ -1734,13 +1811,19 @@ mod tests {
     /// missing journal are refused and write nothing.
     #[test]
     fn the_guarded_attested_seed_refuses_a_broken_or_missing_journal() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Mutex;
 
+        let name = ReplicaName {
+            node_id: uuid::Uuid::from_u128(1),
+            topic: "events.v1",
+            range_id: uuid::Uuid::from_u128(2),
+        };
         let dir = TempDir::new().unwrap();
         let attached = Mutex::new(Some(journal(&dir)));
-        let healthy = AtomicBool::new(false);
-        assert!(FencingEpochJournal::seed_attested_history_in(&attached, &healthy, 9).unwrap());
+        let healthy = EpochHistoryHealth::new();
+        assert!(
+            FencingEpochJournal::seed_attested_history_in(&attached, &healthy, &name, 9).unwrap()
+        );
         assert_eq!(
             attached.lock().unwrap().as_ref().unwrap().entries(),
             starts(&[(9, 0)]).as_slice()
@@ -1748,9 +1831,10 @@ mod tests {
 
         let other = TempDir::new().unwrap();
         let broken_journal = Mutex::new(Some(journal(&other)));
-        let broken = AtomicBool::new(true);
+        let broken = EpochHistoryHealth::new();
+        broken.mark(&name, "a test", None);
         assert!(matches!(
-            FencingEpochJournal::seed_attested_history_in(&broken_journal, &broken, 9),
+            FencingEpochJournal::seed_attested_history_in(&broken_journal, &broken, &name, 9),
             Err(BrokerError::EpochJournalCorrupt(_))
         ));
         assert!(broken_journal
@@ -1760,13 +1844,53 @@ mod tests {
             .unwrap()
             .entries()
             .is_empty());
-        assert!(broken.load(Ordering::SeqCst));
+        assert!(broken.is_broken());
 
         let none: Mutex<Option<FencingEpochJournal>> = Mutex::new(None);
         assert!(matches!(
-            FencingEpochJournal::seed_attested_history_in(&none, &AtomicBool::new(false), 9),
+            FencingEpochJournal::seed_attested_history_in(
+                &none,
+                &EpochHistoryHealth::new(),
+                &name,
+                9
+            ),
             Err(BrokerError::EpochJournalCorrupt(_))
         ));
+    }
+
+    /// #881: only the first break is reported, with what to do, and the
+    /// message names the replica.
+    #[test]
+    fn a_history_break_is_reported_once_with_the_remedy() {
+        let name = ReplicaName {
+            node_id: uuid::Uuid::from_u128(0xA1),
+            topic: "events.v1",
+            range_id: uuid::Uuid::from_u128(0xC1),
+        };
+        let health = EpochHistoryHealth::new();
+        assert!(!health.is_broken());
+        assert_eq!(health.reason(), None);
+        health.mark(
+            &name,
+            "recording an adopted epoch",
+            Some(&"No space left on device"),
+        );
+        let first = health.reason().unwrap();
+        assert!(
+            first.contains("00000000-0000-0000-0000-0000000000a1"),
+            "{first}"
+        );
+        assert!(
+            first.contains("recording an adopted epoch: No space left on device"),
+            "{first}"
+        );
+        assert!(first.contains("vtopctl node repair"), "{first}");
+        health.mark(&name, "a later failure", None);
+        assert_eq!(
+            health.reason().unwrap(),
+            first,
+            "only the first break is reported"
+        );
     }
 
     fn header_version(dir: &TempDir) -> u16 {

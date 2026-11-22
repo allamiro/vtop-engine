@@ -30,8 +30,19 @@ python3 benchmarks/kafka_compare/regenerate.py
 
 Useful knobs: `--sizes 100,1024`, `--reps 3`, `--sat-records 100:3000000,1024:1000000` (records per
 saturation run AND per consume run, per record size), `--fixed-seconds 30` (a fixed-rate run sends rate x this many records),
-`--smoke-records`, `--no-consume`, `--rebuild`, `--run-id` (one path component). Every one is checked
-before any Docker work. A run writes `results/<run-id>/` and never overwrites another. Unlike
+`--smoke-records`, `--no-consume`, `--rebuild`, `--run-id` (one path component), `--max-hours 30`.
+Every one is checked before any Docker work, and so is the matrix's projected run time (`plan.py`):
+a matrix projected past `--max-hours` is refused before the first container starts.
+
+```bash
+# What a run directory still lacks, whatever its state: exit 0 when every expected row is there,
+# 2 with the missing row keys listed otherwise.
+python3 benchmarks/kafka_compare/run.py --check benchmarks/kafka_compare/results/<run-id>
+# The cells, row count and projected hours of a matrix (or an environment.json).
+python3 benchmarks/kafka_compare/plan.py matrix.json --max-hours 30
+```
+
+A run writes `results/<run-id>/` and never overwrites another. Unlike
 `benchmarks/results/` (git-ignored by `benchmarks/.gitignore`, whose `results/*` is anchored to that
 directory), `kafka_compare/results/<run-id>/` is committed on purpose: the published reports are generated
 from it, and a reader can check every number against it.
@@ -64,8 +75,26 @@ For each record size, Kafka first and then VTOP:
 
 ## Output
 
-`results/<run-id>/results.csv`: one row per (system, mode, record size, repetition, offered load), with
-the run-constant columns (`run_id`, `env_fingerprint`, `vtop_commit`, `kafka_image`, `client`, `profile`).
+`results/<run-id>/results.csv`, schema 2 (#596): one row per key
+(`system`, `mode`, `record_size`, `partitions`, `producers`, `compression`, `acks`, `profile`, `repetition`,
+`load_basis`, `load_pct`), with the run-constant columns (`run_id`, `env_fingerprint`, `vtop_commit`,
+`kafka_image`, `client`). `mode` is `saturation`, `fixed_rate`, `consume` or `e2e` (end-to-end latency);
+`compression` is the producer's codec; `profile` is `defaults` or `fsync-parity`; `load_basis` says what a
+rated row's percentage is of: `kafka` (Kafka's median saturation for the cell) or `common` (the slower
+system's), blank on unrated rows. `lat_basis` is `single`, or `worst-of-N` when N producers ran and the row
+carries the worst producer's percentiles. `records_produced` is set on `e2e` rows, whose `records` is the
+count consumed; `window_start_ms` and `window_end_ms` bound the measurement window that the resource
+counters cover. `same_config_as` names the profile a row was measured under when it repeats that
+measurement: VTOP's node configuration is the same under both profiles, so it runs once per cell and its rows
+are recorded under each. Which rows a matrix owes is defined once, in `plan.py`, for the runner, `--check`
+and the report.
+
+Schema 1, the layout of the committed phase-1 run (`20261109T232328Z`), still loads. It had no
+`compression`, `same_config_as`, `load_basis`, `records_produced`, `lat_basis` or window columns, and held
+`profile` constant across the run. Its rows are read as schema 2 with compression `none`, load basis `kafka`
+on fixed-rate rows and latency basis `single`, which is what that run did, and its report is unchanged
+byte for byte.
+
 `status` is `ok`, `failed` (the run ran and did not produce a usable result) or `refused` (it could not run,
 e.g. the smoke failed); a row that is not `ok` says why in `note`. Latencies are the perf tool's own
 percentiles in whole milliseconds; MiB/s is the tool's "MB/sec" (2^20 bytes).
@@ -89,10 +118,15 @@ before pulling or building anything, when the disk cannot be named, and say what
 ## Report
 
 `report.py` refuses (exit 2, the reason on stderr, nothing written) when the CSV or `environment.json` is
-missing, `schema_version` is malformed or newer than the report reads, a schema-2 run records no
-`host_disk`, the run did not finish, a row is malformed or a `failed`/`refused` row gives no reason, any expected
-row is missing or duplicated, rows come from more than one environment, commit, image, client or profile,
-the CSV's run id, commit, image, client, profile or `acks` differ from what `environment.json` records, or
+missing, `environment.json`'s `schema_version` is malformed or newer than the report reads, an
+`environment.json` of schema 2 records no `host_disk`, the run did not finish, a row is malformed or a `failed`/`refused` row gives no reason, any expected
+row is missing or duplicated, rows come from more than one environment, commit, image or client (or, in a run whose
+CSV is schema 1, profile), the run varies along a dimension this report does not draw yet (partitions,
+producers, compression, acks, profile, or a load basis other than `kafka`; the grouped charts are #600's)
+or holds a value its text does not say (a codec other than none, acks other than all, a profile other
+than the environment's, end-to-end rows), a row that repeats another profile's measurement does not match
+a measured row under that profile, the CSV's run id, commit, image, client or `acks` (and, in a run whose CSV is
+schema 1, profile) differ from what `environment.json` records, or
 the CSV's fingerprint does not match `environment.json` (rule 9). A cell that did not run is a row with
 status `refused` (or `failed`, if it ran and gave no usable result); the report accepts such a row, does not
 refuse the run over it, and the chart shows "no result" in its place.

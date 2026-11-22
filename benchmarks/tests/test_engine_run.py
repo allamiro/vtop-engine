@@ -929,7 +929,7 @@ def test_a_long_lived_run_with_a_competitor_is_refused_before_it_costs_anything(
                         classmethod(lambda cls, sc, shape: object()))
 
     @contextlib.contextmanager
-    def contended(_spec, vtop_bytes):
+    def contended(_spec, vtop_bytes, **_diagnostics):
         raise AssertionError("no competitor may start beside a long-lived engine")
         yield  # pragma: no cover
 
