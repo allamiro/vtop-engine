@@ -31,7 +31,8 @@ def environment(run_id: str, plan_name: str = "full", host_class: str = "dedicat
                   "docker_platform": "Docker Engine", "docker_vm_cpus": 8, "docker_vm_kernel": "6.1",
                   "tool_limits": "2 CPUs, 2g"}
     return {"schema_version": schema.SCHEMA_VERSION, "kind": KIND.name, "run_id": run_id, "run_state": "complete",
-            "started_at": "2026-11-22T00:00:00+00:00", "private": False, "store": "MinIO (lab build, upstream archived)",
+            "started_at": "2026-11-22T00:00:00+00:00", "private": False,
+            "store": "MinIO (lab build, upstream archived)",
             "comparable": comparable, "plan": plan, "configs": configs, "telemetry": {}, "events": [],
             "deviations": ["fixture: no deviation was measured"]}
 

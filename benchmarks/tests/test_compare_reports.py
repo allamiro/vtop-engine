@@ -94,7 +94,7 @@ def test_report_refuses_when_a_system_has_no_row_in_a_cell_it_was_expected_in(tm
     csv_path = os.path.join(run, "archive.csv")
     with open(csv_path) as handle:
         lines = handle.read().splitlines(keepends=True)
-    kept = [line for line in lines if not (",vector,acks,live," in line)]
+    kept = [line for line in lines if ",vector,acks,live," not in line]
     assert len(kept) < len(lines)
     with open(csv_path, "w") as handle:
         handle.writelines(kept)

@@ -277,11 +277,11 @@ def setup_matplotlib(salt: str):
 
 def draw_chart(plt, chart: Chart, rows, kind, systems, profiles, names, group_label, footer: str,
                img_dir: str) -> list[str]:
-    from kafka_compare import footer as kfooter
-
     import textwrap
 
     from matplotlib.ticker import MaxNLocator
+
+    from kafka_compare import footer as kfooter
 
     palette = colours.series(colours_order(kind), systems)
     panels = len(chart.metrics)
