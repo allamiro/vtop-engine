@@ -1,0 +1,15 @@
+# Kafka's `fsync-parity` profile (#595 rule 4, #600): every broker flushes the log after every message, so an
+# acknowledgement means "replicated AND on disk on the in-sync replicas". Layered after compose.kafka.yml by
+# run.py for the end-to-end runs of that profile; the topic gets flush.messages=1 as well, when run.py creates it.
+# The same setting crash.py's fsync-parity configuration uses, so the latency cost measured here is the cost of
+# the configuration whose crash results sit beside it.
+services:
+  kafka-1:
+    environment:
+      KAFKA_LOG_FLUSH_INTERVAL_MESSAGES: "1"
+  kafka-2:
+    environment:
+      KAFKA_LOG_FLUSH_INTERVAL_MESSAGES: "1"
+  kafka-3:
+    environment:
+      KAFKA_LOG_FLUSH_INTERVAL_MESSAGES: "1"
