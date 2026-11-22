@@ -28,3 +28,29 @@ pub enum LeaseState {
 pub trait LeaseView: Send + Sync + 'static {
     fn lease(&self) -> LeaseState;
 }
+
+/// The node that holds the range now, as this node's view of the lease names
+/// it (#751).
+///
+/// A candidate that does not hold the range still answers Metadata, and a
+/// client that asked it needs the holder to go to: a client told only about a
+/// dead broker has nowhere to go. `broker_id` is the holder's Kafka broker id,
+/// already mapped from whatever the lease names it by; `epoch` is the
+/// fencing epoch it holds the range at, which Metadata hands out as the
+/// partition's leader epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RangeHolder {
+    pub broker_id: i32,
+    pub epoch: u64,
+}
+
+/// Who holds the range, read without blocking (#751).
+///
+/// `None` is "not known right now": the lease has no holder yet, the view
+/// has not read one, or the holder is a node with no Kafka endpoint. It is
+/// never a guess: a gateway that names a holder the client cannot reach
+/// strands the client, and one that names itself while it does not hold the
+/// range sends the client back to the node that refused it.
+pub trait HolderView: Send + Sync + 'static {
+    fn holder(&self) -> Option<RangeHolder>;
+}

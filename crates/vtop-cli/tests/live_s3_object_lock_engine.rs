@@ -16,7 +16,10 @@
 //!   batch's and the receipt's retention from the store and finds both
 //!   locked; once the receipt's retention is cleared (by a principal allowed
 //!   to bypass governance), it reports the receipt, and only the receipt,
-//!   as a `missing` retention finding (#710).
+//!   as a `missing` retention finding (#710);
+//! - `vtopctl tier copy` with the profile refuses a bucket without Object
+//!   Lock before writing, and against a locked bucket writes the segment and
+//!   its manifest under the lock and checks both before the evidence.
 //!
 //! Run against the compose MinIO lab with:
 //! `VTOP_TEST_S3_ENDPOINT=http://localhost:9000 AWS_ACCESS_KEY_ID=minioadmin
@@ -450,4 +453,204 @@ async fn live_a_replay_over_an_ended_lock_commits_a_fresh_locked_object() {
         },
     )
     .await;
+}
+
+/// A sealed segment and its manifest in `dir`, as a data node leaves them
+/// for `vtopctl tier copy`; and the chunk-tree root the copy is pinned to.
+fn seal_segment(dir: &Path) -> (std::path::PathBuf, blake3::Hash) {
+    use vtop_log::{
+        ActiveSegment, Durability, LogRecord, RangeLineage, SegmentConfigV2, SegmentDescriptorV2,
+        SegmentManifestV2,
+    };
+    let descriptor = SegmentDescriptorV2 {
+        segment_id: uuid::Uuid::from_u128(0x30),
+        topic: "events.v1".to_owned(),
+        topic_epoch: 1,
+        lineage: RangeLineage::root(uuid::Uuid::from_u128(0x21)),
+        base_offset: 0,
+        segment_generation: 0,
+        creation_node_id: uuid::Uuid::from_u128(0x10),
+        creation_fencing_epoch: 1,
+    };
+    let config = SegmentConfigV2 {
+        max_record_bytes: 1024,
+        max_group_bytes: 4096,
+        max_segment_bytes: 16 * 1024,
+        max_segment_records: 100,
+        index_stride: 2,
+        chunk_size: 64 * 1024,
+    };
+    let mut segment =
+        ActiveSegment::create_v2(dir.join("bundle.active"), descriptor, config).unwrap();
+    let records: Vec<LogRecord> = (0..3)
+        .map(|sequence| LogRecord {
+            producer_id: uuid::Uuid::from_u128(0x54),
+            producer_epoch: 2,
+            sequence,
+            timestamp_millis: 1_700_000_000_000 + sequence as i64,
+            attributes: 0,
+            key: b"key".to_vec(),
+            value: format!("value-{sequence}").into_bytes(),
+        })
+        .collect();
+    segment.append_group(&records, Durability::Fsync).unwrap();
+    drop(segment.seal_v2(None).unwrap());
+    let manifest: SegmentManifestV2 =
+        serde_json::from_slice(&std::fs::read(dir.join("bundle.manifest.json")).unwrap()).unwrap();
+    (
+        dir.join("bundle.segment"),
+        blake3::Hash::from_hex(&manifest.chunk_tree_root).unwrap(),
+    )
+}
+
+/// A `vtopctl tier copy` request for `sealed` to `object_uri`, under a
+/// one-day governance lock.
+fn tier_request(
+    sealed: &Path,
+    root: blake3::Hash,
+    object_uri: &str,
+) -> vtop_cli::tier_tools::TierCopyRequest {
+    vtop_cli::tier_tools::TierCopyRequest {
+        segment: sealed.to_path_buf(),
+        topic_uuid: uuid::Uuid::from_u128(0x20),
+        range_uuid: uuid::Uuid::from_u128(0x21),
+        segment_uuid: uuid::Uuid::from_u128(0x30),
+        expected_generation: 1,
+        fencing_epoch: 1,
+        expected_root: root,
+        object_uri: object_uri.to_owned(),
+        require_versioning: true,
+        keyring: std::collections::BTreeMap::new(),
+        verifier_node_uuid: uuid::Uuid::from_u128(0x10),
+        verified_term: 2,
+        request_id: uuid::Uuid::from_u128(0xfeed),
+        issued_at_ms: 0,
+        multipart: None,
+        object_lock: Some(ObjectLockConfig {
+            mode: ObjectLockMode::Governance,
+            retain_days: 1,
+            legal_hold: false,
+        }),
+    }
+}
+
+/// The tier's upload config, as `vtopctl tier copy --upload-config` reads
+/// it, with the Object Lock block.
+async fn tier_backend(bucket: &str) -> std::sync::Arc<dyn vtop_upload::UploadBackend> {
+    let s = settings();
+    let endpoint = s
+        .endpoint
+        .map(|e| format!("endpoint_url: {e}\n"))
+        .unwrap_or_default();
+    let upload: vtop_core::config::UploadConfig = serde_yaml::from_str(&format!(
+        "backend: s3_native\nbucket: {bucket}\n{endpoint}region: {}\n\
+         force_path_style: {}\nverify_tls: {}\nrequire_object_versioning: true\n\
+         object_lock:\n  mode: governance\n  retain_days: 1\n",
+        s.region, s.force_path_style, s.verify_tls
+    ))
+    .unwrap();
+    vtop_upload::build_backend(&upload).await.unwrap()
+}
+
+/// #684 for the cluster plane's cold tier: `vtopctl tier copy` with
+/// `upload.object_lock` writes the segment and its manifest under the lock
+/// and checks both retentions before it proposes the evidence; the store,
+/// read behind its back, keeps both versions in governance mode for a day.
+/// Against a bucket without Object Lock it refuses before writing anything.
+#[tokio::test]
+#[ignore = "requires an S3-compatible endpoint with Object Lock"]
+async fn live_a_tier_copy_is_written_and_checked_under_the_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sealed, root) = seal_segment(dir.path());
+    let client = s3_client().await;
+
+    // A bucket without Object Lock: refused, nothing written.
+    let plain = plain_bucket();
+    let prefix = format!("vtop-it-684-tier-{}", unix_now());
+    let refused = vtop_cli::tier_tools::run_tier_copy(
+        tier_backend(&plain).await.as_ref(),
+        &tier_request(
+            &sealed,
+            root,
+            &format!("s3://{plain}/{prefix}/bundle.segment"),
+        ),
+    )
+    .await
+    .expect_err("a tier copy to a bucket without Object Lock was written");
+    assert!(
+        refused.contains(&format!(
+            "bucket {plain} does not have Object Lock enabled; nothing was copied"
+        )),
+        "{refused}"
+    );
+    let listed = client
+        .list_object_versions()
+        .bucket(&plain)
+        .prefix(&prefix)
+        .send()
+        .await
+        .unwrap();
+    assert!(listed.versions().is_empty(), "{listed:?}");
+
+    // A locked bucket: written, checked, and locked in the store.
+    let bucket = locked_bucket();
+    let object_uri = format!("s3://{bucket}/{prefix}/bundle.segment");
+    let before = unix_now();
+    let command = vtop_cli::tier_tools::run_tier_copy(
+        tier_backend(&bucket).await.as_ref(),
+        &tier_request(&sealed, root, &object_uri),
+    )
+    .await
+    .expect("a locked tier copy must succeed");
+    let vtop_meta::MetadataCommand::CommitTierEvidence {
+        object_version_id,
+        manifest_version_id,
+        ..
+    } = command
+    else {
+        panic!("not tier evidence: {command:?}");
+    };
+    let written = [
+        (
+            format!("{prefix}/bundle.segment"),
+            object_version_id.expect("the segment's version"),
+        ),
+        (
+            format!("{prefix}/bundle.segment.manifest.json"),
+            manifest_version_id.expect("the manifest's version"),
+        ),
+    ];
+    for (key, version) in &written {
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(version)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            head.object_lock_mode().map(|m| m.as_str()),
+            Some("GOVERNANCE"),
+            "{key}"
+        );
+        let until = head.object_lock_retain_until_date().unwrap().secs();
+        assert!(
+            until >= before + 86_400 && until <= unix_now() + 86_400 + 1,
+            "{key} is retained one day from its write: {until}"
+        );
+    }
+
+    // Clean up: the lab's root credentials may bypass governance.
+    for (key, version) in written {
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(&key)
+            .version_id(version)
+            .bypass_governance_retention(true)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("cleaning up {key}: {e:?}"));
+    }
 }

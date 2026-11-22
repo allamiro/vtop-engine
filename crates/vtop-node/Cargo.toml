@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
 
 [[bin]]
 name = "vtop-node"
@@ -24,6 +25,9 @@ tracing = { workspace = true }
 tokio-rustls = { workspace = true }
 uuid = { workspace = true }
 vtop-broker = { workspace = true }
+# The secret-file permission rule (#733), applied to the TLS private keys a
+# node config names (#732, S1): one rule for the engine and the node.
+vtop-core = { workspace = true }
 vtop-log = { workspace = true }
 vtop-meta = { workspace = true }
 vtop-observe = { workspace = true }

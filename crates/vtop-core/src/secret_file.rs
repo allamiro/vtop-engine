@@ -1,8 +1,9 @@
 //! Permission checks on the files that hold secrets or the ledger (#733).
 //!
 //! A manifest MAC key file, the `engine.state_store` secret file, the SQLite
-//! ledger (with its `-wal` and `-shm` files) and the audit file are refused
-//! when other local users can reach them:
+//! ledger (with its `-wal` and `-shm` files), the audit file, and every TLS
+//! private key a `vtop-node` config names (#732) are refused when other local
+//! users can reach them:
 //!
 //! | The file's mode, as the engine sees it | Result |
 //! |---|---|
@@ -59,6 +60,9 @@ pub enum SecretFileKind {
     /// shipper reading the trail through a shared group is the documented
     /// pattern, and the file holds no secret.
     AuditLog,
+    /// A TLS private key named in a `vtop-node` config (#732, S1): the
+    /// node's identity on every plane that uses it.
+    TlsPrivateKey,
 }
 
 impl SecretFileKind {
@@ -69,6 +73,7 @@ impl SecretFileKind {
             SecretFileKind::StateStoreSecret => "state_store_secret",
             SecretFileKind::StateStoreDatabase => "state_store_database",
             SecretFileKind::AuditLog => "audit_log",
+            SecretFileKind::TlsPrivateKey => "tls_private_key",
         }
     }
 
@@ -88,6 +93,7 @@ impl SecretFileKind {
             SecretFileKind::StateStoreSecret => "point the engine at another database",
             SecretFileKind::StateStoreDatabase => "rewrite the ledger",
             SecretFileKind::AuditLog => "rewrite the audit trail",
+            SecretFileKind::TlsPrivateKey => "replace the node's TLS identity",
         }
     }
 
@@ -98,6 +104,9 @@ impl SecretFileKind {
             SecretFileKind::StateStoreSecret => "the state-store connection string",
             SecretFileKind::StateStoreDatabase => "the ledger",
             SecretFileKind::AuditLog => "the audit trail",
+            SecretFileKind::TlsPrivateKey => {
+                "the TLS private key, and so act as this node on every plane it serves"
+            }
         }
     }
 }

@@ -48,6 +48,33 @@ cells:
     since: v0.7.0
     directions: [upgrade, forward]
 
+  # A data node's directory (scripts/compat/cells/segments.sh, which runs
+  # scripts/upgrade-compat.sh): the release's vtop-node writes it (the single
+  # `range.active` before v0.3.0, sealed segments from v0.3.0, segment format
+  # v2 from v0.5.0) and this build must open it, quarantine nothing, serve
+  # every record byte for byte and again after a restart. Upgrade only:
+  # downgrade of a data directory is neither tested nor supported.
+  segments:
+    since: v0.2.0
+    directions: [upgrade]
+
+  # A metadata voter's directory (scripts/compat/cells/meta.sh): the Raft log,
+  # the snapshot, and the applied, purged and hard-state files.
+  #   upgrade  the release's vtop-node writes it with
+  #            scripts/compat/meta-scenario.sh, raised to the highest feature
+  #            level it accepts, and this build opens it, answers a
+  #            compare-and-swap only the replayed state satisfies, raises the
+  #            level and comes back after a SIGKILL;
+  #   forward  this build writes it, at its baseline level and raised to its
+  #            highest, and the release opens each, takes a write and comes
+  #            back after a SIGKILL. A release below the raised level opens
+  #            it and reports a lower level (it applies the raise as a
+  #            rejection): silent, not refused, which the compatibility page
+  #            records. v0.7.0 has no `node-versions` to read the level with.
+  meta:
+    since: v0.8.0
+    directions: [upgrade, forward]
+
   # The PostgreSQL ledger (cells/ledger-postgres.sh). The published archives
   # have no `postgres` feature, so the release is built from its tag with it,
   # and a throwaway server runs beside it: nightly and on demand only.
