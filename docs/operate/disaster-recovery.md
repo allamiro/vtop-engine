@@ -645,6 +645,8 @@ variables are described at the top of
 [`scripts/dr-drill/lib.sh`](https://github.com/allamiro/vtop-engine/blob/main/scripts/dr-drill/lib.sh).
 Each drill prints one `PASS` or `FAIL` line for every criterion above, writes
 its measurements to `result.json`, and exits non-zero if any criterion failed.
+For a second person's run, each takes `--handover`, `--check` and `--teardown`
+([The second person](#the-second-person)).
 
 CI runs them from the `disaster-recovery drills` workflow, nightly and on
 dispatch, never on a pull request: each run builds `vtopctl` and starts
@@ -693,17 +695,66 @@ promise about yours, and the first CI runs will add their own column.
 The runbooks above are run by their author, and the drill is the same author
 following them. What remains is a person who did not write them running each
 one on a lab, within a stated time, with their notes folded back into the
-page. The drills stand a lab up in one command; a mode that stops after the
-disaster and hands the lab to the second person is not built, so for now the
-second person builds the topology the script's header describes, or runs the
-drill once to see it.
+page. Each drill has a mode for that: it builds the lab, causes the disaster,
+and stops, so that the second person starts from the same place the drill's
+recovery steps do and has to follow only this page.
+
+```bash
+# 1. The lab, and the disaster. Nothing is recovered.
+scripts/dr-drill/bucket-lost.sh target/debug/vtopctl --handover
+
+# 2. The second person follows the page's section for that disaster,
+#    in the lab, and stops the engine when they are done.
+
+# 3. Only the pass criteria, against what they left: RPO, RTO, pass or fail.
+DR_DRILL_WORKDIR=/tmp/vtop-dr-handover-bucket-lost \
+  scripts/dr-drill/bucket-lost.sh target/debug/vtopctl --check
+
+# 4. Remove the lab: containers, volumes, mounts, processes, the directory.
+DR_DRILL_WORKDIR=/tmp/vtop-dr-handover-bucket-lost \
+  scripts/dr-drill/bucket-lost.sh target/debug/vtopctl --teardown
+```
+
+`--handover` prints, and keeps in `HANDOVER.txt` in the lab's directory: the
+section of this page to follow; what the disaster destroyed and what the lab
+holds (the databases, topics, buckets and files by name, the configuration, the
+backup where the scenario has one); every endpoint with its credentials and
+how to reach it; `lab.env`, a file to source for the store's credentials, the
+ledger's connection string and any key; and the exact `--check` and
+`--teardown` commands. It runs none of the recovery steps, and it refuses to
+hand over a lab that is not in the state the drill expects (the disaster did
+not take). Names the person must use are given, so that the configuration and
+the check find what they make: the new database, the file the DR
+configuration is written to.
+
+`--check` runs only the pass criteria of the drill's outcome, against the lab
+as the person left it, and exits non-zero if one fails. It reports the RPO,
+which is the records lost, and the RTO, which is the time from the handover to
+the start of the check, so it includes the person's reading and typing: it is
+printed beside the bound above and not enforced, because the bound is the
+automated procedure's. It is safe to run again after a fix, and it removes
+nothing. What it cannot judge is what the person saw on the way (the audit's
+`FAIL storage` lines, for example): those are criteria of the drill's own run.
+
+A drill with legs hands over the first leg, or the one `--leg` names, and
+`--check` and `--teardown` follow the leg in the lab. The legs are:
+`ledger-lost` `file`, `kafka`, `kafka-rebuild`; `region-lost` `replicated`,
+`lagging`; `disk-full` `work`, `ledger`, `store`; `verification-failed`
+`engine`, `readback`, `rest`. `DR_DRILL_WORKDIR` names the lab's directory and
+defaults to `$TMPDIR/vtop-dr-handover-<drill>`; it must be empty for a
+handover. The key-rotation lab is the archive before the rotation: the person
+runs the procedure, writes the configuration they end step 4 with to
+`rotated.yaml` in the lab's directory, and `--check` judges that and the
+archive. The full-disk legs that mount a tmpfs need root or passwordless
+`sudo`, as in a run.
 
 For each runbook, the second person:
 
-1. causes the disaster in the drill's words (the script's header says how);
+1. starts the lab with `--handover`, and reads what it prints;
 2. follows only this page, notes every step that needed a guess, and times the
    run from the first step to the last check;
-3. sends the notes, which are folded into the page's steps.
+3. runs `--check`, and sends the notes and the check's report, which are
+   folded into the page's steps.
 
 | Runbook | Run by | Date | Time taken | Notes folded back |
 |---|---|---|---|---|
