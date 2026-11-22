@@ -218,7 +218,7 @@ struct ReplicaConfig {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NodeClientConfig {
+pub(crate) struct NodeClientConfig {
     range: RangeConfig,
     /// How the replica plane is dialed (#294): `tls` (the default) or
     /// `plaintext`, matching the range's `replica_transport`. Under
@@ -250,7 +250,7 @@ struct ReplicaReport {
     outcome: Result<vtop_protocol::ReplicaStatusResponse, String>,
 }
 
-fn load_config(path: &Path) -> Result<NodeClientConfig, String> {
+pub(crate) fn load_config(path: &Path) -> Result<NodeClientConfig, String> {
     let text =
         fs::read_to_string(path).map_err(|error| format!("read {}: {error}", path.display()))?;
     let config: NodeClientConfig = serde_yaml::from_str(&text)
@@ -568,12 +568,8 @@ async fn run_inner(command: NodeCommand, json: bool) -> Result<i32, String> {
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&json_output(
-                        &config,
-                        &reports,
-                        reference.as_ref()
-                    ))
-                    .map_err(|error| error.to_string())?
+                    crate::report::pretty(&json_output(&config, &reports, reference.as_ref()))
+                        .map_err(|error| error.to_string())?
                 );
             } else {
                 print_text(&config, &reports, reference.as_ref());
@@ -919,7 +915,7 @@ fn reconfigure_range(
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
+            crate::report::pretty(&serde_json::json!({
                 "outcome": outcome_name,
                 "resumed_from_sealed_tail": resumed,
                 "format_version": before.0,
@@ -1541,7 +1537,7 @@ async fn repair(
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({
+                    crate::report::report_json!({
                         "from": from.to_string(),
                         "directory": into.display().to_string(),
                         "segments_installed": installed.len(),
@@ -1598,7 +1594,7 @@ async fn repair(
     if json {
         println!(
             "{}",
-            serde_json::json!({
+            crate::report::report_json!({
                 "from": from.to_string(),
                 "directory": into.display().to_string(),
                 "segments_installed": installed.len(),
