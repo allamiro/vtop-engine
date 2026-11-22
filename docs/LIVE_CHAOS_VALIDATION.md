@@ -281,8 +281,9 @@ with the wall-clock instants it was asked for and answered (`invoke_ms`,
 
 A failed observation (a killed node, a frozen one, a metadata group
 mid-election) is recorded as failed and is evidence of nothing.
-`control_history_start` in `lib.sh` starts it, and `check_history` stops it
-and runs `check_control.py` over what it wrote, keeping the summary in
+`control_history_start` in `lib.sh` starts it, the scenario's exit stops it,
+and `check_history` runs `check_control.py` over what it has written so far
+(a scenario that goes on is checked again later), keeping the summary in
 `logs/control-check.json`:
 
 | Check | What fails it |

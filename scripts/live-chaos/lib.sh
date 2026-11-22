@@ -1142,9 +1142,9 @@ record_read() {
 CONTROL_RECORDER_PID=""
 
 # control_history_start <meta-ids...> [-- <name>=<metrics-addr>=<node-uuid> ...]
-# Starts the recorder in the background; check_history stops it and checks
-# what it wrote. CHAOS_CONTROL_LEASE_MS, CHAOS_CONTROL_STATUS_MS and
-# CHAOS_CONTROL_NODE_MS set the polling intervals.
+# Starts the recorder in the background; check_history checks what it has
+# written, and the scenario's exit stops it. CHAOS_CONTROL_LEASE_MS,
+# CHAOS_CONTROL_STATUS_MS and CHAOS_CONTROL_NODE_MS set the polling intervals.
 control_history_start() {
   local -a args=()
   while [[ $# -gt 0 && "$1" != "--" ]]; do
@@ -1177,12 +1177,14 @@ control_history_stop() {
   CONTROL_RECORDER_PID=""
 }
 
-# check_control_history — check what the recorder wrote. The summary is kept
-# in logs/control-check.json either way.
+# check_control_history — check what the recorder has written so far. The
+# recorder keeps running, so a scenario that goes on (scenario 23's second
+# failover) is recorded and checked again; a line it is writing at that
+# moment is ignored as cut short. The summary is kept in
+# logs/control-check.json either way.
 check_control_history() {
   local files=("$WORKDIR"/history/control/*.jsonl) report="$WORKDIR/logs/control-check.json"
   [[ -e "${files[0]}" ]] || return 0
-  control_history_stop
   if ! python3 "$SCRIPT_DIR/history/check_control.py" "${files[@]}" > "$report" 2>&1; then
     cat "$report" >&2
     fail "the control-plane history breaks a leadership promise (see $report)"
