@@ -31,6 +31,21 @@
 #   DR_DRILL_KEEP       set to keep the workdir and containers on success
 #   DR_DRILL_CPUS       the CPU cap of each helper container (default 1)
 #
+# Modes (the drill's arguments are `<vtopctl> [--handover | --check | --teardown] [--leg NAME]`):
+#   (none)      set the lab up, cause the disaster, follow the page, check, tear down.
+#   --handover  set the lab up and cause the disaster, then stop and leave the
+#               lab running for a second person: it prints the page section to
+#               follow, the lab's endpoints, credentials and environment, and how
+#               to tear it down, and runs none of the recovery steps (#735).
+#   --check     after the person has finished (and stopped the engine), run only
+#               the pass criteria against the lab and report RPO, RTO and
+#               pass or fail. It can be run again; it changes nothing.
+#   --teardown  remove the lab's containers, volumes, mounts, processes and
+#               workdir.
+# A drill with legs runs every leg unless --leg names one; --handover runs the
+# first leg when none is named. DR_DRILL_WORKDIR names the lab's directory; for
+# the three handover modes it defaults to $TMPDIR/vtop-dr-handover-<drill>.
+#
 # Needs bash 5 (EPOCHREALTIME), docker, python3 and curl.
 # shellcheck disable=SC2034  # variables set here are read by the drill scripts
 
@@ -77,11 +92,22 @@ fail() {
 # shellcheck disable=SC2329  # invoked via `trap`
 dr_cleanup() {
   local status=$?
-  [[ -z "$DR_ENGINE_PID" ]] || kill -9 "$DR_ENGINE_PID" 2> /dev/null || true
+  # A lab handed over, and a lab being checked, stay up: the person may still be
+  # working in it, and a failed check is run again after a fix.
+  if [[ ($DR_MODE == handover && $status -eq 0) || $DR_MODE == check ]]; then return; fi
+  dr_teardown_lab "$status"
+}
+# dr_teardown_lab <status>: stop everything the lab started, and remove it (a
+# failed run keeps its workdir and logs).
+dr_teardown_lab() {
+  local status="${1:-0}"
+  if [[ $DR_MODE != teardown ]] || dr_is_engine_pid "$DR_ENGINE_PID"; then
+    [[ -z "$DR_ENGINE_PID" ]] || kill -9 "$DR_ENGINE_PID" 2> /dev/null || true
+  fi
   dr_stop_extra
   local m
   for m in ${DR_MOUNTS[@]+"${DR_MOUNTS[@]}"}; do dr_as_root umount "$m" 2> /dev/null || true; done
-  if [[ -n "${DR_DRILL_KEEP:-}" && $status -eq 0 ]]; then
+  if [[ -n "${DR_DRILL_KEEP:-}" && $status -eq 0 && $DR_MODE == run ]]; then
     log "kept $DR_WORKDIR and containers ${DR_CONTAINERS[*]:-none}"
     return
   fi
@@ -89,20 +115,52 @@ dr_cleanup() {
   for c in ${DR_CONTAINERS[@]+"${DR_CONTAINERS[@]}"}; do docker rm -fv "$c" > /dev/null 2>&1 || true; done
   for v in ${DR_VOLUMES[@]+"${DR_VOLUMES[@]}"}; do docker volume rm -f "$v" > /dev/null 2>&1 || true; done
   # A failure keeps its logs. A clean run removes the directory unless the
-  # caller named it (CI reads the result and the logs from there).
-  if [[ $status -eq 0 && -z "${DR_DRILL_WORKDIR:-}" ]]; then rm -rf "$DR_WORKDIR"; fi
+  # caller named it (CI reads the result and the logs from there); a teardown
+  # of a handed-over lab removes it, its work being done.
+  if [[ $status -eq 0 && ( -z "${DR_DRILL_WORKDIR:-}" || $DR_MODE == teardown ) ]]; then rm -rf "${DR_WORKDIR:?}"; fi
 }
 # A drill that starts a process of its own (a fault proxy) defines this.
 dr_stop_extra() { :; }
+# dr_is_engine_pid <pid>: the pid is a running engine, not a number a handover
+# left behind that the system has since given to something else.
+dr_is_engine_pid() {
+  [[ -n "${1:-}" ]] && [[ "$(ps -o command= -p "$1" 2> /dev/null)" == *" run --config "* ]]
+}
 
 dr_as_root() {
   if ((EUID == 0)); then "$@"; else sudo -n "$@"; fi
 }
 
-# dr_init <drill name> <vtopctl>
+# dr_init <drill name> <arguments of the drill...>
 dr_init() {
   DR_DRILL="$1"
-  DR_BIN="${2:?usage: $(basename "${BASH_SOURCE[1]}") <vtopctl>}"
+  shift
+  DR_MODE=run
+  DR_LEG=""
+  DR_BIN=""
+  DR_HANDED_OVER=0
+  DR_HANDOVER_US=""
+  local usage
+  usage="usage: $(basename "${BASH_SOURCE[1]}") <vtopctl> [--handover | --check | --teardown] [--leg NAME]"
+  while (($# > 0)); do
+    case "$1" in
+      --handover) DR_MODE=handover ;;
+      --check) DR_MODE=check ;;
+      --teardown) DR_MODE=teardown ;;
+      --leg)
+        [[ -n "${2:-}" ]] || { echo "FAIL: --leg needs a name; $usage" >&2; exit 2; }
+        DR_LEG="$2"
+        shift
+        ;;
+      -*) echo "FAIL: unknown option $1; $usage" >&2; exit 2 ;;
+      *)
+        [[ -z "$DR_BIN" ]] || { echo "FAIL: more than one vtopctl given; $usage" >&2; exit 2; }
+        DR_BIN="$1"
+        ;;
+    esac
+    shift
+  done
+  [[ -n "$DR_BIN" ]] || { echo "FAIL: $usage" >&2; exit 2; }
   [[ -x "$DR_BIN" ]] || { echo "FAIL: $DR_BIN is not executable" >&2; exit 2; }
   DR_BIN="$(cd "$(dirname "$DR_BIN")" && pwd)/$(basename "$DR_BIN")"
   ((BASH_VERSINFO[0] >= 5)) || { echo "FAIL: bash 5 or later is needed (EPOCHREALTIME)" >&2; exit 2; }
@@ -110,11 +168,28 @@ dr_init() {
   for tool in docker python3 curl; do
     command -v "$tool" > /dev/null || { echo "FAIL: $tool is needed" >&2; exit 2; }
   done
-  DR_WORKDIR="${DR_DRILL_WORKDIR:-$(mktemp -d "${TMPDIR:-/tmp}/vtop-dr-drill.XXXXXX")}"
+  if [[ $DR_MODE == run ]]; then
+    DR_WORKDIR="${DR_DRILL_WORKDIR:-$(mktemp -d "${TMPDIR:-/tmp}/vtop-dr-drill.XXXXXX")}"
+  else
+    DR_WORKDIR="${DR_DRILL_WORKDIR:-${TMPDIR:-/tmp}/vtop-dr-handover-$DR_DRILL}"
+  fi
+  if [[ $DR_MODE == check || $DR_MODE == teardown ]]; then
+    [[ -d "$DR_WORKDIR" ]] || { echo "[dr-drill/$DR_DRILL] FAIL: $DR_WORKDIR does not exist: no lab was handed over there (set DR_DRILL_WORKDIR to its directory)" >&2; exit 2; }
+  fi
   mkdir -p "$DR_WORKDIR"
   DR_WORKDIR="$(cd "$DR_WORKDIR" && pwd)"
-  [[ -z "$(ls -A "$DR_WORKDIR")" ]] \
-    || { echo "[dr-drill/$DR_DRILL] FAIL: $DR_WORKDIR is not empty; name a new directory in DR_DRILL_WORKDIR" >&2; exit 2; }
+  DR_STATE_FILE="$DR_WORKDIR/handover.state"
+  if [[ $DR_MODE == run || $DR_MODE == handover ]]; then
+    if [[ -n "$(ls -A "$DR_WORKDIR")" ]]; then
+      local hint="name a new directory in DR_DRILL_WORKDIR"
+      [[ $DR_MODE != handover ]] || hint="a lab is already there: run --teardown on it, or name a new directory in DR_DRILL_WORKDIR"
+      echo "[dr-drill/$DR_DRILL] FAIL: $DR_WORKDIR is not empty; $hint" >&2
+      exit 2
+    fi
+  else
+    [[ -f "$DR_STATE_FILE" ]] \
+      || { echo "[dr-drill/$DR_DRILL] FAIL: no handed-over lab in $DR_WORKDIR (no handover.state); run --handover first, or set DR_DRILL_WORKDIR to its directory" >&2; exit 2; }
+  fi
   DR_RESULT_FILE="${DR_DRILL_RESULT:-$DR_WORKDIR/result.json}"
   DR_LOGS="$DR_WORKDIR/logs"
   mkdir -p "$DR_LOGS"
@@ -156,6 +231,169 @@ wait_until() {
   done
 }
 
+# ---- a lab handed to a second person -------------------------------------------
+# State that must survive from --handover to --check and --teardown: the
+# containers and ports, the workdir's run id, and whatever the drill names in
+# DR_HANDOVER_VARS. Written as `declare -g` statements, read back by sourcing.
+DR_STATE_VARS=(DR_RUN_ID DR_CONT DR_PORT DR_CONTAINERS DR_VOLUMES DR_MOUNTS DR_PORTS_USED DR_PG DR_DB
+  DR_KAFKA DR_KAFKA_BOOTSTRAP DR_ENGINE_PID DR_ENGINE_RUN DR_HANDOVER_US DR_HANDOVER_ISO DR_LEG VTOP_STATE_STORE)
+DR_HANDOVER_VARS=()      # the drill's own, set before dr_run_drill
+DR_HANDOVER_ENV=()       # NAME=value lines for lab.env, appended by the drill's lab phase
+DR_LEGS=()               # the drill's legs, in order; empty for a drill without legs
+DR_PAGE_SECTION=""       # the page's heading the second person follows
+
+dr_state_save() {
+  local v out="$DR_STATE_FILE.tmp"
+  : > "$out"
+  for v in "${DR_STATE_VARS[@]}" ${DR_HANDOVER_VARS[@]+"${DR_HANDOVER_VARS[@]}"}; do
+    # A variable that was never set is not saved.
+    declare -p "$v" > /dev/null 2>&1 || continue
+    declare -p "$v" | sed 's/^declare /declare -g /' >> "$out"
+  done
+  mv "$out" "$DR_STATE_FILE"
+}
+dr_state_load() {
+  # shellcheck disable=SC1090  # a file this library wrote
+  source "$DR_STATE_FILE"
+  # This process's own results, not the handover's.
+  rm -f "$DR_WORKDIR/result.tsv"
+}
+
+# dr_write_lab_env: what a person sources to talk to the lab as the engine does.
+dr_write_lab_env() {
+  local f="$DR_WORKDIR/lab.env" kv
+  {
+    echo "# The lab's environment for the drill $DR_DRILL. Source it: . $f"
+    printf 'export AWS_ACCESS_KEY_ID=%q AWS_SECRET_ACCESS_KEY=%q AWS_REGION=%q\n' "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$AWS_REGION"
+    [[ -z "${VTOP_STATE_STORE:-}" ]] || printf 'export VTOP_STATE_STORE=%q\n' "$VTOP_STATE_STORE"
+    for kv in ${DR_HANDOVER_ENV[@]+"${DR_HANDOVER_ENV[@]}"}; do printf 'export %s=%q\n' "${kv%%=*}" "${kv#*=}"; done
+  } > "$f"
+  chmod 0600 "$f"
+}
+
+# dr_lab_endpoints: one line for each service the lab started.
+dr_lab_endpoints() {
+  local label
+  for label in $(printf '%s\n' "${!DR_CONT[@]}" | sort); do
+    case "$label" in
+      minio-*) echo "  object store ${label#minio-}: http://127.0.0.1:${DR_PORT[$label]}  user $DR_S3_USER, password $DR_S3_PASSWORD (its client: docker exec -e HOME=/tmp ${DR_CONT[$label]} mc ...; its container is ${DR_CONT[$label]})" ;;
+      pg-*) echo "  ledger server ${label#pg-}: postgres://vtop:vtop@127.0.0.1:${DR_PORT[$label]}/<database> (psql: docker exec -it ${DR_CONT[$label]} psql -U vtop -d <database>)" ;;
+      kafka-*) echo "  Kafka ${label#kafka-}: bootstrap 127.0.0.1:${DR_PORT[$label]} (tools: docker exec -i ${DR_CONT[$label]} /opt/kafka/bin/<tool>.sh --bootstrap-server 127.0.0.1:${DR_PORT[$label]})" ;;
+      *) echo "  $label: ${DR_CONT[$label]} on 127.0.0.1:${DR_PORT[$label]}" ;;
+    esac
+  done
+  if [[ -n "${DR_DRILL_NETWORK:-}" ]]; then
+    echo "  (the containers were started with DR_DRILL_NETWORK=$DR_DRILL_NETWORK: they are reached where that network puts them)"
+  fi
+}
+
+# dr_handover <leg>: the lab is ready and the disaster has happened. Print what
+# the second person needs, and leave. The drill supplies `handover_text <leg>`,
+# which prints what is lost and what is in the lab (see the drills).
+dr_handover() {
+  local leg="${1:-}" me script
+  me="$(basename "${BASH_SOURCE[2]:-$0}")"
+  script="scripts/dr-drill/$me"
+  ((${#DR_FAILURES[@]} == 0))     || fail "the lab is not in the state the drill expects, so it is not handed over: ${DR_FAILURES[*]}"
+  DR_HANDOVER_US="$(now_us)"
+  DR_HANDOVER_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  dr_write_lab_env
+  dr_state_save
+  local legarg="" envarg="DR_DRILL_WORKDIR=$DR_WORKDIR"
+  [[ -z "$leg" ]] || legarg=" --leg $leg"
+  [[ -z "${DR_DRILL_NETWORK:-}" ]] || envarg+=" DR_DRILL_NETWORK=$DR_DRILL_NETWORK"
+  {
+    echo "=== HANDOVER: $DR_DRILL${leg:+ (leg $leg)}: the disaster has happened; nothing has been recovered ==="
+    echo "Handed over at $DR_HANDOVER_ISO. The clock for the run starts at your first step."
+    echo
+    echo "Follow only: docs/operate/disaster-recovery.md, section \"$DR_PAGE_SECTION\""
+    echo "Note every step that needed a guess, and time the run from the first step to the last check."
+    echo
+    echo "What happened and what you are given:"
+    handover_text "$leg"
+    echo
+    echo "The lab:"
+    echo "  vtopctl: $DR_BIN"
+    echo "  workdir: $DR_WORKDIR (logs in logs/, configs in it)"
+    echo "  environment: . $DR_WORKDIR/lab.env  (the store's credentials and the ledger's connection string)"
+    dr_lab_endpoints
+    if [[ -n "$DR_ENGINE_PID" ]]; then
+      echo "  an engine is running, pid $DR_ENGINE_PID, log $(dr_engine_log); a step that stops it stops it"
+    fi
+    echo
+    echo "When you have finished the page's steps, stop the engine (SIGTERM) and run:"
+    echo "  $envarg $script $DR_BIN --check$legarg"
+    echo "It runs only the pass criteria, reports the RPO, the RTO and pass or fail, and can be run again."
+    echo
+    echo "To tear the lab down (containers, volumes, mounts, processes, workdir):"
+    echo "  $envarg $script $DR_BIN --teardown"
+  } | tee "$DR_WORKDIR/HANDOVER.txt"
+  DR_HANDED_OVER=1
+  exit 0
+}
+
+# dr_run_drill: the drill's lifecycle. A drill defines
+#   lab_shared            (optional) what every leg shares: containers, a proxy
+#   lab <leg>             the lab and the disaster, for one leg
+#   recover <leg>         the page's steps, run by the drill (never by --handover)
+#   check <leg>           the outcome's pass criteria; sets RTO_MS (and CAUGHT_MS)
+#                         itself in a run, and is given the handover-to-check time in --check
+#   handover_text <leg>   what is lost and what the lab holds, for --handover
+#   leg_done <leg>        (optional) what a run tears down between legs
+# and DR_LEGS (empty for a drill without legs), DR_PAGE_SECTION, DR_HANDOVER_VARS.
+dr_run_drill() {
+  local leg legs=()
+  if [[ -n "$DR_LEG" ]]; then
+    local known=0
+    for leg in ${DR_LEGS[@]+"${DR_LEGS[@]}"}; do [[ "$leg" != "$DR_LEG" ]] || known=1; done
+    ((known)) || { echo "[dr-drill/$DR_DRILL] FAIL: no leg $DR_LEG; the legs are: ${DR_LEGS[*]:-(none)}" >&2; exit 2; }
+    legs=("$DR_LEG")
+  elif ((${#DR_LEGS[@]} > 0)); then
+    legs=("${DR_LEGS[@]}")
+  else
+    legs=("")
+  fi
+  case "$DR_MODE" in
+    run)
+      declare -F lab_shared > /dev/null && lab_shared
+      for leg in "${legs[@]}"; do
+        lab "$leg"
+        recover "$leg"
+        check "$leg"
+        ! declare -F leg_done > /dev/null || leg_done "$leg"
+      done
+      dr_finish
+      ;;
+    handover)
+      # One leg: the first, unless --leg names one.
+      leg="${legs[0]}"
+      DR_LEG="$leg"
+      declare -F lab_shared > /dev/null && lab_shared
+      lab "$leg"
+      dr_handover "$leg"
+      ;;
+    check)
+      local cli_leg="$DR_LEG"
+      dr_state_load
+      [[ -z "$cli_leg" || "$cli_leg" == "$DR_LEG" ]] \
+        || fail "the lab was handed over for leg ${DR_LEG:-(none)}, not $cli_leg"
+      leg="$DR_LEG"
+      # An engine the lab started is stopped, as a run's own recovery stops it.
+      dr_engine_stop_detached
+      RTO_MS="$(ms_since "$DR_HANDOVER_US")"
+      CAUGHT_MS="$RTO_MS"
+      check "$leg"
+      log "the lab is still up: run --check again after a fix, or --teardown to remove it"
+      dr_finish
+      ;;
+    teardown)
+      dr_state_load
+      log "tearing the lab down"
+      exit 0
+      ;;
+  esac
+}
+
 # ---- results and criteria -----------------------------------------------------
 # dr_set <key> <value>: a number or string for the JSON result (the last
 # value set for a key wins).
@@ -185,6 +423,32 @@ crit_eq() {
 # crit_ge <what> <got> <bound>
 crit_ge() {
   if (($2 >= $3)); then crit ok "$1" "$2 >= $3${4:-}"; else crit bad "$1" "$2 is below $3${4:-}"; fi
+}
+# crit_rto <what> <got ms> <bound seconds>: a recovery time against the page's
+# bound. A run of the drill enforces it. After a handover the clock is the
+# person's (handover to the start of --check, so it includes reading and
+# typing), which the automated bound was never set for: it is reported, with
+# whether it fell inside the bound, and not a criterion.
+crit_rto() {
+  local what="$1" ms="$2" bound="$3"
+  if [[ $DR_MODE == check ]]; then
+    local within=true
+    (($((ms / 1000)) <= bound)) || within=false
+    log "INFO  $what: $(secs "$ms") s from the handover to the check (the automated drill's bound is $bound s; not enforced for a person)"
+    dr_set rto_within_automated_bound "$within"
+    dr_set rto_bound_s "$bound"
+  else
+    crit_le "$what" "$((ms / 1000))" "$bound" " s"
+  fi
+}
+# dr_check_summary <records lost>: what --check reports as the RPO and RTO.
+dr_check_summary() {
+  [[ $DR_MODE == check ]] || return 0
+  dr_set mode check
+  dr_set handover_at "$DR_HANDOVER_ISO"
+  dr_set rpo_records_lost "$1"
+  dr_set rto_ms "$RTO_MS"
+  log "RPO: $1 record(s) lost. RTO: $(secs "$RTO_MS") s from the handover to this check."
 }
 # crit_le <what> <got> <bound> [unit]
 crit_le() {
@@ -522,7 +786,12 @@ dr_engine_start() { # <config> [extra env as NAME=value...]
   local config="$1"
   shift
   DR_ENGINE_RUN=$((DR_ENGINE_RUN + 1))
-  env "$@" "$DR_BIN" run --config "$config" > "$DR_LOGS/engine-$DR_ENGINE_RUN.log" 2>&1 &
+  # In a lab that will be handed over, the engine must outlive this script.
+  if [[ $DR_MODE == handover ]]; then
+    nohup env "$@" "$DR_BIN" run --config "$config" > "$DR_LOGS/engine-$DR_ENGINE_RUN.log" 2>&1 &
+  else
+    env "$@" "$DR_BIN" run --config "$config" > "$DR_LOGS/engine-$DR_ENGINE_RUN.log" 2>&1 &
+  fi
   DR_ENGINE_PID=$!
 }
 dr_engine_log() { echo "$DR_LOGS/engine-$DR_ENGINE_RUN.log"; }
@@ -547,6 +816,31 @@ dr_engine_stop_any() {
   DR_RC=0
   kill -TERM "$pid" 2> /dev/null || true
   wait "$pid" || DR_RC=$?
+}
+# dr_bg <log> <command...>: a background process of the lab, its output in <log>;
+# DR_BG_PID is its pid. In a lab that will be handed over it outlives this script.
+dr_bg() {
+  local out="$1"
+  shift
+  if [[ $DR_MODE == handover ]]; then
+    nohup "$@" > "$out" 2>&1 &
+  else
+    "$@" > "$out" 2>&1 &
+  fi
+  DR_BG_PID=$!
+}
+# dr_engine_stop_detached: SIGTERM an engine this shell did not start (the lab
+# was handed over with it running), and wait for it to exit.
+dr_engine_stop_detached() {
+  local pid="$DR_ENGINE_PID" i
+  DR_ENGINE_PID=""
+  dr_is_engine_pid "$pid" || return 0
+  kill -TERM "$pid" 2> /dev/null || return 0
+  for ((i = 0; i < 100; i++)); do
+    kill -0 "$pid" 2> /dev/null || return 0
+    sleep 0.3
+  done
+  kill -9 "$pid" 2> /dev/null || true
 }
 dr_engine_alive() { [[ -n "$DR_ENGINE_PID" ]] && kill -0 "$DR_ENGINE_PID" 2> /dev/null; }
 

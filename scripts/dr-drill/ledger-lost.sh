@@ -34,10 +34,11 @@
 #   RTO  from the first recovery step (the new database) until the engine
 #        commits a batch again.
 #
-# Usage: ledger-lost.sh <vtopctl>
+# Usage: ledger-lost.sh <vtopctl> [--handover | --check | --teardown] [--leg file|kafka|kafka-rebuild]
 # shellcheck source=scripts/dr-drill/lib.sh
+# shellcheck disable=SC2034  # DR_LEGS, DR_PAGE_SECTION and DR_HANDOVER_VARS are read by lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
-dr_init ledger-lost "${1:-}"
+dr_init ledger-lost "$@"
 
 VTOP_DR_LEDGER_LOST_RTO_S=60
 dr_check_doc VTOP_DR_LEDGER_LOST_RTO_S=$VTOP_DR_LEDGER_LOST_RTO_S
@@ -47,10 +48,9 @@ REC=dr-rec-
 BEFORE=120 # records archived before the loss
 DURING=60  # records the source receives while the ledger is gone
 
-dr_minio_start store
-dr_bucket_make store "$BUCKET"
-dr_pg_start ledger
-dr_kafka_start k
+DR_LEGS=(file kafka kafka-rebuild)
+DR_PAGE_SECTION="The ledger is lost, with no backup"
+DR_HANDOVER_VARS=(PRE_ROWS PRE_RECORDS)
 
 committed_rows() { dr_sql_num "SELECT count(*) FROM batches WHERE state='source_committed'"; }
 committed_records() { dr_sql_num "SELECT COALESCE(sum(record_count),0) FROM batches WHERE state='source_committed'"; }
@@ -61,114 +61,162 @@ committed_records_ge() { (($(committed_records) >= $1)) && (($(open_rows) == 0))
 committed_rows_gt() { (($(committed_rows) > $1)); }
 gen() { local i; for ((i = $1; i < $2; i++)); do printf '%s%06d payload for the disaster-recovery drill %s\n' "$REC" "$i" "$3"; done; }
 
-# leg <file|kafka|kafka-rebuild>
-leg() {
-  local leg="$1" src="${1%%-*}" db="dr_ll_${1//-/_}" prefix="ledger-lost/$1" cfg="$DR_WORKDIR/$1.yaml"
-  local digests="$DR_WORKDIR/$1-digests" input="$DR_WORKDIR/$1-input.log" total=$((BEFORE + DURING))
-  local topic="dr-ledger-lost-$DR_RUN_ID-$1" group="dr-ledger-lost-$DR_RUN_ID-$1" want_ledger
-  local pre_rows pre_records post_rows post_records unproven rto_ms rebuilt_ms
-  log "=== leg: $leg"
-  dr_pg_admin "CREATE DATABASE $db"
-  dr_pg_db "$db"
-  mkdir -p "$digests"
-  if [[ "$src" == kafka ]]; then
-    dr_config "$cfg" source=kafka bootstrap="$DR_KAFKA_BOOTSTRAP" topic="$topic" group="$group" \
-      endpoint="$(dr_s3_endpoint store)" bucket="$BUCKET" prefix="$prefix" work="$DR_WORKDIR/$leg-work" digests="$digests"
-    dr_kafka_topic "$topic"
-    dr_kafka_produce "$topic" 0 "$BEFORE" "$REC" before
+# ctx <leg>: the leg's names, the same in every phase.
+ctx() {
+  L_LEG="$1"
+  L_SRC="${1%%-*}"
+  L_DB="dr_ll_${1//-/_}"
+  L_PREFIX="ledger-lost/$1"
+  L_CFG="$DR_WORKDIR/$1.yaml"
+  L_DIGESTS="$DR_WORKDIR/$1-digests"
+  L_INPUT="$DR_WORKDIR/$1-input.log"
+  L_TOTAL=$((BEFORE + DURING))
+  L_TOPIC="dr-ledger-lost-$DR_RUN_ID-$1"
+  L_GROUP="dr-ledger-lost-$DR_RUN_ID-$1"
+}
+
+lab_shared() {
+  dr_minio_start store
+  dr_bucket_make store "$BUCKET"
+  dr_pg_start ledger
+  dr_kafka_start k
+}
+
+# lab <leg>: a working archive, then the disaster.
+lab() {
+  ctx "$1"
+  log "=== leg: $L_LEG"
+  dr_pg_admin "CREATE DATABASE $L_DB"
+  dr_pg_db "$L_DB"
+  mkdir -p "$L_DIGESTS"
+  if [[ "$L_SRC" == kafka ]]; then
+    dr_config "$L_CFG" source=kafka bootstrap="$DR_KAFKA_BOOTSTRAP" topic="$L_TOPIC" group="$L_GROUP" \
+      endpoint="$(dr_s3_endpoint store)" bucket="$BUCKET" prefix="$L_PREFIX" work="$DR_WORKDIR/$L_LEG-work" digests="$L_DIGESTS"
+    dr_kafka_topic "$L_TOPIC"
+    dr_kafka_produce "$L_TOPIC" 0 "$BEFORE" "$REC" before
   else
-    dr_config "$cfg" source=file input="$input" \
-      endpoint="$(dr_s3_endpoint store)" bucket="$BUCKET" prefix="$prefix" work="$DR_WORKDIR/$leg-work" digests="$digests"
-    gen 0 "$BEFORE" before > "$input"
+    dr_config "$L_CFG" source=file input="$L_INPUT" \
+      endpoint="$(dr_s3_endpoint store)" bucket="$BUCKET" prefix="$L_PREFIX" work="$DR_WORKDIR/$L_LEG-work" digests="$L_DIGESTS"
+    gen 0 "$BEFORE" before > "$L_INPUT"
   fi
-  dr_ctl "$leg-migrate" migrate --config "$cfg"
+  dr_ctl "$L_LEG-migrate" migrate --config "$L_CFG"
 
   # ---- a working archive ---------------------------------------------------------
-  dr_engine_start "$cfg"
+  dr_engine_start "$L_CFG"
   wait_until 120 "the engine to archive the first $BEFORE records" committed_records_ge "$BEFORE"
   dr_engine_stop
-  pre_rows="$(committed_rows)"
-  pre_records="$(committed_records)"
-  dr_ctl "$leg-audit-verify-before" audit verify --config "$cfg"
-  log "before the loss: $pre_rows committed batch(es), $pre_records record(s); audit trail: $(grep -E '^audit chain' "$DR_LOGS/$leg-audit-verify-before.log")"
-  dr_readback store "$BUCKET" "$prefix" "$DR_WORKDIR/$leg-rb-before"
-  dr_count "$DR_WORKDIR/$leg-rb-before" "$REC" "$BEFORE"
-  crit_eq "$leg: the archive holds every record before the loss" "$DR_UNIQUE" "$BEFORE"
+  PRE_ROWS="$(committed_rows)"
+  PRE_RECORDS="$(committed_records)"
+  dr_ctl "$L_LEG-audit-verify-before" audit verify --config "$L_CFG"
+  log "before the loss: $PRE_ROWS committed batch(es), $PRE_RECORDS record(s); audit trail: $(grep -E '^audit chain' "$DR_LOGS/$L_LEG-audit-verify-before.log")"
+  dr_readback store "$BUCKET" "$L_PREFIX" "$DR_WORKDIR/$L_LEG-rb-before"
+  dr_count "$DR_WORKDIR/$L_LEG-rb-before" "$REC" "$BEFORE"
+  crit_eq "$L_LEG: the archive holds every record before the loss" "$DR_UNIQUE" "$BEFORE"
 
-  # ---- the disaster ---------------------------------------------------------------
+  # ---- the disaster ----------------------------------------------------------------
   log "disaster: the ledger's database is destroyed; there is no backup"
-  dr_pg_admin "DROP DATABASE $db WITH (FORCE)"
-  rm -rf "$digests" "$DR_WORKDIR/$leg-work"
+  dr_pg_admin "DROP DATABASE $L_DB WITH (FORCE)"
+  rm -rf "${L_DIGESTS:?}" "${DR_WORKDIR:?}/${L_LEG:?}-work"
+  mkdir -p "$L_DIGESTS"
   # The source goes on receiving while the ledger is gone.
-  if [[ "$src" == kafka ]]; then
-    dr_kafka_produce "$topic" "$BEFORE" "$DURING" "$REC" during
+  if [[ "$L_SRC" == kafka ]]; then
+    dr_kafka_produce "$L_TOPIC" "$BEFORE" "$DURING" "$REC" during
   else
-    gen "$BEFORE" "$total" during >> "$input"
+    gen "$BEFORE" "$L_TOTAL" during >> "$L_INPUT"
   fi
+}
 
-  # ---- the documented recovery -----------------------------------------------------
+handover_text() {
+  ctx "$1"
+  echo "  The ledger's database $L_DB on the ledger server is destroyed, with the digest directory's contents and the"
+  echo "  engine's work directory. There is no backup of it. The archive in bucket $BUCKET (prefix $L_PREFIX) is intact"
+  echo "  and holds the $BEFORE records archived before the loss; the source then received $DURING more."
+  if [[ "$L_SRC" == kafka ]]; then
+    echo "  Source: Kafka topic $L_TOPIC, consumer group $L_GROUP."
+  else
+    echo "  Source: the file $L_INPUT, which holds all $L_TOTAL records."
+  fi
+  echo "  The engine is stopped. Its configuration is $L_CFG (unchanged); the digest directory is $L_DIGESTS."
+  echo "  Create the new ledger under the same database name, $L_DB, so that the configuration and --check find it."
+  case "$L_LEG" in
+    kafka-rebuild) echo "  This leg exercises the page's extra step for a source that still holds its history: after it, the new ledger must prove every record." ;;
+    kafka) echo "  This leg does not take the extra step: the new ledger is expected to prove only the records archived since the loss." ;;
+    file) echo "  A file source is read again from its start; the objects already archived are found and reused." ;;
+  esac
+}
+
+# recover <leg>: the page's steps.
+recover() {
+  ctx "$1"
+  local want_ledger
   log "recovery: a new database, vtopctl migrate, the same config, start"
   T0=$(now_us)
-  dr_pg_admin "CREATE DATABASE $db"
-  dr_ctl "$leg-migrate-after" migrate --config "$cfg"
-  mkdir -p "$digests"
-  if [[ "$leg" == kafka-rebuild ]]; then
+  dr_pg_admin "CREATE DATABASE $L_DB"
+  dr_ctl "$L_LEG-migrate-after" migrate --config "$L_CFG"
+  mkdir -p "$L_DIGESTS"
+  if [[ "$L_LEG" == kafka-rebuild ]]; then
     # The page's step for a source that still holds its history: read it all
     # again into the new ledger. It must come before the engine's first start
     # on the new ledger: the engine will not move a consumer group behind a
     # ledger that already proves the records.
-    dr_kafka_tool kafka-consumer-groups.sh --group "$group" --topic "$topic" --reset-offsets --to-earliest --execute \
-      > "$DR_LOGS/$leg-reset.log" 2>&1 || fail "could not reset the consumer group; see $DR_LOGS/$leg-reset.log"
+    dr_kafka_tool kafka-consumer-groups.sh --group "$L_GROUP" --topic "$L_TOPIC" --reset-offsets --to-earliest --execute \
+      > "$DR_LOGS/$L_LEG-reset.log" 2>&1 || fail "could not reset the consumer group; see $DR_LOGS/$L_LEG-reset.log"
   fi
-  dr_engine_start "$cfg"
+  dr_engine_start "$L_CFG"
   wait_until 120 "the first commit after the loss" committed_rows_gt 0
-  rto_ms=$(ms_since "$T0")
-  if [[ "$src" == kafka && "$leg" != kafka-rebuild ]]; then want_ledger=$DURING; else want_ledger=$total; fi
+  RTO_MS=$(ms_since "$T0")
+  if [[ "$L_SRC" == kafka && "$L_LEG" != kafka-rebuild ]]; then want_ledger=$DURING; else want_ledger=$L_TOTAL; fi
   wait_until 120 "the engine to archive the rest of the source" committed_records_ge "$want_ledger"
   dr_engine_stop
-  rebuilt_ms=$(ms_since "$T0")
+  CAUGHT_MS=$(ms_since "$T0")
+}
 
+# check <leg>: the pass criteria, from the lab's state alone.
+check() {
+  ctx "$1"
+  dr_pg_db "$L_DB"
+  local post_rows post_records unproven
   post_rows="$(committed_rows)"
   post_records="$(committed_records)"
-  dr_readback store "$BUCKET" "$prefix" "$DR_WORKDIR/$leg-rb-after"
-  dr_count "$DR_WORKDIR/$leg-rb-after" "$REC" "$total"
-  crit_eq "$leg: no record is missing from the archive" "$DR_MISSING" 0
-  case "$leg" in
+  dr_readback store "$BUCKET" "$L_PREFIX" "$DR_WORKDIR/$L_LEG-rb-after"
+  dr_count "$DR_WORKDIR/$L_LEG-rb-after" "$REC" "$L_TOTAL"
+  crit_eq "$L_LEG: no record is missing from the archive" "$DR_MISSING" 0
+  case "$L_LEG" in
     kafka)
-      crit_eq "$leg: no record is archived twice" "$DR_DUPLICATES" 0
-      crit_eq "$leg: the new ledger proves the records archived since the loss" "$post_records" "$DURING"
+      crit_eq "$L_LEG: no record is archived twice" "$DR_DUPLICATES" 0
+      crit_eq "$L_LEG: the new ledger proves the records archived since the loss" "$post_records" "$DURING"
       ;;
     kafka-rebuild)
-      crit_eq "$leg: no record is archived twice: the objects were found and reused" "$DR_DUPLICATES" 0
-      crit_ge "$leg: the new ledger proves every record" "$post_records" "$total"
+      crit_eq "$L_LEG: no record is archived twice: the objects were found and reused" "$DR_DUPLICATES" 0
+      crit_ge "$L_LEG: the new ledger proves every record" "$post_records" "$L_TOTAL"
       ;;
     file)
-      crit_le "$leg: records archived twice are at most those archived before the loss" "$DR_DUPLICATES" "$BEFORE" " records"
-      crit_ge "$leg: the new ledger proves every record" "$post_records" "$total"
+      crit_le "$L_LEG: records archived twice are at most those archived before the loss" "$DR_DUPLICATES" "$BEFORE" " records"
+      crit_ge "$L_LEG: the new ledger proves every record" "$post_records" "$L_TOTAL"
       ;;
   esac
-  dr_checks "$leg-after" "$cfg" "$digests"
-  crit_eq "$leg: audit-coverage --check-storage exits 0" "$DR_AUDIT_RC" 0
-  crit_eq "$leg: scrub exits 0" "$DR_SCRUB_RC" 0
-  crit_eq "$leg: audit verify exits 0" "$DR_VERIFY_RC" 0
-  crit_le "$leg: RTO, to the first commit" "$((rto_ms / 1000))" "$VTOP_DR_LEDGER_LOST_RTO_S" " s"
-  crit_le "$leg: time to be caught up" "$((rebuilt_ms / 1000))" "$VTOP_DR_LEDGER_LOST_RTO_S" " s"
+  dr_checks "$L_LEG-after" "$L_CFG" "$L_DIGESTS"
+  crit_eq "$L_LEG: audit-coverage --check-storage exits 0" "$DR_AUDIT_RC" 0
+  crit_eq "$L_LEG: scrub exits 0" "$DR_SCRUB_RC" 0
+  crit_eq "$L_LEG: audit verify exits 0" "$DR_VERIFY_RC" 0
+  crit_rto "$L_LEG: RTO, to the first commit" "$RTO_MS" "$VTOP_DR_LEDGER_LOST_RTO_S"
+  crit_rto "$L_LEG: time to be caught up" "$CAUGHT_MS" "$VTOP_DR_LEDGER_LOST_RTO_S"
 
   unproven=$((DR_UNIQUE - post_records))
   ((unproven > 0)) || unproven=0
-  local k="${leg//-/_}"
-  dr_set "${k}_rto_ms" "$rto_ms"
-  dr_set "${k}_caught_up_ms" "$rebuilt_ms"
-  dr_set "${k}_records_total" "$total"
+  local k="${L_LEG//-/_}"
+  dr_set "${k}_rto_ms" "$RTO_MS"
+  dr_set "${k}_caught_up_ms" "$CAUGHT_MS"
+  dr_set "${k}_records_total" "$L_TOTAL"
   dr_set "${k}_records_missing" "$DR_MISSING"
   dr_set "${k}_records_archived_twice" "$DR_DUPLICATES"
-  dr_set "${k}_ledger_rows_lost" "$pre_rows"
-  dr_set "${k}_ledger_records_lost" "$pre_records"
+  dr_set "${k}_ledger_rows_lost" "$PRE_ROWS"
+  dr_set "${k}_ledger_records_lost" "$PRE_RECORDS"
   dr_set "${k}_ledger_rows_after" "$post_rows"
   dr_set "${k}_ledger_records_after" "$post_records"
   dr_set "${k}_records_in_archive_not_proven_by_ledger" "$unproven"
-  log "$leg: first commit $(secs "$rto_ms") s, caught up $(secs "$rebuilt_ms") s; the ledger lost $pre_rows batch(es) ($pre_records records); archive: $DR_UNIQUE of $total records, $DR_DUPLICATES archived twice, $DR_MISSING missing; $unproven record(s) in the archive that the new ledger does not prove"
+  dr_check_summary "$DR_MISSING"
+  log "$L_LEG: first commit $(secs "$RTO_MS") s, caught up $(secs "$CAUGHT_MS") s; the ledger lost $PRE_ROWS batch(es) ($PRE_RECORDS records); archive: $DR_UNIQUE of $L_TOTAL records, $DR_DUPLICATES archived twice, $DR_MISSING missing; $unproven record(s) in the archive that the new ledger does not prove"
 }
 
-for L in file kafka kafka-rebuild; do leg "$L"; done
-dr_finish
+dr_run_drill
