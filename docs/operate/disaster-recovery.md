@@ -47,17 +47,54 @@ The RPO is not a time here. The archive's RPO is **zero records while the
 source still holds them**; when it does not, the loss is a count that the
 procedure reports exactly. What each procedure loses is in its section.
 
+## Conventions used in the steps
+
+Every command below is run on the engine's host (the replacement host, after a
+host loss), as the user the engine runs as, against `/etc/vtop/config.yaml`.
+The names in the commands mean this:
+
+| Name | What it is |
+|---|---|
+| `vtopctl` | A build with the `postgres` feature for every PostgreSQL step: release binaries and container images up to v0.10.2 are not ([Install](../install/index.md)). |
+| `VTOP_STATE_STORE` | The PostgreSQL URL the engine's `engine.state_store: { env: VTOP_STATE_STORE }` resolves to, exported in your shell. Its database name is the one you create below: `vtop` in these steps. |
+| `ADMIN_URL` | A PostgreSQL URL for the server's maintenance database (`.../postgres`) as a role that may create, rename and drop databases. Not the engine's role. |
+| `BROKERS`, `GROUP`, `TOPIC` | The Kafka bootstrap servers, `sources.kafka.consumer_group`, and the topic or topics `sources.kafka.topic_include_regex` matches. `kafka-consumer-groups.sh` and `kafka-get-offsets.sh` come from a Kafka distribution; add `--command-config client.properties` when the brokers need authentication. |
+| Object store commands | Shown for S3 with the AWS CLI (`aws s3`, `aws s3api`); the drills use MinIO's `mc`, where `mc ls --recursive <alias>/<bucket>/<prefix>` is the same listing. Credentials are the AWS SDK's chain (`configure/basics.md`), the same the engine uses. |
+| Start and stop the engine | `systemctl start vtop-engine` and `systemctl stop vtop-engine` for the [example unit](https://github.com/allamiro/vtop-engine/blob/main/examples/systemd/vtop-engine.service); scale the Deployment to 0 and back to 1 on Kubernetes; `vtopctl run --config /etc/vtop/config.yaml` in a terminal. |
+| Time to the first commit, and to be caught up | The bounds below are measured from a step to the first `source_committed` batch, and to nothing left in flight. Read them with `vtopctl status --config /etc/vtop/config.yaml`, which prints the batch count for each state: the first commit is when `source_committed` rises above its old count; caught up needs all three of: the source has nothing left to read (for Kafka, `kafka-consumer-groups.sh --bootstrap-server "$BROKERS" --describe --group "$GROUP"` shows a `LAG` of 0 on every partition; for a file, the newest committed batch ends at the file's size), no batch is in flight (every batch is `source_committed`, `superseded`, `failed` or `replay_required`), and `vtopctl audit-coverage --config /etc/vtop/config.yaml` prints no `pending` line, so no `failed` or `replay_required` range is still waiting to be read again. A `source_committed` count that stops rising is not enough on its own: a failed tail on a quiet source looks the same. With `VTOP_METRICS_ADDR` set, `vtop_commits_total` tracks the first commit. |
+
+When a manifest MAC key is configured, `migrate`, `scrub` and `audit verify`
+need it in the environment as the engine does
+([Auditing](auditing.md#tamper-evidence)); set it before the steps.
+
 ## Before any recovery
 
 - **One engine per ledger.** Stop the engine, or know that the host it ran on
   is gone and cannot come back. Nothing on the new side fences the old one for
   you ([Losing the engine's host](../deploy/engine-host-loss.md)).
-- **Write down the audit trail's end.** `vtopctl audit verify --config ...`
-  prints a row count and the last link. A chain cannot show rows removed from
-  its end, so this is the only evidence of what a lost ledger held
-  ([Auditing](auditing.md)).
+- **Record the audit trail's end, routinely, before you need it.**
+  `vtopctl audit verify --config ...` prints a row count and the last link. A
+  chain cannot show rows removed from its end, so a copy of that line, kept
+  where the ledger's writers cannot reach it (taken daily, say), is the only
+  evidence of what a lost ledger held ([Auditing](auditing.md)). After a ledger
+  is lost the command cannot be run: if you kept no copy, say so in the
+  incident record. When the old ledger is still readable (a bucket loss, a
+  restore), run it first and keep the output.
 - **Keep the old ledger when there is one**, as a dump and as a renamed
   database. It is the record of what was lost.
+- **A new PostgreSQL database needs its roles and grants.** The steps below
+  say "create the database, `vtopctl migrate`, start". If your deployment runs
+  the two identities of [PostgreSQL in depth](../POSTGRES_DEPLOYMENT.md#identities)
+  (a migration owner and a runtime role), do it in that order: create the
+  database owned by the migration owner (`CREATE DATABASE vtop OWNER
+  <migration owner>`); run `vtopctl migrate` with `VTOP_STATE_STORE` set to the
+  **migration owner's** URL; apply the runtime grants of
+  [the deployment sequence](../POSTGRES_DEPLOYMENT.md#deployment-sequence);
+  then start the engine with `VTOP_STATE_STORE` set to the **runtime role's**
+  URL. On a new server (a region loss), create both roles first: a dump does
+  not carry roles. A deployment with one role that owns everything, as the
+  drills use, skips the grants. The drills run one role, so this is the part of
+  these steps they do not exercise.
 - **After every recovery** run the three commands that follow a restore, and
   do not call the recovery complete until they pass:
 
@@ -93,15 +130,20 @@ digests that were not backed up are gone with the ledger.
 ### Steps
 
 1. Stop the engine. Confirm the bucket still holds the archive
-   (`mc ls --recursive <alias>/<bucket>/<prefix> | head`).
-2. Create the new database and its schema:
+   (`aws s3 ls --recursive s3://<bucket>/<prefix> | head`; with MinIO,
+   `mc ls --recursive <alias>/<bucket>/<prefix> | head`).
+2. Create the new database and its schema (with two database identities, the
+   [roles and grants](#before-any-recovery) too):
 
    ```bash
    psql "$ADMIN_URL" -c 'CREATE DATABASE vtop'
    vtopctl migrate --config /etc/vtop/config.yaml
    ```
 
-   For SQLite, remove nothing: the engine creates the file at its path.
+   `migrate` ends with `state-store migration complete (postgresql); audit
+   record <id>` and exit 0; an error names what it lacked. For SQLite, remove
+   nothing: the engine creates the file at its path (this variant is not
+   drilled: the drills run the PostgreSQL ledger).
 3. **Kafka source only: choose.**
     - *Resume.* Do nothing. The new ledger proves the records archived from now
       on.
@@ -114,14 +156,25 @@ digests that were not backed up are gone with the ledger.
         --topic "$TOPIC" --reset-offsets --to-earliest --execute
       ```
 
+      Kafka refuses the reset unless the group has no active member
+      (`kafka-consumer-groups.sh --bootstrap-server "$BROKERS" --describe
+      --group "$GROUP" --state` says `Empty`); after a host loss the old
+      consumer leaves only when its session times out, so wait for `Empty`.
+      The tool prints each partition's new offset: the topic's first retained
+      offset, `0` unless retention has removed records. Give `--topic` once for
+      each topic the engine reads, or `--all-topics`.
+
       The engine reads everything the topic still holds, finds each object at
       its key and reuses it. It will not move a group behind a ledger that
       already proves the records, so doing this after the engine has run on the
       new ledger has no effect. A record the broker no longer holds stays in the
       bucket and stays unproven.
-4. Start the engine with the same configuration: `vtopctl run --config
-   /etc/vtop/config.yaml`.
-5. Run the [three checks](#before-any-recovery).
+4. Start the engine with the same configuration (`systemctl start
+   vtop-engine`, or `vtopctl run --config /etc/vtop/config.yaml`). Wait for the
+   first commit and then for it to be caught up, as
+   [read from `vtopctl status`](#conventions-used-in-the-steps).
+5. Run the [three checks](#before-any-recovery); each exits non-zero on a
+   finding.
 
 ### Pass criteria
 
@@ -175,7 +228,26 @@ committed range.
 
 ### Steps
 
-1. **Find out what is gone.**
+1. **A store that answers, and a copy if there is one.** The next step asks
+   the store what it holds, so something must answer at the address the config
+   names (or change `upload.endpoint_url`). If the store has versioning,
+   replication or a backup, restore the bucket from it, then go to
+   [A region is lost](#a-region-is-lost), step 4; the rest of this section is
+   for when there is no copy. Otherwise create a new, empty bucket with the
+   same name, and with what the config requires of it. Versioning, when
+   `upload.require_object_versioning` is set; Object Lock, when
+   `upload.object_lock` is set, which can only be turned on when the bucket is
+   created. The engine does not create it (`upload.create_bucket` is `false`
+   by default, and is refused with Object Lock):
+
+   ```bash
+   aws s3api create-bucket --bucket <bucket> --region <region> \
+     --create-bucket-configuration LocationConstraint=<region>   # omit the last flag in us-east-1
+   aws s3api put-bucket-versioning --bucket <bucket> \
+     --versioning-configuration Status=Enabled
+   ```
+
+2. **Find out what is gone.**
 
    ```bash
    vtopctl audit-coverage --config /etc/vtop/config.yaml --check-storage
@@ -185,14 +257,13 @@ committed range.
    Both exit non-zero. The audit prints one `FAIL storage` line for each
    missing object and each missing manifest, with the batch id; the scrub
    counts `missing=N` and names each batch. These are exact: N is the number of
-   committed batches the store lost.
-2. **Is there a copy?** If the store has versioning, replication or a backup,
-   restore the bucket from it, then go to [A region is lost](#a-region-is-lost),
-   step 4. The rest of this section is for when there is no copy.
-3. **A new, empty store** at the address the config names (or change
-   `upload.endpoint_url`), with the same bucket name, and with versioning if
-   `upload.require_object_versioning` is set.
-4. **Keep the old ledger as the record of the loss**, then start a new one:
+   committed batches the store lost. (Asked of a store that is not there at
+   all, they fail with a connection error and name nothing: that is step 1
+   not done.)
+3. **Keep the old ledger as the record of the loss**, then start a new one.
+   Stop the engine and anything else connected first: PostgreSQL refuses to
+   rename a database that has connections, and the old ledger cannot be kept in
+   use.
 
    ```bash
    pg_dump --format=custom --file=/backup/ledger-lost-bucket.dump "$VTOP_STATE_STORE"
@@ -201,42 +272,60 @@ committed range.
    vtopctl migrate --config /etc/vtop/config.yaml
    ```
 
-   The old ledger cannot be kept in use: its rows say the ranges are committed,
-   and the engine never reads a committed range again.
-5. **Reset the consumer group to the start of what the broker still holds**,
-   with the engine stopped:
+   With two database identities, the [roles and grants](#before-any-recovery)
+   apply to the new database. The old ledger cannot be kept in use: its rows
+   say the ranges are committed, and the engine never reads a committed range
+   again.
+4. **Reset the consumer group to the start of what the broker still holds**,
+   with the engine stopped and the group `Empty` (see
+   [the lost-ledger steps](#the-ledger-is-lost-with-no-backup), step 3, for
+   the check and the options):
 
    ```bash
    kafka-consumer-groups.sh --bootstrap-server "$BROKERS" --group "$GROUP" \
      --topic "$TOPIC" --reset-offsets --to-earliest --execute
    ```
 
-   For a file or spool source the engine reads what is left of the file from
-   its start; nothing needs resetting.
-6. Start the engine, wait until it has archived the source, and run the
-   [three checks](#before-any-recovery).
-7. **Report the loss**, from the old ledger. The records lost are those of the
-   committed batches that start below the first offset the broker still holds
-   (`kafka-get-offsets.sh --bootstrap-server "$BROKERS" --topic "$TOPIC" --time -2`):
-   all of a batch that ends below it, and the part below it of a batch that
-   straddles it:
+   The tool prints the new offset of each partition: the first offset the
+   broker still holds. For a file or spool source the engine reads what is left
+   of the file from its start; nothing needs resetting.
+5. Start the engine, wait until it has archived the source (the first commit,
+   then caught up, [read from `vtopctl status`](#conventions-used-in-the-steps)),
+   and run the [three checks](#before-any-recovery).
+6. **Report the loss**, from the old ledger. The records lost are those of the
+   committed batches that start below the first offset the broker still holds,
+   for each partition: all of a batch that ends below it, and the part below it
+   of a batch that straddles it. Get that offset (the last field of each line
+   is it, the fields are `topic:partition:offset`):
 
-   ```sql
+   ```bash
+   kafka-get-offsets.sh --bootstrap-server "$BROKERS" --topic "$TOPIC" --time -2
+   ```
+
+   Then ask the **renamed** database, once for each partition, with
+   `OLD_LEDGER_URL` the URL of `vtop_lost_bucket` (not the new `vtop`):
+
+   ```bash
+   psql "$OLD_LEDGER_URL" -v topic="$TOPIC" -v partition=0 -v first=<first retained offset> <<'SQL'
    SELECT batch_id, record_count,
           ((progress_start_json::json)->>'start_offset')::bigint AS start_offset,
           ((progress_end_json::json)->>'end_offset')::bigint AS end_offset,
-          CASE WHEN ((progress_end_json::json)->>'end_offset')::bigint < :first_retained_offset
+          CASE WHEN ((progress_end_json::json)->>'end_offset')::bigint < :first
                THEN 'whole' ELSE 'part' END AS lost
    FROM batches
    WHERE state = 'source_committed' AND source_type = 'kafka'
-     AND ((progress_start_json::json)->>'start_offset')::bigint < :first_retained_offset;
+     AND (progress_end_json::json)->>'topic' = :'topic'
+     AND ((progress_end_json::json)->>'partition')::int = :partition
+     AND ((progress_start_json::json)->>'start_offset')::bigint < :first;
+   SQL
    ```
 
    A `whole` batch lost its `record_count` records. A `part` batch lost the
-   records at offsets `start_offset` up to `:first_retained_offset - 1`: at
-   most that many, and exactly that many when the partition's offsets have no
-   gaps (no compaction, no transaction markers). Report a `part` batch's
-   count as "at most" unless you know the offsets are dense.
+   records at offsets `start_offset` up to `first - 1`: at most that many, and
+   exactly that many when the partition's offsets have no gaps (no compaction,
+   no transaction markers). Report a `part` batch's count as "at most" unless
+   you know the offsets are dense. With a topic of several partitions, repeat
+   for each with its own offset.
 
 ### Pass criteria
 
@@ -247,7 +336,7 @@ committed range.
   the new ledger passes the checks.
 - The records missing from the new archive are exactly the ones the old ledger
   committed below the first retained offset.
-- The time from step 4 until the retained records are archived again is inside
+- The time from step 3 until the retained records are archived again is inside
   `VTOP_DR_BUCKET_LOST_RTO_S`.
 
 ### What the drill measured
@@ -270,7 +359,12 @@ replication: S3 cross-region replication, MinIO bucket replication) and the
 ledger's latest backup ([Backup and recovery](backup-and-recovery.md)). **The
 source must survive the region**: a stretched or mirrored Kafka cluster, or
 files on storage the DR region mounts. If it does not, the recovery below still
-restores what the replica and the backup hold and nothing more.
+restores what the replica and the backup hold and nothing more. The drill
+keeps one Kafka broker and the group's offsets across the disaster; whether a
+mirror carries the consumer group's committed offsets, and what the engine does
+when they are missing or behind the ledger, is not drilled: check the group's
+offsets with `kafka-consumer-groups.sh --describe --group "$GROUP"` before
+step 6.
 
 **What the engine does by itself.** On a restored ledger that is older than the
 consumer group, it logs that the group is ahead of the ledger and resumes from
@@ -285,7 +379,12 @@ never re-reads a committed range. The check in step 4 names them.
 
 1. **Fence.** Make sure nothing in the primary region can start again.
 2. **A ledger server in the DR region, with the backup restored**, as in
-   [Dump and restore](backup-and-recovery.md#dump-and-restore):
+   [Dump and restore](backup-and-recovery.md#dump-and-restore). A new server
+   has none of the roles the dump refers to: create them first (the migration
+   owner and the runtime role of [the deployment](../POSTGRES_DEPLOYMENT.md#identities),
+   from your deployment's script or a `pg_dumpall --roles-only` you kept), or
+   `pg_restore --exit-on-error` stops at the first `OWNER TO` or `GRANT` that
+   names a missing role. Then:
 
    ```bash
    createdb vtop
@@ -296,8 +395,14 @@ never re-reads a committed range. The check in step 4 names them.
    ```
 
 3. **Point the engine at the DR bucket.** The same configuration and secrets,
-   with `upload.endpoint_url` (and credentials) of the DR region's store, the
-   same bucket, prefix, consumer group and manifest key.
+   with `upload.endpoint_url` (or `VTOP_S3_ENDPOINT_URL`) and `upload.region`
+   of the DR region's store, the same bucket name, prefix, consumer group and
+   manifest key. The credentials are not in the config: the DR host's own AWS
+   credentials (an instance profile, or `AWS_ACCESS_KEY_ID` and
+   `AWS_SECRET_ACCESS_KEY` in the engine's environment) must reach the DR
+   bucket. The Kafka brokers in `sources.kafka.bootstrap_servers` must be ones
+   the DR region can reach. Set `engine.ledger_digest_dir` to the directory you
+   restored the digests into.
 4. **Check before the engine starts:**
 
    ```bash
@@ -366,11 +471,20 @@ records are in the bucket twice.
 
 ### Steps
 
-1. Find the disk from the engine's log (above).
-2. Free space on it. Do not delete the work directory's staged batches or the
-   ledger's `-wal` file by hand.
-3. If the engine has exited (it did not in the drill), start it: `vtopctl run
-   --config /etc/vtop/config.yaml`. Otherwise nothing.
+1. Find the disk from the engine's log (above): `journalctl -u vtop-engine
+   --since '1 hour ago' | grep -iE 'no space|disk is full|StorageFull'`, or
+   `kubectl logs` for a pod. Match the message to a path: the work directory
+   (`engine.work_dir`), the disk the SQLite ledger is on (the path in
+   `engine.state_store`), or the store's own volume. `df -h <path>` shows a
+   full disk; `df -i <path>` shows one out of inodes.
+2. Free space on it: grow the volume, move what else lives there, or rotate
+   logs. Do not delete the work directory's staged batches or the ledger's
+   `-wal` file by hand.
+3. If the engine has exited (it did not in the drill; `systemctl status
+   vtop-engine` says), start it: `systemctl start vtop-engine`, or `vtopctl run
+   --config /etc/vtop/config.yaml`. Otherwise nothing: give it up to the
+   bound below (90 s; the drill took 12 to 15 s, most of it the engine's retry
+   back-off) before you decide it is stuck, then read its log.
 4. Run the [three checks](#before-any-recovery).
 
 ### Pass criteria
@@ -437,16 +551,23 @@ read it again; the [scrub](scrub-and-audit.md#scrub) finds it.
 
 1. `vtopctl scrub --config /etc/vtop/config.yaml` exits non-zero and names the
    batch: `mismatched` for another content, `missing` for a deleted object.
-2. If the bucket keeps versions, list them and remove the bad one, so that the
+2. Find the object's key: `vtopctl --json list-batches --config
+   /etc/vtop/config.yaml` has each batch's `object_uri` (`s3://<bucket>/<key>`)
+   beside its `batch_id`; the scrub names only the batch.
+3. If the bucket keeps versions, list them and remove the bad one, so that the
    previous one is current:
 
    ```bash
-   mc ls --versions <alias>/<bucket>/<key>
-   mc rm --version-id <bad version id> <alias>/<bucket>/<key>
+   aws s3api list-object-versions --bucket <bucket> --prefix <key>
+   aws s3api delete-object --bucket <bucket> --key <key> --version-id <bad version id>
    ```
 
-   Scrub again: it passes.
-3. If there is no earlier version, or no replica to copy from, the object is
+   With MinIO: `mc ls --versions <alias>/<bucket>/<key>` and `mc rm
+   --version-id <bad version id> <alias>/<bucket>/<key>`. The bad version is
+   the newest one (the top of the listing). Under S3 Object Lock a locked
+   version cannot be removed before its retention date; the drill's bucket has
+   no lock, so that case is not drilled. Scrub again: it passes.
+4. If there is no earlier version, or no replica to copy from, the object is
    lost. `scrub` and `audit-coverage --check-storage` report it exactly, with
    the batch id; the ledger's `record_count` for that batch is the number of
    records lost. The engine will not archive a committed range again: record
@@ -525,7 +646,10 @@ cargo build -p vtop-cli --features postgres --bin vtopctl
 scripts/dr-drill/ledger-lost.sh target/debug/vtopctl
 ```
 
-They need bash 5, docker, python3, curl and sqlite3. The lab's MinIO image is
+They need bash 5 (macOS's `/bin/bash` is 3.2: run them with Homebrew's), docker,
+python3, curl and sqlite3, and about 1 GB of memory for each container the
+drill starts (MinIO, PostgreSQL, Kafka: the region drill starts two MinIO
+servers as well). The lab's MinIO image is
 built from `docker/minio` when it is not present (`docker compose build
 minio`). `DR_DRILL_NETWORK=host` makes every helper container share the host's
 network, as CI does; `DR_DRILL_WORKDIR`, `DR_DRILL_KEEP` and the image
@@ -566,6 +690,15 @@ promise about yours, and the first CI runs will add their own column.
 - **S3 Object Lock.** A locked object cannot be removed or overwritten before
   its date; the at-rest leg runs on a bucket without it.
 - **Rebuilding across an hour boundary**, as described above.
+- **A SQLite ledger.** Only the full-disk drill uses one; the lost-ledger,
+  lost-bucket and lost-region drills run on PostgreSQL. The steps for a SQLite
+  ledger differ only in the ledger step (no database to create), and were not
+  run.
+- **Two database identities.** The drills run one PostgreSQL role that owns
+  everything; the roles and grants of [PostgreSQL in
+  depth](../POSTGRES_DEPLOYMENT.md#deployment-sequence) are not exercised.
+- **An object store other than MinIO.** The drills' store is MinIO; the AWS
+  commands in the steps are not run by them.
 - **Managed services.** A managed PostgreSQL or store has its own backup and
   recovery; use it, then run the three checks.
 
@@ -637,9 +770,34 @@ For each runbook, the second person:
 
 | Runbook | Run by | Date | Time taken | Notes folded back |
 |---|---|---|---|---|
-| The ledger is lost | not yet | | | |
-| The bucket is lost | not yet | | | |
-| A region is lost | not yet | | | |
-| A disk is full | not yet | | | |
-| Verification fails | not yet | | | |
-| Key rotation | not yet | | | |
+| The ledger is lost | desk run; no hands-on run yet | 2026-11-22 | not timed (nothing was run) | Variables and tools defined; roles and grants, MAC key for `migrate`, the audit-trail end as a routine record, the group reset's preconditions. |
+| The bucket is lost | desk run; no hands-on run yet | 2026-11-22 | not timed (nothing was run) | New store first (the audit needs a store that answers); bucket creation commands; renamed-database loss report that runs (psql variables, topic and partition). |
+| A region is lost | desk run; no hands-on run yet | 2026-11-22 | not timed (nothing was run) | Roles on the new server; credentials and region; mirror offsets named as not drilled. |
+| A disk is full | desk run; no hands-on run yet | 2026-11-22 | not timed (nothing was run) | How to find the log and the disk; what to free; how long to wait. |
+| Verification fails | desk run; no hands-on run yet | 2026-11-22 | not timed (nothing was run) | Batch id to object key; AWS commands beside `mc`; Object Lock caveat. |
+| Key rotation | desk run; no hands-on run yet | 2026-11-22 | not timed (nothing was run) | Key file recipe, restarts, the checking shell's access: see [the rotation page](manifest-key-rotation.md). |
+
+The six rows above are a **desk run**: each page was read, step by step,
+against the code, the CLI and the drill scripts, and the gaps found are folded
+into the steps. Nothing was executed, so no time is recorded, and a desk run
+is not the second person's run: no row is closed until a person who did not
+write the runbook runs it on a lab and writes their own row.
+
+### Causing each disaster by hand
+
+The script headers describe each drill's own mechanics. For a second person
+without the drill's lab, this is what each one does to cause the disaster, so
+that the page's steps can be followed on another host. In every case the engine
+is running and has archived a first stretch of records (120 in the drills)
+before the disaster, and the source keeps receiving records after it.
+
+| Runbook | Cause it by | Script |
+|---|---|---|
+| The ledger is lost | Stop the engine, `DROP DATABASE vtop WITH (FORCE)`, remove the digest directory and the work directory. Keep the bucket. Append records to the source meanwhile. | `ledger-lost.sh` |
+| The bucket is lost | Destroy the store's data while the engine runs (delete the bucket and everything in it, including versions). Go on producing. Let the broker expire the topic's first records: `kafka-delete-records.sh --bootstrap-server "$BROKERS" --offset-json-file trim.json` with `{"partitions":[{"topic":"<topic>","partition":0,"offset":40}],"version":1}`. Stop the engine. | `bucket-lost.sh` |
+| A region is lost | Replicate the versioned bucket to a second one (S3 cross-region replication; MinIO `mc replicate add`). After a few batches take the ledger backup (`pg_dump --format=custom` and the digest directory). Let more batches archive. Then kill the engine, the ledger server and the primary bucket together. For "the replica is behind", stop replication for the last batches before the disaster and take the backup afterwards. | `region-lost.sh` |
+| A disk is full | Put the directory on a small volume (a 4 MB tmpfs: `mount -t tmpfs -o size=4m tmpfs <dir>`, needs root) and fill it to the last byte with `dd if=/dev/zero of=<dir>/filler bs=512`. For the store, give it a small volume of its own and fill that. Append records for 20 seconds, then delete `filler`. | `disk-full.sh` |
+| Verification fails, while the engine verifies | Put `scripts/dr-drill/fault-proxy.py <listen port> <store host:port> <control file> <stats file>` between the engine and the store (point `upload.endpoint_url` at the proxy), then `echo head > <control file>` (the store's own checksum is wrong) or `echo get > <control file>` (a read-back returns another first byte; use `checksum.algorithm: blake3`). Remove the control file to end the fault. | `verification-failed.sh` |
+| Verification fails, at rest | Overwrite a committed object (`aws s3 cp - s3://<bucket>/<key> <<< 'not the archived object'`, or `mc pipe`), or delete every version of it. | `verification-failed.sh` |
+| Key rotation | Nothing to break: archive under the old key with `manifest_mac_key_env` first, then follow [the rotation page](manifest-key-rotation.md). | `key-rotation.sh` |
+
