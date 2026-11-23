@@ -279,11 +279,25 @@ What an older binary does with newer data, by case:
   `config.yaml` sections ignore a key they do not know, while the cluster
   role configs and some nested sections refuse one: `manifest.mac` and its
   `keys`, `upload.object_lock`, `upload.transports.<name>`, the state-store
-  `env`/`file` references, and a stream's `checksum` in `streams.yaml`. A
-  `config_version` key and a `vtopctl validate --strict` that refuses
-  unknown keys are planned.
-  Until then, each release's notes list the new keys an older engine
-  silently ignores.
+  `env`/`file` references, and a stream's `checksum` in `streams.yaml`.
+  Two additions make an ignored key visible without changing what loads
+  (#743):
+    - `vtopctl validate --strict` also fails on every key the engine would
+      ignore, in `config.yaml` and in the `streams.yaml` beside it, naming
+      each key's path and the nearest known key when one is close. Plain
+      `validate` and engine start are unchanged.
+    - An optional top-level `config_version`, a whole number. A config
+      without it reads as the current version, which is `1`, so no existing
+      file changes. A config that declares a newer version than the binary
+      reads is refused, by every command that loads it, with a message
+      naming both versions. A config may declare `1` and nothing else
+      today. The version is raised only for a change an older engine would
+      misread (a key renamed, removed or given a new meaning), never for a
+      new key with a safe default. An engine from before this key ignores it,
+      which is harmless while the version is `1`.
+
+  Each release's notes still list the new keys an older engine silently
+  ignores.
 - **JSON output.** Every `vtopctl --json` report that is a JSON object
   carries `report_version`, currently `1`: an additive field, added in
   v0.11.0, so a script can tell which shape of a report it reads. A report
@@ -362,7 +376,7 @@ table differs from what the registry generates. Edit the registry and run
 | 20 | Replica protocol negotiation | replica protocol `1` and `2` | C | evolving | follows #740 |
 | 21 | Metadata peer and admin transport | `VTPM`, version `1` | C | evolving | follows #740 |
 | 22 | Kafka gateway: advertised APIs and version ranges | none | C | experimental | experimental |
-| 23 | `config.yaml` | none (`config_version` planned) | D | evolving | classified at the freeze |
+| 23 | `config.yaml` | optional `config_version`, `1` today (absent reads as `1`) | D | evolving | classified at the freeze |
 | 24 | `vtopctl validate --print-effective` | `effective_version` `1` | D | JSON stable, text for people | JSON stable |
 | 25 | `vtopctl` JSON output and exit codes | `report_version` `1` on every object report | D | evolving | classified at the freeze |
 | 26 | Metric names and labels | none | D | evolving | a stable subset |
