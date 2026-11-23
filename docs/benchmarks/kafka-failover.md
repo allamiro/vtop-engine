@@ -6,17 +6,19 @@
 
 [#597](https://github.com/allamiro/vtop-engine/issues/597), part of [#595](https://github.com/allamiro/vtop-engine/issues/595); charts per [#600](https://github.com/allamiro/vtop-engine/issues/600). Raw data: [`failover.csv`](../../benchmarks/kafka_compare/results/failover-20261111T032549Z/failover.csv), [`timeline.csv`](../../benchmarks/kafka_compare/results/failover-20261111T032549Z/timeline.csv) and [`environment.json`](../../benchmarks/kafka_compare/results/failover-20261111T032549Z/environment.json), run `failover-20261111T032549Z`. Every number below is generated from those files by `benchmarks/kafka_compare/report.py`.
 
-## First finding: a Kafka client cannot follow a VTOP failover
+## First finding: in this run, a Kafka client could not follow a VTOP failover
 
-The only VTOP topology that fails over by itself is the one the Helm chart renders for a replicated range: every node a **candidate**, the role following the metadata lease (#284). A candidate refuses the Kafka gateway at startup, as a co-located node and as a data node alike:
+The only VTOP topology that fails over by itself is the one the Helm chart renders for a replicated range: every node a **candidate**, the role following the metadata lease (#284). In the build this run measured, a candidate refused the Kafka gateway at startup, as a co-located node and as a data node alike:
 
 ```
 error: `kafka` is configured on a Candidate node: the gateway is served by a leader or standalone only — it holds one broker, and a candidate's changes with the lease (#225)
 ```
 
-The gateway runs only on a `leader` or `standalone` node. A leased `leader` with followers can carry it (live-chaos scenario 20), but followers run no lease agent and never take the range themselves (`crates/vtop-node/src/lease_watcher.rs`): failing over that shape means restarting a follower with a rewritten leader config, which is what scenario 09 does by hand. So there is no promoted node for a Kafka client's metadata refresh to find, and no failover through the Kafka wire protocol to measure. The phase-1 static leader could not fail over at all (no lease, plaintext replica plane).
+So there was no promoted node for a Kafka client's metadata refresh to find, and no failover through the Kafka wire protocol to measure. The phase-1 static leader could not fail over at all (no lease, plaintext replica plane).
 
-**What was measured instead, labelled everywhere:** VTOP's failover through its **native** client (`vtop-node produce`, driven by `vtop/failover-driver.sh`, which looks the leader up in the range lease and resumes from the acknowledged floor), against Kafka's failover through its own JVM client. The clusters are the fair part of the comparison (three nodes each, identical limits, both voters of their metadata quorum and replicas of the partition); the clients are not the same program, so the numbers compare two client+cluster paths, not two clusters behind one client.
+**That gap is closed since this run (#751), and this page was not re-measured.** A candidate now serves the gateway, and live-chaos scenarios 27 and 28 show a stock librdkafka producer and the JVM client of Apache Kafka follow a failover with no restart and no configuration change: they resumed 5.7 s to 6.6 s (librdkafka, four runs) and 5.5 s to 5.8 s (JVM client, eight runs) after a leader kill, every acknowledged record read back once and in order ([the scenarios](../LIVE_CHAOS_VALIDATION.md#kafka-clients-and-a-failover-751)). Those runs are one host, debug binaries and a 6 s lease, not this page's shipped timeouts, so their numbers are not comparable with the ones below. They did not cover the co-located `vtop-node node` shape that this page's cluster uses, nor a consumer group's coordinator across a failover (#751 scopes it out), nor the chart's default lease.
+
+**What was measured here, labelled everywhere:** VTOP's failover through its **native** client (`vtop-node produce`, driven by `vtop/failover-driver.sh`, which looks the leader up in the range lease and resumes from the acknowledged floor), against Kafka's failover through its own JVM client. The clusters are the fair part of the comparison (three nodes each, identical limits, both voters of their metadata quorum and replicas of the partition); the clients are not the same program, so the numbers compare two client+cluster paths, not two clusters behind one client.
 
 ## Correctness: acknowledged records lost and duplicated
 
@@ -204,7 +206,7 @@ No `matched-timeouts` profile was run: these are the shipped defaults, and the f
 
 ## Not measured here
 
-- **The Kafka client path on VTOP** (see the first finding). No VTOP number on this page is a Kafka client's.
+- **The Kafka client path on VTOP** (see the first finding): not re-measured after #751 closed the gap. No VTOP number on this page is a Kafka client's.
 - **#597's other faults:** `kill -9` of the metadata leader alone (F2) and of a follower (F5). In both
   co-located clusters the partition leader is often also the metadata leader; the per-repetition table says
   when it was.
