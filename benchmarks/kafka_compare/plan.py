@@ -11,6 +11,12 @@ the schema-2 axes. Each one defaults to what that run did: compression
 end-to-end rows and no `acks` slice. Its keys are therefore the rows it
 wrote.
 
+Schema 3 adds one axis, `group_commits` (#752): VTOP's `group_commit:` setting,
+`off` and/or `on`. It belongs to VTOP alone (Kafka has no counterpart), so
+Kafka's rows carry a blank setting and VTOP owes its rows once per setting
+asked for. A matrix without the axis leaves VTOP at the node's own default and
+writes a blank setting everywhere, which is what every earlier run did.
+
     python3 benchmarks/kafka_compare/plan.py MATRIX.json [--max-hours H]
 
 prints the cells, the expected row count and the projected hours, and exits
@@ -29,6 +35,10 @@ COMPRESSIONS = ("none", "gzip", "zstd", "snappy", "lz4")
 ACKS = ("all", "1")
 PROFILES = ("defaults", "fsync-parity")
 LOAD_BASES = ("kafka", "common")
+# VTOP's `group_commit.enabled` (#752), in the order a run lists them. Written
+# into the node config as `enabled: false` / `enabled: true`, never left to the
+# binary's default, so a later change of that default cannot change what "off" means.
+GROUP_COMMITS = ("off", "on")
 SLICE_MODES = ("saturation", "consume")
 
 
@@ -54,6 +64,7 @@ class Axes(NamedTuple):
     repetitions: int
     load_bases: dict[str, list[int]]
     e2e: dict[str, Any] | None
+    group_commits: list[str]
 
 
 def axes(matrix: dict[str, Any]) -> Axes:
@@ -77,34 +88,38 @@ def axes(matrix: dict[str, Any]) -> Axes:
     for extra in matrix.get("acks_slice") or []:
         cells.append(Cell(extra["record_size"], extra["partitions"], extra["producers"], extra["compression"],
                           extra["acks"], tuple(extra["modes"])))
-    return Axes(cells, list(profiles), int(matrix["repetitions"]), dict(load_bases), e2e)
+    return Axes(cells, list(profiles), int(matrix["repetitions"]), dict(load_bases), e2e,
+                list(matrix.get("group_commits") or []))
 
 
 def expected_keys(matrix: dict[str, Any]) -> set[tuple]:
     """Every row key a complete run of `matrix` writes:
 
     (system, mode, record_size, partitions, producers, compression, acks,
-     profile, repetition, load_basis, load_pct)
+     profile, group_commit, repetition, load_basis, load_pct)
 
     with load_basis and load_pct as the CSV's text ("" where a mode has
-    none). A system that is not run at a rate still owes its row: a
-    `refused` row saying why, never a hole.
+    none), and group_commit "" for Kafka and for a matrix without the axis,
+    else VTOP's setting: VTOP owes its rows once per setting asked for. A
+    system that is not run at a rate still owes its row: a `refused` row
+    saying why, never a hole.
     """
     a = axes(matrix)
     keys = set()
     for cell in a.cells:
         for profile, system, rep in itertools.product(a.profiles, SYSTEMS, range(1, a.repetitions + 1)):
-            base = (system, None, cell.record_size, cell.partitions, cell.producers, cell.compression,
-                    cell.acks, profile, rep)
-            for mode in cell.modes:
-                if mode == "fixed_rate":
-                    for basis, pcts in a.load_bases.items():
-                        for pct in pcts:
-                            keys.add(base[:1] + (mode,) + base[2:] + (basis, str(pct)))
-                elif mode == "e2e":
-                    keys.add(base[:1] + (mode,) + base[2:] + (a.e2e["load_basis"], str(a.e2e["load_pct"])))
-                else:
-                    keys.add(base[:1] + (mode,) + base[2:] + ("", ""))
+            for group_commit in (a.group_commits or [""]) if system == "vtop" else [""]:
+                base = (system, None, cell.record_size, cell.partitions, cell.producers, cell.compression,
+                        cell.acks, profile, group_commit, rep)
+                for mode in cell.modes:
+                    if mode == "fixed_rate":
+                        for basis, pcts in a.load_bases.items():
+                            for pct in pcts:
+                                keys.add(base[:1] + (mode,) + base[2:] + (basis, str(pct)))
+                    elif mode == "e2e":
+                        keys.add(base[:1] + (mode,) + base[2:] + (a.e2e["load_basis"], str(a.e2e["load_pct"])))
+                    else:
+                        keys.add(base[:1] + (mode,) + base[2:] + ("", ""))
     return keys
 
 
@@ -144,6 +159,7 @@ def check_matrix(matrix: dict[str, Any]) -> None:
         raise PlanRefused(f"matrix.load_bases is {matrix.get('load_bases')!r}, not a map of bases to rates")
     strings("compressions", COMPRESSIONS)
     strings("profiles", PROFILES)
+    strings("group_commits", GROUP_COMMITS)
     if any(a not in ACKS for a in matrix["acks"]):
         raise PlanRefused(f"matrix.acks is {matrix['acks']!r}; acknowledgement modes are {list(ACKS)}")
     bases = matrix.get("load_bases")
@@ -232,7 +248,9 @@ def projected_seconds(matrix: dict[str, Any], timing: dict[str, float] | None = 
             vtop = one + (profiles - 1) * a.repetitions * rated
         else:
             vtop = one * profiles
-        total += one * profiles + vtop
+        # VTOP's cluster is brought up and measured afresh for every group-commit
+        # setting asked for (the node's config is read at start); Kafka's is not.
+        total += one * profiles + vtop * max(len(a.group_commits), 1)
     return total
 
 
@@ -245,6 +263,15 @@ def check_budget(matrix: dict[str, Any], max_hours: float, timing: dict[str, flo
     return hours
 
 
+def summary(matrix: dict[str, Any]) -> str:
+    """The plan's one-line summary: cells, rows owed and projected hours."""
+    a = axes(matrix)
+    hours = projected_seconds(matrix) / 3600
+    settings = f" x group commit {', '.join(a.group_commits)} (VTOP)" if a.group_commits else ""
+    return (f"{len(a.cells)} cells x {len(a.profiles)} profile(s) x {len(SYSTEMS)} systems{settings} x "
+            f"{a.repetitions} repetitions: {len(expected_keys(matrix))} result rows, projected {hours:.1f} h")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("matrix", help="a JSON file holding a matrix, or an environment.json")
@@ -255,10 +282,7 @@ def main(argv: list[str] | None = None) -> int:
     matrix = data.get("matrix", data)
     try:
         check_matrix(matrix)
-        a = axes(matrix)
-        hours = projected_seconds(matrix) / 3600
-        print(f"{len(a.cells)} cells x {len(a.profiles)} profile(s) x {len(SYSTEMS)} systems x "
-              f"{a.repetitions} repetitions: {len(expected_keys(matrix))} result rows, projected {hours:.1f} h")
+        print(summary(matrix))
         if args.max_hours is not None:
             check_budget(matrix, args.max_hours)
     except PlanRefused as exc:

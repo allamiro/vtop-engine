@@ -495,7 +495,7 @@ class DockerBackend:
         return sh([*command, *args], timeout=timeout, cwd=HERE, check=check, env={
             "VTOP_IMAGE": self.ctx["vtop_image"], "KAFKA_IMAGE": KAFKA_IMAGE,
             "CRASH_DATA_ROOT": self.ctx["data_root"], "CRASH_NODE_CPUS": str(self.ctx["node_cpus"]),
-            "CRASH_VTOP_LEADER": "./" + vtop_leader_file(config or self.config).replace(os.sep, "/")})
+            "VTOP_LEADER_CONFIG": "./" + vtop_leader_file(config or self.config).replace(os.sep, "/")})
 
     def down(self, config: str | None = None, volumes: bool = False) -> None:
         sh(["docker", "rm", "-f", PRODUCER], check=False)

@@ -2,7 +2,7 @@
 # home directories (their data) are bind mounts under ${CRASH_DATA_ROOT}, one filesystem for all
 # three, and the CPUs per node come from ${CRASH_NODE_CPUS}. Every engine setting is the shipped one, except in
 # the two group-commit configurations (#752), which run the leader with crash/leader-group-commit-{on,off}.yaml:
-# crash.py names the leader's file in ${CRASH_VTOP_LEADER}, which compose.vtop.yml's leader mount reads (the shipped
+# crash.py names the leader's file in ${VTOP_LEADER_CONFIG}, which compose.vtop.yml's leader mount reads (the shipped
 # leader.yaml when it is unset). The file is the shipped leader.yaml plus a `group_commit:` section and nothing
 # else; the followers never get one.
 services:

@@ -34,6 +34,43 @@ saturation run AND per consume run, per record size), `--fixed-seconds 30` (a fi
 Every one is checked before any Docker work, and so is the matrix's projected run time (`plan.py`):
 a matrix projected past `--max-hours` is refused before the first container starts.
 
+### Group commit on and off (#752)
+
+`--group-commit off,on` runs VTOP once per setting of the node's `group_commit.enabled` (`off`, `on`, or
+both), so the official run can report group commit measured instead of argued. It is VTOP's setting alone:
+Kafka has no counterpart, runs once, and its rows leave the `group_commit` column blank.
+
+```bash
+python3 benchmarks/kafka_compare/run.py --group-commit off,on
+```
+
+- **Only what the node accepts.** `run.py` reads `crates/vtop-node/src/config.rs` at `HEAD` (the commit the
+  image is built from) for the keys of the data node's `group_commit:` section, and writes only `enabled`. If
+  the engine at `HEAD` has no such section (it lands with #832), the request is refused before any Docker work,
+  saying so: the node would refuse the key at startup, and a run that left it out would label rows with a
+  setting that was never applied.
+- **Written, not defaulted.** Each setting is appended to the leader's `vtop/leader.yaml` as an explicit
+  `group_commit: {enabled: false}` or `{enabled: true}` (to `results/<run-id>/configs/`, and verbatim into
+  `environment.json` under `configs.vtop_leader_group_commit_<setting>`), so the day the node's own default
+  changes, `off` still means off. `compose.vtop.yml` takes the file from `VTOP_LEADER_CONFIG`. Followers are
+  not given the section: a follower with it enabled is refused by the node.
+- **Confirmed, not assumed.** After each VTOP cluster comes up, the leader's own
+  `vtop_broker_group_commit_enabled` gauge must read 1 for `on` and 0 for `off` (or the node does not export it)
+  or the run stops. It is not written as a `refused` cell: the cause would repeat in every cell.
+- **Owed, and checked.** `group_commits` is an axis of the matrix. A run that asked for both settings owes
+  VTOP's rows twice, and `run.py --check` and the report's completeness check list the setting that is missing.
+  A matrix without the axis leaves VTOP at the node's own default and writes a blank setting, as every earlier
+  run did. `--max-hours` counts VTOP once per setting.
+- **Shown as its own dimension.** The report draws VTOP once per setting, in VTOP's one colour (the palette
+  has two validated slots): `off` hatched or dashed with diamond markers, `on` solid with square markers. It adds
+  a *Group commit ablation* table (off, on, and the ratio of medians per record size), names the settings in
+  the Method, the footer and the Environment table, and replaces the explanation of VTOP's per-request barrier
+  with a pointer to the ablation.
+
+The only knob exposed for the ablation is `enabled`. `group_commit.max_delay_ms`, `max_records`, `max_bytes` and
+`max_pending_requests` stay at the node's defaults (natural batching, the plan's decision D1), so the run
+measures what ships; varying them is not part of this switch.
+
 ```bash
 # What a run directory still lacks, whatever its state: exit 0 when every expected row is there,
 # 2 with the missing row keys listed otherwise.
@@ -75,11 +112,13 @@ For each record size, Kafka first and then VTOP:
 
 ## Output
 
-`results/<run-id>/results.csv`, schema 2 (#596): one row per key
-(`system`, `mode`, `record_size`, `partitions`, `producers`, `compression`, `acks`, `profile`, `repetition`,
-`load_basis`, `load_pct`), with the run-constant columns (`run_id`, `env_fingerprint`, `vtop_commit`,
+`results/<run-id>/results.csv`, schema 3 (#752, on schema 2 from #596): one row per key
+(`system`, `mode`, `record_size`, `partitions`, `producers`, `compression`, `acks`, `profile`, `group_commit`,
+`repetition`, `load_basis`, `load_pct`), with the run-constant columns (`run_id`, `env_fingerprint`, `vtop_commit`,
 `kafka_image`, `client`). `mode` is `saturation`, `fixed_rate`, `consume` or `e2e` (end-to-end latency);
-`compression` is the producer's codec; `profile` is `defaults` or `fsync-parity`; `load_basis` says what a
+`compression` is the producer's codec; `profile` is `defaults` or `fsync-parity`; `group_commit` is VTOP's
+`group_commit.enabled` for the row, `off` or `on`, blank on every Kafka row and on every row of a run that did
+not vary it; `load_basis` says what a
 rated row's percentage is of: `kafka` (Kafka's median saturation for the cell) or `common` (the slower
 system's), blank on unrated rows. `lat_basis` is `single`, or `worst-of-N` when N producers ran and the row
 carries the worst producer's percentiles. `records_produced` is set on `e2e` rows, whose `records` is the
@@ -89,7 +128,8 @@ measurement: VTOP's node configuration is the same under both profiles, so it ru
 are recorded under each. Which rows a matrix owes is defined once, in `plan.py`, for the runner, `--check`
 and the report.
 
-Schema 1, the layout of the committed phase-1 run (`20261109T232328Z`), still loads. It had no
+Schema 2 (no `group_commit` column) still loads, read with a blank setting. Schema 1, the layout of the
+committed phase-1 run (`20261109T232328Z`), still loads. It had no
 `compression`, `same_config_as`, `load_basis`, `records_produced`, `lat_basis` or window columns, and held
 `profile` constant across the run. Its rows are read as schema 2 with compression `none`, load basis `kafka`
 on fixed-rate rows and latency basis `single`, which is what that run did, and its report is unchanged
@@ -106,7 +146,10 @@ properties passed, the client's resolved `ProducerConfig` per system, selected s
 configuration as Kafka reports it (`kafka-configs --describe --all`, filtered to the flush, replication,
 timeout, thread, socket, fetch, segment and group settings `run.py` names) and the topic layout, the derived
 offered rates, the two Compose files and three VTOP node configs verbatim, and the COUNT of other containers
-running on the Docker host at start (not their names). From `schema_version` 2 it also records
+running on the Docker host at start (not their names). From `schema_version` 3 it also records
+`comparable.vtop_group_commit.settings`, the group-commit settings the run measured and the `enabled` each was
+written as (empty when the run did not vary it), which is part of what the fingerprint covers; the report
+refuses a run whose recorded settings disagree with its matrix's `group_commits`. From `schema_version` 2 it also records
 `comparable.host_disk`, the host disk behind Docker's data (model, SSD or HDD on macOS, the kernel's rotational
 flag on Linux, bus, filesystem), which every image's footer names; `run.py` and `failover.py` refuse to start,
 before pulling or building anything, when the disk cannot be named, and say what the probe saw. On a host whose

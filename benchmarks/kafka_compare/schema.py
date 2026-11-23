@@ -6,12 +6,16 @@ report never draws from anything else, so a chart cannot quietly have a hole
 where a row is missing - a cell that did not run is a ROW saying so (status
 `failed` or `refused`), and the chart shows that gap by name.
 
-There are two layouts (#596). Schema 2 (`COLUMNS`) adds compression, the load
-basis, the latency basis, the end-to-end mode, the measurement window and
+There are three layouts. Schema 2 (`COLUMNS_V2`, #596) adds compression, the
+load basis, the latency basis, the end-to-end mode, the measurement window and
 `same_config_as`, and it moves `profile` from the run-constant set into the
-row key. Schema 1 (`COLUMNS_V1`, phase 1's committed run) still loads. Its rows
-are read as schema 2 with compression `none`, load basis `kafka` on fixed-rate
-rows and latency basis `single`, which is what that run did, so its report is
+row key. Schema 3 (`COLUMNS`, #752) adds `group_commit`, VTOP's
+`group_commit.enabled` for the row (`off` or `on`; blank for Kafka, which has
+no such setting, and for a run that did not vary it), and makes it part of the
+row key. Schema 1 (`COLUMNS_V1`, phase 1's committed run) and schema 2 still
+load. Their rows are read as schema 3: schema 1 with compression `none`, load
+basis `kafka` on fixed-rate rows and latency basis `single`, which is what that
+run did, and both with a blank `group_commit`, so a committed run's report is
 unchanged byte for byte.
 """
 from __future__ import annotations
@@ -33,6 +37,7 @@ COMPRESSIONS = plan.COMPRESSIONS
 ACKS = plan.ACKS
 PROFILES = plan.PROFILES
 LOAD_BASES = plan.LOAD_BASES
+GROUP_COMMITS = plan.GROUP_COMMITS
 
 COLUMNS_V1 = (
     "run_id",
@@ -66,7 +71,7 @@ COLUMNS_V1 = (
     "note",
 )
 
-COLUMNS = (
+COLUMNS_V2 = (
     "run_id",
     "env_fingerprint",
     "vtop_commit",
@@ -109,6 +114,12 @@ COLUMNS = (
     "note",
 )
 
+# Schema 3: schema 2 plus `group_commit` after `profile` (#752). VTOP's
+# `group_commit.enabled` for this row, `off` or `on`; blank on every Kafka row
+# and on every row of a run that did not vary it.
+COLUMNS = COLUMNS_V2[:COLUMNS_V2.index("profile") + 1] + ("group_commit",) \
+    + COLUMNS_V2[COLUMNS_V2.index("profile") + 1:]
+
 # Columns that must be the same on every row of one run: a chart that mixed
 # them would compare two environments as if they were one (rule 9). Schema 1
 # also held `profile` constant; schema 2 makes it a key.
@@ -117,7 +128,7 @@ RUN_CONSTANT_V1 = RUN_CONSTANT + ("profile",)
 
 # The row key: completeness and duplicates are judged on it.
 KEY = ("system", "mode", "record_size", "partitions", "producers", "compression", "acks", "profile",
-       "repetition", "load_basis", "load_pct")
+       "group_commit", "repetition", "load_basis", "load_pct")
 
 _LATENCY = ("lat_p50_ms", "lat_p95_ms", "lat_p99_ms", "lat_p999_ms")
 _NUMERIC_OK = {
@@ -146,8 +157,10 @@ class ReportRefused(Exception):
 
 # environment.json's layout. A run without the key is schema 1 (both runs
 # committed before #600). Schema 2 adds `comparable.host_disk`: the disk
-# behind Docker's volumes, which every image's footer names (#600).
-SCHEMA_VERSION = 2
+# behind Docker's volumes, which every image's footer names (#600). Schema 3
+# adds `comparable.vtop_group_commit`, the group-commit settings the run
+# measured and the configuration it wrote for each (#752).
+SCHEMA_VERSION = 3
 
 
 def check_schema_version(environment: dict[str, Any], env_path: str) -> None:
@@ -168,6 +181,37 @@ def check_schema_version(environment: dict[str, Any], env_path: str) -> None:
         if not isinstance(disk, str) or not disk.strip():
             raise ReportRefused(f"{env_path} is schema_version {version} but records no comparable.host_disk "
                                 f"({disk!r}): the footer of every image must name the disk")
+    check_group_commit_record(environment, env_path, version)
+
+
+def check_group_commit_record(environment: dict[str, Any], env_path: str, version: int) -> None:
+    """The group-commit settings a run measured are recorded, and agree with its matrix (#752).
+
+    `comparable.vtop_group_commit.settings` maps each setting the matrix asks for (`matrix.group_commits`)
+    to what the harness wrote into VTOP's leader config for it, so the setting is part of the environment
+    the run's fingerprint covers. A failover run (the HA cluster, no such setting) is exempt.
+    """
+    matrix = environment.get("matrix")
+    asked = matrix.get("group_commits") if isinstance(matrix, dict) else None
+    if asked is not None and version < 3:
+        raise ReportRefused(f"{env_path} is schema_version {version} but its matrix has group_commits: "
+                            "that axis is schema 3")
+    if version < 3 or environment.get("kind") == "failover":
+        return
+    comparable = environment.get("comparable") or {}
+    recorded = comparable.get("vtop_group_commit")
+    settings = recorded.get("settings") if isinstance(recorded, dict) else None
+    if not isinstance(settings, dict):
+        raise ReportRefused(f"{env_path} is schema_version {version} but records no "
+                            f"comparable.vtop_group_commit.settings ({recorded!r}): the run's group-commit "
+                            "settings must be part of its environment")
+    if list(settings) != list(asked or []):
+        raise ReportRefused(f"{env_path} records group-commit settings {list(settings)} but its matrix's "
+                            f"group_commits is {asked!r}")
+    for name, written in settings.items():
+        if not isinstance(written, dict) or written.get("enabled") is not (name == "on"):
+            raise ReportRefused(f"{env_path}: the recorded `{name}` setting is {written!r}, which does not "
+                                f"say `enabled: {'true' if name == 'on' else 'false'}`")
 
 
 class Cell(NamedTuple):
@@ -248,14 +292,22 @@ def _key_int(row: dict[str, str], column: str, line: int) -> int:
     return int(text)
 
 
+def _upgrade_v2(row: dict[str, str]) -> dict[str, str]:
+    """A schema-2 row read as schema 3: it did not vary VTOP's group commit, so the setting is blank."""
+    if None in row or any(value is None for value in row.values()):
+        return row
+    return {**row, "group_commit": ""}
+
+
 def _upgrade_v1(row: dict[str, str]) -> dict[str, str]:
-    """A schema-1 row read as schema 2: what phase 1 did, said in the new
+    """A schema-1 row read as schema 3: what phase 1 did, said in the new
     columns. A short row is left as it is, so `validate_rows` refuses it by
     line."""
     if None in row or any(value is None for value in row.values()):
         return row
     out = dict(row)
     out["compression"] = "none"
+    out["group_commit"] = ""
     out["same_config_as"] = ""
     out["load_basis"] = "kafka" if row["mode"] == "fixed_rate" else ""
     out["lat_basis"] = "single" if row["status"] == "ok" and row["mode"] in _HAS_LATENCY else ""
@@ -265,26 +317,30 @@ def _upgrade_v1(row: dict[str, str]) -> dict[str, str]:
 
 
 def read_rows(csv_path: str, *, allow_empty: bool = False) -> tuple[list[dict[str, str]], int]:
-    """The rows, as schema 2, and the schema the file was written in."""
+    """The rows, as schema 3, and the schema the file was written in."""
     if not os.path.isfile(csv_path):
         raise ReportRefused(f"no results CSV at {csv_path}")
     with open(csv_path, newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         header = tuple(reader.fieldnames or ())
         if header == COLUMNS:
+            version = 3
+        elif header == COLUMNS_V2:
             version = 2
         elif header == COLUMNS_V1:
             version = 1
         else:
             raise ReportRefused(
-                f"{csv_path} has columns {reader.fieldnames}, expected schema 2 {list(COLUMNS)} "
-                f"or schema 1 {list(COLUMNS_V1)}"
+                f"{csv_path} has columns {reader.fieldnames}, expected schema 3 {list(COLUMNS)}, "
+                f"schema 2 {list(COLUMNS_V2)} or schema 1 {list(COLUMNS_V1)}"
             )
         rows = list(reader)
     if not rows and not allow_empty:
         raise ReportRefused(f"{csv_path} has a header and no rows")
     if version == 1:
         rows = [_upgrade_v1(row) for row in rows]
+    elif version == 2:
+        rows = [_upgrade_v2(row) for row in rows]
     return rows, version
 
 
@@ -298,13 +354,20 @@ def _whole_or_blank(row: dict[str, str], column: str, line: int) -> int | None:
 
 
 def _validate_v2_columns(row: dict[str, str], line: int) -> None:
-    """The schema-2 columns of one row (a schema-1 row has them filled in)."""
+    """The schema-2 and -3 columns of one row (an older row has them filled in)."""
     if row["compression"] not in COMPRESSIONS:
         raise ReportRefused(f"results.csv line {line}: unknown compression {row['compression']!r}")
     if row["acks"] not in ACKS:
         raise ReportRefused(f"results.csv line {line}: acks is {row['acks']!r}, not one of {list(ACKS)}")
     if row["profile"] not in PROFILES:
         raise ReportRefused(f"results.csv line {line}: unknown profile {row['profile']!r}")
+    if row["group_commit"] not in ("",) + GROUP_COMMITS:
+        raise ReportRefused(f"results.csv line {line}: group_commit is {row['group_commit']!r}, not blank or one "
+                            f"of {list(GROUP_COMMITS)}")
+    if row["group_commit"] and row["system"] != "vtop":
+        raise ReportRefused(f"results.csv line {line}: a {row['system']} row has group_commit "
+                            f"{row['group_commit']!r}; the setting is VTOP's, and {row['system']} has no "
+                            "counterpart")
     same = row["same_config_as"]
     if same:
         if same not in PROFILES or same == row["profile"]:
@@ -334,7 +397,7 @@ def _validate_v2_columns(row: dict[str, str], line: int) -> None:
                             f"{row['window_end_ms']!r} is not a start and an end at or after it")
 
 
-def validate_rows(rows: list[dict[str, str]], version: int = 2) -> None:
+def validate_rows(rows: list[dict[str, str]], version: int = 3) -> None:
     """Every row well-formed, every run-constant column identical across rows."""
     for line, row in enumerate(rows, start=2):
         if None in row or any(value is None for value in row.values()):
@@ -429,6 +492,7 @@ def row_key(row: dict[str, str]) -> tuple:
         row["compression"],
         row["acks"],
         row["profile"],
+        row["group_commit"],
         int(row["repetition"]),
         row["load_basis"],
         row["load_pct"],
@@ -467,7 +531,7 @@ def check_matrix(matrix: dict[str, Any]) -> None:
         raise ReportRefused(f"environment.json: {exc}") from exc
 
 
-def check_identity(rows: list[dict[str, str]], environment: dict[str, Any], version: int = 2) -> None:
+def check_identity(rows: list[dict[str, str]], environment: dict[str, Any], version: int = 3) -> None:
     """Bind the CSV's identity columns to the run environment.json records.
 
     The fingerprint covers `comparable` only, while every row carries its own
@@ -531,7 +595,7 @@ class Run(NamedTuple):
     rows: list[dict[str, str]]
     environment: dict[str, Any]
     run_dir: str
-    version: int = 2
+    version: int = 3
 
 
 def _load_environment(run_dir: str) -> tuple[str, dict[str, Any]]:

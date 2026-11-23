@@ -11,6 +11,13 @@ with the SAME client container - the JVM perf tools from the pinned
 `apache/kafka` image - at saturation, then at fixed rates derived from Kafka's
 saturation for that cell, then for consume throughput. Each measurement is one
 CSV row; a cell a system could not run is a row saying why. See README.md.
+
+`--group-commit off,on` (#752) runs VTOP once per setting of the node's
+`group_commit.enabled`, so the report shows both. The harness writes the
+setting into the leader's config, only if the engine under test accepts a
+`group_commit:` section, and checks the running node's own gauge says the
+setting took; otherwise it refuses, before any Docker work or before the first
+measurement, rather than run without it.
 """
 from __future__ import annotations
 
@@ -39,6 +46,12 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 KAFKA_IMAGE = "apache/kafka:4.3.2@sha256:852a0d49fc4e656b022e7f23785411802c9a088c78a7c5e39f33969de9c227a7"
 TOPIC = "bench"
 PROFILE = "defaults"
+# Where vtop-node's config is defined, and the section the ablation sets (#752). The
+# harness reads this file at HEAD (the commit the image is built from) to learn which
+# keys the node accepts, so it never writes one the binary would refuse or ignore.
+NODE_CONFIG = "crates/vtop-node/src/config.rs"
+GROUP_COMMIT_GAUGE = "vtop_broker_group_commit_enabled"
+LEADER_CONFIG = os.path.join(HERE, "vtop", "leader.yaml")
 # The client container's limits: identical for both systems, and larger than
 # a node's so the client is not the bottleneck it measures.
 CLIENT_CPUS = "4"
@@ -80,6 +93,115 @@ def sh(args: list[str], *, check: bool = True, timeout: float | None = None, inp
 
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+# ------------------------------------------------------------------ group commit (#752)
+
+
+class GroupCommitNotApplied(Exception):
+    """The node that came up is not running the group-commit setting the run asked for.
+
+    Deliberately not a RuntimeError: a cell that fails with one of those is written as `refused` rows
+    and the run goes on to the next cell, but a setting that did not take would repeat in every cell and
+    leave a table that looks complete and compares nothing. It stops the run."""
+
+
+def parse_group_commits(text: str) -> list[str]:
+    """`--group-commit off,on`: the settings to run, in the one order the matrix records them."""
+    items = text.split(",")
+    unknown = [item for item in items if item not in plan.GROUP_COMMITS]
+    if unknown or len(set(items)) != len(items):
+        raise SystemExit(f"--group-commit {text!r}: give distinct settings from {list(plan.GROUP_COMMITS)}, "
+                         "comma-separated (off = `group_commit.enabled: false`, on = `enabled: true`)")
+    return [setting for setting in plan.GROUP_COMMITS if setting in items]
+
+
+def _struct_body(source: str, name: str) -> str | None:
+    match = re.search(rf"^pub struct {name}\b[^{{]*\{{(.*?)^\}}", source, re.MULTILINE | re.DOTALL)
+    return match.group(1) if match else None
+
+
+def node_group_commit_keys(source: str) -> set[str] | None:
+    """The keys of the `group_commit:` section a vtop-node config.rs accepts, or None when the data node's
+    config has no such section (an engine from before #752 wired group commit in, whose config refuses an
+    unknown key at startup). Read from the source of the commit under test, so it is the binary's own schema."""
+    node = _struct_body(source, "DataNodeConfig")
+    if node is None or not re.search(r"^\s*pub group_commit\s*:", node, re.MULTILINE):
+        return None
+    section = _struct_body(source, "GroupCommitSection")
+    if section is None:
+        raise SystemExit(f"{NODE_CONFIG} gives DataNodeConfig a `group_commit` but defines no GroupCommitSection "
+                         "this harness can read: update the harness to the config's new shape")
+    return set(re.findall(r"^\s*pub (\w+)\s*:", section, re.MULTILINE))
+
+
+def require_group_commit_support(source: str, settings: list[str]) -> set[str]:
+    """The keys the node accepts, or a refusal that says what is missing and what to do."""
+    keys = node_group_commit_keys(source)
+    asked = ", ".join(settings)
+    if keys is None:
+        raise SystemExit(
+            f"--group-commit {asked} was asked for, but the engine at HEAD does not accept a `group_commit:` "
+            f"section ({NODE_CONFIG} has none; it lands with #832, issue #752). A node build without it would "
+            "refuse the key at startup, or, with the key left out, run without group commit while the results "
+            "said it was on or off. Nothing was started. Build a commit that has the section, or run "
+            "without --group-commit.")
+    if "enabled" not in keys:
+        raise SystemExit(f"--group-commit {asked} was asked for, but the node's `group_commit:` section has no "
+                         f"`enabled` key (it accepts {sorted(keys)}): the harness cannot switch group commit on "
+                         "or off. Nothing was started; update the harness to the node's config.")
+    return keys
+
+
+def check_group_commit(args: argparse.Namespace) -> tuple[list[str], set[str]]:
+    """The settings asked for and the keys the node accepts, refused before any Docker work."""
+    if getattr(args, "group_commit", None) is None:
+        return [], set()
+    settings = parse_group_commits(args.group_commit)
+    return settings, require_group_commit_support(git("show", f"HEAD:{NODE_CONFIG}"), settings)
+
+
+def leader_config(base: str, setting: str, accepted: set[str]) -> str:
+    """The leader's node.yaml for one setting: the file the harness ships plus an explicit `group_commit:`
+    section. `off` is written as `enabled: false`, not left out, so a later change of the node's default
+    cannot change what the run's "off" measured. Only `enabled` is written, and only because `accepted`
+    says the node takes it."""
+    if re.search(r"^group_commit\s*:", base, re.MULTILINE):
+        raise SystemExit(f"{os.path.relpath(LEADER_CONFIG, REPO)} already sets group_commit: the harness "
+                         "writes it per run, and a second value would be a guess about which wins")
+    if "enabled" not in accepted:
+        raise SystemExit("the node's group_commit section has no `enabled` key: nothing to write")
+    value = "true" if setting == "on" else "false"
+    return (base if base.endswith("\n") else base + "\n") + (
+        f"# Written by run.py for the group-commit ablation (#752): group commit {setting}.\n"
+        f"group_commit:\n  enabled: {value}\n")
+
+
+def scrape_leader_metrics(system: str) -> str:
+    """The leader's /metrics text, from inside its own container (the node image carries curl, as its
+    healthcheck uses), so no port is published and no client container is needed."""
+    return sh(["docker", "exec", SYSTEM_SPEC[system]["leader"], "curl", "-sf",
+               "http://127.0.0.1:9600/metrics"], timeout=60).stdout
+
+
+def check_group_commit_applied(setting: str, metrics: str) -> int:
+    """The node's own gauge says what the node is running. Returns it; raises GroupCommitNotApplied when it
+    is missing or is not what `setting` asked for."""
+    match = re.search(rf"^{GROUP_COMMIT_GAUGE}(?:\{{[^}}]*\}})?\s+(\S+)\s*$", metrics, re.MULTILINE)
+    if match is None:
+        raise GroupCommitNotApplied(f"the leader exports no {GROUP_COMMIT_GAUGE} gauge, so group commit "
+                                    f"{setting} cannot be confirmed; the node build is not the one the "
+                                    "harness expects")
+    want = 1 if setting == "on" else 0
+    try:
+        have = int(float(match.group(1)))
+    except ValueError:
+        have = None
+    if have != want:
+        raise GroupCommitNotApplied(f"group commit {setting} was asked for, but the leader's {GROUP_COMMIT_GAUGE} "
+                                    f"is {match.group(1)} (expected {want}): the node did not take the setting, "
+                                    "so nothing measured under this label would be what it says")
+    return have
 
 
 # ----------------------------------------------------------------------- environment
@@ -264,7 +386,7 @@ def dirty_build_inputs() -> list[str]:
 
 
 def capture_environment(run_id: str, matrix: dict[str, Any], vtop_image: str, limits: dict[str, str],
-                        disk: str) -> dict:
+                        disk: str, group_commit_configs: dict[str, str] | None = None) -> dict:
     info = json.loads(sh(["docker", "info", "--format", "{{json .}}"]).stdout)
     version = json.loads(sh(["docker", "version", "--format", "{{json .}}"]).stdout)
     kafka_inspect = json.loads(sh(["docker", "image", "inspect", KAFKA_IMAGE]).stdout)[0]
@@ -304,6 +426,10 @@ def capture_environment(run_id: str, matrix: dict[str, Any], vtop_image: str, li
         "client": client_name(),
         "client_java": java.splitlines()[0] if java else "",
         "profile": PROFILE,
+        # The group-commit settings this run measures (#752) and the `enabled` each was written as: part of
+        # the fingerprinted environment, so a run that varied it cannot pass as one that did not. Empty
+        # when the run left VTOP at the node's own default.
+        "vtop_group_commit": {"settings": {name: {"enabled": name == "on"} for name in group_commit_configs or {}}},
         "producer_props": list(PRODUCER_PROPS),
         "consumer_props": list(CONSUMER_PROPS),
     }
@@ -328,7 +454,8 @@ def capture_environment(run_id: str, matrix: dict[str, Any], vtop_image: str, li
         "configs": {
             "kafka_compose": _read(os.path.join(HERE, "compose.kafka.yml")),
             "vtop_compose": _read(os.path.join(HERE, "compose.vtop.yml")),
-            "vtop_leader": _read(os.path.join(HERE, "vtop", "leader.yaml")),
+            "vtop_leader": _read(LEADER_CONFIG),
+            **{f"vtop_leader_group_commit_{name}": text for name, text in (group_commit_configs or {}).items()},
             "vtop_follower_1": _read(os.path.join(HERE, "vtop", "follower-1.yaml")),
             "vtop_follower_2": _read(os.path.join(HERE, "vtop", "follower-2.yaml")),
         },
@@ -359,19 +486,26 @@ def save_environment(run_dir: str, environment: dict) -> None:
 # --------------------------------------------------------------------------- clusters
 
 
-def compose(system: str, *args: str, vtop_image: str, timeout: float = 600) -> subprocess.CompletedProcess:
+def compose(system: str, *args: str, vtop_image: str, timeout: float = 600,
+            leader_config: str | None = None) -> subprocess.CompletedProcess:
+    """`leader_config` is an absolute path to the leader's node.yaml for this run (compose.vtop.yml
+    mounts it in place of the shipped one); None keeps the shipped file."""
     spec = SYSTEM_SPEC[system]
+    env = {"VTOP_IMAGE": vtop_image, "KAFKA_IMAGE": KAFKA_IMAGE}
+    if leader_config is not None:
+        env["VTOP_LEADER_CONFIG"] = leader_config
     return sh(["docker", "compose", "-f", os.path.join(HERE, spec["compose"]), *args],
-              env={"VTOP_IMAGE": vtop_image, "KAFKA_IMAGE": KAFKA_IMAGE}, timeout=timeout, cwd=HERE)
+              env=env, timeout=timeout, cwd=HERE)
 
 
 def cluster_down(system: str, vtop_image: str) -> None:
     compose(system, "down", "-v", "--remove-orphans", vtop_image=vtop_image)
 
 
-def cluster_up(system: str, vtop_image: str) -> None:
+def cluster_up(system: str, vtop_image: str, leader_config: str | None = None) -> None:
     cluster_down(system, vtop_image)
-    compose(system, "up", "-d", "--wait", "--wait-timeout", "300", vtop_image=vtop_image, timeout=400)
+    compose(system, "up", "-d", "--wait", "--wait-timeout", "300", vtop_image=vtop_image, timeout=400,
+            leader_config=leader_config)
     if system == "kafka":
         client(system, ["/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", SYSTEM_SPEC[system]["bootstrap"],
                         "--create", "--topic", TOPIC, "--partitions", "1", "--replication-factor", "3",
@@ -470,13 +604,13 @@ def run_producer(system: str, records: int, size: int, rate: int, timeout: float
     return result, "", wall, output
 
 
-def base_row(ctx: dict, system: str, mode: str, size: int, rep: int) -> dict[str, Any]:
+def base_row(ctx: dict, system: str, mode: str, size: int, rep: int, group_commit: str = "") -> dict[str, Any]:
     return {
         "run_id": ctx["run_id"], "env_fingerprint": ctx["fingerprint"],
         "vtop_commit": ctx["env"]["comparable"]["vtop_commit"], "kafka_image": KAFKA_IMAGE,
         "client": client_name(), "profile": PROFILE, "system": system, "mode": mode,
         "record_size": size, "partitions": 1, "producers": 1, "compression": "none", "acks": "all",
-        "repetition": rep, "load_basis": "kafka" if mode == "fixed_rate" else "",
+        "group_commit": group_commit, "repetition": rep, "load_basis": "kafka" if mode == "fixed_rate" else "",
         "started_at": utc_now(),
     }
 
@@ -493,28 +627,53 @@ def producer_row(row: dict, result: perftool.ProducerResult | None, note: str, w
     return row
 
 
-def refuse_rows(ctx: dict, system: str, size: int, reason: str, load_pcts: list[int]) -> None:
+def refuse_rows(ctx: dict, system: str, size: int, reason: str, load_pcts: list[int],
+                group_commit: str = "") -> None:
     """A row for every measurement of this system's cell, saying why it did not run."""
     for rep in range(1, ctx["reps"] + 1):
         modes = [("saturation", None)] + [("fixed_rate", pct) for pct in load_pcts]
         if ctx["consume"]:
             modes.append(("consume", None))
         for mode, pct in modes:
-            row = base_row(ctx, system, mode, size, rep)
+            row = base_row(ctx, system, mode, size, rep, group_commit)
             row.update(status="refused", note=reason, load_pct=pct)
             schema.append_row(ctx["csv"], row)
 
 
-def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | None) -> dict[int, int] | None:
-    """Every measurement of one system in one cell. Returns Kafka's derived rates."""
+def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | None,
+             group_commit: str = "") -> dict[int, int] | None:
+    """Every measurement of one system in one cell. Returns Kafka's derived rates.
+
+    `group_commit` (`off` or `on`, VTOP only) is the node's `group_commit.enabled` for this cell: its config
+    is written under the run's directory, the cluster comes up with it, and the leader's own gauge must say
+    the setting took before anything is timed (GroupCommitNotApplied stops the run otherwise)."""
     sat_records = ctx["sat_records"][size]
     load_pcts = list(stats.LOAD_FRACTIONS)
     logs = os.path.join(ctx["run_dir"], "logs")
     os.makedirs(logs, exist_ok=True)
-    tag = f"{system}-{size}B"
+    tag = f"{system}-{size}B" + (f"-gc-{group_commit}" if group_commit else "")
+    leader_config = None
+    if group_commit:
+        configs = os.path.join(ctx["run_dir"], "configs")
+        os.makedirs(configs, exist_ok=True)
+        leader_config = os.path.join(configs, f"vtop-leader-group-commit-{group_commit}.yaml")
+        with open(leader_config, "w") as handle:
+            handle.write(ctx["group_commit_configs"][group_commit])
     try:
         log(f"{tag}: bringing the cluster up fresh")
-        cluster_up(system, ctx["vtop_image"])
+        cluster_up(system, ctx["vtop_image"], leader_config)
+        if group_commit:
+            try:
+                have = check_group_commit_applied(group_commit, scrape_leader_metrics(system))
+            except GroupCommitNotApplied as exc:
+                ctx["env"]["events"].append({"at": utc_now(), "system": system, "record_size": size,
+                                             "group_commit": group_commit, "event": str(exc)[:900]})
+                _save_leader_log(system, logs, tag, ctx["vtop_image"])
+                raise
+            ctx["env"]["events"].append({"at": utc_now(), "system": system, "record_size": size,
+                                         "group_commit": group_commit,
+                                         "event": f"group commit {group_commit} confirmed: "
+                                                  f"{GROUP_COMMIT_GAUGE} {have}"})
         log(f"{tag}: smoke - {ctx['smoke_records']} records of {size} B, produced and read back byte-exact")
         smoke(system, ctx["smoke_records"], size)
     except (RuntimeError, subprocess.TimeoutExpired) as exc:
@@ -522,7 +681,7 @@ def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | No
         log(f"{tag}: {reason}")
         ctx["env"]["events"].append({"at": utc_now(), "system": system, "record_size": size, "event": reason})
         _save_leader_log(system, logs, tag, ctx["vtop_image"])
-        refuse_rows(ctx, system, size, reason, load_pcts)
+        refuse_rows(ctx, system, size, reason, load_pcts, group_commit)
         cluster_down(system, ctx["vtop_image"])
         return None
     ctx["env"]["events"].append({"at": utc_now(), "system": system, "record_size": size,
@@ -535,7 +694,8 @@ def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | No
     result, note, _, output = run_producer(system, max(sat_records // 4, 1000), size, -1, ctx["sat_timeout"],
                                            info_logging=True)
     try:
-        ctx["env"]["observed"].setdefault("producer_config", {})[f"{system}-{size}"] = \
+        ctx["env"]["observed"].setdefault("producer_config", {})[
+            f"{system}-{size}" + (f"-gc-{group_commit}" if group_commit else "")] = \
             perftool.parse_client_config(output)
     except perftool.PerfParseError as exc:
         ctx["env"]["events"].append({"at": utc_now(), "system": system, "event": f"producer config: {exc}"})
@@ -545,7 +705,7 @@ def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | No
     saturation = []
     for rep in range(1, ctx["reps"] + 1):
         log(f"{tag}: saturation rep {rep}/{ctx['reps']} ({sat_records} records)")
-        row = base_row(ctx, system, "saturation", size, rep)
+        row = base_row(ctx, system, "saturation", size, rep, group_commit)
         result, note, wall, output = run_producer(system, sat_records, size, -1, ctx["sat_timeout"])
         _save_output(logs, f"{tag}-saturation-{rep}.log", output)
         if result is not None:
@@ -562,7 +722,7 @@ def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | No
         ctx["env"]["observed"].setdefault("offered_rates", {})[str(size)] = kafka_rates
     for rep in range(1, ctx["reps"] + 1):
         for pct in load_pcts:
-            row = base_row(ctx, system, "fixed_rate", size, rep)
+            row = base_row(ctx, system, "fixed_rate", size, rep, group_commit)
             row["load_pct"] = pct
             if not kafka_rates:
                 row.update(status="refused", note="no Kafka saturation for this cell to derive the offered rate from")
@@ -583,12 +743,13 @@ def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | No
 
     if ctx["consume"]:
         for rep in range(1, ctx["reps"] + 1):
-            row = base_row(ctx, system, "consume", size, rep)
+            row = base_row(ctx, system, "consume", size, rep, group_commit)
             log(f"{tag}: consume rep {rep}/{ctx['reps']} ({sat_records} records from the start of the log)")
             started = time.monotonic()
             command = ["/opt/kafka/bin/kafka-consumer-perf-test.sh", "--bootstrap-server",
                        SYSTEM_SPEC[system]["bootstrap"], "--topic", TOPIC, "--num-records", str(sat_records),
-                       "--group", f"kc-{ctx['run_id']}-{system}-{size}-{rep}", "--timeout", "60000",
+                       "--group", f"kc-{ctx['run_id']}-{system}-{size}"
+                       + (f"-gc-{group_commit}" if group_commit else "") + f"-{rep}", "--timeout", "60000",
                        "--command-property", *CONSUMER_PROPS]
             try:
                 done = client(system, command, timeout=ctx["sat_timeout"], check=False)
@@ -731,6 +892,7 @@ def check_args(args: argparse.Namespace) -> tuple[list[int], dict[int, int]]:
         raise SystemExit(f"--smoke-records {args.smoke_records}: the smoke must read back at least one record")
     if args.run_id is not None:
         check_run_id(args.run_id)
+    check_group_commit(args)
     return sizes, sat_records
 
 
@@ -739,11 +901,16 @@ def build_matrix(args: argparse.Namespace, sizes: list[int], sat_records: dict[i
     schema-2 axes say what the phase-1 shape does: one compression, one
     profile, Kafka-relative rates."""
     load_pcts = list(stats.LOAD_FRACTIONS)
-    return {"record_sizes": sizes, "partitions": [1], "producers": [1], "compressions": ["none"],
-            "acks": ["all"], "profile": PROFILE, "profiles": [PROFILE], "repetitions": args.reps,
-            "load_pcts": load_pcts, "load_bases": {"kafka": load_pcts}, "consume": not args.no_consume,
-            "sat_records": {str(k): v for k, v in sat_records.items()},
-            "fixed_seconds": args.fixed_seconds, "warmup_fraction": 0.2, "smoke_records": args.smoke_records}
+    matrix = {"record_sizes": sizes, "partitions": [1], "producers": [1], "compressions": ["none"],
+              "acks": ["all"], "profile": PROFILE, "profiles": [PROFILE], "repetitions": args.reps,
+              "load_pcts": load_pcts, "load_bases": {"kafka": load_pcts}, "consume": not args.no_consume,
+              "sat_records": {str(k): v for k, v in sat_records.items()},
+              "fixed_seconds": args.fixed_seconds, "warmup_fraction": 0.2, "smoke_records": args.smoke_records}
+    if getattr(args, "group_commit", None) is not None:
+        # VTOP's `group_commit.enabled` is an axis of the matrix (#752): a run that asked for both
+        # settings owes both, which `--check` and the report hold it to.
+        matrix["group_commits"] = parse_group_commits(args.group_commit)
+    return matrix
 
 
 def check_plan(matrix: dict[str, Any], max_hours: float) -> float:
@@ -787,7 +954,7 @@ def check(run_dir: str) -> int:
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--sizes", default="100,1024", help="record sizes in bytes")
@@ -806,13 +973,24 @@ def main(argv: list[str] | None = None) -> int:
                              "NVMe volume that reports no model); recorded as given, one line, no '|'")
     parser.add_argument("--check", metavar="RUN_DIR", default=None,
                         help="report which rows a run still lacks; exit 0 when complete, 2 otherwise")
-    args = parser.parse_args(argv)
+    parser.add_argument("--group-commit", metavar="SETTINGS", default=None,
+                        help="VTOP's group_commit.enabled, as a comma-separated list of off and/or on (#752): "
+                             "VTOP runs once per setting, Kafka once. Refused when the engine at HEAD has no "
+                             "`group_commit:` section. Left out, VTOP runs at the node's own default")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
     checked_host_disk(args.host_disk)
 
     if args.check is not None:
         return check(args.check)
     sizes, sat_records = check_args(args)
     matrix = build_matrix(args, sizes, sat_records)
+    settings, node_keys = check_group_commit(args)
+    leader_base = _read(LEADER_CONFIG)
+    group_commit_configs = {setting: leader_config(leader_base, setting, node_keys) for setting in settings}
     hours = check_plan(matrix, args.max_hours)
     log(f"{len(schema.expected_keys(matrix))} result rows, projected {hours:.1f} h (--max-hours {args.max_hours:g})")
     if args.reps < 3:
@@ -831,11 +1009,14 @@ def main(argv: list[str] | None = None) -> int:
     if os.path.exists(run_dir):
         raise SystemExit(f"{run_dir} exists; runs never overwrite each other")
     os.makedirs(run_dir)
-    env = capture_environment(run_id, matrix, vtop_image, limits, disk)
+    env = capture_environment(run_id, matrix, vtop_image, limits, disk, group_commit_configs)
+    if settings:
+        env["observed"]["vtop_group_commit_keys_accepted"] = sorted(node_keys)
     ctx = {"run_id": run_id, "run_dir": run_dir, "csv": os.path.join(run_dir, "results.csv"), "env": env,
            "fingerprint": schema.fingerprint(env), "vtop_image": vtop_image, "reps": args.reps,
            "sat_records": sat_records, "fixed_seconds": args.fixed_seconds,
-           "smoke_records": args.smoke_records, "sat_timeout": args.sat_timeout, "consume": not args.no_consume}
+           "smoke_records": args.smoke_records, "sat_timeout": args.sat_timeout, "consume": not args.no_consume,
+           "group_commit_configs": group_commit_configs}
     schema.write_header(ctx["csv"])
     save_environment(run_dir, env)
     log(f"run {run_id} -> {run_dir} (fingerprint {ctx['fingerprint']})")
@@ -843,8 +1024,9 @@ def main(argv: list[str] | None = None) -> int:
         for size in sizes:
             rates = run_cell(ctx, "kafka", size, None)
             save_environment(run_dir, env)
-            run_cell(ctx, "vtop", size, rates)
-            save_environment(run_dir, env)
+            for setting in settings or [""]:
+                run_cell(ctx, "vtop", size, rates, group_commit=setting)
+                save_environment(run_dir, env)
     except BaseException as exc:
         env["run_state"] = "interrupted"
         env["events"].append({"at": utc_now(), "event": f"run interrupted: {exc!r}"[:900]})

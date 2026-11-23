@@ -55,13 +55,14 @@ def complete_rows(env):
     repeat its defaults rows, as the harness records them."""
     fp = schema.fingerprint(env)
     rows = []
-    for (system, mode, size, partitions, producers, compression, acks, profile, rep, basis,
+    for (system, mode, size, partitions, producers, compression, acks, profile, group_commit, rep, basis,
          pct) in sorted(schema.expected_keys(env["matrix"])):
         row = {
             "run_id": env["run_id"], "env_fingerprint": fp, "vtop_commit": COMPARABLE["vtop_commit"],
             "kafka_image": COMPARABLE["kafka_image"], "client": COMPARABLE["client"], "system": system,
             "mode": mode, "record_size": size, "partitions": partitions, "producers": producers,
-            "compression": compression, "acks": acks, "profile": profile, "repetition": rep,
+            "compression": compression, "acks": acks, "profile": profile, "group_commit": group_commit,
+            "repetition": rep,
             "load_basis": basis, "load_pct": pct, "status": "ok", "records": 1000, "records_per_sec": 1000.0,
             "mib_per_sec": 0.1, "started_at": "2026-11-14T00:00:00+00:00", "wall_seconds": 1.0, "note": "",
             "same_config_as": "",
@@ -122,22 +123,22 @@ def first(rows, **criteria):
 # ------------------------------------------------------------------------ layout
 
 
-def test_v2_header_is_exactly_the_documented_columns():
+def test_v3_header_is_exactly_the_documented_columns():
     assert schema.COLUMNS == (
         "run_id", "env_fingerprint", "vtop_commit", "kafka_image", "client", "system", "mode", "record_size",
-        "partitions", "producers", "compression", "acks", "profile", "same_config_as", "repetition",
+        "partitions", "producers", "compression", "acks", "profile", "group_commit", "same_config_as", "repetition",
         "load_basis", "load_pct", "offered_rate", "status", "sustained", "records", "records_produced",
         "records_per_sec", "mib_per_sec", "lat_avg_ms", "lat_max_ms", "lat_p50_ms", "lat_p95_ms", "lat_p99_ms",
         "lat_p999_ms", "lat_basis", "started_at", "window_start_ms", "window_end_ms", "wall_seconds", "note")
     assert schema.KEY == ("system", "mode", "record_size", "partitions", "producers", "compression", "acks",
-                          "profile", "repetition", "load_basis", "load_pct")
+                          "profile", "group_commit", "repetition", "load_basis", "load_pct")
     assert set(schema.KEY) <= set(schema.COLUMNS)
     assert "profile" not in schema.RUN_CONSTANT and "profile" in schema.RUN_CONSTANT_V1
 
 
-def test_a_complete_v2_run_loads(run_dir):
+def test_a_complete_v3_run_loads(run_dir):
     loaded = schema.load_run(run_dir)
-    assert loaded.version == 2
+    assert loaded.version == 3
     assert len(loaded.rows) == len(schema.expected_keys(SMALL))
 
 
@@ -199,7 +200,7 @@ def test_expected_keys_cover_3_sizes_x_2_partitions_x_2_producers_x_2_codecs_x_2
     per_shape_and_rep = 1 + (3 + 4) + 1 + 1  # saturation, kafka and common rates, consume, e2e
     assert len(main) == len(shapes) * 3 * per_shape_and_rep
     acks_one = {k for k in keys if k[6] == "1"}
-    assert acks_one == {("kafka" if s == 0 else "vtop", "saturation", 1024, 1, 1, "none", "1", p, r, "", "")
+    assert acks_one == {("kafka" if s == 0 else "vtop", "saturation", 1024, 1, 1, "none", "1", p, "", r, "", "")
                         for s in (0, 1) for p in ("defaults", "fsync-parity") for r in (1, 2, 3)}
 
 
@@ -379,7 +380,7 @@ def test_an_interrupted_run_is_incomplete_and_the_check_command_exits_2_listing_
     assert run.main(["--check", run_dir]) == 2
     err = capsys.readouterr().err
     assert "missing 12 " in err  # 2 codecs x 2 profiles x 3 repetitions
-    assert "vtop e2e 100 1 1 zstd all fsync-parity 3 common 50" in err
+    assert "vtop e2e 100 1 1 zstd all fsync-parity - 3 common 50" in err
 
 
 def test_the_check_command_exits_0_on_a_complete_run(run_dir, capsys):

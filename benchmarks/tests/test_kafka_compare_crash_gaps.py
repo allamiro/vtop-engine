@@ -143,7 +143,7 @@ def test_the_followers_are_never_given_a_group_commit_section():
 
 def test_the_leader_mount_reads_the_file_the_harness_names_and_defaults_to_the_shipped_one():
     base = read("compose.vtop.yml")
-    assert base.count("${CRASH_VTOP_LEADER:-./vtop/leader.yaml}:/etc/vtop/node.yaml:ro") == 1
+    assert base.count("${VTOP_LEADER_CONFIG:-./vtop/leader.yaml}:/etc/vtop/node.yaml:ro") == 1
     assert "follower-1.yaml:/etc/vtop/node.yaml:ro" in base and "follower-2.yaml:/etc/vtop/node.yaml:ro" in base
 
 
@@ -176,7 +176,7 @@ def test_compose_is_given_the_leader_file_of_the_configuration(tmp_path, monkeyp
     b, capture = backend(tmp_path, monkeypatch, config)
     b.compose("vtop", "up", "-d", config=config)
     env = capture.calls[-1][1]["env"]
-    assert env["CRASH_VTOP_LEADER"] == "./" + expected.replace(os.sep, "/")
+    assert env["VTOP_LEADER_CONFIG"] == "./" + expected.replace(os.sep, "/")
 
 
 def test_bring_up_checks_the_gauge_after_the_cluster_is_healthy(tmp_path, monkeypatch):
