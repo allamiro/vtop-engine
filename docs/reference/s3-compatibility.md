@@ -12,6 +12,7 @@ rather than weakening silently. How the matrix runs: [S3 compatibility matrix](.
 
 | Server | Version | Image digest | Run date | VTOP commit | All as expected |
 |---|---|---|---|---|---|
+| AWS S3 | - | - | 2026-11-23 | `a7b4491e5b` | yes |
 | Zenko CloudServer | 9.5.5 | `sha256:d4bacb466546…` | 2026-11-20 | `c8f0949c6e` | yes |
 | Garage | v2.5.0 | `sha256:677e5b758e44…` | 2026-11-20 | `c8f0949c6e` | yes |
 | MinIO (lab, source-built) | RELEASE.2025-09-07T16-13-09Z | `sha256:a196f8605139…` | 2026-11-20 | `c8f0949c6e` | yes |
@@ -21,29 +22,33 @@ rather than weakening silently. How the matrix runs: [S3 compatibility matrix](.
 
 ## Capabilities
 
-| Capability | cloudserver | garage | minio | rustfs | seaweedfs | versity |
-|---|---|---|---|---|---|---|
-| `put_get_head` | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass |
-| `path_style` | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass |
-| `virtual_host` | not tested | not tested | not tested | not tested | not tested | not tested |
-| `checksum_sha256_enforced` | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass |
-| `checksum_sha256_returned` | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass |
-| `checksum_crc32_default` | known failure (#778) | known failure (#778) | tested: pass | tested: pass | tested: pass | tested: pass |
-| `multipart` | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass |
-| `multipart_abort` | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass |
-| `multipart_list_uploads` | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass |
-| `multipart_resume` | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass |
-| `versioning` | tested: pass | refused as designed | tested: pass | tested: pass | tested: pass | tested: pass |
-| `object_lock` | tested: pass | refused as designed | tested: pass | tested: pass | tested: pass | tested: pass |
-| `object_lock_enforced` | tested: pass | refused as designed | tested: pass | tested: pass | tested: pass | tested: pass |
-| `object_lock_retention_clear` | not applicable | not applicable | tested: pass | tested: pass | not applicable | not applicable |
-| `conditional_put` | known failure (#722) | known failure (#722) | tested: pass | tested: pass | tested: pass | tested: pass |
-| verification method seen | `read_back`, `store_checksum` | `read_back`, `store_checksum` | `read_back`, `store_checksum` | `read_back`, `store_checksum` | `read_back`, `store_checksum` | `read_back`, `store_checksum` |
+| Capability | aws | cloudserver | garage | minio | rustfs | seaweedfs | versity |
+|---|---|---|---|---|---|---|---|
+| `put_get_head` | passed (unknown) | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass |
+| `path_style` | not tested | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass |
+| `virtual_host` | tested: pass | not tested | not tested | not tested | not tested | not tested | not tested |
+| `checksum_sha256_enforced` | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass |
+| `checksum_sha256_returned` | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass |
+| `checksum_crc32_default` | tested: pass | known failure (#778) | known failure (#778) | tested: pass | tested: pass | tested: pass | tested: pass |
+| `multipart` | passed (unknown) | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass |
+| `multipart_abort` | not tested | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass |
+| `multipart_list_uploads` | not tested | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass |
+| `multipart_resume` | not tested | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass | tested: pass |
+| `versioning` | tested: pass | tested: pass | refused as designed | tested: pass | tested: pass | tested: pass | tested: pass |
+| `object_lock` | passed (unknown) | tested: pass | refused as designed | tested: pass | tested: pass | tested: pass | tested: pass |
+| `object_lock_enforced` | tested: pass | tested: pass | refused as designed | tested: pass | tested: pass | tested: pass | tested: pass |
+| `object_lock_retention_clear` | not applicable | not applicable | not applicable | tested: pass | tested: pass | not applicable | not applicable |
+| `conditional_put` | tested: pass | known failure (#722) | known failure (#722) | tested: pass | tested: pass | tested: pass | tested: pass |
+| verification method seen | `read_back`, `store_checksum` | `read_back`, `store_checksum` | `read_back`, `store_checksum` | `read_back`, `store_checksum` | `read_back`, `store_checksum` | `read_back`, `store_checksum` | `read_back`, `store_checksum` |
 
 ## Notes
 
 From each server's capability file; notes, not test results.
 
+- aws, `multipart_abort`: Not tested on AWS: only the multipart fault-injection cases name it, and their forwarder needs a plain-HTTP VTOP_TEST_S3_ENDPOINT, so against AWS they are not run.
+- aws, `multipart_list_uploads`: Not tested on AWS: only the multipart fault-injection cases name it, and their forwarder needs a plain-HTTP VTOP_TEST_S3_ENDPOINT, so against AWS they are not run.
+- aws, `multipart_resume`: Not tested on AWS: only the multipart fault-injection cases name it, and their forwarder needs a plain-HTTP VTOP_TEST_S3_ENDPOINT, so against AWS they are not run.
+- aws, `object_lock_retention_clear`: The leg's role deliberately lacks s3:BypassGovernanceRetention, which clearing a retention needs, so the case that clears a receipt's retention to see the scrub report it cannot run there. For the same reason the engine case that replays over an ended lock (it shortens a governance retention) is not run on AWS.
 - cloudserver, `checksum_crc32_default`: A PUT carrying the SDK's default CRC32 trailer (aws-chunked) is refused with 400 BadRequest; with AWS_REQUEST_CHECKSUM_CALCULATION=when_required a plain one succeeds. VTOP no longer sends the trailer (#778 was fixed by #788: BLAKE3 and no-checksum writes carry a SHA-256 header), so no VTOP write depends on it; only the informational probe asks.
 - cloudserver, `object_lock_retention_clear`: PutObjectRetention with an empty retention answers 400 MalformedXML (request xml does not contain Mode), so the case that clears a receipt's retention to see the scrub report it cannot run here. VTOP never clears a retention; only that test does.
 - cloudserver, `conditional_put`: PutObject ignores If-None-Match: a second PUT overwrites the key. Informational: VTOP does not use conditional writes.
@@ -55,6 +60,33 @@ From each server's capability file; notes, not test results.
 - versity, `object_lock_retention_clear`: PutObjectRetention with an empty retention answers 400 InvalidArgument (The retain until date must be in the future!), so the case that clears a receipt's retention to see the scrub report it cannot run here. VTOP never clears a retention; only that test does.
 
 ## Cases
+
+### aws
+
+| Case | Capabilities | Expectation | Outcome | Method |
+|---|---|---|---|---|
+| `engine.object_lock.a_replay_over_an_ended_lock_commits_a_fresh_object` | `versioning`, `object_lock`, `virtual_host` | unknown | not_run | - |
+| `engine.object_lock.archives_a_batch_locked` | `object_lock`, `versioning`, `virtual_host` | unknown | pass | - |
+| `engine.object_lock.refuses_a_plain_bucket_at_startup` | `object_lock`, `virtual_host` | unknown | pass | - |
+| `engine.object_lock.scrub_reports_a_receipt_without_retention` | `object_lock`, `versioning`, `object_lock_retention_clear`, `virtual_host` | not_applicable | not_applicable | - |
+| `multipart.a_reset_part_is_sent_again_alone` | `multipart`, `virtual_host` | unknown | not_run | - |
+| `multipart.a_second_backend_resumes_the_session` | `multipart`, `multipart_resume`, `multipart_list_uploads`, `virtual_host` | unknown | not_run | - |
+| `multipart.the_sweep_aborts_an_abandoned_upload` | `multipart`, `multipart_abort`, `multipart_list_uploads`, `virtual_host` | unknown | not_run | - |
+| `object_lock.a_locked_version_survives_delete_and_overwrite` | `object_lock`, `versioning`, `object_lock_enforced`, `virtual_host` | unknown | pass | - |
+| `object_lock.a_multipart_object_carries_its_lock` | `multipart`, `object_lock`, `versioning`, `virtual_host` | unknown | pass | - |
+| `object_lock.an_absent_lock_is_confirmed_and_a_present_one_is_not` | `object_lock`, `virtual_host` | unknown | pass | - |
+| `object_lock.every_write_path_lands_locked` | `object_lock`, `versioning`, `virtual_host` | unknown | pass | - |
+| `object_lock.the_preflight_tells_locked_from_plain` | `object_lock`, `virtual_host` | unknown | pass | - |
+| `probe.a_wrong_service_checksum_is_rejected` | `put_get_head`, `checksum_sha256_enforced`, `virtual_host` | unknown | pass | - |
+| `probe.conditional_put_if_none_match` | `put_get_head`, `conditional_put`, `virtual_host` | unknown | pass | - |
+| `probe.the_sdks_default_crc32_trailer_is_accepted` | `put_get_head`, `checksum_crc32_default`, `virtual_host` | unknown | pass | - |
+| `receipts.a_multipart_object_names_read_back` | `multipart`, `virtual_host` | unknown | pass | read_back |
+| `receipts.a_single_put_names_store_checksum` | `put_get_head`, `checksum_sha256_returned`, `virtual_host` | unknown | pass | store_checksum |
+| `tier.copy.written_and_checked_under_the_lock` | `object_lock`, `versioning`, `virtual_host` | unknown | pass | - |
+| `transport_conformance.tcp_tls` | `put_get_head`, `virtual_host` | unknown | pass | - |
+| `verification.blake3_by_read_back` | `put_get_head`, `virtual_host` | unknown | pass | read_back |
+| `verification.sha256_by_store_checksum` | `put_get_head`, `checksum_sha256_returned`, `virtual_host` | unknown | pass | store_checksum |
+| `verification.sha256_verifies_strongly` | `put_get_head`, `virtual_host` | unknown | pass | store_checksum |
 
 ### cloudserver
 

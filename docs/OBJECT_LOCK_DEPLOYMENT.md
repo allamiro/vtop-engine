@@ -311,6 +311,10 @@ still reclaim them.
   on `HeadObject`, refuse to delete a locked version, and still report an
   ended retention's mode and date. Garage v2.5.0 implements no Object Lock
   (`GetObjectLockConfiguration` answers 501), and the engine refuses it at
-  startup. The [S3 compatibility](reference/s3-compatibility.md) table is
-  generated from the committed results. Behaviour on AWS S3 comes from its
-  documentation until the opt-in AWS workflow has run.
+  startup. On AWS S3 (one run, on v0.11.1, 2026-11-23) locked writes for
+  both checksum paths and for multipart were accepted, the lock headers came
+  back on `HeadObject` and a locked version could not be deleted; the cases
+  that shorten or clear a governance retention do not run there, because the
+  test role has no `s3:BypassGovernanceRetention`. The
+  [S3 compatibility](reference/s3-compatibility.md) table is generated from
+  the committed results.
