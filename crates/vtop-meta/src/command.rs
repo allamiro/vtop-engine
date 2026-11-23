@@ -302,6 +302,17 @@ pub struct CommandEnvelope {
 /// milliseconds; one second is far above both and far below any lease.
 pub const MIN_LEASE_SKEW_BOUND_MS: u64 = 1_000;
 
+/// The longest lease a proposer may ask for, in milliseconds.
+///
+/// The clock-skew tolerance of a lease request grows with the lease it asks
+/// for ([`lease_skew_bound_ms`]), and a lease already held is judged live or
+/// lapsed by the REQUESTER's clock. Without a ceiling a node could ask for a
+/// very long lease, claim a clock ahead by the (then very large) tolerance,
+/// and see a healthy holder's lease as lapsed. Two minutes is far above any
+/// sensible lease (the default is 15 s) and keeps the tolerance at six
+/// seconds. A request above it is refused before it is replicated.
+pub const MAX_LEASE_DURATION_MS: u64 = 120_000;
+
 /// The clock error tolerated between a lease proposer and the metadata leader
 /// for a lease of `lease_duration_ms`: a twentieth of the lease, never less
 /// than [`MIN_LEASE_SKEW_BOUND_MS`] - except that it is never more than a
@@ -353,6 +364,31 @@ impl LeaseClockSkew {
 }
 
 impl MetadataCommand {
+    /// Why a lease-election command asks for a lease longer than
+    /// [`MAX_LEASE_DURATION_MS`], or `None` for a lease within it and for
+    /// every other command.
+    pub fn lease_duration_refusal(&self) -> Option<String> {
+        let lease_duration_ms = match self {
+            MetadataCommand::AcquireRangeLease {
+                lease_duration_ms, ..
+            }
+            | MetadataCommand::RenewRangeLease {
+                lease_duration_ms, ..
+            } => *lease_duration_ms,
+            // An attributed command (#706) is judged by the command it wraps,
+            // as lease_clock_skew does.
+            MetadataCommand::Attributed { subject, .. } => return subject.lease_duration_refusal(),
+            _ => return None,
+        };
+        (lease_duration_ms > MAX_LEASE_DURATION_MS).then(|| {
+            format!(
+                "lease request refused: a lease of {lease_duration_ms} ms is longer than the \
+                 {MAX_LEASE_DURATION_MS} ms the metadata plane grants; lower \
+                 lease.lease_duration_ms"
+            )
+        })
+    }
+
     /// For the lease-election pair, how far the proposer's clock is from
     /// `leader_now_ms` and how much the leader tolerates; `None` for every
     /// other command, whose outcome never reads `issued_at_ms`.
@@ -3496,6 +3532,62 @@ pub(crate) mod tests {
             checked, 2,
             "both lease-election commands are in the fixture"
         );
+    }
+
+    /// A lease longer than the ceiling is refused for both lease-election
+    /// commands, whatever its other fields, so the skew tolerance a proposer
+    /// can claim stays small; a lease at the ceiling and every other command
+    /// is untouched.
+    #[test]
+    fn a_lease_longer_than_the_ceiling_is_refused() {
+        let lease = |acquire: bool, lease_duration_ms: u64| {
+            let env = CommandEnvelope {
+                request_id: Uuid::from_u128(1),
+                issued_at_ms: 1_750_000_000_000,
+            };
+            if acquire {
+                MetadataCommand::AcquireRangeLease {
+                    env,
+                    topic_uuid: Uuid::from_u128(2),
+                    range_uuid: Uuid::from_u128(3),
+                    holder_node_uuid: Uuid::from_u128(4),
+                    expected_range_generation: 1,
+                    lease_duration_ms,
+                }
+            } else {
+                MetadataCommand::RenewRangeLease {
+                    env,
+                    topic_uuid: Uuid::from_u128(2),
+                    range_uuid: Uuid::from_u128(3),
+                    holder_node_uuid: Uuid::from_u128(4),
+                    expected_fencing_epoch: 1,
+                    lease_duration_ms,
+                }
+            }
+        };
+        for acquire in [true, false] {
+            assert_eq!(
+                lease(acquire, MAX_LEASE_DURATION_MS).lease_duration_refusal(),
+                None
+            );
+            assert_eq!(lease(acquire, 15_000).lease_duration_refusal(), None);
+            for too_long in [MAX_LEASE_DURATION_MS + 1, 1 << 61, u64::MAX] {
+                let why = lease(acquire, too_long)
+                    .lease_duration_refusal()
+                    .expect("a lease above the ceiling is refused");
+                assert!(why.contains(&too_long.to_string()), "{why}");
+            }
+        }
+        // The tolerance a proposer can claim is bounded by the ceiling.
+        assert!(lease_skew_bound_ms(MAX_LEASE_DURATION_MS) <= 6_000);
+        for command in every_command() {
+            if !matches!(
+                command,
+                MetadataCommand::AcquireRangeLease { .. } | MetadataCommand::RenewRangeLease { .. }
+            ) {
+                assert_eq!(command.lease_duration_refusal(), None, "{command:?}");
+            }
+        }
     }
 
     #[test]
