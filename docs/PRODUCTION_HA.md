@@ -1428,9 +1428,13 @@ Short procedures now; expand into a full ops runbook before go-live.
   Level 9 (#706) records who asked: from it, the serving leader commits an
   operator's audited command together with the certificate identity it
   verified, the connection's address and its own node id, as one log entry
-  (command kind 40), and the cluster state keeps the last 1024 of them. It
-  changes nothing on the replica plane and no data node uses it, but it is
-  raised like any level above 7: every counted data node must report 9 first,
+  (command kind 40), and the cluster state keeps the last 1024 of them.
+  Level 9 also lets a data node release its own range lease under its own
+  certificate (command kind 41, #732), which an enforcing
+  `admin_authorization` admits; below 9 a node releases with the holder-less
+  command, which such a policy refuses, and its lease lapses on its deadline
+  instead. It changes nothing on the replica plane, but it is raised like any
+  level above 7: every counted data node must report 9 first,
   and every metadata member must answer that it supports 9. Below 9 the actor
   is in the admin endpoint's audit record only. See
   [Auditing](operate/auditing.md).
