@@ -1,16 +1,29 @@
 #!/usr/bin/env bash
 # Re-introduce a fixed data-safety bug into a scratch build and show the
-# history checkers catch it on a live run (#728, criterion A4 of #714).
+# history checkers catch it (#728, criterion A4 of #714).
 #
 # The checkers' unit tests feed them hand-built histories shaped like each
 # bug. That shows the rule is right, not that a real run with the bug breaks
 # it. This runner does the second: it copies the tree, applies one patch from
-# this directory that undoes the bug's fix, builds vtop-node and vtopctl from
-# the copy, and runs the scenarios that reach the bug's shape against that
-# build, with THIS tree's scenarios and checkers. After every run, pass or
-# fail, it runs check_history.py and check_control.py (with --stall-ms) over
-# what the run recorded, so a scenario that stops at its own assertion is
-# still judged by the histories.
+# this directory that undoes the bug's fix, and runs that build, judging what
+# it recorded with THIS tree's checkers. Two modes:
+#
+#   live   (the default) builds vtop-node and vtopctl from the copy and runs
+#          the scenarios that reach the bug's shape against that build.
+#          After every run, pass or fail, it runs check_history.py and
+#          check_control.py (with --stall-ms) over what the run recorded, so
+#          a scenario that stops at its own assertion is still judged by the
+#          histories. Live processes reach the shapes only by luck of timing.
+#   --sweep  runs, in the copy, the tests that reach the shapes by
+#          construction, with VTOP_SWEEP_HISTORY_DIR set so each writes the
+#          client history of its runs: the promotion crash sweep
+#          (crates/vtop-node/src/promotion_crash_sweep.rs: the real replica
+#          code on simulated disks, a crash at every storage operation) and
+#          the loopback test of a returning deposed leader
+#          (crates/vtop-broker/tests/networked_replication.rs: the real
+#          networked replica set over local TLS). Then check_history.py
+#          judges every history written. The tests failing on the patched
+#          build is expected and is not the verdict; the checker's is.
 #
 #   611  a fence discards a suffix the candidate merely lacks (undoes #616)
 #   641  a returning deposed leader's sessions open unfenced (undoes #649)
@@ -23,6 +36,7 @@
 # build they make runs only under this script.
 #
 # Usage: run.sh <611|641|261|640> [runs]
+#        run.sh --sweep <611|641|261|640>
 #
 # Environment:
 #   REINTRODUCE_OUT         where the copy, the build and the runs go
@@ -35,26 +49,38 @@
 #                           a run whose history ends with this long granted
 #                           and unserved is flagged `stalled`, which is how a
 #                           bug that stops the cluster (#640) shows
+#   VTOP_SWEEP_HISTORY_FAILING  (--sweep) failing runs each swept shape
+#                           writes a history for (default 5)
 #
-# Exit status: 0 the checkers flagged at least one run (DETECTED); 1 no run
-# was flagged (MISSED: the summary says what each run did); 2 the patch,
-# the copy or the build failed.
+# Exit status: 0 the checkers flagged at least one run or history
+# (DETECTED); 1 none was flagged (MISSED: the summary says what each did);
+# 2 the patch, the copy or the build failed, or (--sweep) the tests wrote no
+# history or the checker could not read one.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../../../.." && pwd)"
 CHAOS="$REPO_ROOT/scripts/live-chaos"
 
+MODE=live
+if [[ "${1:-}" == --sweep ]]; then
+  MODE=sweep
+  shift
+fi
 BUG="${1:-}"
 RUNS="${2:-3}"
 case "$BUG" in
   611 | 641 | 261) DEFAULT_SCENARIOS="23-acked-suffix-failover" ;;
   640) DEFAULT_SCENARIOS="14-candidate-failover 23-acked-suffix-failover" ;;
   *)
-    echo "usage: $0 <611|641|261|640> [runs]" >&2
+    echo "usage: $0 <611|641|261|640> [runs] | $0 --sweep <611|641|261|640>" >&2
     exit 2
     ;;
 esac
+if [[ "$MODE" == sweep && $# -gt 1 ]]; then
+  echo "--sweep takes no run count: the sweep is deterministic" >&2
+  exit 2
+fi
 [[ "$RUNS" =~ ^[1-9][0-9]*$ ]] || { echo "runs must be a positive integer, got '$RUNS'" >&2; exit 2; }
 read -r -a SCENARIOS <<< "${REINTRODUCE_SCENARIOS:-$DEFAULT_SCENARIOS}"
 read -r -a SEEDS <<< "${REINTRODUCE_SEEDS:-}"
@@ -92,6 +118,64 @@ fi
   && patch -p1 --batch --forward < "$PATCH" > /dev/null) \
   || setup_fail "$PATCH no longer applies: the code it undoes has moved; refresh the patch"
 log "patch applied to $SRC"
+
+# --- --sweep: the deterministic tests, judged by their client histories -----
+if [[ "$MODE" == sweep ]]; then
+  HISTORIES="$OUT/histories"
+  rm -rf "$HISTORIES"
+  mkdir -p "$HISTORIES"
+  # The check each bug's shape predicts, printed beside what was found. The
+  # verdict is any violation; the prediction says whether it is the right one.
+  case "$BUG" in
+    611) PREDICTED="lost (acknowledged records truncated at the fence)" ;;
+    261) PREDICTED="rewritten or lost (a diverged replica acknowledged records it does not hold)" ;;
+    640) PREDICTED="unavailable (no candidate established after a second failover)" ;;
+    641) PREDICTED="rewritten (a deposed leader's records under the new leader's mark)" ;;
+  esac
+  # Built first, so a patch that breaks the build is exit 2 and never
+  # mistaken for a test failing on the bug.
+  (cd "$SRC" && CARGO_TARGET_DIR="$TARGET" cargo test -p vtop-node --bin vtop-node --no-run \
+    && CARGO_TARGET_DIR="$TARGET" cargo test -p vtop-broker --test networked_replication --no-run) \
+    > "$OUT/build.log" 2>&1 || setup_fail "the patched test build failed; see $OUT/build.log"
+  log "built the tests with #$BUG re-introduced"
+  for target in "vtop-node --bin vtop-node promotion_crash_sweep" \
+    "vtop-broker --test networked_replication deposed_leader"; do
+    read -r -a args <<< "$target"
+    started=$SECONDS
+    code=0
+    (cd "$SRC" && CARGO_TARGET_DIR="$TARGET" VTOP_SWEEP_HISTORY_DIR="$HISTORIES" \
+      cargo test -p "${args[@]}" -- --nocapture) >> "$OUT/tests.log" 2>&1 || code=$?
+    log "cargo test -p $target: exit $code ($((SECONDS - started))s; a failure is expected with the bug)"
+  done
+  files=("$HISTORIES"/*.jsonl)
+  [[ -e "${files[0]}" ]] || setup_fail "the patched tests wrote no history; see $OUT/tests.log"
+  flagged=0
+  errors=0
+  for file in "${files[@]}"; do
+    name="$(basename "$file" .jsonl)"
+    code=0
+    python3 "$CHAOS/history/check_history.py" "$file" > "$HISTORIES/$name.verdict.json" 2>&1 || code=$?
+    case "$code" in 0) verdict=valid ;; 1) verdict=VIOLATED ;; *) verdict=error ;; esac
+    kinds="$(python3 -c 'import json, sys
+try:
+    print(",".join(sorted(json.load(open(sys.argv[1]))["violations"])) or "-")
+except (OSError, ValueError, KeyError):
+    print("-")' "$HISTORIES/$name.verdict.json")"
+    log "history $name: $verdict, violations $kinds"
+    printf '{"bug":%s,"mode":"sweep","history":"%s","verdict":"%s","violations":"%s"}\n' \
+      "$BUG" "$name" "$verdict" "$kinds" >> "$SUMMARY"
+    [[ "$verdict" == VIOLATED ]] && flagged=$((flagged + 1))
+    [[ "$verdict" == error ]] && errors=$((errors + 1))
+  done
+  log "the shape of #$BUG predicts: $PREDICTED"
+  ((errors == 0)) || setup_fail "check_history.py could not read $errors history file(s); see $HISTORIES/*.verdict.json"
+  if ((flagged > 0)); then
+    log "DETECTED: check_history.py flagged $flagged of ${#files[@]} history file(s) with #$BUG re-introduced; see $SUMMARY"
+    exit 0
+  fi
+  log "MISSED: none of the ${#files[@]} history file(s) with #$BUG re-introduced broke a history rule; see $SUMMARY"
+  exit 1
+fi
 
 # --- the patched build -------------------------------------------------------
 (cd "$SRC" && CARGO_TARGET_DIR="$TARGET" cargo build -p vtop-node --bin vtop-node \

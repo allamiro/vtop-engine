@@ -18,7 +18,15 @@
 #
 # With `reintroduce` set, it runs no campaign: it re-introduces that fixed
 # data-safety bug into a scratch build and shows the checkers catch it
-# (scripts/live-chaos/history/reintroduce/run.sh).
+# (scripts/live-chaos/history/reintroduce/run.sh), one bug per job (`all`
+# runs the four side by side). `mode: sweep` (the default) judges the client
+# histories the deterministic tests write on the patched build: the promotion
+# crash sweep and the loopback test of a returning deposed leader. `mode:
+# live` runs the live scenarios against it instead, which reach the bugs'
+# shapes only by luck of timing. Each patched build compiles the tests from
+# scratch and runs the full sweeps, so it is evidence for a release, not a
+# gate; ci.yml checks on every pull request that the patches still apply and
+# that the histories of the fixed build are valid.
 name: chaos campaign
 
 on:
@@ -41,20 +49,27 @@ on:
         default: "ubuntu-latest"
         required: true
       reintroduce:
-        description: "Instead of a campaign, re-introduce one fixed bug and show the checkers catch it"
+        description: "Instead of a campaign, re-introduce a fixed bug (or all four, one job each) and show the checkers catch it"
         type: choice
         default: "none"
-        options: ["none", "611", "641", "261", "640"]
+        options: ["none", "611", "641", "261", "640", "all"]
+      mode:
+        description: "Re-introduction mode: sweep (the deterministic tests' histories) or live (the live scenarios)"
+        type: choice
+        default: "sweep"
+        options: ["sweep", "live"]
       reintroduce_runs:
-        description: "Runs for a re-introduction"
+        description: "Runs for a live re-introduction (sweep mode ignores it)"
         default: "3"
         required: true
 
 permissions:
   contents: read
 
+# One queue per kind of run, so dispatching the re-introductions one bug at
+# a time does not cancel the one still waiting.
 concurrency:
-  group: chaos-campaign
+  group: chaos-campaign-${{ inputs.reintroduce }}-${{ inputs.mode }}
   cancel-in-progress: false
 
 jobs:
@@ -171,29 +186,41 @@ jobs:
           PY
 
   reintroduce:
-    name: re-introduce #${{ inputs.reintroduce }}
+    name: re-introduce #${{ matrix.bug }} (${{ inputs.mode }})
     if: inputs.reintroduce != 'none'
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        bug: ${{ fromJSON(inputs.reintroduce == 'all' && '["611","641","261","640"]' || format('["{0}"]', inputs.reintroduce)) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
-      - name: Re-introduce the bug, run its scenarios, judge the histories
+      - name: Re-introduce the bug, run it, judge the histories
         env:
           REINTRODUCE_OUT: ${{ runner.temp }}/reintroduce
-          BUG: ${{ inputs.reintroduce }}
+          BUG: ${{ matrix.bug }}
+          MODE: ${{ inputs.mode }}
           RUNS: ${{ inputs.reintroduce_runs }}
-        run: scripts/live-chaos/history/reintroduce/run.sh "$BUG" "$RUNS"
+        run: |
+          if [[ "$MODE" == sweep ]]; then
+            scripts/live-chaos/history/reintroduce/run.sh --sweep "$BUG"
+          else
+            scripts/live-chaos/history/reintroduce/run.sh "$BUG" "$RUNS"
+          fi
       - name: Keep the runs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: reintroduce-${{ inputs.reintroduce }}
+          name: reintroduce-${{ matrix.bug }}-${{ inputs.mode }}
           path: |
             ${{ runner.temp }}/reintroduce/summary.jsonl
             ${{ runner.temp }}/reintroduce/build.log
+            ${{ runner.temp }}/reintroduce/tests.log
+            ${{ runner.temp }}/reintroduce/histories/
             ${{ runner.temp }}/reintroduce/run-*
           if-no-files-found: warn
           retention-days: 14
