@@ -181,7 +181,7 @@ Data, latency and consume results: [kafka-comparison.md](docs/benchmarks/kafka-c
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/card-tested-dark.svg">
-  <img alt="Tested against: Apache Kafka 3.7.2 to 4.4.0 (8 releases, live-broker tests, nightly); Apache Kafka 4.3.2 (benchmarks); Apache Kafka 4.3.1 (Docker lab and live-broker tests in CI); Kafka JVM client 4.3.2 (benchmarks); librdkafka 2.12.1 (the engine's Kafka source); PostgreSQL 14 to 18 (5 majors, state-store tests, nightly); MinIO RELEASE.2025-09-07T16-13-09Z (Docker lab and live S3 tests in CI). More S3 servers: when the matrix is published (#722)." src="docs/assets/readme/card-tested-light.svg" width="600">
+  <img alt="Tested against: Apache Kafka 3.7.2 to 4.4.0 (8 releases, live-broker tests, nightly); Apache Kafka 4.3.2 (benchmarks); Apache Kafka 4.3.1 (Docker lab and live-broker tests in CI); Kafka JVM client 4.3.2 (benchmarks); librdkafka 2.12.1 (the engine's Kafka source); PostgreSQL 14 to 18 (5 majors, state-store tests, nightly); MinIO RELEASE.2025-09-07T16-13-09Z (Docker lab and live S3 tests in CI); Zenko CloudServer 9.5.5 (S3 compatibility matrix); Garage v2.5.0 (S3 compatibility matrix); RustFS 1.0.5 (S3 compatibility matrix); SeaweedFS 4.53 (S3 compatibility matrix); Versity S3 Gateway v1.11.0 (S3 compatibility matrix)." src="docs/assets/readme/card-tested-light.svg" width="600">
 </picture>
 
 ---
@@ -283,6 +283,10 @@ is in [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | LocalFS, for local or air-gapped storage | the stored file is streamed through the digest |
 | AWS CLI, s3cmd, MinIO client (explicit opt-in) | downloaded and re-hashed |
 | mock, for tests | the stored in-memory bytes are hashed |
+
+<!-- s3-compat:start -->
+The live S3 tests last ran, with every outcome as expected, against: Zenko CloudServer, Garage, MinIO (lab, source-built), RustFS, SeaweedFS, Versity S3 Gateway. Which server supports which capability and verification method: [S3 compatibility](docs/reference/s3-compatibility.md).
+<!-- s3-compat:end -->
 
 The Kafka source is a Cargo feature: `cargo build -p vtop-cli --no-default-features`
 builds without it. The same repository holds a native Rust broker and control
