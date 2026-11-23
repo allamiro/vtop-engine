@@ -113,7 +113,7 @@ opened 2026-11-15, #782). The criterion IDs (A1, B1 and so on) are those of
 
 - **Why:** `preview`: tested on one plaintext broker at a time across 3.7 to 4.4, not on a secured or multi-broker cluster; `production` at 1.0 for the tested configurations the page names.
 - **Tests and CI:** `crates/vtop-adapters/src/kafka_source.rs`; the live-broker suite `tests/integration_kafka_to_minio.rs` including the stale-commit and stall-recovery tests; `kafka matrix` nightly on every Apache Kafka line from 3.7 to 4.4, and on pull requests that change the Kafka path; `engine crash sweep` (Kafka is its source).
-- **Open criteria:** B2 (#721): SASL and TLS cases and a non-Apache broker are not tested; mutual TLS is not configurable; multi-broker clusters are not tested; Kafka fleet mode (several engines in one group) is not built. Two data-safety bugs (#614, #623).
+- **Open criteria:** B2 (#721): SASL and TLS cases and a non-Apache broker are not tested; mutual TLS to the broker is configured and tested on one `mtls` leg (#873); multi-broker clusters are not tested; Kafka fleet mode (several engines in one group) is not built. Two data-safety bugs (#614, #623).
 - **Docs:** `install/kafka.md` states exactly what is and is not tested.
 
 ### File source
@@ -127,14 +127,14 @@ opened 2026-11-15, #782). The criterion IDs (A1, B1 and so on) are those of
 
 - **Why:** `preview`: shares the file source's continuity code but has the thinnest evidence of the three sources.
 - **Tests and CI:** `crates/vtop-adapters/src/syslog_spool_source.rs`; the e2e smoke archives a seeded spool. No live test delivers through rsyslog or syslog-ng, and the crash sweep does not include it.
-- **Open criteria:** A2(a) for the spool (#725 follow-up); `received_time_*` is not extracted into the spool marker; shares #558 and #578 with the file source.
+- **Open criteria:** A2(a) for the spool (#725 follow-up); a line whose time is RFC 3164 (no year or zone) gives the marker no time; shares #558 and #578 with the file source.
 - **Docs:** `README.md` and `when-to-use.md` describe it as reading spool files a collector has written, and say data lost before the spool is out of reach.
 
 ### S3-compatible upload (`s3_native`)
 
 - **Why:** `preview` because every live S3 test runs against one MinIO; `production` at 1.0 for the providers B1 names.
 - **Tests and CI:** `crates/vtop-upload/src/s3_native.rs`; `crates/vtop-upload/tests` (`live_s3_verification`, `live_s3_multipart_resume`, `live_s3_object_lock`, `request_deadline`, `slow_link_deadline`, `transport_conformance`); the `minio integration` job against MinIO built from release 2025-09-07; the README's lossy-link and policed-uplink measurements.
-- **Open criteria:** B1 (#722): no AWS S3 and no second provider, so "which provider supports which verification method" is not tabulated; a test kit for other servers is in review (#764).
+- **Open criteria:** B1 (#722): the live tests run against RustFS, Garage, SeaweedFS, Versity and CloudServer beside MinIO with a generated compatibility table (#764, #837, #841), and an opt-in AWS S3 leg exists (#841), but no AWS S3 result is recorded yet, so AWS has no row in the table.
 - **Docs:** `limitations.md` says "any S3-compatible store"; ROADMAP says Object Lock behaviour on AWS is taken from its documentation.
 
 ### Local directory upload (`localfs`)
@@ -155,14 +155,14 @@ opened 2026-11-15, #782). The criterion IDs (A1, B1 and so on) are those of
 
 - **Why:** `preview`, `production` at 1.0: the default single-engine ledger, with the shared battery and power-loss tests; no restore drill yet.
 - **Tests and CI:** `crates/vtop-state/src/test_battery.rs`; `ledger_power_loss.rs`, `ledger_v0_9_0.rs` (a ledger a released binary wrote opens under this build); the crash sweep uses it.
-- **Open criteria:** E3 backup and restore drill (#734); SQLite migrates on every open, so a ledger change has no operator-gated one-way step yet (compatibility policy); one engine per ledger.
+- **Open criteria:** E3 backup and restore drill (#734); a SQLite one-way schema step is taken only by `vtopctl migrate` (#866): an existing ledger below a step refuses to open and names the command, and the step list is empty today, so no step has been needed yet; one engine per ledger.
 - **Docs:** `deploy/single-node.md`.
 
 ### PostgreSQL state store
 
-- **Why:** `preview`, `production` at 1.0: the best-matrixed backend (five majors nightly) but the release binaries and the container image are built without it.
+- **Why:** `preview`, `production` at 1.0: the best-matrixed backend (five majors nightly) and the container image has it from v0.11.0 (#867), but the release binaries are built without it.
 - **Tests and CI:** `crates/vtop-state/tests/pg_battery.rs`; `postgres_migrate_restore.rs`; the `postgres matrix` workflow on PostgreSQL 14 to 18 (14 and 18 on pull requests, all five nightly); an opt-in managed-service smoke job.
-- **Open criteria:** it needs `cargo build --features postgres` (container page: "no PostgreSQL"), so D6; managed services and `pg_upgrade` are outside the matrix; PostgreSQL 14 reached end of life on 2026-11-12 and is dropped at the next minor; E3 (#734); the crash sweep does not cover it (#725).
+- **Open criteria:** the release binaries need a source build with `--features postgres` for it (the image has it from v0.11.0), so D6 is half met; managed services and `pg_upgrade` are outside the matrix; PostgreSQL 14 reached end of life on 2026-11-12 and is dropped at the next minor; E3 (#734); the crash sweep does not cover it (#725).
 - **Docs:** `POSTGRES_DEPLOYMENT.md` is precise about versions; `when-to-use.md` offers PostgreSQL as an option without saying it is a source build.
 
 ### Manifests 0.1 to 0.3
@@ -190,14 +190,14 @@ opened 2026-11-15, #782). The criterion IDs (A1, B1 and so on) are those of
 
 - **Why:** `experimental`: proven against MinIO only, and a compliance-mode retention cannot be removed by anyone, so a wrong assumption about a provider is not recoverable.
 - **Tests and CI:** `crates/vtop-upload/tests/live_s3_object_lock.rs`, `multipart_object_lock.rs`, `object_lock_wire.rs`; `crates/vtop-cli/tests/live_s3_object_lock_engine.rs`, `object_lock.rs`.
-- **Open criteria:** B1 (#722) on AWS; cold-tier copies are not locked (`vtopctl tier copy` refuses the profile).
+- **Open criteria:** B1 (#722) on AWS; cold-tier copies are written under the lock and their retention is checked (#868).
 - **Docs:** `OBJECT_LOCK_DEPLOYMENT.md`; ROADMAP and `limitations.md` say MinIO only.
 
 ### Audit trail
 
 - **Why:** `preview`, `production` at 1.0: one attributable record for every state-changing command, with a hash chain in the ledger's `audit_events` table; the cluster-command half is not durable yet.
 - **Tests and CI:** `crates/vtop-cli/tests/audit_trail.rs`, `audit_cluster_client.rs`; the `audit_events` trigger in `pg_battery`; the `audit_record` fuzz target.
-- **Open criteria:** #706 (the actor of a cluster command is in the admin endpoint's record only; a fix is in review, #767); a mixed fleet's trail is only as complete as its least-upgraded node.
+- **Open criteria:** #706 (below feature level 9 the actor of a cluster command is in the admin endpoint's record only, from level 9 it is in the replicated log, #850; the applied records are delivered at least once, #767, but do not yet carry `requested_by`); a mixed fleet's trail is only as complete as its least-upgraded node.
 - **Docs:** `operate/auditing.md`, `operate/logs-and-auditing.md`.
 
 ### Prometheus metrics, alert rules and dashboards
@@ -225,7 +225,7 @@ opened 2026-11-15, #782). The criterion IDs (A1, B1 and so on) are those of
 
 - **Why:** `preview` at both stages: leases, fencing epochs and verified promotion are exercised, and promotion has had three data-safety bugs.
 - **Tests and CI:** `crates/vtop-node` unit and crash-sweep tests (`promotion_crash_sweep`); live-chaos scenarios 04, 09, 10, 12, 14, 23, 27, 28.
-- **Open criteria:** A3 (#727), A4 (#728); group commit is measured, not wired into the data node (#752); data-safety bugs #449, #611, #641.
+- **Open criteria:** A3 (#727), A4 (#728); group commit is wired into the data node and off by default until its A/B gates hold (#752); data-safety bugs #449, #611, #641.
 - **Docs:** `NATIVE_BROKER_ARCHITECTURE.md`, `NODE_OBSERVABILITY.md`.
 
 ### Replicated broker (`vtop-broker`)
@@ -239,7 +239,7 @@ opened 2026-11-15, #782). The criterion IDs (A1, B1 and so on) are those of
 
 - **Why:** `experimental` today, `preview` at 1.0: its advertised APIs are `experimental` in the compatibility inventory, and a client following a failover is measured only on one host with debug binaries and a 6 s lease (#751).
 - **Tests and CI:** `crates/vtop-kafka` tests; the `kafka_request` fuzz target; live-chaos scenarios 16 to 21 and 24 with `kcat` (librdkafka) as the stock client; scenarios 27 (`kcat`) and 28 (the JVM client of Apache Kafka 4.4.0) kill the range leader under a client served from candidate nodes, which resumed 5.5 s to 6.6 s later with every acknowledged record read back once and in order; the README's comparison against Apache Kafka.
-- **Open criteria:** #751's remainder: the failover is measured on one host with debug binaries and the harness's 6 s lease, not with the chart's 15 s default lease, not in the co-located `vtop-node node` shape, and a consumer group's coordinator across a failover is out of its scope (members rejoin); #752; 12.0x to 13.9x lower throughput than Apache Kafka at saturation on one laptop (#596 to #600, #610, #737); transactions are out of scope (a transactional `InitProducerId` is refused by name); gzip and zstd produce batches are in review (#762); A3, A4.
+- **Open criteria:** #751's remainder: the failover is measured on one host with debug binaries and the harness's 6 s lease, not with the chart's 15 s default lease, not in the co-located `vtop-node node` shape, and a consumer group's coordinator across a failover is out of its scope (members rejoin); #752; 12.0x to 13.9x lower throughput than Apache Kafka at saturation on one laptop (#596 to #600, #610, #737); transactions are out of scope (a transactional `InitProducerId` is refused by name); A3, A4.
 - **Docs:** README, `when-to-use.md` ("a prototype, measured well below Apache Kafka's throughput") and the benchmark pages.
 
 ### Helm chart

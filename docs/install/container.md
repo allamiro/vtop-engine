@@ -3,8 +3,8 @@
 Each release publishes a multi-arch image to the GitHub Container Registry.
 
 ```bash
-docker pull ghcr.io/allamiro/vtop-engine:0.10.4   # this release, pinned
-docker pull ghcr.io/allamiro/vtop-engine:latest   # the newest release, currently 0.10.4
+docker pull ghcr.io/allamiro/vtop-engine:0.11.0   # this release, pinned
+docker pull ghcr.io/allamiro/vtop-engine:latest   # the newest release, currently 0.11.0
 ```
 
 | Property | Value |
@@ -16,7 +16,7 @@ docker pull ghcr.io/allamiro/vtop-engine:latest   # the newest release, currentl
 | Base | `debian:bookworm-slim`, pinned by digest |
 | User | `vtop`, uid `10001` |
 | Entrypoint | `docker/entrypoint.sh`, default command `run` |
-| Features | Kafka source and the PostgreSQL state store (`--features vtop-cli/postgres`), from the release after v0.10.2; v0.10.2 and earlier images have no PostgreSQL. No Kerberos, no test features. |
+| Features | Kafka source and the PostgreSQL state store (`--features vtop-cli/postgres`), from v0.11.0; v0.10.4 and earlier images have no PostgreSQL. No Kerberos, no test features. |
 | Signing | Keyless cosign signature, SBOM and provenance attestations. See [Verify a release](../RELEASE_VERIFICATION.md#container-image). |
 
 Pin a version tag in anything you deploy. `latest` moves with each release.
@@ -38,7 +38,7 @@ uid 10001. A new named volume is owned by root, so set its ownership once:
 ```bash
 docker volume create vtop-data
 docker run --rm --user root -v vtop-data:/data --entrypoint sh \
-  ghcr.io/allamiro/vtop-engine:0.10.4 \
+  ghcr.io/allamiro/vtop-engine:0.11.0 \
   -c 'mkdir -p /data/input /data/spool /data/work /data/state && chown -R 10001 /data'
 ```
 
@@ -47,13 +47,13 @@ Then check the config and start the engine:
 ```bash
 docker run --rm \
   -v "$PWD/config:/app/examples:ro" -v vtop-data:/data \
-  ghcr.io/allamiro/vtop-engine:0.10.4 validate
+  ghcr.io/allamiro/vtop-engine:0.11.0 validate
 
 docker run -d --name vtop-engine \
   -v "$PWD/config:/app/examples:ro" -v vtop-data:/data \
   -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_REGION \
   -e VTOP_METRICS_ADDR=0.0.0.0:9090 \
-  ghcr.io/allamiro/vtop-engine:0.10.4
+  ghcr.io/allamiro/vtop-engine:0.11.0
 ```
 
 Credentials come from the environment or mounted secrets, never from the
@@ -75,8 +75,8 @@ for a read-only job such as a scheduled `vtopctl scrub`, or for `vtop-node`,
 bypass the entrypoint:
 
 ```bash
-docker run --rm --entrypoint vtopctl ghcr.io/allamiro/vtop-engine:0.10.4 --version
-docker run --rm --entrypoint vtop-node ghcr.io/allamiro/vtop-engine:0.10.4 --help
+docker run --rm --entrypoint vtopctl ghcr.io/allamiro/vtop-engine:0.11.0 --version
+docker run --rm --entrypoint vtop-node ghcr.io/allamiro/vtop-engine:0.11.0 --help
 ```
 
 ## Tools in the image

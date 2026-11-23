@@ -78,7 +78,7 @@ removed; a red run means a row is missing, stale or unlabelled.
 
 Releases: v0.1.0 2026-08-05, v0.2.0 08-06, v0.3.0 08-09, v0.3.1 08-10,
 v0.4.0 08-28, v0.5.0 09-05, v0.6.0 09-07, v0.7.0 11-10, v0.8.0 11-12, v0.9.0 11-14,
-v0.10.0 11-15, v0.10.1 11-15, v0.10.2 11-20, v0.10.3 11-21, v0.10.4 11-22.
+v0.10.0 11-15, v0.10.1 11-15, v0.10.2 11-20, v0.10.3 11-21, v0.10.4 11-22, v0.11.0 11-23.
 
 | Issue | Class | Component | Introduced | Found | Fixed | Found by | What happened |
 |---|---|---|---|---|---|---|---|
@@ -139,3 +139,4 @@ period.
 | Pull request | Class | Component | Introduced | Found | Fixed | Found by | What happened |
 |---|---|---|---|---|---|---|---|
 | [#891](https://github.com/allamiro/vtop-engine/pull/891) | lost range | engine; file, syslog-spool and Kafka sources | #563 (a157549, a failed range handed back to its source) · v0.7.0; v0.7.0 through v0.10.3 carry it | 2026-11-21 | #891 · v0.10.4 · 2026-11-21 | review (while prototyping pipelined archive cycles) | Two windows of one unit that failed in the same pass were both handed back, and the source applied the higher start last: the next pass read on above the lower window, a later window committed past it, and the restart's rewind of it was clamped to that commit, so it was never archived. Reproduced for the file and spool sources through the engine and for all three at the adapter. |
+| [#924](https://github.com/allamiro/vtop-engine/pull/924) | lost range | engine | #892 (e0fa7772, batches stay in flight across cycles); never released | 2026-11-22 | #924 · never released · 2026-11-22 | review (of #892, after it merged) | With upload width 1, a window queued later could take the only upload slot and reach VERIFIED before an earlier window had a ledger row, because a batch task wrote its first row only after it got a slot. A crash then let recovery commit the later window and advance the source past the earlier one's data, since its hold-back sees only recorded rows. The run loop now writes each window's row in seal order before its task is spawned. In the bounded model of the archive path, without seal-order rows the minimal counterexample is 2 windows in flight and one plain kill, with no power loss (121 states); with them there are 0 violations in 20 configurations, the largest of 10.3 million states. Derived and modelled; no loss observed. |

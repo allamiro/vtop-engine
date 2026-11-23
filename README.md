@@ -395,7 +395,7 @@ If you use VTOP Engine in research, please cite it. GitHub's **Cite this reposit
   author  = {Suliman, Tamir},
   title   = {{VTOP Engine: Verified Telemetry Object Protocol Engine}},
   year    = {2026},
-  version = {0.10.4},
+  version = {0.11.0},
   url     = {https://github.com/allamiro/vtop-engine},
   license = {MIT}
 }

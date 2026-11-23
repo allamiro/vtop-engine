@@ -83,7 +83,7 @@ isolated by a separate measurement in this phase; they are the explanation the c
    same guarantee on Kafka.
 2. **No group commit on the gateway path.** `vtop-node data` appends each produce request as its own durability
    barrier: the broker's group-commit mode (one fsync and replication round shared by many concurrent
-   requests) exists in `vtop-broker` but is not wired into the node. The client caps a request at
+   requests) exists in `vtop-broker`; the build these cells were measured on did not wire it into the node (v0.11.0 does, off by default). The client caps a request at
    `batch.size` (16 KiB by default) whatever the record size, so a ceiling set per request shows up as a
    roughly constant MiB/s across record sizes and a record rate that falls as records grow, which is the shape
    of VTOP's cells here.
