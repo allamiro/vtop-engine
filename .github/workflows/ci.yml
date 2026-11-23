@@ -68,6 +68,7 @@ jobs:
       restore_drill: ${{ steps.filter.outputs.restore_drill }}
       helm: ${{ steps.filter.outputs.helm }}
       file_source: ${{ steps.filter.outputs.file_source }}
+      s3_report: ${{ steps.filter.outputs.s3_report }}
       prometheus_rules: ${{ steps.filter.outputs.prometheus_rules }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -312,6 +313,16 @@ jobs:
               # helm job is skipped by exactly the PR that bumps it — the one
               # case the check exists for.
               - 'Cargo.toml'
+            # The S3 compatibility page and README line (#722), generated
+            # from committed results by scripts/s3_compat_report.py.
+            s3_report:
+              - 'scripts/s3_compat_report.py'
+              - 'scripts/tests/test_s3_compat_report.py'
+              - 'tests/s3-compat/**'
+              - 'docker/s3-servers/**'
+              - 'docs/reference/s3-compatibility.md'
+              - 'README.md'
+              - '.github/workflows/ci.yml'
             shell:
               - 'docker/*.sh'
               - 'docker/tests/**'
@@ -355,6 +366,9 @@ jobs:
               # bats suite reads it.
               - 'scripts/check-naming.sh'
               - 'scripts/check-egress-claims.sh'
+              # The Kafka fixture generator (#596): in the shellcheck step,
+              # so here too, for the reason the paragraphs above give.
+              - 'scripts/gen-kafka-fixtures.sh'
               - 'scripts/naming-denylist.txt'
               # The check that no shipped build carries the failpoints
               # feature (#725), listed here and in the shellcheck step.
@@ -1500,7 +1514,8 @@ jobs:
             scripts/traffic-snapshot.sh scripts/test-progress.sh \
             scripts/check-naming.sh scripts/check-egress-claims.sh \
             scripts/check-failpoints-absent.sh scripts/kafka-broker.sh \
-            scripts/kafka-cluster.sh scripts/update-surface-snapshots.sh \
+            scripts/gen-kafka-fixtures.sh scripts/kafka-cluster.sh \
+            scripts/update-surface-snapshots.sh \
             scripts/s3-lab.sh docker/s3-servers/init/bootstrap.sh
 
       # `-P scripts/live-chaos/scenarios` resolves the scenarios' dynamic
@@ -1718,6 +1733,28 @@ jobs:
     with:
       servers: '["minio"]'
 
+  # The S3 compatibility page and the README's line are generated from the
+  # committed results (#722, D6): regenerate both and fail on any
+  # difference, and on results from another image than the one a server's
+  # compose file pins. Cheap: one Python file and PyYAML.
+  s3-compat-report:
+    name: s3 compat report (regenerate + no drift)
+    needs: changes
+    if: needs.changes.outputs.s3_report == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Install the report's dependencies
+        run: pip install --disable-pip-version-check pyyaml==6.0.3 pytest==9.2.0
+      - name: Report tests
+        run: python -m pytest -p no:cacheprovider scripts/tests/test_s3_compat_report.py
+      - name: Regenerate and fail on drift
+        run: python3 scripts/s3_compat_report.py --check
+
   # cargo-deny covers what cargo-audit does not: license compliance, dependency
   # bans, and source provenance. Advisory decisions are mirrored from
   # .cargo/audit.toml (the single source of truth) so the two cannot disagree.
@@ -1787,8 +1824,8 @@ jobs:
 
       # Scenario 17 drives the Kafka gateway with a stock client: kafkacat is
       # librdkafka, the library under every non-JVM Kafka client (#225).
-      # Scenarios 17 to 21, 24 and 27 use it.
-      - name: Install a stock Kafka client for scenarios 17 to 21, 24 and 27
+      # Scenarios 17 to 21, 24, 26 and 27 use it.
+      - name: Install a stock Kafka client for scenarios 17 to 21, 24, 26 and 27
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq kafkacat

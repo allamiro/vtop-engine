@@ -126,7 +126,8 @@ an actor: the admin endpoint refuses a command that arrives already attributed
 (`kind 40`), before authorization, and records the refusal.
 
 A node's own traffic is not attributed: a data node handing a range back
-(`ReleaseRangeLease` under a node certificate) is left bare, so a rolling
+(`ReleaseRangeLeaseAsHolder`, or `ReleaseRangeLease` below level 9, under a
+node certificate) is left bare, so a rolling
 restart of a node that holds hundreds of ranges cannot push operators' commands
 out of the 1024. An operator's own release is attributed. Commands committed
 before the raise to 9 have no actor in the log; their edge and applied records
