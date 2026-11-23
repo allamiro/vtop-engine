@@ -1841,8 +1841,9 @@ jobs:
 
       # Scenario 17 drives the Kafka gateway with a stock client: kafkacat is
       # librdkafka, the library under every non-JVM Kafka client (#225).
-      # Scenarios 17 to 21, 24, 26 and 27 use it.
-      - name: Install a stock Kafka client for scenarios 17 to 21, 24, 26 and 27
+      # Scenarios 17 to 21, 24, 26, 27, 30 and 32 use it (27 and 30 follow a
+      # failover, split and co-located; 32 a paused leader, #751).
+      - name: Install a stock Kafka client for scenarios 17 to 21, 24, 26, 27, 30 and 32
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq kafkacat
@@ -1877,7 +1878,11 @@ jobs:
       # runner's JVM, once per metadata.recovery.strategy, each a full
       # failover. Measured at 75 s for both on two CPUs with debug binaries,
       # plus the image pull; scenario 27 (librdkafka, the kafkacat above) 43 s.
-      # Without the variable the scenario SKIPS (exit 77).
+      # Scenarios 30 and 31 are 27 and 28 again on three co-located
+      # `vtop-node node` processes (each a metadata voter and a candidate), and
+      # 32 pauses the leader past its lease, which a stock client waits out
+      # for its 30 s request timeout (#751). Without the variable 28 and 31
+      # SKIP (exit 77).
       - name: Run the live chaos suite
         id: chaos
         env:

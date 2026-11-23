@@ -27,8 +27,8 @@ mod settings;
 
 pub use capability::{Capability, Expectation, RefusalAt};
 pub use case::{
-    record_method, LiveS3, Outcome, Recorder, ResultLine, COMMIT_ENV, IMAGE_DIGEST_ENV,
-    RESULTS_ENV, SERVER_VERSION_ENV,
+    record_method, record_observation, LiveS3, Outcome, Recorder, ResultLine, COMMIT_ENV,
+    IMAGE_DIGEST_ENV, RESULTS_ENV, SERVER_VERSION_ENV,
 };
 pub use server::{servers_dir, Server, DEFAULT_SERVER, SERVERS_DIR_ENV, SERVER_ENV};
 pub use settings::{
