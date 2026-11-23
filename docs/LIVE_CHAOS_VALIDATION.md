@@ -304,6 +304,7 @@ against it:
 | `missed` | a record the last read holds below an earlier read's high watermark that the earlier read did not see: a committed record is visible to every read that covers it |
 | `hwm` | a later read reporting a lower committed high watermark |
 | `unkeyed` | a visible record whose key is not a producer sequence |
+| `unavailable` | liveness: acknowledged records exist and the last read is `unserved`, a read attempted after the faults stopped that no node could serve (the #640 shape: no leader established again). An `unserved` read followed by a served one is service that came back, and is valid. No live scenario writes the event yet; the promotion sweep's histories do (below) |
 
 An unanswered batch may surface once, whole, or not at all; the checker
 does not count either outcome as a violation. Matching unanswered batches to
@@ -414,26 +415,79 @@ checkers before it fails, so the history is the first to judge the run.
 ### The checkers against the bugs they exist for
 
 The unit tests feed the checkers hand-built histories shaped like each bug.
-`scripts/live-chaos/history/reintroduce/run.sh <bug> [runs]` does the live
-half: it copies the tree, applies a patch from that directory that undoes
-the bug's fix, builds `vtop-node` and `vtopctl` from the copy, runs the
-scenarios that reach the bug's shape against that build with this tree's
-scenarios and checkers, and runs both checkers over each run's histories
-whatever the scenario's own verdict. It exits 0 when a checker flagged a
-run. The patches never ship: they are applied to a copy, and only this
-script runs the build they make.
+That shows each rule is right, not that a run with the bug breaks one.
+`scripts/live-chaos/history/reintroduce/run.sh` does the second: it copies
+the tree, applies a patch from that directory that undoes the bug's fix, runs
+that build, and judges what it recorded with this tree's checkers. The
+patches never ship: they are applied to a copy, and only this script runs the
+build they make. On every pull request that touches Rust, `ci.yml`
+(`build-and-test`) checks that each patch still applies to the tree, so a
+change that moves a hunk fails there and not on the day someone runs them.
 
-| Bug | The patch undoes | Scenarios |
-|---|---|---|
-| #611 | #616: a fence discards a suffix the candidate merely lacks | 23 |
-| #641 | #649: a returning deposed leader's sessions open unfenced | 23 |
-| #261 | #263: a diverged replica is not reconciled at the fence, and acks the new leader's records over its own | 23 |
-| #640 | #648: a follower files caught-up records under its own adopted epoch | 14, 23 |
+| Bug | The patch undoes |
+|---|---|
+| #611 | #616: a fence discards a suffix the candidate merely lacks |
+| #641 | #649: a returning deposed leader's sessions open unfenced |
+| #261 | #263: a diverged replica is not reconciled at the fence, and acks the new leader's records over its own |
+| #640 | #648: a follower files caught-up records under its own adopted epoch |
 
-What the runs showed, on 2026-11-22 (debug builds of this branch, in a
-two-CPU Linux container): **no run reached a bug's shape, so the checkers
-have not yet been shown to fail on a live run with a bug re-introduced.**
-That part of #728 stays open.
+**Deterministic runs (`run.sh --sweep <bug>`).** The shapes need a replica
+that has not learned a commit mark, a deposed leader returning with records
+past the new leader's, or two failovers around a catch-up. Two tests reach
+them by construction, and with `VTOP_SWEEP_HISTORY_DIR` set each writes its
+runs as client histories in the format `check_history.py` reads:
+
+- The promotion crash sweep (`crates/vtop-node/src/promotion_crash_sweep.rs`).
+  Three replicas run the real replica append, fence, reconciliation,
+  journals and segment log, each on a simulated disk, with a crash at every
+  storage operation and the death of every node after every step of the #611
+  sequence. It writes its three runs with no fault, its reproductions and
+  second-failover guard, and the first five failing runs of each full sweep
+  (`VTOP_SWEEP_HISTORY_FAILING`), never one file per swept run.
+- The loopback test of a returning deposed leader (`deposed_leader_returns`
+  in `crates/vtop-broker/tests/networked_replication.rs`, both of its
+  timings). A leader drives two followers through the real
+  `NetworkedReplicaSet` over local TLS; one follower holds records of the old
+  epoch past the leader's tail, is held off while the leader commits, and
+  comes back. The sweep models the leader's session fence instead of
+  running `NetworkedReplicaSet`, so it cannot show #641; this test can.
+
+A history holds acknowledgements and reads only: every acknowledgement to a
+producer in order (a second one at the same offset stays, which is how a
+replaced record shows), every record sent and never acknowledged as
+indeterminate, and a read of every replica up to the final leader's
+high-water mark, the final leader's last. A run in which no leader finished
+ends with an `unserved` read. `check_history.py` judges each file, and
+`run.sh` exits 0 when it flags any. The tests' own assertions fail on a
+patched build too; that is not the verdict. On the fixed code, `ci.yml` runs
+the same tests with the variable set and requires all eight histories they
+write to be valid.
+
+What the deterministic runs showed, on 2026-11-23 (commit `3fea09d8`, debug
+builds on GitHub-hosted `ubuntu-latest` runners, `chaos-campaign.yml`
+dispatched with `mode: sweep`): **each of the four bugs, re-introduced, was
+flagged by `check_history.py`, by the check its shape predicts.**
+
+| Bug | Run | Histories flagged | Checks | What the histories show |
+|---|---|---|---|---|
+| #611 | [45233547825](https://github.com/allamiro/vtop-engine/actions/runs/45233547825) | 4 of 8 | `lost`, `duplicate`, `order` | With no fault, R truncates acknowledged 5..10 at C's fence and C is established at 5: offsets 5 and 6 are acknowledged again for C's records, and 7..9 lie past the final mark of 7. The sweep stops at its no-fault run, so only the no-fault runs and the guards wrote histories |
+| #641 | [45233564440](https://github.com/allamiro/vtop-engine/actions/runs/45233564440) | 2 of 8 | `rewritten` | In both loopback timings the returning replica serves its old-epoch records at 5..7 under the leader's mark, where follower 2 and the leader serve the leader's. The six sweep histories are valid, as expected: the sweep does not run the code this patch changes |
+| #261 | [45233552814](https://github.com/allamiro/vtop-engine/actions/runs/45233552814) | 14 of 18 | `rewritten` | A replica keeps its old-epoch record at 5 under the new leader's mark (in some sweep runs after acknowledging the leader's record there while holding its own); in the no-fault outvoted run, in the #641 reproduction, in five failing runs of each acknowledged shape, and in both loopback timings |
+| #640 | [45233557973](https://github.com/allamiro/vtop-engine/actions/runs/45233557973) | 10 of 18 | `unavailable` | The first five failing runs of each acknowledged shape (R killed after steps 28 to 41): no leader is established again within 12 elections, with acknowledged records. The no-fault runs and the named reproduction, `reproduction_two_caught_up_replicas_cannot_prove_a_quorum_after_the_leader_is_lost`, stay valid with this patch: that guard no longer reaches the shape, and the full sweep does |
+
+What this does not show. These are not live processes. The sweep runs the
+real replica code on simulated disks with the network as in-process calls,
+and models the leader's write path, its session fence, the promotion probe
+and metadata (its header lists exactly which). The loopback test runs real
+sockets and TLS, in one process, with the returning replica held off by a
+gate rather than killed. Neither covers a pause, a partition or clock skew,
+and the patched runs were one dispatch per bug, not a campaign.
+
+**Live runs (`run.sh <bug> [runs]`).** The live mode builds `vtop-node` and
+`vtopctl` from the patched copy, runs the scenarios that can reach the bug's
+shape (23 for all four, and 14 for #640), and runs both checkers over each
+run's histories whatever the scenario's own verdict. On 2026-11-22 (debug
+builds, in a two-CPU Linux container) **no live run reached a bug's shape**:
 
 | Bug | Runs | What happened |
 |---|---|---|
@@ -442,12 +496,12 @@ That part of #728 stays open.
 | #261 | 12 of scenario 23 | As #641: the diverged suffix the patch leaves unreconciled never existed. |
 | #640 | 3 each of scenarios 14 and 23 | Every run passed. The shape needs a follower to catch up records an older epoch wrote after adopting a newer one, then a second failover; neither scenario produces that sequence. With `--stall-ms`, the control checker would report the stall it causes. |
 
-What would close it: a scenario that holds a follower's commit marks back
-while the leader acknowledges (a delivery shim on the replica plane, for
-#611), one that returns the deposed leader with an in-flight suffix on
-purpose rather than by timing (#641, #261), and two failovers around a
-catch-up (#640); or many runs of the existing ones, which the campaign
-workflow's `reintroduce` input runs.
+Reaching the shapes live would take a scenario that holds a follower's
+commit marks back while the leader acknowledges (a delivery shim on the
+replica plane, for #611), one that returns the deposed leader with an
+in-flight suffix on purpose rather than by timing (#641, #261), and two
+failovers around a catch-up (#640). `chaos-campaign.yml` with `mode: live`
+runs the live mode many times.
 
 ### The long campaign
 
