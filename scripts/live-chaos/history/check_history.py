@@ -32,6 +32,9 @@ A scenario records what its clients did and saw, as JSON lines that
            end     the read's committed high watermark, and `start_offset`,
                    the offset it read from (0 unless retention had reclaimed
                    a prefix: `verify --from-offset`)
+           unserved  a read attempted after the faults stopped that no node
+                   could serve: no leader was ever established again. One
+                   event, no records; it is ordered by its own time
 
 Each `verify --dump` is one read, ordered by its `end` event's time. The
 history is checked against the last read; earlier reads are checked against
@@ -63,6 +66,13 @@ is unproven, and counted lost. The invariants:
   hwm           the committed high watermark never goes backwards across reads
   unkeyed       no visible record lacks a producer key (with --allow-unkeyed,
                 such records are reported and not counted as violations)
+  unavailable   liveness: once a record has been acknowledged, the last read
+                is served. A history whose last read is `unserved` lost the
+                range for good after its faults stopped (#640: no candidate
+                could prove a quorum again). An `unserved` read followed by a
+                served one is service that came back, and is valid. With no
+                served read at all, the safety rules above have nothing to
+                judge, and only this one is checked
 
 Usage: check_history.py [--allow-unkeyed] HISTORY.jsonl [HISTORY.jsonl ...]
 Prints a JSON summary; exits 1 when any invariant is violated, 2 on bad input.
@@ -143,6 +153,8 @@ class Read:
     # offset only while it is being checked.
     runs: list[tuple[int, int, int, bool]] = field(default_factory=list)
     unkeyed: list[int] = field(default_factory=list)
+    # An attempt no node could serve: it holds no records and no watermark.
+    unserved: bool = False
 
     def records(self) -> dict[int, tuple[int | None, bool]]:
         """offset -> (sequence, or None for an unkeyed record; values_match)"""
@@ -219,6 +231,10 @@ def load(lines: list[str]) -> tuple[list[Batch], list[Read]]:
                 # (a reused pid, in a run of days) is a read of its own
                 # (review of #881).
                 finished.append(reads.pop(process))
+            elif kind == "unserved":
+                finished.append(
+                    Read(process=process, end_time_us=event.get("time_us", 0), unserved=True)
+                )
             else:
                 raise ValueError(f"line {number}: unknown read event {kind!r}")
         else:
@@ -230,9 +246,18 @@ def load(lines: list[str]) -> tuple[list[Batch], list[Read]]:
 def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) -> dict:
     violations: dict[str, list[str]] = defaultdict(list)
     notes: list[str] = []
+    acknowledged = sum(b.count for b in batches if b.outcome == "ok")
+    if reads and reads[-1].unserved and acknowledged:
+        violations["unavailable"].append(
+            f"the last read ({reads[-1].process}) found no node to serve it, with "
+            f"{acknowledged} acknowledged record(s) in the history"
+        )
+    unserved = [r for r in reads if r.unserved]
+    reads = [r for r in reads if not r.unserved]
     if not reads:
-        violations["input"].append("the history holds no completed read")
-        return summarize(batches, reads, violations, notes)
+        if not unserved:
+            violations["input"].append("the history holds no completed read")
+        return summarize(batches, reads, violations, notes, len(unserved))
     last = reads[-1]
     # Reads in order: each record must be what every earlier read saw at its
     # offset, and an offset an earlier read held must still be there in a later
@@ -471,7 +496,7 @@ def check(batches: list[Batch], reads: list[Read], allow_unkeyed: bool = False) 
                 "are visible, and no acknowledged or indeterminate batch accounts for them"
             )
 
-    return summarize(batches, reads, violations, notes)
+    return summarize(batches, reads, violations, notes, len(unserved))
 
 
 def _covers(batch: Batch, sequences: list[int]) -> bool:
@@ -690,7 +715,7 @@ def _explain_all(
     return True
 
 
-def summarize(batches, reads, violations, notes) -> dict:
+def summarize(batches, reads, violations, notes, unserved: int = 0) -> dict:
     counts = defaultdict(int)
     for batch in batches:
         counts[batch.outcome] += 1
@@ -699,6 +724,7 @@ def summarize(batches, reads, violations, notes) -> dict:
         "batches": dict(counts),
         "acknowledged_records": sum(b.count for b in batches if b.outcome == "ok"),
         "reads": len(reads),
+        "unserved_reads": unserved,
         "high_watermark": reads[-1].high_watermark if reads else None,
         "visible_records": len(reads[-1].records()) if reads else 0,
         "violations": {

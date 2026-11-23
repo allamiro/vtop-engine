@@ -92,6 +92,11 @@ jobs:
               - '.cargo/**'
               - 'rust-toolchain*'
               - '.github/workflows/ci.yml'
+              # Read by build-and-test's history steps (#728): the checker
+              # that judges the sweep's histories, and the patches that must
+              # still apply to the tree.
+              - 'scripts/live-chaos/history/check_history.py'
+              - 'scripts/live-chaos/history/reintroduce/**'
             # Narrow filters for the jobs that spin up external services or a
             # nightly toolchain. Each lists the crates its command actually
             # compiles, taken from `cargo tree`, rather than all of `crates/**`.
@@ -508,6 +513,18 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      # The patches that put back #611, #641, #261 and #640 for
+      # reintroduce/run.sh (#728) are applied by context to files that keep
+      # changing. A change that moves a hunk fails here, not on the day
+      # someone runs the re-introduction.
+      - name: The re-introduction patches still apply
+        run: |
+          set -euo pipefail
+          for patch in scripts/live-chaos/history/reintroduce/*.patch; do
+            patch -p1 --batch --forward --dry-run < "$patch" > /dev/null \
+              || { echo "::error::$patch no longer applies to this tree; refresh it"; exit 1; }
+          done
+
       - name: Check formatting
         run: cargo fmt --all --check
 
@@ -520,6 +537,35 @@ jobs:
 
       - name: Test workspace
         run: cargo test --workspace --locked
+
+      # #728: the promotion crash sweep's runs with no fault, its
+      # reproductions, and the loopback test of a returning deposed leader,
+      # written as client histories and judged by check_history.py, the
+      # checker the live scenarios use. On the fixed code every one must be
+      # valid; reintroduce/run.sh --sweep shows the same checker flags each
+      # bug put back. Seconds on the build above: the full sweeps are not
+      # re-run.
+      - name: The promotion sweep's client histories are valid
+        env:
+          VTOP_SWEEP_HISTORY_DIR: ${{ runner.temp }}/sweep-histories
+        run: |
+          set -euo pipefail
+          cargo test --locked -p vtop-node --bin vtop-node -- \
+            promotion_crash_sweep::the_611_sequence_without_a_fault \
+            promotion_crash_sweep::reproduction_ \
+            promotion_crash_sweep::a_second_failover
+          cargo test --locked -p vtop-broker --test networked_replication deposed_leader
+          histories=("$VTOP_SWEEP_HISTORY_DIR"/*.jsonl)
+          # Three shapes with no fault, two reproductions, the second
+          # failover, and the deposed leader's return in two timings.
+          if [[ "${#histories[@]}" -ne 8 || ! -e "${histories[0]}" ]]; then
+            echo "::error::expected 8 client histories, found ${#histories[@]}: ${histories[*]}"
+            exit 1
+          fi
+          for history in "${histories[@]}"; do
+            echo "== $(basename "$history")"
+            python3 scripts/live-chaos/history/check_history.py "$history"
+          done
 
       - name: Release build
         run: cargo build --release --bin vtopctl --locked
@@ -1531,7 +1577,9 @@ jobs:
             scripts/live-chaos/gen-certs.sh \
             scripts/live-chaos/scenarios/*.sh \
             scripts/live-chaos/engine/*.sh \
-            scripts/live-chaos/soak/*.sh
+            scripts/live-chaos/soak/*.sh \
+            scripts/live-chaos/history/*.sh \
+            scripts/live-chaos/history/reintroduce/*.sh
 
       - name: bats
         run: |

@@ -1,8 +1,7 @@
 diff --git a/crates/vtop-broker/src/replication/mod.rs b/crates/vtop-broker/src/replication/mod.rs
-index 67d15312..b3e82bba 100644
 --- a/crates/vtop-broker/src/replication/mod.rs
 +++ b/crates/vtop-broker/src/replication/mod.rs
-@@ -525,6 +525,13 @@ impl InProcessFollower {
+@@ -525,6 +525,13 @@
      /// journal that fails here is marked broken and also counts as done,
      /// since nothing more may be recorded in it.
      fn follow_leader_lineage(&self, epoch: u64, tail: u64) -> bool {
