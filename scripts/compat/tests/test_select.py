@@ -11,6 +11,11 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import select_cells as select  # noqa: E402
+import yaml  # noqa: E402
+
+ROOT = pathlib.Path(__file__).resolve().parents[3]
+FORMATS = ROOT / "scripts/compat/formats.yaml"
+META_FIXTURES = ROOT / "crates/vtop-meta/tests/fixtures/meta"
 
 TAGS = [
     "v0.1.0", "v0.2.0", "v0.2.1", "v0.3.0", "v0.3.1", "v0.4.0", "v0.5.0",
@@ -279,6 +284,40 @@ class TheCommittedFile(unittest.TestCase):
         manifest = {c["tag"]: c["expect"] for c in full if c["cell"] == "manifest"}
         # Unchanged from the manifest-compat job this replaces.
         self.assertEqual(manifest, {"v0.7.0": "hash-failure", "v0.8.0": "pass", "v0.9.0": "pass"})
+
+    def test_a_release_below_the_attributed_level_refuses_the_raised_meta_directory(self):
+        """meta.sh's forward direction raises this build's directory to its
+        highest feature level, then re-registers a node thousands of times.
+        From ATTRIBUTED_COMMANDS_FEATURE_LEVEL (#706) the leader commits each
+        of those commands as command kind 40, which a release whose highest
+        level is below it cannot decode: it refuses the directory as written
+        by a newer release, so the cell cannot expect `pass` for it (the
+        failure the Compat run of #870 showed). The highest level a release
+        accepts is the one its committed fixture was raised to."""
+        registry = yaml.safe_load(FORMATS.read_text(encoding="utf-8"))
+        constants = {
+            c["name"]: int(c["value"])
+            for entry in registry["formats"]
+            for c in entry.get("constants") or []
+            if c["file"] == "crates/vtop-meta/src/command.rs" and c["value"].isdigit()
+        }
+        attributed = constants["ATTRIBUTED_COMMANDS_FEATURE_LEVEL"]
+        supported = constants["SUPPORTED_FEATURE_LEVEL"]
+        levels = {}
+        for fixture in sorted(META_FIXTURES.iterdir()):
+            expect = fixture / "expect.txt"
+            if expect.is_file():
+                fields = dict(line.split(" ", 1) for line in expect.read_text().splitlines() if " " in line)
+                levels[fixture.name] = int(fields["feature_level"])
+        self.assertTrue(levels, f"no released meta fixture under {META_FIXTURES}")
+        full = select.matrix(select.load(select.DEFAULT_EXPECTED), TAGS + list(levels), "full")
+        forward = {c["tag"]: c for c in full if c["cell"] == "meta" and c["direction"] == "forward"}
+        for tag, level in levels.items():
+            if not level < attributed <= supported:
+                continue
+            with self.subTest(tag=tag, release_level=level, attributed=attributed):
+                self.assertEqual(forward[tag]["expect"], "refuse")
+                self.assertIn("written by a newer release", forward[tag]["message"])
 
 
 if __name__ == "__main__":
