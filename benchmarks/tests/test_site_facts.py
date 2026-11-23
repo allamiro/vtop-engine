@@ -42,7 +42,7 @@ def test_the_vtop_failover_tile_is_vtops_own_tally():
     # "VTOP lost 0" must rest on VTOP's rows alone, not on a total that includes Kafka's.
     fo = readme_charts.failover()
     rows = [row for row in readme_charts.failover_schema.load_failover_run(
-        os.path.join(readme_charts.REPO, readme_charts.FAILOVER_RUN)).rows if row["system"] == "vtop"]
+        os.path.join(readme_charts.REPO, readme_charts.failover_run())).rows if row["system"] == "vtop"]
     vtop = fo["per_system"]["vtop"]
     assert vtop["repetitions"] == len(rows)
     assert vtop["acked"] == sum(int(row["records_acked"]) for row in rows)
@@ -51,7 +51,7 @@ def test_the_vtop_failover_tile_is_vtops_own_tally():
 
 
 def test_a_kafka_loss_does_not_reach_the_vtop_tile(data_tree):
-    csv_path = f"{readme_charts.FAILOVER_RUN}/failover.csv"
+    csv_path = f"{readme_charts.failover_run()}/failover.csv"
 
     def kafka_lost_three(text):
         rows = list(csv.DictReader(io.StringIO(text)))
@@ -71,7 +71,7 @@ def test_a_kafka_loss_does_not_reach_the_vtop_tile(data_tree):
 def test_a_failover_whose_read_back_failed_is_not_counted_as_zero_lost(data_tree):
     # verify FAILED leaves acked_lost and duplicates empty (failover_schema): the tile and the finding must
     # say the counts are unknown, not "0 lost, 0 duplicated".
-    csv_path = f"{readme_charts.FAILOVER_RUN}/failover.csv"
+    csv_path = f"{readme_charts.failover_run()}/failover.csv"
 
     def one_vtop_read_back_failed(text):
         rows = list(csv.DictReader(io.StringIO(text)))

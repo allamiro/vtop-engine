@@ -1224,12 +1224,20 @@ regenerate scripts read `HEAD`, so a run that is not committed is not regenerate
 (The run ids are the command sheet's; use the ids the runs were given.) The reason for the `report.json` column:
 the generators write fixed paths, so two committed runs of one kind write the same page and `regenerate.py` refuses
 them ("two runs write the same file"). The laptop's two committed Kafka runs keep the default paths and stay what the
-README quotes; the AWS runs sit beside them. A `report.json` is exactly
+README quotes; the AWS runs sit beside them. A `report.json` is
 `{"doc": "docs/benchmarks/<page>.md", "img_dir": "docs/benchmarks/<kind's image directory>/<dir>"}` and is the one
-file added to a run by hand. To REPLACE a committed run instead, `git rm -r` it and place the new one with no
-`report.json`: it rewrites the default page and images in place. The README's evidence charts and prose
-(`readme_charts.py`, `tests/test_readme_charts.py`) read the two committed Kafka runs by name; moving them to the
-AWS runs is an editorial change made on purpose, not something placing a run does.
+file added to a run by hand.
+
+To REPLACE a committed Kafka comparison run (throughput, failover or crash) with a newer one of the same kind, the
+newer run's `report.json` says so instead: `{"supersedes": "<the earlier run's id>"}`, with no `doc` or `img_dir`, so
+it writes the kind's default page and images (it may still name its own, both or neither). The earlier run stays
+committed, its raw data checked against `HEAD` as before, but `regenerate.py` no longer draws it. The named run must
+be committed in the same results directory, be of the same kind, and have started earlier (by `environment.json`'s
+`started_at`, since run ids are free text); a cycle is refused, and two current runs writing one file are still
+refused. The README's evidence charts and prose (`readme_charts.py`, `tests/test_readme_charts.py`) read the one
+current run of each kind they chart (throughput, failover) through the same rule, `regenerate.current_run`, and
+refuse when there is not exactly one, so a superseding run moves the README's figures with it: run
+`readme_charts.py` and commit what it writes, and the README test names any sentence whose figure moved.
 
 ```bash
 # What goes in git: the CSVs and environment.json are what the reports read; logs/ is provenance. Keep a run

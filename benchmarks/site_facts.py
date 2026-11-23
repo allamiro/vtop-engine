@@ -305,7 +305,7 @@ def _tiles(fo, egress, conditions, policed, tp, ratios) -> list[dict[str, Any]]:
     single = egress["grid"][("wan100-loss1", 1)][0]
     before, after = policed[("policed", "before")], policed[("policed", "after")]
     low, high = min(ratios), max(ratios)
-    failover_csv = f"{readme_charts.FAILOVER_RUN}/failover.csv"
+    failover_csv = f"{readme_charts.failover_run()}/failover.csv"
     return [
         {"id": "failover", "label": "Acknowledged records lost or duplicated, VTOP",
          "value": value,
@@ -333,7 +333,7 @@ def _tiles(fo, egress, conditions, policed, tp, ratios) -> list[dict[str, Any]]:
                    + ("Here VTOP is behind." if low > 1 else "VTOP is not behind in every cell."),
          "condition": "each system as shipped, one host",
          "tone": "neutral", "badge": "Behind" if low > 1 else None,
-         "source": _source(f"{readme_charts.THROUGHPUT_RUN}/results.csv")},
+         "source": _source(f"{readme_charts.throughput_run()}/results.csv")},
     ]
 
 
@@ -369,7 +369,7 @@ def _recovery(fo) -> dict[str, Any]:
                              "fraction": cell.median / top}
         faults.append(entry)
     return {"title": "Seconds without an acknowledgement after a fault", "faults": faults,
-            "source": _source(f"{readme_charts.FAILOVER_RUN}/failover.csv")}
+            "source": _source(f"{readme_charts.failover_run()}/failover.csv")}
 
 
 def _throughput(tp, ratios) -> dict[str, Any]:
@@ -390,7 +390,7 @@ def _throughput(tp, ratios) -> dict[str, Any]:
         "series": {"kafka": "Apache Kafka", "vtop": "VTOP (Kafka gateway)"},
         "groups": groups,
         "ratio_text": f"Kafka carries {min(ratios):.1f}x to {max(ratios):.1f}x VTOP's records per second.",
-        "source": _source(f"{readme_charts.THROUGHPUT_RUN}/results.csv"),
+        "source": _source(f"{readme_charts.throughput_run()}/results.csv"),
     }
 
 
@@ -413,7 +413,7 @@ def _results(fo, egress, policed, ratios, tp) -> list[dict[str, Any]]:
          "figure": f"{fo['lost']} lost, {fo['duplicates']} duplicated, {fo['repetitions']} failovers"
                    + (f", {unverified} not verified" if unverified else ""),
          "condition": f"{fo['per_cell']} repetitions per fault and system, one host",
-         "data": f"{readme_charts.FAILOVER_RUN}/failover.csv", "method": "docs/benchmarks/kafka-failover.md"},
+         "data": f"{readme_charts.failover_run()}/failover.csv", "method": "docs/benchmarks/kafka-failover.md"},
         {"id": "link-share",
          "finding": ("Concurrent uploads fill a long, lossy link; one at a time does not."
                      if best[1] > grid[0][1] else "One upload at a time carried as much of the lossy link as more."),
@@ -432,7 +432,7 @@ def _results(fo, egress, policed, ratios, tp) -> list[dict[str, Any]]:
          + ", and a Kafka client cannot yet follow a VTOP failover.",
          "figure": f"{min(ratios):.1f}x to {max(ratios):.1f}x",
          "condition": f"same JVM producer, {tp['cpus']} CPUs per node, one host",
-         "data": f"{readme_charts.THROUGHPUT_RUN}/results.csv", "method": "docs/benchmarks/kafka-comparison.md"},
+         "data": f"{readme_charts.throughput_run()}/results.csv", "method": "docs/benchmarks/kafka-comparison.md"},
     ]
 
 
