@@ -1828,8 +1828,8 @@ assert_metadata_names_leader() { # <bootstrap-candidate> <leader-candidate>
 # with no Metadata first, and the answer as one line: `acknowledged offset=N`,
 # `refused code=N name=NAME`, `closed`, `no-reply` or `unreachable ...`
 # (kafka_raw_produce.py says why a stock client cannot be used for this).
-kafka_raw_produce() { # <port> <key> <value> <wait-seconds>
-  python3 "$SCRIPT_DIR/kafka_raw_produce.py" "$1" "$TOPIC" "$2" "$3" "$4"
+kafka_raw_produce() { # <port> <key> <value> <wait-seconds> [--say-sent]
+  python3 "$SCRIPT_DIR/kafka_raw_produce.py" "$1" "$TOPIC" "$2" "$3" "$4" "${@:5}"
 }
 
 # kafka_distribution <copy-dir> <tool...> — the Apache Kafka distribution whose

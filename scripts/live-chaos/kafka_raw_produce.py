@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """One Kafka Produce request on the wire, and what the broker answered (#751).
 
-Usage: kafka_raw_produce.py <port> <topic> <key> <value> <wait-seconds>
+Usage: kafka_raw_produce.py <port> <topic> <key> <value> <wait-seconds> [--say-sent]
 
 Connects to 127.0.0.1:<port>, sends ONE Produce (v3, acks=all, one record in
 a v2 batch with no producer id) for partition 0 of <topic>, and prints one line:
 
   acknowledged offset=<n>       the broker appended it (error code 0)
   refused code=<n> name=<NAME>  the broker answered with an error code
-  closed                        the connection closed with no answer
-  no-reply                      nothing came back within <wait-seconds>
+  closed                        the request was sent, and the connection
+                                closed with no answer
+  no-reply                      the request was sent, and nothing came back
+                                within <wait-seconds>
   unreachable <reason>          the connection could not be made
+  unsent <reason>               connected, but the request could not be sent
 
-Exit status is 0 for every one of those: the caller judges the answer.
+Exit status is 0 for every one of those: the caller judges the answer. Only
+the first four say the request reached the broker. With --say-sent, `sent` is
+written to stderr the moment the request is in the socket, so a caller can
+tell a request queued for a stopped process from one never sent.
 
 Why not a stock client: a stock client asks Metadata first and goes where it
 is told, so it can never be made to send a Produce to a node that no longer
@@ -132,6 +138,13 @@ def main():
         return
     try:
         sock.sendall(struct.pack(">i", len(request)) + request)
+    except OSError as error:
+        sock.close()
+        print("unsent %s" % error)
+        return
+    if "--say-sent" in sys.argv[6:]:
+        print("sent", file=sys.stderr, flush=True)
+    try:
         size = struct.unpack(">i", read_exactly(sock, 4, deadline))[0]
         reply = read_exactly(sock, size, deadline)
     except TimeoutError:

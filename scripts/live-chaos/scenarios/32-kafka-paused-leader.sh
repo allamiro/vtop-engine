@@ -155,10 +155,22 @@ await_metric_equals "$(data_metrics_addr "$((NEW_LEADER + 10))")" \
 # the pause, the resume and a refusal's own deadline.
 QUEUED="$WORKDIR/queued-probe.txt"
 kafka_raw_produce "$OLD_PORT" "stale-queued" "sent-while-paused" \
-  $((PAUSE_LIMIT_SECONDS + 2 * PROGRESS_TIMEOUT_SECONDS)) > "$QUEUED" 2>&1 &
+  $((PAUSE_LIMIT_SECONDS + 2 * PROGRESS_TIMEOUT_SECONDS)) --say-sent \
+  > "$QUEUED" 2> "$QUEUED.err" &
 QUEUED_PID=$!
 echo "$QUEUED_PID" >> "$WORKDIR/pids"
-log "one raw Produce queued for paused candidate $OLD on 127.0.0.1:$OLD_PORT"
+# The request must be IN the paused process's socket before it wakes, or the
+# answer below says nothing about a request that was waiting for it (review):
+# the probe says `sent` once its bytes are in the socket, and is still waiting.
+deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS))
+until grep -qx sent "$QUEUED.err" 2>/dev/null; do
+  kill -0 "$QUEUED_PID" 2>/dev/null \
+    || fail "the queued probe ended before it sent its request: $(cat "$QUEUED" "$QUEUED.err" 2>/dev/null | tr '\n' ' ')"
+  [[ $SECONDS -lt $deadline ]] \
+    || fail "the queued probe did not send its request within ${PROGRESS_TIMEOUT_SECONDS}s"
+  sleep 0.1
+done
+log "one raw Produce sent to paused candidate $OLD on 127.0.0.1:$OLD_PORT, its answer awaited"
 
 # 3. The producer resumes through the new leader. RESUME_ACKS acknowledgements
 # past the count at the pause cannot all be stragglers the old leader sent
@@ -175,6 +187,8 @@ log "the producer resumed through candidate $NEW_LEADER while candidate $OLD is 
 # Still stopped: the resume above must not have come from the old leader.
 [[ "$(ps -o stat= -p "$OLD_PID" 2>/dev/null || true)" == T* ]] \
   || fail "candidate $OLD is no longer stopped before the scenario resumed it"
+kill -0 "$QUEUED_PID" 2>/dev/null \
+  || fail "the queued probe was answered while candidate $OLD was stopped: $(cat "$QUEUED")"
 
 # 4. Wake the old leader.
 CONT_MS="$(wall_ms)"
@@ -182,20 +196,8 @@ resume_pid "$OLD_PID"
 log "candidate $OLD SIGCONTed $(( (CONT_MS - PAUSE_MS) / 1000 )) s after it was stopped"
 
 # --- the deposed leader ----------------------------------------------------------
-# Safety: the queued Produce must not be acknowledged. Every answer but an
-# acknowledgement is acceptable here, and which one came is reported: it
-# depends on whether the old gateway read the request before or after its
-# lease agent demoted it.
-set +e
-wait "$QUEUED_PID"
-set -e
-QUEUED_ANSWER="$(tr -d '\n' < "$QUEUED")"
-[[ -n "$QUEUED_ANSWER" ]] || fail "the queued probe printed nothing (see $QUEUED)"
-[[ "$QUEUED_ANSWER" != acknowledged* ]] \
-  || fail "candidate $OLD acknowledged a Produce after it resumed ($QUEUED_ANSWER), while candidate $NEW_LEADER holds the range at epoch $NEW_EPOCH: a deposed leader acknowledged a write"
-log "the Produce queued while candidate $OLD slept was answered: $QUEUED_ANSWER"
-
-# Liveness: the gateway stops claiming to serve, promptly. One renew and one
+# Liveness first, timed from the resume and not from the probe's answer
+# (review): the gateway stops claiming to serve, promptly. One renew and one
 # poll is the most the lease agent can take to read the rival's hold once it
 # runs again; 2 s more covers the scrape and this loop's own cadence.
 NOT_SERVING_LIMIT_MS=$((LEASE_RENEW_MS + LEASE_POLL_MS + 2000))
@@ -208,6 +210,20 @@ NOT_SERVING_MS=$(( $(wall_ms) - CONT_MS ))
 await_log_line "$(candidate_log "$OLD")" "data_node_role_changed role=follower" \
   "the resumed old leader must change role to follower in place"
 log "candidate $OLD stopped serving ${NOT_SERVING_MS} ms after it resumed and is a follower"
+
+# Safety: the queued Produce must not be acknowledged. A refusal, a closed
+# connection or no answer within its wait all say so, and which one came is
+# reported: it depends on whether the old gateway read the request before or
+# after its lease agent demoted it. Anything else (the probe failing, or a
+# reply it cannot read) is not evidence either way, and fails.
+QUEUED_EXIT=0
+wait "$QUEUED_PID" || QUEUED_EXIT=$?
+QUEUED_ANSWER="$(tr -d '\n' < "$QUEUED")"
+[[ "$QUEUED_ANSWER" != acknowledged* ]] \
+  || fail "candidate $OLD acknowledged a Produce after it resumed ($QUEUED_ANSWER), while candidate $NEW_LEADER holds the range at epoch $NEW_EPOCH: a deposed leader acknowledged a write"
+[[ $QUEUED_EXIT -eq 0 && "$QUEUED_ANSWER" =~ ^(refused\ code=[0-9]+\ name=[A-Z_]+|closed|no-reply)$ ]] \
+  || fail "the queued probe gave no answer to judge (exit $QUEUED_EXIT): '$QUEUED_ANSWER' $(tr '\n' ' ' < "$QUEUED.err")"
+log "the Produce queued while candidate $OLD slept was answered: $QUEUED_ANSWER"
 
 # What a stock client bootstrapped from the old leader alone is told now:
 # the new leader, so it is redirected rather than refused.
