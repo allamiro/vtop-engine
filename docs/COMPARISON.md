@@ -69,8 +69,12 @@ not follow a VTOP failover, because the gateway was refused on the candidate
 nodes that fail over in place, so VTOP's failover there is measured through
 its native client and labelled as a different client path. That gap is closed
 (#751) and the run has not been repeated through a Kafka client; what a Kafka
-client sees is measured separately, in live-chaos scenarios 27 and 28 (one host,
-debug binaries, a 6 s lease), and is not comparable with that report's numbers.
+client sees is measured separately, in live-chaos scenarios 27, 28 and 30 to 33:
+with release binaries and the chart's 15 s lease, on one GitHub-hosted runner
+(2 vCPUs, every process on one host), producers resumed 12.5 s to 15.9 s after a
+leader kill, in the split and the co-located shape, and a consumer group read on
+13.0 s to 14.4 s after it. That is one host class and a different client path,
+so it is not comparable with that report's numbers.
 
 ## VTOP vs LinkedIn Northguard/Xinfra
 

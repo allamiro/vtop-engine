@@ -313,8 +313,8 @@ python3 benchmarks/kafka_compare/report.py benchmarks/kafka_compare/results/fail
 
 **The client paths differ, and that is the first finding.** The only VTOP shape that fails over by itself
 is every node a *candidate* (the Helm replicated topology), and in the build this run measured a candidate
-refused the Kafka gateway (row above; #751 has since lifted that, and live-chaos scenarios 27 and 28 show a
-Kafka client following a failover on one host, with debug binaries and a 6 s lease). A leased leader can carry the gateway, but its followers never take the range over themselves. So the
+refused the Kafka gateway (row above; #751 has since lifted that, and live-chaos scenarios 27, 28 and 30 to 33
+show a Kafka client following a failover on one host, with the chart's lease and release binaries). A leased leader can carry the gateway, but its followers never take the range over themselves. So the
 Kafka side is driven by the JVM client (`kafka-verifiable-producer.sh`, idempotent, retries at the client
 default) and the VTOP side by its native client (`vtop-node produce` via
 [`vtop/failover-driver.sh`](vtop/failover-driver.sh)); every chart and table says so.
