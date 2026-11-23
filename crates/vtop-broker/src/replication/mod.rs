@@ -1413,6 +1413,17 @@ impl InProcessFollower {
                 // held below the base takes no offset here; the rest are
                 // compared, in order, with what this replica holds from the
                 // base.
+                //
+                // A record older than this replica's retry window cannot be
+                // looked up, so nothing says whether it is held: such a
+                // request is not judged here and is left to the duplicate
+                // path, as before this rule.
+                if sent
+                    .iter()
+                    .any(|record| state.segment.below_retry_window(record))
+                {
+                    continue;
+                }
                 let mut fresh = false;
                 let mut placed = Vec::with_capacity(sent.len());
                 for record in &sent {

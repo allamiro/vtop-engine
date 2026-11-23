@@ -995,6 +995,11 @@ impl SegmentSet {
         self.tail().held_offset(record)
     }
 
+    /// [`ActiveSegment::below_retry_window`] of the tail.
+    pub fn below_retry_window(&self, record: &LogRecord) -> bool {
+        self.tail().below_retry_window(record)
+    }
+
     pub fn active_mut(&mut self) -> &mut ActiveSegment {
         self.tail_mut()
     }
