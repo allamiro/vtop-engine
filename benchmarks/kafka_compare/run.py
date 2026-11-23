@@ -897,6 +897,18 @@ def write_e2e_result(ctx: dict, row: dict, hist: dict[int, int] | None) -> None:
     schema.append_row(ctx["csv"], row)
 
 
+def save_events(ctx: dict) -> None:
+    """environment.json as the context holds it now. Called where an event is recorded, not only after a cell:
+    a run killed between the two kept no record of a setting confirmed or a smoke passed (lesson 3 of the
+    v0.11.1 AWS round)."""
+    save_environment(ctx["run_dir"], ctx["env"])
+
+
+def record_event(ctx: dict, event: dict[str, Any]) -> None:
+    ctx["env"]["events"].append(event)
+    save_events(ctx)
+
+
 def write_leader_config(ctx: dict, group_commit: str) -> str | None:
     """The leader's node.yaml for a group-commit setting, written under the run's directory (#752), or None
     (the shipped file) when the run does not vary the setting."""
@@ -920,10 +932,10 @@ def confirm_group_commit(ctx: dict, system: str, size: int, group_commit: str, l
         ctx["env"]["events"].append({"at": utc_now(), "system": system, "record_size": size,
                                      "group_commit": group_commit, "event": str(exc)[:900]})
         _save_leader_log(system, logs, tag, ctx["vtop_image"])
+        save_events(ctx)
         raise
-    ctx["env"]["events"].append({"at": utc_now(), "system": system, "record_size": size,
-                                 "group_commit": group_commit,
-                                 "event": f"group commit {group_commit} confirmed: {GROUP_COMMIT_GAUGE} {have}"})
+    record_event(ctx, {"at": utc_now(), "system": system, "record_size": size, "group_commit": group_commit,
+                       "event": f"group commit {group_commit} confirmed: {GROUP_COMMIT_GAUGE} {have}"})
 
 
 def e2e_targets(matrix: dict[str, Any]) -> list[tuple[str, str, str]]:
@@ -964,6 +976,7 @@ def run_e2e_cell(ctx: dict, system: str, profile: str, size: int, rate: int, gro
         ctx["env"]["events"].append({"at": utc_now(), "system": system, "profile": profile, "record_size": size,
                                      "event": reason})
         _save_leader_log(system, logs, tag, ctx["vtop_image"])
+        save_events(ctx)
         refuse_e2e(ctx, size, reason, targets)
         cluster_down(system, ctx["vtop_image"])
         return
@@ -1009,7 +1022,7 @@ def run_e2e_stage(ctx: dict, size: int) -> None:
     except e2e.E2eRefused as exc:
         reason = f"no common offered rate for this cell: {exc}"
         log(f"e2e {size} B: {reason}")
-        ctx["env"]["events"].append({"at": utc_now(), "record_size": size, "event": reason})
+        record_event(ctx, {"at": utc_now(), "record_size": size, "event": reason})
         refuse_e2e(ctx, size, reason, targets)
         return
     ctx["env"]["observed"].setdefault("e2e_rates", {})[str(size)] = rate
@@ -1075,11 +1088,12 @@ def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | No
         log(f"{tag}: {reason}")
         ctx["env"]["events"].append({"at": utc_now(), "system": system, "record_size": size, "event": reason})
         _save_leader_log(system, logs, tag, ctx["vtop_image"])
+        save_events(ctx)
         refuse_rows(ctx, system, size, reason, load_pcts, group_commit)
         cluster_down(system, ctx["vtop_image"])
         return None
-    ctx["env"]["events"].append({"at": utc_now(), "system": system, "record_size": size,
-                                 "event": f"smoke passed: {ctx['smoke_records']} records byte-exact"})
+    record_event(ctx, {"at": utc_now(), "system": system, "record_size": size,
+                       "event": f"smoke passed: {ctx['smoke_records']} records byte-exact"})
     if system == "kafka" and "kafka_topic" not in ctx["env"]["observed"]:
         _observe_kafka(ctx)
 
