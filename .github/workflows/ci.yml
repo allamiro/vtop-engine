@@ -336,6 +336,9 @@ jobs:
               - 'scripts/compat/cells/*.sh'
               - 'scripts/ledger-compat.sh'
               - 'scripts/restore-drill.sh'
+              # The disaster-recovery drills (#735): executable shell that
+              # gates the runbooks' claims, and the Python their checks run.
+              - 'scripts/dr-drill/**'
               # The live-chaos harness is executable shell that gates every
               # distributed-systems claim this project makes, and it was
               # unlinted: a change to lib.sh — sourced by every scenario —
@@ -1533,6 +1536,20 @@ jobs:
             scripts/live-chaos/engine/*.sh \
             scripts/live-chaos/soak/*.sh
 
+      # The disaster-recovery drills (#735). `-P scripts/dr-drill` resolves
+      # the drills' `source` of their shared library, for the reason the
+      # live-chaos step above gives.
+      - name: shellcheck (disaster-recovery drills)
+        run: |
+          docker run --rm -v "$PWD:/mnt" -w /mnt \
+            koalaman/shellcheck:v0.11.0 -x -P scripts/dr-drill \
+            scripts/dr-drill/*.sh
+
+      # The drills trust these checks to find a missing record, a duplicate and
+      # an altered response; this proves they can.
+      - name: disaster-recovery drill helpers (unit tests)
+        run: python3 -m unittest discover -s scripts/dr-drill -p 'test_*.py' -v
+
       - name: bats
         run: |
           docker run --rm -v "$PWD:/code" -w /code \
@@ -1609,6 +1626,10 @@ jobs:
         run: python -m unittest discover -s scripts/tests -p 'test_check_threat_map.py' -v
       - name: threat map (every named control and test exists)
         run: python scripts/check-threat-map.py
+      # The release workflow restores no build cache and interpolates no
+      # outside text into a script (#730).
+      - name: the release workflow keeps caches out and untrusted text in env
+        run: python -m unittest discover -s scripts/tests -p 'test_release_workflow_hardening.py' -v
       # The 1.0 release gate (#741) names tests and CI jobs too, so a rename
       # fails here for the same reason. This checkout is shallow, so the
       # merged pull requests, runs and issues are checked by the docs

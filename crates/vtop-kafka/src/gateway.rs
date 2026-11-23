@@ -155,6 +155,37 @@ const INITIAL_FRAME_CAPACITY: usize = 64 * 1024;
 /// What ListOffsets answers as the timestamp of a boundary lookup: unknown.
 const TIMESTAMP_UNKNOWN: i64 = -1;
 
+/// Write one framed reply, giving up when the peer has not taken it within
+/// `limit`. `Ok(false)` is the give-up; a write error is the error.
+async fn write_reply<W>(socket: &mut W, body: &[u8], limit: Duration) -> std::io::Result<bool>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(limit, socket.write_all(&frame(body))).await {
+        Ok(written) => written.map(|()| true),
+        Err(_) => Ok(false),
+    }
+}
+
+/// The most one Fetch response may carry, whatever `max_bytes` and each
+/// partition's `partition_max_bytes` ask for (50 MiB, the default of Kafka's
+/// own `fetch.max.bytes`).
+///
+/// Both numbers come off the wire as an `i32`. Taken as they stand, one
+/// request could ask a node to read, copy and encode up to 2 GiB of log into
+/// a single response, and a client can send such a request on every session
+/// it holds.
+const MAX_FETCH_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
+
+/// The byte budget for a whole Fetch response: what the client asked for,
+/// at least one byte (the at-least-one-batch rule), at most
+/// [`MAX_FETCH_RESPONSE_BYTES`].
+fn fetch_response_budget(requested: i32) -> usize {
+    usize::try_from(requested.max(1))
+        .unwrap_or(usize::MAX)
+        .min(MAX_FETCH_RESPONSE_BYTES)
+}
+
 /// Resolves when `shutdown` reads `true`; never on a dropped sender, which
 /// is not a signal (see `serve`).
 async fn shutdown_signalled(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
@@ -1115,7 +1146,17 @@ impl Gateway {
                 return Ok(());
             }
             match self.answer(&body).await {
-                Answer::Reply(bytes) => socket.write_all(&frame(&bytes)).await?,
+                Answer::Reply(bytes) => {
+                    // A peer that stops reading holds this session, and a
+                    // slot, only for the idle limit: the reads are bounded
+                    // by it, so the write is too.
+                    if !write_reply(&mut socket, &bytes, self.config.idle_timeout).await? {
+                        tracing::warn!(
+                            "kafka response not accepted within the idle limit; connection closed"
+                        );
+                        return Ok(());
+                    }
+                }
                 Answer::Close(reason) => {
                     tracing::warn!(%reason, "kafka request refused; connection closed");
                     return Ok(());
@@ -2806,7 +2847,7 @@ impl Gateway {
             // partition: the first partition with data keeps its
             // at-least-one-batch guarantee, and once the budget is spent the
             // rest report their watermarks without asking for records.
-            let mut remaining = usize::try_from(request.max_bytes.max(1)).unwrap_or(usize::MAX);
+            let mut remaining = fetch_response_budget(request.max_bytes);
             let mut total = 0_usize;
             let mut any_error = false;
             for topic in &request.topics {
@@ -7572,6 +7613,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read_fetch(&reply, 4).1, 3, "nothing appended");
+    }
+
+    /// A peer that never reads its reply is given up on at the limit, not
+    /// waited for for ever; one that reads it gets it.
+    #[tokio::test]
+    async fn a_reply_the_peer_never_reads_is_given_up_on() {
+        use tokio::io::AsyncReadExt;
+        let body = vec![7_u8; 4096];
+        // A pipe holding 64 bytes, and a far end that never reads.
+        let (mut near, _far) = tokio::io::duplex(64);
+        let taken = write_reply(&mut near, &body, Duration::from_millis(100))
+            .await
+            .unwrap();
+        assert!(!taken, "the write must end at the limit");
+        // The same pipe, with a reader draining it.
+        let (mut near, mut far) = tokio::io::duplex(64);
+        let drain = tokio::spawn(async move {
+            let mut sink = Vec::new();
+            far.read_to_end(&mut sink).await.unwrap();
+            sink.len()
+        });
+        let taken = write_reply(&mut near, &body, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(taken);
+        drop(near);
+        assert_eq!(drain.await.unwrap(), body.len() + 4);
+    }
+
+    /// A Fetch that asks for the most an `i32` can name is served at most
+    /// [`MAX_FETCH_RESPONSE_BYTES`], and one that asks for little keeps its
+    /// own budget, never less than one byte.
+    #[test]
+    fn a_fetch_response_budget_is_capped() {
+        assert_eq!(fetch_response_budget(i32::MAX), MAX_FETCH_RESPONSE_BYTES);
+        assert_eq!(
+            fetch_response_budget(MAX_FETCH_RESPONSE_BYTES as i32 + 1),
+            MAX_FETCH_RESPONSE_BYTES
+        );
+        assert_eq!(fetch_response_budget(1 << 20), 1 << 20);
+        assert_eq!(fetch_response_budget(0), 1);
+        assert_eq!(fetch_response_budget(i32::MIN), 1);
     }
 
     /// One byte budget per response (review): the second partition gets

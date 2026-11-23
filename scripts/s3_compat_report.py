@@ -227,6 +227,21 @@ def render_page(runs: list[dict], servers: dict[str, dict]) -> str:
                 notes.append(f"- {run['server']}, `{cap}`: {state['note']}")
     if notes:
         out += ["", "## Notes", "", "From each server's capability file; notes, not test results.", ""] + notes
+    observations = [
+        f"- {run['server']}, `{c['case']}`: {c['observation']}"
+        for run in runs
+        for c in sorted(run["cases"], key=lambda c: c["case"])
+        if c.get("observation") and c["outcome"] == "pass"
+    ]
+    if observations:
+        out += [
+            "",
+            "## Observations",
+            "",
+            "What an informational probe saw each server do. Recorded by the run, never judged:",
+            "the probe passes whichever way the server answered.",
+            "",
+        ] + observations
     out += ["", "## Cases", ""]
     for run in runs:
         out += [f"### {run['server']}", "", "| Case | Capabilities | Expectation | Outcome | Method |", "|---|---|---|---|---|"]

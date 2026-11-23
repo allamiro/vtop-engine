@@ -48,7 +48,7 @@ jobs:
   verify:
     name: verify (fmt + clippy + test)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     outputs:
       version: ${{ steps.meta.outputs.version }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
@@ -72,28 +72,9 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
-      # A dispatch builds a commit the dispatcher chose, so it only reads the
-      # cache: what a dispatched build writes would be restored by the next tag
-      # build (cache poisoning). A tag push restores and saves as before.
-      - name: Restore the build cache, read only (dispatch)
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-release-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Restore and save the build cache
-        if: github.event_name != 'workflow_dispatch'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-release-${{ hashFiles('**/Cargo.lock') }}
+      # No build cache here. A release is rare, and a cache restored into it
+      # is writable by any job that runs on the default branch, so a restored
+      # cache would carry that job's code into a signed release.
 
       # librdkafka (cmake-build feature) compiles from source: it needs cmake +
       # a C toolchain, SSL + SASL, zlib, and libcurl (SASL OAUTHBEARER/OIDC
@@ -424,9 +405,13 @@ jobs:
       - name: Package
         id: pkg
         shell: bash
+        # Text from an earlier job is passed through the environment, never
+        # interpolated into the script.
+        env:
+          RELEASE_VERSION: ${{ needs.verify.outputs.version }}
         run: |
           set -euo pipefail
-          name="${BUNDLE_NAME}-${{ needs.verify.outputs.version }}-${{ matrix.target }}"
+          name="${BUNDLE_NAME}-${RELEASE_VERSION}-${{ matrix.target }}"
           mkdir -p "dist/$name"
           cp "target/${{ matrix.target }}/release/vtop-node" "dist/$name/"
           cp "target/${{ matrix.target }}/release/vtopctl" "dist/$name/"
@@ -1152,7 +1137,7 @@ jobs:
     # ordering is kept for the same consistency argument.)
     needs: [verify, binaries, sbom]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
@@ -1218,18 +1203,16 @@ jobs:
           outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'workflow_dispatch' }}
           sbom: true
           provenance: mode=max
-          # Per-arch cache scopes so the two builds stop evicting each other.
-          cache-from: type=gha,scope=docker-${{ matrix.platform }}
-          # Not exported on a dispatch: the layers of a commit the dispatcher
-          # chose must not be restored by a later tag build.
-          cache-to: ${{ github.event_name != 'workflow_dispatch' && format('type=gha,mode=max,scope=docker-{0}', matrix.platform) || '' }}
+          # No layer cache, for the reason the verify job has none.
 
       - name: Export digest
         if: github.event_name != 'workflow_dispatch'
+        env:
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
           mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
+          digest="$BUILD_DIGEST"
           touch "/tmp/digests/${digest#sha256:}"
 
       - name: Upload digest
@@ -1253,6 +1236,9 @@ jobs:
       packages: write
       id-token: write # keyless cosign signing and the provenance attestation
       attestations: write # the provenance attestation
+    env:
+      # Read by the scripts below, which never interpolate it.
+      RELEASE_VERSION: ${{ needs.verify.outputs.version }}
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -1332,7 +1318,7 @@ jobs:
             args+=("$IMAGE_NAME@sha256:$digest")
           done
           docker buildx imagetools create "${args[@]}"
-          docker buildx imagetools inspect "$IMAGE_NAME:${{ needs.verify.outputs.version }}"
+          docker buildx imagetools inspect "$IMAGE_NAME:${RELEASE_VERSION}"
 
       - name: Assert the index is linked to this repository
         run: |
@@ -1340,7 +1326,7 @@ jobs:
           # A silent regression here costs a whole release cycle to notice,
           # because the image works perfectly and only the association is gone.
           source_annotation="$(docker buildx imagetools inspect \
-            "$IMAGE_NAME:${{ needs.verify.outputs.version }}" --raw \
+            "$IMAGE_NAME:${RELEASE_VERSION}" --raw \
             | jq -r '.annotations["org.opencontainers.image.source"] // ""')"
           expected="https://github.com/${{ github.repository }}"
           if [ "$source_annotation" != "$expected" ]; then
@@ -1355,7 +1341,7 @@ jobs:
       - name: Sign manifest (keyless)
         run: |
           set -euo pipefail
-          digest="$(docker buildx imagetools inspect "$IMAGE_NAME:${{ needs.verify.outputs.version }}" --format '{{ .Manifest.Digest }}')"
+          digest="$(docker buildx imagetools inspect "$IMAGE_NAME:${RELEASE_VERSION}" --format '{{ .Manifest.Digest }}')"
           cosign sign --yes "${IMAGE_NAME}@${digest}"
 
       # Build provenance for the image (#731): a SLSA attestation naming this
@@ -1367,7 +1353,7 @@ jobs:
         id: manifest
         run: |
           set -euo pipefail
-          digest="$(docker buildx imagetools inspect "$IMAGE_NAME:${{ needs.verify.outputs.version }}" --format '{{ .Manifest.Digest }}')"
+          digest="$(docker buildx imagetools inspect "$IMAGE_NAME:${RELEASE_VERSION}" --format '{{ .Manifest.Digest }}')"
           case "$digest" in sha256:*) ;; *) echo "::error::unexpected manifest digest '$digest'"; exit 1 ;; esac
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
 

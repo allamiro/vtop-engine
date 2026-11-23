@@ -91,7 +91,7 @@ all nine on 2026-11-21; the other answer is kept for the record.
 | D5 | The syslog spool source | `preview` today and `production` at 1.0, if the crash sweep is extended to it | Treat it as preview at 1.0, since it has the thinnest evidence of the three sources |
 | D6 | The PostgreSQL state store | `production` at 1.0, with a release asset or an image that enables the feature | `preview` at 1.0 if it stays a source build (`--features postgres`) |
 | D7 | The local directory backend | `experimental` today: it copies and renames with no `fsync` of the file or its directory, and nothing tests power loss for it | `preview` after a fix and a power-loss test, or document it as a lab and air-gapped convenience |
-| D8 | The S3 Object Lock profile | `experimental` today, `preview` at 1.0. It is proven against MinIO only, and a compliance-mode retention cannot be undone | `preview` now, with the AWS result (B1, #722) as the exit criterion |
+| D8 | The S3 Object Lock profile | `experimental` today, `preview` at 1.0. It is proven against MinIO and four other S3 servers (the S3 compatibility matrix, #722) and in one AWS S3 run (v0.11.1), and a compliance-mode retention cannot be undone | `preview` now, with the AWS result (B1, #722) as the exit criterion |
 | D9 | The datagram egress transport | Remove it from the 1.0 scope and the criteria. Nothing is built; the measured TCP path was kept (#483) | Keep it as a stated non-goal under #475 |
 
 ## Evidence per component
@@ -188,10 +188,10 @@ opened 2026-11-15, #782). The criterion IDs (A1, B1 and so on) are those of
 
 ### S3 Object Lock profile
 
-- **Why:** `experimental`: proven against MinIO only, and a compliance-mode retention cannot be removed by anyone, so a wrong assumption about a provider is not recoverable.
+- **Why:** `experimental`: proven against MinIO, RustFS, SeaweedFS, Versity and CloudServer (the [S3 compatibility](s3-compatibility.md) table) and, in one run on v0.11.1, AWS S3, and a compliance-mode retention cannot be removed by anyone, so a wrong assumption about a provider is not recoverable.
 - **Tests and CI:** `crates/vtop-upload/tests/live_s3_object_lock.rs`, `multipart_object_lock.rs`, `object_lock_wire.rs`; `crates/vtop-cli/tests/live_s3_object_lock_engine.rs`, `object_lock.rs`.
 - **Open criteria:** B1 on AWS: the first AWS run (v0.11.1, 2026-11-23) wrote locked objects on every write path, multipart included, and found a locked version undeletable, but the cases that shorten or clear a governance retention cannot run there (the test role has no governance bypass); cold-tier copies are written under the lock and their retention is checked (#868).
-- **Docs:** `OBJECT_LOCK_DEPLOYMENT.md`; ROADMAP and `limitations.md` say MinIO only.
+- **Docs:** `OBJECT_LOCK_DEPLOYMENT.md`, [S3 compatibility](s3-compatibility.md).
 
 ### Audit trail
 

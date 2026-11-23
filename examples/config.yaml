@@ -7,6 +7,11 @@
 # Secrets (access keys, passwords) are NEVER placed in this file. They are read
 # from environment variables or mounted secrets. See docs/SECURITY_MODEL.md.
 
+# Optional. The layout version of this file; absent reads as 1, which is the
+# only version there is. A newer number is refused by a build that predates it.
+# `vtopctl validate --strict` also fails on any key the engine would ignore.
+config_version: 1
+
 engine:
   name: vtop-engine
   tenant: default

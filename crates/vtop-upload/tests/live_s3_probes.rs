@@ -22,6 +22,16 @@
 //!   it; it stays asked so a store's answer is on the page, and because
 //!   another tool pointed at the same store would meet it.
 //!
+//! - `probe.a_locked_put_without_an_integrity_header_is_handled_as_the_store_does`
+//!   (`object_lock`, `versioning`; informational, nothing is judged): AWS S3
+//!   refuses (400) a PUT that asks for Object Lock retention unless it carries
+//!   `Content-MD5` or an `x-amz-checksum-*` header (#684, #708). VTOP always
+//!   sends one, so no VTOP write depends on the answer. The probe sends a
+//!   locked PUT with neither, records whether the store refused it (4xx) or
+//!   took it, and passes either way; only another answer (a 5xx, a refused
+//!   connection) fails it. A store that takes it is laxer than S3, which
+//!   matters to no VTOP write: the line only says how this server differs.
+//!
 //! Run like the other live tests (`tests/s3-compat/README.md`):
 //! `VTOP_TEST_S3_ENDPOINT=http://localhost:9000 AWS_ACCESS_KEY_ID=minioadmin
 //!  AWS_SECRET_ACCESS_KEY=minioadmin cargo test -p vtop-upload
@@ -30,8 +40,10 @@
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use std::time::{SystemTime, UNIX_EPOCH};
-use vtop_s3_testkit::{Capability, LiveS3, S3Settings};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use vtop_s3_testkit::{record_observation, Capability, LiveS3, RefusalAt, S3Settings};
+use vtop_upload::s3_native::{S3NativeBackend, S3NativeConfig};
+use vtop_upload::{BucketFeature, UploadBackend};
 
 /// A client straight to the store: the probes need requests the backend
 /// never makes.
@@ -205,6 +217,141 @@ async fn live_the_sdks_default_crc32_trailer_is_accepted() {
             }
             let _ = c.delete_object().bucket(&s.bucket).key(&key).send().await;
         },
+    )
+    .await;
+}
+
+/// The refusal on a store without Object Lock or versioning (#722; Garage
+/// documents both missing): the backend's own answer for the plain bucket,
+/// which the engine refuses at startup on (#770), since such a store has no
+/// locked bucket for the probe to write to.
+async fn store_lacks_it(capability: Capability, at: RefusalAt, s: &S3Settings) {
+    assert_eq!(
+        at,
+        RefusalAt::Startup,
+        "VTOP refuses {capability} at startup"
+    );
+    let backend = S3NativeBackend::new(&S3NativeConfig {
+        region: s.region.clone(),
+        endpoint_url: s.endpoint.clone(),
+        force_path_style: s.force_path_style,
+        verify_tls: s.verify_tls,
+        transport: "tcp_tls".into(),
+        tuning: Default::default(),
+        max_egress_bytes_per_second: None,
+        request_timeout_seconds: 300,
+        request_min_bytes_per_second: 4 * 1024,
+        object_lock: None,
+        server_side_encryption: None,
+    })
+    .await
+    .unwrap();
+    match capability {
+        Capability::ObjectLock => assert_eq!(
+            backend.bucket_object_lock(&s.bucket).await.unwrap(),
+            BucketFeature::NotSupported,
+            "the store answers that it does not implement Object Lock, which the engine \
+             refuses at startup"
+        ),
+        Capability::Versioning => assert_ne!(
+            backend.bucket_versioning(&s.bucket).await.unwrap(),
+            BucketFeature::Enabled,
+            "the store does not keep versions, which the hardened profile refuses at startup"
+        ),
+        other => panic!("no refusal is asserted for {other}"),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires an S3-compatible endpoint with Object Lock"]
+async fn live_a_locked_put_without_an_integrity_header_is_handled_as_the_store_does() {
+    let live = LiveS3::from_env();
+    let s = &live.settings;
+    live.case_with_refusal(
+        "probe.a_locked_put_without_an_integrity_header_is_handled_as_the_store_does",
+        &[Capability::ObjectLock, Capability::Versioning],
+        || async {
+            // The SDK computes a checksum for every PUT by default; asking for
+            // one only when an operation requires it leaves a PUT of a small
+            // in-memory body with neither a checksum nor a Content-MD5.
+            let loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .region(aws_config::Region::new(s.region.clone()));
+            let loader = match &s.endpoint {
+                Some(endpoint) => loader.endpoint_url(endpoint),
+                None => loader,
+            };
+            let shared = loader.load().await;
+            let c = aws_sdk_s3::Client::from_conf(
+                aws_sdk_s3::config::Builder::from(&shared)
+                    .force_path_style(s.force_path_style)
+                    .request_checksum_calculation(
+                        aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+                    )
+                    .build(),
+            );
+            let key = key("locked-no-integrity");
+            let retain_until = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+                + 5;
+            let put = c
+                .put_object()
+                .bucket(&s.locked_bucket)
+                .key(&key)
+                .body(ByteStream::from_static(
+                    b"a locked write with no integrity header",
+                ))
+                .object_lock_mode(aws_sdk_s3::types::ObjectLockMode::Governance)
+                .object_lock_retain_until_date(aws_sdk_s3::primitives::DateTime::from_secs(
+                    retain_until,
+                ))
+                .send()
+                .await;
+            match put {
+                Ok(out) => {
+                    record_observation(
+                        "a locked PUT with no Content-MD5 and no checksum header was accepted",
+                    );
+                    // Governance retention of a few seconds: delete the
+                    // version once it has ended, so the bucket is left clean.
+                    tokio::time::sleep(Duration::from_secs(7)).await;
+                    let mut delete = c.delete_object().bucket(&s.locked_bucket).key(&key);
+                    if let Some(version) = out.version_id() {
+                        delete = delete.version_id(version);
+                    }
+                    if let Err(e) = delete.send().await {
+                        eprintln!("could not clean up {key}: {e:?}");
+                    }
+                }
+                Err(e) => {
+                    let status = e.raw_response().map(|r| r.status().as_u16());
+                    assert!(
+                        matches!(status, Some(400..=499)),
+                        "a locked PUT with no integrity header is either taken or refused as the \
+                         client's error (4xx; S3 answers 400); got {status:?} {:?}",
+                        e.code()
+                    );
+                    record_observation(&format!(
+                        "a locked PUT with no Content-MD5 and no checksum header was refused \
+                         ({} {})",
+                        status.unwrap_or_default(),
+                        e.code().unwrap_or("no code")
+                    ));
+                    let stored = c
+                        .head_object()
+                        .bucket(&s.locked_bucket)
+                        .key(&key)
+                        .send()
+                        .await;
+                    assert!(
+                        stored.is_err(),
+                        "the store refused the PUT, yet {key} exists afterwards"
+                    );
+                }
+            }
+        },
+        |capability, at| store_lacks_it(capability, at, s),
     )
     .await;
 }
