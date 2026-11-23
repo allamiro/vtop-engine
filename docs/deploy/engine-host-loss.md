@@ -113,7 +113,8 @@ Helm chart deploys the cluster plane, not the engine.
   another host, and the drill fences by killing the process before the
   standby starts.
 - A ledger or a store lost with the host. Back up the PostgreSQL ledger
-  ([#734](https://github.com/allamiro/vtop-engine/issues/734)); the store's
-  durability is the store's.
+  ([Backup and recovery](../operate/backup-and-recovery.md)); the store's
+  durability is the store's. What to do when they are lost anyway is in
+  [Disaster recovery](../operate/disaster-recovery.md).
 - A PostgreSQL failover is not drilled. A store outage is (the
   `sqlite-kafka-store-outage` leg), but not at the same time as a host loss.
