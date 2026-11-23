@@ -27,6 +27,9 @@ spec:
         - port: {{ .Values.ports.metaAdmin }}
         - port: {{ .Values.ports.replica }}
         - port: {{ .Values.ports.native }}
+        {{- if .Values.data.kafka.enabled }}
+        - port: {{ .Values.ports.kafka }}
+        {{- end }}
         - port: {{ .Values.ports.observability }}
     # Metrics scraping. An EMPTY networkPolicy.metricsFrom allows all sources
     # on this one port (a scraper we cannot name is the common case); narrow
@@ -50,6 +53,11 @@ spec:
         - port: {{ $.Values.ports.metaAdmin }}
         - port: {{ $.Values.ports.native }}
         - port: {{ $.Values.ports.replica }}
+        {{- if $.Values.data.kafka.enabled }}
+        # The Kafka gateway has NO identity check of its own: this rule is
+        # the only gate on who may produce and fetch.
+        - port: {{ $.Values.ports.kafka }}
+        {{- end }}
     {{- end }}
   egress:
     # Peers dial each other on the same well-known ports.
@@ -62,6 +70,9 @@ spec:
         - port: {{ .Values.ports.metaAdmin }}
         - port: {{ .Values.ports.replica }}
         - port: {{ .Values.ports.native }}
+        {{- if .Values.data.kafka.enabled }}
+        - port: {{ .Values.ports.kafka }}
+        {{- end }}
     # DNS: the peer list is FQDNs, so name resolution is a hard dependency.
     #
     # Scoped to the cluster DNS pods rather than left open. A rule with no

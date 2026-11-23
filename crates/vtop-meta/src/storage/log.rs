@@ -969,16 +969,24 @@ mod newer_format_tests {
     /// so only the payload's meaning differs - exactly what a newer writer
     /// produces, and what bit rot does not.
     fn reframed(edit: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
-        let entry = MetaLogEntry {
-            term: 1,
-            index: 1,
-            payload: MetaLogPayload::Normal(MetadataCommand::SetFeatureLevel {
+        reframed_with(
+            &MetadataCommand::SetFeatureLevel {
                 env: CommandEnvelope {
                     request_id: Uuid::from_u128(1),
                     issued_at_ms: 0,
                 },
                 feature_level: 4,
-            }),
+            },
+            edit,
+        )
+    }
+
+    /// [`reframed`] for any command.
+    fn reframed_with(command: &MetadataCommand, edit: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+        let entry = MetaLogEntry {
+            term: 1,
+            index: 1,
+            payload: MetaLogPayload::Normal(command.clone()),
         };
         let frame = entry.encode_frame().unwrap();
         let payload_at = FRAME_PREFIX_BYTES + FRAME_FIXED_BODY_BYTES - CHECKSUM_LEN;
@@ -1018,6 +1026,46 @@ mod newer_format_tests {
             matches!(parse_frame(&garbage, 0), FrameParse::Corrupt(_)),
             "a truncated payload is damage, not a newer release"
         );
+    }
+
+    /// #706: a wrapper whose actor, peer or subject tag this build does not
+    /// know was written by a later level, and the log reports it as a newer
+    /// release, not as corruption - as it does an unknown kind. (The previous
+    /// release reaches the same report earlier, at kind 40 itself: see
+    /// `an_older_voter_reads_the_attributed_kind_as_a_newer_format`.)
+    #[test]
+    fn an_attributed_entry_with_a_newer_tag_is_a_newer_release_not_corruption() {
+        use crate::command::{Attribution, CommandActor};
+        let command = MetadataCommand::Attributed {
+            attribution: Attribution {
+                actor: CommandActor::Anonymous,
+                peer: None,
+                vouched_by: 1,
+                recorded_at_ms: 2,
+            },
+            subject: Box::new(MetadataCommand::SetFeatureLevel {
+                env: crate::command::CommandEnvelope {
+                    request_id: Uuid::from_u128(1),
+                    issued_at_ms: 3,
+                },
+                feature_level: 4,
+            }),
+        };
+        // The unchanged entry is a complete frame.
+        assert!(matches!(
+            parse_frame(&reframed_with(&command, |_| {}), 0),
+            FrameParse::Complete { .. }
+        ));
+        // kind 2, actor 1, peer 1, vouched 8, at 8: then the subject tag.
+        for (at, what) in [(2, "actor"), (3, "peer"), (2 + 1 + 1 + 8 + 8, "subject")] {
+            let newer = reframed_with(&command, |bytes| bytes[at] = 0x7f);
+            match parse_frame(&newer, 0) {
+                FrameParse::Newer(reason) => {
+                    assert!(reason.contains("attribution"), "{what}: {reason}")
+                }
+                other => panic!("{what}: expected Newer, got {}", describe(&other)),
+            }
+        }
     }
 
     /// A membership with a joint-config marker this build does not know
