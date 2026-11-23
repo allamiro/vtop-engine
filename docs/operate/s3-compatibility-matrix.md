@@ -80,8 +80,8 @@ by hand:
 `.github/workflows/s3-aws.yml` runs the same live tests against AWS S3
 itself, never on a pull request. The release gate takes one run per release
 (row B1, the maintainer's decision of 2026-11-23), dispatched by hand
-(`workflow_dispatch`) on the release's commit; the schedule in the file runs
-it nightly only while the workflow is enabled. AWS is never a required check:
+(`workflow_dispatch`) on the release's commit; the workflow has no schedule,
+so nothing runs against AWS between releases. AWS is never a required check:
 `tests/s3-compat/servers/aws.yaml` stays `gating: false`.
 It uses virtual-host addressing and no endpoint override, runs every test
 twice (`AWS_REQUEST_CHECKSUM_CALCULATION=when_supported`, then
