@@ -327,6 +327,9 @@ fn restarted_leader_behind_both_followers(
 /// first follower's listener is bound, so the leader's dials queue at it,
 /// but its server serves nobody until the returned sender fires: the
 /// leader's first write is acknowledged by the other follower alone.
+// The last element is the plane's guard, an `impl Sized`, so the tuple cannot
+// become a type alias.
+#[allow(clippy::type_complexity)]
 fn stage_restart(
     tls: bool,
     v2: bool,
