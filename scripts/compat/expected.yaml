@@ -81,7 +81,9 @@ cells:
   #            back after a SIGKILL. A release below the raised level opens
   #            it and reports a lower level (it applies the raise as a
   #            rejection): silent, not refused, which the compatibility page
-  #            records. v0.7.0 has no `node-versions` to read the level with.
+  #            records, unless the raised log holds a kind it cannot decode
+  #            (the exception below). v0.7.0 has no `node-versions` to read
+  #            the level with.
   meta:
     since: v0.8.0
     directions: [upgrade, forward]
@@ -129,3 +131,21 @@ exceptions:
     why: >-
       audit-coverage reads the ledger beside the digest, and a release before
       v0.8.0 fails closed on its superseded rows.
+  # From feature level 9 (#706) the leader commits an operator command
+  # wrapped in its actor, command kind 40, which no published release
+  # decodes; level 9 is the first raise that changes the encoding of the
+  # commands meta-scenario.sh issues itself. The directory this build writes
+  # raised to its highest level therefore holds kind-40 entries (every
+  # re-registration after the raise), and a release before v0.11.0 (level 8
+  # at most) refuses it at open as a newer format and changes nothing. The
+  # baseline directory, written below level 9, still opens: meta.sh takes
+  # `refuse` for the raised directory only.
+  - cell: meta
+    direction: forward
+    older_than: v0.11.0
+    expect: refuse
+    message: was written by a newer release
+    why: >-
+      From feature level 9 every operator command is committed as command
+      kind 40, which a release before v0.11.0 does not decode, so it refuses
+      the raised directory as written by a newer release and changes nothing.
