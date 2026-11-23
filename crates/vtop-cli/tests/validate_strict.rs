@@ -90,7 +90,7 @@ fn strict_passes_a_clean_config_and_leaves_the_output_alone() {
     assert_eq!(strict.stdout, lenient.stdout);
     assert_eq!(
         validate(&config, true, true).stdout,
-        b"{\"status\":\"ok\",\"warnings\":[]}\n"
+        b"{\"report_version\":1,\"status\":\"ok\",\"warnings\":[]}\n"
     );
 }
 
