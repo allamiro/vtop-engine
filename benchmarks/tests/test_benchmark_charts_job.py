@@ -60,23 +60,11 @@ def chart_job_test_files():
     return files
 
 
-# The chart tests the six harness branches wire into ci.yml themselves. The temporary AWS overlay branch
-# (bench/v0111-aws-harness) keeps every path outside benchmarks/ and docs/ at the release, so on it they are
-# not wired; any other unwired file still fails.
-OVERLAY_UNWIRED = {"tests/test_kafka_compare_crash_report.py", "tests/test_aws_ingest.py",
-                   "tests/test_kafka_compare_extra_report.py", "tests/test_kafka_compare_extra_charts.py",
-                   "tests/test_compare_summary_charts.py"}
-OVERLAY_REASON = ("the release tree under this temporary AWS overlay has no CI or docs-nav wiring for it; "
-                  "that lands with the harness PRs")
-
-
 def test_every_test_file_that_needs_the_plotting_stack_runs_in_the_chart_job():
     needing = {os.path.relpath(path, BENCH) for path in sorted(glob.glob(os.path.join(HERE, "test_*.py")))
                if needs_plotting_stack(path)}
     assert needing, "no test file needs matplotlib or Pillow: this check has nothing to check"
     missing = sorted(needing - chart_job_test_files())
-    if missing and set(missing) <= OVERLAY_UNWIRED:
-        pytest.skip(f"{missing}: {OVERLAY_REASON}")
     assert not missing, (
         f"these test files need matplotlib or Pillow, which only the benchmark-charts job installs, "
         f"but that job does not run them, so their tests skip everywhere: {missing}")

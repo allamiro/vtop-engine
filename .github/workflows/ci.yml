@@ -277,6 +277,8 @@ jobs:
               - 'benchmarks/tests/test_site_facts.py'
               - 'benchmarks/tests/conftest.py'
               - 'benchmarks/tests/test_kafka_compare_*.py'
+              - 'benchmarks/tests/test_aws_*.py'
+              - 'benchmarks/tests/fixtures/crash-smoke/**'
               - 'benchmarks/tests/test_benchmark_charts_job.py'
               # The hand-written page that links the generated reports.
               - 'docs/COMPARISON.md'
@@ -394,6 +396,10 @@ jobs:
               # them, and the bootstrap runs inside each server's init.
               - 'scripts/s3-lab.sh'
               - 'docker/s3-servers/**'
+              # The host-level half of the whole-replica-set crash benchmark
+              # (#599): it runs as root against a device-mapper device, so a
+              # slip in it is not a test failure but a damaged filesystem.
+              - 'benchmarks/kafka_compare/crash/*.sh'
               - '.github/workflows/**'
 
             # `scripts/live-chaos/run-all.sh`. The harness drives real
@@ -1516,7 +1522,8 @@ jobs:
             scripts/check-failpoints-absent.sh scripts/kafka-broker.sh \
             scripts/gen-kafka-fixtures.sh scripts/kafka-cluster.sh \
             scripts/update-surface-snapshots.sh \
-            scripts/s3-lab.sh docker/s3-servers/init/bootstrap.sh
+            scripts/s3-lab.sh docker/s3-servers/init/bootstrap.sh \
+            benchmarks/kafka_compare/crash/*.sh
 
       # `-P scripts/live-chaos/scenarios` resolves the scenarios' dynamic
       # `source "$(dirname …)/../lib.sh"`. Without it every scenario reports
@@ -2572,9 +2579,20 @@ jobs:
         # without this line the pipe into tee would hide a failing test.
         run: |
           set -o pipefail
-          python -m pytest -rs tests/test_kafka_compare_report.py tests/test_kafka_compare_regenerate.py tests/test_kafka_compare_failover.py tests/test_kafka_compare_footer.py tests/test_kafka_compare_colours.py tests/test_readme_charts.py tests/test_benchmark_charts_job.py tests/test_compare_reports.py tests/test_readme_cards.py tests/test_site_facts.py | tee "$RUNNER_TEMP/chart-tests.log"
+          python -m pytest -rs tests/test_kafka_compare_report.py tests/test_kafka_compare_regenerate.py tests/test_kafka_compare_failover.py tests/test_kafka_compare_footer.py tests/test_kafka_compare_colours.py tests/test_readme_charts.py tests/test_benchmark_charts_job.py tests/test_compare_reports.py tests/test_kafka_compare_crash_report.py tests/test_aws_ingest.py tests/test_kafka_compare_extra_report.py tests/test_kafka_compare_extra_charts.py tests/test_readme_cards.py tests/test_site_facts.py | tee "$RUNNER_TEMP/chart-tests.log"
           if grep -E "SKIPPED.*(matplotlib|PIL)" "$RUNNER_TEMP/chart-tests.log"; then
             echo "::error::A chart test skipped for want of matplotlib or Pillow, in the one job that installs them."
+            exit 1
+          fi
+      # The cross-product summary's charts (#744), on a line of its own so a
+      # test file added to the line above does not collide with it.
+      - name: Cross-product summary tests, with matplotlib
+        working-directory: benchmarks
+        run: |
+          set -o pipefail
+          python -m pytest -rs tests/test_compare_summary_charts.py | tee "$RUNNER_TEMP/summary-tests.log"
+          if grep -E "SKIPPED.*(matplotlib|PIL)" "$RUNNER_TEMP/summary-tests.log"; then
+            echo "::error::A summary chart test skipped for want of matplotlib or Pillow, in the one job that installs them."
             exit 1
           fi
       - name: Regenerate every chart and report and fail on drift
