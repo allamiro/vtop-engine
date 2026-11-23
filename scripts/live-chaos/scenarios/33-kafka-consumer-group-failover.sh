@@ -168,6 +168,22 @@ run_client() {
   echo "$producer" >> "$WORKDIR/pids"
   acked_count() { grep -c 'Message delivered' "$acks" || true; }
 
+  # Where the group's committed offset stands each second, beside how many
+  # records the consumer has delivered: the gap between the two is what a
+  # failover delivers again, so its course is reported, not only its end.
+  local samples="$WORKDIR/cursor-samples.txt" sampler
+  : > "$samples"
+  (
+    while :; do
+      printf '%s %s %s\n' "$(wall_ms)" \
+        "$(group_cursor_offset "$group" "$META_LEADER_ID" || echo '?')" \
+        "$(grep -c . "$consumed" || true)" >> "$samples"
+      sleep 1
+    done
+  ) &
+  sampler=$!
+  echo "$sampler" >> "$WORKDIR/pids"
+
   local deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS + 30))
   until [[ "$(delivered_count)" -ge "$KILL_AFTER_CONSUMED" ]]; do
     consumer_alive
@@ -185,6 +201,9 @@ run_client() {
       || fail "the metadata plane holds no committed offset for group $group after $(delivered_count) deliveries (last read: ${committed_before:-none})"
     [[ -n "$committed_before" && "$committed_before" -ge 0 ]] || sleep 0.2
   done
+  kill9_pid "$sampler"
+  wait "$sampler" 2>/dev/null || true
+  log "the committed offset each second before the kill (wall ms, committed, delivered): $(tr '\n' ';' < "$samples")"
   local kill_ms delivered_at_kill
   kill_ms="$(wall_ms)"
   kill9_pid "${CAND_PIDS[$WINNER]}"
@@ -255,6 +274,17 @@ run_client() {
   kill -0 "$consumer" 2>/dev/null && kill9_pid "$consumer"
   wait "$consumer" 2>/dev/null || consumer_exit=$?
   sleep 0.5
+  # What the consumer and the gateways said about commits and the group, for
+  # the reader of a failure below (and of a pass).
+  log "the consumer's group lines: $(grep -iE 'rebalanc|assign|revok|error|fail' "$clog" | grep -viE 'commit' \
+    | head -12 | cut -c1-240 | tr '\n' '|')"
+  log "the consumer's commit lines ($(grep -ciE 'commit' "$clog" || true) in all): $(grep -iE 'commit' "$clog" \
+    | head -8 | cut -c1-300 | tr '\n' '|')"
+  local n
+  for n in 1 2 3; do
+    log "candidate $n's group and commit lines: $(grep -E 'kafka offsets|kafka (OffsetCommit|JoinGroup|SyncGroup|Heartbeat)|NOT_COORDINATOR|coordinator' \
+      "$(candidate_log "$n")" | head -8 | cut -c1-300 | tr '\n' '|')"
+  done
 
   # --- what it delivered ---------------------------------------------------------
   local verdict
@@ -349,7 +379,7 @@ else:
     || fail "a fresh member of group $group read $(grep -c . "$fresh") record(s) past the committed end: $(head -2 "$fresh" | tr '\n' ' ')"
   log "a fresh member of group $group starts at the committed end and reads nothing"
 
-  local n pid
+  local pid
   for n in 1 2 3; do
     kill9_pid "${CAND_PIDS[$n]}"
   done

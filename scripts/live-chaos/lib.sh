@@ -1869,7 +1869,7 @@ kafka_distribution() { # <copy-dir> <tool...>
 # id, each bounded (the admin transport has no deadline of its own), the first
 # that answers taken; non-zero when none did, so the caller polls.
 group_cursor_offset() { # <group> <meta-id[,meta-id...]>
-  local group="$1" ids="$2" id out="$WORKDIR/group-cursor-$1.json"
+  local group="$1" ids="$2" id out="$WORKDIR/group-cursor-$1.$BASHPID.json"
   local -a readers
   IFS=',' read -ra readers <<< "$ids"
   for id in "${readers[@]}"; do

@@ -26,8 +26,10 @@
 #      reads it the moment it wakes, before or after its lease agent notices
 #      the lease is gone (that race is the point);
 #   3. the producer resumes through the new leader with no restart: librdkafka
-#      gives up on the stalled leader after its request timeout (30 s by
-#      default), refreshes metadata from a survivor and carries on;
+#      gives up on the stalled leader only when its own timeouts on the open
+#      socket run out, refreshes metadata from a survivor and carries on
+#      (60 to 71 s after the pause in the first CI runs, under the 6 s and the
+#      15 s lease alike: the client's wait, not the lease, sets this number);
 #   4. the old leader is SIGCONTed.
 # What it asserts:
 #   safety   the queued Produce is NOT acknowledged (any refusal, a closed
@@ -46,9 +48,11 @@
 #   liveness the producer finishes every record with no failed delivery and no
 #            fatal idempotence error, and the time from the pause to its
 #            acknowledgements resuming is printed and bounded by
-#            CHAOS_KAFKA_PAUSE_LIMIT_SECONDS (90: the client's 30 s request
-#            timeout, which a paused leader's open socket makes it wait out,
-#            plus the lease and the stream's own pace);
+#            CHAOS_KAFKA_PAUSE_LIMIT_SECONDS (120: first set to 90 from
+#            librdkafka's 30 s request timeout, then widened because the runs
+#            measured 60 to 71 s, the client waiting out a socket that stays
+#            open; the margin is for a slower host, and the number is
+#            reported either way);
 #   control  the same raw Produce sent to the NEW leader is acknowledged, so a
 #            refusal above is the old leader's answer and not a malformed
 #            request.
@@ -70,7 +74,7 @@ PAUSE_AFTER_ACKS="${CHAOS_KAFKA_PAUSE_AFTER_ACKS:-800}"
 RESUME_ACKS="${CHAOS_KAFKA_RESUME_ACKS:-200}"
 PACE_EVERY="${CHAOS_KAFKA_PACE_EVERY:-10}"
 PACE_SLEEP="${CHAOS_KAFKA_PACE_SLEEP:-0.1}"
-PAUSE_LIMIT_SECONDS="${CHAOS_KAFKA_PAUSE_LIMIT_SECONDS:-90}"
+PAUSE_LIMIT_SECONDS="${CHAOS_KAFKA_PAUSE_LIMIT_SECONDS:-120}"
 require_integer_in_range CHAOS_KAFKA_RECORDS "$RECORDS" 1000 10000000
 RECORDS=$((10#$RECORDS))
 require_integer_in_range CHAOS_KAFKA_PAUSE_AFTER_ACKS "$PAUSE_AFTER_ACKS" 1 "$((RECORDS / 2))"

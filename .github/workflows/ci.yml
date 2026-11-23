@@ -1865,7 +1865,7 @@ jobs:
       # Scenarios 30 and 31 are 27 and 28 again on three co-located
       # `vtop-node node` processes (each a metadata voter and a candidate), and
       # 32 pauses the leader past its lease, which a stock client waits out
-      # for its 30 s request timeout; 33 runs a librdkafka and, with the
+      # on its open socket (60 to 71 s measured); 33 runs a librdkafka and, with the
       # image, a JVM consumer group through a kill (#751). Without the
       # variable 28 and 31 SKIP (exit 77) and 33 runs librdkafka only. The
       # same scenarios with release binaries and the chart's 15 s lease are
@@ -1885,8 +1885,11 @@ jobs:
       # never reached a scenario, so no logs exist and `error` would stack a
       # spurious "no files found" on top of the real cause. The empty-artifact
       # signal only means something once the run itself has been attempted.
+      # `failure() &&` is still needed in front: an `if:` without a status
+      # function is ANDed with `success()`, so the outcome test alone made
+      # this step skip on exactly the runs it exists for (#751).
       - name: Upload scenario logs
-        if: steps.chaos.outcome == 'failure'
+        if: failure() && steps.chaos.outcome == 'failure'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: live-chaos-logs
