@@ -99,6 +99,18 @@ impl<'a> Reader<'a> {
         self.bytes.len() - self.offset
     }
 
+    /// The next `u16` without consuming it, so a decoder can refuse a shape
+    /// before recursing into it.
+    pub(crate) fn peek_u16(&self, what: &'static str) -> Result<u16, CodecError> {
+        if self.remaining() < 2 {
+            return Err(CodecError::Truncated(what));
+        }
+        Ok(u16::from_be_bytes([
+            self.bytes[self.offset],
+            self.bytes[self.offset + 1],
+        ]))
+    }
+
     pub(crate) fn take(
         &mut self,
         count: usize,
