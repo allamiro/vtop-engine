@@ -6184,6 +6184,151 @@ mod tests {
         );
     }
 
+    /// A consumer that rides through a failover (#751) arrives at a
+    /// coordinator whose memory was reset: the groups are forgotten, the
+    /// committed offsets are not. Its next Heartbeat, SyncGroup and
+    /// OffsetCommit under the generation it held are refused by name and at
+    /// once, never parked: `UNKNOWN_MEMBER_ID` or `ILLEGAL_GENERATION`, the
+    /// codes on which a stock consumer rejoins. The refused commit moves
+    /// nothing, and OffsetFetch still answers the offset committed before the
+    /// reset, which is where the rejoined member resumes. Generations restart
+    /// with the coordinator's memory, so the new round is generation 1 again:
+    /// the old member is refused for its id, not only for its number.
+    #[tokio::test]
+    async fn a_member_from_before_a_reset_is_refused_by_name_and_its_commit_survives() {
+        let unknown_member = ErrorCode::UnknownMemberId.as_i16();
+        let illegal_generation = ErrorCode::IllegalGeneration.as_i16();
+        let store = Arc::new(crate::offsets::MemoryOffsetStore::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_stop, stopped) = tokio::sync::watch::channel(false);
+        let gateway = Gateway::new(
+            Arc::new(MemoryBridge::with_topics(["events"])),
+            GatewayConfig {
+                advertised_port: addr.port() as i32,
+                groups: GroupConfig {
+                    initial_rebalance_delay: Duration::from_millis(50),
+                    ..GroupConfig::default()
+                },
+                ..GatewayConfig::default()
+            },
+        )
+        .with_offsets(Arc::clone(&store) as Arc<dyn OffsetStore>);
+        let handle = gateway.handle();
+        tokio::spawn(gateway.serve(listener, stopped));
+        // Every answer below is a refusal or a read; none may wait.
+        let answer = move |key: i16, version: i16, correlation: i32, body: Vec<u8>| async move {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                call(addr, key, version, correlation, &body),
+            )
+            .await
+            .expect("answered at once, not parked")
+            .expect("answered, not closed")
+        };
+
+        let reply = answer(
+            0,
+            3,
+            1,
+            produce_body("events", 0, -1, None, &batch_bytes(&["a", "b", "c"], false)),
+        )
+        .await;
+        assert_eq!(read_produce(&reply, 3), (0, 0, None));
+        let protocols: &[(&str, &[u8])] = &[("range", b"sub-events")];
+        let joined = read_join(&answer(11, 2, 2, join_body(2, "g", "", protocols)).await, 2);
+        assert_eq!((joined.error, joined.generation), (0, 1));
+        let old = joined.member_id;
+        let assignment = consumer_assignment("events", &[0]);
+        let reply = answer(
+            14,
+            1,
+            3,
+            sync_body(1, "g", 1, &old, &[(old.as_str(), assignment.as_slice())]),
+        )
+        .await;
+        assert_eq!(read_sync(&reply, 1).0, 0);
+        let reply = answer(
+            8,
+            7,
+            4,
+            offset_commit_body(7, "g", 1, &old, "events", 0, 2, None),
+        )
+        .await;
+        assert_eq!(read_offset_commit(&reply, 7), vec![(0, 0)]);
+
+        // The failover: this node's leadership ended, or a new one began.
+        handle.reset_groups();
+
+        let reply = answer(12, 1, 5, heartbeat_body(1, "g", 1, &old)).await;
+        assert_eq!(read_error_only(&reply, 1), unknown_member, "heartbeat");
+        let reply = answer(14, 1, 6, sync_body(1, "g", 1, &old, &[])).await;
+        assert_eq!(read_sync(&reply, 1).0, unknown_member, "sync");
+        let reply = answer(
+            8,
+            7,
+            7,
+            offset_commit_body(7, "g", 1, &old, "events", 0, 3, None),
+        )
+        .await;
+        assert_eq!(
+            read_offset_commit(&reply, 7),
+            vec![(0, illegal_generation)],
+            "no group here has the generation the commit names"
+        );
+        let fetch = offset_fetch_body(3, "g", Some(&[("events", &[0][..])]));
+        let reply = answer(9, 3, 8, fetch.clone()).await;
+        assert_eq!(
+            read_offset_fetch(&reply, 3),
+            (0, vec![("events".to_owned(), vec![(0, 2, None, 0)])]),
+            "the offset committed before the reset, not moved by the refused commit"
+        );
+
+        // The member rejoins as a new one, at generation 1 again.
+        let rejoined = read_join(&answer(11, 2, 9, join_body(2, "g", "", protocols)).await, 2);
+        assert_eq!((rejoined.error, rejoined.generation), (0, 1));
+        assert_ne!(rejoined.member_id, old, "a fresh id, not the old one");
+        let reply = answer(
+            14,
+            1,
+            10,
+            sync_body(
+                1,
+                "g",
+                1,
+                &rejoined.member_id,
+                &[(rejoined.member_id.as_str(), assignment.as_slice())],
+            ),
+        )
+        .await;
+        assert_eq!(read_sync(&reply, 1).0, 0);
+        // Same generation number, old id: still refused.
+        let reply = answer(12, 1, 11, heartbeat_body(1, "g", 1, &old)).await;
+        assert_eq!(read_error_only(&reply, 1), unknown_member);
+        let reply = answer(
+            8,
+            7,
+            12,
+            offset_commit_body(7, "g", 1, &old, "events", 0, 3, None),
+        )
+        .await;
+        assert_eq!(read_offset_commit(&reply, 7), vec![(0, unknown_member)]);
+        let reply = answer(9, 3, 13, fetch).await;
+        assert_eq!(
+            read_offset_fetch(&reply, 3),
+            (0, vec![("events".to_owned(), vec![(0, 2, None, 0)])])
+        );
+        // The rejoined member commits and moves it.
+        let reply = answer(
+            8,
+            7,
+            14,
+            offset_commit_body(7, "g", 1, &rejoined.member_id, "events", 0, 3, None),
+        )
+        .await;
+        assert_eq!(read_offset_commit(&reply, 7), vec![(0, 0)]);
+    }
+
     /// The default minimum session clears every wait a heartbeat can queue
     /// behind on one connection (review): the fetch ceiling and the offset
     /// ceiling, so the heartbeat is read before the session it keeps alive
