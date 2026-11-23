@@ -217,6 +217,25 @@ impl Coordinator {
     /// never by a rebalance timeout.
     pub fn shutdown(&self) {
         self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.forget_every_group();
+    }
+
+    /// A leadership began or ended under a listener that keeps serving
+    /// (#751): every group is forgotten and every parked join and sync is
+    /// released, as at shutdown, but joins are still admitted afterwards.
+    ///
+    /// Group state is this coordinator's memory of one leadership. A node
+    /// that is demoted must not hold members in a round they will never
+    /// finish here (they hear `REBALANCE_IN_PROGRESS` now and find the new
+    /// coordinator), and a node that is promoted again must not judge a
+    /// member against a generation from a leadership that has since moved
+    /// to another node and back. Committed offsets are not here: they live
+    /// in the offset store, which outlives a failover.
+    pub fn reset(&self) {
+        self.forget_every_group();
+    }
+
+    fn forget_every_group(&self) {
         let mut groups = self.lock();
         for group in groups.values_mut() {
             for member in group.members.values_mut() {
@@ -1760,6 +1779,50 @@ mod tests {
             coordinator.join(request("g", "", "b")).await,
             Err(ErrorCode::CoordinatorNotAvailable)
         );
+    }
+
+    /// A reset (#751) releases a parked join as a shutdown does, forgets the
+    /// group, and keeps admitting: a node promoted again coordinates from an
+    /// empty memory, not from the generation it held before the range left.
+    #[tokio::test]
+    async fn a_reset_releases_a_parked_join_forgets_the_group_and_keeps_admitting() {
+        let coordinator = Arc::new(Coordinator::new(GroupConfig {
+            initial_rebalance_delay: Duration::from_secs(60),
+            ..config()
+        }));
+        let parked = {
+            let coordinator = Arc::clone(&coordinator);
+            tokio::spawn(async move { coordinator.join(request("g", "", "a")).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(coordinator.protocol_type("g").is_some());
+        let started = Instant::now();
+        coordinator.reset();
+        assert_eq!(
+            parked.await.unwrap(),
+            Err(ErrorCode::RebalanceInProgress),
+            "released, not held for the round's window"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            coordinator.protocol_type("g"),
+            None,
+            "the group is forgotten"
+        );
+        assert!(coordinator.member_ids("g").is_empty());
+        // Still admitting: the next join opens a round instead of being
+        // refused, as it would be after a shutdown.
+        let again = {
+            let coordinator = Arc::clone(&coordinator);
+            tokio::spawn(async move { coordinator.join(request("g", "", "b")).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            coordinator.protocol_type("g").is_some(),
+            "a new round opened"
+        );
+        coordinator.shutdown();
+        let _ = again.await;
     }
 
     /// A member's session starts again when its round completes (review):

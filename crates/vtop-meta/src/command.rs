@@ -113,6 +113,7 @@ const COMMAND_KIND_SET_FEATURE_LEVEL: u16 = 36;
 const COMMAND_KIND_SET_RANGE_REPLICA_SET: u16 = 37;
 const COMMAND_KIND_REPORT_NODE_VERSION: u16 = 38;
 const COMMAND_KIND_ATTEST_UNPROVEN_PROMOTION: u16 = 39;
+pub(crate) const COMMAND_KIND_ATTRIBUTED: u16 = 40;
 
 /// The metadata feature level of a cluster that has never recorded one: the
 /// command set of v0.6.0, the last release before levels existed (#554).
@@ -134,7 +135,7 @@ pub const BASELINE_FEATURE_LEVEL: u32 = 3;
 /// behaviour on the recorded level, so every replica applies the same
 /// thing). `every_kind_newer_than_the_baseline_release_is_gated` catches a
 /// kind that forgets; the other two are on the author.
-pub const SUPPORTED_FEATURE_LEVEL: u32 = 8;
+pub const SUPPORTED_FEATURE_LEVEL: u32 = 9;
 
 /// The level at which a promotion report may carry a lineage verdict on each
 /// quorum answer (#577). Gated by PAYLOAD rather than by kind: the command is
@@ -169,8 +170,70 @@ pub const MAX_RELEASE_BYTES: usize = 64;
 /// as a new kind is.
 pub const PROMOTE_UNPROVEN_FEATURE_LEVEL: u32 = 8;
 
+/// The level at which the leader may wrap an operator's command in its actor
+/// (#706): [`MetadataCommand::Attributed`], command kind 40. A kind an older
+/// voter cannot decode, so it is held back below this level exactly as every
+/// other new kind is, and the raise to it waits for every metadata voter to
+/// say it implements it (#758).
+///
+/// Invariant: no kind-40 entry exists in a log before the
+/// [`MetadataCommand::SetFeatureLevel`] entry that raises the cluster to this
+/// level, and that entry is itself bare. A cluster below it writes exactly
+/// the bytes it always wrote.
+pub const ATTRIBUTED_COMMANDS_FEATURE_LEVEL: u32 = 9;
+
 /// Bound on the operator name an attestation records (#636).
 pub const MAX_ATTESTATION_OPERATOR_BYTES: usize = 128;
+
+/// Bound on the certificate common name an attributed command records
+/// (#706). X.509 limits a common name to 64 characters; the bound is twice
+/// that, so a name the CA accepted is never refused for its length alone.
+pub const MAX_ACTOR_NAME_BYTES: usize = 128;
+
+const ACTOR_NAMED: u8 = 1;
+const ACTOR_NODE: u8 = 2;
+const ACTOR_META_NODE: u8 = 3;
+const ACTOR_ANONYMOUS: u8 = 4;
+
+const PEER_NONE: u8 = 0;
+const PEER_V4: u8 = 4;
+const PEER_V6: u8 = 6;
+
+/// What the attribution wraps: a command. The tag is a byte so a later level
+/// can add a subject (a membership change has no command to wrap) without a
+/// new kind; a tag this build does not know reads as a newer format.
+pub(crate) const SUBJECT_COMMAND: u8 = 1;
+
+/// Who asked the cluster to do something, as the serving leader verified it
+/// (#706). Never what the client declared: the only text is the certificate's
+/// common name, which the CA controls.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommandActor {
+    /// A certificate whose common name is neither a data node's nor a
+    /// metadata node's: an operator. 1..=[`MAX_ACTOR_NAME_BYTES`] bytes.
+    Named(String),
+    /// A data node, by the node uuid its certificate names.
+    Node(Uuid),
+    /// A metadata node, by its Raft id.
+    MetaNode(u64),
+    /// A plaintext endpoint: no certificate, so no identity.
+    Anonymous,
+}
+
+/// The attribution of one command (#706): the verified actor, what the
+/// vouching leader itself observed, and when. Audit data only: `apply` never
+/// reads the time or the address, so no replica's state depends on them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attribution {
+    pub actor: CommandActor,
+    /// The peer address of the actor's connection, as the leader saw it. No
+    /// port and no hostname: an address is observed, a name is claimed.
+    pub peer: Option<std::net::IpAddr>,
+    /// The metadata node that checked the certificate: the leader.
+    pub vouched_by: u64,
+    /// The leader's clock when it wrapped the command.
+    pub recorded_at_ms: i64,
+}
 
 /// Why a fenced cursor commit is refused (#457 slice 2b): the commit did not
 /// come from the range's current leaseholder at its current fencing epoch. A
@@ -294,12 +357,110 @@ impl MetadataCommand {
                 lease_duration_ms,
                 ..
             } => (env, *lease_duration_ms),
+            MetadataCommand::Attributed { subject, .. } => {
+                return subject.lease_clock_skew(leader_now_ms)
+            }
             _ => return None,
         };
         Some(LeaseClockSkew {
             request_id: env.request_id,
             skew_ms: env.issued_at_ms.saturating_sub(leader_now_ms),
             bound_ms: lease_skew_bound_ms(lease_duration_ms),
+        })
+    }
+}
+
+impl Attribution {
+    /// `actor | peer | vouched_by | recorded_at_ms`, the part of kind 40
+    /// before its subject.
+    pub(crate) fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), CodecError> {
+        match &self.actor {
+            CommandActor::Named(name) => {
+                if name.is_empty() {
+                    return Err(CodecError::InvalidValue {
+                        what: "attribution actor",
+                        reason: "a certificate name must not be empty",
+                    });
+                }
+                put_u8(out, ACTOR_NAMED);
+                put_bounded_str(out, name, MAX_ACTOR_NAME_BYTES, "attribution actor")?;
+            }
+            CommandActor::Node(node_uuid) => {
+                put_u8(out, ACTOR_NODE);
+                put_uuid(out, *node_uuid);
+            }
+            CommandActor::MetaNode(id) => {
+                put_u8(out, ACTOR_META_NODE);
+                put_u64(out, *id);
+            }
+            CommandActor::Anonymous => put_u8(out, ACTOR_ANONYMOUS),
+        }
+        match self.peer {
+            None => put_u8(out, PEER_NONE),
+            Some(std::net::IpAddr::V4(address)) => {
+                put_u8(out, PEER_V4);
+                out.extend_from_slice(&address.octets());
+            }
+            Some(std::net::IpAddr::V6(address)) => {
+                put_u8(out, PEER_V6);
+                out.extend_from_slice(&address.octets());
+            }
+        }
+        put_u64(out, self.vouched_by);
+        put_i64(out, self.recorded_at_ms);
+        Ok(())
+    }
+
+    pub(crate) fn decode_from(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
+        let actor = match reader.u8("attribution actor")? {
+            ACTOR_NAMED => {
+                let name = reader.bounded_str(MAX_ACTOR_NAME_BYTES, "attribution actor")?;
+                if name.is_empty() {
+                    return Err(CodecError::InvalidValue {
+                        what: "attribution actor",
+                        reason: "a certificate name must not be empty",
+                    });
+                }
+                CommandActor::Named(name)
+            }
+            ACTOR_NODE => CommandActor::Node(reader.uuid("attribution node uuid")?),
+            ACTOR_META_NODE => CommandActor::MetaNode(reader.u64("attribution meta node id")?),
+            ACTOR_ANONYMOUS => CommandActor::Anonymous,
+            other => {
+                return Err(CodecError::UnknownTag {
+                    what: "attribution actor",
+                    tag: u32::from(other),
+                });
+            }
+        };
+        let peer = match reader.u8("attribution peer")? {
+            PEER_NONE => None,
+            PEER_V4 => {
+                let octets: [u8; 4] = reader
+                    .take(4, "attribution peer")?
+                    .try_into()
+                    .expect("fixed slice");
+                Some(std::net::IpAddr::from(octets))
+            }
+            PEER_V6 => {
+                let octets: [u8; 16] = reader
+                    .take(16, "attribution peer")?
+                    .try_into()
+                    .expect("fixed slice");
+                Some(std::net::IpAddr::from(octets))
+            }
+            other => {
+                return Err(CodecError::UnknownTag {
+                    what: "attribution peer",
+                    tag: u32::from(other),
+                });
+            }
+        };
+        Ok(Attribution {
+            actor,
+            peer,
+            vouched_by: reader.u64("attribution vouching node")?,
+            recorded_at_ms: reader.i64("attribution recorded-at millis")?,
         })
     }
 }
@@ -1420,6 +1581,23 @@ pub enum MetadataCommand {
         max_replica_protocol: u16,
         supported_feature_level: u32,
     },
+    /// A command together with the actor it is attributed to (#706): the
+    /// serving leader builds it, from the verified certificate of the
+    /// connection that asked, and replicates both as ONE log entry, so the
+    /// actor and its command commit together or not at all.
+    ///
+    /// Never sent by a client (the admin endpoint refuses it before
+    /// authorization) and never built below
+    /// [`ATTRIBUTED_COMMANDS_FEATURE_LEVEL`]. Depth one: the subject is never
+    /// itself attributed. Its request id, level-independent semantics and
+    /// response are the subject's, so dedup, the clock-skew check and every
+    /// client are unchanged; applying it applies the subject exactly as bare
+    /// and then records who asked (see
+    /// [`crate::state::MetaStateMachine::audit_tail`]).
+    Attributed {
+        attribution: Attribution,
+        subject: Box<MetadataCommand>,
+    },
 }
 
 impl MetadataCommand {
@@ -1447,6 +1625,11 @@ impl MetadataCommand {
             // The operator's override for a range with no provable lineage
             // (#636).
             MetadataCommand::AttestUnprovenPromotion { .. } => PROMOTE_UNPROVEN_FEATURE_LEVEL,
+            // The wrapper is kind 40, new at level 9; it also carries its
+            // subject, which a later level may raise above it.
+            MetadataCommand::Attributed { subject, .. } => {
+                ATTRIBUTED_COMMANDS_FEATURE_LEVEL.max(subject.feature_level())
+            }
             // Everything v0.4.0 already knew.
             _ => 1,
         }
@@ -1493,6 +1676,26 @@ impl MetadataCommand {
             | MetadataCommand::SetRangeReplicaSet { env, .. }
             | MetadataCommand::ReportNodeVersion { env, .. }
             | MetadataCommand::AttestUnprovenPromotion { env, .. } => env,
+            // The subject's: a retry of an attributed command dedups against
+            // the original whoever asked.
+            MetadataCommand::Attributed { subject, .. } => subject.envelope(),
+        }
+    }
+
+    /// The command this one carries out: the subject of an attributed
+    /// command, or the command itself.
+    pub fn subject(&self) -> &MetadataCommand {
+        match self {
+            MetadataCommand::Attributed { subject, .. } => subject,
+            other => other,
+        }
+    }
+
+    /// The attribution this command carries, if it is attributed.
+    pub fn attribution(&self) -> Option<&Attribution> {
+        match self {
+            MetadataCommand::Attributed { attribution, .. } => Some(attribution),
+            _ => None,
         }
     }
 
@@ -1684,6 +1887,21 @@ impl MetadataCommand {
                 put_bounded_str(&mut out, release, MAX_RELEASE_BYTES, "release")?;
                 put_u16(&mut out, *max_replica_protocol);
                 put_u32(&mut out, *supported_feature_level);
+            }
+            MetadataCommand::Attributed {
+                attribution,
+                subject,
+            } => {
+                if matches!(**subject, MetadataCommand::Attributed { .. }) {
+                    return Err(CodecError::InvalidValue {
+                        what: "attributed command",
+                        reason: "the subject must not itself be attributed",
+                    });
+                }
+                put_u16(&mut out, COMMAND_KIND_ATTRIBUTED);
+                attribution.encode_into(&mut out)?;
+                put_u8(&mut out, SUBJECT_COMMAND);
+                out.extend_from_slice(&subject.encode()?);
             }
             MetadataCommand::RegisterSealedSegment {
                 env,
@@ -2355,6 +2573,28 @@ impl MetadataCommand {
                 max_replica_protocol: reader.u16("max replica protocol")?,
                 supported_feature_level: reader.u32("supported feature level")?,
             }),
+            COMMAND_KIND_ATTRIBUTED => {
+                let attribution = Attribution::decode_from(reader)?;
+                let subject_tag = reader.u8("attribution subject")?;
+                if subject_tag != SUBJECT_COMMAND {
+                    return Err(CodecError::UnknownTag {
+                        what: "attribution subject",
+                        tag: u32::from(subject_tag),
+                    });
+                }
+                // Refused BEFORE recursing: depth one, so a hostile chain of
+                // wrappers can never cost more than one level of stack.
+                if reader.peek_u16("command kind")? == COMMAND_KIND_ATTRIBUTED {
+                    return Err(CodecError::InvalidValue {
+                        what: "attributed command",
+                        reason: "the subject must not itself be attributed",
+                    });
+                }
+                Ok(MetadataCommand::Attributed {
+                    attribution,
+                    subject: Box::new(Self::decode_from(reader)?),
+                })
+            }
             COMMAND_KIND_REGISTER_SEALED_SEGMENT => Ok(MetadataCommand::RegisterSealedSegment {
                 env: decode_envelope(reader)?,
                 topic_uuid: reader.uuid("topic uuid")?,
@@ -2792,6 +3032,21 @@ impl MetadataError {
     /// Build a `Limit` with the same bounded-detail guarantee.
     pub fn limit(detail: impl Into<String>) -> Self {
         MetadataError::Limit(bound_detail(detail.into()))
+    }
+
+    /// The error's wire kind: what an attributed command's record keeps of a
+    /// rejection (#706), so the record names the failure without the
+    /// free-form text.
+    pub(crate) fn wire_kind(&self) -> u16 {
+        match self {
+            MetadataError::GenerationMismatch { .. } => ERROR_KIND_GENERATION_MISMATCH,
+            MetadataError::EpochMismatch { .. } => ERROR_KIND_EPOCH_MISMATCH,
+            MetadataError::LineageMismatch { .. } => ERROR_KIND_LINEAGE_MISMATCH,
+            MetadataError::AlreadyExists => ERROR_KIND_ALREADY_EXISTS,
+            MetadataError::NotFound => ERROR_KIND_NOT_FOUND,
+            MetadataError::InvalidTransition(_) => ERROR_KIND_INVALID_TRANSITION,
+            MetadataError::Limit(_) => ERROR_KIND_LIMIT,
+        }
     }
 
     fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), CodecError> {
@@ -3237,8 +3492,49 @@ pub(crate) mod tests {
         assert!(!within(i64::MIN, 15_000));
     }
 
+    fn attributed(
+        actor: CommandActor,
+        peer: Option<&str>,
+        subject: MetadataCommand,
+    ) -> MetadataCommand {
+        MetadataCommand::Attributed {
+            attribution: Attribution {
+                actor,
+                peer: peer.map(|address| address.parse().unwrap()),
+                vouched_by: 3,
+                recorded_at_ms: 1_750_000_000_500,
+            },
+            subject: Box::new(subject),
+        }
+    }
+
+    fn create_topic(request: u128) -> MetadataCommand {
+        MetadataCommand::CreateTopic {
+            env: envelope(request),
+            name: "events.v1".to_owned(),
+            topic_uuid: Uuid::from_u128(20),
+            root_range_uuid: Uuid::from_u128(21),
+        }
+    }
+
     pub(crate) fn every_command() -> Vec<MetadataCommand> {
         vec![
+            // An operator's command with its actor (#706), and a node's with
+            // an IPv6 peer: every actor and peer shape is in
+            // `attribution_round_trips_every_actor_and_peer`.
+            attributed(
+                CommandActor::Named("ops-alice".to_owned()),
+                Some("10.0.0.7"),
+                create_topic(70),
+            ),
+            attributed(
+                CommandActor::Anonymous,
+                Some("2001:db8::1"),
+                MetadataCommand::SetFeatureLevel {
+                    env: envelope(71),
+                    feature_level: 4,
+                },
+            ),
             MetadataCommand::RegisterNode {
                 env: envelope(1),
                 node_uuid: Uuid::from_u128(10),
@@ -3991,6 +4287,230 @@ pub(crate) mod tests {
         ));
     }
 
+    /// #706: every actor and every peer shape round-trips, and the codec
+    /// refuses what a decoder would otherwise have to guess at.
+    #[test]
+    fn attribution_round_trips_every_actor_and_peer() {
+        let actors = [
+            CommandActor::Named("o".to_owned()),
+            CommandActor::Named("c".repeat(MAX_ACTOR_NAME_BYTES)),
+            CommandActor::Node(Uuid::from_u128(0xabc)),
+            CommandActor::MetaNode(u64::MAX),
+            CommandActor::Anonymous,
+        ];
+        for actor in actors {
+            for peer in [None, Some("192.0.2.9"), Some("2001:db8::ff")] {
+                let command = attributed(actor.clone(), peer, create_topic(80));
+                let encoded = command.encode().unwrap();
+                assert_eq!(MetadataCommand::decode(&encoded).unwrap(), command);
+                assert_eq!(command.subject(), &create_topic(80));
+                assert_eq!(command.attribution().unwrap().actor, actor);
+                assert_eq!(command.envelope(), create_topic(80).envelope());
+            }
+        }
+        // A bare command has no attribution and is its own subject.
+        assert_eq!(create_topic(80).attribution(), None);
+        assert_eq!(create_topic(80).subject(), &create_topic(80));
+    }
+
+    #[test]
+    fn an_attribution_the_codec_cannot_hold_is_refused_at_both_ends() {
+        // A certificate name of 129 bytes, or none, is never encoded: the
+        // leader refuses before it proposes, and a decoder refuses it too.
+        for name in ["", &"c".repeat(MAX_ACTOR_NAME_BYTES + 1)] {
+            let command = attributed(CommandActor::Named(name.to_owned()), None, create_topic(81));
+            assert!(command.encode().is_err(), "{} bytes", name.len());
+        }
+        let encoded = attributed(CommandActor::Named("ops".into()), None, create_topic(81))
+            .encode()
+            .unwrap();
+        // kind, actor tag, then the name's length: widen it past the bound.
+        let mut over = encoded.clone();
+        over[3..5].copy_from_slice(&(MAX_ACTOR_NAME_BYTES as u16 + 1).to_be_bytes());
+        assert!(matches!(
+            MetadataCommand::decode(&over),
+            Err(CodecError::BoundExceeded { .. })
+        ));
+        let mut empty = encoded;
+        empty[3..5].copy_from_slice(&0u16.to_be_bytes());
+        assert!(MetadataCommand::decode(&empty).is_err());
+    }
+
+    /// Depth one: an attribution of an attribution is refused when encoding
+    /// and, before it recurses, when decoding, so a hostile chain of
+    /// wrappers costs one frame of stack.
+    #[test]
+    fn an_attribution_cannot_wrap_an_attribution() {
+        let inner = attributed(CommandActor::Anonymous, None, create_topic(82));
+        let nested = attributed(CommandActor::Anonymous, None, inner.clone());
+        assert!(matches!(
+            nested.encode(),
+            Err(CodecError::InvalidValue {
+                what: "attributed command",
+                ..
+            })
+        ));
+        // Hand-built: the wrapper's prefix, then the inner wrapper's bytes.
+        let mut bytes = attributed(CommandActor::Anonymous, None, create_topic(82))
+            .encode()
+            .unwrap();
+        let prefix_len = 2 + 1 + 1 + 8 + 8 + 1; // kind, actor, peer, vouched, at, subject tag
+        bytes.truncate(prefix_len);
+        bytes.extend_from_slice(&inner.encode().unwrap());
+        assert!(matches!(
+            MetadataCommand::decode(&bytes),
+            Err(CodecError::InvalidValue {
+                what: "attributed command",
+                ..
+            })
+        ));
+        // A long chain is refused at its second link, not walked.
+        let mut chain = Vec::new();
+        for _ in 0..10_000 {
+            chain.extend_from_slice(&bytes[..prefix_len]);
+        }
+        assert!(MetadataCommand::decode(&chain).is_err());
+    }
+
+    /// #706: a tag inside kind 40 that this build does not know was written
+    /// by a later level, and the store calls it a newer format, not damage.
+    #[test]
+    fn an_unknown_actor_peer_or_subject_tag_reads_as_newer() {
+        let encoded = attributed(CommandActor::Anonymous, Some("10.0.0.1"), create_topic(83))
+            .encode()
+            .unwrap();
+        // kind (2), actor tag (1), peer tag (1) + 4, vouched (8), at (8), subject tag.
+        let at = |offset: usize, expected: u8| {
+            assert_eq!(encoded[offset], expected, "the layout moved");
+            offset
+        };
+        for (offset, expected, what) in [
+            (at(2, 4), 4u8, "attribution actor"),
+            (at(3, 4), 4, "attribution peer"),
+            (at(2 + 1 + 1 + 4 + 8 + 8, 1), 1, "attribution subject"),
+        ] {
+            let mut newer = encoded.clone();
+            newer[offset] = 0x7f;
+            let error = MetadataCommand::decode(&newer).unwrap_err();
+            assert_eq!(
+                error,
+                CodecError::UnknownTag { what, tag: 0x7f },
+                "{expected}"
+            );
+            assert!(crate::storage::is_newer_format(&error), "{what}");
+        }
+    }
+
+    /// #706: what an older voter does with kind 40. The release before
+    /// level 9 knows kinds 1..=39 and has one arm for anything else: an
+    /// unknown kind, which the store reports as a newer release and the peer
+    /// plane as "newer release" (at most once per 30 s) - never as
+    /// corruption. Kind 40 is the first kind that release does not know, and
+    /// it is gated at a level above that release's, so a leader below the
+    /// level never sends it.
+    #[test]
+    fn an_older_voter_reads_the_attributed_kind_as_a_newer_format() {
+        const PREVIOUS_RELEASE_HIGHEST_KIND: u16 = 39;
+        const PREVIOUS_RELEASE_LEVEL: u32 = 8;
+        let wrapper = attributed(CommandActor::Anonymous, None, create_topic(84));
+        let encoded = wrapper.encode().unwrap();
+        let kind = u16::from_be_bytes([encoded[0], encoded[1]]);
+        assert_eq!(kind, PREVIOUS_RELEASE_HIGHEST_KIND + 1);
+        assert_eq!(kind, COMMAND_KIND_ATTRIBUTED);
+        // What its decoder says: its fall-through arm, word for word.
+        let seen_by_the_previous_release = CodecError::UnknownTag {
+            what: "command kind",
+            tag: u32::from(kind),
+        };
+        assert!(crate::storage::is_newer_format(
+            &seen_by_the_previous_release
+        ));
+        assert!(matches!(
+            crate::storage::codec_corrupt(
+                std::path::Path::new("meta.log"),
+                &seen_by_the_previous_release
+            ),
+            crate::storage::MetaStoreError::NewerFormat { .. }
+        ));
+        // And gated above that release's level: it never reaches such a log.
+        assert!(wrapper.feature_level() > PREVIOUS_RELEASE_LEVEL);
+        // The same wrapper with the kind a later release adds is the same
+        // reading for THIS build.
+        let mut later = encoded;
+        later[..2].copy_from_slice(&41u16.to_be_bytes());
+        assert!(crate::storage::is_newer_format(
+            &MetadataCommand::decode(&later).unwrap_err()
+        ));
+    }
+
+    /// #706: the wrapper is audited as what it carries, so an applied record
+    /// is the same with or without the actor in the log; and the leader wraps
+    /// an operator's audited command and nothing a machine sends.
+    #[test]
+    fn an_attributed_command_is_audited_as_its_subject() {
+        use crate::audit::{command_audit, is_attributed_when_audited};
+        use crate::transport::authz::AdminIdentity;
+        let operator = AdminIdentity::Named("ops".to_owned());
+        let node = AdminIdentity::Node(Uuid::from_u128(5));
+        let mut wrapped = 0;
+        for command in every_command() {
+            if matches!(command, MetadataCommand::Attributed { .. }) {
+                let subject = command.subject();
+                assert_eq!(
+                    command_audit(&command).map(|a| (a.action, a.command, a.params)),
+                    command_audit(subject).map(|a| (a.action, a.command, a.params)),
+                );
+                // Never wrapped twice.
+                assert!(!is_attributed_when_audited(&operator, &command));
+                continue;
+            }
+            let audited = command_audit(&command).is_some();
+            assert_eq!(
+                is_attributed_when_audited(&operator, &command),
+                audited,
+                "an operator's {}",
+                crate::audit::command_name(&command)
+            );
+            wrapped += usize::from(audited);
+            // A node's: the same, except a node handing a range back.
+            let machine_traffic = matches!(command, MetadataCommand::ReleaseRangeLease { .. });
+            assert_eq!(
+                is_attributed_when_audited(&node, &command),
+                audited && !machine_traffic,
+                "a node's {}",
+                crate::audit::command_name(&command)
+            );
+        }
+        assert!(wrapped >= 20, "the audited list shrank: {wrapped}");
+    }
+
+    /// The error kind an attributed record keeps is the wire kind.
+    #[test]
+    fn a_metadata_errors_wire_kind_is_the_kind_it_encodes_with() {
+        for error in [
+            MetadataError::GenerationMismatch {
+                expected: 1,
+                actual: 2,
+            },
+            MetadataError::EpochMismatch {
+                expected: 1,
+                actual: 2,
+            },
+            MetadataError::LineageMismatch {
+                expected: 1,
+                actual: 2,
+            },
+            MetadataError::AlreadyExists,
+            MetadataError::NotFound,
+            MetadataError::invalid_transition("x"),
+            MetadataError::limit("x"),
+        ] {
+            let mut out = Vec::new();
+            error.encode_into(&mut out).unwrap();
+            assert_eq!(u16::from_be_bytes([out[0], out[1]]), error.wire_kind());
+        }
+    }
+
     /// #554: a command kind an older voter does not know must not enter the
     /// log until the cluster's level says every voter does. So every kind
     /// added after v0.6.0 (the last release before levels: kinds 1..=34)
@@ -4082,9 +4602,13 @@ pub(crate) mod tests {
         let mut names: Vec<_> = commands.iter().map(command_name).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 39, "every_command() must hold every variant");
+        assert_eq!(names.len(), 40, "every_command() must hold every variant");
+        // The wrapper is audited as what it carries (#706), and says so in
+        // `an_attributed_command_is_audited_as_its_subject`; the list below is
+        // of the bare commands.
         let audited: std::collections::BTreeSet<_> = commands
             .iter()
+            .filter(|c| !matches!(c, MetadataCommand::Attributed { .. }))
             .filter(|c| command_audit(c).is_some())
             .map(command_name)
             .collect();
@@ -4116,7 +4640,10 @@ pub(crate) mod tests {
         .into_iter()
         .collect();
         assert_eq!(audited, expected);
-        for command in &commands {
+        for command in commands
+            .iter()
+            .filter(|c| !matches!(c, MetadataCommand::Attributed { .. }))
+        {
             let Some(audit) = command_audit(command) else {
                 continue;
             };

@@ -86,7 +86,7 @@ all nine on 2026-11-21; the other answer is kept for the record.
 |---|---|---|---|
 | D1 | What a label states | Two columns: what the evidence supports today, and the scope committed to at 1.0 | One column, the 1.0 target only, with "prototype" as the project-wide word until then |
 | D2 | The 1.0 scope | The archive engine, its sources, upload, ledger, formats and operator surface. The cluster plane and the Kafka gateway are preview at 1.0 | Add the cluster plane to 1.0, which needs #727 and #728 and the external review (#730) for it |
-| D3 | The Kafka gateway | `experimental` today, `preview` at 1.0. The compatibility policy already marks its advertised APIs `experimental` (inventory row 22) and #714 recommends `preview` | `preview` today, matching #714, once #751 lets a client follow a failover |
+| D3 | The Kafka gateway | `experimental` today, `preview` at 1.0. The compatibility policy already marks its advertised APIs `experimental` (inventory row 22) and #714 recommends `preview` | `preview` today, matching #714, once #751 lets a client follow a failover (it now does in live-chaos scenarios 27 and 28; the label stays the maintainer's decision) |
 | D4 | The cluster plane today | `preview`. Ten of the 24 data-safety bugs found so far were in it, five of them on 2026-11-10 and 11, but it has deterministic crash sweeps and 26 live-chaos scenario scripts | `experimental` until the history checker (#728) exists |
 | D5 | The syslog spool source | `preview` today and `production` at 1.0, if the crash sweep is extended to it | Treat it as preview at 1.0, since it has the thinnest evidence of the three sources |
 | D6 | The PostgreSQL state store | `production` at 1.0, with a release asset or an image that enables the feature | `preview` at 1.0 if it stays a source build (`--features postgres`) |
@@ -224,7 +224,7 @@ opened 2026-11-15, #782). The criterion IDs (A1, B1 and so on) are those of
 ### Data node (`vtop-node`)
 
 - **Why:** `preview` at both stages: leases, fencing epochs and verified promotion are exercised, and promotion has had three data-safety bugs.
-- **Tests and CI:** `crates/vtop-node` unit and crash-sweep tests (`promotion_crash_sweep`); live-chaos scenarios 04, 09, 10, 12, 14, 23.
+- **Tests and CI:** `crates/vtop-node` unit and crash-sweep tests (`promotion_crash_sweep`); live-chaos scenarios 04, 09, 10, 12, 14, 23, 27, 28.
 - **Open criteria:** A3 (#727), A4 (#728); group commit is wired into the data node and off by default until its A/B gates hold (#752); data-safety bugs #449, #611, #641.
 - **Docs:** `NATIVE_BROKER_ARCHITECTURE.md`, `NODE_OBSERVABILITY.md`.
 
@@ -237,9 +237,9 @@ opened 2026-11-15, #782). The criterion IDs (A1, B1 and so on) are those of
 
 ### Kafka gateway
 
-- **Why:** `experimental` today, `preview` at 1.0: its advertised APIs are `experimental` in the compatibility inventory, and a Kafka client cannot yet follow a failover.
-- **Tests and CI:** `crates/vtop-kafka` tests; the `kafka_request` fuzz target; live-chaos scenarios 16 to 21 and 24 with `kcat` (librdkafka) as the stock client; the README's comparison against Apache Kafka.
-- **Open criteria:** #752; 12.0x to 13.9x lower throughput than Apache Kafka at saturation on one laptop (#596 to #600, #610, #737); transactions are out of scope (a transactional `InitProducerId` is refused by name); A3, A4.
+- **Why:** `experimental` today, `preview` at 1.0: its advertised APIs are `experimental` in the compatibility inventory, and a client following a failover is measured only on one host with debug binaries and a 6 s lease (#751).
+- **Tests and CI:** `crates/vtop-kafka` tests; the `kafka_request` fuzz target; live-chaos scenarios 16 to 21 and 24 with `kcat` (librdkafka) as the stock client; scenarios 27 (`kcat`) and 28 (the JVM client of Apache Kafka 4.4.0) kill the range leader under a client served from candidate nodes, which resumed 5.5 s to 6.6 s later with every acknowledged record read back once and in order; the README's comparison against Apache Kafka.
+- **Open criteria:** #751's remainder: the failover is measured on one host with debug binaries and the harness's 6 s lease, not with the chart's 15 s default lease, not in the co-located `vtop-node node` shape, and a consumer group's coordinator across a failover is out of its scope (members rejoin); #752; 12.0x to 13.9x lower throughput than Apache Kafka at saturation on one laptop (#596 to #600, #610, #737); transactions are out of scope (a transactional `InitProducerId` is refused by name); A3, A4.
 - **Docs:** README, `when-to-use.md` ("a prototype, measured well below Apache Kafka's throughput") and the benchmark pages.
 
 ### Helm chart
