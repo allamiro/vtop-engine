@@ -24,7 +24,7 @@ def fake_cluster(monkeypatch):
         key = (system, state["setting"] if system == "vtop" else "")
         return producer_result(SATURATION[key] if rate < 0 else rate), "", 1.0, ""
 
-    def e2e_once(system, size, rate, records, timeout):
+    def e2e_once(system, size, rate, records, timeout, image):
         return (producer_result(rate), "", 1.0, "", 0, f"READY\nconsumed {records}\n2 {records - 20}\n9 20\n", "")
 
     def scrape(_system):
@@ -61,7 +61,8 @@ def simulate(tmp_path, monkeypatch):
            "fingerprint": schema.fingerprint(env), "vtop_image": "vtop-bench:x", "reps": args.reps,
            "sat_records": {100: 2000}, "fixed_seconds": 1.0, "smoke_records": 10, "sat_timeout": 10.0,
            "consume": True, "group_commit_configs": configs, "matrix": matrix, "resources": True, "e2e": True,
-           "closer": FakeCounters().closer(), "saturation": {}, "hist_csv": os.path.join(run_dir, schema.E2E_HIST)}
+           "closer": FakeCounters().closer(), "saturation": {}, "hist_csv": os.path.join(run_dir, schema.E2E_HIST),
+           "e2e_image": "kc-e2e-client:test"}
     schema.write_header(ctx["csv"])
     schema.write_header(ctx["hist_csv"], schema.E2E_HIST_COLUMNS)
     rates = run.run_cell(ctx, "kafka", 100, None)

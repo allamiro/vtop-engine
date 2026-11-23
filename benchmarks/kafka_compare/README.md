@@ -117,7 +117,9 @@ is `E2E_LOAD_PCT` (50 %) of the SLOWER system's median saturation for the cell, 
 `fsync-parity` as well (`compose.kafka.fsync-parity.yml` layered on the base file, plus `flush.messages=1` on the
 topic: the setting `crash.py`'s fsync-parity configuration uses), are brought up fresh, smoke-checked, warmed up for
 10 s at that rate and measured `--reps` times. In each repetition [`client/E2eLatency.java`](client/E2eLatency.java),
-run by the image's own JVM in a second client container (2 CPUs, 2 GiB), assigns the partition and seeks to the end,
+compiled once by [`client/Dockerfile`](client/Dockerfile) (the pinned `eclipse-temurin` JDK, against the pinned Kafka
+image's own kafka-clients jars, onto that image: the image's JRE has no compiler, so it cannot launch the source
+file) and run by the image's own JVM in a second client container (2 CPUs, 2 GiB), assigns the partition and seeks to the end,
 says `READY`, and counts each record's latency (its `poll()` return time minus the producer's `CreateTime`, both
 the client host's clock, 1 ms resolution) into a histogram while the perf producer offers `rate x --fixed-seconds`
 records at that rate. VTOP has one configuration, so it owes no `fsync-parity` row. With `--group-commit off,on`, VTOP is
@@ -143,9 +145,9 @@ runs beside the producer, which is the point of an end-to-end measurement, but m
 JVMs at once (6 CPUs of client limits beside the nodes' 6): on a host with fewer than 12 CPUs, say so in the
 result. `plan.py` charges both to the projected hours.
 
-**Unverified until a run on the target host:** the consumer launches as a Java source file, which needs the
-image's JVM to include the compiler; `run.py` runs `E2eLatency.java --check` before anything starts and refuses,
-naming `--no-e2e`, when it cannot. Whether VTOP's gateway returns a record's `CreateTime` unchanged (the
+**Unverified until a run on the target host:** before the VTOP image is built or any cluster starts, `run.py` builds
+the consumer's image (`kc-e2e-client:<hash>`, which pulls the pinned JDK image: outbound internet) and runs the class
+once with `--check`, refusing and naming `--no-e2e` when either fails. Whether VTOP's gateway returns a record's `CreateTime` unchanged (the
 latency would otherwise be nonsense, and the run refuses a negative one) and whether the node containers'
 `io.stat` accounts the data volume's writes are the two things the first run shows.
 

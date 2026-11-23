@@ -164,7 +164,7 @@ def test_an_unsustained_rate_is_an_ok_row_flagged_not_sustained():
     assert row["status"] == "ok" and row["sustained"] is False and "not sustained" in row["note"] and hist
 
 
-def test_the_consumer_is_one_container_in_the_pinned_image_with_the_source_mounted_read_only(monkeypatch):
+def test_the_consumer_is_one_container_running_the_compiled_class_in_its_built_image(monkeypatch):
     seen = {}
 
     class FakeProc:
@@ -179,13 +179,15 @@ def test_the_consumer_is_one_container_in_the_pinned_image_with_the_source_mount
         return FakeProc()
 
     monkeypatch.setattr(run.subprocess, "Popen", popen)
-    consumer = run.E2eConsumer("vtop", 1000)
+    consumer = run.E2eConsumer("vtop", 1000, "kc-e2e-client:0123456789ab")
     consumer.wait_ready(5)
     args = seen["args"]
-    assert args[:3] == ["docker", "run", "--rm"] and run.KAFKA_IMAGE in args
-    assert f"{run.CLIENT_DIR}:/client:ro" in args and "kc-vtop-bench" in args
-    assert args[args.index(run.KAFKA_IMAGE) + 1:][:4] == ["java", "-cp", "/opt/kafka/libs/*",
-                                                           "/client/E2eLatency.java"]
+    assert args[:3] == ["docker", "run", "--rm"] and "kc-vtop-bench" in args
+    # The built image, never the Kafka image with a source file: its JRE has no compiler (#596 on AWS).
+    assert run.KAFKA_IMAGE not in args and not any(arg.endswith(".java") for arg in args)
+    assert not any(":/client" in arg for arg in args)
+    assert args[args.index("kc-e2e-client:0123456789ab") + 1:][:4] == [
+        "java", "-cp", "/opt/kafka/libs/*:/opt/e2e-latency", "E2eLatency"]
     assert os.path.isfile(os.path.join(run.CLIENT_DIR, "E2eLatency.java"))
 
 
@@ -207,7 +209,8 @@ def fake_cluster(monkeypatch):
     def producer(system, records, size, rate, timeout, info_logging=False):
         return producer_result(saturation[system] if rate < 0 else rate), "", 1.0, ""
 
-    def e2e_once(system, size, rate, records, timeout):
+    def e2e_once(system, size, rate, records, timeout, image):
+        assert image == "kc-e2e-client:test"
         return (producer_result(rate), "", 1.0, "", 0,
                 f"READY\nconsumed {records}\n2 {records - 20}\n9 20\n", "")
 
@@ -237,7 +240,7 @@ def simulate(tmp_path, matrix_args):
            "sat_records": sat_records, "fixed_seconds": 1.0, "smoke_records": 10, "sat_timeout": 10.0,
            "consume": True, "matrix": matrix, "resources": bool(matrix.get("resources")),
            "e2e": bool(matrix.get("e2e")), "closer": FakeCounters().closer(), "saturation": {},
-           "hist_csv": os.path.join(run_dir, schema.E2E_HIST)}
+           "hist_csv": os.path.join(run_dir, schema.E2E_HIST), "e2e_image": "kc-e2e-client:test"}
     schema.write_header(ctx["csv"])
     if ctx["e2e"]:
         schema.write_header(ctx["hist_csv"], schema.E2E_HIST_COLUMNS)
@@ -284,7 +287,7 @@ def test_no_common_rate_is_a_refused_row_for_every_target_never_a_hole(tmp_path,
 
 def test_a_consumer_that_missed_records_is_a_failed_row_and_leaves_no_histogram_line(tmp_path, monkeypatch,
                                                                                       fake_cluster):
-    monkeypatch.setattr(run, "run_e2e_once", lambda system, size, rate, records, timeout: (
+    monkeypatch.setattr(run, "run_e2e_once", lambda system, size, rate, records, timeout, image: (
         producer_result(rate), "", 1.0, "", 0, f"READY\nconsumed {records - 5}\n2 {records - 5}\n", ""))
     run_dir, _ = simulate(tmp_path, fake_args())
     with open(os.path.join(run_dir, schema.E2E_HIST)) as handle:
@@ -318,7 +321,7 @@ def test_the_preflight_names_the_flag_that_turns_each_measurement_off(monkeypatc
         return subprocess.CompletedProcess(args, 0, "cpuset cpu io memory pids" if "cat" in args else "ok\n", "")
 
     monkeypatch.setattr(run, "sh", fine)
-    run.preflight_clients(matrix)
+    assert run.preflight_clients(matrix) == run.e2e_image_name()
 
 
 def test_the_common_rate_and_the_histogram_helpers_are_the_modules_own():

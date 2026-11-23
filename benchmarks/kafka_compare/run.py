@@ -75,8 +75,13 @@ PRODUCER_PROPS = ("acks=all", "compression.type=none")
 # hinge on it either way.
 CONSUMER_PROPS = ("enable.auto.commit=false",)
 
-# The end-to-end consumer's container: smaller than the producer's, and the file it runs is mounted read-only.
+# The end-to-end consumer's container: smaller than the producer's. The pinned Kafka image's JRE has no
+# jdk.compiler, so it cannot launch E2eLatency.java as a source file: client/Dockerfile compiles it once with this
+# JDK (the one #599's crash/client/Dockerfile uses) against the image's own kafka-clients jars, onto that image.
 CLIENT_DIR = os.path.join(HERE, "client")
+JDK_IMAGE = "eclipse-temurin:21.0.11_10-jdk@sha256:98155457fcdbeb0987472e8abf721657b698ede407aad52ac24ae42618c0931c"
+E2E_CLASSES = "/opt/e2e-latency"
+E2E_CLASSPATH = f"/opt/kafka/libs/*:{E2E_CLASSES}"
 E2E_CPUS = "2"
 E2E_MEMORY = "2g"
 E2E_HEAP = "-Xms512m -Xmx512m"
@@ -462,8 +467,11 @@ def capture_environment(run_id: str, matrix: dict[str, Any], vtop_image: str, li
         comparable["resources_source"] = resources.COUNTER_SOURCE
         comparable["resources_window_close"] = resources.CLOSE_MODE
     if matrix.get("e2e"):
-        comparable["e2e_consumer"] = ("client/E2eLatency.java in the client image's JVM: assign, seek to the end, "
+        comparable["e2e_consumer"] = ("client/E2eLatency.java, compiled by client/Dockerfile against the Kafka "
+                                      "image's kafka-clients and run by that image's JVM: assign, seek to the end, "
                                       "latency = poll() return time minus the record's CreateTime, 1 ms buckets")
+        comparable["e2e_client_image"] = e2e_image_name()
+        comparable["e2e_jdk_image"] = JDK_IMAGE
         comparable["e2e_consumer_limits"] = {"cpus": E2E_CPUS, "memory": E2E_MEMORY, "heap": E2E_HEAP}
         comparable["kafka_profiles"] = dict(KAFKA_PROFILES)
     return {
@@ -746,21 +754,46 @@ def attach_resources(ctx: dict, row: dict, window: Window | None, error: str, de
 _e2e_seq = 0
 
 
+def e2e_image_name() -> str:
+    """kc-e2e-client:<12 hex>, named for the source, the Dockerfile and both pinned images it is built from."""
+    digest = hashlib.sha256()
+    for name in ("Dockerfile", "E2eLatency.java"):
+        with open(os.path.join(CLIENT_DIR, name), "rb") as handle:
+            digest.update(name.encode() + b"\0" + handle.read() + b"\0")
+    digest.update(KAFKA_IMAGE.encode() + b"\0" + JDK_IMAGE.encode())
+    return f"kc-e2e-client:{digest.hexdigest()[:12]}"
+
+
+def ensure_e2e_image(rebuild: bool = False) -> str:
+    """The end-to-end consumer's image (client/Dockerfile), built when it is not there."""
+    image = e2e_image_name()
+    exists = sh(["docker", "image", "inspect", image], check=False).returncode == 0
+    if rebuild or not exists:
+        log(f"building {image} (the end-to-end consumer, compiled against the pinned image's kafka-clients)")
+        sh(["docker", "build", "-t", image, "--build-arg", f"KAFKA_IMAGE={KAFKA_IMAGE}",
+            "--build-arg", f"JDK_IMAGE={JDK_IMAGE}", CLIENT_DIR], timeout=1800)
+    return image
+
+
+def e2e_main_command(*args: str) -> list[str]:
+    """The compiled consumer's class run by the image's JVM, with the image's kafka-clients jars."""
+    return ["java", "-cp", E2E_CLASSPATH, "E2eLatency", *args]
+
+
 def e2e_consumer_command(system: str, expected: int) -> list[str]:
-    return ["java", "-cp", "/opt/kafka/libs/*", "/client/E2eLatency.java", SYSTEM_SPEC[system]["bootstrap"], TOPIC,
-            str(expected), str(E2E_IDLE_MS)]
+    return e2e_main_command(SYSTEM_SPEC[system]["bootstrap"], TOPIC, str(expected), str(E2E_IDLE_MS))
 
 
 class E2eConsumer:
     """The end-to-end consumer's container, started before the producer and read until it exits."""
 
-    def __init__(self, system: str, expected: int):
+    def __init__(self, system: str, expected: int, image: str):
         global _e2e_seq
         _e2e_seq += 1
         self.name = f"kc-e2e-{os.getpid()}-{_e2e_seq}"
         args = ["docker", "run", "--rm", "--name", self.name, "--network", SYSTEM_SPEC[system]["network"],
                 "--cpus", E2E_CPUS, "--memory", E2E_MEMORY, "-e", f"JAVA_TOOL_OPTIONS={E2E_HEAP}",
-                "-v", f"{CLIENT_DIR}:/client:ro", KAFKA_IMAGE, *e2e_consumer_command(system, expected)]
+                image, *e2e_consumer_command(system, expected)]
         self.proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.out: list[str] = []
         self.err: list[str] = []
@@ -796,11 +829,12 @@ class E2eConsumer:
             sh(["docker", "rm", "-f", self.name], check=False)
 
 
-def run_e2e_once(system: str, size: int, rate: int, records: int, timeout: float) -> tuple:
-    """One end-to-end repetition: the consumer is ready at the end of the log, then the producer offers
-    `records` at `rate`, then the consumer is read until it has them all or has waited E2E_IDLE_MS for one.
+def run_e2e_once(system: str, size: int, rate: int, records: int, timeout: float, image: str) -> tuple:
+    """One end-to-end repetition: the consumer (in `image`, see `ensure_e2e_image`) is ready at the end of the
+    log, then the producer offers `records` at `rate`, then the consumer is read until it has them all or has
+    waited E2E_IDLE_MS for one.
     Returns (producer result, note, wall seconds, producer output, consumer exit code, stdout, stderr)."""
-    consumer = E2eConsumer(system, records)
+    consumer = E2eConsumer(system, records, image)
     try:
         consumer.wait_ready(E2E_READY_TIMEOUT)
         result, note, wall, output = run_producer(system, records, size, rate, timeout)
@@ -927,7 +961,8 @@ def run_e2e_cell(ctx: dict, system: str, profile: str, size: int, rate: int, gro
         timeout = max(ctx["sat_timeout"], 6 * records / rate)
         try:
             value, window, werr = measure(
-                ctx, system, functools.partial(run_e2e_once, system, size, rate, records, timeout))
+                ctx, system, functools.partial(run_e2e_once, system, size, rate, records, timeout,
+                                               ctx["e2e_image"]))
             result, note, wall, output, code, out, err = value
         except (RuntimeError, subprocess.TimeoutExpired) as exc:
             row.update(offered_rate=rate, load_pct=E2E_LOAD_PCT, status="failed", note=str(exc)[:600])
@@ -1248,9 +1283,11 @@ def build_matrix(args: argparse.Namespace, sizes: list[int], sat_records: dict[i
     return matrix
 
 
-def preflight_clients(matrix: dict[str, Any]) -> None:
-    """Before any image is built or cluster started: what the resource windows and the end-to-end consumer need
-    from this host and from the pinned image, or a refusal that names the flag that turns it off."""
+def preflight_clients(matrix: dict[str, Any], rebuild: bool = False) -> str | None:
+    """Before the VTOP image is built or any cluster started: what the resource windows and the end-to-end
+    consumer need from this host and from the pinned images, or a refusal that names the flag that turns it off.
+    The end-to-end consumer's image is built here and its class run once in check mode, the way every
+    repetition runs it. Returns that image, or None when the matrix has no end-to-end stage."""
     if matrix.get("resources"):
         try:
             resources.check_v2(sh(["docker", "run", "--rm", KAFKA_IMAGE, "cat",
@@ -1258,16 +1295,23 @@ def preflight_clients(matrix: dict[str, Any]) -> None:
         except (resources.CgroupRefused, RuntimeError, subprocess.TimeoutExpired) as exc:
             raise SystemExit(f"the CPU and bytes-written windows cannot be read on this host: {exc}. Fix it, or "
                              "run with --no-resources to leave metric 4 out.") from exc
-    if matrix.get("e2e"):
-        try:
-            done = sh(["docker", "run", "--rm", "-v", f"{CLIENT_DIR}:/client:ro", KAFKA_IMAGE, "java", "-cp",
-                       "/opt/kafka/libs/*", "/client/E2eLatency.java", "--check"], timeout=300)
-        except (RuntimeError, subprocess.TimeoutExpired) as exc:
-            raise SystemExit(f"the end-to-end consumer cannot run in {KAFKA_IMAGE.split('@')[0]}: {exc}. It is a "
-                             "Java source file launched by the image's JVM, which needs the JDK's compiler. "
-                             "Fix it, or run with --no-e2e to leave metric 3 out.") from exc
-        if done.stdout.strip() != "ok":
-            raise SystemExit(f"the end-to-end consumer's check printed {done.stdout.strip()[:80]!r}, not ok")
+    if not matrix.get("e2e"):
+        return None
+    try:
+        image = ensure_e2e_image(rebuild)
+    except (RuntimeError, subprocess.TimeoutExpired) as exc:
+        raise SystemExit(f"the end-to-end consumer's image (client/Dockerfile: {JDK_IMAGE.split('@')[0]} compiles "
+                         f"E2eLatency.java onto {KAFKA_IMAGE.split('@')[0]}) could not be built: {exc}. Fix it, or "
+                         "run with --no-e2e to leave metric 3 out.") from exc
+    try:
+        done = sh(["docker", "run", "--rm", image, *e2e_main_command("--check")], timeout=300)
+    except (RuntimeError, subprocess.TimeoutExpired) as exc:
+        raise SystemExit(f"the end-to-end consumer cannot run in {image}: {exc}. Fix it, or run with --no-e2e "
+                         "to leave metric 3 out.") from exc
+    if done.stdout.strip() != "ok":
+        raise SystemExit(f"the end-to-end consumer's check in {image} printed {done.stdout.strip()[:80]!r}, not ok. "
+                         "Fix it, or run with --no-e2e to leave metric 3 out.")
+    return image
 
 
 def check_plan(matrix: dict[str, Any], max_hours: float) -> float:
@@ -1365,7 +1409,7 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(f"kc-{system} is already running; stop it first (one system at a time, rule 1)")
     disk = resolve_host_disk(args.host_disk)
     sh(["docker", "pull", "-q", KAFKA_IMAGE], timeout=1800)
-    preflight_clients(matrix)
+    e2e_image = preflight_clients(matrix, args.rebuild)
     vtop_image = ensure_vtop_image(args.rebuild)
 
     run_id = args.run_id or dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -1382,7 +1426,8 @@ def main(argv: list[str] | None = None) -> int:
            "smoke_records": args.smoke_records, "sat_timeout": args.sat_timeout, "consume": not args.no_consume,
            "group_commit_configs": group_commit_configs,
            "matrix": matrix, "resources": bool(matrix.get("resources")), "e2e": bool(matrix.get("e2e")),
-           "closer": make_closer(), "saturation": {}, "hist_csv": os.path.join(run_dir, schema.E2E_HIST)}
+           "closer": make_closer(), "saturation": {}, "hist_csv": os.path.join(run_dir, schema.E2E_HIST),
+           "e2e_image": e2e_image}
     schema.write_header(ctx["csv"])
     if ctx["e2e"]:
         schema.write_header(ctx["hist_csv"], schema.E2E_HIST_COLUMNS)
