@@ -1553,7 +1553,13 @@ A patch release: no schema, wire format, feature level, config key, default or o
 ## v0.12.0 and beyond
 
 The theme is **the road to 1.0**: turn group commit on by default for the data
-node's quorum write (#752; it is wired and off until the A/B gates hold);
+node's quorum write (#752; it is wired and off until the A/B gates hold. On
+`main` after v0.11.1, the next group's local append and fsync overlap the
+previous group's replication, with the rounds still one at a time in offset
+order and at most two groups in flight, and the Kafka comparison runs the
+ablation at 1, 2, 4 and 16 producers on one partition with the leader's group
+and phase counters. A single producer cannot show group commit, since it never
+has two requests in the broker; the A/B on a release has not run);
 finish the format inventory and the tested upgrade and downgrade matrix (#743),
 and make `0.4` the default manifest writer; and work the criteria in #714 that
 must be met before VTOP is called anything but a prototype (the 72 hour engine

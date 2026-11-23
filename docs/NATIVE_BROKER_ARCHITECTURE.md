@@ -163,7 +163,11 @@ for records/bytes/requests, sync duration, queue wait, and flush reason. Each
 request is acknowledged only after its records are included in a successful
 group barrier. A group's leader flushes one group and hands the lead to the
 next waiting request, so every member is answered as soon as its own group's
-barrier is done; a group never mixes durabilities; and a group the log
+barrier is done; on a replicated range it hands the lead on as soon as its
+group is appended and its turn to replicate has come, so the next group's
+local append overlaps its replication, with the replication rounds still one
+at a time in offset order and at most two groups in flight; a group never
+mixes durabilities; and a group the log
 refuses whole for something one member caused (a sequence, fencing or size
 refusal, all judged before a byte is written) is re-run request by request,
 keeping the producer-epoch admissions the group's first pass made, so only
@@ -590,7 +594,35 @@ does each member get its acknowledgement, each judged for its own lease
 epoch and producer sequence. Nothing is acknowledged earlier, and a failed
 fsync or a quorum miss fails the whole group closed. A group the log refuses
 for something one member caused (a sequence, fencing or size refusal) is
-re-run request by request, so only that member fails. `max_delay_ms`
+re-run request by request, so only that member fails.
+
+Consecutive groups overlap in two stages. A group's local stage (the
+fencing check, the append and the fsync, under the broker's locks) takes a
+ticket in the order the groups are appended, which is offset order. Its
+replicate-and-commit stage (the `ReplicaAppend` round, the lease re-check
+and the commit advance) waits until every group with a lower ticket has
+finished its own; then the lead passes to the next request, whose group
+appends and fsyncs during this group's round. So the replication rounds run
+one at a time, in offset order, and a follower receives the groups in the
+order its base-offset check requires (two rounds from two threads can reach
+a follower's command channel in either order; the follower refuses the later
+one and the session resynchronises, which costs a quorum miss). A group that
+finishes its local stage while another replicates keeps the lead until its
+turn, so at most two groups are in flight. What a member's acknowledgement
+waits for does not move: its own group's fsync, a quorum covering its
+offsets, and the lease re-check at the commit advance. A quorum miss on one
+group with the next already appended is the ordinary case of a write that
+returned a quorum miss and may still commit later, and a producer's retry is
+deduplicated by its sequence; a failed fsync poisons the log's tail before
+its offsets advance, so the next group is appended where the failed one would
+have been, never past a hole; a lease lost after both local stages fences
+both groups at their commits. A group re-run request by request waits until
+no earlier group is replicating and does not overlap.
+`vtop_broker_group_commit_overlapped_total` counts the groups sealed while the
+previous group replicated. One producer never has two requests in the broker
+(the Kafka gateway answers a Produce request before reading the next from
+that connection), so a single producer forms groups of one; each partition is
+its own range with its own coordinator, and partitions never share a group. `max_delay_ms`
 defaults to 0 (natural batching): the leader seals what is queued when it
 takes the lead, and requests that arrive during its barrier form the next
 group, so a lone request pays nothing; a non-zero window is latency added to
