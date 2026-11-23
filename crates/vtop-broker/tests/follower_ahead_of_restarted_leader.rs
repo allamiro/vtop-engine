@@ -319,6 +319,26 @@ fn restarted_leader_behind_both_followers(
     Vec<Arc<InProcessFollower>>,
     impl Sized,
 ) {
+    let (outcome, followers, _on_time, plane) = stage_restart(tls, v2, floor, first_write, false);
+    (outcome, followers, plane)
+}
+
+/// `restarted_leader_behind_both_followers`, and with `late_first` the
+/// first follower's listener is bound, so the leader's dials queue at it,
+/// but its server serves nobody until the returned sender fires: the
+/// leader's first write is acknowledged by the other follower alone.
+fn stage_restart(
+    tls: bool,
+    v2: bool,
+    floor: u64,
+    first_write: FirstWrite,
+    late_first: bool,
+) -> (
+    Result<(), ErrorResponse>,
+    Vec<Arc<InProcessFollower>>,
+    Option<tokio::sync::oneshot::Sender<()>>,
+    impl Sized,
+) {
     let runtime: Runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -361,9 +381,17 @@ fn restarted_leader_behind_both_followers(
     let follower_certs = [cert_for(FOLLOWERS[0]), cert_for(FOLLOWERS[1])];
     let mut configs = Vec::new();
     let mut servers = Vec::new();
+    let mut late = None;
     for (index, node) in FOLLOWERS.into_iter().enumerate() {
         let handler = Arc::clone(&followers[index]) as Arc<dyn ReplicaPeerHandler>;
         let server_material = material(&follower_certs[index], &[&leader_certs]);
+        let gate = if late_first && index == 0 {
+            let (open, gate) = tokio::sync::oneshot::channel::<()>();
+            late = Some(open);
+            Some(gate)
+        } else {
+            None
+        };
         let (addr, handle): (SocketAddr, _) = runtime.block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -375,6 +403,9 @@ fn restarted_leader_behind_both_followers(
             let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
             let task = tokio::spawn(async move {
                 let _shutdown = shutdown;
+                if let Some(gate) = gate {
+                    let _ = gate.await;
+                }
                 let _ = server.serve(listener, shutdown_rx).await;
             });
             (addr, task.abort_handle())
@@ -451,6 +482,7 @@ fn restarted_leader_behind_both_followers(
     (
         outcome,
         followers,
+        late,
         (runtime, servers, leader, follower_dirs),
     )
 }
@@ -518,6 +550,83 @@ fn a_v2_leader_behind_its_followers_replaces_their_unacknowledged_tail_on_a_plai
 #[test]
 fn a_v2_leader_behind_its_followers_replaces_their_unacknowledged_tail_on_a_tls_plane() {
     a_leader_behind_its_followers_replaces_their_unacknowledged_tail(true, true);
+}
+
+/// The ordering the TLS runs of the test above hit by timing (#599, CI runs
+/// 45257666251 and 45265624166): one follower's session comes up only after
+/// the leader's first write was acknowledged by the other, so the leader's
+/// committed mark is already published when it connects. Here the first
+/// follower is served only once that write has returned, every time.
+///
+/// Before the fix the late session sent the mark first. The follower took it
+/// as `min(mark, its own log)`, which put its own record at offset 5 under
+/// the mark; the leader's append at 5 then conflicted below the mark, the
+/// truncation was refused, the session re-synchronised, and its status
+/// (9 records) pruned the append as delivered. The follower kept 9 records,
+/// one of them not the leader's under its committed mark.
+///
+/// Invariant: a mark never covers a follower's records the leader's append
+/// has not yet replaced. Both followers end holding exactly the leader's 6
+/// records and serve the leader's values, offset 5 included.
+fn a_late_follower_takes_the_leaders_append_before_its_mark(tls: bool, v2: bool) {
+    let (outcome, followers, late, _plane) = stage_restart(tls, v2, 0, FirstWrite::NewRecord, true);
+    assert!(
+        outcome.is_ok(),
+        "a quorum produce must succeed on the follower that is up; it was refused: {:?} \
+         (follower logs end at {} and {})",
+        outcome.err().map(|error| error.message),
+        followers[0].next_offset(),
+        followers[1].next_offset(),
+    );
+    assert_eq!(
+        followers[0].next_offset(),
+        SHARED + FOLLOWER_ONLY,
+        "precondition: the late follower has taken nothing yet"
+    );
+    late.expect("the first follower is the late one")
+        .send(())
+        .expect("its server is waiting to serve");
+    let expected = expected_after_new_record();
+    for (index, follower) in followers.iter().enumerate() {
+        assert!(
+            await_within(Duration::from_secs(10), || follower.next_offset()
+                == SHARED + 1),
+            "follower {index} must hold exactly the leader's {} records, not the {} it kept \
+             from before the restart: it holds {} (mark {})",
+            SHARED + 1,
+            SHARED + FOLLOWER_ONLY,
+            follower.next_offset(),
+            follower.cluster_committed().get(),
+        );
+        assert!(
+            await_within(Duration::from_secs(10), || served_values(follower)
+                == expected),
+            "follower {index} must serve the leader's records {expected:?}, its own record at \
+             offset 5 replaced; it serves {:?} (mark {})",
+            served_values(follower),
+            follower.cluster_committed().get(),
+        );
+    }
+}
+
+#[test]
+fn a_late_v1_follower_takes_the_leaders_append_before_its_mark_on_a_plaintext_plane() {
+    a_late_follower_takes_the_leaders_append_before_its_mark(false, false);
+}
+
+#[test]
+fn a_late_v1_follower_takes_the_leaders_append_before_its_mark_on_a_tls_plane() {
+    a_late_follower_takes_the_leaders_append_before_its_mark(true, false);
+}
+
+#[test]
+fn a_late_v2_follower_takes_the_leaders_append_before_its_mark_on_a_plaintext_plane() {
+    a_late_follower_takes_the_leaders_append_before_its_mark(false, true);
+}
+
+#[test]
+fn a_late_v2_follower_takes_the_leaders_append_before_its_mark_on_a_tls_plane() {
+    a_late_follower_takes_the_leaders_append_before_its_mark(true, true);
 }
 
 /// The client retries the record the leader lost, and the followers hold it
