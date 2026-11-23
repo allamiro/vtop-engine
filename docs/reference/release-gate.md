@@ -29,8 +29,8 @@ component is production, preview or experimental; the
 | Item | Value |
 |---|---|
 | Evaluated | 2026-11-22 |
-| Met | 16 |
-| Partial | 9 |
+| Met | 17 |
+| Partial | 8 |
 | Not met | 5 |
 | 1.0.0-rc.1 may be cut | no |
 | 1.0.0 may be cut | no |
@@ -53,7 +53,7 @@ only for a met row.
 | A2 | Fault and crash testing | met | (a) `.github/workflows/engine-crash-sweep.yml::sweep` kills `vtopctl run` at every failpoint on SQLite and PostgreSQL, Kafka, file and spool sources, a store outage and ENOSPC (`scripts/live-chaos/engine/run-sweep.sh`; #836, #871); [nightly of 2026-11-21](https://github.com/allamiro/vtop-engine/actions/runs/44916357611)). (b) `crates/vtop-log/tests/sim_crash_sweep.rs`; `.github/workflows/ci.yml::live-chaos`. | none | 2026-11-22 |
 | A3 | Long soak, engine 72 h and cluster 7 days | not met | The engine soak's driver and evaluator are built (`.github/workflows/soak.yml::soak-72h`; `docs/SOAK_VALIDATION.md`); no 72-hour or 7-day run has completed. | #726, #727 | 2026-11-22 |
 | A4 | Jepsen-style history check of the cluster plane | partial | Recorder and data-plane checker (`scripts/live-chaos/history/check_history.py`; #878), fed by scenarios 04 and 09 in `.github/workflows/ci.yml::live-chaos`. Lease and metadata histories, the 24-hour campaign and the live bug re-introductions are open. | #728 | 2026-11-22 |
-| A5 | Fuzz and mutation | partial | `.github/workflows/fuzz-nightly.yml::fuzz` over 12 decoders with a persisted corpus; `.github/workflows/ci.yml::mutants-gate` (`scripts/mutants-gate.py`); the recovery path's mutation score gated per file, nightly (`.github/workflows/fuzz-nightly.yml::mutants`; #900). The verify code (`vtop-upload`) and the file-continuity code (`vtop-adapters`) still score under the 0.80 floor and stay report only. | #729 | 2026-11-22 |
+| A5 | Fuzz and mutation | met | `.github/workflows/fuzz-nightly.yml::fuzz` over 12 decoders, an hour per target each night, with a persisted corpus, and a crash opens an issue; `.github/workflows/ci.yml::mutants-gate` (`scripts/mutants-gate.py`) on the state machine; the recovery path (#900), the verify path in `vtop-upload` (#922) and the file-continuity code in `vtop-adapters` (#919) gated per file at their measured scores, nightly (`.github/workflows/fuzz-nightly.yml::mutants`). | none | 2026-11-22 |
 | A6 | Every bug lands with a test that failed first | met | The rule in `CONTRIBUTING.md`; the release notes name the tests. | none | 2026-11-22 |
 | B1 | AWS S3 and one other S3 provider | not met | The live S3 tests run on every pull request against MinIO, RustFS, Garage, SeaweedFS, Versity and CloudServer, each with its capability file (`.github/workflows/ci.yml::s3-compat`, calling `.github/workflows/s3-compat-matrix.yml::leg`; `crates/vtop-upload/tests/live_s3_verification.rs`; `crates/vtop-s3-testkit`, #764). No AWS run is in CI yet: the `s3-aws` leg is configured and runs once v0.11.0 is released. A store without Object Lock or versioning is refused at startup (#770). | #722 | 2026-11-22 |
 | B2 | Real Kafka versions | met | `.github/workflows/kafka-matrix.yml::kafka` (Apache Kafka 3.7 to 4.4, TLS and SASL listeners, Redpanda; #834); `.github/workflows/kafka-cluster.yml::cluster` (three brokers, a leader stopped mid-read; #874). The [nightly of 2026-11-20](https://github.com/allamiro/vtop-engine/actions/runs/44730486247) passed; the nightly of 2026-11-21 failed one leg on a paused-partition race that #877 fixed the same day. | none | 2026-11-22 |

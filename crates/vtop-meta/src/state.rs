@@ -12,12 +12,13 @@
 //! dedup survives snapshot/restore identically on every replica.
 
 use crate::command::{
-    decode_promotion_outcome, encode_promotion_outcome, MetadataCommand, MetadataError,
-    MetadataResponse, NodeState, PromotionAttestation, PromotionOutcome, RangeAssignment,
-    VerificationMethod, MAX_ASSIGNED_RANGES, MAX_ATTESTATION_OPERATOR_BYTES, MAX_NODE_ADDR_BYTES,
-    MAX_RELEASE_BYTES, MAX_TIER_BACKEND_ID_BYTES, MAX_TIER_OBJECT_URI_BYTES,
+    decode_promotion_outcome, encode_promotion_outcome, Attribution, MetadataCommand,
+    MetadataError, MetadataResponse, NodeState, PromotionAttestation, PromotionOutcome,
+    RangeAssignment, VerificationMethod, MAX_ASSIGNED_RANGES, MAX_ATTESTATION_OPERATOR_BYTES,
+    MAX_NODE_ADDR_BYTES, MAX_RELEASE_BYTES, MAX_TIER_BACKEND_ID_BYTES, MAX_TIER_OBJECT_URI_BYTES,
     MAX_TIER_VERSION_ID_BYTES, MAX_TRANSITION_QUORUM, NODE_VERSION_REPORTS_FEATURE_LEVEL,
 };
+use crate::command::{COMMAND_KIND_ATTRIBUTED, SUBJECT_COMMAND};
 use crate::keys::{validate_group_name, validate_topic_name, MetaKey};
 use crate::placement::{
     select_replicas, PlacementCandidate, DEFAULT_PLACEMENT_WEIGHT, MAX_FAILURE_DOMAIN_BYTES,
@@ -33,6 +34,23 @@ use uuid::Uuid;
 
 /// FIFO capacity of the request dedup table, evicted in apply order.
 pub const DEDUP_CAPACITY: usize = 65_536;
+
+/// How many attributed commands the state remembers: the last 1024, evicted
+/// oldest first (#706).
+///
+/// A COUNT, not a time horizon, so eviction is a function of the log alone
+/// and every replica evicts the same entry. And a protocol constant tied to
+/// feature level 9, never a configuration key: two builds at one level with
+/// different tails would hold different state. A larger tail is a new level.
+/// At most about 230 bytes an entry, so the tail is at most about 240 KB of a
+/// snapshot, against a dedup table that can already be 2 MB.
+pub const AUDIT_TAIL_ENTRIES: usize = 1024;
+
+/// The most attributed entries a snapshot may hold when it is READ. Above
+/// [`AUDIT_TAIL_ENTRIES`] on purpose, so a later level can raise the tail it
+/// writes without a reader that predates it refusing the snapshot (the lesson
+/// of #657, which raised a value bound the same way).
+const MAX_SNAPSHOT_AUDIT_ENTRIES: usize = 16_384;
 
 /// Version byte stream prefix of the state-machine snapshot payload.
 const SNAPSHOT_PAYLOAD_VERSION: u16 = 1;
@@ -97,6 +115,15 @@ const VALUE_TAG_NODE_VERSION: u8 = 24;
 /// An operator's live promotion attestation (#636); written only by a
 /// command gated at feature level 8.
 const VALUE_TAG_PROMOTION_ATTESTATION: u8 = 25;
+/// One entry of the tail of attributed commands (#706, feature level 9).
+const VALUE_TAG_AUDIT_ENTRY: u8 = 26;
+
+const OUTCOME_APPLIED: u8 = 1;
+const OUTCOME_REJECTED: u8 = 2;
+
+/// Derive-key context of the digest that binds an actor to exactly one
+/// command after the log entry is purged.
+const AUDIT_SUBJECT_CONTEXT: &str = "vtop-meta attributed-subject v1";
 
 /// The replica set a range's quorum is counted over (#553).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -553,6 +580,59 @@ impl RangeTransitionRecord {
     }
 }
 
+/// What applying an attributed command came to (#706).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttributedOutcome {
+    /// The command was applied.
+    Applied,
+    /// The state machine rejected it deterministically; `error_kind` is the
+    /// rejection's wire kind. The actor is recorded all the same: an
+    /// operator who tried is as much a fact as one who succeeded.
+    Rejected { error_kind: u16 },
+}
+
+/// One entry of the bounded tail of attributed commands (#706): who asked for
+/// the command applied at the entry's key, and what became of it.
+///
+/// A FROZEN layout, deliberately not the output of
+/// [`crate::audit::command_audit`], whose parameter list may change between
+/// builds: two replicas at one level must store the same bytes. The command's
+/// parameters are not here: they are in the committed log while it is
+/// retained, in the state the command changed, and in the applied audit
+/// record written when it applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuditEntryRecord {
+    /// The command's request id: the key a client, an edge record and an
+    /// applied record already share.
+    pub request_id: Uuid,
+    /// The proposer's own clock, as the command carried it (0 when it
+    /// stamped none).
+    pub issued_at_ms: i64,
+    /// Who asked, from where, who checked and when.
+    pub attribution: Attribution,
+    /// The wire kind of the command that was attributed.
+    pub subject_kind: u16,
+    /// BLAKE3 derive-key (`vtop-meta attributed-subject v1`) of the command's
+    /// encoded bytes: the actor stays bound to exactly one command after the
+    /// log is purged.
+    pub subject_digest: [u8; 32],
+    pub outcome: AttributedOutcome,
+}
+
+/// The digest an [`AuditEntryRecord`] keeps of its command, and the command's
+/// wire kind; `None` for a command that cannot be encoded (never one a log
+/// holds).
+fn attributed_subject(subject: &MetadataCommand) -> Option<(u16, [u8; 32])> {
+    if matches!(subject, MetadataCommand::Attributed { .. }) {
+        return None;
+    }
+    let encoded = subject.encode().ok()?;
+    let kind = u16::from_be_bytes([*encoded.first()?, *encoded.get(1)?]);
+    let mut hasher = blake3::Hasher::new_derive_key(AUDIT_SUBJECT_CONTEXT);
+    hasher.update(&encoded);
+    Some((kind, *hasher.finalize().as_bytes()))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MetaValue {
     Node(NodeRecord),
@@ -576,6 +656,7 @@ pub enum MetaValue {
     RangeReplicaSet(RangeReplicaSetRecord),
     NodeVersion(NodeVersionRecord),
     PromotionAttestation(PromotionAttestation),
+    AuditEntry(AuditEntryRecord),
 }
 
 impl MetaValue {
@@ -904,6 +985,22 @@ impl MetaValue {
                 put_bounded_str(&mut out, &report.release, MAX_RELEASE_BYTES, "release")?;
                 put_u16(&mut out, report.max_replica_protocol);
                 put_u32(&mut out, report.supported_feature_level);
+            }
+            MetaValue::AuditEntry(entry) => {
+                put_u8(&mut out, VALUE_TAG_AUDIT_ENTRY);
+                put_uuid(&mut out, entry.request_id);
+                put_i64(&mut out, entry.issued_at_ms);
+                entry.attribution.encode_into(&mut out)?;
+                put_u8(&mut out, SUBJECT_COMMAND);
+                put_u16(&mut out, entry.subject_kind);
+                put_bytes32(&mut out, &entry.subject_digest);
+                match entry.outcome {
+                    AttributedOutcome::Applied => put_u8(&mut out, OUTCOME_APPLIED),
+                    AttributedOutcome::Rejected { error_kind } => {
+                        put_u8(&mut out, OUTCOME_REJECTED);
+                        put_u16(&mut out, error_kind);
+                    }
+                }
             }
         }
         Ok(out)
@@ -1321,6 +1418,55 @@ impl MetaValue {
                     });
                 }
                 MetaValue::NodeVersion(report)
+            }
+            VALUE_TAG_AUDIT_ENTRY => {
+                let request_id = reader.uuid("audit entry request id")?;
+                let issued_at_ms = reader.i64("audit entry issued-at millis")?;
+                let attribution = Attribution::decode_from(&mut reader)?;
+                let subject_tag = reader.u8("attribution subject")?;
+                if subject_tag != SUBJECT_COMMAND {
+                    return Err(CodecError::UnknownTag {
+                        what: "attribution subject",
+                        tag: u32::from(subject_tag),
+                    });
+                }
+                let subject_kind = reader.u16("audit entry subject kind")?;
+                // Depth one, as in the log: apply never attributes an
+                // attribution, so a record naming one was not written by it.
+                if subject_kind == 0 || subject_kind == COMMAND_KIND_ATTRIBUTED {
+                    return Err(CodecError::InvalidValue {
+                        what: "audit entry",
+                        reason: "the attributed command's kind is not a command's",
+                    });
+                }
+                let subject_digest = reader.bytes32("audit entry subject digest")?;
+                let outcome = match reader.u8("audit outcome")? {
+                    OUTCOME_APPLIED => AttributedOutcome::Applied,
+                    OUTCOME_REJECTED => {
+                        let error_kind = reader.u16("audit entry error kind")?;
+                        if error_kind == 0 {
+                            return Err(CodecError::InvalidValue {
+                                what: "audit entry",
+                                reason: "a rejection names no error kind",
+                            });
+                        }
+                        AttributedOutcome::Rejected { error_kind }
+                    }
+                    other => {
+                        return Err(CodecError::UnknownTag {
+                            what: "audit outcome",
+                            tag: u32::from(other),
+                        });
+                    }
+                };
+                MetaValue::AuditEntry(AuditEntryRecord {
+                    request_id,
+                    issued_at_ms,
+                    attribution,
+                    subject_kind,
+                    subject_digest,
+                    outcome,
+                })
             }
             other => {
                 return Err(CodecError::UnknownTag {
@@ -1936,9 +2082,90 @@ impl MetaStateMachine {
         if let Some(original) = self.dedup_responses.get(&request_id) {
             return original.clone();
         }
-        let response = self.apply_inner(apply_index, command);
+        let response = match command {
+            // The subject is applied exactly as it would be bare, and then
+            // who asked is recorded. A retry that hit the dedup table above
+            // returned before this point: it records nothing, so a retry,
+            // even one from another identity, never rewrites who acted.
+            MetadataCommand::Attributed {
+                attribution,
+                subject,
+            } => {
+                let response = self.apply_inner(apply_index, subject);
+                self.record_attribution(apply_index, attribution, subject, &response);
+                response
+            }
+            _ => self.apply_inner(apply_index, command),
+        };
         self.remember(request_id, response.clone());
         response
+    }
+
+    /// The tail of attributed commands, oldest first (#706): at most
+    /// [`AUDIT_TAIL_ENTRIES`] entries, each with the apply index it was
+    /// recorded at.
+    pub fn audit_tail(&self) -> impl Iterator<Item = (u64, &AuditEntryRecord)> {
+        self.records
+            .range(
+                MetaKey::AuditEntry { apply_index: 0 }.encode()..=MetaKey::AuditEntry {
+                    apply_index: u64::MAX,
+                }
+                .encode(),
+            )
+            .filter_map(|(key, value)| match (MetaKey::decode(key), value) {
+                (Ok(MetaKey::AuditEntry { apply_index }), MetaValue::AuditEntry(entry)) => {
+                    Some((apply_index, entry))
+                }
+                _ => None,
+            })
+    }
+
+    fn record_attribution(
+        &mut self,
+        apply_index: u64,
+        attribution: &Attribution,
+        subject: &MetadataCommand,
+        response: &MetadataResponse,
+    ) {
+        // Apply records what a log can hold; a command that cannot encode
+        // never reached one.
+        let Some((subject_kind, subject_digest)) = attributed_subject(subject) else {
+            return;
+        };
+        let outcome = match response {
+            MetadataResponse::Rejected(error) => AttributedOutcome::Rejected {
+                error_kind: error.wire_kind(),
+            },
+            _ => AttributedOutcome::Applied,
+        };
+        self.records.insert(
+            MetaKey::AuditEntry { apply_index }.encode(),
+            MetaValue::AuditEntry(AuditEntryRecord {
+                request_id: subject.envelope().request_id,
+                issued_at_ms: subject.envelope().issued_at_ms,
+                attribution: attribution.clone(),
+                subject_kind,
+                subject_digest,
+                outcome,
+            }),
+        );
+        let low = MetaKey::AuditEntry { apply_index: 0 }.encode();
+        let high = MetaKey::AuditEntry {
+            apply_index: u64::MAX,
+        }
+        .encode();
+        let held = self.records.range(low.clone()..=high.clone()).count();
+        if held > AUDIT_TAIL_ENTRIES {
+            let evicted: Vec<Vec<u8>> = self
+                .records
+                .range(low..=high)
+                .take(held - AUDIT_TAIL_ENTRIES)
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in evicted {
+                self.records.remove(&key);
+            }
+        }
     }
 
     fn remember(&mut self, request_id: Uuid, response: MetadataResponse) {
@@ -2064,6 +2291,11 @@ impl MetaStateMachine {
             } => {
                 self.set_range_replica_set(*topic_uuid, *range_uuid, members, *expected_generation)
             }
+            // Reached only by an attribution inside an attribution, which no
+            // log holds (the codec refuses it) and `apply` never builds.
+            MetadataCommand::Attributed { .. } => reject(MetadataError::invalid_transition(
+                "an attributed command cannot carry an attributed command",
+            )),
             MetadataCommand::AttestUnprovenPromotion {
                 env,
                 topic_uuid,
@@ -5826,6 +6058,7 @@ impl MetaStateMachine {
                 maximum: MAX_SNAPSHOT_RECORDS as usize,
             })?;
         put_u32(&mut out, record_count);
+        let mut audit_entries = 0usize;
         for (key, value) in &self.records {
             if key.len() > MAX_SNAPSHOT_KEY_BYTES {
                 return Err(CodecError::BoundExceeded {
@@ -5841,7 +6074,9 @@ impl MetaStateMachine {
             // the reader refuses fails HERE, where it was written, and not
             // on the restart of a voter or the catch-up of a follower that
             // is sent it - each of which costs the metadata tier a member.
-            read_snapshot_record(&MetaKey::decode(key)?, &encoded)?;
+            let typed_key = MetaKey::decode(key)?;
+            read_snapshot_record(&typed_key, &encoded)?;
+            count_audit_entry(&typed_key, &mut audit_entries)?;
             put_u32(&mut out, encoded.len() as u32);
             out.extend_from_slice(&encoded);
         }
@@ -5882,6 +6117,7 @@ impl MetaStateMachine {
         }
         let mut records = BTreeMap::new();
         let mut previous_key: Option<Vec<u8>> = None;
+        let mut audit_entries = 0usize;
         for _ in 0..record_count {
             let key_len = reader.u16("snapshot key length")? as usize;
             if key_len > MAX_SNAPSHOT_KEY_BYTES {
@@ -5899,6 +6135,7 @@ impl MetaStateMachine {
                 });
             }
             let typed_key = MetaKey::decode(&key)?;
+            count_audit_entry(&typed_key, &mut audit_entries)?;
             let value_len = reader.u32("snapshot value length")? as usize;
             check_snapshot_value_len(value_len)?;
             let value =
@@ -5936,6 +6173,23 @@ impl MetaStateMachine {
             dedup_responses,
         })
     }
+}
+
+/// Count one entry of the attributed tail, refusing a snapshot that holds more
+/// than a reader will ever accept (#706): the tail is bounded on write by
+/// `apply` and on read here, and the read bound is the larger.
+fn count_audit_entry(key: &MetaKey, held: &mut usize) -> Result<(), CodecError> {
+    if matches!(key, MetaKey::AuditEntry { .. }) {
+        *held += 1;
+        if *held > MAX_SNAPSHOT_AUDIT_ENTRIES {
+            return Err(CodecError::BoundExceeded {
+                what: "audit entry count",
+                actual: *held,
+                maximum: MAX_SNAPSHOT_AUDIT_ENTRIES,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn check_snapshot_value_len(len: usize) -> Result<(), CodecError> {
@@ -6046,6 +6300,7 @@ fn key_matches_value(key: &MetaKey, value: &MetaValue) -> bool {
                 MetaValue::PromotionAttestation(_)
             )
             | (MetaKey::NodeVersion { .. }, MetaValue::NodeVersion(_))
+            | (MetaKey::AuditEntry { .. }, MetaValue::AuditEntry(_))
     )
 }
 
@@ -10645,6 +10900,28 @@ mod tests {
         }
     }
 
+    /// The largest entry of the attributed tail (#706): the certificate name
+    /// at its bound, an IPv6 peer and a rejection.
+    fn largest_audit_entry() -> AuditEntryRecord {
+        AuditEntryRecord {
+            request_id: Uuid::from_u128(u128::MAX),
+            issued_at_ms: i64::MAX,
+            attribution: Attribution {
+                actor: crate::command::CommandActor::Named(
+                    "c".repeat(crate::command::MAX_ACTOR_NAME_BYTES),
+                ),
+                peer: Some(std::net::IpAddr::from([0xff; 16])),
+                vouched_by: u64::MAX,
+                recorded_at_ms: i64::MAX,
+            },
+            subject_kind: u16::MAX,
+            subject_digest: [0xff; 32],
+            outcome: AttributedOutcome::Rejected {
+                error_kind: u16::MAX,
+            },
+        }
+    }
+
     /// The largest attestation (#636): the operator name at its bound.
     fn largest_attestation() -> PromotionAttestation {
         PromotionAttestation {
@@ -10689,7 +10966,7 @@ mod tests {
     /// Every [`MetaValue`] kind, numbered by an exhaustive match: a new
     /// kind does not compile until it is numbered here, and is then missing
     /// from the largest-record test below until a record is added for it.
-    const META_VALUE_KINDS: usize = 21;
+    const META_VALUE_KINDS: usize = 22;
     fn meta_value_kind(value: &MetaValue) -> usize {
         match value {
             MetaValue::Node(_) => 0,
@@ -10713,6 +10990,7 @@ mod tests {
             MetaValue::RangeReplicaSet(_) => 18,
             MetaValue::NodeVersion(_) => 19,
             MetaValue::PromotionAttestation(_) => 20,
+            MetaValue::AuditEntry(_) => 21,
         }
     }
 
@@ -10971,6 +11249,11 @@ mod tests {
                 171,
                 false,
             ),
+            // tag 1 + request id 16 + issued-at 8 + attribution (actor 1 + 2
+            // + MAX_ACTOR_NAME_BYTES 128, peer 1 + 16, vouching node 8,
+            // recorded-at 8) + subject tag 1 + subject kind 2 + digest 32 +
+            // a rejected outcome (1 + 2): 227 bytes (#706, feature level 9).
+            (MetaValue::AuditEntry(largest_audit_entry()), 227, false),
         ]
     }
 
@@ -11719,5 +12002,320 @@ mod closed_enum_newer_tests {
         .unwrap();
         let error = MetaValue::decode(&bytes[..bytes.len() - 1]).unwrap_err();
         assert!(matches!(reported(&error), MetaStoreError::Corrupt { .. }));
+    }
+}
+
+/// #706: the attributed command and the bounded tail it leaves.
+#[cfg(test)]
+mod attributed_tail_tests {
+    use super::*;
+    use crate::command::{CommandActor, CommandEnvelope};
+    use crate::storage::{codec_corrupt, MetaStoreError};
+    use std::path::Path;
+
+    fn env(request: u128) -> CommandEnvelope {
+        CommandEnvelope {
+            request_id: Uuid::from_u128(request),
+            issued_at_ms: 1_750_000_000_000,
+        }
+    }
+
+    fn register(request: u128, node: u128) -> MetadataCommand {
+        MetadataCommand::RegisterNode {
+            env: env(request),
+            node_uuid: Uuid::from_u128(node),
+            addr: "10.0.0.1:9200".to_owned(),
+            expected_generation: None,
+        }
+    }
+
+    fn attribution(name: &str) -> Attribution {
+        Attribution {
+            actor: CommandActor::Named(name.to_owned()),
+            peer: Some("192.0.2.1".parse().unwrap()),
+            vouched_by: 1,
+            recorded_at_ms: 1_750_000_000_900,
+        }
+    }
+
+    fn by(name: &str, subject: MetadataCommand) -> MetadataCommand {
+        MetadataCommand::Attributed {
+            attribution: attribution(name),
+            subject: Box::new(subject),
+        }
+    }
+
+    /// The state with the tail taken out: what applying the subject did.
+    fn without_tail(machine: &MetaStateMachine) -> MetaStateMachine {
+        let mut stripped = machine.clone();
+        let tail: Vec<_> = machine
+            .audit_tail()
+            .map(|(apply_index, _)| MetaKey::AuditEntry { apply_index }.encode())
+            .collect();
+        for key in tail {
+            stripped.records.remove(&key);
+        }
+        stripped
+    }
+
+    /// Applying a command with its actor does what applying it bare does,
+    /// with the same response, and then records who asked.
+    #[test]
+    fn an_attributed_command_applies_as_the_bare_command_and_records_its_actor() {
+        let mut bare = MetaStateMachine::new();
+        let mut wrapped = MetaStateMachine::new();
+        let subjects = [register(1, 10), register(2, 11), register(3, 10)];
+        for (index, subject) in subjects.iter().enumerate() {
+            let index = index as u64 + 1;
+            let expected = bare.apply(index, subject);
+            let response = wrapped.apply(index, &by("ops-alice", subject.clone()));
+            assert_eq!(response, expected, "index {index}");
+        }
+        assert_eq!(
+            without_tail(&wrapped),
+            bare,
+            "the actor must change nothing the command did"
+        );
+        let tail: Vec<_> = wrapped.audit_tail().collect();
+        assert_eq!(tail.len(), 3);
+        let (index, entry) = tail[0];
+        assert_eq!(index, 1);
+        assert_eq!(entry.request_id, Uuid::from_u128(1));
+        assert_eq!(entry.issued_at_ms, 1_750_000_000_000);
+        assert_eq!(entry.attribution, attribution("ops-alice"));
+        assert_eq!(entry.subject_kind, 1, "RegisterNode is kind 1");
+        assert_eq!(entry.outcome, AttributedOutcome::Applied);
+        let (_, digest_of_same) = attributed_subject(&subjects[0]).unwrap();
+        assert_eq!(entry.subject_digest, digest_of_same);
+        let (_, other_digest) = attributed_subject(&subjects[1]).unwrap();
+        assert_ne!(entry.subject_digest, other_digest);
+        // The third register of node 10 is a rejection, and its actor is
+        // recorded all the same, with the error's kind.
+        let (_, rejected) = tail[2];
+        assert_eq!(
+            rejected.outcome,
+            AttributedOutcome::Rejected {
+                error_kind: MetadataError::AlreadyExists.wire_kind()
+            }
+        );
+    }
+
+    /// A retry returns the original answer and appends no entry: whoever
+    /// asked the second time, the log still says who acted.
+    #[test]
+    fn a_retry_records_nothing_and_never_rewrites_who_acted() {
+        let mut machine = MetaStateMachine::new();
+        let first = machine.apply(1, &by("ops-alice", register(1, 10)));
+        let retried = machine.apply(2, &by("ops-mallory", register(1, 10)));
+        let bare_retry = machine.apply(3, &register(1, 10));
+        assert_eq!(first, retried);
+        assert_eq!(first, bare_retry);
+        let tail: Vec<_> = machine.audit_tail().collect();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(
+            tail[0].1.attribution.actor,
+            CommandActor::Named("ops-alice".to_owned())
+        );
+        // And the other way: a bare command first, then a retry that names an
+        // actor, leaves the tail empty: nobody is credited with it.
+        let mut bare_first = MetaStateMachine::new();
+        bare_first.apply(1, &register(1, 10));
+        bare_first.apply(2, &by("ops-mallory", register(1, 10)));
+        assert_eq!(bare_first.audit_tail().count(), 0);
+    }
+
+    /// The tail is the last 1024, evicting the oldest, and the eviction is a
+    /// function of the log: two replicas hold the same bytes.
+    #[test]
+    fn the_tail_keeps_the_last_entries_and_evicts_the_oldest() {
+        let mut machine = MetaStateMachine::new();
+        let mut twin = MetaStateMachine::new();
+        let total = AUDIT_TAIL_ENTRIES as u128 + 10;
+        for request in 1..=total {
+            let command = by("ops", register(request, request));
+            machine.apply(request as u64, &command);
+            twin.apply(request as u64, &command);
+        }
+        let indices: Vec<u64> = machine.audit_tail().map(|(index, _)| index).collect();
+        assert_eq!(indices.len(), AUDIT_TAIL_ENTRIES);
+        assert_eq!(indices.first(), Some(&11), "the ten oldest went");
+        assert_eq!(indices.last(), Some(&(total as u64)));
+        assert!(indices.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(
+            machine.encode_snapshot().unwrap(),
+            twin.encode_snapshot().unwrap()
+        );
+    }
+
+    /// The tail travels in a snapshot and comes back byte for byte, so a
+    /// replica that restarts or installs one still knows who asked.
+    #[test]
+    fn the_tail_survives_a_snapshot_round_trip() {
+        let mut machine = MetaStateMachine::new();
+        machine.apply(1, &by("ops-alice", register(1, 10)));
+        machine.apply(2, &by("ops-bob", register(2, 10)));
+        let encoded = machine.encode_snapshot().unwrap();
+        let restored = MetaStateMachine::decode_snapshot(&encoded).unwrap();
+        assert_eq!(restored, machine);
+        assert_eq!(restored.encode_snapshot().unwrap(), encoded);
+        assert_eq!(
+            restored.audit_tail().map(|(i, _)| i).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    /// An attribution inside an attribution is never applied as one.
+    #[test]
+    fn a_nested_attribution_is_rejected_and_records_nothing() {
+        let mut machine = MetaStateMachine::new();
+        let nested = by("ops", by("ops", register(1, 10)));
+        assert!(matches!(
+            machine.apply(1, &nested),
+            MetadataResponse::Rejected(MetadataError::InvalidTransition(_))
+        ));
+        assert_eq!(machine.record_count(), 0);
+    }
+
+    fn entry() -> AuditEntryRecord {
+        AuditEntryRecord {
+            request_id: Uuid::from_u128(1),
+            issued_at_ms: 2,
+            attribution: attribution("ops"),
+            subject_kind: 3,
+            subject_digest: [4; 32],
+            outcome: AttributedOutcome::Applied,
+        }
+    }
+
+    #[test]
+    fn a_record_of_the_tail_must_sit_under_its_own_key_category() {
+        let mut machine = MetaStateMachine::new();
+        // A tail entry under a node's key, and a node under a tail key.
+        machine.records.insert(
+            MetaKey::Node {
+                node_uuid: Uuid::from_u128(1),
+            }
+            .encode(),
+            MetaValue::AuditEntry(entry()),
+        );
+        assert!(machine.encode_snapshot().is_err());
+        let mut machine = MetaStateMachine::new();
+        machine.records.insert(
+            MetaKey::AuditEntry { apply_index: 1 }.encode(),
+            MetaValue::ClusterConfig(ClusterConfigRecord { feature_level: 9 }),
+        );
+        assert!(machine.encode_snapshot().is_err());
+    }
+
+    /// A reader accepts up to 16384 entries so a later level can write a
+    /// longer tail; a snapshot above that is refused where it is read.
+    #[test]
+    fn a_snapshot_with_more_tail_entries_than_any_reader_accepts_is_refused() {
+        let build = |entries: usize| {
+            let mut machine = MetaStateMachine::new();
+            for apply_index in 0..entries as u64 {
+                machine.records.insert(
+                    MetaKey::AuditEntry { apply_index }.encode(),
+                    MetaValue::AuditEntry(entry()),
+                );
+            }
+            machine
+        };
+        // More than the apply bound, up to the read bound: accepted.
+        let longer = build(AUDIT_TAIL_ENTRIES * 2);
+        let encoded = longer.encode_snapshot().unwrap();
+        assert_eq!(MetaStateMachine::decode_snapshot(&encoded).unwrap(), longer);
+        let over = build(MAX_SNAPSHOT_AUDIT_ENTRIES + 1);
+        assert!(matches!(
+            over.encode_snapshot(),
+            Err(CodecError::BoundExceeded {
+                what: "audit entry count",
+                ..
+            })
+        ));
+        // And on the reading side alone: write the longest accepted and
+        // append one record's worth by hand.
+        let exact = build(MAX_SNAPSHOT_AUDIT_ENTRIES);
+        assert!(MetaStateMachine::decode_snapshot(&exact.encode_snapshot().unwrap()).is_ok());
+    }
+
+    fn reported(error: &CodecError) -> MetaStoreError {
+        codec_corrupt(Path::new("snapshot"), error)
+    }
+
+    /// A record of the tail with an actor, a subject or an outcome this build
+    /// does not know was written by a later level: a newer format.
+    #[test]
+    fn an_unknown_tag_in_a_tail_record_reads_as_a_newer_format() {
+        let bytes = MetaValue::AuditEntry(AuditEntryRecord {
+            attribution: Attribution {
+                actor: CommandActor::Anonymous,
+                peer: None,
+                vouched_by: 1,
+                recorded_at_ms: 2,
+            },
+            ..entry()
+        })
+        .encode()
+        .unwrap();
+        // tag 1, request id 16, issued-at 8: the actor tag; then the peer
+        // tag, the vouching node and the clock (1 + 1 + 8 + 8); the subject
+        // tag, the kind (2) and the digest (32): the outcome.
+        let actor_at = 1 + 16 + 8;
+        let subject_at = actor_at + 1 + 1 + 8 + 8;
+        let outcome_at = subject_at + 1 + 2 + 32;
+        for (at, expected, what) in [
+            (actor_at, 4u8, "attribution actor"),
+            (actor_at + 1, 0, "attribution peer"),
+            (subject_at, 1, "attribution subject"),
+            (outcome_at, 1, "audit outcome"),
+        ] {
+            assert_eq!(bytes[at], expected, "{what}: the layout moved");
+            let mut newer = bytes.clone();
+            newer[at] = 0x7f;
+            let error = MetaValue::decode(&newer).unwrap_err();
+            assert_eq!(error, CodecError::UnknownTag { what, tag: 0x7f });
+            assert!(
+                matches!(reported(&error), MetaStoreError::NewerFormat { .. }),
+                "{what}"
+            );
+        }
+        assert_eq!(
+            bytes.len(),
+            outcome_at + 1,
+            "an applied outcome is one byte"
+        );
+    }
+
+    #[test]
+    fn a_tail_record_apply_never_writes_is_refused() {
+        let encode = |entry: AuditEntryRecord| MetaValue::AuditEntry(entry).encode().unwrap();
+        for bad in [
+            AuditEntryRecord {
+                subject_kind: 0,
+                ..entry()
+            },
+            AuditEntryRecord {
+                subject_kind: COMMAND_KIND_ATTRIBUTED,
+                ..entry()
+            },
+            AuditEntryRecord {
+                outcome: AttributedOutcome::Rejected { error_kind: 0 },
+                ..entry()
+            },
+        ] {
+            assert!(
+                matches!(
+                    MetaValue::decode(&encode(bad.clone())),
+                    Err(CodecError::InvalidValue { .. })
+                ),
+                "{bad:?}"
+            );
+        }
+        let ok = encode(entry());
+        assert!(MetaValue::decode(&ok).is_ok());
+        let mut trailing = ok;
+        trailing.push(0);
+        assert_eq!(MetaValue::decode(&trailing), Err(CodecError::Trailing(1)));
     }
 }
