@@ -83,7 +83,7 @@ def complete_rows(env):
     return rows
 
 
-def write_run(directory, env, rows, columns=schema.COLUMNS_V2):
+def write_run(directory, env, rows, columns=schema.COLUMNS_V3):
     os.makedirs(directory, exist_ok=True)
     with open(os.path.join(directory, "environment.json"), "w") as handle:
         json.dump(env, handle)
@@ -106,7 +106,7 @@ def rewrite(run_dir, mutate):
         rows = list(csv.DictReader(handle))
     rows = mutate(rows)
     with open(path, "w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=schema.COLUMNS_V2)
+        writer = csv.DictWriter(handle, fieldnames=schema.COLUMNS_V3)
         writer.writeheader()
         writer.writerows(rows)
 

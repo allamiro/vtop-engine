@@ -688,13 +688,15 @@ def check_run(run_dir: str) -> Completeness:
 
 
 def check_versions(environment: dict[str, Any], csv_version: int) -> None:
-    """environment.json and results.csv are written together: from schema 3 on the two carry the same
-    number, so a schema-4 CSV under an older environment, or the reverse, is two harnesses' files in one
-    directory."""
+    """environment.json and results.csv are written together: a schema-4 CSV under an older environment, or
+    the reverse, is two harnesses' files in one directory."""
     version = environment.get("schema_version", 1)
-    if (csv_version >= 3 or version >= 3) and csv_version != version:
-        raise ReportRefused(f"results.csv has the schema-{csv_version} columns but environment.json has "
-                            f"schema_version {version}: they were not written together")
+    if csv_version == 4 and version < 4:
+        raise ReportRefused(f"results.csv has the schema-4 columns but environment.json has schema_version "
+                            f"{version}: they were not written together")
+    if csv_version < 4 and version >= 4:
+        raise ReportRefused(f"environment.json has schema_version {version} but results.csv has the "
+                            f"schema-{csv_version} columns: they were not written together")
 
 
 def check_resources(rows: list[dict[str, str]], matrix: dict[str, Any]) -> None:

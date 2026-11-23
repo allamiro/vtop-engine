@@ -173,8 +173,8 @@ refused row), a sidecar `e2e_hist.csv` (one line per ok `e2e` row and 1 ms bucke
 `group_commit`, then `bucket_ms` with 60000 meaning 60 s or more, and `count`; the counts must sum to the row's
 `records`, and the row's percentiles must be the histogram's), and two matrix keys, `resources` (every ok measured
 row carries its resources) and `e2e.extra_profiles` (profiles Kafka alone is also measured under, end-to-end only,
-at the common rate). It is written with `environment.json` `schema_version` 4, and from schema 3 on the two are
-refused when they disagree. Schemas 1 to 3 still load, and their reports are unchanged byte for byte: the columns
+at the common rate). It is written with `environment.json` `schema_version` 4, and the two are refused when
+one is schema 4 and the other is not. Schemas 1 to 3 still load, and their reports are unchanged byte for byte: the columns
 a row predates read as blank.
 
 Schema 3 (#752, the `group_commit` column) and schema 2 (no `group_commit` column, read with a blank setting)

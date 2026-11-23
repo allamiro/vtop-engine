@@ -1,10 +1,10 @@
 """The arithmetic and the refusals behind the end-to-end CDF, the resource charts and the profile latency chart
-(#596, #600): pure functions over a loaded schema-3 run, so nothing here needs matplotlib. The images themselves
+(#596, #600): pure functions over a loaded schema-4 run, so nothing here needs matplotlib. The images themselves
 are in test_kafka_compare_extra_report.py."""
 import os
 
 import pytest
-from test_kafka_compare_schema_v3 import V3, env3, make, rows3
+from test_kafka_compare_schema_v4 import V3, env3, make, rows3
 
 from kafka_compare import colours, e2e, extra_charts, report, run_outputs, schema
 
@@ -25,11 +25,11 @@ def report_matrix():
 
 
 def report_run(tmp_path, mutate=None, matrix=None):
-    """A complete schema-3 run whose end-to-end rows carry a different histogram per configuration."""
+    """A complete schema-4 run whose end-to-end rows carry a different histogram per configuration."""
     from test_kafka_compare_report import COMPARABLE
 
     env = env3(matrix or report_matrix())
-    env["comparable"] = {**COMPARABLE, "host_disk": "Test SSD, SSD, NVMe, ext4"}
+    env["comparable"] = {**COMPARABLE, "host_disk": "Test SSD, SSD, NVMe, ext4", "vtop_group_commit": {"settings": {}}}
     env.update(started_at="2026-11-09T00:00:00+00:00", finished_at="2026-11-09T01:00:00+00:00",
                other_containers_at_start_count=0)
     rows = rows3(env)
@@ -106,7 +106,7 @@ def test_a_latency_cell_is_the_median_and_range_over_the_repetitions(tmp_path):
     cell = extra_charts.e2e_cell(run.rows, "kafka", "defaults", 100, "lat_p99_ms")
     assert (cell["n"], cell["ok"], cell["sustained"], cell["offered"]) == (2, 2, True, 500)
     assert cell["summary"].median == e2e.percentile_ms(CONFIG_HISTS[("kafka", "defaults")], 99, 100)
-    assert extra_charts.configs(run.rows) == list(extra_charts.CONFIGS)
+    assert extra_charts.configs(run.rows) == [(*config, "") for config in extra_charts.CONFIGS]
 
 
 def test_a_not_sustained_repetition_makes_the_cell_not_sustained(tmp_path):
@@ -212,9 +212,10 @@ def test_a_zero_is_the_digit_zero_and_a_bar_label_never_runs_wide():
 
 def test_the_report_text_that_says_a_measurement_is_missing_is_replaced_only_for_a_run_that_has_it(tmp_path):
     old = {"matrix": {"load_pcts": [25]}}
-    assert report.reading(old) == report.READING
+    assert report.reading(old, 25, False) == report.reading({"matrix": {}}, 25, False)
+    assert "unrecorded probe" in report.reading(old, 25, False)
     run = schema.load_run(report_run(tmp_path))
-    text = report.reading(run.environment)
+    text = report.reading(run.environment, 25, False)
     assert "unrecorded probe" not in text and "phase-2 item" not in text
     assert "CPU and bytes written" in text
     assert "not measured yet" in report.known_gaps({"matrix": {"record_sizes": [100], "partitions": [1],

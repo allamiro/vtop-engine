@@ -1227,7 +1227,7 @@ def check_args(args: argparse.Namespace) -> tuple[list[int], dict[int, int]]:
 def build_matrix(args: argparse.Namespace, sizes: list[int], sat_records: dict[int, int]) -> dict[str, Any]:
     """The matrix this invocation runs, as environment.json records it. The
     schema-2 axes say what the phase-1 shape does: one compression, one
-    profile, Kafka-relative rates. Schema 3 adds the resource windows and the
+    profile, Kafka-relative rates. Schema 4 adds the resource windows and the
     end-to-end stage (at the common rate, with Kafka also under `fsync-parity`),
     each switched off by its own flag."""
     load_pcts = list(stats.LOAD_FRACTIONS)

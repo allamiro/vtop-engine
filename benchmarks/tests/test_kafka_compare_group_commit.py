@@ -48,7 +48,7 @@ def axis_run(tmp_path):
     return write_run(str(tmp_path / "run"), env, complete_rows(env))
 
 
-def rewrite_rows(directory, mutate, columns=schema.COLUMNS):
+def rewrite_rows(directory, mutate, columns=schema.COLUMNS_V3):
     path = os.path.join(directory, "results.csv")
     with open(path, newline="") as handle:
         rows = list(csv.DictReader(handle))
@@ -105,10 +105,11 @@ def test_the_plan_names_the_settings_it_will_run():
 # ---------------------------------------------------------------- the schema
 
 
-def test_results_schema_is_3_and_the_v2_layout_is_kept():
-    assert schema.SCHEMA_VERSION == 3
-    assert "group_commit" in schema.COLUMNS and "group_commit" not in schema.COLUMNS_V2
-    assert [c for c in schema.COLUMNS if c != "group_commit"] == list(schema.COLUMNS_V2)
+def test_results_schema_3_adds_group_commit_and_the_v2_layout_is_kept():
+    assert schema.SCHEMA_VERSION >= 3
+    assert "group_commit" in schema.COLUMNS_V3 and "group_commit" in schema.COLUMNS
+    assert "group_commit" not in schema.COLUMNS_V2
+    assert [c for c in schema.COLUMNS_V3 if c != "group_commit"] == list(schema.COLUMNS_V2)
     assert schema.KEY[schema.KEY.index("profile") + 1] == "group_commit"
 
 
@@ -420,7 +421,7 @@ def test_environment_capture_records_the_settings_and_configs(monkeypatch, tmp_p
     configs = {"off": run.leader_config(LEADER, "off", {"enabled"}), "on": run.leader_config(LEADER, "on", {"enabled"})}
     env = run.capture_environment("r", {"group_commits": ["off", "on"]}, "vtop-bench:x", {"cpus": "2"}, "disk",
                                   group_commit_configs=configs)
-    assert env["schema_version"] == 3
+    assert env["schema_version"] == schema.SCHEMA_VERSION
     assert env["comparable"]["vtop_group_commit"] == {"settings": SETTINGS}
     assert env["configs"]["vtop_leader_group_commit_on"] == configs["on"]
     assert env["configs"]["vtop_leader_group_commit_off"] == configs["off"]

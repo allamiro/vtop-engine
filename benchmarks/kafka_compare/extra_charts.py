@@ -1,6 +1,6 @@
 """The end-to-end latency CDF, the resource charts and the profile latency chart (#596 metrics 3 and 4, #600).
 
-Drawn from a schema-3 run loaded by `schema.load_run`: its `e2e` rows and their 1 ms histograms (`run.hist`),
+Drawn from a schema-4 run loaded by `schema.load_run`: its `e2e` rows and their 1 ms histograms (`run.hist`),
 and the `delivered_bytes`, `cpu_seconds` and `disk_write_bytes` columns of its measured rows. Nothing here reads
 a file or types a number: a figure is the CSV's, or a quotient of two of the CSV's.
 
@@ -39,13 +39,27 @@ IMAGES = {"e2e-cdf": "kafka-compare-e2e-cdf", "resources": "kafka-compare-resour
           "profile-latency": "kafka-compare-profile-latency"}
 
 
-def label_of(config: tuple[str, str]) -> str:
-    return CONFIG_LABEL[CONFIG_NAME[config]]
+# A configuration is (system, profile) or, read from a run's rows, (system, profile, group_commit): VTOP's
+# group-commit setting (#752) is its own configuration when the run varied it, "" otherwise.
 
 
-def config_style(config: tuple[str, str]) -> dict[str, str]:
-    """Colour (the registry's, by system), marker, hatch and line style of one configuration."""
-    return {"color": colours.colour(config[0], "light"), **_STYLE[config]}
+def _setting(config: tuple[str, ...]) -> str:
+    return config[2] if len(config) > 2 else ""
+
+
+def label_of(config: tuple[str, ...]) -> str:
+    setting = _setting(config)
+    if setting:
+        return f"VTOP, group commit {setting}"
+    return CONFIG_LABEL[CONFIG_NAME[config[:2]]]
+
+
+def config_style(config: tuple[str, ...]) -> dict[str, str]:
+    """Colour (the registry's, by system), marker, hatch and line style of one configuration; a VTOP
+    group-commit setting takes the throughput report's style for it."""
+    setting = _setting(config)
+    style = base.GROUP_COMMIT_STYLE[setting] if setting else _STYLE[config[:2]]
+    return {"color": colours.colour(config[0], "light"), **style}
 
 
 # ------------------------------------------------------------------------------------------ arithmetic
@@ -122,15 +136,26 @@ def basis_text(env: dict[str, Any]) -> str:
     return f"{config['load_pct']}% of {who} median saturation for the cell"
 
 
-def configs(rows: list[dict[str, str]]) -> list[tuple[str, str]]:
-    """The configurations that have end-to-end rows, in CONFIGS order."""
-    present = {(row["system"], row["profile"]) for row in rows if row["mode"] == "e2e"}
-    return [config for config in CONFIGS if config in present]
+def configs(rows: list[dict[str, str]]) -> list[tuple[str, str, str]]:
+    """The configurations that have end-to-end rows, (system, profile, group_commit), in CONFIGS order and
+    then by group-commit setting."""
+    present = {(row["system"], row["profile"], row["group_commit"]) for row in rows if row["mode"] == "e2e"}
+    return [config for pair in CONFIGS for config in sorted(present) if config[:2] == pair]
 
 
-def e2e_cell(rows: list[dict[str, str]], system: str, profile: str, size: int, column: str) -> dict[str, Any]:
-    """Median and min-max of `column` over the ok repetitions of one configuration and record size."""
-    selected = schema.select(rows, system=system, mode="e2e", profile=profile, record_size=size)
+def vtop_settings(rows: list[dict[str, str]]) -> list[str]:
+    """VTOP's group-commit settings in the run's rows: [""] for a run that did not vary it."""
+    return sorted({row["group_commit"] for row in rows if row["system"] == "vtop"}) or [""]
+
+
+def e2e_cell(rows: list[dict[str, str]], system: str, profile: str, size: int, column: str,
+             group_commit: str | None = None) -> dict[str, Any]:
+    """Median and min-max of `column` over the ok repetitions of one configuration and record size (and, when
+    given, one VTOP group-commit setting)."""
+    criteria: dict[str, Any] = {"system": system, "mode": "e2e", "profile": profile, "record_size": size}
+    if group_commit is not None:
+        criteria["group_commit"] = group_commit
+    selected = schema.select(rows, **criteria)
     ok = [row for row in selected if row["status"] == "ok"]
     out: dict[str, Any] = {"n": len(selected), "ok": len(ok), "not_ok": [r for r in selected if r["status"] != "ok"],
                            "summary": None, "offered": None, "records": None,
@@ -145,13 +170,21 @@ def e2e_cell(rows: list[dict[str, str]], system: str, profile: str, size: int, c
     return out
 
 
+def config_cell(rows: list[dict[str, str]], config: tuple[str, ...], size: int, column: str) -> dict[str, Any]:
+    """`e2e_cell` for one configuration as `configs` returns it."""
+    return e2e_cell(rows, config[0], config[1], size, column, config[2] if len(config) > 2 else None)
+
+
 def resource_cell(rows: list[dict[str, str]], system: str, mode: str, size: int, metric: str,
-                  load_pct: int | None = None, profile: str = "defaults") -> dict[str, Any]:
+                  load_pct: int | None = None, profile: str = "defaults",
+                  group_commit: str | None = None) -> dict[str, Any]:
     """Median and min-max over the ok repetitions of a per-delivered-unit resource figure: each repetition is
     divided by its own delivered bytes before the median is taken."""
     criteria: dict[str, Any] = {"system": system, "mode": mode, "record_size": size, "profile": profile}
     if load_pct is not None:
         criteria["load_pct"] = load_pct
+    if group_commit is not None:
+        criteria["group_commit"] = group_commit
     selected = schema.select(rows, **criteria)
     ok = [row for row in selected if row["status"] == "ok" and row["delivered_bytes"] != ""]
     out: dict[str, Any] = {"n": len(selected), "ok": len(ok), "not_ok": [r for r in selected if r["status"] != "ok"],
@@ -194,7 +227,7 @@ def e2e_section(run: schema.Run, images: dict[str, str], hist_rel: str) -> list[
     body = []
     for size in _sizes(env):
         for config in cfgs:
-            cells = {col: e2e_cell(rows, config[0], config[1], size, col) for col in e2e.PERCENTILES}
+            cells = {col: config_cell(rows, config, size, col) for col in e2e.PERCENTILES}
             first = cells["lat_p50_ms"]
             sustained = ("yes" if first["sustained"] else "**no**") if first["summary"] is not None else "-"
             body.append([base.size_label(size), label_of(config),
@@ -212,7 +245,7 @@ def e2e_section(run: schema.Run, images: dict[str, str], hist_rel: str) -> list[
     for size in _sizes(env):
         parts = []
         for config in cfgs:
-            cell = e2e_cell(rows, config[0], config[1], size, "lat_p99_ms")
+            cell = config_cell(rows, config, size, "lat_p99_ms")
             if cell["summary"] is not None:
                 parts.append(f"{label_of(config)} {base._fmt(cell['summary'].median)} ms "
                              f"({base._fmt(cell['summary'].low)}-{base._fmt(cell['summary'].high)})")
@@ -220,6 +253,17 @@ def e2e_section(run: schema.Run, images: dict[str, str], hist_rel: str) -> list[
             out.append(f"- {base.size_label(size)} records, p99 end to end: " + "; ".join(parts) + ".")
     out.append("")
     return out
+
+
+def resource_series(rows: list[dict[str, str]]) -> list[tuple[str, str]]:
+    """(system, group-commit setting) for every series of the resource table and chart: Kafka, then VTOP once
+    per setting the run measured."""
+    return [("kafka", "")] + [("vtop", setting) for setting in vtop_settings(rows)]
+
+
+def series_label(system: str, setting: str) -> str:
+    label = base.SYSTEM_STYLE[system]["label"]
+    return f"{label}, group commit {setting}" if setting else label
 
 
 def resources_section(run: schema.Run, images: dict[str, str]) -> list[str]:
@@ -240,10 +284,11 @@ def resources_section(run: schema.Run, images: dict[str, str]) -> list[str]:
              *([("consume", None)] if env["matrix"].get("consume") else [])]
     for size in _sizes(env):
         for mode, pct in modes:
-            for system in ("kafka", "vtop"):
-                cells = [resource_cell(rows, system, mode, size, metric, pct) for metric in METRICS]
+            for system, setting in resource_series(rows):
+                cells = [resource_cell(rows, system, mode, size, metric, pct, group_commit=setting)
+                         for metric in METRICS]
                 label = mode.replace("_", " ") + (f" {pct}%" if pct else "")
-                body.append([base.size_label(size), label, base.SYSTEM_STYLE[system]["label"],
+                body.append([base.size_label(size), label, series_label(system, setting),
                              *(range_text(c["summary"]) if c["summary"] is not None else _no_result(c)
                                for c in cells)])
     out += _table(["record size", "run", "system", "CPU seconds per GiB delivered",
@@ -254,12 +299,14 @@ def resources_section(run: schema.Run, images: dict[str, str]) -> list[str]:
     for size in _sizes(env):
         for metric, (_f, said) in METRICS.items():
             k = resource_cell(rows, "kafka", "saturation", size, metric)["summary"]
-            v = resource_cell(rows, "vtop", "saturation", size, metric)["summary"]
-            if k is not None and v is not None and k.median and v.median:
-                high, low = ("Kafka", "VTOP") if k.median >= v.median else ("VTOP", "Kafka")
-                factor = max(k.median, v.median) / min(k.median, v.median)
-                out.append(f"- {base.size_label(size)} at saturation, {said}: {high} spends {factor:.1f}x "
-                           f"{low}'s median.")
+            for setting in vtop_settings(rows):
+                v = resource_cell(rows, "vtop", "saturation", size, metric, group_commit=setting)["summary"]
+                if k is not None and v is not None and k.median and v.median:
+                    vtop = f"VTOP (group commit {setting})" if setting else "VTOP"
+                    high, low = ("Kafka", vtop) if k.median >= v.median else (vtop, "Kafka")
+                    factor = max(k.median, v.median) / min(k.median, v.median)
+                    out.append(f"- {base.size_label(size)} at saturation, {said}: {high} spends {factor:.1f}x "
+                               f"{low}'s median.")
     out.append("")
     return out
 
@@ -273,13 +320,14 @@ def profile_section(run: schema.Run, images: dict[str, str]) -> list[str]:
                "fsync on every message (so an acknowledgement waits for the in-sync replicas to flush), and VTOP "
                "as shipped, whose quorum acknowledgement already waits for an fsync. This is what the extra "
                "durability costs in latency, to be read beside what the crash report shows each of them losing. "
-               "VTOP has one configuration, so it is measured once.")
+               + ("VTOP has one configuration, so it is measured once." if vtop_settings(rows) == [""] else
+                  "VTOP is measured once per group-commit setting the run varied (#752)."))
     out.append("")
     body = []
     for size in _sizes(env):
         for config in cfgs:
-            p50 = e2e_cell(rows, config[0], config[1], size, "lat_p50_ms")
-            p99 = e2e_cell(rows, config[0], config[1], size, "lat_p99_ms")
+            p50 = config_cell(rows, config, size, "lat_p50_ms")
+            p99 = config_cell(rows, config, size, "lat_p99_ms")
             body.append([base.size_label(size), label_of(config),
                          ("yes" if p50["sustained"] else "**no**") if p50["summary"] is not None else "-",
                          base._summary_cell(p50), base._summary_cell(p99)])
@@ -334,9 +382,9 @@ def e2e_cdf_chart(plt, run: schema.Run, img_dir: str) -> list[str]:
         right = LOG_FLOOR_MS
         for config in cfgs:
             style = config_style(config)
-            cell = e2e_cell(rows, config[0], config[1], size, "lat_p50_ms")
+            cell = config_cell(rows, config, size, "lat_p50_ms")
             ok = schema.select(rows, system=config[0], mode="e2e", profile=config[1], record_size=size,
-                               status="ok")
+                               group_commit=_setting(config), status="ok")
             hists = [run.hist[schema.row_key(row)] for row in ok]
             line = style["linestyle"] if cell["sustained"] else ":"
             if not cell["sustained"] and cell["summary"] is not None:
@@ -360,7 +408,7 @@ def e2e_cdf_chart(plt, run: schema.Run, img_dir: str) -> list[str]:
         ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _p: f"{v * 100:.0f}%"))
         ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda v, _p: base._tick(v)))
         ax.xaxis.set_minor_formatter(plt.NullFormatter())
-        offered = next((c["offered"] for c in (e2e_cell(rows, cf[0], cf[1], size, "lat_p50_ms") for cf in cfgs)
+        offered = next((c["offered"] for c in (config_cell(rows, cf, size, "lat_p50_ms") for cf in cfgs)
                         if c["offered"]), None)
         ax.set_title(f"{base.size_label(size)} records" + (f", {base.compact(offered)}/s offered" if offered else ""),
                      loc="left", fontsize=9)
@@ -416,19 +464,21 @@ def resources_chart(plt, run: schema.Run, img_dir: str) -> list[str]:
     fig, axes = plt.subplots(2, 2, figsize=(width_in, height_in))
     fig.subplots_adjust(left=0.085, right=0.985, top=1 - 1.35 / height_in, bottom=1.1 / height_in, wspace=0.28,
                         hspace=0.42)
-    width, gap = 0.2, 0.03
+    series = resource_series(rows)
+    width, gap = 0.4 / len(series), 0.03
     for r, (mode, mode_label) in enumerate(modes):
         for c, (metric, (_f, said)) in enumerate(METRICS.items()):
             ax = axes[r][c]
             base._style_axes(ax)
             ax.grid(axis="y")
             top = 0.0
-            for index, system in enumerate(("kafka", "vtop")):
-                style = {"color": base.SYSTEM_STYLE[system]["color"], "hatch": ""}
+            for index, (system, setting) in enumerate(series):
+                style = {"color": base.SYSTEM_STYLE[system]["color"],
+                         "hatch": base.GROUP_COMMIT_STYLE[setting]["hatch"] if setting else ""}
                 for position, size in enumerate(sizes):
-                    cell = resource_cell(rows, system, mode, size, metric)
-                    top = _bars(ax, position + (index - 0.5) * (width + gap), cell["summary"], width, style,
-                                base.SYSTEM_STYLE[system]["label"] if position == 0 else None, cell, top)
+                    cell = resource_cell(rows, system, mode, size, metric, group_commit=setting)
+                    top = _bars(ax, position + (index - (len(series) - 1) / 2) * (width + gap), cell["summary"],
+                                width, style, series_label(system, setting) if position == 0 else None, cell, top)
             ax.set_xticks(range(len(sizes)))
             ax.set_xticklabels([f"{base.size_label(s)} records" for s in sizes])
             ax.set_xlim(-0.6, len(sizes) - 0.4)
@@ -437,9 +487,13 @@ def resources_chart(plt, run: schema.Run, img_dir: str) -> list[str]:
             ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _p: "0" if v == 0 else (
                 base.compact(v) if v >= 10_000 else f"{v:g}")))
             ax.set_title(f"{said}, {mode_label}", loc="left", fontsize=8.3, color=base.INK_2)
-    handles = [plt.Rectangle((0, 0), 1, 1, color=base.SYSTEM_STYLE[s]["color"], label=base.SYSTEM_STYLE[s]["label"])
-               for s in ("kafka", "vtop")]
-    fig.legend(handles=handles, loc="upper left", ncol=2, fontsize=8.5,
+    handles = []
+    for system, setting in series:
+        hatch = base.GROUP_COMMIT_STYLE[setting]["hatch"] if setting else ""
+        kw = ({"facecolor": base.SYSTEM_STYLE[system]["color"], "hatch": hatch, "edgecolor": base.SURFACE}
+              if hatch else {"color": base.SYSTEM_STYLE[system]["color"]})
+        handles.append(plt.Rectangle((0, 0), 1, 1, label=series_label(system, setting), **kw))
+    fig.legend(handles=handles, loc="upper left", ncol=len(handles), fontsize=8.5,
                bbox_to_anchor=(0.075, 1 - 0.88 / height_in), handlelength=1.2, columnspacing=1.6)
     base._header(fig, height_in, "CPU and bytes written per byte delivered, VTOP vs Apache Kafka",
                  "Three nodes' cgroup v2 counters summed over each run's window (sync before each reading, 2 s "
@@ -468,7 +522,7 @@ def profile_latency_chart(plt, run: schema.Run, img_dir: str) -> list[str]:
         for index, config in enumerate(cfgs):
             style = config_style(config)
             for position, size in enumerate(sizes):
-                cell = e2e_cell(rows, config[0], config[1], size, column)
+                cell = config_cell(rows, config, size, column)
                 x = position + (index - (len(cfgs) - 1) / 2) * (width + gap)
                 top = _bars(ax, x, cell["summary"], width, style, None, cell, top)
                 if cell["summary"] is not None and not cell["sustained"]:

@@ -242,7 +242,7 @@ DEFAULT_TIMING = {
     "fixed_rate": 10.0,      # one fixed-rate run's overhead; its duration is matrix.fixed_seconds
     "consume": 20.0,
     "e2e": 40.0,
-    # Schema 3: the cgroup counters are read, and the nodes synced, before and after every measured run.
+    # Schema 4: the cgroup counters are read, and the nodes synced, before and after every measured run.
     "resource_window": 6.0,
 }
 SLOWEST_BYTES_PER_SECOND = 2 * 1024 * 1024

@@ -35,10 +35,13 @@ MODE_ORDER = ("flakey-drop", "sigkill")
 MODE_TITLE = {"flakey-drop": "power loss of the whole replica set (dm-flakey drop_writes)",
               "sigkill": "SIGKILL of all three nodes, page cache kept (the control)"}
 # One colour per system from the registry; the two Kafka configurations share it and differ by marker.
-MARKER = {"kafka-defaults": "o", "kafka-fsync-parity": "D", "vtop-shipped": "s"}
+# The VTOP configurations share VTOP's colour and differ by marker too (#599's group-commit pair, #752).
+MARKER = {"kafka-defaults": "o", "kafka-fsync-parity": "D", "vtop-shipped": "s", "vtop-group-commit-on": "^",
+          "vtop-group-commit-off": "v"}
 SYSTEM_LABEL = {"kafka": "Apache Kafka", "vtop": "VTOP (Kafka gateway)"}
 CONFIG_LABEL = {"kafka-defaults": "Kafka, defaults", "kafka-fsync-parity": "Kafka, fsync on every message",
-                "vtop-shipped": "VTOP, as shipped"}
+                "vtop-shipped": "VTOP, as shipped", "vtop-group-commit-on": "VTOP, group commit on",
+                "vtop-group-commit-off": "VTOP, group commit off"}
 
 
 class Cell(NamedTuple):
@@ -279,6 +282,24 @@ class Paired(NamedTuple):
 
     run: schema.Run
     configs: list[str]  # the crash matrix's configuration names, in its order
+    # {crash configuration: the latency run's (system, profile, group_commit) drawn for it}
+    latency_configs: dict[str, tuple[str, str, str]] = {}
+
+
+def latency_config(config: str, crash_env: dict[str, Any], have: list[tuple[str, str, str]]) -> tuple[str, str, str]:
+    """The latency run's configuration that answers a crash configuration. Kafka's are its profiles; VTOP's
+    group-commit pair (#599, #752) are the latency run's VTOP rows at that setting; VTOP as shipped is the
+    latency run's VTOP without a setting, or, when that run varied it, the setting the node ships with."""
+    system, profile = ca.CONFIGS[config]
+    if system != "vtop":
+        return (system, profile, "")
+    asked = ca.VTOP_GROUP_COMMIT.get(config)
+    if asked is not None:
+        return ("vtop", "defaults", "on" if asked else "off")
+    if ("vtop", "defaults", "") in have:
+        return ("vtop", "defaults", "")
+    shipped = crash_env["comparable"].get("vtop_group_commit_shipped_default")
+    return ("vtop", "defaults", "" if shipped is None else ("on" if shipped else "off"))
 
 
 def _loss_mode(env: dict[str, Any]) -> str:
@@ -305,12 +326,14 @@ def load_paired(crash_run: cs.CrashRun, latency_dir: str) -> Paired:
                                    "it holds no latency to draw beside the crash results")
     have = ec.configs(latency.rows)
     configs = list(crash_run.environment["matrix"]["configs"])
-    missing = [name for name in configs if ca.CONFIGS[name] not in have]
+    mapped = {name: latency_config(name, crash_run.environment, have) for name in configs}
+    missing = [name for name in configs if mapped[name] not in have]
     if missing:
         raise schema.ReportRefused(f"the latency run {latency.environment['run_id']} has no end-to-end rows for "
                                    f"{', '.join(missing)}, which the crash run measures: its matrix needs "
-                                   "e2e.extra_profiles for the Kafka profile that is not `defaults`")
-    return Paired(latency, configs)
+                                   "e2e.extra_profiles for the Kafka profile that is not `defaults`, and "
+                                   "group_commits for a VTOP group-commit configuration")
+    return Paired(latency, configs, mapped)
 
 
 def paired_footer(crash_text: str, paired: Paired) -> str:
@@ -343,7 +366,7 @@ def paired_chart(plt, crash_run: cs.CrashRun, paired: Paired, img_dir: str, text
     top = max([4] + [n for c in mine.values() for n in c.lost])
     for i, config in enumerate(paired.configs):
         cell = mine[config]
-        style = ec.config_style(ca.CONFIGS[config])
+        style = ec.config_style(paired.latency_configs[config])
         xs = [i + dx for dx in _x_offsets(len(cell.lost))]
         loss.scatter(xs, cell.lost, marker=style["marker"], s=30, color=style["color"], edgecolors=base.SURFACE,
                      linewidths=0.8, zorder=4)
@@ -369,10 +392,9 @@ def paired_chart(plt, crash_run: cs.CrashRun, paired: Paired, img_dir: str, text
         ax.grid(axis="y")
         high = 0.0
         for index, config in enumerate(paired.configs):
-            system, profile = ca.CONFIGS[config]
-            style = ec.config_style((system, profile))
+            style = ec.config_style(paired.latency_configs[config])
             for position, size in enumerate(sizes):
-                cell = ec.e2e_cell(rows, system, profile, size, column)
+                cell = ec.config_cell(rows, paired.latency_configs[config], size, column)
                 x = position + (index - (len(paired.configs) - 1) / 2) * (width + gap)
                 high = ec._bars(ax, x, cell["summary"], width, style, None, cell, high)
                 if cell["summary"] is not None and not cell["sustained"]:
@@ -387,7 +409,7 @@ def paired_chart(plt, crash_run: cs.CrashRun, paired: Paired, img_dir: str, text
         ax.set_title(f"what it costs: {name} latency", loc="left", fontsize=8.5)
     handles = []
     for config in paired.configs:
-        style = ec.config_style(ca.CONFIGS[config])
+        style = ec.config_style(paired.latency_configs[config])
         kw = {"hatch": style["hatch"], "edgecolor": base.SURFACE} if style["hatch"] else {}
         handles.append(Patch(facecolor=style["color"], linewidth=0, label=CONFIG_LABEL[config], **kw))
     if unheld:
@@ -420,11 +442,10 @@ def paired_section(all_cells: list[Cell], paired: Paired, images: dict[str, str]
     out.append("")
     body = []
     for config in paired.configs:
-        system, profile = ca.CONFIGS[config]
         cell = next(c for c in all_cells if c.config == config and c.mode == mode)
         for size in lat.environment["matrix"]["record_sizes"]:
-            p50 = ec.e2e_cell(lat.rows, system, profile, size, "lat_p50_ms")
-            p99 = ec.e2e_cell(lat.rows, system, profile, size, "lat_p99_ms")
+            p50 = ec.config_cell(lat.rows, paired.latency_configs[config], size, "lat_p50_ms")
+            p99 = ec.config_cell(lat.rows, paired.latency_configs[config], size, "lat_p99_ms")
             held = ("yes" if p50["sustained"] else "**no**") if p50["summary"] is not None else "-"
             body.append([CONFIG_LABEL[config], f"{cell.lossy} of {len(cell.ok)}",
                          percent(cell.bound) if cell.bound is not None else "-", base.size_label(size), held,

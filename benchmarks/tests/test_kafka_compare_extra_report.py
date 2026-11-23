@@ -1,4 +1,4 @@
-"""The end-to-end CDF, the resource chart and the profile latency chart, drawn from a schema-3 run, and the crash
+"""The end-to-end CDF, the resource chart and the profile latency chart, drawn from a schema-4 run, and the crash
 page's pairing with that run (#596, #600). Needs the pinned plotting stack; the arithmetic they rest on is in
 test_kafka_compare_extra_charts.py."""
 import json
@@ -49,7 +49,7 @@ def test_the_committed_phase_1_run_regenerates_byte_for_byte(tmp_path):
     assert not [p for p in written if os.path.basename(p).rsplit(".", 1)[0] in NEW_IMAGES]
 
 
-# ---------------------------------------------------------------------------------- a schema-3 run
+# ---------------------------------------------------------------------------------- a schema-4 run
 
 
 def test_a_schema_3_run_draws_the_three_new_charts_and_their_sections(tmp_path):

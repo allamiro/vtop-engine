@@ -87,6 +87,7 @@
     ],
     "crashes": 2,
     "rate": 1000,
+    "record_size": 0,
     "seed": 599,
     "smoke": true,
     "trigger_window_s": [

@@ -861,7 +861,7 @@ def check_drawable(rows: list[dict[str, str]], environment: dict[str, Any],
     say (it writes "no compression", `acks=all` and the environment's
     profile), or rows it does not draw at all.
 
-    End-to-end rows are drawn (schema 3), with their histograms; so are Kafka's
+    End-to-end rows are drawn (schema 4), with their histograms; so are Kafka's
     end-to-end rows under the matrix's extra profiles, the one place a second profile is
     allowed, because that is the profile latency chart."""
     profile = environment["comparable"].get("profile")
@@ -877,7 +877,7 @@ def check_drawable(rows: list[dict[str, str]], environment: dict[str, Any],
     ok_e2e = [row for row in rows if row["mode"] == "e2e" and row["status"] == "ok"]
     if any(row["mode"] == "e2e" for row in rows) and (
             hist is None or any(schema.row_key(row) not in hist for row in ok_e2e)):
-        raise schema.ReportRefused("the run has end-to-end rows without their latency histograms (schema 3's "
+        raise schema.ReportRefused("the run has end-to-end rows without their latency histograms (schema 4's "
                                    "e2e_hist.csv), so it cannot draw them; refused rather than left out")
     for column in SINGLE_VALUED:
         values = sorted({row[column] for row in (main if column == "profile" else rows)})

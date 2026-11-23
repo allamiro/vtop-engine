@@ -1,11 +1,11 @@
-"""Schema 3 of the Kafka comparison's results (#596, #600): end-to-end latency histograms, CPU and bytes written,
+"""Schema 4 of the Kafka comparison's results (#596, #600): end-to-end latency histograms, CPU and bytes written,
 and the durability profile's latency cost.
 
-Schema 3 adds four columns to results.csv (`delivered_bytes`, `cpu_seconds`, `disk_write_bytes`,
+Schema 4 adds four columns to results.csv (`delivered_bytes`, `cpu_seconds`, `disk_write_bytes`,
 `disk_read_bytes`), a sidecar `e2e_hist.csv` that holds each end-to-end row's 1 ms latency histogram, and two
 matrix keys (`resources`, and `e2e.extra_profiles`, the profiles Kafka alone is also measured under at the
-common offered rate). Every rule the report relies on is enforced on load. Runs written before it, schema 1
-and schema 2, load unchanged.
+common offered rate). It is schema 3 (#752, the `group_commit` column) plus those. Every rule the report relies
+on is enforced on load. Runs written before it, schemas 1 to 3, load unchanged.
 """
 import copy
 import csv
@@ -24,13 +24,14 @@ V3 = {
 }
 HIST = {1: 500, 2: 400, 10: 99, 100: 1}  # 1000 records
 KEY_COLUMNS = ("system", "record_size", "partitions", "producers", "compression", "acks", "profile",
-               "repetition", "load_basis", "load_pct")
+               "group_commit", "repetition", "load_basis", "load_pct")
 
 
 def env3(matrix=V3):
     env = environment(matrix)
-    env["schema_version"] = 3
+    env["schema_version"] = 4
     env["comparable"]["host_disk"] = "Test SSD, SSD, NVMe, ext4"
+    env["comparable"]["vtop_group_commit"] = {"settings": {}}
     return env
 
 
@@ -94,20 +95,20 @@ def first(rows, **criteria):
 # ------------------------------------------------------------------------------------------------ layout
 
 
-def test_v3_adds_four_columns_after_the_window_and_keeps_the_v2_layout_as_it_was():
-    assert schema.SCHEMA_VERSION == 3
+def test_v4_adds_four_columns_after_the_window_and_keeps_the_v3_layout_as_it_was():
+    assert schema.SCHEMA_VERSION == 4
     new = ("delivered_bytes", "cpu_seconds", "disk_write_bytes", "disk_read_bytes")
-    at = schema.COLUMNS_V2.index("window_end_ms") + 1
-    assert schema.COLUMNS == schema.COLUMNS_V2[:at] + new + schema.COLUMNS_V2[at:]
+    at = schema.COLUMNS_V3.index("window_end_ms") + 1
+    assert schema.COLUMNS == schema.COLUMNS_V3[:at] + new + schema.COLUMNS_V3[at:]
     assert schema.COLUMNS_V2[-6:] == ("lat_basis", "started_at", "window_start_ms", "window_end_ms",
                                       "wall_seconds", "note")
     assert schema.KEY == ("system", "mode", "record_size", "partitions", "producers", "compression", "acks",
-                          "profile", "repetition", "load_basis", "load_pct")
+                          "profile", "group_commit", "repetition", "load_basis", "load_pct")
 
 
-def test_a_complete_v3_run_loads_with_its_histograms(run_dir):
+def test_a_complete_v4_run_loads_with_its_histograms(run_dir):
     loaded = schema.load_run(run_dir)
-    assert loaded.version == 3
+    assert loaded.version == 4
     ok_e2e = [row for row in loaded.rows if row["mode"] == "e2e" and row["status"] == "ok"]
     assert len(ok_e2e) == 6  # 2 repetitions x (Kafka and VTOP under defaults, Kafka under fsync-parity)
     assert set(loaded.hist) == {schema.row_key(row) for row in ok_e2e}
@@ -117,10 +118,10 @@ def test_a_complete_v3_run_loads_with_its_histograms(run_dir):
 def test_an_extra_profile_is_measured_for_kafka_only_and_only_in_e2e():
     keys = schema.expected_keys(V3)
     extra = {key for key in keys if key[7] == "fsync-parity"}
-    assert extra == {("kafka", "e2e", 100, 1, 1, "none", "all", "fsync-parity", rep, "common", "50")
+    assert extra == {("kafka", "e2e", 100, 1, 1, "none", "all", "fsync-parity", "", rep, "common", "50")
                      for rep in (1, 2)}
     assert {key for key in keys if key[7] == "defaults" and key[1] == "e2e"} == {
-        (system, "e2e", 100, 1, 1, "none", "all", "defaults", rep, "common", "50")
+        (system, "e2e", 100, 1, 1, "none", "all", "defaults", "", rep, "common", "50")
         for system in ("kafka", "vtop") for rep in (1, 2)}
 
 
@@ -153,8 +154,9 @@ def test_a_v2_csv_loads_with_the_new_columns_blank(tmp_path):
     env["matrix"].pop("resources")
     env["matrix"]["e2e"].pop("extra_profiles")
     rows = complete_rows(env)
+    for row in rows:
+        row.pop("group_commit")
     directory = write_run(str(tmp_path / "v2"), env, rows, schema.COLUMNS_V2)
-    write_hist(directory, rows)
     loaded = schema.load_run(directory)
     assert loaded.version == 2
     assert {row[c] for row in loaded.rows for c in ("delivered_bytes", "cpu_seconds", "disk_write_bytes",
@@ -170,30 +172,30 @@ def test_the_committed_phase_1_run_still_loads_as_schema_1_with_no_histograms():
 # --------------------------------------------------------------------------- the versions agree with each other
 
 
-def test_the_new_matrix_keys_need_schema_3_in_environment_json(tmp_path):
+def test_the_new_matrix_keys_need_schema_4_in_environment_json(tmp_path):
     for mutate in (lambda e: e["matrix"].pop("resources"), lambda e: e["matrix"]["e2e"].pop("extra_profiles")):
         env = env3()
         mutate(env)
-        env["schema_version"] = 2
+        env["schema_version"] = 3
         directory = make(tmp_path / str(id(mutate)), env, rows3(env), hist=True)
-        refused(directory, "schema 3|schema_version 2")
+        refused(directory, "schema 4|schema_version 3")
 
 
-def test_a_v3_csv_needs_a_schema_3_environment_and_the_reverse(tmp_path):
+def test_a_v4_csv_needs_a_schema_4_environment_and_the_reverse(tmp_path):
     env = env3()
-    env["schema_version"] = 2
-    refused(make(tmp_path / "a", env), "schema_version 2")
+    env["schema_version"] = 3
+    refused(make(tmp_path / "a", env), "schema_version 3")
     env = env3({**V3, "resources": False})
     rows = rows3(env)
-    directory = write_run(str(tmp_path / "b" / "run"), env, rows, schema.COLUMNS_V2)
+    directory = write_run(str(tmp_path / "b" / "run"), env, rows, schema.COLUMNS_V3)
     write_hist(directory, rows)
-    refused(directory, "schema_version 3")
+    refused(directory, "schema_version 4")
 
 
-def test_a_schema_4_environment_is_newer_than_this_report(tmp_path):
+def test_a_schema_5_environment_is_newer_than_this_report(tmp_path):
     env = env3()
-    env["schema_version"] = 4
-    refused(make(tmp_path, env), "schema_version 4")
+    env["schema_version"] = 5
+    refused(make(tmp_path, env), "schema_version 5")
 
 
 # ---------------------------------------------------------------------------------------------- resources

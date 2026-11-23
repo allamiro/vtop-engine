@@ -1,4 +1,4 @@
-"""The runner's schema-3 measurements (#596, #600) without Docker: the resource window around a measured run, the
+"""The runner's schema-4 measurements (#596, #600) without Docker: the resource window around a measured run, the
 end-to-end stage, and that what the runner writes is what the report's loader accepts.
 
 Everything that would touch Docker (clusters, the perf tools, the consumer container, `docker exec`) is replaced
@@ -28,7 +28,8 @@ def test_the_default_matrix_asks_for_resources_and_the_end_to_end_stage_with_kaf
     assert matrix["resources"] is True
     assert matrix["e2e"] == {"load_basis": "common", "load_pct": 50, "extra_profiles": ["fsync-parity"]}
     plan.check_matrix(matrix)
-    assert run.e2e_targets(matrix) == [("kafka", "defaults"), ("vtop", "defaults"), ("kafka", "fsync-parity")]
+    assert run.e2e_targets(matrix) == [("kafka", "defaults", ""), ("vtop", "defaults", ""),
+                                       ("kafka", "fsync-parity", "")]
 
 
 def test_each_new_measurement_has_its_own_off_switch_and_the_matrix_says_so():
@@ -36,7 +37,7 @@ def test_each_new_measurement_has_its_own_off_switch_and_the_matrix_says_so():
     assert bare["resources"] is False and "e2e" not in bare
     no_fsync = run.build_matrix(fake_args(no_fsync_parity=True), [100], {100: 2000})
     assert "extra_profiles" not in no_fsync["e2e"]
-    assert run.e2e_targets(no_fsync) == [("kafka", "defaults"), ("vtop", "defaults")]
+    assert run.e2e_targets(no_fsync) == [("kafka", "defaults", ""), ("vtop", "defaults", "")]
 
 
 def test_kafka_fsync_parity_is_a_second_compose_file_and_a_topic_flush_setting(monkeypatch):
@@ -210,7 +211,7 @@ def fake_cluster(monkeypatch):
         return (producer_result(rate), "", 1.0, "", 0,
                 f"READY\nconsumed {records}\n2 {records - 20}\n9 20\n", "")
 
-    monkeypatch.setattr(run, "cluster_up", lambda *_a: None)
+    monkeypatch.setattr(run, "cluster_up", lambda *_a, **_k: None)
     monkeypatch.setattr(run, "cluster_down", lambda *_a: None)
     monkeypatch.setattr(run, "smoke", lambda *_a: None)
     monkeypatch.setattr(run, "_save_leader_log", lambda *_a: None)
@@ -225,7 +226,8 @@ def simulate(tmp_path, matrix_args):
     sizes, sat_records = [100], {100: 2000}
     matrix = run.build_matrix(matrix_args, sizes, sat_records)
     comparable = {"vtop_commit": "a" * 40, "kafka_image": run.KAFKA_IMAGE, "client": run.client_name(),
-                  "host_disk": "Test SSD, SSD, NVMe, ext4", "profile": "defaults"}
+                  "host_disk": "Test SSD, SSD, NVMe, ext4", "profile": "defaults",
+                  "vtop_group_commit": {"settings": {}}}
     env = {"schema_version": schema.SCHEMA_VERSION, "kind": "throughput", "run_id": "sim", "run_state": "running",
            "comparable": comparable, "matrix": matrix, "observed": {}, "events": []}
     run_dir = str(tmp_path / "sim")
@@ -252,7 +254,7 @@ def simulate(tmp_path, matrix_args):
 def test_a_simulated_run_is_complete_and_loads_with_every_new_measurement(tmp_path, fake_cluster):
     run_dir, ctx = simulate(tmp_path, fake_args())
     loaded = schema.load_run(run_dir)
-    assert loaded.version == 3
+    assert loaded.version == 4
     assert ctx["env"]["observed"]["e2e_rates"] == {"100": 10_000}  # half of the slower system's saturation
     ok_e2e = [r for r in loaded.rows if r["mode"] == "e2e" and r["status"] == "ok"]
     assert {(r["system"], r["profile"]) for r in ok_e2e} == {("kafka", "defaults"), ("vtop", "defaults"),
