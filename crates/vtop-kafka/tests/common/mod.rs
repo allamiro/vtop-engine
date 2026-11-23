@@ -487,6 +487,22 @@ pub fn list_latest(addr: SocketAddr, topic: &str, epoch: i32) -> (i16, i64) {
     (error, offset)
 }
 
+/// FindCoordinator v1 for `group`: `(error, node id, host, port)`.
+pub fn find_coordinator(addr: SocketAddr, group: &str) -> (i16, i32, String, i32) {
+    let mut e = Encoder::new();
+    e.string(group);
+    e.i8(0); // key_type: a group
+    let reply = call(addr, 10, 1, e.as_slice());
+    let mut d = Decoder::new(&reply);
+    d.i32("throttle").unwrap();
+    let error = d.i16("error").unwrap();
+    d.nullable_string("message").unwrap();
+    let node = d.i32("node").unwrap();
+    let host = d.string("host").unwrap().to_owned();
+    let port = d.i32("port").unwrap();
+    (error, node, host, port)
+}
+
 /// Every record value in `bytes`, in order.
 pub fn values(mut bytes: &[u8]) -> Vec<String> {
     let mut out = Vec::new();

@@ -242,10 +242,11 @@ formats:
     at_1_0: "follows #740"
     constants:
       - {file: crates/vtop-meta/src/command.rs, name: BASELINE_FEATURE_LEVEL, value: '3'}
-      - {file: crates/vtop-meta/src/command.rs, name: SUPPORTED_FEATURE_LEVEL, value: '8'}
+      - {file: crates/vtop-meta/src/command.rs, name: SUPPORTED_FEATURE_LEVEL, value: '9'}
       - {file: crates/vtop-meta/src/command.rs, name: LINEAGE_VERDICTS_FEATURE_LEVEL, value: '6'}
       - {file: crates/vtop-meta/src/command.rs, name: NODE_VERSION_REPORTS_FEATURE_LEVEL, value: '7'}
       - {file: crates/vtop-meta/src/command.rs, name: PROMOTE_UNPROVEN_FEATURE_LEVEL, value: '8'}
+      - {file: crates/vtop-meta/src/command.rs, name: ATTRIBUTED_COMMANDS_FEATURE_LEVEL, value: '9'}
       - {file: crates/vtop-meta/src/command.rs, name: COMMAND_KIND_SET_FEATURE_LEVEL, value: '36'}
       - {file: crates/vtop-meta/src/command.rs, name: COMMAND_KIND_REPORT_NODE_VERSION, value: '38'}
       - {file: crates/vtop-meta/src/versions.rs, name: FIRST_MEMBER_CHECKED_FEATURE_LEVEL, value: '8'}
@@ -292,6 +293,7 @@ formats:
           COMMAND_KIND_SET_RANGE_REPLICA_SET: 37
           COMMAND_KIND_REPORT_NODE_VERSION: 38
           COMMAND_KIND_ATTEST_UNPROVEN_PROMOTION: 39
+          COMMAND_KIND_ATTRIBUTED: 40
     one_way:
       - "raising the feature level (vtopctl meta enable-features): permanent; a voter older than the level refuses a log that holds its kinds"
     fixtures: [crates/vtop-meta/tests/fixtures/meta]
@@ -340,6 +342,7 @@ formats:
           VALUE_TAG_RANGE_REPLICA_SET: 23
           VALUE_TAG_NODE_VERSION: 24
           VALUE_TAG_PROMOTION_ATTESTATION: 25
+          VALUE_TAG_AUDIT_ENTRY: 26
       - file: crates/vtop-meta/src/keys.rs
         prefix: CATEGORY_
         tags:
@@ -365,6 +368,7 @@ formats:
           CATEGORY_RANGE_REPLICA_SET: 20
           CATEGORY_NODE_VERSION: 21
           CATEGORY_PROMOTION_ATTESTATION: 22
+          CATEGORY_AUDIT_ENTRY: 23
     fixtures: [crates/vtop-meta/tests/fixtures/meta]
     fuzz: [meta_decode, meta_storage_files]
     cells: [meta]

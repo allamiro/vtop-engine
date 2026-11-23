@@ -77,8 +77,9 @@ NATIVE_PORT="${CHAOS_NATIVE_PORT:-9400}"
 # kafka-5 for the two partitions of scenarios 21 and 24, kafka-5 again for
 # scenario 25's leader (24 also takes
 # replica-4, replica-5 and data-metrics 4 and 5 for its second range's
-# followers, and checks its own bound). Above the candidate natives
-# (NATIVE_PORT + 11..13) so the default layout has no overlap.
+# followers, and checks its own bound), and kafka-6 to kafka-8 for the three
+# candidates of scenarios 27 and 28 (#751, candidate_kafka_port). Above the
+# candidate natives (NATIVE_PORT + 11..13) so the default layout has no overlap.
 KAFKA_BASE_PORT="${CHAOS_KAFKA_BASE_PORT:-$((NATIVE_PORT + 20))}"
 # Observability endpoints (#224). Every node gets one so scenarios can gate on
 # /readyz instead of grepping stdout: a ready marker is a one-shot edge, and a
@@ -165,8 +166,8 @@ preflight_settings() {
   # so the ceiling leaves that headroom — the same reasoning as the metrics
   # bases below.
   require_integer_in_range CHAOS_NATIVE_PORT "$NATIVE_PORT" 1024 65522
-  # Six listeners (kafka-0..5), so the base may be at most 65530 (review).
-  require_integer_in_range CHAOS_KAFKA_BASE_PORT "$KAFKA_BASE_PORT" 1024 65530
+  # Nine listeners (kafka-0..8), so the base may be at most 65527 (review).
+  require_integer_in_range CHAOS_KAFKA_BASE_PORT "$KAFKA_BASE_PORT" 1024 65527
   # Ceilings are the highest port each family actually derives: metadata ids
   # run 1..5 so the top base is 65535-5, and data indices run 0..3 — index 3 is
   # the replacement replica (#242) — so the top base is 65535-3. A tighter bound
@@ -200,7 +201,7 @@ preflight_settings() {
   endpoints+=("$(native_addr)")
   labels+=("native-p1")
   endpoints+=("$DATA_HOST:$((NATIVE_PORT + 2))")
-  for id in 0 1 2 3 4 5; do
+  for id in 0 1 2 3 4 5 6 7 8; do
     labels+=("kafka-$id")
     endpoints+=("$(kafka_addr "$id")")
   done
@@ -1617,6 +1618,9 @@ candidate_native_addr() { echo "$DATA_HOST:$((NATIVE_PORT + 10 + $1))"; }
 # it), so the collision scan must judge the port on the host that will use it.
 kafka_addr() { echo "127.0.0.1:$((KAFKA_BASE_PORT + $1))"; }
 kafka_port() { echo "$((KAFKA_BASE_PORT + $1))"; }
+# The Kafka listener of candidate <n: 1|2|3> (#751): kafka-6 to kafka-8, clear
+# of the fixed-role scenarios' kafka-0 to kafka-5.
+candidate_kafka_port() { kafka_port "$(($1 + 5))"; }
 
 candidate_identity() { # <n: 1|2|3> — echoes "<uuid> <cert-basename>"
   case "$1" in
@@ -1625,6 +1629,23 @@ candidate_identity() { # <n: 1|2|3> — echoes "<uuid> <cert-basename>"
     3) echo "$FOLLOWER2_UUID data-3" ;;
     *) fail "unknown candidate $1" ;;
   esac
+}
+
+# emit_candidate_kafka_yaml <n: 1|2|3> — the `kafka:` block of candidate <n>
+# (#751). The block differs between members only in `listen` and `node_id`;
+# `brokers` is the same list on every member, this one included, each at its
+# own broker id (the candidate's ordinal) and loopback port.
+emit_candidate_kafka_yaml() {
+  local n="$1" i iu
+  echo "kafka:"
+  echo "  listen: \"127.0.0.1:$(candidate_kafka_port "$n")\""
+  echo "  topic: \"$TOPIC\""
+  echo "  node_id: $n"
+  echo "  brokers:"
+  for i in 1 2 3; do
+    read -r iu _ <<<"$(candidate_identity "$i")"
+    echo "    - { node_uuid: $iu, node_id: $i, host: \"127.0.0.1\", port: $(candidate_kafka_port "$i") }"
+  done
 }
 
 # emit_candidate_config <n: 1|2|3> <meta-id>
@@ -1664,6 +1685,10 @@ emit_candidate_config() {
     echo "segment_id: $SEGMENT_ID"
     echo "native_listen: \"$(candidate_native_addr "$n")\""
     echo "replica_listen: \"$(replica_addr $((n - 1)))\""
+    # The Kafka gateway (#751), for scenarios 27 and 28: every member serves
+    # it and lists every member as a broker, so a client bootstrapped from any
+    # of them finds the holder after a failover.
+    [[ -n "${CHAOS_CANDIDATE_KAFKA:-}" ]] && emit_candidate_kafka_yaml "$n"
     # THE SAME LIST ON EVERY MEMBER, this node included; the binary filters
     # its own entry by node_uuid. Symmetry is the feature under test.
     echo "peers:"
@@ -1756,6 +1781,100 @@ candidate_by_uuid() {
     [[ "$uuid" == "$1" ]] && { echo "$n"; return 0; }
   done
   fail "lease holder $1 is not one of the three candidates"
+}
+
+# bring_up_kafka_candidates — the cluster scenarios 27 and 28 (#751) start
+# from: a three-node metadata plane, the topic and the three candidates
+# registered, then three candidates that each serve the Kafka gateway and list
+# all three as brokers. Nothing is scripted about who leads: it returns when
+# SOMEBODY holds the range and every member's gateway is listening.
+#
+# Sets, for the caller (the scenario reads them):
+#   META_LEADER_ID   the metadata leader's node id
+#   CAND_PIDS[1..3]  the candidates' pids
+#   HOLDER, EPOCH    the lease holder's uuid and fencing epoch at the start
+#   WINNER           the holder's candidate ordinal
+#   KAFKA_BOOTSTRAP  every member's Kafka endpoint, comma separated
+# shellcheck disable=SC2034  # read by the scenarios that source this file
+bring_up_kafka_candidates() {
+  CHAOS_CANDIDATE_KAFKA=1
+  local m1 m2 m3 node
+  m1="$(start_meta_node 1 2 3)"
+  m2="$(start_meta_node 2 1 3)"
+  m3="$(start_meta_node 3 1 2)"
+  log "meta nodes up: $m1 $m2 $m3"
+  meta_admin 1 init --members 1,2,3 > /dev/null
+  META_LEADER_ID="$(wait_meta_leader 1 2 3)"
+  log "meta leader elected: node $META_LEADER_ID"
+  meta_admin "$META_LEADER_ID" create-topic \
+    --name "$TOPIC" --topic-uuid "$TOPIC_UUID" --root-range-uuid "$RANGE_ID" > /dev/null \
+    || fail "could not create the topic in metadata"
+  # The lease is granted only to a REGISTERED node (scenario 14's lesson).
+  for node in "$LEADER_UUID" "$FOLLOWER1_UUID" "$FOLLOWER2_UUID"; do
+    meta_admin "$META_LEADER_ID" register-node \
+      --node-uuid "$node" --addr "$REGISTER_HOST_PREFIX.1:$REGISTER_PORT" > /dev/null \
+      || fail "could not register data node $node"
+  done
+  CAND_PIDS=("" "" "" "")
+  CAND_PIDS[1]="$(start_candidate 1 "$META_LEADER_ID")"
+  CAND_PIDS[2]="$(start_candidate 2 "$META_LEADER_ID")"
+  CAND_PIDS[3]="$(start_candidate 3 "$META_LEADER_ID")"
+  log "three candidates up from one config shape, each serving Kafka: ${CAND_PIDS[1]} ${CAND_PIDS[2]} ${CAND_PIDS[3]}"
+  KAFKA_BOOTSTRAP="127.0.0.1:$(candidate_kafka_port 1),127.0.0.1:$(candidate_kafka_port 2),127.0.0.1:$(candidate_kafka_port 3)"
+  read -r HOLDER EPOCH <<<"$(await_any_lease_holder "$META_LEADER_ID")"
+  WINNER="$(candidate_by_uuid "$HOLDER")"
+  log "candidate $WINNER ($HOLDER) took the range at epoch $EPOCH, unscripted"
+  await_log_line "$WORKDIR/logs/data-candidate-$WINNER.log" \
+    "data_node_role_changed role=leader" \
+    "the winner must record its promotion as a role change"
+}
+
+# wall_ms — wall-clock milliseconds, from the clock every process on this host
+# shares, so a kill and an acknowledgement a client printed can be subtracted.
+wall_ms() {
+  python3 -c 'import time; print(time.time_ns() // 1000000)'
+}
+
+# stamp_stdin_ms — copy stdin to stdout with each line prefixed by the wall
+# clock in milliseconds at which the line arrived. A client's acknowledgements
+# go through this, so their times can be compared with wall_ms at a kill.
+stamp_stdin_ms() {
+  python3 -u -c '
+import sys, time
+for line in sys.stdin:
+    print(time.time_ns() // 1000000, line, end="", flush=True)
+'
+}
+
+# ack_outage_report <stamped-file> <kill-ms> [needle] — read the lines
+# stamp_stdin_ms wrote (only those containing <needle>, when given: an
+# acknowledgement among a client's other output) and print three integers, in
+# milliseconds, on one line:
+#   first   from the kill to the first acknowledgement after it;
+#   resume  from the kill to the end of the longest silence that ends after it;
+#   silence that longest silence.
+# The first acknowledgement after a kill can be a straggler the dead leader
+# sent just before it died, so `resume` is the number a client lived through.
+ack_outage_report() {
+  python3 -c '
+import sys
+path, kill, needle = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+times = []
+for line in open(path):
+    stamp, _, rest = line.partition(" ")
+    if stamp.isdigit() and needle in rest:
+        times.append(int(stamp))
+after = [t for t in times if t > kill]
+if not after:
+    sys.exit("no acknowledgement after the kill")
+prev = max([t for t in times if t <= kill], default=kill)
+best_gap, best_end = 0, after[0]
+for t in after:
+    if t - prev > best_gap:
+        best_gap, best_end = t - prev, t
+    prev = t
+print(after[0] - kill, best_end - kill, best_gap)
+' "$1" "$2" "${3:-}"
 }
 
 start_follower() {

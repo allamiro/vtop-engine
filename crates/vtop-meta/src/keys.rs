@@ -45,6 +45,7 @@ const CATEGORY_LINEAGE_TRANSITION: u8 = 19;
 const CATEGORY_RANGE_REPLICA_SET: u8 = 20;
 const CATEGORY_NODE_VERSION: u8 = 21;
 const CATEGORY_PROMOTION_ATTESTATION: u8 = 22;
+const CATEGORY_AUDIT_ENTRY: u8 = 23;
 
 /// Consumer-group names reuse the topic-name bound so group identity stays
 /// allocation-bounded on the wire and in snapshots.
@@ -177,6 +178,13 @@ pub enum MetaKey {
     NodeVersion {
         node_uuid: Uuid,
     },
+    /// Who asked for the command applied at `apply_index` (#706): one entry
+    /// of the bounded tail of attributed commands. The index is big-endian
+    /// in the key, so key order is index order and the oldest entry is the
+    /// first one in the category.
+    AuditEntry {
+        apply_index: u64,
+    },
 }
 
 /// Validate a topic name against the shared 249-byte semantics.
@@ -228,6 +236,7 @@ impl MetaKey {
             MetaKey::RangeReplicaSet { .. } => CATEGORY_RANGE_REPLICA_SET,
             MetaKey::PromotionAttestation { .. } => CATEGORY_PROMOTION_ATTESTATION,
             MetaKey::NodeVersion { .. } => CATEGORY_NODE_VERSION,
+            MetaKey::AuditEntry { .. } => CATEGORY_AUDIT_ENTRY,
         }
     }
 
@@ -344,6 +353,7 @@ impl MetaKey {
                 put_uuid(&mut out, *range_uuid);
             }
             MetaKey::NodeVersion { node_uuid } => put_uuid(&mut out, *node_uuid),
+            MetaKey::AuditEntry { apply_index } => put_u64(&mut out, *apply_index),
         }
         out
     }
@@ -460,6 +470,9 @@ impl MetaKey {
             },
             CATEGORY_NODE_VERSION => MetaKey::NodeVersion {
                 node_uuid: reader.uuid("node uuid")?,
+            },
+            CATEGORY_AUDIT_ENTRY => MetaKey::AuditEntry {
+                apply_index: reader.u64("audit entry apply index")?,
             },
             CATEGORY_TOPIC_RETENTION_POLICY => MetaKey::TopicRetentionPolicy {
                 topic_uuid: reader.uuid("topic uuid")?,
@@ -592,6 +605,9 @@ impl fmt::Display for MetaKey {
             MetaKey::NodeVersion { node_uuid } => {
                 write!(formatter, "/meta/0/node-version/{node_uuid}")
             }
+            MetaKey::AuditEntry { apply_index } => {
+                write!(formatter, "/meta/0/audit-entry/{apply_index}")
+            }
         }
     }
 }
@@ -603,6 +619,9 @@ mod tests {
     fn every_key() -> Vec<MetaKey> {
         vec![
             MetaKey::ClusterConfig,
+            MetaKey::AuditEntry {
+                apply_index: 0x0102_0304_0506_0708,
+            },
             MetaKey::NodeVersion {
                 node_uuid: Uuid::from_u128(1),
             },
@@ -712,6 +731,24 @@ mod tests {
             at(u64::MAX) < other_range,
             "every epoch of one range precedes the next range"
         );
+    }
+
+    /// #706: the tail of attributed commands sorts by apply index, so the
+    /// oldest entry is the first key of its category and eviction is a
+    /// range scan from the front.
+    #[test]
+    fn audit_entries_sort_by_apply_index() {
+        let at = |apply_index: u64| MetaKey::AuditEntry { apply_index };
+        assert!(at(1) < at(2));
+        assert!(at(255) < at(256), "big-endian: width never reorders");
+        assert!(at(u64::MAX - 1) < at(u64::MAX));
+        let encoded = at(0x0102_0304_0506_0708).encode();
+        assert_eq!(
+            encoded,
+            [0, 0, CATEGORY_AUDIT_ENTRY, 1, 2, 3, 4, 5, 6, 7, 8],
+            "shard u16, category u8, index u64 big-endian"
+        );
+        assert_eq!(CATEGORY_AUDIT_ENTRY, 23);
     }
 
     #[test]

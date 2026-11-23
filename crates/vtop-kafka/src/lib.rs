@@ -68,6 +68,6 @@ pub use offsets::{Committed, MemoryOffsetStore, OffsetStore, OverlayOffsetStore}
 pub use records::{Record, RecordBatch};
 pub use refusals::{Refusal, Refusals};
 pub use remote::{RemoteBridge, RemoteConfig};
-pub use slot::BridgeSlot;
+pub use slot::{BridgeSlot, OffsetSlot};
 pub use topics::{TopicBinding, TopicMap};
 pub use wire::{Decoder, Encoder, WireError};

@@ -344,6 +344,7 @@ pub struct Quiesced {
 #[derive(Clone)]
 pub struct GatewayHandle {
     jobs: Arc<Jobs>,
+    groups: Arc<Coordinator>,
     ceiling: Duration,
 }
 
@@ -359,6 +360,17 @@ impl GatewayHandle {
     /// for at shutdown.
     pub fn ceiling(&self) -> Duration {
         self.ceiling
+    }
+
+    /// Forget every consumer group this gateway coordinates and release the
+    /// joins and syncs parked on them (#751). A node calls this when its
+    /// leadership ends, so members stop waiting on a round that cannot finish
+    /// here and go to the new coordinator, and again when a new leadership
+    /// begins, so no group from an earlier one is judged against. Joins are
+    /// admitted afterwards; committed offsets are in the offset store and are
+    /// not touched.
+    pub fn reset_groups(&self) {
+        self.groups.reset();
     }
 
     /// Wait until every call that was in flight when this was called has
@@ -596,6 +608,7 @@ impl Gateway {
     pub fn handle(&self) -> GatewayHandle {
         GatewayHandle {
             jobs: Arc::clone(&self.jobs),
+            groups: Arc::clone(&self.groups),
             ceiling: self.config.max_produce_wait
                 + self.config.max_fetch_wait
                 + self.config.max_offset_wait
@@ -1518,6 +1531,15 @@ impl Gateway {
             .collect()
     }
 
+    /// The holder's listed endpoint, when there is one to name (#751).
+    fn holder_endpoint(&self) -> Option<MetadataBroker> {
+        let brokers = self.listed_brokers();
+        let holder = self.reachable_holder(&brokers)?;
+        brokers
+            .into_iter()
+            .find(|broker| broker.node_id == holder.broker_id)
+    }
+
     /// The holder, when naming it would help: another node than this one, and
     /// one a client can be told the address of.
     fn reachable_holder(&self, brokers: &[MetadataBroker]) -> Option<RangeHolder> {
@@ -1603,7 +1625,8 @@ impl Gateway {
     /// this group, the same answer from every gateway that has the topology.
     /// This gateway names itself only when it is that broker and still holds
     /// the lease; a fenced coordinator does not send clients to a node that
-    /// cannot take their commits. A gateway that is not the group's still
+    /// cannot take their commits, and names the lease holder instead when it
+    /// knows one (#751). A gateway that is not the group's still
     /// answers with the elected broker — that is how a client finds it. A
     /// transaction key is out of scope, by name; an empty key names no group.
     fn find_coordinator(&self, request: FindCoordinatorRequest) -> FindCoordinatorResponse {
@@ -1639,6 +1662,21 @@ impl Gateway {
             );
         };
         if elected.node_id == self.config.node_id {
+            // A candidate that does not hold the range names the node that
+            // does (#751): its coordinator moved with the lease, and a
+            // consumer told "not available" by every member but the holder
+            // would find it only by luck of which member it asked.
+            if !self.speaks_for_the_range() {
+                if let Some(holder) = self.holder_endpoint() {
+                    return FindCoordinatorResponse {
+                        error: ErrorCode::None,
+                        error_message: None,
+                        node_id: holder.node_id,
+                        host: holder.host,
+                        port: holder.port,
+                    };
+                }
+            }
             if let Some(error) = self.fenced("FindCoordinator") {
                 return refused(
                     error,
@@ -1997,6 +2035,16 @@ impl Gateway {
         Vec<OffsetCommitTopicResponse>,
         Vec<tokio::task::JoinHandle<Result<(), ErrorCode>>>,
     ) {
+        // The whole validated commit is one job (#751, review): membership is
+        // judged against the coordinator of the leadership running now, and
+        // the store is resolved later, after awaits that are not jobs of
+        // their own. A demotion's quiesce must not end between the two, or
+        // a promotion that follows could install the next leadership's store
+        // and this commit, judged by a coordinator since forgotten, would be
+        // written through it. Counted from before the judgment to the last
+        // write it starts, so a demotion waits for it, and a commit that
+        // starts after the demotion began is judged by the reset coordinator.
+        let _validated = self.jobs.enter();
         let mut outstanding = Vec::new();
         if let Some(error) = self.not_this_groups_coordinator("OffsetCommit", &request.group_id) {
             return (every_partition(request, error), outstanding);
@@ -4902,6 +4950,106 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(read_sync(&reply[4..], 1), (0, p0));
+    }
+
+    /// A bridge whose topic list parks once armed, so a test can hold an
+    /// OffsetCommit between its membership check and its store write.
+    struct ParkedTopics {
+        inner: MemoryBridge,
+        entered: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>,
+        release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl Bridge for ParkedTopics {
+        fn topics(&self) -> Vec<String> {
+            if let Some(entered) = self.entered.lock().unwrap().take() {
+                let release = self.release.lock().unwrap().take().unwrap();
+                entered.send(()).unwrap();
+                release.recv().unwrap();
+            }
+            self.inner.topics()
+        }
+        fn produce(
+            &self,
+            topic: &str,
+            batches: &[RecordBatch],
+            sequenced: Option<crate::bridge::Sequenced>,
+        ) -> Result<crate::bridge::Appended, ErrorCode> {
+            self.inner.produce(topic, batches, sequenced)
+        }
+        fn fetch(
+            &self,
+            topic: &str,
+            offset: i64,
+            max_bytes: usize,
+        ) -> Result<crate::bridge::Fetched, ErrorCode> {
+            self.inner.fetch(topic, offset, max_bytes)
+        }
+        fn bounds(&self, topic: &str) -> Result<(i64, i64), ErrorCode> {
+            self.inner.bounds(topic)
+        }
+    }
+
+    /// A demotion's quiesce covers the whole validated OffsetCommit, not only
+    /// the bridge and store calls it hands out (#751, review). Between the
+    /// membership check and the store write a commit awaits work that ends
+    /// before it resumes; a quiesce that returned in that gap would let the
+    /// next promotion install its store first, and the commit, judged by a
+    /// coordinator since forgotten, would be written through it. Here the
+    /// commit is held in that stretch while a quiesce starts: when the
+    /// quiesce returns, the write has already reached the store. Red when
+    /// the commit is not counted as a job of its own: the quiesce then ends
+    /// with the topic list, before the commit resumes.
+    #[tokio::test]
+    async fn a_quiesce_waits_for_the_whole_validated_offset_commit() {
+        let store = Arc::new(crate::offsets::MemoryOffsetStore::default());
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let bridge = Arc::new(ParkedTopics {
+            inner: MemoryBridge::with_topics(["events"]),
+            entered: std::sync::Mutex::new(Some(entered_tx)),
+            release: std::sync::Mutex::new(Some(release_rx)),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let gateway = Gateway::new(
+            bridge,
+            GatewayConfig {
+                advertised_port: addr.port() as i32,
+                ..GatewayConfig::default()
+            },
+        )
+        .with_offsets(Arc::clone(&store) as Arc<dyn OffsetStore>);
+        let handle = gateway.handle();
+        let (_stop, rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(gateway.serve(listener, rx));
+
+        let commit = tokio::spawn(async move {
+            call(
+                addr,
+                8,
+                7,
+                1,
+                &offset_commit_body(7, "g", -1, "", "events", 0, 0, None),
+            )
+            .await
+            .unwrap()
+        });
+        // The commit has passed its membership check and is listing topics.
+        entered_rx.recv().await.unwrap();
+        let quiesce = tokio::spawn(async move { handle.quiesce(|_| {}).await });
+        tokio::task::yield_now().await;
+        release_tx.send(()).unwrap();
+        quiesce.await.unwrap();
+        assert_eq!(
+            store.fetch("g", "events", 0).await,
+            Ok(Some(Committed {
+                offset: 0,
+                metadata: None
+            })),
+            "the quiesce returned before the validated commit reached its store"
+        );
+        assert_eq!(read_offset_commit(&commit.await.unwrap(), 7), vec![(0, 0)]);
     }
 
     /// Committed offsets live in the store: a commit is read back, survives a
