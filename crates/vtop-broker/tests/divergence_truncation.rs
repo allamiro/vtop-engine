@@ -134,11 +134,9 @@ fn replicate(f: &Follower, epoch: u64, leader: Uuid, base: u64, count: u64) {
 }
 
 /// The whole arc: a follower takes records from a leader that is then deposed,
-/// the new leader's history disagrees, and truncation to the divergence point
-/// makes the follower able to accept the new leader's appends.
-///
-/// Without the truncation the final append is refused and stays refused, which
-/// is the stranding this issue is about.
+/// the new leader's history disagrees, and the follower truncates to the
+/// divergence point and accepts the new leader's appends. Since #599 the new
+/// leader's first append over the diverged tail does the truncation itself.
 #[test]
 fn a_diverged_follower_truncates_and_rejoins_the_new_leader() {
     let f = follower();
@@ -197,36 +195,18 @@ fn a_diverged_follower_truncates_and_rejoins_the_new_leader() {
         }],
     };
 
-    // KNOWN GAP (#261), asserted so it cannot change unnoticed. Before the truncation
-    // the follower ACCEPTS this append as an idempotent retry: the catch-up
-    // branch asks only whether it is durable through the batch end, which it
-    // is, having taken five records the new leader never wrote. It answers "I
-    // already have offset 5" when it holds a DIFFERENT record there, and the
-    // leader counts that toward a quorum.
-    //
-    // The fix is not a check on the request's fencing epoch — that was tried
-    // and is wrong, because a newly promoted leader inherits its predecessor's
-    // prefix and retransmits it under its own newer epoch during ordinary
-    // catch-up. It needs the epoch each record was ORIGINALLY written under,
-    // which the request does not carry.
-    let premature = f.node.apply_append(&collision);
-    assert!(
-        premature.is_ok(),
-        "documenting current behaviour: the diverged follower acks rather than \
-         refusing, which is why the truncation below is not optional"
-    );
-    // It acked without applying anything — its log is untouched and still wrong.
-    assert_eq!(f.node.next_offset(), 10);
-
-    let outcome = f.node.truncate_to(divergence).unwrap();
-    assert_eq!(outcome.records_removed, 5);
-    assert_eq!(outcome.next_offset, 5);
-
-    // Now the same append genuinely lands, on a log that agrees with the leader.
+    // Once #261's gap, asserted here so it could not change unnoticed: the
+    // follower ACKED this append as an idempotent retry, because it was
+    // durable through the batch end, while it held a DIFFERENT record at
+    // offset 5, and the leader counted it toward a quorum. The follower now
+    // compares the record it holds at 5 with the leader's (#599): other bytes
+    // at an offset at its high-water mark, where nothing was acknowledged, is
+    // a conflict, so it discards its records from 5 and takes the leader's.
+    // That is the truncation to the divergence point, done by the append.
     let ack = f
         .node
         .apply_append(&collision)
-        .expect("the follower should accept the new leader after truncating");
+        .expect("the follower should discard its diverged tail and take the new leader's record");
     assert_eq!(ack.local_committed_offset, 6);
     assert_eq!(f.node.next_offset(), 6);
 }

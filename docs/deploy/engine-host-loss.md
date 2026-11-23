@@ -36,13 +36,37 @@ ledger lets the standby rebuild.
    engine on another host cannot see it. It warns about exactly that at every
    start on PostgreSQL. Two engines reading the same sources into the same
    ledger archive ranges twice and race each other's consumer-group commits.
+   On a cloud VM, stop or terminate the instance with your provider's tool
+   (`aws ec2 stop-instances --instance-ids <id>`, then wait for the state
+   `stopped`: the call returning is not the host being down) and, for a host
+   that may still be running but unreachable, also remove its access to the
+   ledger and the sources (revoke its database role or its security-group
+   rule) before you go on. Do not start the standby until one of these is
+   true; the engine will not check it for you.
 2. **Start the standby** with the same configuration and secrets and an empty
-   work directory: `vtopctl run --config /etc/vtop/config.yaml`, or let the
-   orchestrator start the replacement pod.
-3. **Wait for it to catch up.** Watch `vtop_commits_total` rise and the
-   source lag fall, or read the ledger with `vtopctl status`.
-4. **Check the archive.** `vtopctl audit-coverage --config ...` exits zero
-   when the committed ranges tile every source with no hole.
+   work directory. On the standby host, as the engine's user:
+   `systemctl start vtop-engine` for the
+   [example unit](https://github.com/allamiro/vtop-engine/blob/main/examples/systemd/vtop-engine.service),
+   or `vtopctl run --config /etc/vtop/config.yaml` directly, or let the
+   orchestrator start the replacement pod. The standby needs a `vtopctl` with
+   the `postgres` feature, the state-store secret (the same PostgreSQL URL),
+   the key files, and the shared `engine.ledger_digest_dir`. It starts with
+   recovery, as [below](#what-the-standby-does).
+3. **Wait for it to catch up.** With `VTOP_METRICS_ADDR` set on the engine
+   (for example `VTOP_METRICS_ADDR=127.0.0.1:9090`, see
+   [Metrics and alerts](../operate/monitoring.md)), `curl -s
+   127.0.0.1:9090/metrics | grep vtop_commits_total` rises and the source lag
+   falls; without it, `vtopctl status --config /etc/vtop/config.yaml` shows
+   the batches by state, and you are caught up when none is left in an
+   unfinished state and the committed count has stopped rising while the
+   source is idle. The drill's figure is 8 to 12 seconds from the kill; a
+   production figure is that plus your fencing and start time, and grows with
+   the backlog.
+4. **Check the archive.** `vtopctl audit-coverage --config
+   /etc/vtop/config.yaml --check-storage` exits zero when the committed
+   ranges tile every source with no hole and every committed object and
+   manifest is present (a range the standby has not archived yet is pending,
+   not a hole); a non-zero exit names the range or object.
 
 ## What the standby does
 
@@ -113,7 +137,8 @@ Helm chart deploys the cluster plane, not the engine.
   another host, and the drill fences by killing the process before the
   standby starts.
 - A ledger or a store lost with the host. Back up the PostgreSQL ledger
-  ([#734](https://github.com/allamiro/vtop-engine/issues/734)); the store's
-  durability is the store's.
+  ([Backup and recovery](../operate/backup-and-recovery.md)); the store's
+  durability is the store's. What to do when they are lost anyway is in
+  [Disaster recovery](../operate/disaster-recovery.md).
 - A PostgreSQL failover is not drilled. A store outage is (the
   `sqlite-kafka-store-outage` leg), but not at the same time as a host loss.

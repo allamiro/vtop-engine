@@ -308,7 +308,12 @@ impl AdminServer {
             );
         }
         loop {
-            let (tcp, peer) = listener.accept().await?;
+            let (tcp, peer) = super::accept::accept_retrying(
+                "metadata admin listener",
+                super::accept::ACCEPT_RETRY_DELAY,
+                || listener.accept(),
+            )
+            .await;
             // Over the cap: closed now, before the handshake, and counted.
             let Some(slot) = self.limit.admit(peer) else {
                 drop(tcp);
