@@ -988,18 +988,6 @@ impl SegmentSet {
         self.tail()
     }
 
-    /// [`ActiveSegment::held_offset`] of the tail, whose producer state is
-    /// the range's (a roll carries it to the successor) and is what an append
-    /// is deduplicated against.
-    pub fn held_offset(&self, record: &LogRecord) -> Option<u64> {
-        self.tail().held_offset(record)
-    }
-
-    /// [`ActiveSegment::below_retry_window`] of the tail.
-    pub fn below_retry_window(&self, record: &LogRecord) -> bool {
-        self.tail().below_retry_window(record)
-    }
-
     pub fn active_mut(&mut self) -> &mut ActiveSegment {
         self.tail_mut()
     }
