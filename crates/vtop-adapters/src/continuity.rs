@@ -275,6 +275,19 @@ pub(crate) fn open_regular(path: &std::path::Path) -> std::io::Result<std::fs::F
     Ok(file)
 }
 
+/// [`open_regular`] on tokio's blocking pool, where `tokio::fs::File::open`
+/// ran the open it replaces. `O_NONBLOCK` stops a FIFO from holding the open;
+/// it does not make a regular file's open or `fstat` asynchronous, and a slow
+/// or stalled filesystem would otherwise hold the executor thread that polls
+/// the read pipeline's other files (`buffer_unordered`).
+pub(crate) async fn open_regular_async(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || open_regular(&path))
+        .await
+        .map_err(std::io::Error::other)?
+        .map(tokio::fs::File::from_std)
+}
+
 /// The file now at `path` - its metadata and first bytes, through ONE open
 /// descriptor - for judging a commit or a rewind against it. `None` when it
 /// cannot be opened or read.
@@ -593,6 +606,40 @@ mod tests {
         let file = dir.path().join("regular.log");
         std::fs::write(&file, b"line\n").unwrap();
         assert!(open_regular(&file).is_ok());
+    }
+
+    /// The read and replay paths' open, on the blocking pool: a FIFO is still
+    /// refused without waiting, and a regular file opens and reads.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_async_open_refuses_a_fifo_and_opens_a_file() {
+        use tokio::io::AsyncReadExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("app.log");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success());
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            open_regular_async(&fifo),
+        )
+        .await
+        .expect("opening a FIFO must not wait for a writer");
+        assert_eq!(
+            refused.map(|_| ()).map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::InvalidInput),
+            "a FIFO is not taken for a file"
+        );
+        let file = dir.path().join("regular.log");
+        std::fs::write(&file, b"line\n").unwrap();
+        let mut opened = open_regular_async(&file)
+            .await
+            .expect("a regular file opens");
+        let mut read = String::new();
+        opened.read_to_string(&mut read).await.unwrap();
+        assert_eq!(read, "line\n");
     }
 
     fn seen(inode: Option<u64>, size: u64) -> Option<Observed> {

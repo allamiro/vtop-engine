@@ -2648,8 +2648,8 @@ impl FileSource {
         // "read the bytes" and "stat the path" would otherwise mix the old
         // file's offsets with the NEW file's identity (#65). The descriptor is
         // judged before any byte is read.
-        let mut file = continuity::open_regular(Path::new(&path))
-            .map(tokio::fs::File::from_std)
+        let mut file = continuity::open_regular_async(Path::new(&path))
+            .await
             .map_err(SliceError::before_judged)?;
         let mut opened =
             Self::identity_of(&file.metadata().await.map_err(SliceError::before_judged)?);
