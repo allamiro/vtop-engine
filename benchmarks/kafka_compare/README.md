@@ -30,7 +30,9 @@ python3 benchmarks/kafka_compare/regenerate.py
 
 Useful knobs: `--sizes 100,1024`, `--reps 3`, `--sat-records 100:3000000,1024:1000000` (records per
 saturation run AND per consume run, per record size), `--fixed-seconds 30` (a fixed-rate run sends rate x this many records),
-`--smoke-records`, `--no-consume`, `--rebuild`, `--run-id` (one path component), `--max-hours 30`.
+`--smoke-records`, `--no-consume`, `--rebuild`, `--run-id` (one path component), `--max-hours 30`, and the
+schema-4 switches `--no-e2e` (no end-to-end stage), `--no-fsync-parity` (the end-to-end stage for both systems as
+shipped only) and `--no-resources` (no cgroup windows).
 Every one is checked before any Docker work, and so is the matrix's projected run time (`plan.py`):
 a matrix projected past `--max-hours` is refused before the first container starts.
 
@@ -110,9 +112,46 @@ For each record size, Kafka first and then VTOP:
    fresh group, `--reps` times; the recorded rates are its `fetch.*` columns, which exclude the group join.
 7. **Down.** The leader's log is saved under `logs/`, the cluster is removed with its volumes.
 
+Then, once per record size and after both systems' cells (schema 4, #600), **the end-to-end stage**: the common rate
+is `E2E_LOAD_PCT` (50 %) of the SLOWER system's median saturation for the cell, and both systems, and Kafka under
+`fsync-parity` as well (`compose.kafka.fsync-parity.yml` layered on the base file, plus `flush.messages=1` on the
+topic: the setting `crash.py`'s fsync-parity configuration uses), are brought up fresh, smoke-checked, warmed up for
+10 s at that rate and measured `--reps` times. In each repetition [`client/E2eLatency.java`](client/E2eLatency.java),
+run by the image's own JVM in a second client container (2 CPUs, 2 GiB), assigns the partition and seeks to the end,
+says `READY`, and counts each record's latency (its `poll()` return time minus the producer's `CreateTime`, both
+the client host's clock, 1 ms resolution) into a histogram while the perf producer offers `rate x --fixed-seconds`
+records at that rate. VTOP has one configuration, so it owes no `fsync-parity` row. With `--group-commit off,on`, VTOP is
+measured end-to-end once per setting, and the common rate's slower system is the slower of Kafka and VTOP's
+slowest setting, so every end-to-end series is offered the same rate. A run that consumed a
+different number of records than it produced is a `failed` row saying how many are missing; a negative latency
+fails the row (a clock or timestamp fault); a rate not held is flagged `sustained=false`.
+
+**Resources (metric 4).** Around every measured run (saturation, each fixed rate, consume, end-to-end), the
+runner `sync`s each of the system's three nodes, reads `cpu.stat` and `io.stat` from inside each container
+(`docker exec`, [`resources.py`](resources.py)), runs the producer or consumer, `sync`s again, waits 2 s for
+write-back, and reads again. The row records the three nodes' summed deltas (`cpu_seconds`, `disk_write_bytes`,
+`disk_read_bytes`), the bytes the run delivered (`delivered_bytes`: records sent, or read, times the record
+size) and the window's start and end. The report divides: CPU seconds per GiB delivered, and bytes written per
+byte delivered (write amplification: replication, logs, indexes and metadata included). cgroup v2 with the `cpu`
+and `io` controllers is required and checked before the run starts (cgroup v1 is refused, not approximated).
+
+**Overhead, stated.** The counters are read outside the producer's run, never during it, so they add no load to
+what is timed; each window adds about 6 s of wall time (the syncs, the settle and the reads), about 6 minutes
+over a default run's 36 measured runs per system. The end-to-end stage adds two fresh clusters per record size
+(one for Kafka under `fsync-parity`) with 40 s of runs per repetition, about 15 minutes in all. The consumer
+runs beside the producer, which is the point of an end-to-end measurement, but means the client host carries two
+JVMs at once (6 CPUs of client limits beside the nodes' 6): on a host with fewer than 12 CPUs, say so in the
+result. `plan.py` charges both to the projected hours.
+
+**Unverified until a run on the target host:** the consumer launches as a Java source file, which needs the
+image's JVM to include the compiler; `run.py` runs `E2eLatency.java --check` before anything starts and refuses,
+naming `--no-e2e`, when it cannot. Whether VTOP's gateway returns a record's `CreateTime` unchanged (the
+latency would otherwise be nonsense, and the run refuses a negative one) and whether the node containers'
+`io.stat` accounts the data volume's writes are the two things the first run shows.
+
 ## Output
 
-`results/<run-id>/results.csv`, schema 3 (#752, on schema 2 from #596): one row per key
+`results/<run-id>/results.csv`, schema 4 (#600, on schema 3 from #752 and schema 2 from #596): one row per key
 (`system`, `mode`, `record_size`, `partitions`, `producers`, `compression`, `acks`, `profile`, `group_commit`,
 `repetition`, `load_basis`, `load_pct`), with the run-constant columns (`run_id`, `env_fingerprint`, `vtop_commit`,
 `kafka_image`, `client`). `mode` is `saturation`, `fixed_rate`, `consume` or `e2e` (end-to-end latency);
@@ -128,7 +167,18 @@ measurement: VTOP's node configuration is the same under both profiles, so it ru
 are recorded under each. Which rows a matrix owes is defined once, in `plan.py`, for the runner, `--check`
 and the report.
 
-Schema 2 (no `group_commit` column) still loads, read with a blank setting. Schema 1, the layout of the
+**Schema 4** (#600) adds four columns after the window, `delivered_bytes`, `cpu_seconds`, `disk_write_bytes` and
+`disk_read_bytes` (the three nodes summed; all four blank on a row without a resource window and on every failed or
+refused row), a sidecar `e2e_hist.csv` (one line per ok `e2e` row and 1 ms bucket: the row's key columns, including
+`group_commit`, then `bucket_ms` with 60000 meaning 60 s or more, and `count`; the counts must sum to the row's
+`records`, and the row's percentiles must be the histogram's), and two matrix keys, `resources` (every ok measured
+row carries its resources) and `e2e.extra_profiles` (profiles Kafka alone is also measured under, end-to-end only,
+at the common rate). It is written with `environment.json` `schema_version` 4, and from schema 3 on the two are
+refused when they disagree. Schemas 1 to 3 still load, and their reports are unchanged byte for byte: the columns
+a row predates read as blank.
+
+Schema 3 (#752, the `group_commit` column) and schema 2 (no `group_commit` column, read with a blank setting)
+still load. Schema 1, the layout of the
 committed phase-1 run (`20261109T232328Z`), still loads. It had no
 `compression`, `same_config_as`, `load_basis`, `records_produced`, `lat_basis` or window columns, and held
 `profile` constant across the run. Its rows are read as schema 2 with compression `none`, load basis `kafka`
@@ -172,9 +222,11 @@ missing, `environment.json`'s `schema_version` is malformed or newer than the re
 `environment.json` of schema 2 records no `host_disk`, the run did not finish, a row is malformed or a `failed`/`refused` row gives no reason, any expected
 row is missing or duplicated, rows come from more than one environment, commit, image or client (or, in a run whose
 CSV is schema 1, profile), the run varies along a dimension this report does not draw yet (partitions,
-producers, compression, acks, profile, or a load basis other than `kafka`; the grouped charts are #600's)
+producers, compression, acks, profile other than Kafka's `fsync-parity` end-to-end rows, or a load basis other
+than `kafka` on fixed-rate rows and `common` on end-to-end rows; the grouped charts are #600's)
 or holds a value its text does not say (a codec other than none, acks other than all, a profile other
-than the environment's, end-to-end rows), a row that repeats another profile's measurement does not match
+than the environment's), a run whose matrix has the end-to-end mode but whose `e2e_hist.csv` is missing, short,
+or disagrees with its rows, a run whose matrix asks for resources but has an ok row without them, a row that repeats another profile's measurement does not match
 a measured row under that profile, the CSV's run id, commit, image, client or `acks` (and, in a run whose CSV is
 schema 1, profile) differ from what `environment.json` records, or
 the CSV's fingerprint does not match `environment.json` (rule 9). A cell that did not run is a row with
@@ -418,5 +470,7 @@ crashes, 9.5 % at 30. The issue's plan asks for 30 crashes per configuration (3.
 - Matrix: 100 B and 1 KiB, 1 partition, 1 producer, no compression, `defaults` only (no `fsync-parity`,
   `matched-timeouts`, 10 KiB, 6 partitions, 4 producers).
 - VTOP runs without its metadata plane (static leadership): no lease, no failover, no durable offsets.
-- No per-node CPU/RSS or bytes-written sampling, no end-to-end latency.
+- Resources are the three nodes' summed CPU seconds and bytes read and written (no per-node breakdown, no RSS),
+  and end-to-end latency is at one offered load, the common rate, at 1 ms resolution. A run of the schema-1 shape
+  (`--no-e2e --no-resources`) has neither.
 - Laptop numbers: Docker Desktop on one host, sharing the VM with whatever else runs there.

@@ -83,7 +83,7 @@ def complete_rows(env):
     return rows
 
 
-def write_run(directory, env, rows, columns=schema.COLUMNS):
+def write_run(directory, env, rows, columns=schema.COLUMNS_V2):
     os.makedirs(directory, exist_ok=True)
     with open(os.path.join(directory, "environment.json"), "w") as handle:
         json.dump(env, handle)
@@ -106,7 +106,7 @@ def rewrite(run_dir, mutate):
         rows = list(csv.DictReader(handle))
     rows = mutate(rows)
     with open(path, "w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=schema.COLUMNS)
+        writer = csv.DictWriter(handle, fieldnames=schema.COLUMNS_V2)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -124,7 +124,7 @@ def first(rows, **criteria):
 
 
 def test_v3_header_is_exactly_the_documented_columns():
-    assert schema.COLUMNS == (
+    assert schema.COLUMNS_V3 == (
         "run_id", "env_fingerprint", "vtop_commit", "kafka_image", "client", "system", "mode", "record_size",
         "partitions", "producers", "compression", "acks", "profile", "group_commit", "same_config_as", "repetition",
         "load_basis", "load_pct", "offered_rate", "status", "sustained", "records", "records_produced",
@@ -132,7 +132,7 @@ def test_v3_header_is_exactly_the_documented_columns():
         "lat_p999_ms", "lat_basis", "started_at", "window_start_ms", "window_end_ms", "wall_seconds", "note")
     assert schema.KEY == ("system", "mode", "record_size", "partitions", "producers", "compression", "acks",
                           "profile", "group_commit", "repetition", "load_basis", "load_pct")
-    assert set(schema.KEY) <= set(schema.COLUMNS)
+    assert set(schema.KEY) <= set(schema.COLUMNS_V3) <= set(schema.COLUMNS)
     assert "profile" not in schema.RUN_CONSTANT and "profile" in schema.RUN_CONSTANT_V1
 
 

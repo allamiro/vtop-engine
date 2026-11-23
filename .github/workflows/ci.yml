@@ -2579,7 +2579,7 @@ jobs:
         # without this line the pipe into tee would hide a failing test.
         run: |
           set -o pipefail
-          python -m pytest -rs tests/test_kafka_compare_report.py tests/test_kafka_compare_regenerate.py tests/test_kafka_compare_failover.py tests/test_kafka_compare_footer.py tests/test_kafka_compare_colours.py tests/test_readme_charts.py tests/test_benchmark_charts_job.py tests/test_compare_reports.py tests/test_kafka_compare_crash_report.py tests/test_aws_ingest.py tests/test_readme_cards.py tests/test_site_facts.py | tee "$RUNNER_TEMP/chart-tests.log"
+          python -m pytest -rs tests/test_kafka_compare_report.py tests/test_kafka_compare_regenerate.py tests/test_kafka_compare_failover.py tests/test_kafka_compare_footer.py tests/test_kafka_compare_colours.py tests/test_readme_charts.py tests/test_benchmark_charts_job.py tests/test_compare_reports.py tests/test_kafka_compare_crash_report.py tests/test_aws_ingest.py tests/test_kafka_compare_extra_report.py tests/test_kafka_compare_extra_charts.py tests/test_readme_cards.py tests/test_site_facts.py | tee "$RUNNER_TEMP/chart-tests.log"
           if grep -E "SKIPPED.*(matplotlib|PIL)" "$RUNNER_TEMP/chart-tests.log"; then
             echo "::error::A chart test skipped for want of matplotlib or Pillow, in the one job that installs them."
             exit 1

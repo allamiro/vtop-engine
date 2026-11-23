@@ -22,6 +22,7 @@ from typing import Any, NamedTuple
 from kafka_compare import colours, footer, schema, stats
 from kafka_compare import crash_analysis as ca
 from kafka_compare import crash_schema as cs
+from kafka_compare import extra_charts as ec
 from kafka_compare import report as base
 
 # The fewest ok crashes a configuration may have for the report to draw it. The plan is 12 per
@@ -263,6 +264,177 @@ def drop_chart(plt, run: cs.CrashRun, img_dir: str, text: str) -> list[str]:
     return paths
 
 
+# ------------------------------------------------------------------------------ the paired latency run
+
+# What must be the same for a latency run to stand beside a crash run: the host, its kernel and the limits,
+# the Kafka image, and (when both record it) the engine tree. A run that differs in any of them was measured
+# on another machine, and a chart that put them side by side would compare two environments as one (rule 9).
+PAIRED_MATCH = ("host_cpu", "host_logical_cpus", "host_memory_bytes", "host_os", "docker_vm_kernel",
+                "kafka_image", "node_limits")
+PAIRED_IMAGE = "kafka-crash-vs-latency"
+
+
+class Paired(NamedTuple):
+    """The throughput run whose end-to-end latencies are drawn beside the crash run's losses."""
+
+    run: schema.Run
+    configs: list[str]  # the crash matrix's configuration names, in its order
+
+
+def _loss_mode(env: dict[str, Any]) -> str:
+    modes = [m for m in MODE_ORDER if m in env["matrix"]["crash_modes"]]
+    return modes[0]  # power loss first: it is the measurement, the process kill its control
+
+
+def load_paired(crash_run: cs.CrashRun, latency_dir: str) -> Paired:
+    """The latency run, loaded by the throughput report's own loader and held to the crash run's environment."""
+    latency = schema.load_run(latency_dir)  # complete, single-environment, or refused
+    crash_c, lat_c = crash_run.environment["comparable"], latency.environment["comparable"]
+    differs = [f"{key} ({crash_c.get(key)!r} in the crash run, {lat_c.get(key)!r} in the latency run)"
+               for key in PAIRED_MATCH if crash_c.get(key) != lat_c.get(key)]
+    if "vtop_engine_tree" in crash_c and "vtop_engine_tree" in lat_c \
+            and crash_c["vtop_engine_tree"] != lat_c["vtop_engine_tree"]:
+        differs.append(f"vtop_engine_tree ({crash_c['vtop_engine_tree']!r} in the crash run, "
+                       f"{lat_c['vtop_engine_tree']!r} in the latency run)")
+    if differs:
+        raise schema.ReportRefused(f"the latency run {latency.environment['run_id']} is not the same environment "
+                                   f"as the crash run {crash_run.environment['run_id']}: it differs in "
+                                   + "; ".join(differs) + ". Their results would be drawn side by side as one.")
+    if not ec.has_e2e(latency.environment):
+        raise schema.ReportRefused(f"the latency run {latency.environment['run_id']} has no end-to-end mode, so "
+                                   "it holds no latency to draw beside the crash results")
+    have = ec.configs(latency.rows)
+    configs = list(crash_run.environment["matrix"]["configs"])
+    missing = [name for name in configs if ca.CONFIGS[name] not in have]
+    if missing:
+        raise schema.ReportRefused(f"the latency run {latency.environment['run_id']} has no end-to-end rows for "
+                                   f"{', '.join(missing)}, which the crash run measures: its matrix needs "
+                                   "e2e.extra_profiles for the Kafka profile that is not `defaults`")
+    return Paired(latency, configs)
+
+
+def paired_footer(crash_text: str, paired: Paired) -> str:
+    """The crash footer, and a line that names the latency run: both runs are in the figure."""
+    env = paired.run.environment
+    extra = [("latency run", env["run_id"]), ("latency client", env["comparable"]["client"]),
+             ("latency offered", ec.basis_text(env)), ("latency repetitions", str(env["matrix"]["repetitions"])),
+             ("latency date", env["started_at"][:10])]
+    for label, value in extra:
+        if footer.SEPARATOR.strip() in value or "\n" in value:
+            raise ValueError(f"footer field {label!r} is {value!r}, which holds a separator or a line break")
+    return crash_text + "\n" + footer.SEPARATOR.join(f"{label}: {value}" for label, value in extra)
+
+
+def paired_chart(plt, crash_run: cs.CrashRun, paired: Paired, img_dir: str, text: str) -> list[str]:
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+    from matplotlib.ticker import MaxNLocator
+
+    env, rows = crash_run.environment, paired.run.rows
+    mode = _loss_mode(env)
+    mine = {c.config: c for c in cells(crash_run.rows, env) if c.mode == mode}
+    sizes = paired.run.environment["matrix"]["record_sizes"]
+    width_in, height_in = 6.0 + 2 * 4.0, 5.9
+    fig, axes = plt.subplots(1, 3, figsize=(width_in, height_in), gridspec_kw={"width_ratios": [1.15, 1, 1]})
+    fig.subplots_adjust(left=0.065, right=0.99, top=1 - 1.85 / height_in, bottom=1.75 / height_in, wspace=0.27)
+    loss, p50, p99 = axes
+    base._style_axes(loss)
+    loss.grid(axis="y")
+    top = max([4] + [n for c in mine.values() for n in c.lost])
+    for i, config in enumerate(paired.configs):
+        cell = mine[config]
+        style = ec.config_style(ca.CONFIGS[config])
+        xs = [i + dx for dx in _x_offsets(len(cell.lost))]
+        loss.scatter(xs, cell.lost, marker=style["marker"], s=30, color=style["color"], edgecolors=base.SURFACE,
+                     linewidths=0.8, zorder=4)
+        if cell.lost:
+            loss.hlines(stats.median(cell.lost), i - 0.34, i + 0.34, color=base.INK, linewidth=1.3, zorder=5)
+        said = f"{cell.lossy} of {len(cell.ok)} lost records"
+        if cell.bound is not None:
+            said += f"\n95 % bound: {percent(cell.bound)}"
+        loss.text(i, 0.975, said, transform=loss.get_xaxis_transform(), ha="center", va="top", fontsize=7.3,
+                  color=base.INK)
+    loss.set_xticks(range(len(paired.configs)))
+    loss.set_xticklabels([CONFIG_LABEL[c].replace(", ", ",\n") for c in paired.configs], fontsize=7.5)
+    loss.set_xlim(-0.6, len(paired.configs) - 0.4)
+    loss.set_ylim(-0.04 * top, top * 1.4)
+    loss.yaxis.set_major_locator(MaxNLocator(integer=True))
+    loss.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _p: base._tick(v)))
+    loss.set_ylabel("acknowledged records lost, per crash")
+    loss.set_title(f"what it loses: {MODE_TITLE[mode].split(' (')[0]}", loc="left", fontsize=8.5)
+    width, gap = 0.12, 0.02
+    unheld = False
+    for ax, (column, name) in ((p50, ("lat_p50_ms", "p50")), (p99, ("lat_p99_ms", "p99"))):
+        base._style_axes(ax)
+        ax.grid(axis="y")
+        high = 0.0
+        for index, config in enumerate(paired.configs):
+            system, profile = ca.CONFIGS[config]
+            style = ec.config_style((system, profile))
+            for position, size in enumerate(sizes):
+                cell = ec.e2e_cell(rows, system, profile, size, column)
+                x = position + (index - (len(paired.configs) - 1) / 2) * (width + gap)
+                high = ec._bars(ax, x, cell["summary"], width, style, None, cell, high)
+                if cell["summary"] is not None and not cell["sustained"]:
+                    unheld = True
+                    ax.text(x, 0, "*", ha="center", va="bottom", fontsize=11, color=base.INK)
+        ax.set_xticks(range(len(sizes)))
+        ax.set_xticklabels([f"{base.size_label(s)}\nrecords" for s in sizes], fontsize=7.8)
+        ax.set_xlim(-0.6, len(sizes) - 0.4)
+        ax.set_ylim(0, high * 1.22 if high else 1)
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _p: base._tick(v)))
+        ax.set_ylabel(f"{name} end-to-end latency, ms")
+        ax.set_title(f"what it costs: {name} latency", loc="left", fontsize=8.5)
+    handles = []
+    for config in paired.configs:
+        style = ec.config_style(ca.CONFIGS[config])
+        kw = {"hatch": style["hatch"], "edgecolor": base.SURFACE} if style["hatch"] else {}
+        handles.append(Patch(facecolor=style["color"], linewidth=0, label=CONFIG_LABEL[config], **kw))
+    if unheld:
+        handles.append(Patch(facecolor=base.SURFACE, edgecolor=base.INK_2, label="* offered rate NOT held"))
+    handles.append(Line2D([], [], color=base.INK, linewidth=1.3, label="median lost over the ok crashes"))
+    fig.legend(handles=handles, loc="upper left", ncol=len(handles), fontsize=8, handlelength=1.4,
+               bbox_to_anchor=(0.055, 1 - 1.22 / height_in))
+    base._header(fig, height_in, "What each durability profile loses in a whole-replica-set crash, and what it costs",
+                 base._wrap("Left: acknowledged records lost per power-loss crash (crash run "
+                            f"{env['run_id']}). Middle and right: the same configuration's end-to-end latency at "
+                            f"one offered rate (latency run {paired.run.environment['run_id']}, "
+                            f"{ec.basis_text(paired.run.environment)}), measured on the same host and engine tree, "
+                            "not in the crash run. Bars: median of repetitions; whiskers: min-max.", 190))
+    base._footer(fig, text, 200)
+    paths = base._save(fig, img_dir, PAIRED_IMAGE, text)
+    plt.close(fig)
+    return paths
+
+
+def paired_section(all_cells: list[Cell], paired: Paired, images: dict[str, str], mode: str) -> list[str]:
+    lat = paired.run
+    out = ["## What each profile costs in latency, beside what it loses", "",
+           f"![What each profile loses and what it costs]({images['paired']})", ""]
+    out.append(f"The losses are this run's. The latencies are from run `{lat.environment['run_id']}`, the "
+               "throughput harness's end-to-end mode on the same host, kernel, limits, Kafka image and engine tree "
+               "(the report refuses a latency run that differs in any of them), at "
+               f"{ec.basis_text(lat.environment)} for every configuration. The crash client sends a few bytes a "
+               "record and the latency run sends the sizes below, so the latency is what the same configuration "
+               "costs, not a measurement made during the crash.")
+    out.append("")
+    body = []
+    for config in paired.configs:
+        system, profile = ca.CONFIGS[config]
+        cell = next(c for c in all_cells if c.config == config and c.mode == mode)
+        for size in lat.environment["matrix"]["record_sizes"]:
+            p50 = ec.e2e_cell(lat.rows, system, profile, size, "lat_p50_ms")
+            p99 = ec.e2e_cell(lat.rows, system, profile, size, "lat_p99_ms")
+            held = ("yes" if p50["sustained"] else "**no**") if p50["summary"] is not None else "-"
+            body.append([CONFIG_LABEL[config], f"{cell.lossy} of {len(cell.ok)}",
+                         percent(cell.bound) if cell.bound is not None else "-", base.size_label(size), held,
+                         base._summary_cell(p50), base._summary_cell(p99)])
+    out += _table(["configuration", "crashes that lost records", "95 % bound", "latency record size", "rate held",
+                   "p50 ms", "p99 ms"], body)
+    out.append("")
+    return out
+
+
 # ------------------------------------------------------------------------------ the page
 
 
@@ -328,7 +500,7 @@ LIMITS = """\
 
 
 def write_markdown(run: cs.CrashRun, images: dict[str, str], csv_rel: dict[str, str], text: str,
-                   doc_path: str) -> None:
+                   doc_path: str, paired: Paired | None = None) -> None:
     env = run.environment
     rows = run.rows
     c = env["comparable"]
@@ -389,6 +561,8 @@ def write_markdown(run: cs.CrashRun, images: dict[str, str], csv_rel: dict[str, 
     add("")
     add(f"![Acknowledged records lost per crash]({images['loss']})")
     add("")
+    if paired is not None:
+        lines += paired_section(all_cells, paired, images, _loss_mode(env))
     add("## Everything else the read-back checks")
     add("")
     lines += _table(
@@ -468,10 +642,13 @@ def write_markdown(run: cs.CrashRun, images: dict[str, str], csv_rel: dict[str, 
         handle.write("\n".join(lines))
 
 
-def build(run_dir: str, img_dir: str, doc_path: str, setup_matplotlib, min_ok: int = MIN_OK_CRASHES) -> list[str]:
+def build(run_dir: str, img_dir: str, doc_path: str, setup_matplotlib, min_ok: int = MIN_OK_CRASHES,
+          latency_run: str | None = None) -> list[str]:
     run = cs.load_crash_run(run_dir, min_ok=min_ok)  # raises ReportRefused before anything is written
+    paired = load_paired(run, latency_run) if latency_run else None
     try:
         text = footer_text(run.environment)
+        paired_text = paired_footer(text, paired) if paired else None
     except (KeyError, ValueError) as exc:
         raise schema.ReportRefused(f"{run_dir}/environment.json cannot make the footer every image carries: "
                                    f"{exc!r}") from exc
@@ -481,11 +658,14 @@ def build(run_dir: str, img_dir: str, doc_path: str, setup_matplotlib, min_ok: i
     written = loss_chart(plt, run, img_dir, text)
     if "flakey-drop" in run.environment["matrix"]["crash_modes"]:
         written += drop_chart(plt, run, img_dir, text)
+    if paired:
+        written += paired_chart(plt, run, paired, img_dir, paired_text)
     doc_dir = os.path.dirname(os.path.abspath(doc_path))
     images = {key: os.path.relpath(os.path.join(img_dir, f"kafka-crash-{name}.png"), doc_dir)
               for key, name in (("loss", "loss"), ("drop", "drop-gap"))}
+    images["paired"] = os.path.relpath(os.path.join(img_dir, f"{PAIRED_IMAGE}.png"), doc_dir)
     rel = {"crash": os.path.relpath(os.path.join(run_dir, "crash.csv"), doc_dir),
            "environment": os.path.relpath(os.path.join(run_dir, "environment.json"), doc_dir)}
-    write_markdown(run, images, rel, text, doc_path)
+    write_markdown(run, images, rel, text, doc_path, paired)
     written.append(doc_path)
     return written

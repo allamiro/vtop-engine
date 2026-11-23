@@ -17,6 +17,12 @@ Kafka's rows carry a blank setting and VTOP owes its rows once per setting
 asked for. A matrix without the axis leaves VTOP at the node's own default and
 writes a blank setting everywhere, which is what every earlier run did.
 
+Schema 4 (#600) adds two optional keys. `resources: true` says every measured row also carries the CPU
+seconds and bytes written its window cost. `e2e.extra_profiles` lists profiles that Kafka ALONE is also
+measured under, in the end-to-end mode only, at the same common offered rate: the latency cost of a durability
+profile, read beside the crash results. VTOP owes no row for them (its rows carry a blank group-commit
+setting there too, as Kafka's always do).
+
     python3 benchmarks/kafka_compare/plan.py MATRIX.json [--max-hours H]
 
 prints the cells, the expected row count and the projected hours, and exits
@@ -120,7 +126,19 @@ def expected_keys(matrix: dict[str, Any]) -> set[tuple]:
                         keys.add(base[:1] + (mode,) + base[2:] + (a.e2e["load_basis"], str(a.e2e["load_pct"])))
                     else:
                         keys.add(base[:1] + (mode,) + base[2:] + ("", ""))
+    for extra in extra_profiles(matrix):
+        for cell in a.cells:
+            if "e2e" in cell.modes:
+                for rep in range(1, a.repetitions + 1):
+                    keys.add(("kafka", "e2e", cell.record_size, cell.partitions, cell.producers, cell.compression,
+                              cell.acks, extra, "", rep, a.e2e["load_basis"], str(a.e2e["load_pct"])))
     return keys
+
+
+def extra_profiles(matrix: dict[str, Any]) -> list[str]:
+    """The profiles Kafka alone is also measured under in the end-to-end mode (schema 4), or none."""
+    e2e = matrix.get("e2e")
+    return list(e2e.get("extra_profiles") or []) if isinstance(e2e, dict) else []
 
 
 def _is_int(value: Any) -> bool:
@@ -182,6 +200,19 @@ def check_matrix(matrix: dict[str, Any]) -> None:
         if (not isinstance(e2e, dict) or e2e.get("load_basis") not in LOAD_BASES
                 or not _is_int(e2e.get("load_pct")) or not 0 < e2e["load_pct"] < 100):
             raise PlanRefused(f"matrix.e2e is {e2e!r}, not {{load_basis, load_pct}}")
+        if "extra_profiles" in e2e:
+            extra = e2e["extra_profiles"]
+            if (not isinstance(extra, list) or not extra or len(set(extra)) != len(extra)
+                    or any(p not in PROFILES for p in extra)):
+                raise PlanRefused(f"matrix.e2e.extra_profiles is {extra!r}, not a list of distinct profiles from "
+                                  f"{list(PROFILES)}")
+            main = matrix.get("profiles") or [matrix.get("profile") or "defaults"]
+            already = [p for p in extra if p in main]
+            if already:
+                raise PlanRefused(f"matrix.e2e.extra_profiles names {already}, which the run already measures "
+                                  "in every mode")
+    if not isinstance(matrix.get("resources", False), bool):
+        raise PlanRefused(f"matrix.resources is {matrix.get('resources')!r}, not true or false")
     for extra in matrix.get("acks_slice") or []:
         if (not isinstance(extra, dict) or extra.get("acks") not in ACKS
                 or extra.get("compression") not in COMPRESSIONS
@@ -211,6 +242,8 @@ DEFAULT_TIMING = {
     "fixed_rate": 10.0,      # one fixed-rate run's overhead; its duration is matrix.fixed_seconds
     "consume": 20.0,
     "e2e": 40.0,
+    # Schema 3: the cgroup counters are read, and the nodes synced, before and after every measured run.
+    "resource_window": 6.0,
 }
 SLOWEST_BYTES_PER_SECOND = 2 * 1024 * 1024
 
@@ -239,6 +272,9 @@ def projected_seconds(matrix: dict[str, Any], timing: dict[str, float] | None = 
             sized = {mode: max(seconds, moved) for mode, seconds in sized.items()}
         shared = sum(sized.get(m, t[m]) for m in cell.modes if m != "fixed_rate")
         rated = t["fixed_rate"] * fixed if "fixed_rate" in cell.modes else 0.0
+        if matrix.get("resources"):
+            runs = sum(1 for m in cell.modes if m != "fixed_rate") + (fixed if "fixed_rate" in cell.modes else 0)
+            shared += t["resource_window"] * runs
         one = t["bring_up"] + t["warm_up"] + a.repetitions * (shared + rated)
         # Kafka runs every profile in full. VTOP, when its configuration is
         # the same under all of them, brings its cluster up once and makes
@@ -251,6 +287,9 @@ def projected_seconds(matrix: dict[str, Any], timing: dict[str, float] | None = 
         # VTOP's cluster is brought up and measured afresh for every group-commit
         # setting asked for (the node's config is read at start); Kafka's is not.
         total += one * profiles + vtop * max(len(a.group_commits), 1)
+        if "e2e" in cell.modes:
+            # Kafka alone, once per extra profile: a fresh cluster, the warm-up, and the e2e runs.
+            total += len(extra_profiles(matrix)) * (t["bring_up"] + t["warm_up"] + a.repetitions * t["e2e"])
     return total
 
 
