@@ -46,7 +46,7 @@ head-on.
 | Epoch-qualified truncation (KIP-101/KIP-279) | Largely closed in v0.2.0: per-replica epoch history, bounded divergence truncation, fence-and-read reconciliation. The §5.4.1-style election restriction shipped in v0.4.0 (`promotion.rs`, per-voter form). The §5.4.2 rule — a new leader publishes its high-water mark only through a quorum-acked marker of its own epoch, so a published mark never regresses — is implemented on `main` for v0.5.0 (`publish_boundary_marker`, driven from the lease publisher; scenarios 09 and 14 assert the non-regression). The remaining piece is the signed leadership-transition record. | #240 remainder |
 | Transactions / EOS | Kafka has cross-partition transactions and exactly-once streams. VTOP has producer idempotency (epoch + sequence dedup) — enough for exactly-once produce per range, no cross-range transactions. | Not scheduled; deliberate scope cut for now |
 | Consumer-group sophistication | Kafka has incremental cooperative rebalancing, static membership, regex subscriptions. VTOP has groups, cursors-in-metadata, heartbeats, and assignment — the minimum honest core. | Not scheduled |
-| Ecosystem | Clients in every language, Connect, Streams, MirrorMaker, ksqlDB, decades of operational tooling. VTOP has `vtopctl`, dashboards-as-code, and a Kafka wire-compatibility gateway (#225) that stock librdkafka clients produce to and consume from; it is measured slower than Apache Kafka ([benchmarks/kafka-comparison.md](benchmarks/kafka-comparison.md)), and a Kafka client cannot yet follow a VTOP failover. | #225 shipped the gateway; a Kafka client following a failover is #751 (v0.11.0) |
+| Ecosystem | Clients in every language, Connect, Streams, MirrorMaker, ksqlDB, decades of operational tooling. VTOP has `vtopctl`, dashboards-as-code, and a Kafka wire-compatibility gateway (#225) that stock librdkafka clients produce to and consume from; it is measured slower than Apache Kafka ([benchmarks/kafka-comparison.md](benchmarks/kafka-comparison.md)), and a Kafka client follows a VTOP failover with no restart and no configuration change when the nodes are candidates (#751; live-chaos scenarios 27 and 28: librdkafka resumed 5.7 s to 6.6 s after a leader kill, the JVM client 5.5 s to 5.8 s, every acknowledged record read back once and in order, on one host with debug binaries and a 6 s lease; [details](LIVE_CHAOS_VALIDATION.md#kafka-clients-and-a-failover-751)). Not shown: production lease defaults, the co-located `vtop-node node` shape, or a consumer group's coordinator across a failover (a group's members rejoin). | #225 shipped the gateway; the failover is #751 (v0.11.0), whose remaining measurements are the ones not shown |
 | Scale features | Quotas, throttled reassignment, multi-tenancy, tiered storage at scale, thousands-of-partition operations. | Not scheduled. The benchmark issues once named here (#92, #98, #130) are closed |
 
 ### Measured
@@ -64,10 +64,13 @@ quorum acknowledgement does.
 
 Failover under load is in
 [`benchmarks/kafka-failover.md`](benchmarks/kafka-failover.md) (#597). Its
-first finding is a gap, not a number: a Kafka client cannot follow a VTOP
-failover, because the gateway is refused on the candidate nodes that fail over
-in place, so VTOP's failover there is measured through its native client and
-labelled as a different client path.
+first finding was a gap, not a number: when it was run, a Kafka client could
+not follow a VTOP failover, because the gateway was refused on the candidate
+nodes that fail over in place, so VTOP's failover there is measured through
+its native client and labelled as a different client path. That gap is closed
+(#751) and the run has not been repeated through a Kafka client; what a Kafka
+client sees is measured separately, in live-chaos scenarios 27 and 28 (one host,
+debug binaries, a 6 s lease), and is not comparable with that report's numbers.
 
 ## VTOP vs LinkedIn Northguard/Xinfra
 
