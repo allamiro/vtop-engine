@@ -28,7 +28,7 @@ only its `appVersion`. Before upgrading, check that no lease agent is
 configured with a lease above 120 s (it now refuses to start) and that, on a
 TLS replica plane, every node replicating to a candidate is in that
 candidate's `peers` list (other writers are now refused). The notes are in
-[v0.11.2](../ROADMAP.md#v0112--a-replay-reuses-a-verified-object-followers-take-a-restarted-leaders-writes-and-hardening).
+[v0.11.2](../ROADMAP.md#v0112--a-replay-reuses-a-verified-object-and-hardening).
 
 ## Upgrading from v0.11.0 to v0.11.1
 
