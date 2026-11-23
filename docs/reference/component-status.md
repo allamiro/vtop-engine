@@ -134,7 +134,7 @@ opened 2026-11-15, #782). The criterion IDs (A1, B1 and so on) are those of
 
 - **Why:** `preview` because every live S3 test runs against one MinIO; `production` at 1.0 for the providers B1 names.
 - **Tests and CI:** `crates/vtop-upload/src/s3_native.rs`; `crates/vtop-upload/tests` (`live_s3_verification`, `live_s3_multipart_resume`, `live_s3_object_lock`, `request_deadline`, `slow_link_deadline`, `transport_conformance`); the `minio integration` job against MinIO built from release 2025-09-07; the README's lossy-link and policed-uplink measurements.
-- **Open criteria:** B1 (#722): the live tests run against RustFS, Garage, SeaweedFS, Versity and CloudServer beside MinIO with a generated compatibility table (#764, #837, #841), and an opt-in AWS S3 leg exists (#841), but no AWS S3 result is recorded yet, so AWS has no row in the table.
+- **Open criteria:** B1 (partial in the [release gate](release-gate.md)): the live tests run against RustFS, Garage, SeaweedFS, Versity and CloudServer beside MinIO with a generated compatibility table (#764, #837, #841), and against AWS S3 once per release: the first AWS run, on v0.11.1 (2026-11-23), passed every case it could run, with `store_checksum` verification for a single PUT and Object Lock enforced (`tests/s3-compat/results/aws.json`). Its multipart resume cases cannot run against AWS (their fault-injecting forwarder needs a plain-HTTP endpoint), so resume is proven on the lab's servers only.
 - **Docs:** `limitations.md` says "any S3-compatible store"; ROADMAP says Object Lock behaviour on AWS is taken from its documentation.
 
 ### Local directory upload (`localfs`)
@@ -190,7 +190,7 @@ opened 2026-11-15, #782). The criterion IDs (A1, B1 and so on) are those of
 
 - **Why:** `experimental`: proven against MinIO only, and a compliance-mode retention cannot be removed by anyone, so a wrong assumption about a provider is not recoverable.
 - **Tests and CI:** `crates/vtop-upload/tests/live_s3_object_lock.rs`, `multipart_object_lock.rs`, `object_lock_wire.rs`; `crates/vtop-cli/tests/live_s3_object_lock_engine.rs`, `object_lock.rs`.
-- **Open criteria:** B1 (#722) on AWS; cold-tier copies are written under the lock and their retention is checked (#868).
+- **Open criteria:** B1 on AWS: the first AWS run (v0.11.1, 2026-11-23) wrote locked objects on every write path, multipart included, and found a locked version undeletable, but the cases that shorten or clear a governance retention cannot run there (the test role has no governance bypass); cold-tier copies are written under the lock and their retention is checked (#868).
 - **Docs:** `OBJECT_LOCK_DEPLOYMENT.md`; ROADMAP and `limitations.md` say MinIO only.
 
 ### Audit trail
