@@ -109,9 +109,16 @@ offered rates, the two Compose files and three VTOP node configs verbatim, and t
 running on the Docker host at start (not their names). From `schema_version` 2 it also records
 `comparable.host_disk`, the host disk behind Docker's data (model, SSD or HDD on macOS, the kernel's rotational
 flag on Linux, bus, filesystem), which every image's footer names; `run.py` and `failover.py` refuse to start,
-before pulling or building anything, when the disk cannot be named, and say what the probe saw. A file without
+before pulling or building anything, when the disk cannot be named, and say what the probe saw. On a host whose
+probe cannot name it (an EBS NVMe volume that reports no model), `--host-disk "EBS gp3 100 GiB, SSD, NVMe, ext4"`
+names it instead; it is recorded as given and must be one line without `|` (the footer's separator). A file without
 `schema_version` is schema 1 (the runs committed before #600). The `comparable` block is hashed into
 `env_fingerprint`; `run_state` is `complete` only when the run finished.
+
+Beside `comparable`, and outside the fingerprint, `host_metadata` records `instance_type` (the EC2 instance type from
+IMDSv2, `unknown` anywhere else or when the metadata service does not answer in a second), `cpu_model` and `kernel`
+(`compare_common/hostmeta.py`; the archive, link and spool comparisons record the same block). A run committed
+without it loads and regenerates as before. `VTOP_BENCH_NO_IMDS=1` skips the instance-type lookup.
 
 `logs/`: every perf tool's output and each cluster's node-1 log.
 
