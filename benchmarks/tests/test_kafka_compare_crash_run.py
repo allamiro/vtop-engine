@@ -615,3 +615,20 @@ def test_every_command_the_readme_shows_parses_and_the_full_run_fits_its_own_cap
     assert full[1]["crashes"] == 12 and full[1]["crash_modes"] == ["flakey-drop"] and len(full[1]["configs"]) == 4
     assert 1.1 <= full[2] <= 1.6, full[2]
     assert resume[0].resume == "<run-id>"
+
+
+def test_a_read_back_that_stops_before_the_sentinel_is_a_failed_row_not_a_loss():
+    # Review of #946: the consumer's exit and a short read were not checked, so a one-record read-back of a
+    # cluster that kept everything was an ok row with every other acknowledged record "lost".
+    b = FakeBackend(loss_window_s=0.0)
+    full = b.read_all
+
+    def short(end):
+        text = full(end)
+        return text.splitlines()[0] + "\n" if b.sentinel_done else text
+
+    b.read_all = short
+    row = crash.run_crash(b, params(), "kafka-fsync-parity", "flakey-drop", 1, 20.0)
+    assert row["status"] == "failed"
+    assert "did not reach the sentinel" in row["note"] and "1 record" in row["note"]
+    assert "acked_lost" not in row

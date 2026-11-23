@@ -118,6 +118,10 @@ class SuspectMethod(Exception):
     """Kafka's defaults lost nothing: the method is probably not dropping the page cache."""
 
 
+class ShortRead(Exception):
+    """The read that decides the loss ended before the sentinel: the measurement failed, nothing was lost."""
+
+
 class CapReached(Exception):
     """The next crash would not fit in --max-hours."""
 
@@ -386,6 +390,18 @@ def _crash(b: Any, p: Params, row: dict[str, Any], config: str, mode: str, crash
         row["recovery_seconds"] = round(time.monotonic() - started, 1)
         end_after = b.wait_served(at_least=end_before + 1)
         consumed = ca.parse_consumed(b.read_all(end_after), prefix, sentinel)
+        if not any(c.kind == "sentinel" for c in consumed):
+            # A consumer that failed or stopped early returns a short read; counting every acknowledged
+            # record it did not reach as lost would turn a client fault into a durability result (review of
+            # #946). The read that decides the loss must reach the sentinel, the partition's last record.
+            raise ShortRead(f"the read-back did not reach the sentinel: {len(consumed)} record"
+                            f"{'' if len(consumed) == 1 else 's'} read of the {end_after} the partition holds")
+    except ShortRead as exc:
+        row.update(recovery_seconds=round(time.monotonic() - started, 1))
+        if row["status"] == "ok":
+            row["status"] = "failed"
+        row["note"] = ((row["note"] + "; " if row["note"] else "") + str(exc))[:600]
+        return row
     except Exception as exc:
         row.update(needed_manual_repair=True, recovery_seconds=round(time.monotonic() - started, 1))
         if row["status"] == "ok":
