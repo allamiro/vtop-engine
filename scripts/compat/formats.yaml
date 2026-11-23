@@ -501,7 +501,8 @@ formats:
     status: experimental
     at_1_0: experimental
     state: unfrozen
-    fuzz: [kafka_request]
+    fixtures: [crates/vtop-kafka/tests/fixtures]
+    fuzz: [kafka_request, kafka_batch]
 
   - id: 23
     name: "`config.yaml`"
