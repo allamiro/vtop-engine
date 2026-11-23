@@ -22,7 +22,7 @@ import subprocess
 from collections.abc import Iterable
 from typing import Any
 
-from compare_common import schema
+from compare_common import hostmeta, schema
 
 BENCH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO = os.path.dirname(BENCH)
@@ -115,6 +115,9 @@ def new_environment(kind: str, run_id: str, plan: dict[str, Any], comparable: di
         "private": private,
         "store": STORE_LABEL,
         "comparable": comparable,
+        # Which machine this was (#737). Beside `comparable`, not in it: not part of the fingerprint, so a
+        # resume never refuses over what the metadata service said this time.
+        "host_metadata": hostmeta.collect(),
         "plan": plan,
         "configs": configs,
         "telemetry": telemetry,

@@ -92,6 +92,11 @@ jobs:
               - '.cargo/**'
               - 'rust-toolchain*'
               - '.github/workflows/ci.yml'
+              # Read by build-and-test's history steps (#728): the checker
+              # that judges the sweep's histories, and the patches that must
+              # still apply to the tree.
+              - 'scripts/live-chaos/history/check_history.py'
+              - 'scripts/live-chaos/history/reintroduce/**'
             # Narrow filters for the jobs that spin up external services or a
             # nightly toolchain. Each lists the crates its command actually
             # compiles, taken from `cargo tree`, rather than all of `crates/**`.
@@ -277,6 +282,8 @@ jobs:
               - 'benchmarks/tests/test_site_facts.py'
               - 'benchmarks/tests/conftest.py'
               - 'benchmarks/tests/test_kafka_compare_*.py'
+              - 'benchmarks/tests/test_aws_*.py'
+              - 'benchmarks/tests/fixtures/crash-smoke/**'
               - 'benchmarks/tests/test_benchmark_charts_job.py'
               # The hand-written page that links the generated reports.
               - 'docs/COMPARISON.md'
@@ -397,6 +404,10 @@ jobs:
               # them, and the bootstrap runs inside each server's init.
               - 'scripts/s3-lab.sh'
               - 'docker/s3-servers/**'
+              # The host-level half of the whole-replica-set crash benchmark
+              # (#599): it runs as root against a device-mapper device, so a
+              # slip in it is not a test failure but a damaged filesystem.
+              - 'benchmarks/kafka_compare/crash/*.sh'
               - '.github/workflows/**'
 
             # `scripts/live-chaos/run-all.sh`. The harness drives real
@@ -511,6 +522,18 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      # The patches that put back #611, #641, #261 and #640 for
+      # reintroduce/run.sh (#728) are applied by context to files that keep
+      # changing. A change that moves a hunk fails here, not on the day
+      # someone runs the re-introduction.
+      - name: The re-introduction patches still apply
+        run: |
+          set -euo pipefail
+          for patch in scripts/live-chaos/history/reintroduce/*.patch; do
+            patch -p1 --batch --forward --dry-run < "$patch" > /dev/null \
+              || { echo "::error::$patch no longer applies to this tree; refresh it"; exit 1; }
+          done
+
       - name: Check formatting
         run: cargo fmt --all --check
 
@@ -523,6 +546,35 @@ jobs:
 
       - name: Test workspace
         run: cargo test --workspace --locked
+
+      # #728: the promotion crash sweep's runs with no fault, its
+      # reproductions, and the loopback test of a returning deposed leader,
+      # written as client histories and judged by check_history.py, the
+      # checker the live scenarios use. On the fixed code every one must be
+      # valid; reintroduce/run.sh --sweep shows the same checker flags each
+      # bug put back. Seconds on the build above: the full sweeps are not
+      # re-run.
+      - name: The promotion sweep's client histories are valid
+        env:
+          VTOP_SWEEP_HISTORY_DIR: ${{ runner.temp }}/sweep-histories
+        run: |
+          set -euo pipefail
+          cargo test --locked -p vtop-node --bin vtop-node -- \
+            promotion_crash_sweep::the_611_sequence_without_a_fault \
+            promotion_crash_sweep::reproduction_ \
+            promotion_crash_sweep::a_second_failover
+          cargo test --locked -p vtop-broker --test networked_replication deposed_leader
+          histories=("$VTOP_SWEEP_HISTORY_DIR"/*.jsonl)
+          # Three shapes with no fault, two reproductions, the second
+          # failover, and the deposed leader's return in two timings.
+          if [[ "${#histories[@]}" -ne 8 || ! -e "${histories[0]}" ]]; then
+            echo "::error::expected 8 client histories, found ${#histories[@]}: ${histories[*]}"
+            exit 1
+          fi
+          for history in "${histories[@]}"; do
+            echo "== $(basename "$history")"
+            python3 scripts/live-chaos/history/check_history.py "$history"
+          done
 
       - name: Release build
         run: cargo build --release --bin vtopctl --locked
@@ -1519,7 +1571,8 @@ jobs:
             scripts/check-failpoints-absent.sh scripts/kafka-broker.sh \
             scripts/gen-kafka-fixtures.sh scripts/kafka-cluster.sh \
             scripts/update-surface-snapshots.sh \
-            scripts/s3-lab.sh docker/s3-servers/init/bootstrap.sh
+            scripts/s3-lab.sh docker/s3-servers/init/bootstrap.sh \
+            benchmarks/kafka_compare/crash/*.sh
 
       # `-P scripts/live-chaos/scenarios` resolves the scenarios' dynamic
       # `source "$(dirname …)/../lib.sh"`. Without it every scenario reports
@@ -1534,7 +1587,9 @@ jobs:
             scripts/live-chaos/gen-certs.sh \
             scripts/live-chaos/scenarios/*.sh \
             scripts/live-chaos/engine/*.sh \
-            scripts/live-chaos/soak/*.sh
+            scripts/live-chaos/soak/*.sh \
+            scripts/live-chaos/history/*.sh \
+            scripts/live-chaos/history/reintroduce/*.sh
 
       # The disaster-recovery drills (#735). `-P scripts/dr-drill` resolves
       # the drills' `source` of their shared library, for the reason the
@@ -1590,8 +1645,14 @@ jobs:
         run: python -m pip install --disable-pip-version-check --require-hashes -r scripts/compat/requirements.txt
       - name: the registry check can fail for each drift it exists to catch
         run: python -m unittest discover -s scripts/compat/tests -p 'test_format_registry.py' -v
-      - name: format registry (every magic and version constant has an entry)
-        run: python scripts/check-format-registry.py
+      # Also the byte lock (every golden file hashed in scripts/compat/
+      # golden.lock, a changed one fails naming the file and its format) and
+      # the freeze (a frozen format's constants, tags and golden bytes move
+      # only by a recorded exception). --base compares with the registry at
+      # HEAD^1, as the surface check below does, so a format cannot be
+      # un-frozen by editing the registry alone.
+      - name: format registry (every magic and version constant has an entry; golden files locked; frozen formats unchanged)
+        run: python scripts/check-format-registry.py --base HEAD^1
       # The upgrade-compat job's checkout is shallow, and scenario 22 reads the
       # newest release's source from its tag, so that job must fetch the tag.
       # Checked here, because the upgrade job runs only when its paths change.
@@ -2605,9 +2666,20 @@ jobs:
         # without this line the pipe into tee would hide a failing test.
         run: |
           set -o pipefail
-          python -m pytest -rs tests/test_kafka_compare_report.py tests/test_kafka_compare_regenerate.py tests/test_kafka_compare_failover.py tests/test_kafka_compare_footer.py tests/test_kafka_compare_colours.py tests/test_readme_charts.py tests/test_benchmark_charts_job.py tests/test_compare_reports.py tests/test_readme_cards.py tests/test_site_facts.py | tee "$RUNNER_TEMP/chart-tests.log"
+          python -m pytest -rs tests/test_kafka_compare_report.py tests/test_kafka_compare_regenerate.py tests/test_kafka_compare_failover.py tests/test_kafka_compare_footer.py tests/test_kafka_compare_colours.py tests/test_readme_charts.py tests/test_benchmark_charts_job.py tests/test_compare_reports.py tests/test_kafka_compare_crash_report.py tests/test_aws_ingest.py tests/test_kafka_compare_extra_report.py tests/test_kafka_compare_extra_charts.py tests/test_kafka_compare_group_commit.py tests/test_readme_cards.py tests/test_site_facts.py | tee "$RUNNER_TEMP/chart-tests.log"
           if grep -E "SKIPPED.*(matplotlib|PIL)" "$RUNNER_TEMP/chart-tests.log"; then
             echo "::error::A chart test skipped for want of matplotlib or Pillow, in the one job that installs them."
+            exit 1
+          fi
+      # The cross-product summary's charts (#744), on a line of its own so a
+      # test file added to the line above does not collide with it.
+      - name: Cross-product summary tests, with matplotlib
+        working-directory: benchmarks
+        run: |
+          set -o pipefail
+          python -m pytest -rs tests/test_compare_summary_charts.py | tee "$RUNNER_TEMP/summary-tests.log"
+          if grep -E "SKIPPED.*(matplotlib|PIL)" "$RUNNER_TEMP/summary-tests.log"; then
+            echo "::error::A summary chart test skipped for want of matplotlib or Pillow, in the one job that installs them."
             exit 1
           fi
       - name: Regenerate every chart and report and fail on drift

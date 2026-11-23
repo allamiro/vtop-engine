@@ -30,9 +30,48 @@ python3 benchmarks/kafka_compare/regenerate.py
 
 Useful knobs: `--sizes 100,1024`, `--reps 3`, `--sat-records 100:3000000,1024:1000000` (records per
 saturation run AND per consume run, per record size), `--fixed-seconds 30` (a fixed-rate run sends rate x this many records),
-`--smoke-records`, `--no-consume`, `--rebuild`, `--run-id` (one path component), `--max-hours 30`.
+`--smoke-records`, `--no-consume`, `--rebuild`, `--run-id` (one path component), `--max-hours 30`, and the
+schema-4 switches `--no-e2e` (no end-to-end stage), `--no-fsync-parity` (the end-to-end stage for both systems as
+shipped only) and `--no-resources` (no cgroup windows).
 Every one is checked before any Docker work, and so is the matrix's projected run time (`plan.py`):
 a matrix projected past `--max-hours` is refused before the first container starts.
+
+### Group commit on and off (#752)
+
+`--group-commit off,on` runs VTOP once per setting of the node's `group_commit.enabled` (`off`, `on`, or
+both), so the official run can report group commit measured instead of argued. It is VTOP's setting alone:
+Kafka has no counterpart, runs once, and its rows leave the `group_commit` column blank.
+
+```bash
+python3 benchmarks/kafka_compare/run.py --group-commit off,on
+```
+
+- **Only what the node accepts.** `run.py` reads `crates/vtop-node/src/config.rs` at `HEAD` (the commit the
+  image is built from) for the keys of the data node's `group_commit:` section, and writes only `enabled`. If
+  the engine at `HEAD` has no such section (it lands with #832), the request is refused before any Docker work,
+  saying so: the node would refuse the key at startup, and a run that left it out would label rows with a
+  setting that was never applied.
+- **Written, not defaulted.** Each setting is appended to the leader's `vtop/leader.yaml` as an explicit
+  `group_commit: {enabled: false}` or `{enabled: true}` (to `results/<run-id>/configs/`, and verbatim into
+  `environment.json` under `configs.vtop_leader_group_commit_<setting>`), so the day the node's own default
+  changes, `off` still means off. `compose.vtop.yml` takes the file from `VTOP_LEADER_CONFIG`. Followers are
+  not given the section: a follower with it enabled is refused by the node.
+- **Confirmed, not assumed.** After each VTOP cluster comes up, the leader's own
+  `vtop_broker_group_commit_enabled` gauge must read 1 for `on` and 0 for `off` (or the node does not export it)
+  or the run stops. It is not written as a `refused` cell: the cause would repeat in every cell.
+- **Owed, and checked.** `group_commits` is an axis of the matrix. A run that asked for both settings owes
+  VTOP's rows twice, and `run.py --check` and the report's completeness check list the setting that is missing.
+  A matrix without the axis leaves VTOP at the node's own default and writes a blank setting, as every earlier
+  run did. `--max-hours` counts VTOP once per setting.
+- **Shown as its own dimension.** The report draws VTOP once per setting, in VTOP's one colour (the palette
+  has two validated slots): `off` hatched or dashed with diamond markers, `on` solid with square markers. It adds
+  a *Group commit ablation* table (off, on, and the ratio of medians per record size), names the settings in
+  the Method, the footer and the Environment table, and replaces the explanation of VTOP's per-request barrier
+  with a pointer to the ablation.
+
+The only knob exposed for the ablation is `enabled`. `group_commit.max_delay_ms`, `max_records`, `max_bytes` and
+`max_pending_requests` stay at the node's defaults (natural batching, the plan's decision D1), so the run
+measures what ships; varying them is not part of this switch.
 
 ```bash
 # What a run directory still lacks, whatever its state: exit 0 when every expected row is there,
@@ -73,13 +112,54 @@ For each record size, Kafka first and then VTOP:
    fresh group, `--reps` times; the recorded rates are its `fetch.*` columns, which exclude the group join.
 7. **Down.** The leader's log is saved under `logs/`, the cluster is removed with its volumes.
 
+Then, once per record size and after both systems' cells (schema 4, #600), **the end-to-end stage**: the common rate
+is `E2E_LOAD_PCT` (50 %) of the SLOWER system's median saturation for the cell, and both systems, and Kafka under
+`fsync-parity` as well (`compose.kafka.fsync-parity.yml` layered on the base file, plus `flush.messages=1` on the
+topic: the setting `crash.py`'s fsync-parity configuration uses), are brought up fresh, smoke-checked, warmed up for
+10 s at that rate and measured `--reps` times. In each repetition [`client/E2eLatency.java`](client/E2eLatency.java),
+compiled once by [`client/Dockerfile`](client/Dockerfile) (the pinned `eclipse-temurin` JDK, against the pinned Kafka
+image's own kafka-clients jars, onto that image: the image's JRE has no compiler, so it cannot launch the source
+file) and run by the image's own JVM in a second client container (2 CPUs, 2 GiB), assigns the partition and seeks to the end,
+says `READY`, and counts each record's latency (its `poll()` return time minus the producer's `CreateTime`, both
+the client host's clock, 1 ms resolution) into a histogram while the perf producer offers `rate x --fixed-seconds`
+records at that rate. VTOP has one configuration, so it owes no `fsync-parity` row. With `--group-commit off,on`, VTOP is
+measured end-to-end once per setting, and the common rate's slower system is the slower of Kafka and VTOP's
+slowest setting, so every end-to-end series is offered the same rate. A run that consumed a
+different number of records than it produced is a `failed` row saying how many are missing; a negative latency
+fails the row (a clock or timestamp fault); a rate not held is flagged `sustained=false`.
+
+**Resources (metric 4).** Around every measured run (saturation, each fixed rate, consume, end-to-end), the
+runner `sync`s each of the system's three nodes, reads `cpu.stat` and `io.stat` from inside each container
+(`docker exec`, [`resources.py`](resources.py)), runs the producer or consumer, `sync`s again, waits 2 s for
+write-back, and reads again. The row records the three nodes' summed deltas (`cpu_seconds`, `disk_write_bytes`,
+`disk_read_bytes`), the bytes the run delivered (`delivered_bytes`: records sent, or read, times the record
+size) and the window's start and end. The report divides: CPU seconds per GiB delivered, and bytes written per
+byte delivered (write amplification: replication, logs, indexes and metadata included). cgroup v2 with the `cpu`
+and `io` controllers is required and checked before the run starts (cgroup v1 is refused, not approximated).
+
+**Overhead, stated.** The counters are read outside the producer's run, never during it, so they add no load to
+what is timed; each window adds about 6 s of wall time (the syncs, the settle and the reads), about 6 minutes
+over a default run's 36 measured runs per system. The end-to-end stage adds two fresh clusters per record size
+(one for Kafka under `fsync-parity`) with 40 s of runs per repetition, about 15 minutes in all. The consumer
+runs beside the producer, which is the point of an end-to-end measurement, but means the client host carries two
+JVMs at once (6 CPUs of client limits beside the nodes' 6): on a host with fewer than 12 CPUs, say so in the
+result. `plan.py` charges both to the projected hours.
+
+**Unverified until a run on the target host:** before the VTOP image is built or any cluster starts, `run.py` builds
+the consumer's image (`kc-e2e-client:<hash>`, which pulls the pinned JDK image: outbound internet) and runs the class
+once with `--check`, refusing and naming `--no-e2e` when either fails. Whether VTOP's gateway returns a record's `CreateTime` unchanged (the
+latency would otherwise be nonsense, and the run refuses a negative one) and whether the node containers'
+`io.stat` accounts the data volume's writes are the two things the first run shows.
+
 ## Output
 
-`results/<run-id>/results.csv`, schema 2 (#596): one row per key
-(`system`, `mode`, `record_size`, `partitions`, `producers`, `compression`, `acks`, `profile`, `repetition`,
-`load_basis`, `load_pct`), with the run-constant columns (`run_id`, `env_fingerprint`, `vtop_commit`,
+`results/<run-id>/results.csv`, schema 4 (#600, on schema 3 from #752 and schema 2 from #596): one row per key
+(`system`, `mode`, `record_size`, `partitions`, `producers`, `compression`, `acks`, `profile`, `group_commit`,
+`repetition`, `load_basis`, `load_pct`), with the run-constant columns (`run_id`, `env_fingerprint`, `vtop_commit`,
 `kafka_image`, `client`). `mode` is `saturation`, `fixed_rate`, `consume` or `e2e` (end-to-end latency);
-`compression` is the producer's codec; `profile` is `defaults` or `fsync-parity`; `load_basis` says what a
+`compression` is the producer's codec; `profile` is `defaults` or `fsync-parity`; `group_commit` is VTOP's
+`group_commit.enabled` for the row, `off` or `on`, blank on every Kafka row and on every row of a run that did
+not vary it; `load_basis` says what a
 rated row's percentage is of: `kafka` (Kafka's median saturation for the cell) or `common` (the slower
 system's), blank on unrated rows. `lat_basis` is `single`, or `worst-of-N` when N producers ran and the row
 carries the worst producer's percentiles. `records_produced` is set on `e2e` rows, whose `records` is the
@@ -89,7 +169,19 @@ measurement: VTOP's node configuration is the same under both profiles, so it ru
 are recorded under each. Which rows a matrix owes is defined once, in `plan.py`, for the runner, `--check`
 and the report.
 
-Schema 1, the layout of the committed phase-1 run (`20261109T232328Z`), still loads. It had no
+**Schema 4** (#600) adds four columns after the window, `delivered_bytes`, `cpu_seconds`, `disk_write_bytes` and
+`disk_read_bytes` (the three nodes summed; all four blank on a row without a resource window and on every failed or
+refused row), a sidecar `e2e_hist.csv` (one line per ok `e2e` row and 1 ms bucket: the row's key columns, including
+`group_commit`, then `bucket_ms` with 60000 meaning 60 s or more, and `count`; the counts must sum to the row's
+`records`, and the row's percentiles must be the histogram's), and two matrix keys, `resources` (every ok measured
+row carries its resources) and `e2e.extra_profiles` (profiles Kafka alone is also measured under, end-to-end only,
+at the common rate). It is written with `environment.json` `schema_version` 4, and the two are refused when
+one is schema 4 and the other is not. Schemas 1 to 3 still load, and their reports are unchanged byte for byte: the columns
+a row predates read as blank.
+
+Schema 3 (#752, the `group_commit` column) and schema 2 (no `group_commit` column, read with a blank setting)
+still load. Schema 1, the layout of the
+committed phase-1 run (`20261109T232328Z`), still loads. It had no
 `compression`, `same_config_as`, `load_basis`, `records_produced`, `lat_basis` or window columns, and held
 `profile` constant across the run. Its rows are read as schema 2 with compression `none`, load basis `kafka`
 on fixed-rate rows and latency basis `single`, which is what that run did, and its report is unchanged
@@ -106,12 +198,22 @@ properties passed, the client's resolved `ProducerConfig` per system, selected s
 configuration as Kafka reports it (`kafka-configs --describe --all`, filtered to the flush, replication,
 timeout, thread, socket, fetch, segment and group settings `run.py` names) and the topic layout, the derived
 offered rates, the two Compose files and three VTOP node configs verbatim, and the COUNT of other containers
-running on the Docker host at start (not their names). From `schema_version` 2 it also records
+running on the Docker host at start (not their names). From `schema_version` 3 it also records
+`comparable.vtop_group_commit.settings`, the group-commit settings the run measured and the `enabled` each was
+written as (empty when the run did not vary it), which is part of what the fingerprint covers; the report
+refuses a run whose recorded settings disagree with its matrix's `group_commits`. From `schema_version` 2 it also records
 `comparable.host_disk`, the host disk behind Docker's data (model, SSD or HDD on macOS, the kernel's rotational
 flag on Linux, bus, filesystem), which every image's footer names; `run.py` and `failover.py` refuse to start,
-before pulling or building anything, when the disk cannot be named, and say what the probe saw. A file without
+before pulling or building anything, when the disk cannot be named, and say what the probe saw. On a host whose
+probe cannot name it (an EBS NVMe volume that reports no model), `--host-disk "EBS gp3 100 GiB, SSD, NVMe, ext4"`
+names it instead; it is recorded as given and must be one line without `|` (the footer's separator). A file without
 `schema_version` is schema 1 (the runs committed before #600). The `comparable` block is hashed into
 `env_fingerprint`; `run_state` is `complete` only when the run finished.
+
+Beside `comparable`, and outside the fingerprint, `host_metadata` records `instance_type` (the EC2 instance type from
+IMDSv2, `unknown` anywhere else or when the metadata service does not answer in a second), `cpu_model` and `kernel`
+(`compare_common/hostmeta.py`; the archive, link and spool comparisons record the same block). A run committed
+without it loads and regenerates as before. `VTOP_BENCH_NO_IMDS=1` skips the instance-type lookup.
 
 `logs/`: every perf tool's output and each cluster's node-1 log.
 
@@ -122,9 +224,11 @@ missing, `environment.json`'s `schema_version` is malformed or newer than the re
 `environment.json` of schema 2 records no `host_disk`, the run did not finish, a row is malformed or a `failed`/`refused` row gives no reason, any expected
 row is missing or duplicated, rows come from more than one environment, commit, image or client (or, in a run whose
 CSV is schema 1, profile), the run varies along a dimension this report does not draw yet (partitions,
-producers, compression, acks, profile, or a load basis other than `kafka`; the grouped charts are #600's)
+producers, compression, acks, profile other than Kafka's `fsync-parity` end-to-end rows, or a load basis other
+than `kafka` on fixed-rate rows and `common` on end-to-end rows; the grouped charts are #600's)
 or holds a value its text does not say (a codec other than none, acks other than all, a profile other
-than the environment's, end-to-end rows), a row that repeats another profile's measurement does not match
+than the environment's), a run whose matrix has the end-to-end mode but whose `e2e_hist.csv` is missing, short,
+or disagrees with its rows, a run whose matrix asks for resources but has an ok row without them, a row that repeats another profile's measurement does not match
 a measured row under that profile, the CSV's run id, commit, image, client or `acks` (and, in a run whose CSV is
 schema 1, profile) differ from what `environment.json` records, or
 the CSV's fingerprint does not match `environment.json` (rule 9). A cell that did not run is a row with
@@ -151,6 +255,16 @@ back), two runs writing one file, and committed output
 that no run writes. SVG and Markdown must match byte for byte. PNGs must match pixel for
 pixel, not byte for byte: Pillow's macOS and Linux wheels compress identical pixels to different bytes, so a
 PNG whose decoded image is unchanged keeps its committed bytes.
+
+**A second run of a kind, and the crash report.** A run directory may hold a [`report.json`](run_outputs.py),
+`{"doc": "docs/benchmarks/<page>.md", "img_dir": "docs/benchmarks/img/<dir>"}`, which sends that run's page and
+images beside the first run's instead of onto the same files (without it two committed runs of one kind are
+refused, as above). The file is part of the run, committed with it. `report.py` hands a crash run (its directory
+holds `crash.csv`, #599) to [`crash_report.py`](crash_report.py), which reads it through the harness's own
+`crash_schema.load_crash_run` with a floor of ten ok crashes per configuration and mode, writes
+`docs/benchmarks/kafka-crash.md` and `kafka-crash-*.{png,svg}`, and prints the exact binomial upper bound beside every
+cell that lost nothing. The steps for placing a run, in order, are in
+[`../README.md`](../README.md#ingesting-a-results-directory-the-v0110-aws-round).
 
 The same job then runs [`../readme_charts.py`](../readme_charts.py), which draws the project README's
 evidence charts (light and dark SVGs under `docs/assets/readme/`) from these runs and from
@@ -241,10 +355,124 @@ default) and the VTOP side by its native client (`vtop-node produce` via
   comparable with Kafka's (#613 review). That run was added in e0c3d35 and is last present, unchanged, in
   190037b on the #613 branch (`git show 190037b:benchmarks/kafka_compare/results/failover-20261110T185855Z/failover.csv`).
 
+## Whole-replica-set crash (#599)
+
+`acks=all` means *replicated*, not *on disk*: Kafka's default (`flush.messages` unset) acknowledges a write once
+the in-sync replicas have it in their page cache. `crash.py` kills the whole replica set at once and counts the
+acknowledged records that are missing afterwards, for Kafka as shipped, Kafka made to fsync, and VTOP.
+
+```bash
+# The short profile: 2 crashes per cell, both modes, SIGKILL and power-loss, about 20 minutes on a 4-vCPU VM.
+python3 benchmarks/kafka_compare/crash.py --smoke --setup-flakey 8192
+
+# The full run on a dedicated Linux host (see below): 4 configurations x 12 power-loss crashes, projected at 1.3 h.
+python3 benchmarks/kafka_compare/crash.py --setup-flakey 10240 --teardown-flakey \
+    --crashes 12 --modes flakey-drop --max-hours 2
+
+# What a run directory still owes, whatever its state (exit 0 when complete, 2 listing the missing crashes), and
+# the way to continue an interrupted one.
+python3 benchmarks/kafka_compare/crash.py --check benchmarks/kafka_compare/results/<run-id>
+python3 benchmarks/kafka_compare/crash.py --resume <run-id> --crashes 12 --modes flakey-drop
+```
+
+The projection (`crash_schema.projected_seconds`, checked against `--max-hours` before any container starts, and again
+before every crash) uses per-crash timings measured on the smoke run: a Kafka crash takes about 46 s and a VTOP crash
+about 21 s beyond its trigger (mean 40 s in the default window), so a crash index of the four default configurations takes
+about 4 minutes and 12 of them about an hour; the full length was not run. The issue's 30 crashes per configuration
+are `--crashes 30` (3.2 h with the four default configurations), and a `sigkill` control for them doubles that.
+
+**The host.** One Linux machine with Docker Engine (Compose v2), a user in the `docker` group with passwordless
+`sudo` (the harness runs only `crash/powercut.sh` through `sudo -n`; run it as root and git will want
+`safe.directory` for the checkout), and a kernel that has `loop` and `dm-flakey`
+(`sudo modprobe dm-flakey` must succeed; on Ubuntu the `linux-modules-extra-$(uname -r)` package carries it).
+Nothing in the harness is macOS-specific, and it does not use Docker Desktop: Docker Desktop's VM is not one this
+script can crash. The reference shape for the full run is one EC2 instance of 16 vCPUs and 32 GiB with Ubuntu
+24.04 and a gp3 or instance-store volume (a `c7i.4xlarge` or `m7i.4xlarge`): three 2-CPU nodes, the 4-CPU client and
+headroom, with nothing else running. `environment.json` records the instance type (`host_metadata`, from IMDSv2, and the DMI's word in `comparable.host_instance`), the CPU model, kernel,
+filesystem and mount options, the `vm.dirty_*` sysctls, and the disk behind Docker's data. The first run builds
+`vtop-bench:<commit>` from `docker/Dockerfile` if it is not there (the release build took 7 minutes with 2 CPUs). Docker installs with
+`curl -fsSL https://get.docker.com | sudo sh`; the harness needs only the Python standard library.
+
+`--setup-flakey MIB` makes `--data-root` (default `/var/lib/kc599/data`) a sparse image file, a loop device, a
+dm-flakey device and an ext4 filesystem (`crash/powercut.sh setup`); `--teardown-flakey` removes it at the end. A host
+whose disk the probe cannot name (a virtio VM) is told with `--host-disk TEXT`. The CPUs per node default to 2, as the
+Compose files say; the smoke run on a small VM lowers them (`--node-cpus 1 --client-cpus 1 --client-memory 2g`) for
+Kafka and VTOP alike, and `environment.json` records what ran.
+
+**Per crash** (one row of `crash.csv`): wipe the three data directories, bring a fresh three-node cluster up, create
+the topic, `sync` the data filesystem, write the fsynced canary, start the producer, and at `t_i` seconds after it
+started (`t_i` is uniform in the trigger window, drawn from the seed and `i` only, so every
+configuration and mode sees the same schedule) write the unsynced canary and:
+
+1. `docker kill --signal KILL` on all three nodes, one command;
+2. in `flakey-drop` mode, immediately `dmsetup` reload of the data device with `drop_writes`, with the filesystem
+   neither frozen nor synced; no sync runs between the kill and the drop;
+3. stop the client (its last acknowledgements are already on disk), remove the dead containers, and in `flakey-drop`
+   unmount, write again, and mount (journal recovery);
+4. read the canaries: the fsynced one must be whole; the unsynced one must be absent or short in `flakey-drop` and whole
+   in `sigkill`, or the crash is a `refused` row (kept, with the reason) and not an `ok` one;
+5. `docker compose up`; wait until ListOffsets is served (the first served read); read the whole partition
+   (`read_missing_before_sentinel`); produce a **sentinel** record with `acks=all` and wait until the partition's end
+   offset has moved past what it was; read the whole partition again: that read decides the loss, `acked_lost`.
+   `sentinel_needed` says the two reads differ, that is, that records acknowledged before the crash were not served
+   until a new write was committed (a restarted leader serves what is cluster-committed, so a read straight after a
+   whole-set restart can be short without anything being lost on disk). `served_end_before_sentinel` and
+   `served_end_after_sentinel` are the end offsets ListOffsets reported.
+
+The client is the same for both systems: `kafka-verifiable-producer.sh` from the pinned apache/kafka image,
+`acks=all`, idempotence on, at a fixed offered rate (default 1,000 records/s), bootstrapped at all three Kafka brokers
+and at VTOP's range leader (the Kafka gateway). It prints one line per acknowledgement with its offset, so
+"acknowledged" is what the client saw before the kill. Records are 1 KiB (`--record-size`, the issue's size): the stock tool has no size option (its `--value-prefix` is an integer and its value is `<prefix>.<n>`), so for a size the client is `crash/client/AckProducer.java`, the same `KafkaProducer` from the same pinned image (compiled in a multi-stage build with a pinned JDK image, since the Kafka image ships a JRE only; `ensure_client_image` builds it once, named for its source), paced the same way and printing the same lines, with the value padded to the size (`<crash>.<n>~xxx...`). It is used for both systems, so nothing differs but the system. `--record-size 0` runs the stock `kafka-verifiable-producer` and a few bytes a record, which needs no build. The size is part of the run's matrix (a resume cannot change it) and a column of every row. A bigger record means more dirty page cache per second, which is why the size matters to the loss window.
+
+**Configurations** (`config`): `kafka-defaults`, `kafka-fsync-parity` (`log.flush.interval.messages=1` on every broker
+through `crash/compose.kafka.fsync-parity.yml`, and `flush.messages=1` on the topic; the brokers' own report of the
+setting is checked and a mismatch refuses the cell), and VTOP in three configurations that differ in the node's
+`group_commit:` section only (#752, `crates/vtop-node/src/config.rs`): `vtop-shipped` (the section left out: the node as
+shipped; an append is acknowledged after 2 of 3 replicas have fsynced it, and it answers both Kafka profiles),
+`vtop-group-commit-on` and `vtop-group-commit-off` (the shipped leader file plus the section, in
+`crash/leader-group-commit-{on,off}.yaml`; the followers never get one). The node ships with group commit **off**
+(`GROUP_COMMIT_ON_BY_DEFAULT = false`), so `vtop-group-commit-off` would repeat `vtop-shipped`; by default a run takes
+both Kafka profiles, `vtop-shipped` and the state that differs from the shipped one (today `vtop-group-commit-on`), read
+from the source, and says so when `--configs` names two that coincide. At every bring-up the leader's own
+`vtop_broker_group_commit_enabled` gauge is read and a mismatch refuses the cell, as the Kafka flush setting is.
+
+**What `flakey-drop` simulates, and what it does not.** The three data directories are on one ext4 filesystem on one
+dm-flakey device over a loop device. After the SIGKILL, `drop_writes` discards every write the page cache has not yet
+sent to the device, and the filesystem is unmounted and mounted again. What is left is what had reached the device:
+data an fsync returned for, and whatever the kernel's own writeback had already flushed. That is the loss of one host's
+page cache for all three replicas at once: a kernel panic, or power loss with a disk that honours flushes. It does
+**not** model a drive whose volatile write cache lies about flushes, a torn write inside a block, a host with a hardware
+write-back cache, or independent crashes (the replicas share one failure domain, on purpose). Between the kill and the
+drop there is a gap (`kill_to_drop_ms`, about 0.15 s here) in which the kernel may flush a little more; that can only
+make a system look better. `sigkill` is the control: killing processes leaves the page cache intact, so no
+acknowledged record may be lost in either system, and the canary says so.
+
+The method is not the issue's first choice (`echo b > /proc/sysrq-trigger` in a VM that holds all three replicas, with the
+client outside it): that needs a second machine for the client, and the harness here is one process on one host. The
+two agree on what they simulate (the guest's page cache is lost and what an fsync returned for is kept); the issue's
+calibration of one against the other is not done here.
+
+**A restart that never serves is a row, not a stop.** If the cluster does not serve a write within 120 s of the
+restart (the sentinel's deadline), the crash is a `failed` row with `needed_manual_repair` true and the reason in
+`note`; the harness never repairs a cluster, and its node logs are kept under `logs/`. The run goes on.
+
+**A run that looks wrong stops.** If Kafka's defaults lose nothing in `--suspect-after` (5) `flakey-drop` crashes, the
+method is probably not dropping the page cache, and the run stops (exit 3) with that said, before any chart.
+
+**Output.** `results/<run-id>/crash.csv` (columns in [`crash_schema.py`](crash_schema.py)) and `environment.json`
+(`kind: "crash"`, schema 2; `matrix`, `comparable` and the verbatim Compose files and `powercut.sh`); `logs/<cell>/`
+holds each crash's three node logs (as they died and after the restart) and a summary. The report generator reads a
+run through `crash_schema.load_crash_run(run_dir, min_ok=N)`, which refuses a partial, mixed-environment or
+unfinished run, a row that is `ok` while its canary did not behave, and fewer than `N` ok crashes in any cell, by name.
+`crash_analysis.upper_bound_95(0, n)` gives the exact binomial bound to print beside every "0 of n": 13.9 % at 20
+crashes, 9.5 % at 30. The issue's plan asks for 30 crashes per configuration (3.2 h projected with four configurations: `--crashes 30`).
+
 ## Known gaps
 
 - Matrix: 100 B and 1 KiB, 1 partition, 1 producer, no compression, `defaults` only (no `fsync-parity`,
   `matched-timeouts`, 10 KiB, 6 partitions, 4 producers).
 - VTOP runs without its metadata plane (static leadership): no lease, no failover, no durable offsets.
-- No per-node CPU/RSS or bytes-written sampling, no end-to-end latency.
+- Resources are the three nodes' summed CPU seconds and bytes read and written (no per-node breakdown, no RSS),
+  and end-to-end latency is at one offered load, the common rate, at 1 ms resolution. A run of the schema-1 shape
+  (`--no-e2e --no-resources`) has neither.
 - Laptop numbers: Docker Desktop on one host, sharing the VM with whatever else runs there.

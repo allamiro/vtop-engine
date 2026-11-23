@@ -1,8 +1,7 @@
 diff --git a/crates/vtop-broker/src/replication/mod.rs b/crates/vtop-broker/src/replication/mod.rs
-index 67d15312..51dfbd85 100644
 --- a/crates/vtop-broker/src/replication/mod.rs
 +++ b/crates/vtop-broker/src/replication/mod.rs
-@@ -1750,7 +1750,10 @@ impl InProcessFollower {
+@@ -1754,7 +1754,10 @@
              crate::fencing_epochs::Lineage::Agreed | crate::fencing_epochs::Lineage::Unknown => {
                  return Ok(0)
              }

@@ -56,7 +56,9 @@ services:
       vtop-2: { condition: service_healthy }
       vtop-3: { condition: service_healthy }
     volumes:
-      - "./vtop/leader.yaml:/etc/vtop/node.yaml:ro"
+      # ${VTOP_LEADER_CONFIG} names another leader file: run.py's per-run group-commit config (#752) or crash.py's
+      # group-commit configurations (#599); unset, it is the shipped one.
+      - "${VTOP_LEADER_CONFIG:-./vtop/leader.yaml}:/etc/vtop/node.yaml:ro"
       - "vtop-1-data:/home/vtop"
 
 volumes:

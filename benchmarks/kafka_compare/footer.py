@@ -62,6 +62,10 @@ def fields(env: dict[str, Any]) -> list[list[tuple[str, str]]]:
         ("per node", f"{limits['cpus']} CPUs, {limits['mem_limit']} RAM"),
     ]
     second = [("Kafka", kafka), ("VTOP", vtop), ("client", client), ("profile", profile)]
+    # A run that varied VTOP's group commit (#752) says so; Kafka has no such setting.
+    settings = list((c.get("vtop_group_commit") or {}).get("settings") or {})
+    if settings:
+        second.append(("group commit", f"{', '.join(settings)} (VTOP only)"))
     if failover:
         second.append(("offered", f"{m['offered_rate']:,} records/s"))
     second += [("repetitions", str(m["repetitions"])), ("run", env["run_id"]), ("date", env["started_at"][:10])]

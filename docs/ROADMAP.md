@@ -1562,6 +1562,18 @@ targets, the history checker's remaining scenarios, a pilot). Failover and
 crash-durability measurements against Apache Kafka stay open (#597, #599), as
 does the head-to-head throughput run (#596).
 
+In v0.12.0 so far:
+
+- **Applied audit records name the actor from the log (#706).** From
+  metadata feature level 9, each replica's applied record of an attributed
+  cluster command carries `requested_by`, `requested_from` and `vouched_by`,
+  read from the committed entry rather than from what the replica observed,
+  so every replica writes the same three values for one entry and a replica
+  that lost the edge record still names the actor. A command committed bare
+  (below level 9, or a node's own release) has none of them. Reading the
+  tail back with a command and request ids for bootstrap and membership are
+  the rest of #706.
+
 ---
 
 ## Versioning

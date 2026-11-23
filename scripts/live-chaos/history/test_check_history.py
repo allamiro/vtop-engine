@@ -62,6 +62,11 @@ class History:
         self._event(**end)
         return self
 
+    def unserved(self, process):
+        """A read no node could serve (#640's shape)."""
+        self._event(op="read", type="unserved", process=process)
+        return self
+
     def check(self, allow_unkeyed=False):
         batches, reads = ch.load(self.lines)
         return ch.check(batches, reads, allow_unkeyed)
@@ -433,6 +438,49 @@ class Violations(unittest.TestCase):
         h = History()
         h.produce("p", 1, 0, 10, "ok", 10)
         self.assertEqual(kinds(h.check()), {"input"})
+
+
+class Unavailable(unittest.TestCase):
+    """#640: after a second failover no candidate could prove a quorum, so no
+    leader was established again and nothing could be read, with two healthy
+    replicas. Liveness, judged by the last read."""
+
+    def test_an_unserved_last_read_after_acknowledged_records_is_unavailable(self):
+        h = History()
+        h.produce("p", 1, 0, 10, "ok", 10)
+        h.unserved("final")
+        result = h.check()
+        self.assertEqual(kinds(result), {"unavailable"}, result)
+        self.assertEqual(result["unserved_reads"], 1)
+
+    def test_an_unserved_read_after_a_served_one_is_still_unavailable(self):
+        h = History()
+        h.produce("p", 1, 0, 10, "ok", 10)
+        h.read("r", [(0, 0, 10)], 10)
+        h.unserved("final")
+        self.assertEqual(kinds(h.check()), {"unavailable"})
+
+    def test_service_that_comes_back_is_valid(self):
+        h = History()
+        h.produce("p", 1, 0, 10, "ok", 10)
+        h.unserved("during")
+        h.read("r", [(0, 0, 10)], 10)
+        result = h.check()
+        self.assertTrue(result["valid"], result)
+        self.assertEqual(result["reads"], 1)
+
+    def test_an_unserved_read_with_nothing_acknowledged_is_valid(self):
+        h = History()
+        h.produce("p", 1, 0, 10, "info")
+        h.unserved("final")
+        self.assertTrue(h.check()["valid"])
+
+    def test_a_safety_violation_before_the_unserved_read_is_still_reported(self):
+        h = History()
+        h.produce("p", 1, 0, 10, "ok", 10)
+        h.read("r", [(0, 0, 9)], 9)
+        h.unserved("final")
+        self.assertEqual(kinds(h.check()), {"lost", "unavailable"})
 
 
 class Retention(unittest.TestCase):
