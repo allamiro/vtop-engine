@@ -39,6 +39,27 @@ each fixed-rate leg is charged its wall limit (`3 x --fixed-seconds + 60 s`), an
 the longer of its bytes at 2 MiB/s and its records at 6,000 records/s (VTOP's rate with 100 B records in the
 v0.11.1 AWS round, rounded down). `plan.py` and the runner's first line also print the figure if every leg is on time.
 
+### An interrupted run, and continuing it
+
+A run writes each row as it is measured and each event (a group-commit setting confirmed, a smoke passed, a cell
+refused) to `environment.json` when it happens. Ctrl-C and a `SIGTERM` (a stopped instance, a CI timeout) are
+handled alike: `run_state` becomes `interrupted`, the signal is recorded in `events`, and both clusters are taken
+down. `--check <run-dir>` lists the rows it still owes.
+
+```bash
+python3 benchmarks/kafka_compare/run.py --resume <run-id> <the arguments the run was started with>
+```
+
+`--resume` reopens `results/<run-id>/` and refuses, before any cluster starts, unless the matrix the arguments give,
+the environment fingerprint, the VTOP commit and the images (`vtop_image_id`, `kafka_image_id`, the end-to-end
+client's) and the cluster configuration files equal what `environment.json` recorded. It then skips every unit of
+work whose rows are all present: a unit is one system's cell of one record size at one group-commit setting, or the
+end-to-end stage of one size. A unit with only some of its rows is run again whole: those rows are moved to
+`logs/partial-<unit>.csv` (an end-to-end stage's histogram rows to `logs/partial-<unit>-e2e_hist.csv`) and an event
+says how many, so no row key is ever written twice and nothing measured is deleted. A skipped Kafka cell's offered
+rates come from `observed.offered_rates`, and a skipped cell's saturation rows still set the end-to-end stage's
+common rate.
+
 ### Group commit on and off (#752)
 
 `--group-commit off,on` runs VTOP once per setting of the node's `group_commit.enabled` (`off`, `on`, or

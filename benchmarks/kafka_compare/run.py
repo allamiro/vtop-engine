@@ -30,6 +30,7 @@ consumer stamps each record's receive time against its CreateTime
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
 import functools
 import hashlib
@@ -1315,6 +1316,10 @@ def check_args(args: argparse.Namespace) -> tuple[list[int], dict[int, int]]:
         raise SystemExit(f"--smoke-records {args.smoke_records}: the smoke must read back at least one record")
     if args.run_id is not None:
         check_run_id(args.run_id)
+    if args.resume is not None:
+        if args.run_id is not None:
+            raise SystemExit("--resume continues the run it names and --run-id names a new one: give one of them")
+        check_run_id(args.resume)
     check_group_commit(args)
     return sizes, sat_records
 
@@ -1415,9 +1420,160 @@ def check(run_dir: str) -> int:
     return 0
 
 
+# ------------------------------------------------------------------------------ resume
+
+
+def unit_tag(unit: tuple) -> str:
+    """The name of a unit of work, as its logs are named: `kafka-100B`, `vtop-100B-gc-on`, `e2e-100B`."""
+    if unit[0] == "e2e":
+        return f"e2e-{unit[1]}B"
+    _, system, size, group_commit = unit
+    return f"{system}-{size}B" + (f"-gc-{group_commit}" if group_commit else "")
+
+
+def owed_units(matrix: dict[str, Any]) -> dict[tuple, set[tuple]]:
+    """Every unit of work a run of `matrix` does, and the row keys it owes. A unit is what the runner does in one
+    go and can only redo whole: one system's cell of one record size at one group-commit setting
+    (`("cell", system, size, setting)`), or the end-to-end stage of one size (`("e2e", size)`), all its
+    targets together, since they share one offered rate."""
+    units: dict[tuple, set[tuple]] = {}
+    for key in schema.expected_keys(matrix):
+        system, mode, size, group_commit = key[0], key[1], key[2], key[8]
+        unit = ("e2e", size) if mode == "e2e" else ("cell", system, size, group_commit)
+        units.setdefault(unit, set()).add(key)
+    return units
+
+
+# What must be the same for a resumed run to be one run: the build under test and the images it ran.
+# The fingerprint covers them too; naming them says which one moved.
+RESUME_KEYS = ("vtop_commit", "vtop_engine_tree", "vtop_image", "vtop_image_id", "kafka_image", "kafka_image_id",
+               "e2e_client_image")
+
+
+def resume_dir(run_id: str) -> str:
+    """The run directory `--resume` names, refused before any Docker work when it holds no run."""
+    run_dir = os.path.join(HERE, "results", check_run_id(run_id))
+    for name in ("environment.json", "results.csv"):
+        if not os.path.isfile(os.path.join(run_dir, name)):
+            raise SystemExit(f"--resume {run_id}: no {name} in {run_dir}, so there is no run to continue")
+    return run_dir
+
+
+def check_resumable(run_id: str, before: dict[str, Any], env: dict[str, Any], matrix: dict[str, Any]) -> None:
+    """Refuse a resume that would make one run of two environments, as crash.py's does."""
+    where = f"--resume {run_id}"
+    if before.get("kind", "throughput") != "throughput" or before.get("schema_version") != schema.SCHEMA_VERSION:
+        raise SystemExit(f"{where}: the run is kind {before.get('kind')!r}, schema {before.get('schema_version')!r}; "
+                         f"this runner continues throughput runs of schema {schema.SCHEMA_VERSION} only")
+    if before.get("run_state") == "complete":
+        raise SystemExit(f"{where}: the run is complete; nothing is owed")
+    if before.get("matrix") != matrix:
+        raise SystemExit(f"{where}: the matrix differs from the run's (it recorded {before.get('matrix')!r}; these "
+                         f"arguments give {matrix!r}). Give the arguments the run was started with.")
+    was, now = before.get("comparable") or {}, env["comparable"]
+    moved = [f"{key} {was.get(key)!r} -> {now.get(key)!r}" for key in RESUME_KEYS if was.get(key) != now.get(key)]
+    if moved:
+        raise SystemExit(f"{where}: the build or the images differ from the run's ({'; '.join(moved)}); a run is one "
+                         "build. Check out and build what the run ran, or start a new run.")
+    if schema.fingerprint(before) != schema.fingerprint(env):
+        raise SystemExit(f"{where}: this host or its settings differ from the run's (fingerprint "
+                         f"{schema.fingerprint(before)} against {schema.fingerprint(env)}); a run is one environment")
+    if before.get("configs") != env.get("configs"):
+        changed = sorted(name for name in set(before.get("configs") or {}) | set(env.get("configs") or {})
+                         if (before.get("configs") or {}).get(name) != (env.get("configs") or {}).get(name))
+        raise SystemExit(f"{where}: the cluster configuration differs from the run's ({', '.join(changed)})")
+
+
+def _write_rows(path: str, rows: list[dict[str, str]], columns: tuple[str, ...]) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+def _read_rows(path: str) -> list[dict[str, str]]:
+    if not os.path.isfile(path):
+        return []
+    with open(path, newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _aside(logs: str, name: str) -> str:
+    """A path under logs/ no earlier resume used."""
+    path, n = os.path.join(logs, f"{name}.csv"), 2
+    while os.path.exists(path):
+        path, n = os.path.join(logs, f"{name}-{n}.csv"), n + 1
+    return path
+
+
+def prepare_resume(ctx: dict, matrix: dict[str, Any]) -> tuple[set[tuple], list[dict[str, str]]]:
+    """The units a resumed run skips (every row they owe is present), and the rows it keeps.
+
+    A unit with only some of its rows is re-run whole: its rows are moved out of results.csv to
+    `logs/partial-<tag>.csv` (an end-to-end stage's histogram rows to `logs/partial-<tag>-e2e_hist.csv`) and an
+    event says how many, so the re-run never writes a key twice and nothing measured is deleted."""
+    rows = _read_rows(ctx["csv"])
+    units = owed_units(matrix)
+    unit_of = {key: unit for unit, keys in units.items() for key in keys}
+    present: dict[tuple, set[tuple]] = {}
+    for row in rows:
+        key = schema.row_key(row)
+        present.setdefault(unit_of.get(key), set()).add(key)
+    done = {unit for unit, keys in units.items() if keys <= present.get(unit, set())}
+    partial = sorted((unit for unit in units if unit not in done and present.get(unit)), key=unit_tag)
+    if partial:
+        logs = os.path.join(ctx["run_dir"], "logs")
+        os.makedirs(logs, exist_ok=True)
+        hist = _read_rows(ctx["hist_csv"])
+        for unit in partial:
+            tag = unit_tag(unit)
+            moved = [row for row in rows if unit_of.get(schema.row_key(row)) == unit]
+            aside = _aside(logs, f"partial-{tag}")
+            _write_rows(aside, moved, schema.COLUMNS)
+            note = (f"{tag}: {len(moved)} of its {len(units[unit])} rows were present; moved to "
+                    f"logs/{os.path.basename(aside)} and the unit is run again whole")
+            if unit[0] == "e2e":
+                stale = [row for row in hist if row["record_size"] == str(unit[1])]
+                if stale:
+                    hist_aside = _aside(logs, f"partial-{tag}-e2e_hist")
+                    _write_rows(hist_aside, stale, schema.E2E_HIST_COLUMNS)
+                    hist = [row for row in hist if row not in stale]
+                    note += f", with its {len(stale)} histogram rows (logs/{os.path.basename(hist_aside)})"
+            log(note)
+            ctx["env"]["events"].append({"at": utc_now(), "event": note})
+        rows = [row for row in rows if unit_of.get(schema.row_key(row)) not in partial]
+        _write_rows(ctx["csv"], rows, schema.COLUMNS)
+        if os.path.isfile(ctx["hist_csv"]):
+            _write_rows(ctx["hist_csv"], hist, schema.E2E_HIST_COLUMNS)
+    return done, rows
+
+
+def saturation_from_rows(rows: list[dict[str, str]], system: str, size: int, group_commit: str) -> list[float]:
+    """A skipped cell's saturation repetitions, as the run measured them: the end-to-end stage's common rate is
+    a share of them."""
+    return [float(row["records_per_sec"]) for row in rows
+            if (row["system"], row["mode"], row["record_size"], row["group_commit"], row["status"])
+            == (system, "saturation", str(size), group_commit, "ok")]
+
+
+def recorded_rates(env: dict[str, Any], size: int) -> dict[int, int] | None:
+    """The offered rates a skipped Kafka cell derived, from `observed.offered_rates` (JSON keys are text)."""
+    rates = (env["observed"].get("offered_rates") or {}).get(str(size))
+    return {int(pct): int(rate) for pct, rate in rates.items()} if rates else None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--run-id", default=None)
+    parser.add_argument("--resume", metavar="RUN_ID", default=None,
+                        help="continue this interrupted run with the same arguments it was started with: units whose "
+                             "rows are all in its results.csv are skipped, a unit with some of them is run again "
+                             "whole (its rows moved to logs/partial-<unit>.csv). Refused when the matrix, the build, "
+                             "the images or the host differ from the run's")
     parser.add_argument("--sizes", default="100,1024", help="record sizes in bytes")
     parser.add_argument("--reps", type=int, default=3)
     parser.add_argument("--sat-records", default="100:3000000,1024:1000000",
@@ -1457,6 +1613,7 @@ def main(argv: list[str] | None = None) -> int:
         return check(args.check)
     sizes, sat_records = check_args(args)
     matrix = build_matrix(args, sizes, sat_records)
+    resuming = resume_dir(args.resume) if args.resume else None
     settings, node_keys = check_group_commit(args)
     leader_base = _read(LEADER_CONFIG)
     group_commit_configs = {setting: leader_config(leader_base, setting, node_keys) for setting in settings}
@@ -1475,14 +1632,24 @@ def main(argv: list[str] | None = None) -> int:
     e2e_image = preflight_clients(matrix, args.rebuild)
     vtop_image = ensure_vtop_image(args.rebuild)
 
-    run_id = args.run_id or dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    run_dir = os.path.join(HERE, "results", run_id)
-    if os.path.exists(run_dir):
-        raise SystemExit(f"{run_dir} exists; runs never overwrite each other")
-    os.makedirs(run_dir)
+    if resuming:
+        run_id, run_dir = args.resume, resuming
+        with open(os.path.join(run_dir, "environment.json"), encoding="utf-8") as handle:
+            before = json.load(handle)
+    else:
+        run_id = args.run_id or dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        run_dir = os.path.join(HERE, "results", run_id)
+        if os.path.exists(run_dir):
+            raise SystemExit(f"{run_dir} exists; runs never overwrite each other (--resume continues one)")
+        os.makedirs(run_dir)
     env = capture_environment(run_id, matrix, vtop_image, limits, disk, group_commit_configs)
     if settings:
         env["observed"]["vtop_group_commit_keys_accepted"] = sorted(node_keys)
+    if resuming:
+        check_resumable(run_id, before, env, matrix)
+        env["started_at"] = before.get("started_at", env["started_at"])
+        env["observed"] = before.get("observed", {})
+        env["events"] = before.get("events", [])
     ctx = {"run_id": run_id, "run_dir": run_dir, "csv": os.path.join(run_dir, "results.csv"), "env": env,
            "fingerprint": schema.fingerprint(env), "vtop_image": vtop_image, "reps": args.reps,
            "sat_records": sat_records, "fixed_seconds": args.fixed_seconds,
@@ -1491,19 +1658,39 @@ def main(argv: list[str] | None = None) -> int:
            "matrix": matrix, "resources": bool(matrix.get("resources")), "e2e": bool(matrix.get("e2e")),
            "closer": make_closer(), "saturation": {}, "hist_csv": os.path.join(run_dir, schema.E2E_HIST),
            "e2e_image": e2e_image}
-    schema.write_header(ctx["csv"])
-    if ctx["e2e"]:
-        schema.write_header(ctx["hist_csv"], schema.E2E_HIST_COLUMNS)
+    done: set[tuple] = set()
+    kept: list[dict[str, str]] = []
+    if resuming:
+        done, kept = prepare_resume(ctx, matrix)
+        if ctx["e2e"] and not os.path.isfile(ctx["hist_csv"]):
+            schema.write_header(ctx["hist_csv"], schema.E2E_HIST_COLUMNS)
+        units = owed_units(matrix)
+        env["events"].append({"at": utc_now(), "event": f"resumed: {len(done)} of {len(units)} units complete "
+                              f"and skipped ({', '.join(sorted(unit_tag(u) for u in done)) or 'none'})"})
+    else:
+        schema.write_header(ctx["csv"])
+        if ctx["e2e"]:
+            schema.write_header(ctx["hist_csv"], schema.E2E_HIST_COLUMNS)
     save_environment(run_dir, env)
-    log(f"run {run_id} -> {run_dir} (fingerprint {ctx['fingerprint']})")
+    log(f"run {run_id} -> {run_dir} (fingerprint {ctx['fingerprint']})" + (" resumed" if resuming else ""))
     try:
         for size in sizes:
-            rates = run_cell(ctx, "kafka", size, None)
+            if ("cell", "kafka", size, "") in done:
+                log(f"kafka-{size}B: complete in the run being resumed, skipped")
+                rates = recorded_rates(env, size)
+                ctx["saturation"][("kafka", size, "")] = saturation_from_rows(kept, "kafka", size, "")
+            else:
+                rates = run_cell(ctx, "kafka", size, None)
             save_environment(run_dir, env)
             for setting in settings or [""]:
+                unit = ("cell", "vtop", size, setting)
+                if unit in done:
+                    log(f"{unit_tag(unit)}: complete in the run being resumed, skipped")
+                    ctx["saturation"][("vtop", size, setting)] = saturation_from_rows(kept, "vtop", size, setting)
+                    continue
                 run_cell(ctx, "vtop", size, rates, group_commit=setting)
                 save_environment(run_dir, env)
-            if ctx["e2e"]:
+            if ctx["e2e"] and ("e2e", size) not in done:
                 run_e2e_stage(ctx, size)
                 save_environment(run_dir, env)
     except BaseException as exc:
