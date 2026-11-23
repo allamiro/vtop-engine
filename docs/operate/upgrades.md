@@ -20,6 +20,16 @@ promises, and the rules for changing one, are in the
 [compatibility policy](../reference/compatibility.md); which releases get
 fixes is in [Versioning and support](../SUPPORT.md).
 
+## Upgrading from v0.11.1 to v0.11.2
+
+A patch release: replace the binaries, in any order. No config key, schema
+marker, feature level or default changes, and the Helm chart (0.7.2) changes
+only its `appVersion`. Before upgrading, check that no lease agent is
+configured with a lease above 120 s (it now refuses to start) and that, on a
+TLS replica plane, every node replicating to a candidate is in that
+candidate's `peers` list (other writers are now refused). The notes are in
+[v0.11.2](../ROADMAP.md#v0112--a-replay-reuses-a-verified-object-and-hardening).
+
 ## Upgrading from v0.11.0 to v0.11.1
 
 A patch release: replace the binaries, in any order. Nothing to configure, no

@@ -1550,6 +1550,29 @@ A patch release: no schema, wire format, feature level, config key, default or o
 - **Helm chart 0.7.1** (from 0.7.0; `appVersion` 0.11.1). No template or values change.
 - **Known open.** Memory grows with the number of windows in flight (297 to 420 MiB at width 8 against about 170 MiB for v0.10.4 in the same run), which fits width times `max_bytes` in flight with a residual not yet explained. Everything listed as known open for v0.11.0 still is.
 
+## v0.11.2 — a replay reuses a verified object, and hardening
+
+A patch release built on v0.11.1 from the `release/v0.11.x` branch: two fixes and nothing else. No schema marker, wire format, feature level, config key, default or one-way step changes. Changes merged to `main` after v0.11.1 that are not fixes (an optional `config_version` and `vtopctl validate --strict` (#942), new drills and tests) are not in this release; they ship with v0.12.0.
+
+- **A verified window above a replayed one is rebuilt to its recorded cut, not cut again (bug, duplicates) (#936).** With several windows in flight (#892), a window could reach VERIFIED while a lower window of the same source had to be read again, after a kill or a failed upload. The held VERIFIED window had no recorded cut, so its re-read was cut again by the batch thresholds, under new keys, and the same records were archived a second time. Seen on v0.11.1 after a SIGKILL of a Kafka-source engine with eight windows in flight: 118,318 records written into two new objects beside the verified one. Nothing was lost and the commit rule held. The held window is now recorded like a window handed back: its re-read stops at its recorded end and is sealed at its recorded instant, so it derives the same key and reuses the object. Nothing commits earlier than before.
+- **Hardening (security) (#938, refs #730).**
+  - A lease-election command asking for a lease above 120 s (`MAX_LEASE_DURATION_MS`; the default is 15 s) is refused before it is replicated, and the lease agent refuses that value at start.
+  - The Kafka gateway clamps one Fetch response to 50 MiB (Kafka's own `fetch.max.bytes` default), serves record timestamps clamped to -1 .. 2^52 ms so a batch with widely spread stored timestamps no longer panics the encoder (stored data is unchanged), and closes a session whose client does not take its reply within the idle limit.
+  - The metadata, replica and native listeners log and retry a failed `accept()` after 500 ms instead of stopping the process.
+  - The file and syslog-spool sources open with `O_NONBLOCK` and refuse anything that is not a regular file, so a FIFO at a source path no longer blocks archiving.
+  - On a TLS replica plane, a candidate node accepts an append, fence or high-water-mark update only from a peer in its `peers` list. Before, any certificate chained to the plane's CA with a UUID common name passed, which includes client certificates when one CA signs both (the chart's default).
+  - The release workflow restores no cargo or BuildKit cache, and passes versions and digests to scripts through `env:`.
+
+**Upgrading from v0.11.1.** Replace the binaries; v0.11.1 and v0.11.2 nodes can run side by side. No config key or default changes (`scripts/config-keys-since.py v0.11.1` lists none), and no schema marker or feature level. Check two settings before upgrading:
+
+- A lease agent configured with a lease duration above 120 s now refuses to start. Set it at or below 120 s first.
+- On a TLS replica plane, every node that replicates to a candidate must be in that candidate's `peers` list, as the documented configuration already requires. A writer that is not is now refused.
+
+Downgrade to v0.11.1 is as safe as running v0.11.1: nothing this release writes differs.
+
+- **Helm chart 0.7.2** (from 0.7.1; `appVersion` 0.11.2). No template or values change.
+- **Known open.** Everything listed as known open for v0.11.1 still is. The follower fix for a restarted leader behind its followers (#937) is on `main` for v0.12.0, not in this release. A replica-plane write is bound to the replica set, not yet to the node holding the range's lease. The 50 MiB Fetch ceiling is not configurable. The duplicate fix (#936) does not cover a window recorded while still uploading through a command backend (`awscli`, `minio`, `s3cmd`), which may still write a second object.
+
 ## v0.12.0 and beyond
 
 The theme is **the road to 1.0**: turn group commit on by default for the data
