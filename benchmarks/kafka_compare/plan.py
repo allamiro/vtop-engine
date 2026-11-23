@@ -248,6 +248,17 @@ DEFAULT_TIMING = {
 SLOWEST_BYTES_PER_SECOND = 2 * 1024 * 1024
 
 
+def fixed_rate_wall_limit(fixed_seconds: float) -> float:
+    """The wall limit of one fixed-rate leg: three times its target and a minute for the JVM and the join.
+
+    The runner sizes a leg from the system's own saturation (`min(offered, own median) x fixed_seconds`), so
+    a leg on time lasts about `fixed_seconds`; this bound is what one that is not may cost. The projection
+    charges it, so the budget holds even when every leg runs to it. Before the v0.11.1 AWS round the limit was
+    `max(--sat-timeout, 6 x records / rate)` and the record count came from the offered rate alone, so a
+    system that could not hold the rate ran a "30 s" leg for 7 to 20 minutes (VTOP at 100 B)."""
+    return 3.0 * float(fixed_seconds) + 60.0
+
+
 def projected_seconds(matrix: dict[str, Any], timing: dict[str, float] | None = None) -> float:
     """Wall time of the whole matrix, both systems, every profile run.
 

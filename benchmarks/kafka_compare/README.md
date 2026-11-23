@@ -29,7 +29,7 @@ python3 benchmarks/kafka_compare/regenerate.py
 ```
 
 Useful knobs: `--sizes 100,1024`, `--reps 3`, `--sat-records 100:3000000,1024:1000000` (records per
-saturation run AND per consume run, per record size), `--fixed-seconds 30` (a fixed-rate run sends rate x this many records),
+saturation run AND per consume run, per record size), `--fixed-seconds 30` (the target length of a fixed-rate leg; see step 5),
 `--smoke-records`, `--no-consume`, `--rebuild`, `--run-id` (one path component), `--max-hours 30`, and the
 schema-4 switches `--no-e2e` (no end-to-end stage), `--no-fsync-parity` (the end-to-end stage for both systems as
 shipped only) and `--no-resources` (no cgroup windows).
@@ -103,8 +103,14 @@ For each record size, Kafka first and then VTOP:
 4. **Saturation.** `kafka-producer-perf-test --throughput -1`, `--reps` times. The first 20% of each run's
    records are `--warmup-records` and excluded from its steady-state line, which is the one recorded.
 5. **Fixed rate.** 25 / 50 / 75 % of **Kafka's** median saturation for the cell, offered to both systems with
-   `--throughput` (open loop, rule 6), each sending about `rate x --fixed-seconds` records. That is a target
-   length, not a time limit: a system that cannot keep up takes longer to send them, and the CSV's
+   `--throughput` (open loop, rule 6). A leg sends `min(rate, the system's own saturation median) x
+   --fixed-seconds` records, still throttled at the offered rate, so it lasts about `--fixed-seconds` whether
+   or not the system can hold the rate. (Until the v0.11.1 AWS round a leg sent `rate x --fixed-seconds`
+   records, and a system below the rate ran for as long as its shortfall: VTOP's "30 s" legs at 100 B took 7
+   to 20 minutes.) A leg sized from the system's saturation is `sustained=false` with a note naming the
+   offered rate, the achieved rate and the sizing. Each leg's wall limit is `3 x --fixed-seconds + 60 s`; a
+   leg that reaches it is a `failed` row with `sustained=false`, its client container removed, and its note
+   gives the achieved rate of the last progress line the tool printed, when it printed one. The CSV's
    `wall_seconds` says how long each run took. The three rates run in turn, and that round `--reps` times.
    The systems are not interleaved: Kafka's whole cell runs before VTOP's. A run whose achieved rate is more
    than 5% under its offer is recorded with `sustained=false`.

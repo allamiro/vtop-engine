@@ -631,16 +631,34 @@ def producer_command(system: str, records: int, size: int, rate: int, warmup: in
             "--warmup-records", str(warmup), "--command-property", *PRODUCER_PROPS]
 
 
+TIMED_OUT = "timed out after"
+
+
+def _captured(text: str | bytes | None) -> str:
+    """What a timed-out child printed: subprocess.run hands it back as bytes even in text mode."""
+    if text is None:
+        return ""
+    return text.decode(errors="replace") if isinstance(text, bytes) else text
+
+
 def run_producer(system: str, records: int, size: int, rate: int, timeout: float,
                  info_logging: bool = False) -> tuple[perftool.ProducerResult | None, str, float, str]:
-    """(result or None, note, wall seconds, raw output)."""
+    """(result or None, note, wall seconds, raw output).
+
+    A run that hits `timeout` is a failed run (its container is removed by `client`). Its note names the
+    achieved rate of the last progress line the tool printed before it was cut off, when there is one, so a
+    leg that ran to its wall limit still says how fast the system was going."""
     warmup = max(1, records // 5)
     started = time.monotonic()
     try:
         done = client(system, producer_command(system, records, size, rate, warmup), timeout=timeout,
                       check=False, info_logging=info_logging)
-    except subprocess.TimeoutExpired:
-        return None, f"timed out after {int(timeout)} s", time.monotonic() - started, ""
+    except subprocess.TimeoutExpired as exc:
+        output = _captured(exc.stdout) + "\n" + _captured(exc.stderr)
+        last = perftool.last_progress_rate(output)
+        seen = (f"last achieved rate {last} records/s (the tool's last progress line)" if last is not None
+                else "no progress line to read an achieved rate from")
+        return None, f"{TIMED_OUT} {int(timeout)} s; {seen}", time.monotonic() - started, output
     wall = time.monotonic() - started
     output = done.stdout + "\n" + done.stderr
     errors = sorted({line.strip()[:200] for line in output.splitlines()
@@ -999,6 +1017,27 @@ def run_e2e_stage(ctx: dict, size: int) -> None:
         run_e2e_cell(ctx, system, profile, size, rate, group_commit)
 
 
+def fixed_rate_records(rate: int, own_saturation: float | None, fixed_seconds: float) -> tuple[int, bool]:
+    """(records to send, whether they were sized from the system's own saturation) for one fixed-rate leg.
+
+    The producer is throttled at the offered `rate` either way. A system whose own saturation median is below
+    that rate cannot send `rate x fixed_seconds` records in `fixed_seconds`, and used to run for as long as
+    its shortfall made it (lesson 1 of the v0.11.1 AWS round); it is sent `own median x fixed_seconds`, so
+    the leg lasts about the target and the row says it did not hold the rate. With no saturation measured the
+    leg is sized from the rate, and the wall limit bounds it."""
+    if own_saturation is not None and own_saturation < rate:
+        return stats.records_for_duration(max(1, int(own_saturation)), fixed_seconds), True
+    return stats.records_for_duration(rate, fixed_seconds), False
+
+
+def sized_note(rate: int, achieved: float, own_saturation: float, fixed_seconds: float, records: int,
+               note: str) -> str:
+    said = (f"offered {rate} records/s, achieved {achieved:.0f}; the leg was sized from this system's saturation "
+            f"median ({own_saturation:.0f} records/s x {fixed_seconds:g} s = {records} records), not from the "
+            "offered rate")
+    return f"{said}; {note}" if note else said
+
+
 def refuse_rows(ctx: dict, system: str, size: int, reason: str, load_pcts: list[int],
                 group_commit: str = "") -> None:
     """A row for every measurement of this system's cell, saying why it did not run."""
@@ -1071,6 +1110,7 @@ def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | No
         log(f"{tag}: -> {row.get('records_per_sec', row.get('note'))} records/s")
 
     ctx.setdefault("saturation", {})[(system, size, group_commit)] = saturation
+    own = stats.median(saturation) if saturation else None
     if system == "kafka":
         try:
             kafka_rates = stats.derive_offered_rates(saturation)
@@ -1087,15 +1127,21 @@ def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | No
                 schema.append_row(ctx["csv"], row)
                 continue
             rate = kafka_rates[pct]
-            records = stats.records_for_duration(rate, ctx["fixed_seconds"])
+            records, sized = fixed_rate_records(rate, own, ctx["fixed_seconds"])
             row["offered_rate"] = rate
-            log(f"{tag}: fixed rate {pct}% = {rate} records/s, rep {rep}/{ctx['reps']}")
-            timeout = max(ctx["sat_timeout"], 6 * records / rate)
+            log(f"{tag}: fixed rate {pct}% = {rate} records/s, rep {rep}/{ctx['reps']}"
+                + (f" ({records} records, sized from this system's saturation)" if sized else ""))
+            timeout = plan.fixed_rate_wall_limit(ctx["fixed_seconds"])
             (result, note, wall, output), window, werr = measure(
                 ctx, system, functools.partial(run_producer, system, records, size, rate, timeout))
             _save_output(logs, f"{tag}-fixed-{pct}-{rep}.log", output)
             if result is not None:
                 row["sustained"] = stats.sustained(rate, result.records_per_sec)
+                if sized:
+                    note = sized_note(rate, result.records_per_sec, own, ctx["fixed_seconds"], records, note)
+            elif note.startswith(TIMED_OUT):
+                # The leg ran to its wall limit: whatever it achieved, it did not hold the offered rate.
+                row["sustained"] = False
             row = attach_resources(ctx, producer_row(row, result, note, wall), window, werr, records * size)
             schema.append_row(ctx["csv"], row)
             log(f"{tag}: -> p50 {row.get('lat_p50_ms')} ms p99 {row.get('lat_p99_ms')} ms "
@@ -1364,7 +1410,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="records per saturation run, per record size")
     parser.add_argument("--fixed-seconds", type=float, default=30.0, help="target length of a fixed-rate run")
     parser.add_argument("--smoke-records", type=int, default=10000)
-    parser.add_argument("--sat-timeout", type=float, default=1800.0, help="seconds before a run is failed")
+    parser.add_argument("--sat-timeout", type=float, default=1800.0,
+                        help="seconds before a saturation, consume or warm-up run is failed (a fixed-rate leg's "
+                             "limit is 3 x --fixed-seconds + 60 s)")
     parser.add_argument("--no-consume", action="store_true")
     parser.add_argument("--no-e2e", action="store_true",
                         help="leave out the end-to-end latency stage (metric 3, and the profile's latency cost)")
