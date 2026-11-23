@@ -308,7 +308,7 @@ fn search(
         }
     }
     candidates.into_iter().find_map(|candidate| {
-        let file = std::fs::File::open(&candidate).ok()?;
+        let file = continuity::open_regular(&candidate).ok()?;
         proves(&file, inode, content, size_when_read, start, tail).then_some((candidate, file))
     })
 }

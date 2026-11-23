@@ -15,7 +15,7 @@
 
 use crate::bridge::{Appended, Bridge, Fetched, Sequenced};
 use crate::messages::ErrorCode;
-use crate::records::{Record, RecordBatch};
+use crate::records::{served_timestamp, Record, RecordBatch};
 use crate::turnstile::Turnstile;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -791,7 +791,7 @@ impl Bridge for NativeBridge {
                     .iter()
                     .map(|record| Record {
                         offset: record.offset as i64,
-                        timestamp_millis: record.timestamp_millis,
+                        timestamp_millis: served_timestamp(record.timestamp_millis),
                         key: (!record.key.is_empty()).then(|| record.key.clone()),
                         value: Some(record.value.clone()),
                         headers: Vec::new(),
