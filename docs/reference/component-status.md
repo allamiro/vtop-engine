@@ -239,7 +239,7 @@ opened 2026-11-15, #782). The criterion IDs (A1, B1 and so on) are those of
 
 - **Why:** `experimental` today, `preview` at 1.0: its advertised APIs are `experimental` in the compatibility inventory, and a Kafka client cannot yet follow a failover.
 - **Tests and CI:** `crates/vtop-kafka` tests; the `kafka_request` fuzz target; live-chaos scenarios 16 to 21 and 24 with `kcat` (librdkafka) as the stock client; the README's comparison against Apache Kafka.
-- **Open criteria:** #751 (serve clients from candidate nodes so one can follow a failover), #752; 12.0x to 13.9x lower throughput than Apache Kafka at saturation on one laptop (#596 to #600, #610, #737); transactions are out of scope (a transactional `InitProducerId` is refused by name); gzip and zstd produce batches are in review (#762); A3, A4.
+- **Open criteria:** #752; 12.0x to 13.9x lower throughput than Apache Kafka at saturation on one laptop (#596 to #600, #610, #737); transactions are out of scope (a transactional `InitProducerId` is refused by name); A3, A4.
 - **Docs:** README, `when-to-use.md` ("a prototype, measured well below Apache Kafka's throughput") and the benchmark pages.
 
 ### Helm chart
