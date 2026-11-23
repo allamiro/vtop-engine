@@ -156,6 +156,10 @@ fn every_collector(dir: &std::path::Path) -> Vec<(&'static str, Box<dyn Collecto
             Box::new(MetaAuditMetrics::new().unwrap()),
         ),
         (
+            "KafkaGatewayServingCollector",
+            Box::new(KafkaGatewayServingCollector::new(Arc::new(|| false)).unwrap()),
+        ),
+        (
             "ConnectionLimitCollector",
             Box::new(ConnectionLimitCollector::new(ConnectionLimits::default()).unwrap()),
         ),
