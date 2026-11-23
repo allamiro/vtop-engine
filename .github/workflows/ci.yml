@@ -368,6 +368,9 @@ jobs:
               # bats suite reads it.
               - 'scripts/check-naming.sh'
               - 'scripts/check-egress-claims.sh'
+              # The Kafka fixture generator (#596): in the shellcheck step,
+              # so here too, for the reason the paragraphs above give.
+              - 'scripts/gen-kafka-fixtures.sh'
               - 'scripts/naming-denylist.txt'
               # The check that no shipped build carries the failpoints
               # feature (#725), listed here and in the shellcheck step.
@@ -1513,7 +1516,8 @@ jobs:
             scripts/traffic-snapshot.sh scripts/test-progress.sh \
             scripts/check-naming.sh scripts/check-egress-claims.sh \
             scripts/check-failpoints-absent.sh scripts/kafka-broker.sh \
-            scripts/kafka-cluster.sh scripts/update-surface-snapshots.sh \
+            scripts/gen-kafka-fixtures.sh scripts/kafka-cluster.sh \
+            scripts/update-surface-snapshots.sh \
             scripts/s3-lab.sh docker/s3-servers/init/bootstrap.sh
 
       # `-P scripts/live-chaos/scenarios` resolves the scenarios' dynamic
@@ -1822,8 +1826,8 @@ jobs:
 
       # Scenario 17 drives the Kafka gateway with a stock client: kafkacat is
       # librdkafka, the library under every non-JVM Kafka client (#225).
-      # Scenarios 17 to 21, 24 and 27 use it.
-      - name: Install a stock Kafka client for scenarios 17 to 21, 24 and 27
+      # Scenarios 17 to 21, 24, 26 and 27 use it.
+      - name: Install a stock Kafka client for scenarios 17 to 21, 24, 26 and 27
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq kafkacat
