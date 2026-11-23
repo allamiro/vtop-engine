@@ -936,6 +936,20 @@ def check_args(args: argparse.Namespace, matrix: dict[str, Any]) -> float:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """The crash run, with SIGTERM handled as Ctrl-C is for its whole length (run.sigterm_raises)."""
+    with phase1.sigterm_raises():
+        return _main(argv)
+
+
+def entry(argv: list[str] | None = None) -> int:
+    """The command line: a run ended by SIGTERM exits 143 after recording it."""
+    try:
+        return main(argv)
+    except phase1.Terminated as exc:
+        return 128 + exc.signum
+
+
+def _main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     phase1.checked_host_disk(args.host_disk)
     if args.check is not None:
@@ -1020,7 +1034,7 @@ def main(argv: list[str] | None = None) -> int:
         code = 3 if isinstance(exc, SuspectMethod) else 4
     except BaseException as exc:
         env["run_state"] = "interrupted"
-        env["events"].append({"at": utc_now(), "event": f"run interrupted: {exc!r}"[:900]})
+        env["events"].append(phase1.interruption_event(exc))
         phase1.save_environment(run_dir, env)
         backend.down(volumes=True)
         raise
@@ -1051,4 +1065,4 @@ def ensure_image(rebuild: bool) -> str:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(entry())

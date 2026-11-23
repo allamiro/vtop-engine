@@ -30,6 +30,7 @@ consumer stamps each record's receive time against its CreateTime
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import datetime as dt
 import functools
@@ -40,6 +41,7 @@ import os
 import platform
 import plistlib
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -124,6 +126,56 @@ def sh(args: list[str], *, check: bool = True, timeout: float | None = None, inp
 
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+# ------------------------------------------------------------------ interruption
+
+
+class Terminated(BaseException):
+    """A SIGTERM, raised in the main thread by `sigterm_raises`' handler.
+
+    A BaseException, as KeyboardInterrupt is, so no cell's `except Exception` swallows it and the runner's
+    own `except BaseException` records `run_state: interrupted` and takes the clusters down. Before the
+    v0.11.1 AWS round only SIGINT reached that path: a stopped instance or a CI timeout (SIGTERM) left a run
+    saying `running` with its clusters up."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(f"{signal.Signals(signum).name} received")
+        self.signum = signum
+
+
+@contextlib.contextmanager
+def sigterm_raises():
+    """For the length of the block, a SIGTERM raises Terminated in the main thread. A second SIGTERM while
+    the run records the first and takes its clusters down is ignored, so that record is written (SIGKILL
+    still ends the process). The caller's handler is put back afterwards. Outside the main thread, where
+    Python cannot install a handler, nothing changes."""
+    import threading
+
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def handler(signum, _frame):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        raise Terminated(signum)
+
+    previous = signal.signal(signal.SIGTERM, handler)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+def interruption_event(exc: BaseException) -> dict[str, Any]:
+    """The event a run records when it stops before its end, naming the signal when one stopped it."""
+    event = {"at": utc_now(), "event": f"run interrupted: {exc!r}"[:900]}
+    if isinstance(exc, Terminated):
+        event.update(signal=signal.Signals(exc.signum).name,
+                     event=f"run interrupted: {signal.Signals(exc.signum).name} received")
+    elif isinstance(exc, KeyboardInterrupt):
+        event.update(signal="SIGINT", event="run interrupted: SIGINT received (Ctrl-C)")
+    return event
 
 
 # ------------------------------------------------------------------ group commit (#752)
@@ -583,7 +635,8 @@ def client(system: str, command: list[str], *, timeout: float, input_text: str |
     args += [KAFKA_IMAGE, *command]
     try:
         return sh(args, timeout=timeout, input_text=input_text, check=check)
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, Terminated, KeyboardInterrupt):
+        # Killing `docker run` leaves its container running: remove it, so no producer outlives its leg.
         sh(["docker", "rm", "-f", name], check=False)
         raise
 
@@ -1606,6 +1659,20 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """The runner, with SIGTERM handled as Ctrl-C is for its whole length."""
+    with sigterm_raises():
+        return _main(argv)
+
+
+def entry(argv: list[str] | None = None) -> int:
+    """The command line: a run ended by SIGTERM exits 143, as an unhandled SIGTERM would, after recording it."""
+    try:
+        return main(argv)
+    except Terminated as exc:
+        return 128 + exc.signum
+
+
+def _main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     checked_host_disk(args.host_disk)
 
@@ -1695,7 +1762,7 @@ def main(argv: list[str] | None = None) -> int:
                 save_environment(run_dir, env)
     except BaseException as exc:
         env["run_state"] = "interrupted"
-        env["events"].append({"at": utc_now(), "event": f"run interrupted: {exc!r}"[:900]})
+        env["events"].append(interruption_event(exc))
         save_environment(run_dir, env)
         for system in SYSTEM_SPEC:
             try:
@@ -1711,4 +1778,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(entry())
