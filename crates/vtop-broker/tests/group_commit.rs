@@ -1328,7 +1328,7 @@ fn the_next_group_starts_its_local_append_while_the_previous_replicates() {
     assert_eq!(staged.cluster_committed.get(), 2);
     assert_eq!(
         staged.rounds.calls(),
-        [(0, 1), (1, 2)],
+        [(0u64, 1u64), (1, 2)],
         "one round a group, in offset order, each covering its own records"
     );
     assert_eq!(coordinator.groups_in_flight(), 0);
@@ -1379,7 +1379,7 @@ fn no_member_is_acknowledged_before_its_own_fsync_and_quorum_with_two_groups_in_
         (second.outcomes[0].offset, second.committed_next_offset),
         (1, 2)
     );
-    assert_eq!(staged.rounds.calls(), [(0, 1), (1, 2)]);
+    assert_eq!(staged.rounds.calls(), [(0u64, 1u64), (1, 2)]);
 }
 
 /// E3 (#752): under concurrent load (eight producers, four requests each),
@@ -1575,7 +1575,7 @@ fn a_failed_fsync_in_the_next_group_fails_it_closed_and_the_group_after_is_not_a
         "the failed group's retry is a fresh append after group 3: {retried:?}"
     );
     assert_eq!(staged.cluster_committed.get(), 3);
-    assert_eq!(staged.rounds.calls(), [(0, 1), (1, 2), (2, 3)]);
+    assert_eq!(staged.rounds.calls(), [(0u64, 1u64), (1, 2), (2, 3)]);
     for follower in staged.rounds.followers() {
         assert_eq!(follower.local_committed_offset(), 3);
     }
@@ -1659,6 +1659,6 @@ fn a_split_group_is_re_run_only_after_the_earlier_group_has_finished() {
         expect_ok(request.join().unwrap());
     }
     assert_eq!(coordinator.metrics().split_groups_total(), 1);
-    assert_eq!(staged.rounds.calls(), [(0, 1), (1, 2), (2, 3)]);
+    assert_eq!(staged.rounds.calls(), [(0u64, 1u64), (1, 2), (2, 3)]);
     assert_eq!(staged.cluster_committed.get(), 3);
 }
