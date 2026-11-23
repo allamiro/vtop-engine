@@ -211,9 +211,9 @@ The Kafka releases the source is tested against are listed in
 | `sasl_username` | - | Kafka `sasl.username`. |
 | `sasl_password_env` | - | Name of the environment variable holding the SASL password. |
 | `ssl_ca_location` | - | Kafka `ssl.ca.location`. |
-| `ssl_certificate_location` | - | Mutual TLS: the PEM client certificate (`ssl.certificate.location`). Set with `ssl_key_location`, and only with `security_protocol` `SSL` or `SASL_SSL`. See [Kafka brokers](../install/kafka.md#mutual-tls). |
-| `ssl_key_location` | - | Mutual TLS: the PEM key of the client certificate (`ssl.key.location`). |
-| `ssl_key_password_env` | - | Name of the environment variable holding the client key's passphrase, for an encrypted key. |
+| `ssl_certificate_location` | - | Mutual TLS: the PEM client certificate (`ssl.certificate.location`). Set with `ssl_key_location`, and only with `security_protocol` `SSL` or `SASL_SSL`. See [Kafka brokers](../install/kafka.md#mutual-tls). An engine before v0.11.0 ignores the three mutual TLS keys and connects without a client certificate, so a broker that requires one refuses it. |
+| `ssl_key_location` | - | Mutual TLS: the PEM key of the client certificate (`ssl.key.location`). An engine before v0.11.0 ignores it, as it does `ssl_certificate_location`. |
+| `ssl_key_password_env` | - | Name of the environment variable holding the client key's passphrase, for an encrypted key. An engine before v0.11.0 ignores it, as it does `ssl_certificate_location`. |
 
 ### `sources.file`
 

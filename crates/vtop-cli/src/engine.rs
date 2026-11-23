@@ -4770,6 +4770,7 @@ impl Engine {
                     batch_id: None,
                     record_count: Some(read.records.len() as u64),
                     bounded: false,
+                    above_replay: false,
                 });
                 let bytes = read.records.iter().map(Vec::len).sum();
                 let unit = unit_key(&window.start);
@@ -5055,6 +5056,9 @@ impl Engine {
         let mut first_err: Option<VtopError> = None;
         let mut rewinds: Vec<ProgressMarker> = Vec::new();
         let mut handed_back: Vec<RecordedWindow> = Vec::new();
+        // Windows of a unit sealed after one of its windows failed: read
+        // again with it, so recorded like it once the rewind has landed.
+        let mut read_again: Vec<RecordedWindow> = Vec::new();
 
         // Failures first, wherever they are in the queue: the read head is
         // past them, and the next read must start at their first byte.
@@ -5077,10 +5081,23 @@ impl Engine {
             // refused once its bytes are gone (review of #891).
             let unit = queue[i].unit.clone();
             let content = queue[i].window.start.content_fingerprint().cloned();
+            let failed_at = start_position(&queue[i].window.start);
             for later in queue.iter_mut().skip(i + 1) {
                 if later.unit == unit
                     && !proven_other(content.as_ref(), later.window.start.content_fingerprint())
                 {
+                    // Recorded once, when first superseded: its re-read is
+                    // cut where it was and sealed at its instant, so if it
+                    // verifies (and is held) the re-read names its object
+                    // instead of cutting the range again under new keys.
+                    if !later.superseded && start_position(&later.window.start) > failed_at {
+                        let mut window = (*later.window).clone();
+                        window.above_replay = true;
+                        if let Some(Ok(VerifyStep::Verified(v))) = &later.result {
+                            window.batch_id = Some(v.batch_id.clone());
+                        }
+                        read_again.push(window);
+                    }
                     later.superseded = true;
                 }
             }
@@ -5202,11 +5219,15 @@ impl Engine {
         // clamped to that commit, so it was never archived. The rewind to the
         // lowest start re-reads the higher windows too.
         let (rewinds, covered) = lowest_rewind_per_unit(rewinds);
+        let mut refused_units = std::collections::HashSet::new();
         for (at, (marker, result)) in rewinds
             .iter()
             .zip(adapter.replay_from_markers(&rewinds).await)
             .enumerate()
         {
+            if result.is_err() {
+                refused_units.insert(unit_key(marker));
+            }
             match result {
                 Ok(()) => {
                     tracing::warn!(
@@ -5239,6 +5260,14 @@ impl Engine {
                     );
                     first_err.get_or_insert(e);
                 }
+            }
+        }
+        // The windows read again above a failed one, recorded only where the
+        // rewind landed: a refused rewind re-reads none of them.
+        for window in read_again {
+            if !refused_units.contains(&unit_key(&window.start)) {
+                self.recorded.remember(window.clone());
+                handed_back.push(window);
             }
         }
         // Each handed-back window is re-read up to where it ended, where the
@@ -6034,6 +6063,19 @@ impl Engine {
                     .adapters
                     .get(&rec.source_type)
                     .and_then(|adapter| adapter.committed_through(&rec.progress_end));
+                // The re-read below it runs on through its range. Recorded
+                // like a window handed back, it is cut where it was cut and
+                // sealed at its recorded instant, so it names the object it
+                // already has. Not recorded, the thresholds cut that range
+                // again into windows of their own, under new keys: a second
+                // copy of a range already archived and verified (a Kafka
+                // partition after a SIGKILL under pipelining, 118,318
+                // records). The row itself still settles once the source has
+                // committed through its end, which the rebuilt window's
+                // commit brings about.
+                scanned.push(RecordedWindow::held_above_replay(&rec));
+                self.recorded
+                    .remember(RecordedWindow::held_above_replay(&rec));
                 self.unsettled
                     .push(Unsettled::held_back(&rec, at_hold, recheck));
                 continue;
@@ -8912,6 +8954,10 @@ mod tests {
     struct GatedObjects {
         inner: Arc<vtop_upload::MockBackend>,
         gates: std::sync::Mutex<Vec<(String, Arc<tokio::sync::Semaphore>)>>,
+        /// The same, for manifest puts (by a piece of the manifest key, which
+        /// carries the batch id and so the range token): a batch is then
+        /// held at OBJECT_UPLOADED, its object stored and its row naming it.
+        manifest_gates: std::sync::Mutex<Vec<(String, Arc<tokio::sync::Semaphore>)>>,
         refused: std::sync::Mutex<Vec<String>>,
     }
 
@@ -8920,8 +8966,29 @@ mod tests {
             Arc::new(Self {
                 inner: Arc::new(vtop_upload::MockBackend::new()),
                 gates: std::sync::Mutex::new(Vec::new()),
+                manifest_gates: std::sync::Mutex::new(Vec::new()),
                 refused: std::sync::Mutex::new(Vec::new()),
             })
+        }
+
+        /// Hold every manifest put whose key contains `part` until the gate
+        /// returned is opened.
+        fn gate_manifest(&self, part: &str) -> Arc<tokio::sync::Semaphore> {
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            self.manifest_gates
+                .lock()
+                .unwrap()
+                .push((part.to_owned(), Arc::clone(&gate)));
+            gate
+        }
+
+        /// The data objects the store holds (not manifests or receipts).
+        fn data_objects(&self) -> Vec<String> {
+            self.inner
+                .object_uris()
+                .into_iter()
+                .filter(|uri| !uri.ends_with(".manifest.json") && !uri.ends_with(".receipt.json"))
+                .collect()
         }
 
         /// Hold every object put whose key contains `part` until the gate
@@ -8984,8 +9051,40 @@ mod tests {
             manifest_uri: &str,
             checksum: Option<ObjectChecksum<'_>>,
         ) -> Result<vtop_upload::StoredManifest, VtopError> {
+            let gate = self
+                .manifest_gates
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(part, _)| manifest_uri.contains(part.as_str()))
+                .map(|(_, gate)| Arc::clone(gate));
+            if let Some(gate) = gate {
+                drop(gate.acquire().await.unwrap());
+            }
             self.inner
                 .put_manifest(local_path, manifest_uri, checksum)
+                .await
+        }
+        // The pinned reads recovery's re-check of a VERIFIED row makes: the
+        // mock pins a manifest version, and the defaults fail closed.
+        async fn get_manifest_pinned(
+            &self,
+            uri: &str,
+            version_id: &str,
+            max_bytes: usize,
+        ) -> Result<Vec<u8>, VtopError> {
+            self.inner
+                .get_manifest_pinned(uri, version_id, max_bytes)
+                .await
+        }
+        async fn get_object_pinned(
+            &self,
+            uri: &str,
+            version_id: &str,
+            max_bytes: usize,
+        ) -> Result<Vec<u8>, VtopError> {
+            self.inner
+                .get_object_pinned(uri, version_id, max_bytes)
                 .await
         }
         async fn head_object(&self, uri: &str) -> Result<vtop_upload::ObjectHead, VtopError> {
@@ -9173,6 +9272,7 @@ mod tests {
                         batch_id: None,
                         record_count: Some(0),
                         bounded: false,
+                        above_replay: false,
                     }),
                     bytes: 0,
                     superseded: false,
@@ -9646,6 +9746,224 @@ mod tests {
         assert!(
             engine.inflight.values().all(VecDeque::is_empty),
             "every batch settled"
+        );
+    }
+
+    /// An instant in hour `h` of one day, for a seal clock: the first
+    /// attempts are sealed in one hour and the re-read in the next, so a
+    /// window cut again, rather than rebuilt at its recorded instant, names
+    /// another key.
+    fn in_hour(h: u32) -> chrono::DateTime<Utc> {
+        chrono::DateTime::parse_from_rfc3339(&format!("2026-03-04T{h:02}:30:00+00:00"))
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// The SOURCE_COMMITTED rows whose range overlaps `[from, to)`.
+    async fn committed_over(engine: &Engine, from: i128, to: i128) -> Vec<BatchRecord> {
+        engine
+            .store
+            .list_batches()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|b| b.state == BatchState::SourceCommitted)
+            .filter(|b| {
+                let (start, end) = unit_range(b);
+                start < to && end > from
+            })
+            .collect()
+    }
+
+    /// What a held VERIFIED window above a re-read must come to: the ranges
+    /// tile the file, every committed row over `[14, 28)` is that range and
+    /// names `held`'s object, the held row itself committed (it is not left
+    /// waiting), the object was put once, and nothing is left in flight or
+    /// unsettled.
+    async fn assert_held_window_rebuilt(
+        case: &str,
+        engine: &Engine,
+        store: &GatedObjects,
+        held: &BatchRecord,
+        len: i128,
+    ) {
+        assert_committed_without_a_gap(case, engine, len).await;
+        let uri = held
+            .object_uri
+            .clone()
+            .expect("the held window recorded its object");
+        let over = committed_over(engine, 14, 28).await;
+        assert!(
+            over.iter().any(|r| r.batch_id == held.batch_id),
+            "{case}: the held VERIFIED row committed, not left waiting: {over:?}"
+        );
+        for row in &over {
+            assert_eq!(
+                (unit_range(row), row.object_uri.as_deref()),
+                ((14, 28), Some(uri.as_str())),
+                "{case}: the range above the replay was rebuilt as first cut and names the \
+                 object it already had, not cut again into a new object: {over:?}"
+            );
+        }
+        assert_eq!(
+            over.len(),
+            2,
+            "{case}: the held row and its rebuild, one object between them: {over:?}"
+        );
+        assert!(
+            store
+                .inner
+                .get_object_pinned(&uri, "v2", 1 << 20)
+                .await
+                .is_err(),
+            "{case}: {uri} was reused, not put again"
+        );
+        assert!(
+            engine.unsettled.is_empty(),
+            "{case}: no VERIFIED row is left uncommitted"
+        );
+        assert!(
+            engine.inflight.values().all(VecDeque::is_empty),
+            "{case}: every batch settled"
+        );
+    }
+
+    fn append_lines(input: &std::path::Path, lines: std::ops::RangeInclusive<usize>) {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(input)
+            .unwrap();
+        for n in lines {
+            writeln!(f, "line {n}").unwrap();
+        }
+    }
+
+    /// The sequence a SIGKILL left in a Kafka run with pipelined archiving
+    /// (v0.11.1): the lower window of a partition at OBJECT_UPLOADED, the
+    /// window above it VERIFIED. Recovery replays the lower one and holds the
+    /// VERIFIED one above it. The re-read rebuilt the lower window as first
+    /// cut, then ran on through the held range and cut it again by the
+    /// thresholds, under new keys: 118,318 records archived a second time
+    /// beside an object already verified. The held window is now recorded
+    /// like a window handed back, so its re-read is cut where it was and
+    /// sealed at its recorded instant, and reuses its object; the held row
+    /// then commits once the source has committed through its end.
+    ///
+    /// The re-read here runs under other limits, in a later hour and over a
+    /// file that has grown: cut again, the range above would name another
+    /// key (both a longer range and another hour).
+    #[tokio::test]
+    async fn a_verified_window_above_a_replayed_one_reuses_its_object_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "").unwrap();
+        append_lines(&input, 1..=4);
+        let mut cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            &format!("sqlite://{}", dir.path().join("state.db").display()),
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.max_records = 2;
+        cfg.batching.max_batch_age_seconds = 3_600;
+        cfg.batching.idle_poll_interval_ms = 20;
+        let store = GatedObjects::new();
+
+        let held = {
+            let mut first = Engine::new(cfg.clone(), StreamsConfig { streams: vec![] })
+                .await
+                .unwrap();
+            first.backend = store.clone();
+            first.set_seal_clock(|| in_hour(5));
+            // [0, 14): its object lands, its manifest put never returns.
+            let lower = store.gate_manifest("b0-14");
+            pass_until(&mut first, 0, BatchState::ObjectUploaded).await;
+            // [14, 28): VERIFIED behind it, and cannot commit before it.
+            pass_until(&mut first, 14, BatchState::Verified).await;
+            assert_eq!(
+                states_of_range(&first, 0).await,
+                vec![BatchState::ObjectUploaded],
+                "the lower window is uploaded, not verified"
+            );
+            assert!(committed_file_ranges(&first).await.is_empty());
+            let held = row_at(&first, 14).await;
+            // The kill: dropping the engine aborts its batch tasks.
+            drop(first);
+            lower.add_permits(1_000);
+            held
+        };
+        let before = store.data_objects();
+
+        cfg.batching.max_records = 4;
+        append_lines(&input, 5..=6);
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        engine.backend = store.clone();
+        engine.set_seal_clock(|| in_hour(6));
+        let summary = engine.recover().await.unwrap();
+        assert_eq!(
+            (summary.replay_required, summary.committed),
+            (1, 0),
+            "the lower window is replayed and the VERIFIED one above it held: {summary:?}"
+        );
+        for _ in 0..6 {
+            let _ = engine.run_source(SourceType::File, true).await;
+        }
+
+        let len = std::fs::metadata(&input).unwrap().len() as i128;
+        assert_held_window_rebuilt("after a restart", &engine, &store, &held, len).await;
+        let new: Vec<String> = store
+            .data_objects()
+            .into_iter()
+            .filter(|uri| !before.contains(uri))
+            .collect();
+        assert!(
+            new.len() == 1 && new[0].contains("-b28-42-"),
+            "only the appended lines are a new object; the lower window reused the object it \
+             uploaded and the held one its own: {new:?}"
+        );
+    }
+
+    /// The same, while the engine runs: the lower window fails after the
+    /// window above it verified. The window above is held (`commit_held_back`)
+    /// and is now recorded too, so the re-read rebuilds it as first cut and
+    /// reuses its object, rather than cutting its range again under a new
+    /// key.
+    #[tokio::test]
+    async fn a_verified_window_above_a_failed_one_reuses_its_object_in_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, store, input) = pipelined_file_engine(dir.path(), 4).await;
+        engine.set_seal_clock(|| in_hour(5));
+        let lower = store.gate("b0-14");
+        store.refuse_once("b0-14");
+        pass_until(&mut engine, 14, BatchState::Verified).await;
+        let held = row_at(&engine, 14).await;
+        let before = store.data_objects();
+
+        engine.config.batching.max_records = 4;
+        engine.set_seal_clock(|| in_hour(6));
+        append_lines(&input, 5..=6);
+        lower.add_permits(1_000);
+        for _ in 0..8 {
+            let _ = engine.run_source(SourceType::File, true).await;
+        }
+
+        let len = std::fs::metadata(&input).unwrap().len() as i128;
+        assert_held_window_rebuilt("in process", &engine, &store, &held, len).await;
+        let new: Vec<String> = store
+            .data_objects()
+            .into_iter()
+            .filter(|uri| !before.contains(uri))
+            .collect();
+        // The failed window's put was refused, so its rebuild is its first
+        // object; the appended lines are read for the first time. Neither
+        // overlaps the held range.
+        assert!(
+            new.len() == 2
+                && new.iter().any(|uri| uri.contains("-b0-14-"))
+                && new.iter().any(|uri| uri.contains("-b28-42-")),
+            "only the failed window and the appended lines are new objects: {new:?}"
         );
     }
 
