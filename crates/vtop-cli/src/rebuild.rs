@@ -69,6 +69,13 @@ pub(crate) struct RecordedWindow {
     /// ([`vtop_adapters::base::SourceAdapter::bound_replays`]). A window
     /// that is being rebuilt is held until it reaches that end.
     pub(crate) bounded: bool,
+    /// The earlier attempt did not fail: it was read again only because a
+    /// range of its unit below it was handed back, so it is held VERIFIED
+    /// (or was still on the wire when the range below failed). Recorded so
+    /// its re-read is cut where it was and names the object it already has,
+    /// rather than being cut again by the thresholds into windows of its own
+    /// that duplicate it; reported as such, not as a failure.
+    pub(crate) above_replay: bool,
 }
 
 impl RecordedWindow {
@@ -83,6 +90,26 @@ impl RecordedWindow {
             batch_id: Some(rec.batch_id.clone()),
             record_count: rec.record_count.and_then(|n| u64::try_from(n).ok()),
             bounded: false,
+            above_replay: false,
+        }
+    }
+
+    /// The window of a VERIFIED row held back above a range that is being
+    /// read again: see [`RecordedWindow::above_replay`].
+    pub(crate) fn held_above_replay(rec: &BatchRecord) -> Self {
+        Self {
+            above_replay: true,
+            ..Self::from_row(rec)
+        }
+    }
+
+    /// What became of the earlier attempt, for the replay messages.
+    fn history(&self) -> String {
+        let earlier = self.batch_id.as_deref().unwrap_or("unrecorded");
+        if self.above_replay {
+            format!("was sealed earlier (batch {earlier}) above a range that was handed back")
+        } else {
+            format!("failed earlier (batch {earlier})")
         }
     }
 
@@ -397,6 +424,7 @@ pub(crate) fn note_rebuilt(
         .map(|t| t.to_rfc3339())
         .unwrap_or_else(|| "unknown".to_owned());
     let recorded_digest = window.digest.as_deref().unwrap_or("unknown");
+    let history = window.history();
     match differs {
         None if !key_is_derived => tracing::info!(
             event = "replay_key_fallback",
@@ -407,17 +435,21 @@ pub(crate) fn note_rebuilt(
             key,
             records,
             sealed_at = %sealed_at,
-            "range {range} of {source} failed earlier (batch {earlier}) and was rebuilt exactly as \
-             first cut ({records} records) and sealed at the instant first recorded \
-             ({sealed_at}), but its derived key could not be used, so it was written under {key}, \
-             a second object (nothing is lost); the object_key_fallback or \
-             object_key_per_attempt event for this batch says why and what to do"
+            "range {range} of {source} {history} and was rebuilt exactly as first cut \
+             ({records} records) and sealed at the instant first recorded ({sealed_at}), but \
+             its derived key could not be used, so it was written under {key}, a second object \
+             (nothing is lost); the object_key_fallback or object_key_per_attempt event for \
+             this batch says why and what to do"
         ),
         None => {
             // What can be said of the object depends on whether the ledger
             // recorded the earlier attempt's digest.
             let object = if window.digest.is_some() {
                 "the object the earlier attempt uploaded, with the same bytes"
+            } else if window.above_replay {
+                // A window still on the wire when the range below it failed
+                // has no digest in memory, but may well have uploaded.
+                "the key the earlier attempt used, or would have used, for the same bytes"
             } else {
                 "the key the earlier attempt would have used for the same bytes (it recorded no \
                  upload)"
@@ -432,10 +464,10 @@ pub(crate) fn note_rebuilt(
                 records,
                 sealed_at = %sealed_at,
                 recorded_digest,
-                "range {range} of {source} failed earlier (batch {earlier}) and was read again: it \
-                 was rebuilt exactly as first cut ({records} records) and sealed at the instant \
-                 first recorded ({sealed_at}), so under `partitioning.time_source: seal` it is \
-                 filed under the same hour and names {object}: {key}; nothing to do"
+                "range {range} of {source} {history} and was read again: it was rebuilt \
+                 exactly as first cut ({records} records) and sealed at the instant first \
+                 recorded ({sealed_at}), so under `partitioning.time_source: seal` it is filed \
+                 under the same hour and names {object}: {key}; nothing to do"
             )
         }
         Some((recorded, rebuilt)) => tracing::warn!(
@@ -587,6 +619,7 @@ mod tests {
             batch_id: Some(format!("b{start}")),
             record_count: None,
             bounded: false,
+            above_replay: false,
         }
     }
 
@@ -739,6 +772,7 @@ mod tests {
                 batch_id: Some(format!("p{partition}")),
                 record_count: Some(20),
                 bounded: false,
+                above_replay: false,
             });
             windows.set_bounded(&kafka(partition, 0, 0), true);
         }
