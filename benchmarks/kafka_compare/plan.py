@@ -23,6 +23,10 @@ measured under, in the end-to-end mode only, at the same common offered rate: th
 profile, read beside the crash results. VTOP owes no row for them (its rows carry a blank group-commit
 setting there too, as Kafka's always do).
 
+The end-to-end mode is owed by the 1-partition, 1-producer cells only: one consumer reads one partition at a
+common rate, and the runner measures it in a run of that shape alone. A matrix with other partition or producer
+counts owes no end-to-end rows for those cells (every committed run is 1 and 1, so its keys are unchanged).
+
     python3 benchmarks/kafka_compare/plan.py MATRIX.json [--max-hours H]
 
 prints the cells, the expected row count and the projected hours, and exits
@@ -83,10 +87,12 @@ def axes(matrix: dict[str, Any]) -> Axes:
         main_modes.append("fixed_rate")
     if matrix.get("consume"):
         main_modes.append("consume")
-    if e2e:
-        main_modes.append("e2e")
+    # The end-to-end stage is measured at 1 partition and 1 producer only (one consumer reading one partition
+    # at a common rate): no other cell owes it.
+    e2e_modes = ["e2e"] if e2e else []
     cells = [
-        Cell(size, partitions, producers, compression, acks, tuple(main_modes))
+        Cell(size, partitions, producers, compression, acks,
+             tuple(main_modes + (e2e_modes if (partitions, producers) == (1, 1) else [])))
         for size, partitions, producers, compression, acks in itertools.product(
             matrix["record_sizes"], matrix["partitions"], matrix["producers"],
             matrix.get("compressions") or ["none"], matrix["acks"])

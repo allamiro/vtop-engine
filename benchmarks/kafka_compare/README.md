@@ -39,6 +39,30 @@ each fixed-rate leg is charged its wall limit (`3 x --fixed-seconds + 60 s`), an
 the longer of its bytes at 2 MiB/s and its records at 6,000 records/s (VTOP's rate with 100 B records in the
 v0.11.1 AWS round, rounded down). `plan.py` and the runner's first line also print the figure if every leg is on time.
 
+### More than one producer or partition (#596, #752)
+
+`--producers N` and `--partitions N` set the run's shape, one value of each per run (a sweep is several runs, as
+for `--group-commit`); `environment.json` records them in `matrix.producers` and `matrix.partitions`, the keys
+every run already had, so a run of either shape is still schema 4.
+
+- **Producers.** Every measured run is N `kafka-producer-perf-test` containers at once against the same topic,
+  each its own idempotent producer, offered `rate / N` and sent `records / N` (unthrottled for each at
+  saturation). A row sums their records and rates and carries the worst of their percentiles, with `lat_basis`
+  `worst-of-N`. A percentile of their latencies merged cannot exceed the worst producer's, so that is an upper
+  bound; and the producers' windows overlap but do not start together, so the summed rate is the sum of their
+  own rates. A producer that fails fails the row, naming it. One producer's appends are serialised in VTOP's
+  gateway, so group commit (#752) has something to merge only at more than one.
+- **Partitions.** Kafka's topic is created with N partitions; the smoke reads every partition from its start and
+  requires every record back once and each partition's records in the order produced. VTOP is not measured at
+  N > 1: its Kafka gateway serves one partition per node process, one range each, and refuses the others by name
+  (`kafka.partitions` in `crates/vtop-node/src/config.rs`). N partitions replicated three ways are N ranges with
+  a leader and two followers each, 3N node processes (live-chaos scenario 24 runs that shape with 2), and this
+  harness runs VTOP as three single-process containers at the per-node limits Kafka's brokers get (fairness
+  rule 1). Building a cluster that packs 3N processes into those three limits is not done here, so VTOP's rows
+  at N > 1 are `refused` rows saying why, and the report says so.
+- **The end-to-end stage** is measured at 1 partition and 1 producer only (`plan.axes` gives no other cell the
+  mode); a run of another shape has none, and its end-to-end figures are a 1-partition, 1-producer run's.
+
 ### An interrupted run, and continuing it
 
 A run writes each row as it is measured and each event (a group-commit setting confirmed, a smoke passed, a cell

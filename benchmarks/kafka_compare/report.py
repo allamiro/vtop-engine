@@ -822,6 +822,19 @@ def known_gaps(env: dict[str, Any]) -> str:
         lines.append(
             "- **One gateway, one partition.** The gateway runs on the range's leader only; a multi-partition VTOP "
             "topic\n  needs one leader per partition and is not exercised here.")
+    else:
+        lines.append(
+            f"- **VTOP at {_counted(partitions, 'partition')} is not measured.** Its gateway serves one partition "
+            "per node process, so\n  that many partitions need as many replicated ranges, three node processes "
+            "each; this harness runs VTOP as three\n  single-process nodes at Kafka's per-node limits, so VTOP's "
+            "rows are `refused` rows saying so.")
+    if max(producers) > 1:
+        lines.append(
+            f"- **{_counted(producers, 'producer')}, worst of their percentiles.** Each producer is its own perf-tool "
+            "container and\n  idempotent producer, offered its share of the rate. A row sums their records and "
+            "rates (over windows that overlap\n  but do not start together) and carries the worst of their "
+            "percentiles (`lat_basis` worst-of-N): a percentile of\n  all their latencies merged cannot exceed the "
+            "worst producer's, so the latencies are an upper bound.")
     fixed = KNOWN_GAPS_FIXED
     if extra_charts.has_e2e(env) or extra_charts.has_resources(env):
         measured = [what for what, present in (("end-to-end latency", extra_charts.has_e2e(env)),
