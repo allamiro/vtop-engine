@@ -20,6 +20,15 @@ promises, and the rules for changing one, are in the
 [compatibility policy](../reference/compatibility.md); which releases get
 fixes is in [Versioning and support](../SUPPORT.md).
 
+## Upgrading from v0.11.0 to v0.11.1
+
+A patch release: replace the binaries, in any order. Nothing to configure, no
+schema marker, feature level or default changes, and the Helm chart (0.7.1)
+changes only its `appVersion`. It writes uncompressed objects in 1 MiB writes
+instead of 8 KiB, which brings back the CPU per byte that v0.11.0 lost with
+`compression: none` and several windows in flight. The notes are in
+[v0.11.1](../ROADMAP.md#v0111--an-uncompressed-object-is-written-in-1-mib-writes).
+
 ## Upgrading from v0.10.4 to v0.11.0
 
 v0.11.0 keeps sealed batches in flight across the archive engine's cycles,
