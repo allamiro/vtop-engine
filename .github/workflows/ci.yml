@@ -2584,6 +2584,17 @@ jobs:
             echo "::error::A chart test skipped for want of matplotlib or Pillow, in the one job that installs them."
             exit 1
           fi
+      # The cross-product summary's charts (#744), on a line of its own so a
+      # test file added to the line above does not collide with it.
+      - name: Cross-product summary tests, with matplotlib
+        working-directory: benchmarks
+        run: |
+          set -o pipefail
+          python -m pytest -rs tests/test_compare_summary_charts.py | tee "$RUNNER_TEMP/summary-tests.log"
+          if grep -E "SKIPPED.*(matplotlib|PIL)" "$RUNNER_TEMP/summary-tests.log"; then
+            echo "::error::A summary chart test skipped for want of matplotlib or Pillow, in the one job that installs them."
+            exit 1
+          fi
       - name: Regenerate every chart and report and fail on drift
         run: |
           python3 benchmarks/kafka_compare/regenerate.py
