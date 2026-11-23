@@ -200,12 +200,16 @@ def test_a_kind_that_does_not_take_supersedes_refuses_it(tmp_path):
 
 
 def test_this_repository_has_one_current_run_of_each_kind_the_readme_draws():
-    # No committed run supersedes another today, so every committed run is regenerated as before and the
-    # README's charts read the runs they always read.
+    # True of whatever runs are committed (review of #955: naming today's ids here would fail the day a run
+    # supersedes one, as the ingest intends): every supersedes in the repository is valid, and each of the
+    # README's two runs is a current, committed run of its kind.
     runs = regenerate.committed_runs()
-    assert regenerate.current_runs(runs) == runs
-    assert readme_charts.throughput_run() == f"{RESULTS}/20261109T232328Z"
-    assert readme_charts.failover_run() == f"{RESULTS}/failover-20261111T032549Z"
+    current = {os.path.basename(run): run for run in regenerate.current_runs(runs)}
+    assert set(current) <= {os.path.basename(run) for run in runs}
+    for resolve, kind in ((readme_charts.throughput_run, "throughput"), (readme_charts.failover_run, "failover")):
+        rel = resolve()
+        assert rel.startswith(f"{RESULTS}/") and os.path.basename(rel) in current
+        assert run_outputs.run_kind(current[os.path.basename(rel)]) == kind
 
 
 def test_the_readme_s_runs_follow_a_superseding_run(repo, monkeypatch):
