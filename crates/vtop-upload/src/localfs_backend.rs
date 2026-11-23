@@ -153,7 +153,20 @@ fn store_blocking(
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         let mut out = options.open(&staging)?;
+        // On Linux, `io::copy` from a file to a file uses `copy_file_range`
+        // and moves no bytes through user space. Elsewhere it loops over an
+        // 8 KiB buffer, which with several objects in flight cost several
+        // times the system time per byte on macOS; one MiB keeps it flat.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         std::io::copy(&mut src, &mut out)?;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        std::io::copy(
+            &mut std::io::BufReader::with_capacity(
+                vtop_core::compression::OBJECT_WRITE_BUFFER_BYTES,
+                &mut src,
+            ),
+            &mut out,
+        )?;
         out.flush()?;
         // The source's mode, as a copy keeps it, set through the handle so a
         // read-only source leaves a staging file this handle can still sync.
