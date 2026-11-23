@@ -961,8 +961,8 @@ def main(argv: list[str] | None = None) -> int:
                              "crash_report.MIN_OK_CRASHES); lower it to preview a short run, never to commit one")
     args = parser.parse_args(argv)
     try:
-        own = run_outputs.resolve(args.run_dir, REPO, IMG_ROOT, allow_latency_run=True)
-        img_dir = args.img_dir or (own.img_dir if own else DEFAULT_IMG_DIR)
+        own = run_outputs.resolve(args.run_dir, REPO, IMG_ROOT, allow_latency_run=True, allow_supersedes=True)
+        img_dir = args.img_dir or (own.img_dir if own and own.img_dir else DEFAULT_IMG_DIR)
         doc = args.doc or (own.doc if own else None)
         is_crash = os.path.isfile(os.path.join(args.run_dir, "crash.csv"))
         if own and own.latency_run and not is_crash:

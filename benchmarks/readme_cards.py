@@ -344,8 +344,8 @@ def tested(canvas: Canvas, facts: dict[str, Any]) -> tuple[float, str]:
     y += PAD - 18
     return y, "Versions read from: " + ", ".join(sorted({site_facts.COMPOSE, site_facts.CI, site_facts.CARGO_LOCK,
                                                          site_facts.KAFKA_MATRIX, site_facts.POSTGRES_MATRIX,
-                                                         readme_charts.THROUGHPUT_RUN + "/environment.json",
-                                                         readme_charts.FAILOVER_RUN + "/environment.json",
+                                                         readme_charts.throughput_run() + "/environment.json",
+                                                         readme_charts.failover_run() + "/environment.json",
                                                          *filter(None, sources)}))
 
 

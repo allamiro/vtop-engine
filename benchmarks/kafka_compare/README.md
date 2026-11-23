@@ -313,7 +313,13 @@ PNG whose decoded image is unchanged keeps its committed bytes.
 **A second run of a kind, and the crash report.** A run directory may hold a [`report.json`](run_outputs.py),
 `{"doc": "docs/benchmarks/<page>.md", "img_dir": "docs/benchmarks/img/<dir>"}`, which sends that run's page and
 images beside the first run's instead of onto the same files (without it two committed runs of one kind are
-refused, as above). The file is part of the run, committed with it. `report.py` hands a crash run (its directory
+refused, as above). The file is part of the run, committed with it. A newer run that REPLACES an earlier one of its
+kind (throughput, failover or crash, by the file the directory holds) says `{"supersedes": "<run-id>"}` instead,
+with `doc` and `img_dir` both or neither (neither: the kind's default paths). The superseded run stays committed
+and checked, but `regenerate.py` does not draw it, so the newer run takes over its page and images; the target
+must be a committed run in the same results directory, of the same kind, that started earlier (`started_at`),
+with no cycle. `readme_charts.py` draws the one current throughput run and the one current failover run, refusing
+when there is not exactly one of each (`regenerate.current_run`). `report.py` hands a crash run (its directory
 holds `crash.csv`, #599) to [`crash_report.py`](crash_report.py), which reads it through the harness's own
 `crash_schema.load_crash_run` with a floor of ten ok crashes per configuration and mode, writes
 `docs/benchmarks/kafka-crash.md` and `kafka-crash-*.{png,svg}`, and prints the exact binomial upper bound beside every
