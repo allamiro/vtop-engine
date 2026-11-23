@@ -74,7 +74,9 @@ none when every capability is `pass`), the outcome (`pass`, `fail`,
 `refused`, `not_applicable`, `not_run`, `unexpected_pass`, `unexpected_fail`), whether
 that was expected, the verification method the case saw (`store_checksum` or
 `read_back`), how long it took, and for a failed body or an unexpected
-outcome the first line of why (`detail`).
+outcome the first line of why (`detail`). An informational probe may also
+record what it saw the store do (`observation`, a fact the case never
+judges); the page lists them under "Observations".
 
 `not_run` is a case the test harness cannot run against the server, with
 the reason in `detail` (the multipart tests' fault-injecting forwarder needs
@@ -144,7 +146,7 @@ pinned by digest and that the digest still resolves.
 
 ## Probes and the second checksum pass
 
-`crates/vtop-upload/tests/live_s3_probes.rs` asks each server three things
+`crates/vtop-upload/tests/live_s3_probes.rs` asks each server four things
 VTOP's guarantees lean on or may: whether a PUT with a wrong
 `x-amz-checksum-sha256` is refused and nothing stored
 (`checksum_sha256_enforced`; `store_checksum` verification trusts the
@@ -153,7 +155,14 @@ pass corrupt data), and whether `If-None-Match: *` on PUT is honoured
 (`conditional_put`, informational), and whether the SDK's default CRC32
 trailer on a PUT with no checksum of its own is accepted
 (`checksum_crc32_default`, informational: Garage and Zenko CloudServer refuse
-it, and since #788 no VTOP write sends it).
+it, and since #788 no VTOP write sends it), and whether a PUT that asks for
+Object Lock retention with neither `Content-MD5` nor a checksum header is
+refused, as S3 does, or taken (`probe.a_locked_put_without_an_integrity_header_is_handled_as_the_store_does`,
+needs `object_lock` and `versioning`). That last probe judges nothing: it
+passes whichever way the store answers, records the answer as the line's
+`observation`, and fails only on another answer (a 5xx, a dropped
+connection). VTOP always sends an integrity header on a locked write (#684,
+#708), so no write depends on it.
 
 Each leg also reruns the verification and Object Lock write tests with
 `AWS_REQUEST_CHECKSUM_CALCULATION=when_required` (D13), into

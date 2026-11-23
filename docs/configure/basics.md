@@ -25,6 +25,13 @@ exits non-zero only for an invalid config. A setting that is valid but risky,
 such as `upload.require_strong_verification: false`, is printed as a warning
 and still passes.
 
+Add `--strict` to also fail on every key the engine would silently ignore (a
+misspelled or removed key): each is listed with its path, such as
+`engine.state_stor`, and the nearest known key when one is close. Without it a
+config with such a key still passes, as before. `--strict` reads `streams.yaml`
+too. A `config.yaml` may start with `config_version: 1`; a newer number is
+refused by every command that loads the file.
+
 Add `--print-effective` to see what each stream runs with and where each value
 came from; see [Effective settings](print-effective.md).
 

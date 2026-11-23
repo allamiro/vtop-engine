@@ -392,7 +392,7 @@ table differs from what the registry generates. Edit the registry and run
 | 20 | Replica protocol negotiation | replica protocol `1` and `2` | C | evolving | follows #740 | unfrozen |
 | 21 | Metadata peer and admin transport | `VTPM`, version `1` | C | evolving | follows #740 | unfrozen |
 | 22 | Kafka gateway: advertised APIs and version ranges | none | C | experimental | experimental | unfrozen |
-| 23 | `config.yaml` | none (`config_version` planned) | D | evolving | classified at the freeze | unfrozen |
+| 23 | `config.yaml` | optional `config_version`, `1` today (absent reads as `1`) | D | evolving | classified at the freeze | unfrozen |
 | 24 | `vtopctl validate --print-effective` | `effective_version` `1` | D | JSON stable, text for people | JSON stable | unfrozen |
 | 25 | `vtopctl` JSON output and exit codes | `report_version` `1` on every object report | D | evolving | classified at the freeze | unfrozen |
 | 26 | Metric names and labels | none | D | evolving | a stable subset | unfrozen |
