@@ -47,7 +47,7 @@ def complete_rows(env):
     """One plausible row for every key a complete run of MATRIX writes."""
     fp = schema.fingerprint(env)
     rows = []
-    for (system, mode, size, partitions, producers, _compression, _acks, _profile, rep, _basis,
+    for (system, mode, size, partitions, producers, _compression, _acks, _profile, _group_commit, rep, _basis,
          pct) in sorted(schema.expected_keys(env["matrix"])):
         base = 300000.0 if system == "kafka" else 30000.0
         rate = base / (1 if size == 100 else 10) * (1 + rep / 100)

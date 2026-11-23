@@ -8,8 +8,13 @@
 
 ## The full reports
 
+- [Comparison summary](comparison-summary.md): VTOP against other telemetry and archive
+  products, per use case, with the fairness rules and the limits. Cells are
+  "not measured yet" until a run is committed.
 - [Kafka comparison](kafka-comparison.md) and [Kafka failover](kafka-failover.md):
   method, raw data and every condition.
+- [AWS results, v0.11.0](aws-v0.11.0.md): the release's AWS round, the method and the
+  limits of each benchmark, and what each result closes.
 - [Egress transport research](../EGRESS_TRANSPORT_RESEARCH.md): the upload
   path on long, lossy and policed links.
 - [Throughput research](../THROUGHPUT_RESEARCH.md): what the per-stage
