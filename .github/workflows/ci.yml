@@ -341,6 +341,9 @@ jobs:
               - 'scripts/compat/cells/*.sh'
               - 'scripts/ledger-compat.sh'
               - 'scripts/restore-drill.sh'
+              # The disaster-recovery drills (#735): executable shell that
+              # gates the runbooks' claims, and the Python their checks run.
+              - 'scripts/dr-drill/**'
               # The live-chaos harness is executable shell that gates every
               # distributed-systems claim this project makes, and it was
               # unlinted: a change to lib.sh — sourced by every scenario —
@@ -1581,6 +1584,20 @@ jobs:
             scripts/live-chaos/history/*.sh \
             scripts/live-chaos/history/reintroduce/*.sh
 
+      # The disaster-recovery drills (#735). `-P scripts/dr-drill` resolves
+      # the drills' `source` of their shared library, for the reason the
+      # live-chaos step above gives.
+      - name: shellcheck (disaster-recovery drills)
+        run: |
+          docker run --rm -v "$PWD:/mnt" -w /mnt \
+            koalaman/shellcheck:v0.11.0 -x -P scripts/dr-drill \
+            scripts/dr-drill/*.sh
+
+      # The drills trust these checks to find a missing record, a duplicate and
+      # an altered response; this proves they can.
+      - name: disaster-recovery drill helpers (unit tests)
+        run: python3 -m unittest discover -s scripts/dr-drill -p 'test_*.py' -v
+
       - name: bats
         run: |
           docker run --rm -v "$PWD:/code" -w /code \
@@ -1657,6 +1674,10 @@ jobs:
         run: python -m unittest discover -s scripts/tests -p 'test_check_threat_map.py' -v
       - name: threat map (every named control and test exists)
         run: python scripts/check-threat-map.py
+      # The release workflow restores no build cache and interpolates no
+      # outside text into a script (#730).
+      - name: the release workflow keeps caches out and untrusted text in env
+        run: python -m unittest discover -s scripts/tests -p 'test_release_workflow_hardening.py' -v
       # The 1.0 release gate (#741) names tests and CI jobs too, so a rename
       # fails here for the same reason. This checkout is shallow, so the
       # merged pull requests, runs and issues are checked by the docs
@@ -1872,8 +1893,9 @@ jobs:
 
       # Scenario 17 drives the Kafka gateway with a stock client: kafkacat is
       # librdkafka, the library under every non-JVM Kafka client (#225).
-      # Scenarios 17 to 21, 24, 26 and 27 use it.
-      - name: Install a stock Kafka client for scenarios 17 to 21, 24, 26 and 27
+      # Scenarios 17 to 21, 24, 26, 27, 30 and 32 use it (27 and 30 follow a
+      # failover, split and co-located; 32 a paused leader, #751).
+      - name: Install a stock Kafka client for scenarios 17 to 21, 24, 26, 27, 30 and 32
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq kafkacat
@@ -1908,7 +1930,11 @@ jobs:
       # runner's JVM, once per metadata.recovery.strategy, each a full
       # failover. Measured at 75 s for both on two CPUs with debug binaries,
       # plus the image pull; scenario 27 (librdkafka, the kafkacat above) 43 s.
-      # Without the variable the scenario SKIPS (exit 77).
+      # Scenarios 30 and 31 are 27 and 28 again on three co-located
+      # `vtop-node node` processes (each a metadata voter and a candidate), and
+      # 32 pauses the leader past its lease, which a stock client waits out
+      # for its 30 s request timeout (#751). Without the variable 28 and 31
+      # SKIP (exit 77).
       - name: Run the live chaos suite
         id: chaos
         env:

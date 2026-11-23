@@ -362,6 +362,7 @@ vtopctl tier rehydrate --upload-config value=<UPLOAD_CONFIG> required
 vtopctl validate
 vtopctl validate --config value=<CONFIG> required
 vtopctl validate --print-effective flag
+vtopctl validate --strict flag
 vtopctl verify-manifest
 vtopctl verify-manifest --config value=<CONFIG> required
 vtopctl verify-manifest --manifest value=<MANIFEST> required
