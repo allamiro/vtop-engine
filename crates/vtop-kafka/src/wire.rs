@@ -115,6 +115,15 @@ impl<'a> Decoder<'a> {
         Ok(out)
     }
 
+    /// Take everything left. A compressed batch's records section (#596)
+    /// has no length of its own: it runs to the end of the batch, whose
+    /// length the caller has already enforced.
+    pub fn rest(&mut self) -> &'a [u8] {
+        let out = &self.buf[self.pos..];
+        self.pos = self.buf.len();
+        out
+    }
+
     /// Take `len` bytes and hand back a decoder that can read only those.
     ///
     /// This is how a declared length stops being decoration: a nested
