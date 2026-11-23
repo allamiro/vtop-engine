@@ -61,7 +61,7 @@ The names in the commands mean this:
 | `BROKERS`, `GROUP`, `TOPIC` | The Kafka bootstrap servers, `sources.kafka.consumer_group`, and the topic or topics `sources.kafka.topic_include_regex` matches. `kafka-consumer-groups.sh` and `kafka-get-offsets.sh` come from a Kafka distribution; add `--command-config client.properties` when the brokers need authentication. |
 | Object store commands | Shown for S3 with the AWS CLI (`aws s3`, `aws s3api`); the drills use MinIO's `mc`, where `mc ls --recursive <alias>/<bucket>/<prefix>` is the same listing. Credentials are the AWS SDK's chain (`configure/basics.md`), the same the engine uses. |
 | Start and stop the engine | `systemctl start vtop-engine` and `systemctl stop vtop-engine` for the [example unit](https://github.com/allamiro/vtop-engine/blob/main/examples/systemd/vtop-engine.service); scale the Deployment to 0 and back to 1 on Kubernetes; `vtopctl run --config /etc/vtop/config.yaml` in a terminal. |
-| Time to the first commit, and to be caught up | The bounds below are measured from a step to the first `source_committed` batch, and to nothing left in flight. Read them with `vtopctl status --config /etc/vtop/config.yaml`, which prints the batch count for each state: the first commit is when `source_committed` rises above its old count; caught up is when no batch is in any state but `source_committed`, `superseded`, `failed` or `replay_required` and the `source_committed` count stops rising while the source is quiet. With `VTOP_METRICS_ADDR` set, `vtop_commits_total` is the same signal. |
+| Time to the first commit, and to be caught up | The bounds below are measured from a step to the first `source_committed` batch, and to nothing left in flight. Read them with `vtopctl status --config /etc/vtop/config.yaml`, which prints the batch count for each state: the first commit is when `source_committed` rises above its old count; caught up needs all three of: the source has nothing left to read (for Kafka, `kafka-consumer-groups.sh --bootstrap-server "$BROKERS" --describe --group "$GROUP"` shows a `LAG` of 0 on every partition; for a file, the newest committed batch ends at the file's size), no batch is in flight (every batch is `source_committed`, `superseded`, `failed` or `replay_required`), and `vtopctl audit-coverage --config /etc/vtop/config.yaml` prints no `pending` line, so no `failed` or `replay_required` range is still waiting to be read again. A `source_committed` count that stops rising is not enough on its own: a failed tail on a quiet source looks the same. With `VTOP_METRICS_ADDR` set, `vtop_commits_total` tracks the first commit. |
 
 When a manifest MAC key is configured, `migrate`, `scrub` and `audit verify`
 need it in the environment as the engine does
@@ -292,10 +292,11 @@ committed range.
 5. Start the engine, wait until it has archived the source (the first commit,
    then caught up, [read from `vtopctl status`](#conventions-used-in-the-steps)),
    and run the [three checks](#before-any-recovery).
-6. **Report the loss**, from the old ledger. The records lost are the committed
-   batches whose range is below the first offset the broker still holds, for
-   each partition. Get that offset (the last field of each line is it, the
-   fields are `topic:partition:offset`):
+6. **Report the loss**, from the old ledger. The records lost are those of the
+   committed batches that start below the first offset the broker still holds,
+   for each partition: all of a batch that ends below it, and the part below it
+   of a batch that straddles it. Get that offset (the last field of each line
+   is it, the fields are `topic:partition:offset`):
 
    ```bash
    kafka-get-offsets.sh --bootstrap-server "$BROKERS" --topic "$TOPIC" --time -2
@@ -306,19 +307,25 @@ committed range.
 
    ```bash
    psql "$OLD_LEDGER_URL" -v topic="$TOPIC" -v partition=0 -v first=<first retained offset> <<'SQL'
-   SELECT batch_id, record_count, progress_start_json, progress_end_json
+   SELECT batch_id, record_count,
+          ((progress_start_json::json)->>'start_offset')::bigint AS start_offset,
+          ((progress_end_json::json)->>'end_offset')::bigint AS end_offset,
+          CASE WHEN ((progress_end_json::json)->>'end_offset')::bigint < :first
+               THEN 'whole' ELSE 'part' END AS lost
    FROM batches
    WHERE state = 'source_committed' AND source_type = 'kafka'
      AND (progress_end_json::json)->>'topic' = :'topic'
      AND ((progress_end_json::json)->>'partition')::int = :partition
-     AND ((progress_end_json::json)->>'end_offset')::bigint < :first;
+     AND ((progress_start_json::json)->>'start_offset')::bigint < :first;
    SQL
    ```
 
-   The sum of `record_count` is the number of records lost. A batch that
-   straddles the first retained offset is partly lost and is not in this
-   list; its `start_offset` is below `:first` and its `end_offset` is not. With
-   a topic of several partitions, repeat for each with its own offset.
+   A `whole` batch lost its `record_count` records. A `part` batch lost the
+   records at offsets `start_offset` up to `first - 1`: at most that many, and
+   exactly that many when the partition's offsets have no gaps (no compaction,
+   no transaction markers). Report a `part` batch's count as "at most" unless
+   you know the offsets are dense. With a topic of several partitions, repeat
+   for each with its own offset.
 
 ### Pass criteria
 
@@ -434,7 +441,12 @@ nine.
 | Leg | The backup held | The DR bucket held at the disaster | Ledger rows lost | Check in step 4 | First commit | Caught up | Missing | Archived twice |
 |---|---|---|---|---|---|---|---|---|
 | Replica complete | 6 batches | 180 of 180 archived records | 3 batches | passes | 2.9 s | 9.9 s | 0 | 0 |
-| Replica behind (cut off for the last three batches) | 9 batches | 120 of 180 archived records | 0 batches | fails: 6 objects, naming exactly the last three batches | 13.4 s (the repair) | 13.4 s | 0 | 0 |
+| Replica behind (cut off for the last three batches) | 9 batches | 120 of 180 archived records | 0 batches | fails: 6 objects, naming exactly the last three batches | 13.4 s (the repair alone; see below) | 13.4 s (the repair alone) | 0 | 0 |
+
+The "replica behind" times are the repair alone: they were measured before the
+drill timed that leg from the first step in the DR region, as the bound says,
+so they leave out the restore, the migration and the failed check. The next
+run replaces them.
 
 The records the replica lacked were archived again from the source: that is
 the RPO of the archive, 60 records here, and it is zero losses only because the

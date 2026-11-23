@@ -131,6 +131,24 @@ class Lifecycle(unittest.TestCase):
         with open(path) as f:
             return f.read().split("\n")[:-1]
 
+    # ---- the lab directory is this user's alone: --check runs its state file as shell
+    def test_a_lab_directory_others_can_write_is_refused(self):
+        os.makedirs(self.work)
+        os.chmod(self.work, 0o777)
+        out = self.run_drill("--handover")
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertIn("writable by no one else", out.stderr)
+        self.assertNotIn("run", self.docker_calls())
+
+    def test_a_state_file_others_can_write_is_not_run(self):
+        out = self.run_drill("--handover")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        state = os.path.join(self.work, "handover.state")
+        os.chmod(state, 0o666)
+        out = self.run_drill("--check")
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertIn("writable by no one else", out.stderr)
+
     # ---- a run is unchanged: lab, recover, check, per leg, then the lab is removed
     def test_a_run_goes_through_every_leg_and_tears_the_lab_down(self):
         out = self.run_drill()

@@ -223,8 +223,11 @@ recover() {
     local want_missing=$(((BACKUP_ROWS - FIRST / BATCH) * 2)) # an object and a manifest for each batch of the last stretch
     crit_eq "$L_LEG: the check names exactly the objects the DR region lacks (an object and a manifest for each batch)" "$missing_objects" "$want_missing"
     repair_universal
-    RTO_MS="$REPAIR_RTO_MS"
-    CAUGHT_MS="$REPAIR_RTO_MS"
+    # VTOP_DR_REGION_LOST_RTO_S bounds the recovery from its first step in
+    # the DR region, so the restore, the migration and the failed check count
+    # as well as the repair; the repair alone is recorded beside it.
+    RTO_MS="$REPAIR_CAUGHT_MS"
+    CAUGHT_MS="$REPAIR_CAUGHT_MS"
   else
     crit_eq "$L_LEG: the check after the restore passes" "$check_rc" 0
     dr_engine_start "$L_CFG_D"
@@ -257,6 +260,7 @@ repair_universal() {
   dr_engine_start "$L_CFG_D"
   wait_until 240 "the engine to archive the whole source again" drained "$TOTAL"
   REPAIR_RTO_MS=$(ms_since "$t1")
+  REPAIR_CAUGHT_MS=$(ms_since "$T0")
   dr_engine_stop
 }
 
@@ -288,6 +292,7 @@ check() {
   dr_set "${L_K}_rpo_archive_records_not_in_dr_region" "$ARCHIVE_RPO"
   dr_set "${L_K}_rto_ms" "$RTO_MS"
   dr_set "${L_K}_caught_up_ms" "$CAUGHT_MS"
+  [[ -z "${REPAIR_RTO_MS:-}" ]] || dr_set "${L_K}_repair_ms" "$REPAIR_RTO_MS"
   dr_check_summary "$DR_MISSING"
   log "$L_LEG: the ledger lost $((DEAD_ROWS - BACKUP_ROWS)) committed batch(es); the DR region lacked $ARCHIVE_RPO archived record(s); first commit $(secs "$RTO_MS") s, caught up $(secs "$CAUGHT_MS") s"
 }

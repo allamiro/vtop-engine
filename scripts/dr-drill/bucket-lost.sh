@@ -156,12 +156,13 @@ check() {
   crit_eq "the first records lost are the first records expired" "$DR_MISSING_FIRST" "0,1,2,3,4"
   crit_eq "no record is archived twice" "$DR_DUPLICATES" 0
   # The loss report from the old ledger, the record the page says to keep: the
-  # committed batches whose records are below the first offset the broker still
-  # holds, which the page's command reads.
+  # records of committed batches below the first offset the broker still holds,
+  # whole batches and the part of one that straddles it (the topic has no
+  # offset gaps, so the part is exact), as the page's query reports them.
   first_retained="$(dr_kafka_tool kafka-get-offsets.sh --topic "$TOPIC" --time -2 | awk -F: '{print $3}')"
   crit_eq "the first retained offset, as the page's command reads it" "$first_retained" "$EXPIRED"
   lost_from_ledger="$(docker exec "${DR_CONT[pg-$DR_PG]}" psql --no-psqlrc -U vtop -d "${DB_OLD}_lost_bucket" -tA -c \
-    "SELECT COALESCE(sum(record_count),0) FROM batches WHERE state='source_committed' AND source_type='kafka' AND ((progress_end_json::json)->>'end_offset')::bigint < $first_retained" 2> "$DR_LOGS/loss-report.err" || true)"
+    "SELECT COALESCE(sum(CASE WHEN ((progress_end_json::json)->>'end_offset')::bigint < $first_retained THEN record_count ELSE $first_retained - ((progress_start_json::json)->>'start_offset')::bigint END),0) FROM batches WHERE state='source_committed' AND source_type='kafka' AND ((progress_start_json::json)->>'start_offset')::bigint < $first_retained" 2> "$DR_LOGS/loss-report.err" || true)"
   log "the old ledger's loss report: ${lost_from_ledger:-unreadable} record(s) committed below offset $EXPIRED"
   crit_eq "the old ledger's loss report names exactly the records that are lost" "${lost_from_ledger:-unreadable}" "$DR_MISSING"
   dr_checks recovered "$CFG" "$DIGESTS"

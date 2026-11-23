@@ -176,6 +176,10 @@ class FaultProxy(unittest.TestCase):
         r = c.getresponse()
         self.assertEqual(r.read(), b"payload")
 
+    def test_a_header_from_the_store_cannot_carry_a_line_break(self):
+        self.assertEqual(proxy.header_text("v1\r\nSet-Cookie: x=1"), "v1Set-Cookie: x=1")
+        self.assertEqual(proxy.header_text(42), "42")
+
 
 if __name__ == "__main__":
     unittest.main()
