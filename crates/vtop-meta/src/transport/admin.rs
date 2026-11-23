@@ -538,6 +538,36 @@ pub fn refuses_version_report(error: &TransportError) -> bool {
     message.starts_with(gate_prefix) || message.contains(&undecodable)
 }
 
+/// Whether metadata refused a holder's own lease release (#732) because the
+/// tier cannot record it yet, so the holder-less release is the one to send.
+///
+/// Two releases refuse it, each in its own words, both before anything is
+/// replicated: one with feature levels below
+/// [`crate::command::HOLDER_RELEASE_FEATURE_LEVEL`], with the gate's
+/// `FeatureNotEnabled`; and one that cannot decode the command kind at all
+/// (kind 41). Anything else - an authorization refusal, a lost connection -
+/// is not this, and the release is not retried in the older form.
+pub fn refuses_holder_release(error: &TransportError) -> bool {
+    let TransportError::Protocol(message) = error else {
+        return false;
+    };
+    let gate = crate::raft::ConsensusError::FeatureNotEnabled {
+        needed: crate::command::HOLDER_RELEASE_FEATURE_LEVEL,
+        enabled: 0,
+    }
+    .to_string();
+    let gate_prefix = gate
+        .split(" and the cluster runs at")
+        .next()
+        .unwrap_or(&gate);
+    let undecodable = crate::wire::CodecError::UnknownTag {
+        what: "command kind",
+        tag: 41,
+    }
+    .to_string();
+    message.starts_with(gate_prefix) || message.contains(&undecodable)
+}
+
 /// Whether metadata refused a promotion report BECAUSE it carries a payload
 /// of the override's level (#636): the lineage-unproven refusal reason, or
 /// an attestation. Recognized as [`refuses_lineage_verdicts`] recognizes its
@@ -3474,6 +3504,96 @@ mod tests {
         assert_eq!(handler.proposals.load(Ordering::SeqCst), 1);
 
         task.abort();
+    }
+
+    fn release(as_holder: Option<Uuid>) -> MetadataCommand {
+        let env = CommandEnvelope {
+            request_id: Uuid::from_u128(2),
+            issued_at_ms: 0,
+        };
+        match as_holder {
+            Some(holder) => MetadataCommand::ReleaseRangeLeaseAsHolder {
+                env,
+                topic_uuid: Uuid::from_u128(7),
+                range_uuid: Uuid::from_u128(8),
+                holder_node_uuid: holder,
+                expected_fencing_epoch: 3,
+            },
+            None => MetadataCommand::ReleaseRangeLease {
+                env,
+                topic_uuid: Uuid::from_u128(7),
+                range_uuid: Uuid::from_u128(8),
+                expected_fencing_epoch: 3,
+            },
+        }
+    }
+
+    /// #732: under an enforcing policy a data node hands its own range back
+    /// at once, with the release that names it as the holder; another node's
+    /// certificate is refused that release, and the holder-less release,
+    /// which names no one, stays an operator's. Before this, a node's only
+    /// release was the holder-less one, so its shutdown release was refused
+    /// and its lease lapsed on its deadline.
+    #[tokio::test]
+    async fn a_node_may_release_its_own_lease_and_no_one_elses_over_the_wire() {
+        let (client, handler, task) =
+            live_endpoint(AdminAuthorizer::with_operators([]), &NODE_A.to_string()).await;
+
+        let own = client.propose(release(Some(NODE_A))).await.unwrap_err();
+        assert!(
+            own.to_string().contains("handler reached"),
+            "a node's release of its own lease must reach the backend: {own}"
+        );
+        assert_eq!(handler.proposals.load(Ordering::SeqCst), 1);
+
+        let theirs = client.propose(release(Some(NODE_B))).await.unwrap_err();
+        let message = theirs.to_string();
+        assert!(message.contains("unauthorized"), "{message}");
+        assert!(message.contains(&NODE_A.to_string()), "{message}");
+        assert!(message.contains(&NODE_B.to_string()), "{message}");
+
+        let anyones = client.propose(release(None)).await.unwrap_err();
+        assert!(anyones.to_string().contains("unauthorized"), "{anyones}");
+        assert_eq!(
+            handler.proposals.load(Ordering::SeqCst),
+            1,
+            "a refused release must never reach the state machine"
+        );
+
+        task.abort();
+    }
+
+    /// #732: a node upgraded ahead of its metadata tier recognizes both ways
+    /// the tier says it cannot record a holder's release yet - the gate below
+    /// level 9, the codec of a tier that predates kind 41 - and nothing else,
+    /// so an authorization refusal is never retried in the older form.
+    #[test]
+    fn a_refusal_of_a_holder_release_is_recognized_and_nothing_else_is() {
+        let gate = crate::raft::ConsensusError::FeatureNotEnabled {
+            needed: crate::command::HOLDER_RELEASE_FEATURE_LEVEL,
+            enabled: 8,
+        }
+        .to_string();
+        assert!(refuses_holder_release(&TransportError::Protocol(gate)));
+        assert!(refuses_holder_release(&TransportError::Protocol(
+            "unknown command kind tag 41".to_owned()
+        )));
+        for other in [
+            TransportError::Protocol(
+                crate::raft::ConsensusError::FeatureNotEnabled {
+                    needed: crate::command::PROMOTE_UNPROVEN_FEATURE_LEVEL,
+                    enabled: 7,
+                }
+                .to_string(),
+            ),
+            TransportError::Protocol("unknown command kind tag 40".to_owned()),
+            TransportError::Protocol(
+                "unauthorized: node aaaaaaaa may not act for bbbbbbbb".to_owned(),
+            ),
+            TransportError::Closed,
+        ] {
+            assert!(!refuses_holder_release(&other), "{other}");
+        }
     }
 
     /// The rule that makes it safe. One compromised node must not be able to
