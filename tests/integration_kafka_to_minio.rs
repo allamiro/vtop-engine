@@ -2500,6 +2500,21 @@ async fn a_held_back_kafka_range_is_settled_without_a_restart_and_never_moves_th
         BatchState::SourceCommitted,
         "the held-back range is settled without a restart"
     );
+    // The held range is now rebuilt as first cut (its re-read stops at 19), so
+    // it settles as soon as the re-read has committed through 20, before the
+    // rest of the partition is read. Read on: every later commit must still
+    // only move the group forward (`OffsetWatch::look` asserts it at each
+    // look), up to the end of the partition.
+    for _ in 0..15 {
+        if watch.0.last() == Some(&40) {
+            break;
+        }
+        engine
+            .process_once(SourceType::Kafka)
+            .await
+            .expect("a read pass");
+        watch.look(&topic, &group);
+    }
     assert_eq!(
         watch.0.last(),
         Some(&40),

@@ -198,21 +198,41 @@ def _ci_runs_live_s3_on_minio(ci: str) -> bool:
     return False
 
 
+def _s3_server_file(server: str, repo: str) -> str:
+    """A server's capability file, or "" when it has none."""
+    path = os.path.join(repo, S3_SERVERS, f"{server}.yaml")
+    return _read(os.path.relpath(path, repo), repo) if os.path.isfile(path) else ""
+
+
 def _s3_server_name(server: str, repo: str) -> str:
     """The display name a server's capability file gives (its `name:` line), or the id when it has none."""
-    path = os.path.join(repo, S3_SERVERS, f"{server}.yaml")
-    if os.path.isfile(path):
-        match = re.search(r"^name:\s*(.+?)\s*$", _read(os.path.relpath(path, repo), repo), re.M)
-        if match:
-            return match.group(1).strip("\"'")
-    return server
+    match = re.search(r"^name:\s*(.+?)\s*$", _s3_server_file(server, repo), re.M)
+    return match.group(1).strip("\"'") if match else server
+
+
+def _s3_version(result: dict, repo: str) -> str | None:
+    """The version a matrix result is shown with.
+
+    A server run from an image records its `server_version`. A hosted service (AWS S3: its capability
+    file sets `sdk_default_endpoint: true`, so the SDK finds the endpoint itself) has no version to
+    record, so it is shown with the date it was tested, "as of YYYY-MM-DD", from the result's own
+    `run_date`. Anything else without a version is refused by the caller."""
+    version = result.get("server_version", result.get("version"))
+    if isinstance(version, str) and version:
+        return version
+    hosted = re.search(r"^sdk_default_endpoint:\s*true\s*$", _s3_server_file(result["server"], repo), re.M)
+    run_date = result.get("run_date")
+    if hosted and isinstance(run_date, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", run_date):
+        return f"as of {run_date}"
+    return None
 
 
 def s3_servers(repo: str = REPO) -> dict[str, Any]:
     """The lab's MinIO, plus one entry per committed result of the S3 compatibility matrix (#722).
 
     Until #722's report lands there are no results, and the strip says when more servers will appear.
-    Each results file names its `server` and `version`; anything else in it belongs to #722's report.
+    Each results file names its `server` and `server_version` (a hosted service, which has none, is
+    shown "as of" its `run_date`); anything else in it belongs to #722's report.
     """
     compose = _read(COMPOSE, repo)
     lab = _images(compose, "vtop-minio")
@@ -226,11 +246,13 @@ def s3_servers(repo: str = REPO) -> dict[str, Any]:
         rel = os.path.relpath(path, repo)
         with open(path, encoding="utf-8") as handle:
             result = json.load(handle)
-        # scripts/s3_compat_report.py writes `server` (the id) and `server_version`.
-        version = result.get("server_version", result.get("version")) if isinstance(result, dict) else None
-        if not isinstance(result, dict) or not isinstance(result.get("server"), str) or not result["server"] \
-                or not isinstance(version, str) or not version:
+        # scripts/s3_compat_report.py writes `server` (the id), `server_version` and `run_date`.
+        if not isinstance(result, dict) or not isinstance(result.get("server"), str) or not result["server"]:
             raise Refused(f"{rel}: a matrix result must name its server and version")
+        version = _s3_version(result, repo)
+        if version is None:
+            raise Refused(f"{rel}: a matrix result must name its server and version "
+                          "(or, for a hosted service, its run_date)")
         if result["server"] == LAB_S3_SERVER:
             continue  # the lab's MinIO is the entry above
         entries.append({"name": _s3_server_name(result["server"], repo), "version": version,

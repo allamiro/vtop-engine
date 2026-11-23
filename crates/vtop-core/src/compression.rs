@@ -17,6 +17,12 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+/// The buffer an uncompressed object is written through. The default 8 KiB
+/// `BufWriter` issued one `write(2)` per 8 KiB, and with several windows in
+/// flight at once (#892) the system time per byte grew several-fold on
+/// macOS/APFS. One MiB keeps that cost flat; the encoders buffer on their own.
+pub const OBJECT_WRITE_BUFFER_BYTES: usize = 1 << 20;
+
 /// Result of compressing a batch: the local object path and its byte size.
 #[derive(Debug, Clone)]
 pub struct CompressedObject {
@@ -75,12 +81,7 @@ pub fn compress_batch(
                     .map_err(|e| VtopError::Compression(e.to_string()))?;
                 Ok(written)
             }
-            CompressionType::None => {
-                let mut writer = BufWriter::new(file);
-                let written = write_batch_payload(batch, &mut writer)?;
-                writer.flush()?;
-                Ok(written)
-            }
+            CompressionType::None => write_uncompressed(batch, file),
         }
     })();
     let uncompressed_bytes = match result {
@@ -108,6 +109,15 @@ pub fn compress_batch(
         compression,
         extension,
     })
+}
+
+/// An uncompressed batch written through [`OBJECT_WRITE_BUFFER_BYTES`] of
+/// buffer, so the file sees MiB-sized writes rather than 8 KiB ones.
+fn write_uncompressed<W: Write>(batch: &TelemetryBatch, inner: W) -> Result<u64, VtopError> {
+    let mut writer = BufWriter::with_capacity(OBJECT_WRITE_BUFFER_BYTES, inner);
+    let written = write_batch_payload(batch, &mut writer)?;
+    writer.flush()?;
+    Ok(written)
 }
 
 /// Stream a batch's exact wire framing into `writer` without first
@@ -267,6 +277,47 @@ mod tests {
         let raw: &[u8] = &[0x00, 0x01, 0xff, 0x42];
         let batch = sealed_batch_framed(vec![raw], true);
         assert_eq!(batch.to_record_bytes(), raw);
+    }
+
+    /// A writer that counts the `write` calls it is given.
+    struct CountingWriter {
+        calls: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// An uncompressed object reaches the file in MiB-sized writes: 4 MiB of
+    /// 100-byte records is a handful of calls, where the default 8 KiB buffer
+    /// made it over five hundred. The bytes are the batch's framing, unchanged.
+    #[test]
+    fn an_uncompressed_object_is_written_in_large_writes() {
+        let line = [b'x'; 99];
+        let records: Vec<&[u8]> = (0..(4 << 20) / 100).map(|_| &line[..]).collect();
+        let batch = sealed_batch(records);
+        let mut out = CountingWriter {
+            calls: 0,
+            bytes: Vec::new(),
+        };
+        let written = write_uncompressed(&batch, &mut out).unwrap();
+        assert_eq!(written, out.bytes.len() as u64);
+        assert_eq!(out.bytes, batch.to_record_bytes());
+        let ceiling = out.bytes.len() / OBJECT_WRITE_BUFFER_BYTES + 2;
+        assert!(
+            out.calls <= ceiling,
+            "{} writes for {} bytes, at most {ceiling} expected",
+            out.calls,
+            out.bytes.len()
+        );
     }
 
     #[test]
