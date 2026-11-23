@@ -1,0 +1,235 @@
+{
+  "comparable": {
+    "client": "kafka-producer-perf-test/kafka-consumer-perf-test 4.3.2 (JVM)",
+    "client_java": "openjdk version \"21.0.11\" 2026-04-21",
+    "client_limits": {
+      "cpus": "4",
+      "heap": "-Xms1g -Xmx1g",
+      "memory": "4g"
+    },
+    "consumer_props": [
+      "enable.auto.commit=false"
+    ],
+    "docker_platform": "Docker Engine - Community",
+    "docker_server_version": "29.0.0",
+    "docker_storage_driver": "overlayfs",
+    "docker_vm_arch": "x86_64",
+    "docker_vm_cpus": 16,
+    "docker_vm_kernel": "6.8.0",
+    "docker_vm_memory_bytes": 34359738368,
+    "docker_vm_os": "Ubuntu 24.04",
+    "e2e_client_image": "kc-e2e-client:dff5290f8b8d",
+    "e2e_consumer": "client/E2eLatency.java, compiled by client/Dockerfile against the Kafka image's kafka-clients and run by that image's JVM: assign, seek to the end, latency = poll() return time minus the record's CreateTime, 1 ms buckets",
+    "e2e_consumer_limits": {
+      "cpus": "2",
+      "heap": "-Xms512m -Xmx512m",
+      "memory": "2g"
+    },
+    "e2e_jdk_image": "eclipse-temurin:21.0.11_10-jdk@sha256:98155457fcdbeb0987472e8abf721657b698ede407aad52ac24ae42618c0931c",
+    "host_cpu": "Apple M5 Max",
+    "host_disk": "Stub NVMe, SSD, NVMe, ext4",
+    "host_logical_cpus": "18",
+    "host_memory_bytes": "137438953472",
+    "host_model": "",
+    "host_os": "macOS 27.0.1",
+    "kafka_image": "apache/kafka:4.3.2@sha256:852a0d49fc4e656b022e7f23785411802c9a088c78a7c5e39f33969de9c227a7",
+    "kafka_image_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "kafka_profiles": {
+      "defaults": "Kafka as shipped: log.flush.interval.messages unset, so an acknowledgement does not wait for an fsync",
+      "fsync-parity": "flush.messages=1 on every broker and on the topic: every append is flushed before it is acknowledged"
+    },
+    "node_limits": {
+      "cpus": "2",
+      "mem_limit": "2g",
+      "memswap_limit": "2g"
+    },
+    "producer_props": [
+      "acks=all",
+      "compression.type=none"
+    ],
+    "profile": "defaults",
+    "resources_source": "/sys/fs/cgroup/cpu.stat:usage_usec; /sys/fs/cgroup/io.stat:rbytes,wbytes",
+    "resources_window_close": "sync+settle=2s",
+    "volume_filesystem": "/dev/nvme1n1 ext4",
+    "vtop_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "vtop_engine_tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "vtop_group_commit": {
+      "settings": {
+        "off": {
+          "enabled": false
+        },
+        "on": {
+          "enabled": true
+        }
+      }
+    },
+    "vtop_image": "vtop-bench:stub",
+    "vtop_image_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "configs": {
+    "kafka_compose": "# Apache Kafka for the head-to-head comparison (#595, #596): three brokers in\n# KRaft mode, each a combined broker+controller, RF=3, min.insync.replicas=2.\n#\n# Fairness rule 1: every broker gets EXACTLY the limits each VTOP node gets in\n# compose.vtop.yml (2 CPUs, 2 GiB, no swap, a named volume on the same Docker\n# VM disk). Change one file, change the other; run.py records both in\n# environment.json and refuses to start when they differ.\n#\n# Everything else is Kafka as shipped (profile `defaults`, #595 rule 4): no\n# flush.messages, so a broker acknowledges on replication, not on fsync.\n#\n# The image is pinned by tag AND digest (rule 8); KAFKA_IMAGE overrides both.\nname: kc-kafka\n\nx-broker: &broker\n  image: ${KAFKA_IMAGE:-apache/kafka:4.3.2@sha256:852a0d49fc4e656b022e7f23785411802c9a088c78a7c5e39f33969de9c227a7}\n  cpus: 2\n  mem_limit: 2g\n  memswap_limit: 2g\n  ulimits:\n    nofile: { soft: 65536, hard: 65536 }\n  # The same hardening as the VTOP nodes (fairness rule 1): no capabilities\n  # (the broker listens above 1024 as appuser), no setuid gain. Not\n  # read_only or pids_limit: the first would move the JVM's writable paths\n  # to tmpfs, the second caps its threads; either could change what is\n  # measured.\n  cap_drop: [ALL]\n  security_opt: [\"no-new-privileges:true\"]\n  networks: [bench]\n  healthcheck:\n    test: [\"CMD-SHELL\", \"/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1\"]\n    interval: 5s\n    timeout: 20s\n    retries: 30\n    start_period: 10s\n\nx-env: &env\n  # One fixed id: KRaft formats every log dir with it on first start.\n  CLUSTER_ID: \"a2NvbXBhcmUtcGhhc2UtMQ\"\n  KAFKA_PROCESS_ROLES: \"broker,controller\"\n  KAFKA_LISTENERS: \"PLAINTEXT://:9092,CONTROLLER://:9093\"\n  KAFKA_CONTROLLER_LISTENER_NAMES: \"CONTROLLER\"\n  KAFKA_INTER_BROKER_LISTENER_NAME: \"PLAINTEXT\"\n  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: \"CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT\"\n  KAFKA_CONTROLLER_QUORUM_VOTERS: \"1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093\"\n  KAFKA_LOG_DIRS: \"/var/lib/kafka/data\"\n  # The replication contract (#595 rule 3).\n  KAFKA_DEFAULT_REPLICATION_FACTOR: \"3\"\n  KAFKA_MIN_INSYNC_REPLICAS: \"2\"\n  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: \"3\"\n  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: \"3\"\n  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: \"2\"\n  # The benchmark topic is created explicitly by run.py with these settings;\n  # a typo'd topic must not be auto-created with others.\n  KAFKA_AUTO_CREATE_TOPICS_ENABLE: \"false\"\n\nservices:\n  kafka-1:\n    <<: *broker\n    hostname: kafka-1\n    environment:\n      <<: *env\n      KAFKA_NODE_ID: \"1\"\n      KAFKA_ADVERTISED_LISTENERS: \"PLAINTEXT://kafka-1:9092\"\n    volumes: [\"kafka-1-data:/var/lib/kafka/data\"]\n  kafka-2:\n    <<: *broker\n    hostname: kafka-2\n    environment:\n      <<: *env\n      KAFKA_NODE_ID: \"2\"\n      KAFKA_ADVERTISED_LISTENERS: \"PLAINTEXT://kafka-2:9092\"\n    volumes: [\"kafka-2-data:/var/lib/kafka/data\"]\n  kafka-3:\n    <<: *broker\n    hostname: kafka-3\n    environment:\n      <<: *env\n      KAFKA_NODE_ID: \"3\"\n      KAFKA_ADVERTISED_LISTENERS: \"PLAINTEXT://kafka-3:9092\"\n    volumes: [\"kafka-3-data:/var/lib/kafka/data\"]\n\nvolumes:\n  kafka-1-data:\n  kafka-2-data:\n  kafka-3-data:\n\nnetworks:\n  bench:\n    name: kc-kafka-bench\n",
+    "vtop_compose": "# VTOP for the head-to-head comparison (#595, #596): three data nodes from the\n# image docker/Dockerfile builds, one range replicated to all three with a\n# write quorum of 2 of 3, and the Kafka gateway on the range's leader.\n#\n# Fairness rule 1: EXACTLY the per-node limits compose.kafka.yml gives each\n# Kafka broker (2 CPUs, 2 GiB, no swap, a named volume on the same Docker VM\n# disk). run.py records both in environment.json and refuses to start when\n# they differ.\n#\n# VTOP_IMAGE is set by run.py to the image it built from the commit under\n# test (vtop-bench:<sha>), so the recorded commit is the one that ran.\nname: kc-vtop\n\nx-node: &node\n  image: ${VTOP_IMAGE:?set VTOP_IMAGE to the vtop-bench image run.py built}\n  entrypoint: [\"vtop-node\", \"data\", \"--config\", \"/etc/vtop/node.yaml\"]\n  cpus: 2\n  mem_limit: 2g\n  memswap_limit: 2g\n  ulimits:\n    nofile: { soft: 65536, hard: 65536 }\n  # The same hardening as compose.kafka.yml's brokers (fairness rule 1): no\n  # capabilities (the node listens above 1024 as user vtop), no setuid gain.\n  # Not read_only or pids_limit: the first would move writable paths to\n  # tmpfs, the second caps threads; either could change what is measured.\n  cap_drop: [ALL]\n  security_opt: [\"no-new-privileges:true\"]\n  networks: [bench]\n  healthcheck:\n    test: [\"CMD-SHELL\", \"curl -sf http://127.0.0.1:9600/readyz > /dev/null\"]\n    interval: 2s\n    timeout: 5s\n    retries: 60\n    start_period: 2s\n\nservices:\n  # Followers first: the leader's quorum needs them listening.\n  vtop-2:\n    <<: *node\n    hostname: vtop-2\n    volumes:\n      - \"./vtop/follower-1.yaml:/etc/vtop/node.yaml:ro\"\n      # Mounted at the image's home (owned by the unprivileged `vtop` user), so\n      # a fresh named volume inherits that ownership.\n      - \"vtop-2-data:/home/vtop\"\n  vtop-3:\n    <<: *node\n    hostname: vtop-3\n    volumes:\n      - \"./vtop/follower-2.yaml:/etc/vtop/node.yaml:ro\"\n      - \"vtop-3-data:/home/vtop\"\n  vtop-1:\n    <<: *node\n    hostname: vtop-1\n    depends_on:\n      vtop-2: { condition: service_healthy }\n      vtop-3: { condition: service_healthy }\n    volumes:\n      # ${VTOP_LEADER_CONFIG} names another leader file: run.py's per-run group-commit config (#752) or crash.py's\n      # group-commit configurations (#599); unset, it is the shipped one.\n      - \"${VTOP_LEADER_CONFIG:-./vtop/leader.yaml}:/etc/vtop/node.yaml:ro\"\n      - \"vtop-1-data:/home/vtop\"\n\nvolumes:\n  vtop-1-data:\n  vtop-2-data:\n  vtop-3-data:\n\nnetworks:\n  bench:\n    name: kc-vtop-bench\n",
+    "vtop_follower_1": "# VTOP node 2: a follower of the range led by vtop-1 (see leader.yaml).\n# Followers serve no Kafka gateway: the node refuses `kafka` on any role but\n# leader or standalone, because the gateway serves the range this node leads.\nrole: follower\nnode_uuid: aaaaaaaa-0000-0000-0000-0000000000a2\ncluster_id: 11111111-2222-3333-4444-555555555555\ndata_dir: /home/vtop/data\nfencing_epoch: 18\nrange: { topic: \"bench\", topic_epoch: 1, range_id: aaaaaaaa-0000-0000-0000-0000000000c1, range_generation: 0 }\nsegment_id: aaaaaaaa-0000-0000-0000-0000000000d1\nreplica_listen: \"0.0.0.0:9300\"\nreplica_transport: plaintext-on-any-interface\nobservability: { listen: \"0.0.0.0:9600\" }\n",
+    "vtop_follower_2": "# VTOP node 3: a follower of the range led by vtop-1 (see leader.yaml).\nrole: follower\nnode_uuid: aaaaaaaa-0000-0000-0000-0000000000a3\ncluster_id: 11111111-2222-3333-4444-555555555555\ndata_dir: /home/vtop/data\nfencing_epoch: 18\nrange: { topic: \"bench\", topic_epoch: 1, range_id: aaaaaaaa-0000-0000-0000-0000000000c1, range_generation: 0 }\nsegment_id: aaaaaaaa-0000-0000-0000-0000000000d1\nreplica_listen: \"0.0.0.0:9300\"\nreplica_transport: plaintext-on-any-interface\nobservability: { listen: \"0.0.0.0:9600\" }\n",
+    "vtop_leader": "# VTOP node 1: the range's static leader, with the Kafka gateway (#225).\n#\n# The shape scripts/live-chaos scenario 17 drives with a stock librdkafka\n# client (a static leader at a fixed fencing epoch, two followers, quorum\n# acknowledgement), moved into containers. Plaintext planes, as Kafka's\n# PLAINTEXT listeners on the other side, so neither system pays for TLS; the\n# `-on-any-interface` spelling is the node's own opt-in for leaving loopback.\n#\n# Every engine knob not written here is the binary's default (profile\n# `defaults`, #595 rule 4): the gateway appends with Durability::Quorum, which\n# acknowledges after a majority of the three replicas (leader included) has\n# made the append locally durable (fsync) \u2014 2 of 3, the write quorum the\n# comparison asks for. Kafka under `defaults` acknowledges on replication\n# without fsync; that difference is stated in the report, never hidden.\nrole: leader\nnode_uuid: aaaaaaaa-0000-0000-0000-0000000000a1\ncluster_id: 11111111-2222-3333-4444-555555555555\ndata_dir: /home/vtop/data\nfencing_epoch: 18\nrange: { topic: \"bench\", topic_epoch: 1, range_id: aaaaaaaa-0000-0000-0000-0000000000c1, range_generation: 0 }\nsegment_id: aaaaaaaa-0000-0000-0000-0000000000d1\nnative_listen: \"0.0.0.0:9400\"\nreplica_listen: \"0.0.0.0:9300\"\nfollowers:\n  - { node_uuid: aaaaaaaa-0000-0000-0000-0000000000a2, addr: \"vtop-2:9300\", server_name: \"vtop-2\" }\n  - { node_uuid: aaaaaaaa-0000-0000-0000-0000000000a3, addr: \"vtop-3:9300\", server_name: \"vtop-3\" }\nreplica_transport: plaintext-on-any-interface\nnative_transport: plaintext-on-any-interface\nprincipal_id: aaaaaaaa-0000-0000-0000-0000000000ce\nobservability: { listen: \"0.0.0.0:9600\" }\nkafka:\n  # Off loopback because the client runs in its own container; the gateway\n  # demands that be said by name (`any_interface`), and Metadata must name a\n  # host the client container resolves (`advertised_host`).\n  listen: \"0.0.0.0:9092\"\n  any_interface: true\n  advertised_host: \"vtop-1\"\n  advertised_port: 9092\n  topic: \"bench\"\n  node_id: 1\n",
+    "vtop_leader_group_commit_off": "# VTOP node 1: the range's static leader, with the Kafka gateway (#225).\n#\n# The shape scripts/live-chaos scenario 17 drives with a stock librdkafka\n# client (a static leader at a fixed fencing epoch, two followers, quorum\n# acknowledgement), moved into containers. Plaintext planes, as Kafka's\n# PLAINTEXT listeners on the other side, so neither system pays for TLS; the\n# `-on-any-interface` spelling is the node's own opt-in for leaving loopback.\n#\n# Every engine knob not written here is the binary's default (profile\n# `defaults`, #595 rule 4): the gateway appends with Durability::Quorum, which\n# acknowledges after a majority of the three replicas (leader included) has\n# made the append locally durable (fsync) \u2014 2 of 3, the write quorum the\n# comparison asks for. Kafka under `defaults` acknowledges on replication\n# without fsync; that difference is stated in the report, never hidden.\nrole: leader\nnode_uuid: aaaaaaaa-0000-0000-0000-0000000000a1\ncluster_id: 11111111-2222-3333-4444-555555555555\ndata_dir: /home/vtop/data\nfencing_epoch: 18\nrange: { topic: \"bench\", topic_epoch: 1, range_id: aaaaaaaa-0000-0000-0000-0000000000c1, range_generation: 0 }\nsegment_id: aaaaaaaa-0000-0000-0000-0000000000d1\nnative_listen: \"0.0.0.0:9400\"\nreplica_listen: \"0.0.0.0:9300\"\nfollowers:\n  - { node_uuid: aaaaaaaa-0000-0000-0000-0000000000a2, addr: \"vtop-2:9300\", server_name: \"vtop-2\" }\n  - { node_uuid: aaaaaaaa-0000-0000-0000-0000000000a3, addr: \"vtop-3:9300\", server_name: \"vtop-3\" }\nreplica_transport: plaintext-on-any-interface\nnative_transport: plaintext-on-any-interface\nprincipal_id: aaaaaaaa-0000-0000-0000-0000000000ce\nobservability: { listen: \"0.0.0.0:9600\" }\nkafka:\n  # Off loopback because the client runs in its own container; the gateway\n  # demands that be said by name (`any_interface`), and Metadata must name a\n  # host the client container resolves (`advertised_host`).\n  listen: \"0.0.0.0:9092\"\n  any_interface: true\n  advertised_host: \"vtop-1\"\n  advertised_port: 9092\n  topic: \"bench\"\n  node_id: 1\n# Written by run.py for the group-commit ablation (#752): group commit off.\ngroup_commit:\n  enabled: false\n",
+    "vtop_leader_group_commit_on": "# VTOP node 1: the range's static leader, with the Kafka gateway (#225).\n#\n# The shape scripts/live-chaos scenario 17 drives with a stock librdkafka\n# client (a static leader at a fixed fencing epoch, two followers, quorum\n# acknowledgement), moved into containers. Plaintext planes, as Kafka's\n# PLAINTEXT listeners on the other side, so neither system pays for TLS; the\n# `-on-any-interface` spelling is the node's own opt-in for leaving loopback.\n#\n# Every engine knob not written here is the binary's default (profile\n# `defaults`, #595 rule 4): the gateway appends with Durability::Quorum, which\n# acknowledges after a majority of the three replicas (leader included) has\n# made the append locally durable (fsync) \u2014 2 of 3, the write quorum the\n# comparison asks for. Kafka under `defaults` acknowledges on replication\n# without fsync; that difference is stated in the report, never hidden.\nrole: leader\nnode_uuid: aaaaaaaa-0000-0000-0000-0000000000a1\ncluster_id: 11111111-2222-3333-4444-555555555555\ndata_dir: /home/vtop/data\nfencing_epoch: 18\nrange: { topic: \"bench\", topic_epoch: 1, range_id: aaaaaaaa-0000-0000-0000-0000000000c1, range_generation: 0 }\nsegment_id: aaaaaaaa-0000-0000-0000-0000000000d1\nnative_listen: \"0.0.0.0:9400\"\nreplica_listen: \"0.0.0.0:9300\"\nfollowers:\n  - { node_uuid: aaaaaaaa-0000-0000-0000-0000000000a2, addr: \"vtop-2:9300\", server_name: \"vtop-2\" }\n  - { node_uuid: aaaaaaaa-0000-0000-0000-0000000000a3, addr: \"vtop-3:9300\", server_name: \"vtop-3\" }\nreplica_transport: plaintext-on-any-interface\nnative_transport: plaintext-on-any-interface\nprincipal_id: aaaaaaaa-0000-0000-0000-0000000000ce\nobservability: { listen: \"0.0.0.0:9600\" }\nkafka:\n  # Off loopback because the client runs in its own container; the gateway\n  # demands that be said by name (`any_interface`), and Metadata must name a\n  # host the client container resolves (`advertised_host`).\n  listen: \"0.0.0.0:9092\"\n  any_interface: true\n  advertised_host: \"vtop-1\"\n  advertised_port: 9092\n  topic: \"bench\"\n  node_id: 1\n# Written by run.py for the group-commit ablation (#752): group commit on.\ngroup_commit:\n  enabled: true\n"
+  },
+  "events": [
+    {
+      "at": "2026-11-23T17:41:59+00:00",
+      "event": "smoke passed: 10 records byte-exact",
+      "record_size": 100,
+      "system": "kafka"
+    },
+    {
+      "at": "2026-11-23T17:41:59+00:00",
+      "event": "producer config: no 'ProducerConfig values:' block in the client's output",
+      "system": "kafka"
+    },
+    {
+      "at": "2026-11-23T17:41:59+00:00",
+      "event": "group commit off confirmed: vtop_broker_group_commit_enabled 0",
+      "group_commit": "off",
+      "record_size": 100,
+      "system": "vtop"
+    },
+    {
+      "at": "2026-11-23T17:41:59+00:00",
+      "event": "smoke passed: 10 records byte-exact",
+      "record_size": 100,
+      "system": "vtop"
+    },
+    {
+      "at": "2026-11-23T17:41:59+00:00",
+      "event": "producer config: no 'ProducerConfig values:' block in the client's output",
+      "system": "vtop"
+    },
+    {
+      "at": "2026-11-23T17:41:59+00:00",
+      "event": "group commit on confirmed: vtop_broker_group_commit_enabled 1",
+      "group_commit": "on",
+      "record_size": 100,
+      "system": "vtop"
+    },
+    {
+      "at": "2026-11-23T17:41:59+00:00",
+      "event": "smoke passed: 10 records byte-exact",
+      "record_size": 100,
+      "system": "vtop"
+    },
+    {
+      "at": "2026-11-23T17:41:59+00:00",
+      "event": "producer config: no 'ProducerConfig values:' block in the client's output",
+      "system": "vtop"
+    },
+    {
+      "at": "2026-11-23T17:41:59+00:00",
+      "event": "group commit off confirmed: vtop_broker_group_commit_enabled 0",
+      "group_commit": "off",
+      "record_size": 100,
+      "system": "vtop"
+    },
+    {
+      "at": "2026-11-23T17:41:59+00:00",
+      "event": "group commit on confirmed: vtop_broker_group_commit_enabled 1",
+      "group_commit": "on",
+      "record_size": 100,
+      "system": "vtop"
+    }
+  ],
+  "finished_at": "2026-11-23T17:41:59+00:00",
+  "host_metadata": {
+    "cpu_model": "Stub CPU",
+    "instance_type": "stub.large",
+    "kernel": "Linux 6.8.0"
+  },
+  "kind": "throughput",
+  "label": "single host, Docker Desktop; indicative, not a production benchmark",
+  "matrix": {
+    "acks": [
+      "all"
+    ],
+    "compressions": [
+      "none"
+    ],
+    "consume": true,
+    "e2e": {
+      "extra_profiles": [
+        "fsync-parity"
+      ],
+      "load_basis": "common",
+      "load_pct": 50
+    },
+    "fixed_seconds": 1.0,
+    "group_commits": [
+      "off",
+      "on"
+    ],
+    "load_bases": {
+      "kafka": [
+        25,
+        50,
+        75
+      ]
+    },
+    "load_pcts": [
+      25,
+      50,
+      75
+    ],
+    "partitions": [
+      1
+    ],
+    "producers": [
+      1
+    ],
+    "profile": "defaults",
+    "profiles": [
+      "defaults"
+    ],
+    "record_sizes": [
+      100
+    ],
+    "repetitions": 1,
+    "resources": true,
+    "sat_records": {
+      "100": 30000
+    },
+    "smoke_records": 10,
+    "warmup_fraction": 0.2
+  },
+  "observed": {
+    "e2e_rates": {
+      "100": 3000
+    },
+    "kafka_broker_1_config": {
+      "min.insync.replicas": "2"
+    },
+    "kafka_broker_1_config_fsync-parity": {
+      "min.insync.replicas": "2"
+    },
+    "kafka_topic": "Topic: bench PartitionCount: 1",
+    "kafka_topic_fsync-parity": "Topic: bench PartitionCount: 1",
+    "offered_rates": {
+      "100": {
+        "25": 75000,
+        "50": 150000,
+        "75": 225000
+      }
+    },
+    "vtop_group_commit_keys_accepted": [
+      "enabled",
+      "max_bytes",
+      "max_delay_ms",
+      "max_pending_requests",
+      "max_records"
+    ]
+  },
+  "other_containers_at_start_count": 0,
+  "run_id": "schema4-runner",
+  "run_state": "complete",
+  "schema_version": 4,
+  "started_at": "2026-11-23T17:41:59+00:00",
+  "worktree_dirty": false
+}

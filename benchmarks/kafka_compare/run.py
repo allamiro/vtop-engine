@@ -30,15 +30,19 @@ consumer stamps each record's receive time against its CreateTime
 from __future__ import annotations
 
 import argparse
+import contextlib
+import csv
 import datetime as dt
 import functools
 import hashlib
+import itertools
 import json
 import math
 import os
 import platform
 import plistlib
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -103,6 +107,17 @@ SYSTEM_SPEC = {
 }
 
 
+# Why VTOP has no rows at more than one partition (#596, checked against crates/vtop-node/src/config.rs and
+# scripts/live-chaos/scenarios/24-kafka-replicated-partitions.sh).
+VTOP_PARTITIONS_REFUSED = (
+    "VTOP at {n} partitions is not measured: its Kafka gateway serves one partition per node process, one range "
+    "each, and refuses the others by name (`kafka.partitions` in crates/vtop-node/src/config.rs). {n} partitions "
+    "replicated 3 ways are {n} ranges with a leader and two followers each ({processes} node processes; "
+    "live-chaos scenario 24 runs that shape with 2), and compose.vtop.yml's three single-process nodes, at the "
+    "per-node limits Kafka's brokers get (fairness rule 1), do not hold them. This harness does not build that "
+    "cluster.")
+
+
 def log(message: str) -> None:
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%H:%M:%S")
     print(f"[kafka-compare {stamp}] {message}", flush=True)
@@ -123,6 +138,54 @@ def sh(args: list[str], *, check: bool = True, timeout: float | None = None, inp
 
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+# ------------------------------------------------------------------ interruption
+
+
+class Terminated(BaseException):
+    """A SIGTERM, raised in the main thread by `sigterm_raises`' handler.
+
+    A BaseException, as KeyboardInterrupt is, so no cell's `except Exception` swallows it and the runner's
+    own `except BaseException` records `run_state: interrupted` and takes the clusters down. Before the
+    v0.11.1 AWS round only SIGINT reached that path: a stopped instance or a CI timeout (SIGTERM) left a run
+    saying `running` with its clusters up."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(f"{signal.Signals(signum).name} received")
+        self.signum = signum
+
+
+@contextlib.contextmanager
+def sigterm_raises():
+    """For the length of the block, a SIGTERM raises Terminated in the main thread. A second SIGTERM while
+    the run records the first and takes its clusters down is ignored, so that record is written (SIGKILL
+    still ends the process). The caller's handler is put back afterwards. Outside the main thread, where
+    Python cannot install a handler, nothing changes."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def handler(signum, _frame):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        raise Terminated(signum)
+
+    previous = signal.signal(signal.SIGTERM, handler)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+def interruption_event(exc: BaseException) -> dict[str, Any]:
+    """The event a run records when it stops before its end, naming the signal when one stopped it."""
+    event = {"at": utc_now(), "event": f"run interrupted: {exc!r}"[:900]}
+    if isinstance(exc, Terminated):
+        event.update(signal=signal.Signals(exc.signum).name,
+                     event=f"run interrupted: {signal.Signals(exc.signum).name} received")
+    elif isinstance(exc, KeyboardInterrupt):
+        event.update(signal="SIGINT", event="run interrupted: SIGINT received (Ctrl-C)")
+    return event
 
 
 # ------------------------------------------------------------------ group commit (#752)
@@ -550,28 +613,37 @@ def cluster_down(system: str, vtop_image: str) -> None:
     compose(system, "down", "-v", "--remove-orphans", vtop_image=vtop_image)
 
 
-def cluster_up(system: str, vtop_image: str, profile: str = "defaults", leader_config: str | None = None) -> None:
+def cluster_up(system: str, vtop_image: str, profile: str = "defaults", leader_config: str | None = None,
+               partitions: int = 1) -> None:
+    """A fresh cluster; for Kafka, the topic with `partitions` partitions. VTOP is never brought up at more than
+    one partition (see VTOP_PARTITIONS_REFUSED)."""
     cluster_down(system, vtop_image)
     compose(system, "up", "-d", "--wait", "--wait-timeout", "300", vtop_image=vtop_image, timeout=400,
             profile=profile, leader_config=leader_config)
     if system == "kafka":
         command = ["/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", SYSTEM_SPEC[system]["bootstrap"],
-                   "--create", "--topic", TOPIC, "--partitions", "1", "--replication-factor", "3",
+                   "--create", "--topic", TOPIC, "--partitions", str(partitions), "--replication-factor", "3",
                    "--config", "min.insync.replicas=2"]
         if profile == "fsync-parity":
             command += ["--config", "flush.messages=1"]
         client(system, command, timeout=120)
 
 
-_client_seq = 0
+# next() on an itertools.count is atomic, so producers started in threads never share a container name.
+_client_seq = itertools.count(1)
+# The client containers running now: a run interrupted while N producers run in threads removes them all.
+_live_clients: set[str] = set()
+
+
+def remove_live_clients() -> None:
+    for name in list(_live_clients):
+        sh(["docker", "rm", "-f", name], check=False)
 
 
 def client(system: str, command: list[str], *, timeout: float, input_text: str | None = None,
            info_logging: bool = False, check: bool = True) -> subprocess.CompletedProcess:
     """One client invocation in its own container on the system's network."""
-    global _client_seq
-    _client_seq += 1
-    name = f"kc-client-{os.getpid()}-{_client_seq}"
+    name = f"kc-client-{os.getpid()}-{next(_client_seq)}"
     env_args = ["-e", f"KAFKA_HEAP_OPTS={CLIENT_HEAP}"]
     if info_logging:
         env_args += ["-e", "KAFKA_LOG4J_OPTS=-Dlog4j2.configurationFile=/opt/kafka/config/log4j2.yaml"]
@@ -580,11 +652,15 @@ def client(system: str, command: list[str], *, timeout: float, input_text: str |
     if input_text is not None:
         args.append("-i")
     args += [KAFKA_IMAGE, *command]
+    _live_clients.add(name)
     try:
         return sh(args, timeout=timeout, input_text=input_text, check=check)
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, Terminated, KeyboardInterrupt):
+        # Killing `docker run` leaves its container running: remove it, so no producer outlives its leg.
         sh(["docker", "rm", "-f", name], check=False)
         raise
+    finally:
+        _live_clients.discard(name)
 
 
 # ------------------------------------------------------------------------------ smoke
@@ -602,13 +678,19 @@ def smoke_records(count: int, size: int) -> list[str]:
     return records
 
 
-def smoke(system: str, count: int, size: int) -> None:
+def smoke(system: str, count: int, size: int, partitions: int = 1) -> None:
     """Produce `count` records with acks=all and read every one back, byte-exact
-    and in order, through the same client; raise on any difference (#596)."""
+    and in order, through the same client; raise on any difference (#596).
+    Over more than one partition, each partition is read from its start, every record must come back once,
+    and each partition's records must be in the order they were produced (the order across partitions is
+    the partitioner's, not the log's)."""
     records = smoke_records(count, size)
     bootstrap = SYSTEM_SPEC[system]["bootstrap"]
     client(system, ["/opt/kafka/bin/kafka-console-producer.sh", "--bootstrap-server", bootstrap, "--topic", TOPIC,
                     "--command-property", "acks=all"], timeout=300, input_text="\n".join(records) + "\n")
+    if partitions > 1:
+        _smoke_partitions(system, records, partitions)
+        return
     read = client(system, ["/opt/kafka/bin/kafka-console-consumer.sh", "--bootstrap-server", bootstrap,
                            "--topic", TOPIC, "--partition", "0", "--offset", "earliest",
                            "--max-messages", str(count), "--timeout-ms", "60000"], timeout=300, check=False)
@@ -622,6 +704,33 @@ def smoke(system: str, count: int, size: int) -> None:
             raise RuntimeError(f"smoke record {index} differs: produced {want[:40]!r}..., read {have[:40]!r}...")
 
 
+def _smoke_partitions(system: str, records: list[str], partitions: int) -> None:
+    bootstrap = SYSTEM_SPEC[system]["bootstrap"]
+    produced = {record: index for index, record in enumerate(records)}
+    seen: list[list[str]] = []
+    for partition in range(partitions):
+        read = client(system, ["/opt/kafka/bin/kafka-console-consumer.sh", "--bootstrap-server", bootstrap,
+                               "--topic", TOPIC, "--partition", str(partition), "--offset", "earliest",
+                               "--timeout-ms", "15000"], timeout=300, check=False)
+        got = read.stdout.split("\n")
+        if got and got[-1] == "":
+            got.pop()
+        seen.append(got)
+    total = sum(len(got) for got in seen)
+    if total != len(records):
+        raise RuntimeError(f"smoke read back {total} records over {partitions} partitions, produced {len(records)} "
+                           f"(per partition: {[len(got) for got in seen]})")
+    for partition, got in enumerate(seen):
+        order = [produced.get(record) for record in got]
+        if None in order:
+            have = got[order.index(None)]
+            raise RuntimeError(f"smoke partition {partition} holds a record that was not produced: {have[:40]!r}...")
+        if order != sorted(order):
+            raise RuntimeError(f"smoke partition {partition} holds the smoke's records out of the order produced")
+    if len({record for got in seen for record in got}) != len(records):
+        raise RuntimeError("smoke read some records back twice and others not at all")
+
+
 # ------------------------------------------------------------------------------- runs
 
 
@@ -631,16 +740,34 @@ def producer_command(system: str, records: int, size: int, rate: int, warmup: in
             "--warmup-records", str(warmup), "--command-property", *PRODUCER_PROPS]
 
 
+TIMED_OUT = "timed out after"
+
+
+def _captured(text: str | bytes | None) -> str:
+    """What a timed-out child printed: subprocess.run hands it back as bytes even in text mode."""
+    if text is None:
+        return ""
+    return text.decode(errors="replace") if isinstance(text, bytes) else text
+
+
 def run_producer(system: str, records: int, size: int, rate: int, timeout: float,
                  info_logging: bool = False) -> tuple[perftool.ProducerResult | None, str, float, str]:
-    """(result or None, note, wall seconds, raw output)."""
+    """(result or None, note, wall seconds, raw output).
+
+    A run that hits `timeout` is a failed run (its container is removed by `client`). Its note names the
+    achieved rate of the last progress line the tool printed before it was cut off, when there is one, so a
+    leg that ran to its wall limit still says how fast the system was going."""
     warmup = max(1, records // 5)
     started = time.monotonic()
     try:
         done = client(system, producer_command(system, records, size, rate, warmup), timeout=timeout,
                       check=False, info_logging=info_logging)
-    except subprocess.TimeoutExpired:
-        return None, f"timed out after {int(timeout)} s", time.monotonic() - started, ""
+    except subprocess.TimeoutExpired as exc:
+        output = _captured(exc.stdout) + "\n" + _captured(exc.stderr)
+        last = perftool.last_progress_rate(output)
+        seen = (f"last achieved rate {last} records/s (the tool's last progress line)" if last is not None
+                else "no progress line to read an achieved rate from")
+        return None, f"{TIMED_OUT} {int(timeout)} s; {seen}", time.monotonic() - started, output
     wall = time.monotonic() - started
     output = done.stdout + "\n" + done.stderr
     errors = sorted({line.strip()[:200] for line in output.splitlines()
@@ -655,6 +782,60 @@ def run_producer(system: str, records: int, size: int, rate: int, timeout: float
     return result, "", wall, output
 
 
+def split_evenly(total: int, parts: int) -> list[int]:
+    """`total` in `parts` whole shares that sum to it, the larger first."""
+    base, extra = divmod(total, parts)
+    return [base + (1 if index < extra else 0) for index in range(parts)]
+
+
+def combine_producers(results: list[perftool.ProducerResult]) -> perftool.ProducerResult:
+    """N concurrent producers as one row: their records and rates summed, and each latency column the worst
+    of theirs (`lat_basis` worst-of-N). The producers' windows overlap but each container starts on its own, so
+    the summed rate is the sum of their own rates, not a rate over one shared window; a percentile of the merged
+    latencies cannot exceed the worst producer's, so the worst is a bound on it."""
+    return perftool.ProducerResult(
+        records=sum(r.records for r in results), records_per_sec=sum(r.records_per_sec for r in results),
+        mib_per_sec=sum(r.mib_per_sec for r in results), lat_avg_ms=max(r.lat_avg_ms for r in results),
+        lat_max_ms=max(r.lat_max_ms for r in results), lat_p50_ms=max(r.lat_p50_ms for r in results),
+        lat_p95_ms=max(r.lat_p95_ms for r in results), lat_p99_ms=max(r.lat_p99_ms for r in results),
+        lat_p999_ms=max(r.lat_p999_ms for r in results), steady_state=all(r.steady_state for r in results))
+
+
+def run_producers(ctx: dict, system: str, records: int, size: int, rate: int, timeout: float,
+                  info_logging: bool = False) -> tuple[perftool.ProducerResult | None, str, float, str]:
+    """`run_producer` for the run's `--producers N`: N perf-tool containers at once, each its own idempotent
+    producer on the same topic, each sent its share of `records` at its share of `rate` (-1, unthrottled, for
+    each). One producer is `run_producer` itself."""
+    count = int(ctx.get("producers", 1))
+    if count == 1:
+        return run_producer(system, records, size, rate, timeout, info_logging)
+    if 0 < rate < count:
+        return None, f"offered rate {rate} records/s is below one record/s for each of {count} producers", 0.0, ""
+    rates = split_evenly(rate, count) if rate > 0 else [rate] * count
+    outcomes: list[Any] = [None] * count
+
+    def one(index: int, share: int, share_rate: int) -> None:
+        try:
+            outcomes[index] = run_producer(system, share, size, share_rate, timeout, info_logging)
+        except Exception as exc:  # a producer's own failure is its row's note, not the run's end
+            outcomes[index] = (None, f"{type(exc).__name__}: {exc}"[:300], 0.0, "")
+
+    threads = [threading.Thread(target=one, args=(index, share, share_rate), daemon=True)
+               for index, (share, share_rate) in enumerate(zip(split_evenly(records, count), rates))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    output = "\n".join(f"--- producer {index + 1} of {count} ---\n{out[3]}" for index, out in enumerate(outcomes))
+    wall = max(out[2] for out in outcomes)
+    failed = [(index, out[1]) for index, out in enumerate(outcomes) if out[0] is None]
+    if failed:
+        said = "; ".join(f"producer {index + 1} of {count}: {note}" for index, note in failed[:3])
+        timed_out = any(note.startswith(TIMED_OUT) for _, note in failed)
+        return None, (f"{TIMED_OUT} {int(timeout)} s: " if timed_out else "") + said, wall, output
+    return combine_producers([out[0] for out in outcomes]), "", wall, output
+
+
 def base_row(ctx: dict, system: str, mode: str, size: int, rep: int, profile: str = PROFILE,
              group_commit: str = "") -> dict[str, Any]:
     basis = {"fixed_rate": "kafka", "e2e": "common"}.get(mode, "")
@@ -662,7 +843,8 @@ def base_row(ctx: dict, system: str, mode: str, size: int, rep: int, profile: st
         "run_id": ctx["run_id"], "env_fingerprint": ctx["fingerprint"],
         "vtop_commit": ctx["env"]["comparable"]["vtop_commit"], "kafka_image": KAFKA_IMAGE,
         "client": client_name(), "profile": profile, "system": system, "mode": mode,
-        "record_size": size, "partitions": 1, "producers": 1, "compression": "none", "acks": "all",
+        "record_size": size, "partitions": ctx.get("partitions", 1), "producers": ctx.get("producers", 1),
+        "compression": "none", "acks": "all",
         "group_commit": group_commit, "repetition": rep, "load_basis": basis, "started_at": utc_now(),
     }
 
@@ -675,7 +857,8 @@ def producer_row(row: dict, result: perftool.ProducerResult | None, note: str, w
     row.update(status="ok", records=result.records, records_per_sec=result.records_per_sec,
                mib_per_sec=result.mib_per_sec, lat_avg_ms=result.lat_avg_ms, lat_max_ms=result.lat_max_ms,
                lat_p50_ms=result.lat_p50_ms, lat_p95_ms=result.lat_p95_ms, lat_p99_ms=result.lat_p99_ms,
-               lat_p999_ms=result.lat_p999_ms, lat_basis="single", note=note)
+               lat_p999_ms=result.lat_p999_ms, lat_basis=schema.expected_lat_basis(str(row["producers"])),
+               note=note)
     return row
 
 
@@ -879,6 +1062,18 @@ def write_e2e_result(ctx: dict, row: dict, hist: dict[int, int] | None) -> None:
     schema.append_row(ctx["csv"], row)
 
 
+def save_events(ctx: dict) -> None:
+    """environment.json as the context holds it now. Called where an event is recorded, not only after a cell:
+    a run killed between the two kept no record of a setting confirmed or a smoke passed (lesson 3 of the
+    v0.11.1 AWS round)."""
+    save_environment(ctx["run_dir"], ctx["env"])
+
+
+def record_event(ctx: dict, event: dict[str, Any]) -> None:
+    ctx["env"]["events"].append(event)
+    save_events(ctx)
+
+
 def write_leader_config(ctx: dict, group_commit: str) -> str | None:
     """The leader's node.yaml for a group-commit setting, written under the run's directory (#752), or None
     (the shipped file) when the run does not vary the setting."""
@@ -902,10 +1097,10 @@ def confirm_group_commit(ctx: dict, system: str, size: int, group_commit: str, l
         ctx["env"]["events"].append({"at": utc_now(), "system": system, "record_size": size,
                                      "group_commit": group_commit, "event": str(exc)[:900]})
         _save_leader_log(system, logs, tag, ctx["vtop_image"])
+        save_events(ctx)
         raise
-    ctx["env"]["events"].append({"at": utc_now(), "system": system, "record_size": size,
-                                 "group_commit": group_commit,
-                                 "event": f"group commit {group_commit} confirmed: {GROUP_COMMIT_GAUGE} {have}"})
+    record_event(ctx, {"at": utc_now(), "system": system, "record_size": size, "group_commit": group_commit,
+                       "event": f"group commit {group_commit} confirmed: {GROUP_COMMIT_GAUGE} {have}"})
 
 
 def e2e_targets(matrix: dict[str, Any]) -> list[tuple[str, str, str]]:
@@ -946,6 +1141,7 @@ def run_e2e_cell(ctx: dict, system: str, profile: str, size: int, rate: int, gro
         ctx["env"]["events"].append({"at": utc_now(), "system": system, "profile": profile, "record_size": size,
                                      "event": reason})
         _save_leader_log(system, logs, tag, ctx["vtop_image"])
+        save_events(ctx)
         refuse_e2e(ctx, size, reason, targets)
         cluster_down(system, ctx["vtop_image"])
         return
@@ -991,12 +1187,33 @@ def run_e2e_stage(ctx: dict, size: int) -> None:
     except e2e.E2eRefused as exc:
         reason = f"no common offered rate for this cell: {exc}"
         log(f"e2e {size} B: {reason}")
-        ctx["env"]["events"].append({"at": utc_now(), "record_size": size, "event": reason})
+        record_event(ctx, {"at": utc_now(), "record_size": size, "event": reason})
         refuse_e2e(ctx, size, reason, targets)
         return
     ctx["env"]["observed"].setdefault("e2e_rates", {})[str(size)] = rate
     for system, profile, group_commit in targets:
         run_e2e_cell(ctx, system, profile, size, rate, group_commit)
+
+
+def fixed_rate_records(rate: int, own_saturation: float | None, fixed_seconds: float) -> tuple[int, bool]:
+    """(records to send, whether they were sized from the system's own saturation) for one fixed-rate leg.
+
+    The producer is throttled at the offered `rate` either way. A system whose own saturation median is below
+    that rate cannot send `rate x fixed_seconds` records in `fixed_seconds`, and used to run for as long as
+    its shortfall made it (lesson 1 of the v0.11.1 AWS round); it is sent `own median x fixed_seconds`, so
+    the leg lasts about the target and the row says it did not hold the rate. With no saturation measured the
+    leg is sized from the rate, and the wall limit bounds it."""
+    if own_saturation is not None and own_saturation < rate:
+        return stats.records_for_duration(max(1, int(own_saturation)), fixed_seconds), True
+    return stats.records_for_duration(rate, fixed_seconds), False
+
+
+def sized_note(rate: int, achieved: float, own_saturation: float, fixed_seconds: float, records: int,
+               note: str) -> str:
+    said = (f"offered {rate} records/s, achieved {achieved:.0f}; the leg was sized from this system's saturation "
+            f"median ({own_saturation:.0f} records/s x {fixed_seconds:g} s = {records} records), not from the "
+            "offered rate")
+    return f"{said}; {note}" if note else said
 
 
 def refuse_rows(ctx: dict, system: str, size: int, reason: str, load_pcts: list[int],
@@ -1024,30 +1241,38 @@ def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | No
     logs = os.path.join(ctx["run_dir"], "logs")
     os.makedirs(logs, exist_ok=True)
     tag = f"{system}-{size}B" + (f"-gc-{group_commit}" if group_commit else "")
+    partitions = int(ctx.get("partitions", 1))
+    if system == "vtop" and partitions > 1:
+        reason = VTOP_PARTITIONS_REFUSED.format(n=partitions, processes=3 * partitions)
+        log(f"{tag}: {reason}")
+        record_event(ctx, {"at": utc_now(), "system": system, "record_size": size, "event": reason})
+        refuse_rows(ctx, system, size, reason, load_pcts, group_commit)
+        return None
     leader_config = write_leader_config(ctx, group_commit)
     try:
         log(f"{tag}: bringing the cluster up fresh")
-        cluster_up(system, ctx["vtop_image"], leader_config=leader_config)
+        cluster_up(system, ctx["vtop_image"], leader_config=leader_config, partitions=partitions)
         confirm_group_commit(ctx, system, size, group_commit, logs, tag)
         log(f"{tag}: smoke - {ctx['smoke_records']} records of {size} B, produced and read back byte-exact")
-        smoke(system, ctx["smoke_records"], size)
+        smoke(system, ctx["smoke_records"], size, partitions)
     except (RuntimeError, subprocess.TimeoutExpired) as exc:
         reason = f"cluster refused before timing: {exc}"[:900]
         log(f"{tag}: {reason}")
         ctx["env"]["events"].append({"at": utc_now(), "system": system, "record_size": size, "event": reason})
         _save_leader_log(system, logs, tag, ctx["vtop_image"])
+        save_events(ctx)
         refuse_rows(ctx, system, size, reason, load_pcts, group_commit)
         cluster_down(system, ctx["vtop_image"])
         return None
-    ctx["env"]["events"].append({"at": utc_now(), "system": system, "record_size": size,
-                                 "event": f"smoke passed: {ctx['smoke_records']} records byte-exact"})
+    record_event(ctx, {"at": utc_now(), "system": system, "record_size": size,
+                       "event": f"smoke passed: {ctx['smoke_records']} records byte-exact"})
     if system == "kafka" and "kafka_topic" not in ctx["env"]["observed"]:
         _observe_kafka(ctx)
 
     # Unrecorded warm-up run: JIT, page cache, segment creation on both sides.
     log(f"{tag}: warm-up run (not recorded)")
-    result, note, _, output = run_producer(system, max(sat_records // 4, 1000), size, -1, ctx["sat_timeout"],
-                                           info_logging=True)
+    result, note, _, output = run_producers(ctx, system, max(sat_records // 4, 1000), size, -1, ctx["sat_timeout"],
+                                            info_logging=True)
     try:
         ctx["env"]["observed"].setdefault("producer_config", {})[
             f"{system}-{size}" + (f"-gc-{group_commit}" if group_commit else "")] = \
@@ -1062,7 +1287,7 @@ def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | No
         log(f"{tag}: saturation rep {rep}/{ctx['reps']} ({sat_records} records)")
         row = base_row(ctx, system, "saturation", size, rep, group_commit=group_commit)
         (result, note, wall, output), window, werr = measure(
-            ctx, system, lambda: run_producer(system, sat_records, size, -1, ctx["sat_timeout"]))
+            ctx, system, lambda: run_producers(ctx, system, sat_records, size, -1, ctx["sat_timeout"]))
         _save_output(logs, f"{tag}-saturation-{rep}.log", output)
         if result is not None:
             saturation.append(result.records_per_sec)
@@ -1071,6 +1296,7 @@ def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | No
         log(f"{tag}: -> {row.get('records_per_sec', row.get('note'))} records/s")
 
     ctx.setdefault("saturation", {})[(system, size, group_commit)] = saturation
+    own = stats.median(saturation) if saturation else None
     if system == "kafka":
         try:
             kafka_rates = stats.derive_offered_rates(saturation)
@@ -1078,6 +1304,9 @@ def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | No
             kafka_rates = None
             ctx["env"]["events"].append({"at": utc_now(), "event": f"no offered rates for {size} B: {exc}"})
         ctx["env"]["observed"].setdefault("offered_rates", {})[str(size)] = kafka_rates
+        # On disk before the first leg: once Kafka's last row is written its cell is complete for a resume,
+        # which takes the rates from here (a SIGKILL runs no `except` that would save them later).
+        save_events(ctx)
     for rep in range(1, ctx["reps"] + 1):
         for pct in load_pcts:
             row = base_row(ctx, system, "fixed_rate", size, rep, group_commit=group_commit)
@@ -1087,15 +1316,21 @@ def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | No
                 schema.append_row(ctx["csv"], row)
                 continue
             rate = kafka_rates[pct]
-            records = stats.records_for_duration(rate, ctx["fixed_seconds"])
+            records, sized = fixed_rate_records(rate, own, ctx["fixed_seconds"])
             row["offered_rate"] = rate
-            log(f"{tag}: fixed rate {pct}% = {rate} records/s, rep {rep}/{ctx['reps']}")
-            timeout = max(ctx["sat_timeout"], 6 * records / rate)
+            log(f"{tag}: fixed rate {pct}% = {rate} records/s, rep {rep}/{ctx['reps']}"
+                + (f" ({records} records, sized from this system's saturation)" if sized else ""))
+            timeout = plan.fixed_rate_wall_limit(ctx["fixed_seconds"])
             (result, note, wall, output), window, werr = measure(
-                ctx, system, functools.partial(run_producer, system, records, size, rate, timeout))
+                ctx, system, functools.partial(run_producers, ctx, system, records, size, rate, timeout))
             _save_output(logs, f"{tag}-fixed-{pct}-{rep}.log", output)
             if result is not None:
                 row["sustained"] = stats.sustained(rate, result.records_per_sec)
+                if sized:
+                    note = sized_note(rate, result.records_per_sec, own, ctx["fixed_seconds"], records, note)
+            elif note.startswith(TIMED_OUT):
+                # The leg ran to its wall limit: whatever it achieved, it did not hold the offered rate.
+                row["sustained"] = False
             row = attach_resources(ctx, producer_row(row, result, note, wall), window, werr, records * size)
             schema.append_row(ctx["csv"], row)
             log(f"{tag}: -> p50 {row.get('lat_p50_ms')} ms p99 {row.get('lat_p99_ms')} ms "
@@ -1253,10 +1488,22 @@ def check_args(args: argparse.Namespace) -> tuple[list[int], dict[int, int]]:
             raise SystemExit(f"{name} {value}: must be a positive, finite number of seconds")
     if args.smoke_records < 1:
         raise SystemExit(f"--smoke-records {args.smoke_records}: the smoke must read back at least one record")
+    for name, value in (("--producers", shape(args)[1]), ("--partitions", shape(args)[0])):
+        if value < 1:
+            raise SystemExit(f"{name} {value}: at least one")
     if args.run_id is not None:
         check_run_id(args.run_id)
+    if args.resume is not None:
+        if args.run_id is not None:
+            raise SystemExit("--resume continues the run it names and --run-id names a new one: give one of them")
+        check_run_id(args.resume)
     check_group_commit(args)
     return sizes, sat_records
+
+
+def shape(args: argparse.Namespace) -> tuple[int, int]:
+    """(partitions, producers) of the run: one value of each (a sweep is several runs)."""
+    return getattr(args, "partitions", 1), getattr(args, "producers", 1)
 
 
 def build_matrix(args: argparse.Namespace, sizes: list[int], sat_records: dict[int, int]) -> dict[str, Any]:
@@ -1266,13 +1513,17 @@ def build_matrix(args: argparse.Namespace, sizes: list[int], sat_records: dict[i
     end-to-end stage (at the common rate, with Kafka also under `fsync-parity`),
     each switched off by its own flag."""
     load_pcts = list(stats.LOAD_FRACTIONS)
-    matrix = {"record_sizes": sizes, "partitions": [1], "producers": [1], "compressions": ["none"],
+    partitions, producers = shape(args)
+    matrix = {"record_sizes": sizes, "partitions": [partitions], "producers": [producers],
+              "compressions": ["none"],
               "acks": ["all"], "profile": PROFILE, "profiles": [PROFILE], "repetitions": args.reps,
               "load_pcts": load_pcts, "load_bases": {"kafka": load_pcts}, "consume": not args.no_consume,
               "sat_records": {str(k): v for k, v in sat_records.items()},
               "fixed_seconds": args.fixed_seconds, "warmup_fraction": 0.2, "smoke_records": args.smoke_records,
               "resources": not getattr(args, "no_resources", False)}
-    if not getattr(args, "no_e2e", False):
+    # The end-to-end stage is measured at 1 partition and 1 producer (plan.axes gives no other cell the mode), so a
+    # run of another shape has none; its end-to-end figures are a 1-partition, 1-producer run's.
+    if not getattr(args, "no_e2e", False) and (partitions, producers) == (1, 1):
         matrix["e2e"] = {"load_basis": "common", "load_pct": E2E_LOAD_PCT}
         if not getattr(args, "no_fsync_parity", False):
             matrix["e2e"]["extra_profiles"] = list(E2E_EXTRA_PROFILES)
@@ -1355,17 +1606,198 @@ def check(run_dir: str) -> int:
     return 0
 
 
+# ------------------------------------------------------------------------------ resume
+
+
+def unit_tag(unit: tuple) -> str:
+    """The name of a unit of work, as its logs are named: `kafka-100B`, `vtop-100B-gc-on`, `e2e-100B`."""
+    if unit[0] == "e2e":
+        return f"e2e-{unit[1]}B"
+    _, system, size, group_commit = unit
+    return f"{system}-{size}B" + (f"-gc-{group_commit}" if group_commit else "")
+
+
+def owed_units(matrix: dict[str, Any]) -> dict[tuple, set[tuple]]:
+    """Every unit of work a run of `matrix` does, and the row keys it owes. A unit is what the runner does in one
+    go and can only redo whole: one system's cell of one record size at one group-commit setting
+    (`("cell", system, size, setting)`), or the end-to-end stage of one size (`("e2e", size)`), all its
+    targets together, since they share one offered rate."""
+    units: dict[tuple, set[tuple]] = {}
+    for key in schema.expected_keys(matrix):
+        system, mode, size, group_commit = key[0], key[1], key[2], key[8]
+        unit = ("e2e", size) if mode == "e2e" else ("cell", system, size, group_commit)
+        units.setdefault(unit, set()).add(key)
+    return units
+
+
+# What must be the same for a resumed run to be one run: the build under test and the images it ran.
+# The fingerprint covers them too; naming them says which one moved.
+RESUME_KEYS = ("vtop_commit", "vtop_engine_tree", "vtop_image", "vtop_image_id", "kafka_image", "kafka_image_id",
+               "e2e_client_image")
+
+
+def resume_dir(run_id: str) -> str:
+    """The run directory `--resume` names, refused before any Docker work when it holds no run."""
+    run_dir = os.path.join(HERE, "results", check_run_id(run_id))
+    for name in ("environment.json", "results.csv"):
+        if not os.path.isfile(os.path.join(run_dir, name)):
+            raise SystemExit(f"--resume {run_id}: no {name} in {run_dir}, so there is no run to continue")
+    return run_dir
+
+
+def check_resumable(run_id: str, before: dict[str, Any], env: dict[str, Any], matrix: dict[str, Any]) -> None:
+    """Refuse a resume that would make one run of two environments, as crash.py's does."""
+    where = f"--resume {run_id}"
+    if before.get("kind", "throughput") != "throughput" or before.get("schema_version") != schema.SCHEMA_VERSION:
+        raise SystemExit(f"{where}: the run is kind {before.get('kind')!r}, schema {before.get('schema_version')!r}; "
+                         f"this runner continues throughput runs of schema {schema.SCHEMA_VERSION} only")
+    if before.get("run_state") == "complete":
+        raise SystemExit(f"{where}: the run is complete; nothing is owed")
+    if before.get("matrix") != matrix:
+        raise SystemExit(f"{where}: the matrix differs from the run's (it recorded {before.get('matrix')!r}; these "
+                         f"arguments give {matrix!r}). Give the arguments the run was started with.")
+    was, now = before.get("comparable") or {}, env["comparable"]
+    moved = [f"{key} {was.get(key)!r} -> {now.get(key)!r}" for key in RESUME_KEYS if was.get(key) != now.get(key)]
+    if moved:
+        raise SystemExit(f"{where}: the build or the images differ from the run's ({'; '.join(moved)}); a run is one "
+                         "build. Check out and build what the run ran, or start a new run.")
+    if schema.fingerprint(before) != schema.fingerprint(env):
+        raise SystemExit(f"{where}: this host or its settings differ from the run's (fingerprint "
+                         f"{schema.fingerprint(before)} against {schema.fingerprint(env)}); a run is one environment")
+    if before.get("configs") != env.get("configs"):
+        changed = sorted(name for name in set(before.get("configs") or {}) | set(env.get("configs") or {})
+                         if (before.get("configs") or {}).get(name) != (env.get("configs") or {}).get(name))
+        raise SystemExit(f"{where}: the cluster configuration differs from the run's ({', '.join(changed)})")
+
+
+def _write_rows(path: str, rows: list[dict[str, str]], columns: tuple[str, ...]) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+def _read_rows(path: str) -> list[dict[str, str]]:
+    if not os.path.isfile(path):
+        return []
+    with open(path, newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _aside(logs: str, name: str) -> str:
+    """A path under logs/ no earlier resume used."""
+    path, n = os.path.join(logs, f"{name}.csv"), 2
+    while os.path.exists(path):
+        path, n = os.path.join(logs, f"{name}-{n}.csv"), n + 1
+    return path
+
+
+def prepare_resume(ctx: dict, matrix: dict[str, Any]) -> tuple[set[tuple], list[dict[str, str]]]:
+    """The units a resumed run skips (every row they owe is present), and the rows it keeps.
+
+    A unit with only some of its rows is re-run whole: its rows are moved out of results.csv to
+    `logs/partial-<tag>.csv` (an end-to-end stage's histogram rows to `logs/partial-<tag>-e2e_hist.csv`) and an
+    event says how many, so the re-run never writes a key twice and nothing measured is deleted."""
+    rows = _read_rows(ctx["csv"])
+    units = owed_units(matrix)
+    unit_of = {key: unit for unit, keys in units.items() for key in keys}
+    present: dict[tuple, set[tuple]] = {}
+    for row in rows:
+        key = schema.row_key(row)
+        present.setdefault(unit_of.get(key), set()).add(key)
+    done = {unit for unit, keys in units.items() if keys <= present.get(unit, set())}
+    partial = sorted((unit for unit in units if unit not in done and present.get(unit)), key=unit_tag)
+    hist = _read_rows(ctx["hist_csv"])
+    # Histogram rows are written before the row that vouches for them, so a stage killed between the two has
+    # buckets and no row. Every end-to-end stage that runs again has its buckets moved aside, rows or not.
+    rerun_sizes = {str(unit[1]) for unit in units if unit[0] == "e2e" and unit not in done}
+    stale = [row for row in hist if row["record_size"] in rerun_sizes]
+    if not partial and not stale:
+        return done, rows
+    logs = os.path.join(ctx["run_dir"], "logs")
+    os.makedirs(logs, exist_ok=True)
+    notes = []
+    for unit in partial:
+        tag = unit_tag(unit)
+        moved = [row for row in rows if unit_of.get(schema.row_key(row)) == unit]
+        aside = _aside(logs, f"partial-{tag}")
+        _write_rows(aside, moved, schema.COLUMNS)
+        notes.append(f"{tag}: {len(moved)} of its {len(units[unit])} rows were present; moved to "
+                     f"logs/{os.path.basename(aside)} and the unit is run again whole")
+    for size in sorted(rerun_sizes, key=int):
+        mine = [row for row in stale if row["record_size"] == size]
+        if mine:
+            hist_aside = _aside(logs, f"partial-e2e-{size}B-e2e_hist")
+            _write_rows(hist_aside, mine, schema.E2E_HIST_COLUMNS)
+            notes.append(f"e2e-{size}B: {len(mine)} histogram rows of a stage that runs again moved to "
+                         f"logs/{os.path.basename(hist_aside)}")
+    for note in notes:
+        log(note)
+        ctx["env"]["events"].append({"at": utc_now(), "event": note})
+    rows = [row for row in rows if unit_of.get(schema.row_key(row)) not in partial]
+    _write_rows(ctx["csv"], rows, schema.COLUMNS)
+    if os.path.isfile(ctx["hist_csv"]):
+        _write_rows(ctx["hist_csv"], [row for row in hist if row["record_size"] not in rerun_sizes],
+                    schema.E2E_HIST_COLUMNS)
+    return done, rows
+
+
+def saturation_from_rows(rows: list[dict[str, str]], system: str, size: int, group_commit: str) -> list[float]:
+    """A skipped cell's saturation repetitions, as the run measured them: the end-to-end stage's common rate is
+    a share of them."""
+    return [float(row["records_per_sec"]) for row in rows
+            if (row["system"], row["mode"], row["record_size"], row["group_commit"], row["status"])
+            == (system, "saturation", str(size), group_commit, "ok")]
+
+
+def recorded_rates(env: dict[str, Any], size: int, saturation: list[float]) -> dict[int, int] | None:
+    """The offered rates a skipped Kafka cell derived, from `observed.offered_rates` (JSON keys are text). A run
+    that recorded none for the size (one written before they were saved ahead of the first leg) has them
+    derived again from the cell's saturation rows, as run_cell derives them; None when they cannot be."""
+    recorded = env["observed"].get("offered_rates") or {}
+    if str(size) in recorded:
+        rates = recorded[str(size)]
+        return {int(pct): int(rate) for pct, rate in rates.items()} if rates else None
+    try:
+        rates = stats.derive_offered_rates(saturation)
+    except ValueError:
+        return None
+    recorded[str(size)] = rates
+    env["observed"]["offered_rates"] = recorded
+    return rates
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--run-id", default=None)
+    parser.add_argument("--resume", metavar="RUN_ID", default=None,
+                        help="continue this interrupted run with the same arguments it was started with: units whose "
+                             "rows are all in its results.csv are skipped, a unit with some of them is run again "
+                             "whole (its rows moved to logs/partial-<unit>.csv). Refused when the matrix, the build, "
+                             "the images or the host differ from the run's")
     parser.add_argument("--sizes", default="100,1024", help="record sizes in bytes")
     parser.add_argument("--reps", type=int, default=3)
     parser.add_argument("--sat-records", default="100:3000000,1024:1000000",
                         help="records per saturation run, per record size")
     parser.add_argument("--fixed-seconds", type=float, default=30.0, help="target length of a fixed-rate run")
     parser.add_argument("--smoke-records", type=int, default=10000)
-    parser.add_argument("--sat-timeout", type=float, default=1800.0, help="seconds before a run is failed")
+    parser.add_argument("--sat-timeout", type=float, default=1800.0,
+                        help="seconds before a saturation, consume or warm-up run is failed (a fixed-rate leg's "
+                             "limit is 3 x --fixed-seconds + 60 s)")
     parser.add_argument("--no-consume", action="store_true")
+    parser.add_argument("--producers", type=int, default=1,
+                        help="concurrent producers per measured run, each its own perf-tool container and "
+                             "idempotent producer, offered rate / N and sent records / N; the row sums them and "
+                             "carries the worst of their percentiles (lat_basis worst-of-N). One value per run. "
+                             "Not 1: no end-to-end stage")
+    parser.add_argument("--partitions", type=int, default=1,
+                        help="partitions of Kafka's topic. VTOP's rows at more than 1 are refused (its gateway "
+                             "serves one partition per node process; see README). One value per run. Not 1: no "
+                             "end-to-end stage")
     parser.add_argument("--no-e2e", action="store_true",
                         help="leave out the end-to-end latency stage (metric 3, and the profile's latency cost)")
     parser.add_argument("--no-fsync-parity", action="store_true",
@@ -1388,6 +1820,20 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """The runner, with SIGTERM handled as Ctrl-C is for its whole length."""
+    with sigterm_raises():
+        return _main(argv)
+
+
+def entry(argv: list[str] | None = None) -> int:
+    """The command line: a run ended by SIGTERM exits 143, as an unhandled SIGTERM would, after recording it."""
+    try:
+        return main(argv)
+    except Terminated as exc:
+        return 128 + exc.signum
+
+
+def _main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     checked_host_disk(args.host_disk)
 
@@ -1395,13 +1841,18 @@ def main(argv: list[str] | None = None) -> int:
         return check(args.check)
     sizes, sat_records = check_args(args)
     matrix = build_matrix(args, sizes, sat_records)
+    resuming = resume_dir(args.resume) if args.resume else None
     settings, node_keys = check_group_commit(args)
     leader_base = _read(LEADER_CONFIG)
     group_commit_configs = {setting: leader_config(leader_base, setting, node_keys) for setting in settings}
     hours = check_plan(matrix, args.max_hours)
-    log(f"{len(schema.expected_keys(matrix))} result rows, projected {hours:.1f} h (--max-hours {args.max_hours:g})")
+    log(f"{len(schema.expected_keys(matrix))} result rows, projected {hours:.1f} h at most, "
+        f"{plan.on_time_hours(matrix):.1f} h if every fixed-rate leg is on time (--max-hours {args.max_hours:g})")
     if args.reps < 3:
         log(f"warning: {args.reps} repetitions is below #595 rule 7's minimum of 3")
+    if (args.partitions, args.producers) != (1, 1) and not args.no_e2e:
+        log(f"{args.partitions} partition(s), {args.producers} producer(s): the end-to-end stage is measured at 1 and "
+            "1 only, so this run has none")
     limits = check_equal_limits()
     for system in SYSTEM_SPEC:
         running = sh(["docker", "ps", "-q", "--filter", f"label=com.docker.compose.project=kc-{system}"]).stdout
@@ -1412,14 +1863,24 @@ def main(argv: list[str] | None = None) -> int:
     e2e_image = preflight_clients(matrix, args.rebuild)
     vtop_image = ensure_vtop_image(args.rebuild)
 
-    run_id = args.run_id or dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    run_dir = os.path.join(HERE, "results", run_id)
-    if os.path.exists(run_dir):
-        raise SystemExit(f"{run_dir} exists; runs never overwrite each other")
-    os.makedirs(run_dir)
+    if resuming:
+        run_id, run_dir = args.resume, resuming
+        with open(os.path.join(run_dir, "environment.json"), encoding="utf-8") as handle:
+            before = json.load(handle)
+    else:
+        run_id = args.run_id or dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        run_dir = os.path.join(HERE, "results", run_id)
+        if os.path.exists(run_dir):
+            raise SystemExit(f"{run_dir} exists; runs never overwrite each other (--resume continues one)")
+        os.makedirs(run_dir)
     env = capture_environment(run_id, matrix, vtop_image, limits, disk, group_commit_configs)
     if settings:
         env["observed"]["vtop_group_commit_keys_accepted"] = sorted(node_keys)
+    if resuming:
+        check_resumable(run_id, before, env, matrix)
+        env["started_at"] = before.get("started_at", env["started_at"])
+        env["observed"] = before.get("observed", {})
+        env["events"] = before.get("events", [])
     ctx = {"run_id": run_id, "run_dir": run_dir, "csv": os.path.join(run_dir, "results.csv"), "env": env,
            "fingerprint": schema.fingerprint(env), "vtop_image": vtop_image, "reps": args.reps,
            "sat_records": sat_records, "fixed_seconds": args.fixed_seconds,
@@ -1427,26 +1888,47 @@ def main(argv: list[str] | None = None) -> int:
            "group_commit_configs": group_commit_configs,
            "matrix": matrix, "resources": bool(matrix.get("resources")), "e2e": bool(matrix.get("e2e")),
            "closer": make_closer(), "saturation": {}, "hist_csv": os.path.join(run_dir, schema.E2E_HIST),
-           "e2e_image": e2e_image}
-    schema.write_header(ctx["csv"])
-    if ctx["e2e"]:
-        schema.write_header(ctx["hist_csv"], schema.E2E_HIST_COLUMNS)
+           "e2e_image": e2e_image, "producers": args.producers, "partitions": args.partitions}
+    done: set[tuple] = set()
+    kept: list[dict[str, str]] = []
+    if resuming:
+        done, kept = prepare_resume(ctx, matrix)
+        if ctx["e2e"] and not os.path.isfile(ctx["hist_csv"]):
+            schema.write_header(ctx["hist_csv"], schema.E2E_HIST_COLUMNS)
+        units = owed_units(matrix)
+        env["events"].append({"at": utc_now(), "event": f"resumed: {len(done)} of {len(units)} units complete "
+                              f"and skipped ({', '.join(sorted(unit_tag(u) for u in done)) or 'none'})"})
+    else:
+        schema.write_header(ctx["csv"])
+        if ctx["e2e"]:
+            schema.write_header(ctx["hist_csv"], schema.E2E_HIST_COLUMNS)
     save_environment(run_dir, env)
-    log(f"run {run_id} -> {run_dir} (fingerprint {ctx['fingerprint']})")
+    log(f"run {run_id} -> {run_dir} (fingerprint {ctx['fingerprint']})" + (" resumed" if resuming else ""))
     try:
         for size in sizes:
-            rates = run_cell(ctx, "kafka", size, None)
+            if ("cell", "kafka", size, "") in done:
+                log(f"kafka-{size}B: complete in the run being resumed, skipped")
+                ctx["saturation"][("kafka", size, "")] = saturation_from_rows(kept, "kafka", size, "")
+                rates = recorded_rates(env, size, ctx["saturation"][("kafka", size, "")])
+            else:
+                rates = run_cell(ctx, "kafka", size, None)
             save_environment(run_dir, env)
             for setting in settings or [""]:
+                unit = ("cell", "vtop", size, setting)
+                if unit in done:
+                    log(f"{unit_tag(unit)}: complete in the run being resumed, skipped")
+                    ctx["saturation"][("vtop", size, setting)] = saturation_from_rows(kept, "vtop", size, setting)
+                    continue
                 run_cell(ctx, "vtop", size, rates, group_commit=setting)
                 save_environment(run_dir, env)
-            if ctx["e2e"]:
+            if ctx["e2e"] and ("e2e", size) not in done:
                 run_e2e_stage(ctx, size)
                 save_environment(run_dir, env)
     except BaseException as exc:
         env["run_state"] = "interrupted"
-        env["events"].append({"at": utc_now(), "event": f"run interrupted: {exc!r}"[:900]})
+        env["events"].append(interruption_event(exc))
         save_environment(run_dir, env)
+        remove_live_clients()
         for system in SYSTEM_SPEC:
             try:
                 cluster_down(system, vtop_image)
@@ -1461,4 +1943,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(entry())

@@ -441,7 +441,8 @@ def _ctx(tmp_path, gcs):
 
 def _fake_cluster(monkeypatch):
     calls = {"up": [], "applied": []}
-    monkeypatch.setattr(run, "cluster_up", lambda system, image, leader_config=None: calls["up"].append(leader_config))
+    monkeypatch.setattr(run, "cluster_up", lambda system, image, leader_config=None, **_k:
+                        calls["up"].append(leader_config))
     monkeypatch.setattr(run, "cluster_down", lambda *a, **k: None)
     monkeypatch.setattr(run, "smoke", lambda *a, **k: None)
     monkeypatch.setattr(run, "_save_leader_log", lambda *a, **k: None)

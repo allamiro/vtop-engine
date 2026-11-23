@@ -29,12 +29,60 @@ python3 benchmarks/kafka_compare/regenerate.py
 ```
 
 Useful knobs: `--sizes 100,1024`, `--reps 3`, `--sat-records 100:3000000,1024:1000000` (records per
-saturation run AND per consume run, per record size), `--fixed-seconds 30` (a fixed-rate run sends rate x this many records),
+saturation run AND per consume run, per record size), `--fixed-seconds 30` (the target length of a fixed-rate leg; see step 5),
 `--smoke-records`, `--no-consume`, `--rebuild`, `--run-id` (one path component), `--max-hours 30`, and the
 schema-4 switches `--no-e2e` (no end-to-end stage), `--no-fsync-parity` (the end-to-end stage for both systems as
 shipped only) and `--no-resources` (no cgroup windows).
 Every one is checked before any Docker work, and so is the matrix's projected run time (`plan.py`):
-a matrix projected past `--max-hours` is refused before the first container starts.
+a matrix projected past `--max-hours` is refused before the first container starts. The projection is a bound:
+each fixed-rate leg is charged its wall limit (`3 x --fixed-seconds + 60 s`), and each saturation or consume run
+the longer of its bytes at 2 MiB/s and its records at 6,000 records/s (VTOP's rate with 100 B records in the
+v0.11.1 AWS round, rounded down). `plan.py` and the runner's first line also print the figure if every leg is on time.
+
+### More than one producer or partition (#596, #752)
+
+`--producers N` and `--partitions N` set the run's shape, one value of each per run (a sweep is several runs, as
+for `--group-commit`); `environment.json` records them in `matrix.producers` and `matrix.partitions`, the keys
+every run already had, so a run of either shape is still schema 4.
+
+- **Producers.** Every measured run is N `kafka-producer-perf-test` containers at once against the same topic,
+  each its own idempotent producer, offered `rate / N` and sent `records / N` (unthrottled for each at
+  saturation). A row sums their records and rates and carries the worst of their percentiles, with `lat_basis`
+  `worst-of-N`. A percentile of their latencies merged cannot exceed the worst producer's, so that is an upper
+  bound; and the producers' windows overlap but do not start together, so the summed rate is the sum of their
+  own rates. A producer that fails fails the row, naming it. One producer's appends are serialised in VTOP's
+  gateway, so group commit (#752) has something to merge only at more than one.
+- **Partitions.** Kafka's topic is created with N partitions; the smoke reads every partition from its start and
+  requires every record back once and each partition's records in the order produced. VTOP is not measured at
+  N > 1: its Kafka gateway serves one partition per node process, one range each, and refuses the others by name
+  (`kafka.partitions` in `crates/vtop-node/src/config.rs`). N partitions replicated three ways are N ranges with
+  a leader and two followers each, 3N node processes (live-chaos scenario 24 runs that shape with 2), and this
+  harness runs VTOP as three single-process containers at the per-node limits Kafka's brokers get (fairness
+  rule 1). Building a cluster that packs 3N processes into those three limits is not done here, so VTOP's rows
+  at N > 1 are `refused` rows saying why, and the report says so.
+- **The end-to-end stage** is measured at 1 partition and 1 producer only (`plan.axes` gives no other cell the
+  mode); a run of another shape has none, and its end-to-end figures are a 1-partition, 1-producer run's.
+
+### An interrupted run, and continuing it
+
+A run writes each row as it is measured and each event (a group-commit setting confirmed, a smoke passed, a cell
+refused) to `environment.json` when it happens. Ctrl-C and a `SIGTERM` (a stopped instance, a CI timeout) are
+handled alike: `run_state` becomes `interrupted`, the signal is recorded in `events`, and both clusters are taken
+down. `--check <run-dir>` lists the rows it still owes.
+
+```bash
+python3 benchmarks/kafka_compare/run.py --resume <run-id> <the arguments the run was started with>
+```
+
+`--resume` reopens `results/<run-id>/` and refuses, before any cluster starts, unless the matrix the arguments give,
+the environment fingerprint, the VTOP commit and the images (`vtop_image_id`, `kafka_image_id`, the end-to-end
+client's) and the cluster configuration files equal what `environment.json` recorded. It then skips every unit of
+work whose rows are all present: a unit is one system's cell of one record size at one group-commit setting, or the
+end-to-end stage of one size. A unit with only some of its rows is run again whole: those rows are moved to
+`logs/partial-<unit>.csv` (an end-to-end stage's histogram rows to `logs/partial-<unit>-e2e_hist.csv`) and an event
+says how many, so no row key is ever written twice and nothing measured is deleted. A skipped Kafka cell's offered
+rates come from `observed.offered_rates`, and a skipped cell's saturation rows still set the end-to-end stage's
+common rate.
 
 ### Group commit on and off (#752)
 
@@ -103,8 +151,14 @@ For each record size, Kafka first and then VTOP:
 4. **Saturation.** `kafka-producer-perf-test --throughput -1`, `--reps` times. The first 20% of each run's
    records are `--warmup-records` and excluded from its steady-state line, which is the one recorded.
 5. **Fixed rate.** 25 / 50 / 75 % of **Kafka's** median saturation for the cell, offered to both systems with
-   `--throughput` (open loop, rule 6), each sending about `rate x --fixed-seconds` records. That is a target
-   length, not a time limit: a system that cannot keep up takes longer to send them, and the CSV's
+   `--throughput` (open loop, rule 6). A leg sends `min(rate, the system's own saturation median) x
+   --fixed-seconds` records, still throttled at the offered rate, so it lasts about `--fixed-seconds` whether
+   or not the system can hold the rate. (Until the v0.11.1 AWS round a leg sent `rate x --fixed-seconds`
+   records, and a system below the rate ran for as long as its shortfall: VTOP's "30 s" legs at 100 B took 7
+   to 20 minutes.) A leg sized from the system's saturation is `sustained=false` with a note naming the
+   offered rate, the achieved rate and the sizing. Each leg's wall limit is `3 x --fixed-seconds + 60 s`; a
+   leg that reaches it is a `failed` row with `sustained=false`, its client container removed, and its note
+   gives the achieved rate of the last progress line the tool printed, when it printed one. The CSV's
    `wall_seconds` says how long each run took. The three rates run in turn, and that round `--reps` times.
    The systems are not interleaved: Kafka's whole cell runs before VTOP's. A run whose achieved rate is more
    than 5% under its offer is recorded with `sustained=false`.
@@ -259,7 +313,13 @@ PNG whose decoded image is unchanged keeps its committed bytes.
 **A second run of a kind, and the crash report.** A run directory may hold a [`report.json`](run_outputs.py),
 `{"doc": "docs/benchmarks/<page>.md", "img_dir": "docs/benchmarks/img/<dir>"}`, which sends that run's page and
 images beside the first run's instead of onto the same files (without it two committed runs of one kind are
-refused, as above). The file is part of the run, committed with it. `report.py` hands a crash run (its directory
+refused, as above). The file is part of the run, committed with it. A newer run that REPLACES an earlier one of its
+kind (throughput, failover or crash, by the file the directory holds) says `{"supersedes": "<run-id>"}` instead,
+with `doc` and `img_dir` both or neither (neither: the kind's default paths). The superseded run stays committed
+and checked, but `regenerate.py` does not draw it, so the newer run takes over its page and images; the target
+must be a committed run in the same results directory, of the same kind, that started earlier (`started_at`),
+with no cycle. `readme_charts.py` draws the one current throughput run and the one current failover run, refusing
+when there is not exactly one of each (`regenerate.current_run`). `report.py` hands a crash run (its directory
 holds `crash.csv`, #599) to [`crash_report.py`](crash_report.py), which reads it through the harness's own
 `crash_schema.load_crash_run` with a floor of ten ok crashes per configuration and mode, writes
 `docs/benchmarks/kafka-crash.md` and `kafka-crash-*.{png,svg}`, and prints the exact binomial upper bound beside every

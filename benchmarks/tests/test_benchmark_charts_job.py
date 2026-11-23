@@ -171,7 +171,7 @@ def test_every_input_of_the_readme_cards_starts_the_chart_job():
               site_facts.CARGO_TOML, site_facts.CARGO_LOCK,
               site_facts.EGRESS_ENV, f"{site_facts.S3_RESULTS}/garage.json",
               site_facts.readme_charts.EGRESS, site_facts.readme_charts.POLICED,
-              f"{site_facts.readme_charts.FAILOVER_RUN}/failover.csv",
-              f"{site_facts.readme_charts.THROUGHPUT_RUN}/results.csv"]
+              f"{site_facts.readme_charts.failover_run()}/failover.csv",
+              f"{site_facts.readme_charts.throughput_run()}/results.csv"]
     uncovered = sorted(path for path in inputs if not _covered(path, globs))
     assert not uncovered, f"the benchmark_charts paths filter misses these inputs of the README cards: {uncovered}"

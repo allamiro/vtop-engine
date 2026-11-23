@@ -284,6 +284,7 @@ jobs:
               - 'benchmarks/tests/test_kafka_compare_*.py'
               - 'benchmarks/tests/test_aws_*.py'
               - 'benchmarks/tests/fixtures/crash-smoke/**'
+              - 'benchmarks/tests/fixtures/kafka-schema4-runner/**'
               - 'benchmarks/tests/test_benchmark_charts_job.py'
               # The hand-written page that links the generated reports.
               - 'docs/COMPARISON.md'
@@ -2640,7 +2641,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.benchmark_charts == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # The chart tests alone took 7.5 min on main after #946 (the AWS ingest rehearsal regenerates a scratch
+    # repository several times), the whole job 8.5 to 9.5, and one run was cancelled at the old 10.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # The patch version is pinned: a floating "3.12" moves with the runner
@@ -2666,7 +2669,7 @@ jobs:
         # without this line the pipe into tee would hide a failing test.
         run: |
           set -o pipefail
-          python -m pytest -rs tests/test_kafka_compare_report.py tests/test_kafka_compare_regenerate.py tests/test_kafka_compare_failover.py tests/test_kafka_compare_footer.py tests/test_kafka_compare_colours.py tests/test_readme_charts.py tests/test_benchmark_charts_job.py tests/test_compare_reports.py tests/test_kafka_compare_crash_report.py tests/test_aws_ingest.py tests/test_kafka_compare_extra_report.py tests/test_kafka_compare_extra_charts.py tests/test_kafka_compare_group_commit.py tests/test_readme_cards.py tests/test_site_facts.py | tee "$RUNNER_TEMP/chart-tests.log"
+          python -m pytest -rs tests/test_kafka_compare_report.py tests/test_kafka_compare_regenerate.py tests/test_kafka_compare_failover.py tests/test_kafka_compare_footer.py tests/test_kafka_compare_colours.py tests/test_readme_charts.py tests/test_benchmark_charts_job.py tests/test_compare_reports.py tests/test_kafka_compare_crash_report.py tests/test_aws_ingest.py tests/test_kafka_compare_extra_report.py tests/test_kafka_compare_extra_charts.py tests/test_kafka_compare_group_commit.py tests/test_kafka_compare_schema4_runner.py tests/test_readme_cards.py tests/test_site_facts.py | tee "$RUNNER_TEMP/chart-tests.log"
           if grep -E "SKIPPED.*(matplotlib|PIL)" "$RUNNER_TEMP/chart-tests.log"; then
             echo "::error::A chart test skipped for want of matplotlib or Pillow, in the one job that installs them."
             exit 1

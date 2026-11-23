@@ -17,7 +17,7 @@ SATURATION = {("kafka", ""): 40_000.0, ("vtop", "off"): 10_000.0, ("vtop", "on")
 def fake_cluster(monkeypatch):
     state = {"setting": ""}
 
-    def cluster_up(system, image, profile="defaults", leader_config=None):
+    def cluster_up(system, image, profile="defaults", leader_config=None, partitions=1):
         state["setting"] = "" if leader_config is None else leader_config.rsplit("-", 1)[1].split(".")[0]
 
     def producer(system, records, size, rate, timeout, info_logging=False):

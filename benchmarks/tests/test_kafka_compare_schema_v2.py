@@ -197,8 +197,12 @@ def test_expected_keys_cover_3_sizes_x_2_partitions_x_2_producers_x_2_codecs_x_2
     main = {k for k in keys if k[6] == "all"}
     shapes = {(k[2], k[3], k[4], k[5], k[7], k[0]) for k in main}
     assert len(shapes) == 3 * 2 * 2 * 2 * 2 * 2
-    per_shape_and_rep = 1 + (3 + 4) + 1 + 1  # saturation, kafka and common rates, consume, e2e
-    assert len(main) == len(shapes) * 3 * per_shape_and_rep
+    per_shape_and_rep = 1 + (3 + 4) + 1  # saturation, kafka and common rates, consume
+    # The end-to-end mode is owed by the 1-partition, 1-producer shapes only (plan.axes): 3 sizes x 2 codecs x
+    # 2 profiles x 2 systems of them.
+    one_one = 3 * 2 * 2 * 2
+    assert len(main) == len(shapes) * 3 * per_shape_and_rep + one_one * 3
+    assert {(k[3], k[4]) for k in main if k[1] == "e2e"} == {(1, 1)}
     acks_one = {k for k in keys if k[6] == "1"}
     assert acks_one == {("kafka" if s == 0 else "vtop", "saturation", 1024, 1, 1, "none", "1", p, "", r, "", "")
                         for s in (0, 1) for p in ("defaults", "fsync-parity") for r in (1, 2, 3)}
@@ -357,8 +361,9 @@ def test_vtop_sharing_its_configuration_saves_one_bring_up_and_its_unrated_runs_
     shared = plan.projected_seconds(FULL)
     separate = plan.projected_seconds({**FULL, "vtop_profiles_share_config": False})
     main_cells, slice_cells, reps = 3 * 2 * 2 * 2, 1, 3
-    unrated_main = t["saturation"] + t["consume"] + t["e2e"]
-    saved = (main_cells * (t["bring_up"] + t["warm_up"] + reps * unrated_main)
+    one_one_cells = 3 * 2  # the 1-partition, 1-producer cells, the only ones with the end-to-end mode
+    unrated_main = t["saturation"] + t["consume"]
+    saved = (main_cells * (t["bring_up"] + t["warm_up"] + reps * unrated_main) + one_one_cells * reps * t["e2e"]
              + slice_cells * (t["bring_up"] + t["warm_up"] + reps * t["saturation"]))
     assert separate - shared == pytest.approx(saved)
 
@@ -428,8 +433,12 @@ def test_the_projection_charges_each_fixed_rate_run_its_configured_duration():
     short = {**SMALL, "fixed_seconds": 30}
     long = {**SMALL, "fixed_seconds": 7200}
     fixed_runs = 2 * 2 * 2 * 3 * 4  # cells x profiles x systems x reps x rates: every system runs every profile's
+    # The bound charges each leg its wall limit (3 x fixed_seconds + 60 s, lesson 2 of the v0.11.1 AWS round);
+    # the on-time figure its target.
     assert plan.projected_seconds(long) - plan.projected_seconds(short) == pytest.approx(
-        fixed_runs * (7200 - 30))
+        fixed_runs * (plan.fixed_rate_wall_limit(7200) - plan.fixed_rate_wall_limit(30)))
+    assert plan.projected_seconds(long, on_time=True) - plan.projected_seconds(short, on_time=True) == \
+        pytest.approx(fixed_runs * (7200 - 30))
     with pytest.raises(plan.PlanRefused, match="over --max-hours 30"):
         plan.check_budget(long, 30)
 

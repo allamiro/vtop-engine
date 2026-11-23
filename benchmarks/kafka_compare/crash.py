@@ -118,6 +118,10 @@ class SuspectMethod(Exception):
     """Kafka's defaults lost nothing: the method is probably not dropping the page cache."""
 
 
+class ShortRead(Exception):
+    """The read that decides the loss ended before the sentinel: the measurement failed, nothing was lost."""
+
+
 class CapReached(Exception):
     """The next crash would not fit in --max-hours."""
 
@@ -386,6 +390,18 @@ def _crash(b: Any, p: Params, row: dict[str, Any], config: str, mode: str, crash
         row["recovery_seconds"] = round(time.monotonic() - started, 1)
         end_after = b.wait_served(at_least=end_before + 1)
         consumed = ca.parse_consumed(b.read_all(end_after), prefix, sentinel)
+        if not any(c.kind == "sentinel" for c in consumed):
+            # A consumer that failed or stopped early returns a short read; counting every acknowledged
+            # record it did not reach as lost would turn a client fault into a durability result (review of
+            # #946). The read that decides the loss must reach the sentinel, the partition's last record.
+            raise ShortRead(f"the read-back did not reach the sentinel: {len(consumed)} record"
+                            f"{'' if len(consumed) == 1 else 's'} read of the {end_after} the partition holds")
+    except ShortRead as exc:
+        row.update(recovery_seconds=round(time.monotonic() - started, 1))
+        if row["status"] == "ok":
+            row["status"] = "failed"
+        row["note"] = ((row["note"] + "; " if row["note"] else "") + str(exc))[:600]
+        return row
     except Exception as exc:
         row.update(needed_manual_repair=True, recovery_seconds=round(time.monotonic() - started, 1))
         if row["status"] == "ok":
@@ -936,6 +952,20 @@ def check_args(args: argparse.Namespace, matrix: dict[str, Any]) -> float:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """The crash run, with SIGTERM handled as Ctrl-C is for its whole length (run.sigterm_raises)."""
+    with phase1.sigterm_raises():
+        return _main(argv)
+
+
+def entry(argv: list[str] | None = None) -> int:
+    """The command line: a run ended by SIGTERM exits 143 after recording it."""
+    try:
+        return main(argv)
+    except phase1.Terminated as exc:
+        return 128 + exc.signum
+
+
+def _main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     phase1.checked_host_disk(args.host_disk)
     if args.check is not None:
@@ -1020,7 +1050,7 @@ def main(argv: list[str] | None = None) -> int:
         code = 3 if isinstance(exc, SuspectMethod) else 4
     except BaseException as exc:
         env["run_state"] = "interrupted"
-        env["events"].append({"at": utc_now(), "event": f"run interrupted: {exc!r}"[:900]})
+        env["events"].append(phase1.interruption_event(exc))
         phase1.save_environment(run_dir, env)
         backend.down(volumes=True)
         raise
@@ -1051,4 +1081,4 @@ def ensure_image(rebuild: bool) -> str:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(entry())
