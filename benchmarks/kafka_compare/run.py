@@ -1304,6 +1304,9 @@ def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | No
             kafka_rates = None
             ctx["env"]["events"].append({"at": utc_now(), "event": f"no offered rates for {size} B: {exc}"})
         ctx["env"]["observed"].setdefault("offered_rates", {})[str(size)] = kafka_rates
+        # On disk before the first leg: once Kafka's last row is written its cell is complete for a resume,
+        # which takes the rates from here (a SIGKILL runs no `except` that would save them later).
+        save_events(ctx)
     for rep in range(1, ctx["reps"] + 1):
         for pct in load_pcts:
             row = base_row(ctx, system, "fixed_rate", size, rep, group_commit=group_commit)
@@ -1708,30 +1711,38 @@ def prepare_resume(ctx: dict, matrix: dict[str, Any]) -> tuple[set[tuple], list[
         present.setdefault(unit_of.get(key), set()).add(key)
     done = {unit for unit, keys in units.items() if keys <= present.get(unit, set())}
     partial = sorted((unit for unit in units if unit not in done and present.get(unit)), key=unit_tag)
-    if partial:
-        logs = os.path.join(ctx["run_dir"], "logs")
-        os.makedirs(logs, exist_ok=True)
-        hist = _read_rows(ctx["hist_csv"])
-        for unit in partial:
-            tag = unit_tag(unit)
-            moved = [row for row in rows if unit_of.get(schema.row_key(row)) == unit]
-            aside = _aside(logs, f"partial-{tag}")
-            _write_rows(aside, moved, schema.COLUMNS)
-            note = (f"{tag}: {len(moved)} of its {len(units[unit])} rows were present; moved to "
-                    f"logs/{os.path.basename(aside)} and the unit is run again whole")
-            if unit[0] == "e2e":
-                stale = [row for row in hist if row["record_size"] == str(unit[1])]
-                if stale:
-                    hist_aside = _aside(logs, f"partial-{tag}-e2e_hist")
-                    _write_rows(hist_aside, stale, schema.E2E_HIST_COLUMNS)
-                    hist = [row for row in hist if row not in stale]
-                    note += f", with its {len(stale)} histogram rows (logs/{os.path.basename(hist_aside)})"
-            log(note)
-            ctx["env"]["events"].append({"at": utc_now(), "event": note})
-        rows = [row for row in rows if unit_of.get(schema.row_key(row)) not in partial]
-        _write_rows(ctx["csv"], rows, schema.COLUMNS)
-        if os.path.isfile(ctx["hist_csv"]):
-            _write_rows(ctx["hist_csv"], hist, schema.E2E_HIST_COLUMNS)
+    hist = _read_rows(ctx["hist_csv"])
+    # Histogram rows are written before the row that vouches for them, so a stage killed between the two has
+    # buckets and no row. Every end-to-end stage that runs again has its buckets moved aside, rows or not.
+    rerun_sizes = {str(unit[1]) for unit in units if unit[0] == "e2e" and unit not in done}
+    stale = [row for row in hist if row["record_size"] in rerun_sizes]
+    if not partial and not stale:
+        return done, rows
+    logs = os.path.join(ctx["run_dir"], "logs")
+    os.makedirs(logs, exist_ok=True)
+    notes = []
+    for unit in partial:
+        tag = unit_tag(unit)
+        moved = [row for row in rows if unit_of.get(schema.row_key(row)) == unit]
+        aside = _aside(logs, f"partial-{tag}")
+        _write_rows(aside, moved, schema.COLUMNS)
+        notes.append(f"{tag}: {len(moved)} of its {len(units[unit])} rows were present; moved to "
+                     f"logs/{os.path.basename(aside)} and the unit is run again whole")
+    for size in sorted(rerun_sizes, key=int):
+        mine = [row for row in stale if row["record_size"] == size]
+        if mine:
+            hist_aside = _aside(logs, f"partial-e2e-{size}B-e2e_hist")
+            _write_rows(hist_aside, mine, schema.E2E_HIST_COLUMNS)
+            notes.append(f"e2e-{size}B: {len(mine)} histogram rows of a stage that runs again moved to "
+                         f"logs/{os.path.basename(hist_aside)}")
+    for note in notes:
+        log(note)
+        ctx["env"]["events"].append({"at": utc_now(), "event": note})
+    rows = [row for row in rows if unit_of.get(schema.row_key(row)) not in partial]
+    _write_rows(ctx["csv"], rows, schema.COLUMNS)
+    if os.path.isfile(ctx["hist_csv"]):
+        _write_rows(ctx["hist_csv"], [row for row in hist if row["record_size"] not in rerun_sizes],
+                    schema.E2E_HIST_COLUMNS)
     return done, rows
 
 
@@ -1743,10 +1754,21 @@ def saturation_from_rows(rows: list[dict[str, str]], system: str, size: int, gro
             == (system, "saturation", str(size), group_commit, "ok")]
 
 
-def recorded_rates(env: dict[str, Any], size: int) -> dict[int, int] | None:
-    """The offered rates a skipped Kafka cell derived, from `observed.offered_rates` (JSON keys are text)."""
-    rates = (env["observed"].get("offered_rates") or {}).get(str(size))
-    return {int(pct): int(rate) for pct, rate in rates.items()} if rates else None
+def recorded_rates(env: dict[str, Any], size: int, saturation: list[float]) -> dict[int, int] | None:
+    """The offered rates a skipped Kafka cell derived, from `observed.offered_rates` (JSON keys are text). A run
+    that recorded none for the size (one written before they were saved ahead of the first leg) has them
+    derived again from the cell's saturation rows, as run_cell derives them; None when they cannot be."""
+    recorded = env["observed"].get("offered_rates") or {}
+    if str(size) in recorded:
+        rates = recorded[str(size)]
+        return {int(pct): int(rate) for pct, rate in rates.items()} if rates else None
+    try:
+        rates = stats.derive_offered_rates(saturation)
+    except ValueError:
+        return None
+    recorded[str(size)] = rates
+    env["observed"]["offered_rates"] = recorded
+    return rates
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1886,8 +1908,8 @@ def _main(argv: list[str] | None = None) -> int:
         for size in sizes:
             if ("cell", "kafka", size, "") in done:
                 log(f"kafka-{size}B: complete in the run being resumed, skipped")
-                rates = recorded_rates(env, size)
                 ctx["saturation"][("kafka", size, "")] = saturation_from_rows(kept, "kafka", size, "")
+                rates = recorded_rates(env, size, ctx["saturation"][("kafka", size, "")])
             else:
                 rates = run_cell(ctx, "kafka", size, None)
             save_environment(run_dir, env)
