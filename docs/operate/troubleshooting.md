@@ -11,7 +11,7 @@ entrypoint or the chart prints. Build and library-loading errors are on
 | ``missing field `batching` `` (or another section) | `engine`, `batching`, `compression`, `sources` and `upload` must all be present; `batching: {}` and `compression: {}` take every default. See the [reference](../configure/reference.md#top-level). |
 | `another VTOP engine already holds ... multi-instance operation is UNSUPPORTED` | A second engine on this host uses the same state store or work directory. Run one engine per ledger. Read-only commands (`status`, `audit-coverage`, `scrub`) take no lock. |
 | `endpoint_url ... is plaintext http:// while verify_tls is true` | `upload.verify_tls` is on by default and refuses plaintext. Use an `https://` endpoint. Only for a lab, set `verify_tls: false` (or `VTOP_S3_VERIFY_TLS=false`). |
-| `postgres:// state store requires a build with --features postgres` | The release binaries and image have no PostgreSQL support. Build `vtopctl` with `--features postgres`. |
+| `postgres:// state store requires a build with --features postgres` | The release binaries, and images before v0.11.0, have no PostgreSQL support. Use the v0.11.0 or later image, or build `vtopctl` with `--features postgres`. |
 | `PostgreSQL engine.state_store URLs must be loaded from a secret reference` | Move the URL out of the config: `state_store: { env: VTOP_STATE_STORE }` or `{ file: /run/secrets/vtop-state-store }`. |
 | `kafka.enable_auto_commit MUST be false` | Remove the key or set it to `false`. The engine commits offsets itself, after verification. |
 | `kafka.bootstrap_servers must not be empty when kafka is enabled` | List at least one broker. |
