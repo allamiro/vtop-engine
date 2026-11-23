@@ -12,15 +12,15 @@ name: s3-aws
 # run skips, says so in its summary, and is green.
 #
 # A separate workflow from ci.yml on purpose: it needs `id-token: write`,
-# which ci.yml (run for every pull request) must never hold. It runs only on
-# its schedule and by hand, never on a pull request, so a fork cannot reach
+# which ci.yml (run for every pull request) must never hold. It runs only by
+# hand, never on a pull request, so a fork cannot reach
 # it; GitHub disables a fork's scheduled runs, and a fork has no secrets.
 # There are no access keys anywhere: credentials are short-lived, from OIDC.
+#
+# BY HAND, ONCE PER RELEASE. It is dispatched on main when main equals the
+# release tag, and its results are committed (release-gate B1). There is no
+# schedule: AWS is tested against releases, never nightly against main.
 on:
-  schedule:
-    # 03:37 UTC nightly. Off the hour, as traffic.yml is: scheduled runs
-    # queue heavily at :00.
-    - cron: "37 3 * * *"
   workflow_dispatch:
 
 concurrency:

@@ -1,0 +1,446 @@
+{
+  "cases": [
+    {
+      "capabilities": [
+        "versioning",
+        "object_lock",
+        "virtual_host"
+      ],
+      "case": "engine.object_lock.a_replay_over_an_ended_lock_commits_a_fresh_object",
+      "deciding_capability": null,
+      "detail": "the case shortens a governance retention, which needs s3:BypassGovernanceRetention; the AWS role deliberately lacks it",
+      "expectation": "unknown",
+      "expected": true,
+      "image_digest": null,
+      "method": null,
+      "outcome": "not_run",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.0,
+      "server": "aws",
+      "server_version": null,
+      "vtop_commit": "a7b4491e5b605551554c13a02978fd6319612b25"
+    },
+    {
+      "capabilities": [
+        "object_lock",
+        "versioning",
+        "virtual_host"
+      ],
+      "case": "engine.object_lock.archives_a_batch_locked",
+      "deciding_capability": "object_lock",
+      "detail": null,
+      "expectation": "unknown",
+      "expected": true,
+      "image_digest": null,
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.57,
+      "server": "aws",
+      "server_version": null,
+      "vtop_commit": "a7b4491e5b605551554c13a02978fd6319612b25"
+    },
+    {
+      "capabilities": [
+        "object_lock",
+        "virtual_host"
+      ],
+      "case": "engine.object_lock.refuses_a_plain_bucket_at_startup",
+      "deciding_capability": "object_lock",
+      "detail": null,
+      "expectation": "unknown",
+      "expected": true,
+      "image_digest": null,
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.059,
+      "server": "aws",
+      "server_version": null,
+      "vtop_commit": "a7b4491e5b605551554c13a02978fd6319612b25"
+    },
+    {
+      "capabilities": [
+        "object_lock",
+        "versioning",
+        "object_lock_retention_clear",
+        "virtual_host"
+      ],
+      "case": "engine.object_lock.scrub_reports_a_receipt_without_retention",
+      "deciding_capability": "object_lock_retention_clear",
+      "detail": null,
+      "expectation": "not_applicable",
+      "expected": true,
+      "image_digest": null,
+      "method": null,
+      "outcome": "not_applicable",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.0,
+      "server": "aws",
+      "server_version": null,
+      "vtop_commit": "a7b4491e5b605551554c13a02978fd6319612b25"
+    },
+    {
+      "capabilities": [
+        "multipart",
+        "virtual_host"
+      ],
+      "case": "multipart.a_reset_part_is_sent_again_alone",
+      "deciding_capability": null,
+      "detail": "the test's fault-injecting forwarder needs VTOP_TEST_S3_ENDPOINT, and the SDK finds this server's endpoint itself",
+      "expectation": "unknown",
+      "expected": true,
+      "image_digest": null,
+      "method": null,
+      "outcome": "not_run",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.0,
+      "server": "aws",
+      "server_version": null,
+      "vtop_commit": "a7b4491e5b605551554c13a02978fd6319612b25"
+    },
+    {
+      "capabilities": [
+        "multipart",
+        "multipart_resume",
+        "multipart_list_uploads",
+        "virtual_host"
+      ],
+      "case": "multipart.a_second_backend_resumes_the_session",
+      "deciding_capability": null,
+      "detail": "the test's fault-injecting forwarder needs VTOP_TEST_S3_ENDPOINT, and the SDK finds this server's endpoint itself",
+      "expectation": "unknown",
+      "expected": true,
+      "image_digest": null,
+      "method": null,
+      "outcome": "not_run",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.0,
+      "server": "aws",
+      "server_version": null,
+      "vtop_commit": "a7b4491e5b605551554c13a02978fd6319612b25"
+    },
+    {
+      "capabilities": [
+        "multipart",
+        "multipart_abort",
+        "multipart_list_uploads",
+        "virtual_host"
+      ],
+      "case": "multipart.the_sweep_aborts_an_abandoned_upload",
+      "deciding_capability": null,
+      "detail": "the test's fault-injecting forwarder needs VTOP_TEST_S3_ENDPOINT, and the SDK finds this server's endpoint itself",
+      "expectation": "unknown",
+      "expected": true,
+      "image_digest": null,
+      "method": null,
+      "outcome": "not_run",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.0,
+      "server": "aws",
+      "server_version": null,
+      "vtop_commit": "a7b4491e5b605551554c13a02978fd6319612b25"
+    },
+    {
+      "capabilities": [
+        "object_lock",
+        "versioning",
+        "object_lock_enforced",
+        "virtual_host"
+      ],
+      "case": "object_lock.a_locked_version_survives_delete_and_overwrite",
+      "deciding_capability": "object_lock",
+      "detail": null,
+      "expectation": "unknown",
+      "expected": true,
+      "image_digest": null,
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 6.721,
+      "server": "aws",
+      "server_version": null,
+      "vtop_commit": "a7b4491e5b605551554c13a02978fd6319612b25"
+    },
+    {
+      "capabilities": [
+        "multipart",
+        "object_lock",
+        "versioning",
+        "virtual_host"
+      ],
+      "case": "object_lock.a_multipart_object_carries_its_lock",
+      "deciding_capability": "multipart",
+      "detail": null,
+      "expectation": "unknown",
+      "expected": true,
+      "image_digest": null,
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 7.204,
+      "server": "aws",
+      "server_version": null,
+      "vtop_commit": "a7b4491e5b605551554c13a02978fd6319612b25"
+    },
+    {
+      "capabilities": [
+        "object_lock",
+        "virtual_host"
+      ],
+      "case": "object_lock.an_absent_lock_is_confirmed_and_a_present_one_is_not",
+      "deciding_capability": "object_lock",
+      "detail": null,
+      "expectation": "unknown",
+      "expected": true,
+      "image_digest": null,
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 6.481,
+      "server": "aws",
+      "server_version": null,
+      "vtop_commit": "a7b4491e5b605551554c13a02978fd6319612b25"
+    },
+    {
+      "capabilities": [
+        "object_lock",
+        "versioning",
+        "virtual_host"
+      ],
+      "case": "object_lock.every_write_path_lands_locked",
+      "deciding_capability": "object_lock",
+      "detail": null,
+      "expectation": "unknown",
+      "expected": true,
+      "image_digest": null,
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 7.381,
+      "server": "aws",
+      "server_version": null,
+      "vtop_commit": "a7b4491e5b605551554c13a02978fd6319612b25"
+    },
+    {
+      "capabilities": [
+        "object_lock",
+        "virtual_host"
+      ],
+      "case": "object_lock.the_preflight_tells_locked_from_plain",
+      "deciding_capability": "object_lock",
+      "detail": null,
+      "expectation": "unknown",
+      "expected": true,
+      "image_digest": null,
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.141,
+      "server": "aws",
+      "server_version": null,
+      "vtop_commit": "a7b4491e5b605551554c13a02978fd6319612b25"
+    },
+    {
+      "capabilities": [
+        "put_get_head",
+        "checksum_sha256_enforced",
+        "virtual_host"
+      ],
+      "case": "probe.a_wrong_service_checksum_is_rejected",
+      "deciding_capability": "put_get_head",
+      "detail": null,
+      "expectation": "unknown",
+      "expected": true,
+      "image_digest": null,
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.169,
+      "server": "aws",
+      "server_version": null,
+      "vtop_commit": "a7b4491e5b605551554c13a02978fd6319612b25"
+    },
+    {
+      "capabilities": [
+        "put_get_head",
+        "conditional_put",
+        "virtual_host"
+      ],
+      "case": "probe.conditional_put_if_none_match",
+      "deciding_capability": "put_get_head",
+      "detail": null,
+      "expectation": "unknown",
+      "expected": true,
+      "image_digest": null,
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.149,
+      "server": "aws",
+      "server_version": null,
+      "vtop_commit": "a7b4491e5b605551554c13a02978fd6319612b25"
+    },
+    {
+      "capabilities": [
+        "put_get_head",
+        "checksum_crc32_default",
+        "virtual_host"
+      ],
+      "case": "probe.the_sdks_default_crc32_trailer_is_accepted",
+      "deciding_capability": "put_get_head",
+      "detail": null,
+      "expectation": "unknown",
+      "expected": true,
+      "image_digest": null,
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.155,
+      "server": "aws",
+      "server_version": null,
+      "vtop_commit": "a7b4491e5b605551554c13a02978fd6319612b25"
+    },
+    {
+      "capabilities": [
+        "multipart",
+        "virtual_host"
+      ],
+      "case": "receipts.a_multipart_object_names_read_back",
+      "deciding_capability": "multipart",
+      "detail": null,
+      "expectation": "unknown",
+      "expected": true,
+      "image_digest": null,
+      "method": "read_back",
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 1.658,
+      "server": "aws",
+      "server_version": null,
+      "vtop_commit": "a7b4491e5b605551554c13a02978fd6319612b25"
+    },
+    {
+      "capabilities": [
+        "put_get_head",
+        "checksum_sha256_returned",
+        "virtual_host"
+      ],
+      "case": "receipts.a_single_put_names_store_checksum",
+      "deciding_capability": "put_get_head",
+      "detail": null,
+      "expectation": "unknown",
+      "expected": true,
+      "image_digest": null,
+      "method": "store_checksum",
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.583,
+      "server": "aws",
+      "server_version": null,
+      "vtop_commit": "a7b4491e5b605551554c13a02978fd6319612b25"
+    },
+    {
+      "capabilities": [
+        "object_lock",
+        "versioning",
+        "virtual_host"
+      ],
+      "case": "tier.copy.written_and_checked_under_the_lock",
+      "deciding_capability": "object_lock",
+      "detail": null,
+      "expectation": "unknown",
+      "expected": true,
+      "image_digest": null,
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.597,
+      "server": "aws",
+      "server_version": null,
+      "vtop_commit": "a7b4491e5b605551554c13a02978fd6319612b25"
+    },
+    {
+      "capabilities": [
+        "put_get_head",
+        "virtual_host"
+      ],
+      "case": "transport_conformance.tcp_tls",
+      "deciding_capability": "put_get_head",
+      "detail": null,
+      "expectation": "unknown",
+      "expected": true,
+      "image_digest": null,
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.396,
+      "server": "aws",
+      "server_version": null,
+      "vtop_commit": "a7b4491e5b605551554c13a02978fd6319612b25"
+    },
+    {
+      "capabilities": [
+        "put_get_head",
+        "virtual_host"
+      ],
+      "case": "verification.blake3_by_read_back",
+      "deciding_capability": "put_get_head",
+      "detail": null,
+      "expectation": "unknown",
+      "expected": true,
+      "image_digest": null,
+      "method": "read_back",
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.17,
+      "server": "aws",
+      "server_version": null,
+      "vtop_commit": "a7b4491e5b605551554c13a02978fd6319612b25"
+    },
+    {
+      "capabilities": [
+        "put_get_head",
+        "checksum_sha256_returned",
+        "virtual_host"
+      ],
+      "case": "verification.sha256_by_store_checksum",
+      "deciding_capability": "put_get_head",
+      "detail": null,
+      "expectation": "unknown",
+      "expected": true,
+      "image_digest": null,
+      "method": "store_checksum",
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.154,
+      "server": "aws",
+      "server_version": null,
+      "vtop_commit": "a7b4491e5b605551554c13a02978fd6319612b25"
+    },
+    {
+      "capabilities": [
+        "put_get_head",
+        "virtual_host"
+      ],
+      "case": "verification.sha256_verifies_strongly",
+      "deciding_capability": "put_get_head",
+      "detail": null,
+      "expectation": "unknown",
+      "expected": true,
+      "image_digest": null,
+      "method": "store_checksum",
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.248,
+      "server": "aws",
+      "server_version": null,
+      "vtop_commit": "a7b4491e5b605551554c13a02978fd6319612b25"
+    }
+  ],
+  "image_digest": null,
+  "run_date": "2026-11-23",
+  "server": "aws",
+  "server_version": null,
+  "vtop_commit": "a7b4491e5b605551554c13a02978fd6319612b25"
+}

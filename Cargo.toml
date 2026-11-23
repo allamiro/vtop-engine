@@ -18,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.10.4"
+version = "0.11.1"
 edition = "2021"
 # MSRV: the floor is now set by aws-smithy-types 1.6.3, which declares
 # rust-version 1.94.1 (it raised the 1.94.0 floor sqlx 0.9 set, which had
@@ -133,21 +133,21 @@ quote = { version = "1", default-features = false }
 # path locally, and the version is what a published crate would resolve. Without
 # it these are wildcard dependencies, which crates.io rejects outright - so the
 # workspace could not actually be published as declared.
-vtop-core = { path = "crates/vtop-core", version = "0.10.4" }
-vtop-log = { path = "crates/vtop-log", version = "0.10.4" }
-vtop-protocol = { path = "crates/vtop-protocol", version = "0.10.4" }
-vtop-broker = { path = "crates/vtop-broker", version = "0.10.4" }
-vtop-meta = { path = "crates/vtop-meta", version = "0.10.4" }
-vtop-observe = { path = "crates/vtop-observe", version = "0.10.4" }
-vtop-surface = { path = "crates/vtop-surface", version = "0.10.4" }
-vtop-kafka = { path = "crates/vtop-kafka", version = "0.10.4" }
-vtop-adapters = { path = "crates/vtop-adapters", version = "0.10.4", default-features = false }
-vtop-upload = { path = "crates/vtop-upload", version = "0.10.4" }
-vtop-state = { path = "crates/vtop-state", version = "0.10.4" }
+vtop-core = { path = "crates/vtop-core", version = "0.11.1" }
+vtop-log = { path = "crates/vtop-log", version = "0.11.1" }
+vtop-protocol = { path = "crates/vtop-protocol", version = "0.11.1" }
+vtop-broker = { path = "crates/vtop-broker", version = "0.11.1" }
+vtop-meta = { path = "crates/vtop-meta", version = "0.11.1" }
+vtop-observe = { path = "crates/vtop-observe", version = "0.11.1" }
+vtop-surface = { path = "crates/vtop-surface", version = "0.11.1" }
+vtop-kafka = { path = "crates/vtop-kafka", version = "0.11.1" }
+vtop-adapters = { path = "crates/vtop-adapters", version = "0.11.1", default-features = false }
+vtop-upload = { path = "crates/vtop-upload", version = "0.11.1" }
+vtop-state = { path = "crates/vtop-state", version = "0.11.1" }
 # Test support for the live S3 tests (#722), a dev-dependency only and never
 # published. The version is cargo-deny's: a path dependency without one is a
 # wildcard, which `bans` refuses.
-vtop-s3-testkit = { path = "crates/vtop-s3-testkit", version = "0.10.4" }
+vtop-s3-testkit = { path = "crates/vtop-s3-testkit", version = "0.11.1" }
 
 [profile.release]
 opt-level = 3
