@@ -161,16 +161,28 @@ def test_every_finding_is_built_from_the_numbers_it_states():
 # -------------------------------------------------------------- the S3 strip
 
 
-def test_without_matrix_results_the_strip_says_when_more_servers_appear():
-    s3 = site_facts.s3_servers()
+def test_without_matrix_results_the_strip_says_when_more_servers_appear(data_tree):
+    root = data_tree({os.path.join(site_facts.S3_RESULTS, name): None
+                      for name in os.listdir(os.path.join(readme_charts.REPO, site_facts.S3_RESULTS))})
+    s3 = site_facts.s3_servers(root)
     assert s3["lab"]["name"] == "MinIO" and s3["lab"]["version"].startswith("RELEASE.")
     assert s3["matrix"] == {"available": False, "entries": [],
                             "placeholder": "More S3 servers: when the matrix is published (#722)"}
 
 
+def test_the_committed_matrix_results_name_each_server_by_its_capability_file():
+    s3 = site_facts.s3_servers()
+    names = {entry["name"] for entry in s3["matrix"]["entries"]}
+    assert s3["matrix"]["available"] is True
+    assert {"Garage", "RustFS", "SeaweedFS"} <= names
+    # The lab's MinIO is the lab entry, not a second matrix entry.
+    assert not any(name.startswith("MinIO") for name in names)
+
+
 def test_a_committed_matrix_result_joins_the_strip(data_tree):
     rel = f"{site_facts.S3_RESULTS}/garage.json"
-    root = data_tree({rel: lambda _text: json.dumps({"server": "Garage", "version": "v2.1.0", "passed": 41})})
+    # The shape scripts/s3_compat_report.py writes: the server's id and its version.
+    root = data_tree({rel: lambda _text: json.dumps({"server": "garage", "server_version": "v2.1.0", "cases": []})})
     facts = site_facts.site_facts(root)
     assert facts["tested"]["s3_matrix"]["available"] is True
     assert {"name": "Garage", "version": "v2.1.0", "ran": "S3 compatibility matrix", "source": rel} \

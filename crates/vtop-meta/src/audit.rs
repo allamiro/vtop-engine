@@ -353,6 +353,7 @@ pub fn command_name(command: &MetadataCommand) -> &'static str {
         MetadataCommand::SetRangeReplicaSet { .. } => "SetRangeReplicaSet",
         MetadataCommand::AttestUnprovenPromotion { .. } => "AttestUnprovenPromotion",
         MetadataCommand::ReportNodeVersion { .. } => "ReportNodeVersion",
+        MetadataCommand::Attributed { .. } => "Attributed",
     }
 }
 
@@ -376,6 +377,10 @@ pub fn command_audit(command: &MetadataCommand) -> Option<CommandAudit> {
         })
     };
     match command {
+        // An attributed command is audited as what it carries (#706): the
+        // record of a command is the same with or without its actor in the
+        // log.
+        MetadataCommand::Attributed { subject, .. } => command_audit(subject),
         // ---- Audited: what an operator asks the cluster to become ----
         MetadataCommand::SetFeatureLevel { feature_level, .. } => Some(CommandAudit {
             action: AuditAction::ClusterEnableFeatures,
@@ -663,6 +668,27 @@ pub fn command_audit(command: &MetadataCommand) -> Option<CommandAudit> {
         | MetadataCommand::EnsureGroupMemberCoordinated { .. }
         | MetadataCommand::ExpireStaleMember { .. } => None,
     }
+}
+
+/// Whether the serving leader wraps `command` in its caller's actor (#706):
+/// an audited command, asked by someone other than a machine.
+///
+/// Machine traffic is left bare. A data node hands a range back with
+/// `ReleaseRangeLease` when it stops, and a rolling restart of a node that
+/// holds hundreds of ranges would otherwise flush the operators' commands out
+/// of the bounded tail (see [`crate::state::AUDIT_TAIL_ENTRIES`]); the edge
+/// and applied records still name it. An operator's own release is wrapped.
+pub fn is_attributed_when_audited(identity: &AdminIdentity, command: &MetadataCommand) -> bool {
+    if matches!(command, MetadataCommand::Attributed { .. }) || command_audit(command).is_none() {
+        return false;
+    }
+    !matches!(
+        (identity, command),
+        (
+            AdminIdentity::Node(_),
+            MetadataCommand::ReleaseRangeLease { .. }
+        )
+    )
 }
 
 /// The record for a refused request, whatever the command: a refusal is

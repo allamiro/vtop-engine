@@ -2678,6 +2678,41 @@ pub fn decide(
     }
 }
 
+/// The node holding the range, as one read of the lease named it (#751).
+///
+/// A candidate that does not hold the range still answers Kafka Metadata, and
+/// names the holder so a client can go there. This is what the agent hands
+/// the gateway after every read: the holder's node uuid and the fencing epoch
+/// it holds the range at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObservedHolder {
+    pub node_uuid: Uuid,
+    pub fencing_epoch: u64,
+}
+
+/// Who holds the range by `view`, judged at `now_ms` (#751). `None` when the
+/// range is missing, has no lease, or its lease has lapsed: a lapsed holder
+/// is not one a client should be sent to, and naming nobody makes a client
+/// ask again, which is right while an election is under way. Judged on the
+/// local clock, like [`decide`]'s reading of a rival's lease; a wrong answer
+/// costs a client one redirect, never correctness.
+pub fn observed_holder(
+    view: &vtop_meta::AdminReadRangeLeaseResponse,
+    now_ms: i64,
+) -> Option<ObservedHolder> {
+    if !view.found {
+        return None;
+    }
+    let lease = view.lease.as_ref()?;
+    match lease.expires_at_ms {
+        Some(deadline) if now_ms >= deadline => None,
+        _ => Some(ObservedHolder {
+            node_uuid: lease.holder_node_uuid,
+            fencing_epoch: lease.fencing_epoch,
+        }),
+    }
+}
+
 /// What the stood-down latch says about a round's decision (review, #410).
 ///
 /// A pure function for the same reason [`QuorumMissBudget`] is one: the
@@ -2885,6 +2920,9 @@ pub struct LeaseAgent {
     /// later than that. `None` while not held, or held administratively
     /// (which cannot lapse).
     held_until_ms: Option<i64>,
+    /// Where each read's holder is published for the Kafka gateway (#751).
+    /// `None` on a node without one.
+    holder: Option<tokio::sync::watch::Sender<Option<ObservedHolder>>>,
 }
 
 /// Whether a holder that cannot reach the metadata plane must stop serving.
@@ -2983,7 +3021,20 @@ impl LeaseAgent {
             held_until_ms: None,
             campaign_hold_off_rounds: 0,
             quorum_miss_hold: None,
+            holder: None,
         })
+    }
+
+    /// Publish the holder every read names on `holder` (#751): the Kafka
+    /// gateway of a candidate that does not hold the range names it to
+    /// clients. A read that fails publishes nothing, so the last holder read
+    /// stands until a read says otherwise.
+    pub fn with_holder_watch(
+        mut self,
+        holder: tokio::sync::watch::Sender<Option<ObservedHolder>>,
+    ) -> Self {
+        self.holder = Some(holder);
+        self
     }
 
     /// Count this agent's promotion refusals by reason, and its promotions
@@ -3461,6 +3512,14 @@ impl LeaseAgent {
             )
             .await?;
         let decision = decide(&view, self.node_uuid, now_ms());
+        if let Some(holder) = &self.holder {
+            let seen = observed_holder(&view, now_ms());
+            holder.send_if_modified(|current| {
+                let changed = *current != seen;
+                *current = seen;
+                changed
+            });
+        }
         match stood_down_verdict(
             self.stood_down_latched,
             self.campaign_hold_off_rounds > 0,
@@ -4101,6 +4160,41 @@ mod tests {
         let mut missing = view(None);
         missing.found = false;
         assert_eq!(decide(&missing, US, 1_000), LeaseDecision::RangeMissing);
+    }
+
+    /// The holder a read names is the one the Kafka gateway sends clients to
+    /// (#751): a live holder, ours or a rival's, at the epoch it holds; an
+    /// administrative grant, which never lapses; and nobody for a lapsed
+    /// lease, an unheld range or a missing one.
+    #[test]
+    fn a_read_names_the_live_holder_and_nobody_else() {
+        let named = |holder| {
+            Some(ObservedHolder {
+                node_uuid: holder,
+                fencing_epoch: 4,
+            })
+        };
+        assert_eq!(
+            observed_holder(&view(held_by(THEM, Some(9_000))), 1_000),
+            named(THEM)
+        );
+        assert_eq!(
+            observed_holder(&view(held_by(US, Some(9_000))), 1_000),
+            named(US)
+        );
+        assert_eq!(
+            observed_holder(&view(held_by(THEM, None)), i64::MAX),
+            named(THEM)
+        );
+        assert_eq!(
+            observed_holder(&view(held_by(THEM, Some(9_000))), 9_000),
+            None,
+            "a lapsed lease names nobody a client should go to"
+        );
+        assert_eq!(observed_holder(&view(None), 1_000), None);
+        let mut missing = view(held_by(THEM, Some(9_000)));
+        missing.found = false;
+        assert_eq!(observed_holder(&missing, 1_000), None);
     }
 
     /// Promotion must leave the broker's two epoch views EQUAL. Produce

@@ -20,8 +20,9 @@ for scenario in "$SCRIPT_DIR"/scenarios/*.sh; do
     scenario_workdir="${CHAOS_WORKDIR%/}/${name%.sh}"
   fi
   # Exit 77 is a SKIP: the scenario needs something this run did not provide
-  # (scenario 22: a previous release's binary). It is reported, not counted
-  # as a pass or a failure.
+  # (scenario 22: a previous release's binary; scenario 28: an Apache Kafka
+  # distribution, CHAOS_KAFKA_HOME or CHAOS_KAFKA_IMAGE). It is reported, not
+  # counted as a pass or a failure.
   code=0
   if [[ -n "$scenario_workdir" ]]; then
     CHAOS_WORKDIR="$scenario_workdir" bash "$scenario" || code=$?

@@ -68,6 +68,7 @@ jobs:
       restore_drill: ${{ steps.filter.outputs.restore_drill }}
       helm: ${{ steps.filter.outputs.helm }}
       file_source: ${{ steps.filter.outputs.file_source }}
+      s3_report: ${{ steps.filter.outputs.s3_report }}
       prometheus_rules: ${{ steps.filter.outputs.prometheus_rules }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -312,6 +313,16 @@ jobs:
               # helm job is skipped by exactly the PR that bumps it — the one
               # case the check exists for.
               - 'Cargo.toml'
+            # The S3 compatibility page and README line (#722), generated
+            # from committed results by scripts/s3_compat_report.py.
+            s3_report:
+              - 'scripts/s3_compat_report.py'
+              - 'scripts/tests/test_s3_compat_report.py'
+              - 'tests/s3-compat/**'
+              - 'docker/s3-servers/**'
+              - 'docs/reference/s3-compatibility.md'
+              - 'README.md'
+              - '.github/workflows/ci.yml'
             shell:
               - 'docker/*.sh'
               - 'docker/tests/**'
@@ -756,6 +767,8 @@ jobs:
           helm lint helm/vtop -f helm/vtop/ci/separated-values.yaml
           helm lint helm/vtop -f helm/vtop/ci/plaintext-values.yaml
           helm lint helm/vtop -f helm/vtop/ci/external-secret-values.yaml
+          helm lint helm/vtop -f helm/vtop/ci/replicated-values.yaml -f helm/vtop/ci/replicated-kafka-values.yaml
+          helm lint helm/vtop -f helm/vtop/ci/separated-values.yaml -f helm/vtop/ci/replicated-kafka-values.yaml
 
       # The plaintext shape (#294): every plane without TLS renders WITHOUT a
       # Secret, as the node's spelled-out any-interface form, and never a tls
@@ -1350,6 +1363,90 @@ jobs:
             --set replicaCount=1 \
             --set 'data.nodeUuids={aaaaaaaa-0000-0000-0000-0000000000a1}'
 
+      # The Kafka gateway on a replicated range (#751). Parsed, not matched:
+      # a kafka block the node cannot read is a pod in CrashLoopBackOff, and
+      # the lists must be the SAME on every pod with each pod at its own
+      # broker id, or a client is sent to a broker that answers as another.
+      # (No apostrophes in the ruby program: it is one shell argument.)
+      - name: The Kafka gateway renders on a replicated range, and only when acknowledged
+        run: |
+          set -euo pipefail
+          for shape in colocated separated; do
+            if [ "$shape" = colocated ]; then
+              base=helm/vtop/ci/replicated-values.yaml
+            else
+              base=helm/vtop/ci/separated-values.yaml
+            fi
+            helm template vtop helm/vtop -f "$base" -f helm/vtop/ci/replicated-kafka-values.yaml > "/tmp/kafka-$shape.yaml"
+            SHAPE="$shape" ruby -ryaml -e '
+              docs = YAML.load_stream(File.read("/tmp/kafka-" + ENV.fetch("SHAPE") + ".yaml")).compact
+              cm = docs.select { |d| d["kind"] == "ConfigMap" }.find { |d| d["data"]&.keys&.any? { |k| k =~ /\A(node|data)-\d\.yaml\z/ } }
+              abort "no node or data ConfigMap in the render" unless cm
+              configs = {}
+              cm["data"].each do |name, body|
+                matched = name.match(/\A(?:node|data)-(\d)\.yaml\z/)
+                next unless matched
+                parsed = YAML.safe_load(body)
+                configs[matched[1].to_i] = parsed.key?("data") ? parsed["data"] : parsed
+              end
+              abort "expected three data configs, got #{configs.keys.sort}" unless configs.size == 3
+              lists = configs.values.map { |c| c.fetch("kafka").fetch("brokers") }
+              abort "broker lists differ between pods" unless lists.uniq.size == 1
+              brokers = lists.first
+              abort "expected 3 brokers, got #{brokers.size}" unless brokers.size == 3
+              abort "broker ids are not unique: #{brokers.map { |b| b["node_id"] }}" unless brokers.map { |b| b["node_id"] }.uniq.size == 3
+              configs.each do |ordinal, c|
+                kafka = c.fetch("kafka")
+                own = brokers.find { |b| b["node_uuid"] == c.fetch("node_uuid") }
+                abort "pod #{ordinal} has no broker entry of its own" unless own
+                abort "pod #{ordinal} node_id #{kafka["node_id"]} != its entry #{own["node_id"]}" unless kafka["node_id"] == own["node_id"]
+                abort "pod #{ordinal} kafka.node_id is not its ordinal" unless kafka["node_id"] == ordinal
+                abort "pod #{ordinal} does not listen on every interface" unless kafka["listen"] == "0.0.0.0:9092" && kafka["any_interface"] == true
+                abort "pod #{ordinal} advertises a host that is not its own FQDN: #{own["host"]}" unless own["host"].start_with?("vtop-") && own["host"].include?(".svc.")
+                abort "pod #{ordinal} serves a topic other than the range" unless kafka["topic"] == c.fetch("range").fetch("topic")
+                abort "pod #{ordinal} is not a candidate" unless c.fetch("role") == "candidate"
+              end
+              puts "kafka gateway parses on every pod (" + ENV.fetch("SHAPE") + "): three brokers, one list, each pod at its own id"
+            '
+            grep -q 'name: kafka' "/tmp/kafka-$shape.yaml" \
+              || { echo "::error::$shape: no kafka port on the pods or the headless Service"; exit 1; }
+          done
+          # Off unless asked: the default replicated render carries no gateway.
+          helm template vtop helm/vtop -f helm/vtop/ci/replicated-values.yaml > /tmp/kafka-off.yaml
+          if grep -q 'kafka' /tmp/kafka-off.yaml; then
+            echo "::error::a replicated render without data.kafka.enabled mentions kafka"; exit 1
+          fi
+          # A client policy opens the port; without one the policy does not.
+          helm template vtop helm/vtop -f helm/vtop/ci/replicated-values.yaml -f helm/vtop/ci/replicated-kafka-values.yaml \
+            --set networkPolicy.enabled=true --set 'networkPolicy.clientFrom[0].ipBlock.cidr=10.0.0.0/8' > /tmp/kafka-policy.yaml
+          grep -q 'port: 9092' /tmp/kafka-policy.yaml \
+            || { echo "::error::the network policy does not open the Kafka port to clients"; exit 1; }
+          refuses_because() {
+            expected="$1"; shift
+            if output=$(helm template vtop helm/vtop "$@" 2>&1); then
+              echo "::error::rendered successfully; expected a refusal mentioning: $expected"
+              exit 1
+            fi
+            if ! printf '%s' "$output" | grep -qF "$expected"; then
+              echo "::error::refused, but not for the expected reason."
+              echo "::error::wanted: $expected"
+              printf '%s\n' "$output" | tail -5
+              exit 1
+            fi
+            echo "refused because: $expected"
+          }
+          # The gateway carries no vtop identity: acknowledged by name.
+          refuses_because "without data.kafka.acknowledgeUnauthenticated" \
+            -f helm/vtop/ci/replicated-values.yaml -f helm/vtop/ci/replicated-kafka-values.yaml \
+            --set data.kafka.acknowledgeUnauthenticated=false
+          # A standalone pod would serve one of several independent ranges.
+          refuses_because "data.topology is not" \
+            -f helm/vtop/ci/default-values.yaml -f helm/vtop/ci/replicated-kafka-values.yaml
+          # One advertised address per data pod, or none.
+          refuses_because "data.kafka.advertisedHosts has 2 entries but there are 3 data pods" \
+            -f helm/vtop/ci/replicated-values.yaml -f helm/vtop/ci/replicated-kafka-values.yaml \
+            --set 'data.kafka.advertisedHosts={a.example.com,b.example.com}'
+
       # Long names are where DNS limits and collisions appear, and both were
       # real: the headless Service used to truncate to the same string as the
       # client Service, so a long release name rendered two Services with one
@@ -1636,6 +1733,28 @@ jobs:
     with:
       servers: '["minio"]'
 
+  # The S3 compatibility page and the README's line are generated from the
+  # committed results (#722, D6): regenerate both and fail on any
+  # difference, and on results from another image than the one a server's
+  # compose file pins. Cheap: one Python file and PyYAML.
+  s3-compat-report:
+    name: s3 compat report (regenerate + no drift)
+    needs: changes
+    if: needs.changes.outputs.s3_report == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Install the report's dependencies
+        run: pip install --disable-pip-version-check pyyaml==6.0.3 pytest==9.2.0
+      - name: Report tests
+        run: python -m pytest -p no:cacheprovider scripts/tests/test_s3_compat_report.py
+      - name: Regenerate and fail on drift
+        run: python3 scripts/s3_compat_report.py --check
+
   # cargo-deny covers what cargo-audit does not: license compliance, dependency
   # bans, and source provenance. Advisory decisions are mirrored from
   # .cargo/audit.toml (the single source of truth) so the two cannot disagree.
@@ -1705,7 +1824,8 @@ jobs:
 
       # Scenario 17 drives the Kafka gateway with a stock client: kafkacat is
       # librdkafka, the library under every non-JVM Kafka client (#225).
-      - name: Install a stock Kafka client for scenarios 17 to 20
+      # Scenarios 17 to 21, 24 and 27 use it.
+      - name: Install a stock Kafka client for scenarios 17 to 21, 24 and 27
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq kafkacat
@@ -1733,8 +1853,18 @@ jobs:
       # empty — a diagnostic that appears to exist and is absent exactly when
       # it is needed. Supplying the directory also sets WORKDIR_GENERATED=0,
       # which suppresses that cleanup, so the tree is still there afterwards.
+      #
+      # Scenario 28 runs the JVM Kafka client (#751): the Apache Kafka
+      # distribution is copied out of the apache/kafka image pinned below (the
+      # 4.4.0 line of kafka-matrix.yml, by the same digest) and run on the
+      # runner's JVM, once per metadata.recovery.strategy, each a full
+      # failover. Measured at 75 s for both on two CPUs with debug binaries,
+      # plus the image pull; scenario 27 (librdkafka, the kafkacat above) 43 s.
+      # Without the variable the scenario SKIPS (exit 77).
       - name: Run the live chaos suite
         id: chaos
+        env:
+          CHAOS_KAFKA_IMAGE: apache/kafka@sha256:833b867a9585a141da455dc2b57431c65cbccb27f11c91f694444cca9f777e0f
         run: CHAOS_PROFILE=debug CHAOS_WORKDIR="$RUNNER_TEMP/chaos" scripts/live-chaos/run-all.sh
 
       # A failing scenario names a log file; without this the reason dies with
