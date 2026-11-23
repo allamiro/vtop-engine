@@ -241,7 +241,9 @@ run_client() {
 
   # --- the same consumer delivers the last record ------------------------------
   deadline=$((SECONDS + FAILOVER_LIMIT_SECONDS + PROGRESS_TIMEOUT_SECONDS))
-  until grep -qE "[:	]${LAST_KEY}[:	]" "$consumed"; do
+  # kcat separates with a colon, the JVM formatter with a tab.
+  local sep=$'[:\t]'
+  until grep -qE "${sep}${LAST_KEY}${sep}" "$consumed"; do
     consumer_alive
     [[ $SECONDS -lt $deadline ]] \
       || fail "the consumer had not delivered $LAST_KEY, with $(delivered_count) deliveries: $(tail -3 "$clog")"
