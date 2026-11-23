@@ -134,7 +134,7 @@ opened 2026-11-15, #782). The criterion IDs (A1, B1 and so on) are those of
 
 - **Why:** `preview` because every live S3 test runs against one MinIO; `production` at 1.0 for the providers B1 names.
 - **Tests and CI:** `crates/vtop-upload/src/s3_native.rs`; `crates/vtop-upload/tests` (`live_s3_verification`, `live_s3_multipart_resume`, `live_s3_object_lock`, `request_deadline`, `slow_link_deadline`, `transport_conformance`); the `minio integration` job against MinIO built from release 2025-09-07; the README's lossy-link and policed-uplink measurements.
-- **Open criteria:** B1 (#722): no AWS S3 and no second provider, so "which provider supports which verification method" is not tabulated; a test kit for other servers is in review (#764).
+- **Open criteria:** B1 (#722): the live tests run against RustFS, Garage, SeaweedFS, Versity and CloudServer beside MinIO with a generated compatibility table (#764, #837, #841), and an opt-in AWS S3 leg exists (#841), but no AWS S3 result is recorded yet, so AWS has no row in the table.
 - **Docs:** `limitations.md` says "any S3-compatible store"; ROADMAP says Object Lock behaviour on AWS is taken from its documentation.
 
 ### Local directory upload (`localfs`)
@@ -197,7 +197,7 @@ opened 2026-11-15, #782). The criterion IDs (A1, B1 and so on) are those of
 
 - **Why:** `preview`, `production` at 1.0: one attributable record for every state-changing command, with a hash chain in the ledger's `audit_events` table; the cluster-command half is not durable yet.
 - **Tests and CI:** `crates/vtop-cli/tests/audit_trail.rs`, `audit_cluster_client.rs`; the `audit_events` trigger in `pg_battery`; the `audit_record` fuzz target.
-- **Open criteria:** #706 (the actor of a cluster command is in the admin endpoint's record only; a fix is in review, #767); a mixed fleet's trail is only as complete as its least-upgraded node.
+- **Open criteria:** #706 (below feature level 9 the actor of a cluster command is in the admin endpoint's record only, from level 9 it is in the replicated log, #850; the applied records are delivered at least once, #767, but do not yet carry `requested_by`); a mixed fleet's trail is only as complete as its least-upgraded node.
 - **Docs:** `operate/auditing.md`, `operate/logs-and-auditing.md`.
 
 ### Prometheus metrics, alert rules and dashboards
