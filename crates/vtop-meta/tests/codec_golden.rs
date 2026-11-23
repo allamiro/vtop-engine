@@ -83,6 +83,18 @@ const GOLDEN_SET_RANGE_REPLICA_SET_HEX: &str = concat!(
 /// AttestUnprovenPromotion (#636), derived by hand from the layout: kind 39,
 /// the envelope, topic, range, the attested replica, the operator as a
 /// length-prefixed string.
+/// A holder's own release (#732), kind 41: kind 5's fields with the holder
+/// between the range and the epoch. Hand-derived from the layout.
+const GOLDEN_RELEASE_AS_HOLDER_HEX: &str = concat!(
+    "0029",                             // kind 41
+    "00112233445566778899aabbccddee41", // request id
+    "0102030405060708",                 // issued_at_ms
+    "ffeeddccbbaa99887766554433221100", // topic
+    "0f1e2d3c4b5a69788796a5b4c3d2e1f0", // range
+    "bbbbbbbb000000000000000000000031", // holder
+    "0000000000000007",                 // expected fencing epoch
+);
+
 const GOLDEN_ATTEST_UNPROVEN_PROMOTION_HEX: &str = concat!(
     "0027",                             // kind 39
     "00112233445566778899aabbccddee07", // request id
@@ -457,6 +469,28 @@ fn attributed_command_matches_golden_vectors() {
     let encoded = node.encode().unwrap();
     assert_eq!(to_hex(&encoded), GOLDEN_ATTRIBUTED_NODE_V4_HEX);
     assert_eq!(MetadataCommand::decode(&encoded).unwrap(), node);
+}
+
+#[test]
+fn release_as_holder_command_matches_golden_vector() {
+    let command = MetadataCommand::ReleaseRangeLeaseAsHolder {
+        env: CommandEnvelope {
+            request_id: Uuid::parse_str("00112233-4455-6677-8899-aabbccddee41").unwrap(),
+            issued_at_ms: 0x0102_0304_0506_0708,
+        },
+        topic_uuid: Uuid::parse_str("ffeeddcc-bbaa-9988-7766-554433221100").unwrap(),
+        range_uuid: Uuid::parse_str("0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0").unwrap(),
+        holder_node_uuid: Uuid::parse_str("bbbbbbbb-0000-0000-0000-000000000031").unwrap(),
+        expected_fencing_epoch: 7,
+    };
+    let encoded = command.encode().unwrap();
+    assert_eq!(to_hex(&encoded), GOLDEN_RELEASE_AS_HOLDER_HEX);
+    assert_eq!(MetadataCommand::decode(&encoded).unwrap(), command);
+    assert_eq!(
+        command.feature_level(),
+        9,
+        "gated: older voters cannot decode it"
+    );
 }
 
 #[test]
@@ -1189,6 +1223,10 @@ fn golden_fuzz_seeds() -> Vec<(&'static str, Vec<u8>)> {
         (
             "golden-command-attributed-node-v4",
             with(0, GOLDEN_ATTRIBUTED_NODE_V4_HEX),
+        ),
+        (
+            "golden-command-release-as-holder",
+            with(0, GOLDEN_RELEASE_AS_HOLDER_HEX),
         ),
         ("golden-snapshot-state", with(3, GOLDEN_STATE_PAYLOAD_HEX)),
         (
