@@ -2634,7 +2634,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.benchmark_charts == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # The chart tests alone took 7.5 min on main after #946 (the AWS ingest rehearsal regenerates a scratch
+    # repository several times), the whole job 8.5 to 9.5, and one run was cancelled at the old 10.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # The patch version is pinned: a floating "3.12" moves with the runner
