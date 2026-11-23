@@ -1221,7 +1221,7 @@ regenerate scripts read `HEAD`, so a run that is not committed is not regenerate
 | #748 spool, crash | `spool-hosted-crash-v0110` to `benchmarks/spool_compare/results/` | `spool-comparison-crash.md` / `spool/img/crash` | the same, plus `spool/img/crash/*` |
 | #748 spool, rotation | `spool-hosted-rotation-v0110` to `benchmarks/spool_compare/results/` | `spool-comparison-rotation.md` / `spool/img/rotation` | the same, plus `spool/img/rotation/*` |
 
-(The run ids are the command sheet's; use the ids the runs were given.) The reason for the `report.json` column:
+(The run ids are the command sheet's; use the ids the runs were given.) The cross-product summary (`compare_common/summary.py`) draws one run per kind, so `compare_common/regenerate.py` refuses a kind with two committed runs (the two archive and the two spool runs above) rather than leave one out of the summary: those runs need the summary to combine them first. The reason for the `report.json` column:
 the generators write fixed paths, so two committed runs of one kind write the same page and `regenerate.py` refuses
 them ("two runs write the same file"). The laptop's two committed Kafka runs keep the default paths and stay what the
 README quotes; the AWS runs sit beside them. A `report.json` is
