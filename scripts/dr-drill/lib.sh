@@ -176,9 +176,14 @@ dr_init() {
   if [[ $DR_MODE == check || $DR_MODE == teardown ]]; then
     [[ -d "$DR_WORKDIR" ]] || { echo "[dr-drill/$DR_DRILL] FAIL: $DR_WORKDIR does not exist: no lab was handed over there (set DR_DRILL_WORKDIR to its directory)" >&2; exit 2; }
   fi
-  mkdir -p "$DR_WORKDIR"
+  [[ -d "$DR_WORKDIR" ]] || (umask 077 && mkdir -p "$DR_WORKDIR")
   DR_WORKDIR="$(cd "$DR_WORKDIR" && pwd)"
   DR_STATE_FILE="$DR_WORKDIR/handover.state"
+  # The handover directory has a fixed default name under a shared TMPDIR,
+  # and --check and --teardown run its state file as shell: refuse a
+  # directory or state file someone else owns or can write.
+  dr_private "$DR_WORKDIR"
+  [[ ! -e "$DR_STATE_FILE" ]] || dr_private "$DR_STATE_FILE"
   if [[ $DR_MODE == run || $DR_MODE == handover ]]; then
     if [[ -n "$(ls -A "$DR_WORKDIR")" ]]; then
       local hint="name a new directory in DR_DRILL_WORKDIR"
@@ -195,6 +200,26 @@ dr_init() {
   mkdir -p "$DR_LOGS"
   DR_RUN_ID="$$"
   trap dr_cleanup EXIT
+}
+
+# dr_private <path>: exits unless <path> is not a symlink, is owned by this
+# user and is writable by no one else.
+dr_private() {
+  local path="$1" owner mode
+  if [[ -L "$path" ]]; then
+    echo "[dr-drill/$DR_DRILL] FAIL: $path is a symlink; name a directory of your own in DR_DRILL_WORKDIR" >&2
+    exit 2
+  fi
+  if owner="$(stat -c %u "$path" 2> /dev/null)"; then
+    mode="$(stat -c %a "$path")"
+  else
+    owner="$(stat -f %u "$path")"
+    mode="$(stat -f %Lp "$path")"
+  fi
+  if [[ $owner != "$(id -u)" ]] || (((8#$mode & 8#022) != 0)); then
+    echo "[dr-drill/$DR_DRILL] FAIL: $path is owned by uid $owner with mode $mode; it must be yours and writable by no one else (name a new directory in DR_DRILL_WORKDIR)" >&2
+    exit 2
+  fi
 }
 
 # ---- the page's numbers are the script's --------------------------------------
@@ -642,12 +667,18 @@ dr_sqlite_num() { local n; n="$(dr_sqlite "$1" "$2" 2> /dev/null | head -n 1 || 
 
 # ---- Kafka --------------------------------------------------------------------
 dr_kafka_start() {
-  local label="kafka-$1" port ctl
+  local label="kafka-$1" port ctl bind=127.0.0.1
   port="$(dr_free_port)"
   ctl="$(dr_free_port)"
+  # With no shared network the engine reaches the broker through the port
+  # published on the host's loopback, which arrives on the container's own
+  # interface, not on its loopback: the client listener binds every
+  # interface there. It still advertises 127.0.0.1, the address the engine
+  # dials. In a shared network namespace it stays on loopback.
+  [[ -n "${DR_DRILL_NETWORK:-}" ]] || bind=0.0.0.0
   dr_run "$label" "$port" --memory=1500m \
     -e KAFKA_NODE_ID=1 -e KAFKA_PROCESS_ROLES=broker,controller \
-    -e "KAFKA_LISTENERS=PLAINTEXT://127.0.0.1:$port,CONTROLLER://127.0.0.1:$ctl" \
+    -e "KAFKA_LISTENERS=PLAINTEXT://$bind:$port,CONTROLLER://127.0.0.1:$ctl" \
     -e "KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://127.0.0.1:$port" \
     -e "KAFKA_CONTROLLER_QUORUM_VOTERS=1@127.0.0.1:$ctl" \
     -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \

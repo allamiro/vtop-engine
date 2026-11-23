@@ -54,6 +54,11 @@ def fault_mode(control):
         return None
 
 
+def header_text(value):
+    """A header name or value with no line break, so nothing the store sends can start a header or a body of its own."""
+    return str(value).replace("\r", "").replace("\n", "")
+
+
 def alter_base64(value):
     """The same length, and another value."""
     return ("B" if value[:1] == "A" else "A") + value[1:]
@@ -110,11 +115,11 @@ def make_handler(upstream, control, stats):
                     continue
                 if changed and mode == "head" and k.lower() == "x-amz-checksum-sha256":
                     v = alter_base64(v)
-                self.send_header(k, v)
+                self.send_header(header_text(k), header_text(v))
             if self.command == "HEAD":
                 length = resp.getheader("Content-Length")
                 if length is not None:
-                    self.send_header("Content-Length", length)
+                    self.send_header("Content-Length", header_text(length))
             else:
                 self.send_header("Content-Length", str(len(data)))
             self.end_headers()

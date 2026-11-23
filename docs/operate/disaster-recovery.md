@@ -215,16 +215,28 @@ committed range.
    its start; nothing needs resetting.
 6. Start the engine, wait until it has archived the source, and run the
    [three checks](#before-any-recovery).
-7. **Report the loss**, from the old ledger. The records lost are the committed
-   batches whose range is below the first offset the broker still holds
+7. **Report the loss**, from the old ledger. The records lost are those of the
+   committed batches that start below the first offset the broker still holds
    (`kafka-get-offsets.sh --bootstrap-server "$BROKERS" --topic "$TOPIC" --time -2`):
+   all of a batch that ends below it, and the part below it of a batch that
+   straddles it:
 
    ```sql
-   SELECT batch_id, record_count, progress_start_json, progress_end_json
+   SELECT batch_id, record_count,
+          ((progress_start_json::json)->>'start_offset')::bigint AS start_offset,
+          ((progress_end_json::json)->>'end_offset')::bigint AS end_offset,
+          CASE WHEN ((progress_end_json::json)->>'end_offset')::bigint < :first_retained_offset
+               THEN 'whole' ELSE 'part' END AS lost
    FROM batches
    WHERE state = 'source_committed' AND source_type = 'kafka'
-     AND ((progress_end_json::json)->>'end_offset')::bigint < :first_retained_offset;
+     AND ((progress_start_json::json)->>'start_offset')::bigint < :first_retained_offset;
    ```
+
+   A `whole` batch lost its `record_count` records. A `part` batch lost the
+   records at offsets `start_offset` up to `:first_retained_offset - 1`: at
+   most that many, and exactly that many when the partition's offsets have no
+   gaps (no compaction, no transaction markers). Report a `part` batch's
+   count as "at most" unless you know the offsets are dense.
 
 ### Pass criteria
 
@@ -324,7 +336,12 @@ nine.
 | Leg | The backup held | The DR bucket held at the disaster | Ledger rows lost | Check in step 4 | First commit | Caught up | Missing | Archived twice |
 |---|---|---|---|---|---|---|---|---|
 | Replica complete | 6 batches | 180 of 180 archived records | 3 batches | passes | 2.9 s | 9.9 s | 0 | 0 |
-| Replica behind (cut off for the last three batches) | 9 batches | 120 of 180 archived records | 0 batches | fails: 6 objects, naming exactly the last three batches | 13.4 s (the repair) | 13.4 s | 0 | 0 |
+| Replica behind (cut off for the last three batches) | 9 batches | 120 of 180 archived records | 0 batches | fails: 6 objects, naming exactly the last three batches | 13.4 s (the repair alone; see below) | 13.4 s (the repair alone) | 0 | 0 |
+
+The "replica behind" times are the repair alone: they were measured before the
+drill timed that leg from the first step in the DR region, as the bound says,
+so they leave out the restore, the migration and the failed check. The next
+run replaces them.
 
 The records the replica lacked were archived again from the source: that is
 the RPO of the archive, 60 records here, and it is zero losses only because the
