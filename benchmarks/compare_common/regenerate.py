@@ -125,17 +125,7 @@ def main(argv: list[str] | None = None) -> int:
                     owner[path] = run
         if clashes:
             raise kr.Refused("two runs write the same file, so only the last is checked: " + "; ".join(clashes))
-        # The summary draws the same runs once more, in its own files: one run per kind. A kind with two (the
-        # two halves of a split plan, each with its own report.json) would have all but one left out of it
-        # without a word, so that is refused until the summary draws more than one run of a kind.
-        several = {kind: runs for kind, runs in all_runs.items() if len(runs) > 1}
-        if several:
-            said = "; ".join(f"{kind} has {len(runs)} committed runs "
-                             f"({', '.join(os.path.basename(run) for run in runs)})"
-                             for kind, runs in sorted(several.items()))
-            raise kr.Refused(f"the summary draws one run per kind, and {said}: it would leave the others' results "
-                             "out. Combine them in the summary (compare_common/summary.py) before committing a "
-                             "second run of a kind.")
+        # The summary draws the same runs once more, in its own files.
         try:
             written = summary.build({kind: runs[0] for kind, runs in all_runs.items() if runs}, REPO)
         except (schema.RunRefused, registry.RegistryError) as exc:

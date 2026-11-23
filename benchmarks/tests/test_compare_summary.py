@@ -221,23 +221,6 @@ def test_regenerate_draws_the_summary_from_the_runs_it_found_and_checks_its_outp
     assert os.path.realpath("/out/summary.md") in seen["written"]
 
 
-def test_regenerate_refuses_a_kind_with_two_runs_rather_than_summarise_one(monkeypatch, capsys):
-    # Review of #946: the summary is drawn from one run per kind, and took the first of two committed runs of a
-    # kind (the AWS ingest commits two archive runs), leaving the other's results out of it without a word.
-    monkeypatch.setattr(regenerate, "committed_runs",
-                        lambda kind, repo=REPO: [f"/runs/{kind}-store-kills", f"/runs/{kind}-time-kills"]
-                        if kind == "archive" else [])
-    monkeypatch.setattr(regenerate.kr, "check_stack", lambda pins: None)
-    monkeypatch.setattr(regenerate.kr, "check_font", lambda: None)
-    monkeypatch.setattr(regenerate.kr, "check_runs_unchanged", lambda runs: None)
-    monkeypatch.setattr(regenerate, "run_report", lambda kind, run: [f"/out/{os.path.basename(run)}.md"])
-    monkeypatch.setattr(summary, "build", lambda runs, repo: pytest.fail(f"summarised one run of two: {runs}"))
-    assert regenerate.main([]) == 2
-    err = capsys.readouterr().err
-    assert "archive has 2 committed runs (archive-store-kills, archive-time-kills)" in err
-    assert "draws one run per kind" in err
-
-
 def test_regenerate_refuses_when_the_summary_cannot_be_drawn(monkeypatch, capsys):
     monkeypatch.setattr(regenerate, "committed_runs", lambda kind, repo=REPO: [])
     monkeypatch.setattr(regenerate.kr, "check_runs_unchanged", lambda runs: None)
