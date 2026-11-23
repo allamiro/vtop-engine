@@ -142,14 +142,6 @@ markdown_extensions:
 # hooks add at the end of every page both follow it. The long design
 # documents sit at the end of Reference so the guided path never detours
 # through them.
-# The per-kind comparison pages (#744) exist only once a run of that kind is
-# committed (regenerate.py writes them), so they cannot be listed in the nav
-# without a missing-file warning before that; the summary page links them.
-not_in_nav: |
-  /benchmarks/archive-comparison.md
-  /benchmarks/link-comparison.md
-  /benchmarks/spool-comparison.md
-
 nav:
   - Home: index.md
   - Introduction:
@@ -228,10 +220,8 @@ nav:
           - Comparison: COMPARISON.md
   - Benchmarks:
       - benchmarks/index.md
-      - Comparison summary: benchmarks/comparison-summary.md
       - Kafka comparison: benchmarks/kafka-comparison.md
       - Kafka failover: benchmarks/kafka-failover.md
-      - AWS results, v0.11.0: benchmarks/aws-v0.11.0.md
       - Throughput research: THROUGHPUT_RESEARCH.md
       - Egress transport research: EGRESS_TRANSPORT_RESEARCH.md
       - Fetch I/O research: FETCH_IO_RESEARCH.md
