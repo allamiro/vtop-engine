@@ -185,6 +185,16 @@ def test_a_matrix_result_that_names_no_server_is_refused(data_tree):
         site_facts.site_facts(root)
 
 
+def test_the_lab_minio_counts_as_live_s3_tests_in_ci_when_the_matrix_runs_it():
+    # Since #837, ci.yml runs the live S3 tests by calling the matrix with servers ["minio"].
+    assert site_facts.s3_servers()["lab"]["ran"] == "Docker lab and live S3 tests in CI"
+
+
+def test_a_matrix_call_without_minio_is_not_live_s3_tests_on_the_lab(data_tree):
+    root = data_tree({site_facts.CI: lambda text: text.replace("servers: '[\"minio\"]'", "servers: '[\"rustfs\"]'")})
+    assert site_facts.s3_servers(root)["lab"]["ran"] == "Docker lab"
+
+
 def test_the_kafka_versions_are_the_runs_the_lab_s_and_ci_s():
     tested = site_facts.site_facts()["tested"]
     by_version = {item["version"]: item["ran"] for item in tested["kafka"]}

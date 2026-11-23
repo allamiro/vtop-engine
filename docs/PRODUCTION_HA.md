@@ -1794,7 +1794,7 @@ deployment identity; the live battery proves the runtime role cannot run DDL,
   derived key is never written over (`crates/vtop-cli/tests/object_lock.rs`,
   against the mock store); the store's own behaviour, an overwrite that makes
   a new version and a locked version that survives a delete, is tested
-  against the lab's MinIO in CI (`minio-integration`). A replay in a later
+  against the lab's MinIO in CI (the `s3 compat` job, which also runs it against the other servers nightly). A replay in a later
   hour is sealed at the instant its row recorded (#755), and a replay over a
   source that grew is rebuilt as first cut (#793, #796), so both reuse the
   object (v0.10.0). Not done: reproducing batch boundaries after a power

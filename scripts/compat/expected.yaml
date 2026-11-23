@@ -58,6 +58,17 @@ cells:
     since: v0.2.0
     directions: [upgrade]
 
+  # The native protocol (scripts/compat/cells/wire.sh, which runs
+  # scripts/upgrade-compat.sh with UPGRADE_WIRE): the release's vtop-node
+  # serves and this build's produce and verify are the client (upgrade), and
+  # the reverse (forward): a leader and a follower on quorum durability, 2000
+  # records produced and read back. The replica plane is exercised between
+  # nodes of the same release; an old follower under a new leader is live
+  # scenario 22's.
+  wire:
+    since: v0.2.0
+    directions: [upgrade, forward]
+
   # A metadata voter's directory (scripts/compat/cells/meta.sh): the Raft log,
   # the snapshot, and the applied, purged and hard-state files.
   #   upgrade  the release's vtop-node writes it with
