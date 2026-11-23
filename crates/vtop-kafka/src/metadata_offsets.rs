@@ -120,6 +120,24 @@ pub struct PartitionRange {
 /// from holding the request past its deadline.
 const CAS_ATTEMPTS: usize = 4;
 
+/// How long a commit waits for the broker's lease view while it is busy
+/// (#751), and how often it looks again.
+///
+/// The view is busy whenever a produce or a fetch holds the broker's lease
+/// lock, which a produce does through its fsync: on a range that is being
+/// written and read, that is a large share of the time. Answered at once,
+/// every busy moment was a `COORDINATOR_NOT_AVAILABLE`, which a stock client
+/// treats as a lost coordinator: librdkafka defers the commit, finds the
+/// coordinator again and resends, and under a steady stream the group's
+/// position stood still for seconds at a time while its consumer read on.
+/// Live-chaos scenario 33 saw the committed offset stay 368 records behind a
+/// consumer that auto-commits every 500 ms, and a failover then delivered all
+/// of them again. Waiting a few milliseconds for the fsync to end is what the
+/// commit needs; the bound keeps a view that stays busy (a stalled disk) from
+/// holding the request, which then answers as before.
+const LEASE_VIEW_PATIENCE: std::time::Duration = std::time::Duration::from_millis(1_000);
+const LEASE_VIEW_POLL: std::time::Duration = std::time::Duration::from_millis(1);
+
 /// What the store remembers of a group on one range: the plane's identities
 /// for it and the last CAS tokens it saw. A guess, corrected by every answer.
 #[derive(Debug, Clone, Default)]
@@ -162,6 +180,8 @@ pub struct MetadataOffsetStore {
     groups: Mutex<HashMap<String, GroupState>>,
     /// The metadata warning is given once per store, not per commit.
     metadata_dropped_said: AtomicBool,
+    /// The busy-lease-view warning, likewise once per store.
+    lease_busy_said: AtomicBool,
 }
 
 impl MetadataOffsetStore {
@@ -178,6 +198,21 @@ impl MetadataOffsetStore {
             aliases: Vec::new(),
             groups: Mutex::new(HashMap::new()),
             metadata_dropped_said: AtomicBool::new(false),
+            lease_busy_said: AtomicBool::new(false),
+        }
+    }
+
+    /// The lease as the broker holds it, waited for while the broker's view
+    /// is busy (see [`LEASE_VIEW_PATIENCE`]). `Unknown` only once the
+    /// patience has run out; `Held` and `Gone` as soon as either is seen.
+    async fn settled_lease(&self) -> LeaseState {
+        let deadline = tokio::time::Instant::now() + LEASE_VIEW_PATIENCE;
+        loop {
+            let state = self.lease.lease();
+            if state != LeaseState::Unknown || tokio::time::Instant::now() >= deadline {
+                return state;
+            }
+            tokio::time::sleep(LEASE_VIEW_POLL).await;
         }
     }
 
@@ -515,7 +550,7 @@ impl OffsetStore for MetadataOffsetStore {
         }
         // The lease, before anything else (review): a node that does not
         // hold the range takes no commit for it, and says which code.
-        let fencing_epoch = match self.lease.lease() {
+        let fencing_epoch = match self.settled_lease().await {
             LeaseState::Held(epoch) => epoch,
             LeaseState::Gone => {
                 tracing::warn!(
@@ -527,12 +562,24 @@ impl OffsetStore for MetadataOffsetStore {
                 return Err(ErrorCode::NotCoordinator);
             }
             LeaseState::Unknown => {
-                tracing::debug!(
-                    group,
-                    range = %self.range.range_uuid,
-                    "kafka offsets: the broker's lease view is busy; the commit is not taken now and \
-                     the client retries"
-                );
+                if !self.lease_busy_said.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        group,
+                        range = %self.range.range_uuid,
+                        patience_ms = LEASE_VIEW_PATIENCE.as_millis() as u64,
+                        "kafka offsets: the broker's lease view stayed busy for {} ms, so the commit \
+                         is not taken now and the client retries; a broker that holds it this long \
+                         is waiting on its disk (said once)",
+                        LEASE_VIEW_PATIENCE.as_millis()
+                    );
+                } else {
+                    tracing::debug!(
+                        group,
+                        range = %self.range.range_uuid,
+                        "kafka offsets: the broker's lease view is busy; the commit is not taken now and \
+                         the client retries"
+                    );
+                }
                 return Err(ErrorCode::CoordinatorNotAvailable);
             }
         };
@@ -1161,6 +1208,64 @@ mod tests {
         );
         // Reads are the plane's truth for anyone.
         assert_eq!(store_a.fetch("g", "events", 0).await, Ok(Some(at(20))));
+    }
+
+    /// A broker view that is busy for a moment does not refuse the commit
+    /// (#751): the store waits for it, so a commit made while a produce holds
+    /// the broker's lock through its fsync lands, where it used to be
+    /// answered `COORDINATOR_NOT_AVAILABLE` and the group's position stood
+    /// still under a steady stream. A view that stays busy past the patience
+    /// is still refused as retryable, and the plane is not asked.
+    #[tokio::test]
+    async fn a_commit_waits_out_a_busy_lease_view() {
+        /// Busy for the first `busy` reads, then held.
+        struct BusyThenHeld {
+            busy: std::sync::atomic::AtomicUsize,
+            epoch: u64,
+        }
+        impl LeaseView for BusyThenHeld {
+            fn lease(&self) -> LeaseState {
+                let left = self.busy.load(Ordering::SeqCst);
+                if left == 0 {
+                    return LeaseState::Held(self.epoch);
+                }
+                self.busy.store(left - 1, Ordering::SeqCst);
+                LeaseState::Unknown
+            }
+        }
+        let plane = Arc::new(MemoryPlane::with_range());
+        let epoch = plane.grant(NODE_A);
+        let view = Arc::new(BusyThenHeld {
+            busy: std::sync::atomic::AtomicUsize::new(5),
+            epoch,
+        });
+        let store = MetadataOffsetStore::new(
+            Arc::clone(&plane) as Arc<dyn CursorPlane>,
+            Arc::clone(&view) as Arc<dyn LeaseView>,
+            identity_of(NODE_A),
+        );
+        store.commit("g", "events", 0, at(10)).await.unwrap();
+        assert_eq!(store.fetch("g", "events", 0).await, Ok(Some(at(10))));
+        view.busy.store(3, Ordering::SeqCst);
+        store.commit("g", "events", 0, at(20)).await.unwrap();
+        assert_eq!(store.fetch("g", "events", 0).await, Ok(Some(at(20))));
+
+        // Busy for longer than the patience: refused as retryable, at about
+        // the patience, without asking the plane.
+        view.busy.store(usize::MAX, Ordering::SeqCst);
+        let before = plane.index.load(Ordering::SeqCst);
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            store.commit("g", "events", 0, at(30)).await,
+            Err(ErrorCode::CoordinatorNotAvailable)
+        );
+        assert!(started.elapsed() >= LEASE_VIEW_PATIENCE);
+        assert_eq!(
+            plane.index.load(Ordering::SeqCst),
+            before,
+            "the plane was not asked"
+        );
+        assert_eq!(store.fetch("g", "events", 0).await, Ok(Some(at(20))));
     }
 
     /// The commit path's lines hold at the store, before the plane is asked:

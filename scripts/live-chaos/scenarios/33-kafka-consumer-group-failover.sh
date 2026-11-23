@@ -390,6 +390,7 @@ else:
 }
 
 : > "$BASE_WORKDIR/group-failover-results.txt"
+FAILED_CLIENTS=()
 for client in $CLIENTS; do
   if [[ "$client" == "jvm" ]]; then
     if [[ -z "${CHAOS_KAFKA_HOME:-}" && -z "${CHAOS_KAFKA_IMAGE:-}" ]]; then
@@ -399,10 +400,27 @@ for client in $CLIENTS; do
     require_command java "Install a JVM, 17 or newer: the Kafka distribution's client tools run on it."
     kafka_distribution "$BASE_WORKDIR" kafka-console-consumer
   fi
-  run_client "$client"
+  # Each client in a subshell of its own, so one that fails does not keep
+  # the other from being run and reported: two clients' evidence from one
+  # run. errexit is set again inside, since a subshell tested by `if` or
+  # `||` would run with it off. The EXIT trap is not inherited, so what a
+  # failed client left running is stopped here.
+  set +e
+  ( set -e; run_client "$client" )
+  code=$?
+  set -e
+  if [[ $code -ne 0 ]]; then
+    FAILED_CLIENTS+=("$client")
+    while read -r pid; do
+      kill -9 "$pid" 2>/dev/null || true
+    done < "$BASE_WORKDIR/$client/pids"
+    wait 2>/dev/null || true
+  fi
 done
 WORKDIR="$BASE_WORKDIR"
 SCENARIO="$BASE_SCENARIO"
 log "results:"
 sed 's/^/  /' "$BASE_WORKDIR/group-failover-results.txt"
+[[ ${#FAILED_CLIENTS[@]} -eq 0 ]] \
+  || fail "the consumer group did not follow the failover under: ${FAILED_CLIENTS[*]} (each client's reason is above)"
 log "PASS"
