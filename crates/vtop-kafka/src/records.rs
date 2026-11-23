@@ -15,7 +15,8 @@
 //! idempotent contract for, and the honest answer is a version refusal at the
 //! API level rather than a silent downgrade here.
 
-use crate::wire::{Decoder, Encoder, WireError};
+use crate::codec::{self, CodecError};
+use crate::wire::{Decoder, Encoder, WireError, MAX_FIELD_BYTES};
 
 /// Batch header size through the end of `baseSequence`, i.e. everything before
 /// the record count.
@@ -77,8 +78,25 @@ pub enum BatchError {
     Wire(#[from] WireError),
     #[error("record batch magic {found} is not supported; this gateway serves magic {MAGIC_V2} (Kafka 0.11+) only")]
     UnsupportedMagic { found: i8 },
-    #[error("record batch is compressed (codec {codec}), which this gateway does not decompress")]
-    Compressed { codec: i16 },
+    #[error(
+        "record batch is compressed with {} (codec {codec}), which this gateway does not \
+         decompress; it serves {}",
+        codec::name(*codec),
+        codec::served_list()
+    )]
+    CodecNotServed { codec: i16 },
+    #[error("record batch declares compression codec {codec}, which Kafka does not define")]
+    UnknownCodec { codec: i16 },
+    #[error(
+        "record batch's {} stream does not decompress although its CRC matched: {reason}",
+        codec::name(*codec)
+    )]
+    CorruptCompressed { codec: i16, reason: String },
+    #[error(
+        "record batch expands past {limit} bytes after {} decompression",
+        codec::name(*codec)
+    )]
+    DecompressedTooLarge { codec: i16, limit: usize },
     #[error("record batch is transactional, and transactions are out of scope (#225)")]
     Transactional,
     #[error(
@@ -158,14 +176,31 @@ pub struct RecordBatch {
     pub records: Vec<Record>,
 }
 
+/// The codec a batch's header declares, from its `attributes`, without
+/// judging anything else. The caller has checked the slice is at least 23
+/// bytes long.
+pub fn declared_codec(batch: &[u8]) -> i16 {
+    i16::from_be_bytes([batch[21], batch[22]]) & COMPRESSION_MASK
+}
+
 impl RecordBatch {
-    /// Parse one batch, verifying its CRC.
+    /// Parse one batch, verifying its CRC; a compressed batch may expand to
+    /// at most [`MAX_FIELD_BYTES`], the most an uncompressed one can carry.
+    pub fn decode(buf: &[u8]) -> Result<Self, BatchError> {
+        Self::decode_within(buf, MAX_FIELD_BYTES).map(|(batch, _)| batch)
+    }
+
+    /// Parse one batch, verifying its CRC, and say how many bytes its
+    /// records section decompressed to (zero for an uncompressed batch).
+    /// A compressed records section may expand to at most `limit` bytes.
     ///
     /// The CRC is checked BEFORE the contents are trusted, because every field
     /// after it is a length or a delta that steers the parse: verifying
     /// afterwards would mean deciding a batch was corrupt only after acting on
-    /// its numbers.
-    pub fn decode(buf: &[u8]) -> Result<Self, BatchError> {
+    /// its numbers. The same holds for a compressed batch (#596): the CRC
+    /// covers the compressed bytes, so a decoder never sees a byte the
+    /// producer did not checksum.
+    pub fn decode_within(buf: &[u8], limit: usize) -> Result<(Self, usize), BatchError> {
         if buf.len() < HEADER_BYTES {
             return Err(BatchError::Short { len: buf.len() });
         }
@@ -212,9 +247,6 @@ impl RecordBatch {
         let _crc = d.u32("batch.crc")?;
         let attributes = d.i16("batch.attributes")?;
         let codec = attributes & COMPRESSION_MASK;
-        if codec != 0 {
-            return Err(BatchError::Compressed { codec });
-        }
         if attributes & TRANSACTIONAL_FLAG != 0 {
             return Err(BatchError::Transactional);
         }
@@ -250,6 +282,38 @@ impl RecordBatch {
             });
         }
 
+        // Compressed (#596): everything after the record count is one codec
+        // stream holding the records, which decode from the decompressed
+        // bytes exactly as from a plain batch. Offsets and timestamps are
+        // deltas inside it, and the count stays binding in both directions
+        // over the decompressed records.
+        let decompressed = if codec == 0 {
+            None
+        } else {
+            let rest = d.rest();
+            Some(
+                codec::decompress(codec, rest, limit).map_err(|error| match error {
+                    CodecError::NotServed { codec } => BatchError::CodecNotServed { codec },
+                    CodecError::Unknown { codec } => BatchError::UnknownCodec { codec },
+                    CodecError::Corrupt { codec, reason } => {
+                        BatchError::CorruptCompressed { codec, reason }
+                    }
+                    CodecError::TooLarge { codec, limit } => {
+                        BatchError::DecompressedTooLarge { codec, limit }
+                    }
+                })?,
+            )
+        };
+        let expanded = decompressed.as_ref().map_or(0, Vec::len);
+        let mut inner;
+        let d = match decompressed.as_deref() {
+            Some(bytes) => {
+                inner = Decoder::new(bytes);
+                &mut inner
+            }
+            None => &mut d,
+        };
+
         // No `with_capacity(declared)`: the count is an attacker's number
         // until the records are actually there, and the ceiling above is
         // 65,536 entries of reserve on a lie.
@@ -265,7 +329,7 @@ impl RecordBatch {
                 });
             }
             records.push(decode_record(
-                &mut d,
+                d,
                 base_offset,
                 base_timestamp,
                 index,
@@ -288,13 +352,16 @@ impl RecordBatch {
                 remaining: d.remaining(),
             });
         }
-        Ok(Self {
-            base_offset,
-            producer_id,
-            producer_epoch,
-            base_sequence,
-            records,
-        })
+        Ok((
+            Self {
+                base_offset,
+                producer_id,
+                producer_epoch,
+                base_sequence,
+                records,
+            },
+            expanded,
+        ))
     }
 
     /// Encode records as one batch at `base_offset`, computing the deltas and
@@ -628,8 +695,237 @@ pub fn crc32c(data: &[u8]) -> u32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// A plain batch re-packed with its records section compressed by
+    /// `codec` (#596), as a producer would send it: the attributes carry the
+    /// codec, and batchLength and the CRC are recomputed over the compressed
+    /// bytes. The record count stays the uncompressed count.
+    pub(crate) fn compressed(codec: i16, plain: &[u8]) -> Vec<u8> {
+        let section = &plain[HEADER_BYTES..];
+        let packed = match codec {
+            codec::GZIP => {
+                use std::io::Write as _;
+                let mut e =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                e.write_all(section).unwrap();
+                e.finish().unwrap()
+            }
+            codec::ZSTD => zstd::encode_all(section, 3).unwrap(),
+            _ => section.to_vec(),
+        };
+        with_records_section(codec, &plain[..HEADER_BYTES], &packed)
+    }
+
+    /// A batch with `header` (through the record count) and `section` as its
+    /// records, codec bits set to `codec`, framing and CRC made valid.
+    pub(crate) fn with_records_section(codec: i16, header: &[u8], section: &[u8]) -> Vec<u8> {
+        let mut out = header[..HEADER_BYTES].to_vec();
+        out.extend_from_slice(section);
+        let attributes = i16::from_be_bytes([out[21], out[22]]) & !COMPRESSION_MASK | codec;
+        out[21..23].copy_from_slice(&attributes.to_be_bytes());
+        let batch_length = (out.len() - 12) as i32;
+        out[8..12].copy_from_slice(&batch_length.to_be_bytes());
+        let crc = crc32c(&out[CRC_COVERAGE_START..]);
+        out[CRC_OFFSET..CRC_OFFSET + 4].copy_from_slice(&crc.to_be_bytes());
+        out
+    }
+
+    /// The records every fixture carries, from `tests/fixtures/records.txt`
+    /// (`key:value` per line), the file `scripts/gen-kafka-fixtures.sh`
+    /// produced them from.
+    fn fixture_records() -> Vec<(Vec<u8>, Vec<u8>)> {
+        include_str!("../tests/fixtures/records.txt")
+            .lines()
+            .map(|line| {
+                let (key, value) = line.split_once(':').unwrap();
+                (key.as_bytes().to_vec(), value.as_bytes().to_vec())
+            })
+            .collect()
+    }
+
+    /// A batch the pinned JVM producer compressed decodes to exactly the
+    /// records it was given, in order, with contiguous offsets and the
+    /// producer's create times.
+    fn the_jvm_batch_decodes_to_its_records(codec: i16, batch: &[u8]) {
+        assert_eq!(
+            i16::from_be_bytes([batch[21], batch[22]]) & COMPRESSION_MASK,
+            codec,
+            "the fixture is not {} (regenerate it)",
+            codec::name(codec)
+        );
+        let (decoded, expanded) = RecordBatch::decode_within(batch, MAX_FIELD_BYTES).unwrap();
+        let want = fixture_records();
+        assert!(
+            expanded > batch.len(),
+            "{} expanded to {expanded}",
+            codec::name(codec)
+        );
+        assert_eq!(decoded.records.len(), want.len());
+        for (i, (record, (key, value))) in decoded.records.iter().zip(&want).enumerate() {
+            assert_eq!(record.key.as_deref(), Some(&key[..]), "record {i}");
+            assert_eq!(record.value.as_deref(), Some(&value[..]), "record {i}");
+            assert_eq!(record.offset, decoded.base_offset + i as i64);
+            assert!(record.headers.is_empty());
+            assert!(
+                record.timestamp_millis > 1_700_000_000_000,
+                "record {i}: create time {}",
+                record.timestamp_millis
+            );
+        }
+        assert!(decoded.producer_id >= 0, "an idempotent producer's batch");
+    }
+
+    #[test]
+    fn a_gzip_batch_decodes_to_its_records() {
+        the_jvm_batch_decodes_to_its_records(
+            codec::GZIP,
+            include_bytes!("../tests/fixtures/gzip.batch"),
+        );
+    }
+
+    #[test]
+    fn a_zstd_batch_decodes_to_its_records() {
+        the_jvm_batch_decodes_to_its_records(
+            codec::ZSTD,
+            include_bytes!("../tests/fixtures/zstd.batch"),
+        );
+    }
+
+    /// The CRC covers the compressed bytes and is checked first: a stream
+    /// that would expand past the cap, or not decompress at all, is reported
+    /// as a CRC mismatch when one of its bytes is flipped. The decoder never
+    /// ran, or the error would be the decoder's.
+    #[test]
+    fn a_compressed_batch_with_a_bad_crc_is_corrupt_and_never_reaches_the_decoder() {
+        let plain = RecordBatch::encode(0, -1, -1, -1, &[record(0, "k", "v")]);
+        let bomb = zstd::encode_all(&vec![0_u8; MAX_FIELD_BYTES + 1][..], 19).unwrap();
+        for codec in [codec::GZIP, codec::ZSTD] {
+            for section in [bomb.clone(), b"not a stream at all".to_vec()] {
+                let mut batch = with_records_section(codec, &plain, &section);
+                let last = batch.len() - 1;
+                batch[last] ^= 0xff;
+                assert!(
+                    matches!(
+                        RecordBatch::decode(&batch),
+                        Err(BatchError::CrcMismatch { .. })
+                    ),
+                    "{}: {:?}",
+                    codec::name(codec),
+                    RecordBatch::decode(&batch)
+                );
+            }
+        }
+    }
+
+    /// A few KiB of zeros that expand past 16 MiB stop at the cap: refused
+    /// as too large, with at most cap + 1 bytes ever held.
+    #[test]
+    fn a_decompression_bomb_stops_at_the_cap() {
+        let plain = RecordBatch::encode(0, -1, -1, -1, &[record(0, "k", "v")]);
+        let zeros = vec![0_u8; MAX_FIELD_BYTES + 4096];
+        for codec in [codec::GZIP, codec::ZSTD] {
+            let packed = match codec {
+                codec::GZIP => {
+                    use std::io::Write as _;
+                    let mut e =
+                        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+                    e.write_all(&zeros).unwrap();
+                    e.finish().unwrap()
+                }
+                _ => zstd::encode_all(&zeros[..], 19).unwrap(),
+            };
+            assert!(packed.len() < 64 * 1024, "{} bytes", packed.len());
+            let batch = with_records_section(codec, &plain, &packed);
+            assert_eq!(
+                RecordBatch::decode(&batch),
+                Err(BatchError::DecompressedTooLarge {
+                    codec,
+                    limit: MAX_FIELD_BYTES
+                })
+            );
+            // A smaller budget is honoured, not only the default.
+            assert_eq!(
+                RecordBatch::decode_within(&batch, 1024).map(|_| ()),
+                Err(BatchError::DecompressedTooLarge { codec, limit: 1024 })
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncated_compressed_stream_is_corrupt() {
+        let records: Vec<Record> = (0..50).map(|i| record(i, "key", "a value")).collect();
+        let plain = RecordBatch::encode(0, -1, -1, -1, &records);
+        for codec in [codec::GZIP, codec::ZSTD] {
+            let whole = compressed(codec, &plain);
+            assert_eq!(RecordBatch::decode(&whole).unwrap().records, records);
+            let section = &whole[HEADER_BYTES..];
+            let cut = with_records_section(codec, &plain, &section[..section.len() / 2]);
+            assert!(
+                matches!(
+                    RecordBatch::decode(&cut),
+                    Err(BatchError::CorruptCompressed { .. })
+                ),
+                "{}: {:?}",
+                codec::name(codec),
+                RecordBatch::decode(&cut)
+            );
+        }
+    }
+
+    /// The header's count is the uncompressed count, binding both ways over
+    /// the decompressed records: too many declared is a short read, too few
+    /// leaves records behind, and neither is a successful batch.
+    #[test]
+    fn a_record_count_that_disagrees_with_the_decompressed_records_is_refused() {
+        let records: Vec<Record> = (0..5).map(|i| record(i, "k", "v")).collect();
+        let plain = RecordBatch::encode(0, -1, -1, -1, &records);
+        for codec in [codec::GZIP, codec::ZSTD] {
+            for (declared, too_many) in [(6_i32, true), (4, false)] {
+                let mut header = plain[..HEADER_BYTES].to_vec();
+                header[57..61].copy_from_slice(&declared.to_be_bytes());
+                let mut lying = header.clone();
+                lying.extend_from_slice(&plain[HEADER_BYTES..]);
+                let batch = compressed(codec, &lying);
+                let result = RecordBatch::decode(&batch);
+                if too_many {
+                    assert_eq!(
+                        result,
+                        Err(BatchError::RecordCount { declared, found: 5 }),
+                        "{}",
+                        codec::name(codec)
+                    );
+                } else {
+                    assert!(
+                        matches!(result, Err(BatchError::TrailingBytes { declared: 4, .. })),
+                        "{}: {result:?}",
+                        codec::name(codec)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unserved_and_unknown_codecs_are_refused_by_name() {
+        let plain = RecordBatch::encode(0, -1, -1, -1, &[record(0, "k", "v")]);
+        for codec in [codec::SNAPPY, codec::LZ4] {
+            let batch = with_records_section(codec, &plain, &plain[HEADER_BYTES..]);
+            let error = RecordBatch::decode(&batch).unwrap_err();
+            assert_eq!(error, BatchError::CodecNotServed { codec });
+            let text = error.to_string();
+            assert!(text.contains(codec::name(codec)), "{text}");
+            assert!(text.contains("gzip, zstd, none"), "{text}");
+        }
+        for codec in 5..=7 {
+            let batch = with_records_section(codec, &plain, &plain[HEADER_BYTES..]);
+            assert_eq!(
+                RecordBatch::decode(&batch),
+                Err(BatchError::UnknownCodec { codec })
+            );
+        }
+    }
 
     fn record(offset: i64, key: &str, value: &str) -> Record {
         Record {
@@ -726,11 +1022,20 @@ mod tests {
     fn compressed_and_transactional_batches_are_refused_by_name() {
         let base = RecordBatch::encode(0, 1, 0, 0, &[record(0, "k", "v")]);
 
+        // A batch flagged gzip whose section is plain records is not a gzip
+        // stream (#596: gzip is decompressed now): corrupt, never read as
+        // the plain records it happens to hold.
         let mut compressed = base.clone();
         set_attributes(&mut compressed, 1); // gzip
         assert!(matches!(
             RecordBatch::decode(&compressed),
-            Err(BatchError::Compressed { codec: 1 })
+            Err(BatchError::CorruptCompressed { codec: 1, .. })
+        ));
+        let mut unknown = base.clone();
+        set_attributes(&mut unknown, 7);
+        assert!(matches!(
+            RecordBatch::decode(&unknown),
+            Err(BatchError::UnknownCodec { codec: 7 })
         ));
 
         let mut transactional = base.clone();
