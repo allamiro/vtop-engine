@@ -226,10 +226,11 @@ def test_an_informational_probes_observation_is_listed_and_never_judged(tmp_path
     repo2 = write_repo(tmp_path / "two", [run("srv", [refused])])
     assert report.main(["--repo", repo2]) == 0
     assert "## Observations" not in (tmp_path / "two" / report.PAGE).read_text()
-    # Results with no observation (every committed run today) render without the section.
-    committed = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", report.PAGE)
-    with open(committed, encoding="utf-8") as handle:
-        assert "## Observations" not in handle.read()
+    # Results with no observation render without the section (a fixture, not the
+    # committed page: once the probe's results are ingested that page has one).
+    repo3 = write_repo(tmp_path / "three", [run("srv", [case("v", ["put_get_head"], "pass")])])
+    assert report.main(["--repo", repo3]) == 0
+    assert "## Observations" not in (tmp_path / "three" / report.PAGE).read_text()
 
 
 @pytest.mark.parametrize("server", ["../../.github/workflows/evil", "a/b", ".hidden", "", "MinIO", 7])
