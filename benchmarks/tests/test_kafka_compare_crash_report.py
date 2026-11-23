@@ -209,3 +209,39 @@ def test_a_disk_name_that_would_break_the_footer_is_a_refusal_not_a_traceback(tm
     err = capsys.readouterr().err
     assert "report refused" in err and "footer" in err and "host_disk" not in err.replace("disk", "")
     assert not out.exists()
+
+
+def test_the_loss_chart_is_599_s_chart_of_acknowledged_records_lost_per_profile(tmp_path, monkeypatch):
+    # #599 asks for "a chart of lost-acknowledged records per profile, generated from the CSV". kafka-crash-loss
+    # is that chart: one panel per crash mode, one column per configuration (Kafka's two profiles and VTOP's),
+    # every ok crash's acked_lost from crash.csv as a point, and above each column how many ok crashes lost
+    # records and, where none did, the 95 % bound. So no second, summary chart is drawn; this pins what it holds.
+    from matplotlib.collections import PathCollection
+
+    drawn = {}
+    real_save = kreport._save
+
+    def capture(fig, img_dir, name, text):
+        drawn[name] = fig
+        return real_save(fig, img_dir, name, text)
+
+    monkeypatch.setattr(crash_report.base, "_save", capture)
+    render(SMOKE, tmp_path, min_ok=1)
+    fig = drawn["kafka-crash-loss"]
+    run = cs.load_crash_run(SMOKE, min_ok=1)
+    configs, modes = run.environment["matrix"]["configs"], ["flakey-drop", "sigkill"]
+    assert [ax.get_title(loc="left").split(" ")[0] for ax in fig.axes] == ["power", "SIGKILL"]
+    for ax, mode in zip(fig.axes, modes):
+        labels = [label.get_text().split("\n")[0] for label in ax.get_xticklabels()]
+        assert labels == [crash_report.CONFIG_LABEL[c] for c in configs]
+        for index, config in enumerate(configs):
+            want = sorted(int(r["acked_lost"]) for r in run.rows
+                          if (r["config"], r["crash_mode"], r["status"]) == (config, mode, "ok"))
+            points = sorted(int(y) for collection in ax.collections if isinstance(collection, PathCollection)
+                            for x, y in collection.get_offsets() if round(x) == index)
+            assert points == want, (mode, config)
+        said = [text.get_text() for text in ax.texts]
+        assert len(said) == len(configs)
+    flakey = [text.get_text() for text in fig.axes[0].texts]
+    assert flakey[0] == "2 of 2 lost records"
+    assert flakey[1] == "0 of 2 lost records\n95 % bound: 77.6 %"
