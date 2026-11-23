@@ -182,8 +182,29 @@ impl Action {
                 "voters",
                 "retain_removed_as_learners",
             ],
-            Action::ClusterEnableFeatures => &["level", "command"],
-            Action::ClusterCreateTopic => &["name", "topic_uuid", "root_range_uuid", "command"],
+            // The three attribution parameters (#706) come from a committed
+            // entry that named its actor, on the applied record of
+            // `cluster.enable_features`, `cluster.create_topic`,
+            // `cluster.propose` and `promotion.attest`: `requested_by` (the
+            // verified identity), `requested_from` (the address the leader
+            // saw) and `vouched_by` (the metadata node that checked the
+            // certificate). Identifiers and an address, never a claim.
+            Action::ClusterEnableFeatures => &[
+                "level",
+                "command",
+                "requested_by",
+                "requested_from",
+                "vouched_by",
+            ],
+            Action::ClusterCreateTopic => &[
+                "name",
+                "topic_uuid",
+                "root_range_uuid",
+                "command",
+                "requested_by",
+                "requested_from",
+                "vouched_by",
+            ],
             Action::ClusterPropose => &[
                 "command",
                 "topic_uuid",
@@ -198,6 +219,9 @@ impl Action {
                 "key_id",
                 "failure_domain",
                 "unarchived_deletion_allowed",
+                "requested_by",
+                "requested_from",
+                "vouched_by",
             ],
             Action::NodeRepair => &[
                 "from",
@@ -220,6 +244,9 @@ impl Action {
                 "replica_node_uuid",
                 "operator",
                 "command",
+                "requested_by",
+                "requested_from",
+                "vouched_by",
             ],
             Action::AuditGap => &["from_index", "through_index", "reason"],
             // What the file holds, its mode and who besides the owner can

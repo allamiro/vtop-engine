@@ -222,6 +222,14 @@ pub(crate) fn applied_command_record(
     record.log_index = Some(index);
     record.log_term = Some(term);
     record.issued_at_ms = Some(command.envelope().issued_at_ms);
+    // An attributed entry names its actor in the log (#706), so this
+    // replica's record does too, from the entry and not from anything
+    // this node saw: every replica writes the same three values.
+    if let MetadataCommand::Attributed { attribution, .. } = command {
+        record
+            .params
+            .extend(crate::audit::attribution_params(attribution));
+    }
     match response {
         Some(MetadataResponse::Rejected(error)) => {
             record.outcome = crate::audit::AuditOutcome::Failure;
