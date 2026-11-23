@@ -712,6 +712,10 @@ fn record_values(encoded: &[u8]) -> Vec<Vec<u8>> {
 
 fn decode_batches(mut encoded: &[u8]) -> Result<Vec<RecordBatch>, ErrorCode> {
     let mut out = Vec::new();
+    // A shadow's compressed batches share one budget (#596), as a produce's
+    // do: the shadow is the operator's, but its answer is still bytes off
+    // the network.
+    let mut budget = crate::wire::MAX_FIELD_BYTES;
     while !encoded.is_empty() {
         if encoded.len() < 12 {
             return Err(ErrorCode::CorruptMessage);
@@ -724,7 +728,9 @@ fn decode_batches(mut encoded: &[u8]) -> Result<Vec<RecordBatch>, ErrorCode> {
         if len > encoded.len() {
             return Err(ErrorCode::CorruptMessage);
         }
-        let batch = RecordBatch::decode(&encoded[..len]).map_err(|_| ErrorCode::CorruptMessage)?;
+        let (batch, used) = RecordBatch::decode_within(&encoded[..len], budget)
+            .map_err(|_| ErrorCode::CorruptMessage)?;
+        budget -= used;
         out.push(batch);
         encoded = &encoded[len..];
     }
