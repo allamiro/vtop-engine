@@ -61,8 +61,8 @@ by hand:
 - A cell is derived from a recorded outcome. A capability no case recorded
   is **not tested**, never assumed to pass.
 - The `s3-compat-results` workflow (weekly, and by hand) takes the results
-  of the newest nightly matrix run on `main` (and the newest AWS run, once
-  there is one), writes them under `tests/s3-compat/results/`, regenerates
+  of the newest nightly matrix run on `main` (and the newest AWS run),
+  writes them under `tests/s3-compat/results/`, regenerates
   the page and the README line, and uploads the changed files as the
   `s3-compat-results-refresh` artifact. It holds read permissions only. The
   maintainer copies the files over a branch of `main` and opens a pull
@@ -78,7 +78,11 @@ by hand:
 ## AWS S3 (opt-in)
 
 `.github/workflows/s3-aws.yml` runs the same live tests against AWS S3
-itself, nightly and by hand (`workflow_dispatch`), never on a pull request.
+itself, never on a pull request. The release gate takes one run per release
+(row B1, the maintainer's decision of 2026-11-23), dispatched by hand
+(`workflow_dispatch`) on the release's commit; the schedule in the file runs
+it nightly only while the workflow is enabled. AWS is never a required check:
+`tests/s3-compat/servers/aws.yaml` stays `gating: false`.
 It uses virtual-host addressing and no endpoint override, runs every test
 twice (`AWS_REQUEST_CHECKSUM_CALCULATION=when_supported`, then
 `when_required`), and uploads its results as the `s3-compat-results-aws`
@@ -183,6 +187,12 @@ GitHub's OIDC provider, for a role that trusts only this repository's
    matrix's and prepares the files that commit them; settle
    `tests/s3-compat/servers/aws.yaml` from them in a reviewed pull request.
    Issue #722 closes after this run.
+
+The first run, on v0.11.1 ([run 45127198938](https://github.com/allamiro/vtop-engine/actions/runs/45127198938),
+2026-11-23), passed every case it could run in both checksum modes, and
+`aws.yaml` was settled from it: `pass` for every capability a case tested,
+`unknown` with a note for the three that only the fault-injecting multipart
+cases name (`multipart_abort`, `multipart_list_uploads`, `multipart_resume`).
 
 What the AWS run cannot do: the multipart tests that inject faults through
 a local forwarder need a plain-HTTP endpoint, so on AWS they are recorded
