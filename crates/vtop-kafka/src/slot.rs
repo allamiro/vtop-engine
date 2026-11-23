@@ -32,6 +32,7 @@
 
 use crate::bridge::{Appended, Bridge, Fetched, Sequenced};
 use crate::messages::ErrorCode;
+use crate::offsets::{Committed, OffsetStore};
 use crate::records::RecordBatch;
 use std::sync::{Arc, RwLock};
 
@@ -173,6 +174,101 @@ impl Bridge for BridgeSlot {
             Some(bridge) => bridge.bounds(topic),
             None => Err(self.refusal(topic)),
         }
+    }
+}
+
+/// An [`OffsetStore`] that may be empty, for the same reason a
+/// [`BridgeSlot`] may be (#751).
+///
+/// The store a leader commits through is bound to its leadership: it reads
+/// the lease through that leadership's broker, and keeps that leadership's
+/// view of each group's cursor. A candidate therefore builds a fresh store at
+/// every promotion and installs it here, and clears it at the demotion. Empty
+/// answers `NOT_COORDINATOR`, which a client answers by finding the
+/// coordinator again; a gateway whose lease is gone refuses the group
+/// protocol before it reaches the store, so this is the answer only in the
+/// moment between a lease and its store.
+///
+/// As with the bridge, a call resolves the store once, at its start, and a
+/// cleared store is handed back to the caller to drop after the gateway has
+/// quiesced: a store write is a counted job, so after
+/// [`crate::gateway::GatewayHandle::quiesce`] nothing still holds it.
+#[derive(Default)]
+pub struct OffsetSlot {
+    installed: RwLock<Option<Arc<dyn OffsetStore>>>,
+}
+
+impl OffsetSlot {
+    /// An empty slot.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Install `store`, returning the one it replaced, if any.
+    pub fn install(&self, store: Arc<dyn OffsetStore>) -> Option<Arc<dyn OffsetStore>> {
+        self.write().replace(store)
+    }
+
+    /// Empty the slot, returning the store that was installed.
+    pub fn clear(&self) -> Option<Arc<dyn OffsetStore>> {
+        self.write().take()
+    }
+
+    /// Whether a store is installed now.
+    pub fn is_installed(&self) -> bool {
+        self.read().is_some()
+    }
+
+    fn current(&self) -> Result<Arc<dyn OffsetStore>, ErrorCode> {
+        self.read()
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or(ErrorCode::NotCoordinator)
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Option<Arc<dyn OffsetStore>>> {
+        self.installed
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Option<Arc<dyn OffsetStore>>> {
+        self.installed
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[async_trait::async_trait]
+impl OffsetStore for OffsetSlot {
+    async fn commit(
+        &self,
+        group: &str,
+        topic: &str,
+        partition: i32,
+        committed: Committed,
+    ) -> Result<(), ErrorCode> {
+        let store = self.current()?;
+        store.commit(group, topic, partition, committed).await
+    }
+
+    async fn fetch(
+        &self,
+        group: &str,
+        topic: &str,
+        partition: i32,
+    ) -> Result<Option<Committed>, ErrorCode> {
+        let store = self.current()?;
+        store.fetch(group, topic, partition).await
+    }
+
+    async fn committed(
+        &self,
+        group: &str,
+        at_most: usize,
+    ) -> Result<Vec<(String, i32, Committed)>, ErrorCode> {
+        let store = self.current()?;
+        store.committed(group, at_most).await
     }
 }
 
@@ -349,5 +445,40 @@ mod tests {
             witness.upgrade().is_none(),
             "the slot kept no second owner of a bridge it was told to clear"
         );
+    }
+
+    /// An empty offset slot answers `NOT_COORDINATOR`; an installed store
+    /// answers; a cleared one is the caller's to drop, and nothing else keeps
+    /// it (#751).
+    #[tokio::test]
+    async fn an_offset_slot_refuses_while_empty_and_hands_back_what_it_cleared() {
+        use crate::offsets::MemoryOffsetStore;
+        let slot = OffsetSlot::empty();
+        let at = Committed {
+            offset: 3,
+            metadata: None,
+        };
+        assert_eq!(
+            slot.commit("g", "events", 0, at.clone()).await,
+            Err(ErrorCode::NotCoordinator)
+        );
+        assert_eq!(
+            slot.fetch("g", "events", 0).await,
+            Err(ErrorCode::NotCoordinator)
+        );
+        let store: Arc<dyn OffsetStore> = Arc::new(MemoryOffsetStore::default());
+        let witness = Arc::downgrade(&store);
+        assert!(slot.install(store).is_none());
+        assert!(slot.is_installed());
+        slot.commit("g", "events", 0, at.clone()).await.unwrap();
+        assert_eq!(slot.fetch("g", "events", 0).await, Ok(Some(at)));
+        let retired = slot.clear();
+        assert!(retired.is_some());
+        assert_eq!(
+            slot.committed("g", 10).await,
+            Err(ErrorCode::NotCoordinator)
+        );
+        drop(retired);
+        assert!(witness.upgrade().is_none(), "the slot kept no second owner");
     }
 }
