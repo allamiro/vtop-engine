@@ -137,10 +137,17 @@ pub(crate) fn refuse_newer_level(
 /// level, so it is the only one the apply and replay paths look for.
 pub(crate) fn first_raise_above(entries: &[MetaLogEntry], supported: u32) -> Option<(u64, u32)> {
     entries.iter().find_map(|entry| match &entry.payload {
-        MetaLogPayload::Normal(crate::command::MetadataCommand::SetFeatureLevel {
-            feature_level,
-            ..
-        }) if *feature_level > supported => Some((entry.index, *feature_level)),
+        // The subject, not the command: an operator's raise is logged
+        // wrapped in its attribution (#706), and must be refused as a newer
+        // release exactly as the bare one is, not applied as a rejection.
+        MetaLogPayload::Normal(command) => match command.subject() {
+            crate::command::MetadataCommand::SetFeatureLevel { feature_level, .. }
+                if *feature_level > supported =>
+            {
+                Some((entry.index, *feature_level))
+            }
+            _ => None,
+        },
         _ => None,
     })
 }
@@ -183,6 +190,15 @@ pub(crate) const NEWER_FORMAT_WHATS: &[&str] = &[
     // entry from a newer leader.
     "lease presence",
     "joint marker",
+    // Inside kind 40 and the record of tag 26 (#706): the actor, the peer
+    // and the subject an attribution carries, and the outcome the tail
+    // records. A later level adds an actor kind (a declared user, say) or a
+    // subject (a membership change) by a new tag; a reader that predates it
+    // says "newer", not "corrupt".
+    "attribution actor",
+    "attribution peer",
+    "attribution subject",
+    "audit outcome",
 ];
 
 /// The `UnknownTag` `what`s this review does not classify as newer, each
@@ -717,10 +733,13 @@ mod closed_enum_review_tests {
                     continue;
                 }
                 let full = std::fs::read_to_string(&path).unwrap();
-                let source = match full.find("#[cfg(test)]\nmod ") {
-                    Some(at) => &full[..at],
-                    None => &full[..],
-                };
+                // The first test module, private or not: command.rs's is
+                // `pub(crate)` so the fuzz seeds can reuse its values.
+                let source = ["#[cfg(test)]\nmod ", "#[cfg(test)]\npub(crate) mod "]
+                    .iter()
+                    .filter_map(|marker| full.find(marker))
+                    .min()
+                    .map_or(&full[..], |at| &full[..at]);
                 for (at, opening) in source.match_indices("UnknownTag {") {
                     // The struct literal up to its closing brace.
                     let body = &source[at + opening.len()..];
@@ -838,6 +857,28 @@ mod feature_level_refusal_tests {
         }
     }
 
+    /// A raise the way an operator's is logged (#706): the leader wraps it
+    /// in the attribution of the connection that proposed it.
+    fn attributed_raise(index: u64, level: u32) -> MetaLogEntry {
+        use crate::command::{Attribution, CommandActor};
+        let MetaLogPayload::Normal(subject) = raise(index, level).payload else {
+            unreachable!()
+        };
+        MetaLogEntry {
+            term: 1,
+            index,
+            payload: MetaLogPayload::Normal(MetadataCommand::Attributed {
+                attribution: Attribution {
+                    actor: CommandActor::Named("operator".to_owned()),
+                    peer: None,
+                    vouched_by: 1,
+                    recorded_at_ms: 1_750_000_000_000,
+                },
+                subject: Box::new(subject),
+            }),
+        }
+    }
+
     /// Publish a snapshot of a state recorded at `level` into `/n1`.
     fn publish_snapshot_at(env: &Env, level: u32) {
         let payload = MetaStateMachine::at_feature_level_for_test(level)
@@ -943,6 +984,52 @@ mod feature_level_refusal_tests {
         drop(storage);
         // The directory still refuses at the next open only if the raise was
         // applied before: it was not, so a reopen is at the old frontier.
+        let reopened = MetaStorage::open_in(&env, "/n1", cluster()).unwrap();
+        assert_eq!(reopened.last_applied(), 0);
+    }
+
+    /// #850 review: the storage guard looked only at a bare raise, so a raise
+    /// wrapped in its attribution got past it and was applied as a rejection.
+    #[test]
+    fn an_attributed_raise_above_this_builds_level_is_refused_when_replayed_at_open() {
+        let (_sim, env) = sim();
+        let mut log = MetaLog::open_in(&env, "/n1", cluster(), MetaLogConfig::default()).unwrap();
+        log.append(&[attributed_raise(1, ABOVE)]).unwrap();
+        drop(log);
+        let (level, supported, text) = refused(MetaStorage::open_in(&env, "/n1", cluster()));
+        assert_eq!((level, supported), (ABOVE, SUPPORTED_FEATURE_LEVEL));
+        assert!(text.contains("log entry at index 1"), "{text}");
+    }
+
+    #[test]
+    fn an_attributed_raise_above_this_builds_level_is_refused_when_applied_not_turned_into_a_rejection(
+    ) {
+        let (_sim, env) = sim();
+        let mut storage = MetaStorage::open_in(&env, "/n1", cluster()).unwrap();
+        storage.ensure_raft_applied_frontier().unwrap();
+        storage
+            .append(&[
+                raise(1, SUPPORTED_FEATURE_LEVEL),
+                attributed_raise(2, ABOVE),
+            ])
+            .unwrap();
+        let error = storage.apply_through(2).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MetaStoreError::NewerFeatureLevel {
+                    directory_level: ABOVE,
+                    supported: SUPPORTED_FEATURE_LEVEL,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        // Nothing applied and no rejection remembered: a build that supports
+        // the level applies the same entries.
+        assert_eq!(storage.last_applied(), 0);
+        assert_eq!(storage.state().feature_level(), BASELINE_FEATURE_LEVEL);
+        drop(storage);
         let reopened = MetaStorage::open_in(&env, "/n1", cluster()).unwrap();
         assert_eq!(reopened.last_applied(), 0);
     }

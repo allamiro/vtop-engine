@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 use vtop_log::sim::{SimDiskState, SimStorage};
 use vtop_meta::{
-    CommandEnvelope, HardState, MetaLogEntry, MetaLogPayload, MetaMembership, MetaNodeId,
-    MetaStorage, MetadataCommand,
+    Attribution, CommandActor, CommandEnvelope, HardState, MetaLogEntry, MetaLogPayload,
+    MetaMembership, MetaNodeId, MetaStorage, MetadataCommand,
 };
 
 const SEED: u64 = 0x5eed_0729;
@@ -100,6 +100,49 @@ fn seeds() -> Vec<(&'static str, Vec<u8>)> {
     drop(storage);
     seeds.push(("all-files", sim.snapshot().to_bundle()));
 
+    // Level 9 (#706): attributed commands (kind 40) in the log and the tail
+    // of attributed commands (key category 23, value tag 26) in a snapshot.
+    let sim = SimStorage::new();
+    sim.create_dir_all(Path::new(ROOT));
+    let env = sim.env(SEED);
+    let mut storage = MetaStorage::open_in(&env, ROOT, cluster).unwrap();
+    storage
+        .save_hard_state(HardState {
+            term: 3,
+            voted_for: Some(MetaNodeId(1)),
+            vote_committed: true,
+        })
+        .unwrap();
+    let attributed = |index: u64| MetaLogEntry {
+        term: 3,
+        index,
+        payload: MetaLogPayload::Normal(MetadataCommand::Attributed {
+            attribution: Attribution {
+                actor: if index.is_multiple_of(2) {
+                    CommandActor::Named("ops-alice".to_owned())
+                } else {
+                    CommandActor::Node(Uuid::from_u128(0x10))
+                },
+                peer: Some("192.0.2.7".parse().unwrap()),
+                vouched_by: 1,
+                recorded_at_ms: 1_750_000_000_500,
+            },
+            subject: Box::new(command(u128::from(index))),
+        }),
+    };
+    let mut log = entries(3, 1, 4);
+    log.extend((5..=8).map(attributed));
+    storage.append(&log).unwrap();
+    storage.apply_through(8).unwrap();
+    storage.write_snapshot().unwrap();
+    storage
+        .append(&(9..=11).map(attributed).collect::<Vec<_>>())
+        .unwrap();
+    storage.apply_through(10).unwrap();
+    storage.sync_applied_frontier().unwrap();
+    drop(storage);
+    seeds.push(("attributed-tail", sim.snapshot().to_bundle()));
+
     seeds
 }
 
@@ -124,6 +167,16 @@ fn the_written_seeds_open_and_cover_every_file() {
         opens(name, bundle);
     }
     let all = SimDiskState::from_bundle(&seeds[1].1);
+    // The level-9 seed's directory holds a state that carries the tail.
+    let attributed = SimStorage::new();
+    attributed.restore(&SimDiskState::from_bundle(&seeds[2].1));
+    attributed.create_dir_all(Path::new(ROOT));
+    let storage =
+        MetaStorage::open_in(&attributed.env(SEED), ROOT, Uuid::from_u128(CLUSTER)).unwrap();
+    assert!(
+        storage.state().audit_tail().count() >= 3,
+        "the attributed-tail seed holds no tail"
+    );
     let names: Vec<String> = all
         .files
         .keys()
@@ -165,7 +218,7 @@ fn the_committed_fuzz_seeds_open() {
         count += 1;
     }
     assert!(
-        count >= 2,
+        count >= 3,
         "only {count} committed seed(s); run write_fuzz_seeds"
     );
 }

@@ -92,6 +92,48 @@ fn with_no_holder_known_metadata_says_so_by_code_and_nothing_serves() {
     );
 }
 
+/// A consumer follows a failover only if every member tells it where its
+/// group's coordinator went (#751). A member that does not hold the range
+/// names the holder, from its own address; with no holder known it says the
+/// coordinator is not available, which a client asks again about.
+#[test]
+fn a_follower_names_the_holder_as_the_groups_coordinator() {
+    const COORDINATOR_NOT_AVAILABLE: i16 = 15;
+    let cluster = Cluster::start(3);
+    for node in [0, 1, 2] {
+        assert_eq!(
+            find_coordinator(cluster.nodes[node].addr, "g").0,
+            COORDINATOR_NOT_AVAILABLE,
+            "node {node}: nobody holds the range yet"
+        );
+    }
+    let holder_at = |node: usize| {
+        (
+            0,
+            broker_id(node),
+            cluster.nodes[node].addr.ip().to_string(),
+            i32::from(cluster.nodes[node].addr.port()),
+        )
+    };
+    cluster.promote(0);
+    for node in [0, 1, 2] {
+        assert_eq!(
+            find_coordinator(cluster.nodes[node].addr, "g"),
+            holder_at(0),
+            "node {node}"
+        );
+    }
+    // The range moves: the old holder, still listening, names the new one.
+    cluster.promote(2);
+    for node in [0, 1, 2] {
+        assert_eq!(
+            find_coordinator(cluster.nodes[node].addr, "g"),
+            holder_at(2),
+            "node {node}"
+        );
+    }
+}
+
 #[test]
 fn a_topic_the_slot_was_not_built_for_is_unknown_not_elsewhere() {
     let cluster = Cluster::start(3);

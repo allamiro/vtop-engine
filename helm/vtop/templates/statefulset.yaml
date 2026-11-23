@@ -143,6 +143,10 @@ spec:
               containerPort: {{ .Values.ports.replica }}
             - name: native
               containerPort: {{ .Values.ports.native }}
+            {{- if .Values.data.kafka.enabled }}
+            - name: kafka
+              containerPort: {{ .Values.ports.kafka }}
+            {{- end }}
             - name: obs
               containerPort: {{ .Values.ports.observability }}
           {{- if .Values.probes.startup.enabled }}

@@ -144,8 +144,17 @@ All 30 failovers, 15 per system, read back every acknowledged record:
 **0 lost, 0 duplicated**, 14,250,000 records in all. Kafka's producer resumes
 sooner after a `kill -9` of the leader (10.2 s, against 25.7 s for VTOP) and
 after an orderly stop; a network partition costs both about 30 s. VTOP was
-driven through its native client, because a Kafka client cannot yet follow a
-VTOP failover.
+driven through its native client in that run, which predates #751: a Kafka
+client could not follow a VTOP failover then.
+A Kafka client now can, with no restart and no configuration change (#751):
+live-chaos scenarios 27 and 28 killed the range leader under a stock
+librdkafka producer and under the JVM client of Apache Kafka 4.4.0, and each
+resumed 5.5 s to 6.6 s later (librdkafka 5.7 s to 6.6 s in four runs, the JVM
+client 5.5 s to 5.8 s in eight), with every acknowledged record read back once
+and in order. That is one host, debug binaries and a 6 s lease, against the
+chart's 15 s default; it is not a comparison with Kafka's numbers above, and it
+does not cover the co-located `vtop-node node` shape or a consumer group across
+a failover ([details](docs/LIVE_CHAOS_VALIDATION.md#kafka-clients-and-a-failover-751)).
 Data and the full report: [kafka-failover.md](docs/benchmarks/kafka-failover.md).
 
 ### Produce throughput, against Apache Kafka
@@ -172,7 +181,7 @@ Data, latency and consume results: [kafka-comparison.md](docs/benchmarks/kafka-c
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/card-tested-dark.svg">
-  <img alt="Tested against: Apache Kafka 3.7.2 to 4.4.0 (8 releases, live-broker tests, nightly); Apache Kafka 4.3.2 (benchmarks); Apache Kafka 4.3.1 (Docker lab and live-broker tests in CI); Kafka JVM client 4.3.2 (benchmarks); librdkafka 2.12.1 (the engine's Kafka source); PostgreSQL 14 to 18 (5 majors, state-store tests, nightly); MinIO RELEASE.2025-09-07T16-13-09Z (Docker lab and live S3 tests in CI). More S3 servers: when the matrix is published (#722)." src="docs/assets/readme/card-tested-light.svg" width="600">
+  <img alt="Tested against: Apache Kafka 3.7.2 to 4.4.0 (8 releases, live-broker tests, nightly); Apache Kafka 4.3.2 (benchmarks); Apache Kafka 4.3.1 (Docker lab and live-broker tests in CI); Kafka JVM client 4.3.2 (benchmarks); librdkafka 2.12.1 (the engine's Kafka source); PostgreSQL 14 to 18 (5 majors, state-store tests, nightly); MinIO RELEASE.2025-09-07T16-13-09Z (Docker lab and live S3 tests in CI); Zenko CloudServer 9.5.5 (S3 compatibility matrix); Garage v2.5.0 (S3 compatibility matrix); RustFS 1.0.5 (S3 compatibility matrix); SeaweedFS 4.53 (S3 compatibility matrix); Versity S3 Gateway v1.11.0 (S3 compatibility matrix)." src="docs/assets/readme/card-tested-light.svg" width="600">
 </picture>
 
 ---
@@ -275,6 +284,10 @@ is in [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | AWS CLI, s3cmd, MinIO client (explicit opt-in) | downloaded and re-hashed |
 | mock, for tests | the stored in-memory bytes are hashed |
 
+<!-- s3-compat:start -->
+The live S3 tests last ran, with every outcome as expected, against: Zenko CloudServer, Garage, MinIO (lab, source-built), RustFS, SeaweedFS, Versity S3 Gateway. Which server supports which capability and verification method: [S3 compatibility](docs/reference/s3-compatibility.md).
+<!-- s3-compat:end -->
+
 The Kafka source is a Cargo feature: `cargo build -p vtop-cli --no-default-features`
 builds without it. The same repository holds a native Rust broker and control
 plane (Raft metadata, quorum replication, fenced range leadership), in which
@@ -309,8 +322,11 @@ The limits that matter most when evaluating it:
   corruption.** Strong verification is the default; the opt-out is reported at
   startup, by `vtopctl validate`, and in the metrics.
 - **The Kafka gateway is slower than Apache Kafka**, by 12.0x to 13.9x in
-  records per second in the comparison above, and a Kafka client cannot yet
-  follow a VTOP failover.
+  records per second in the comparison above. A Kafka client follows a VTOP
+  failover without reconfiguration (#751), measured on one host with debug
+  binaries and a 6 s lease; the chart's 15 s lease default, the co-located
+  `vtop-node node` shape and a consumer group across a failover are not
+  measured.
 - **Not built yet:** public-key manifest signatures and a million-file
   benchmark.
 

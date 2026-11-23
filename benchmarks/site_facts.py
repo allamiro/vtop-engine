@@ -58,6 +58,8 @@ CARGO_TOML = "Cargo.toml"
 CARGO_LOCK = "Cargo.lock"
 EGRESS_ENV = "benchmarks/measurements/483-tcp-baseline/environment.json"
 S3_RESULTS = "tests/s3-compat/results"
+S3_SERVERS = "tests/s3-compat/servers"
+LAB_S3_SERVER = "minio"
 CARDS = ("card-hero", "card-link-share", "card-throughput", "card-tested")
 
 HEADLINE = "Source progress moves only after the stored object is verified."
@@ -196,6 +198,16 @@ def _ci_runs_live_s3_on_minio(ci: str) -> bool:
     return False
 
 
+def _s3_server_name(server: str, repo: str) -> str:
+    """The display name a server's capability file gives (its `name:` line), or the id when it has none."""
+    path = os.path.join(repo, S3_SERVERS, f"{server}.yaml")
+    if os.path.isfile(path):
+        match = re.search(r"^name:\s*(.+?)\s*$", _read(os.path.relpath(path, repo), repo), re.M)
+        if match:
+            return match.group(1).strip("\"'")
+    return server
+
+
 def s3_servers(repo: str = REPO) -> dict[str, Any]:
     """The lab's MinIO, plus one entry per committed result of the S3 compatibility matrix (#722).
 
@@ -214,11 +226,15 @@ def s3_servers(repo: str = REPO) -> dict[str, Any]:
         rel = os.path.relpath(path, repo)
         with open(path, encoding="utf-8") as handle:
             result = json.load(handle)
-        if not isinstance(result, dict) or not all(isinstance(result.get(k), str) and result[k]
-                                                   for k in ("server", "version")):
+        # scripts/s3_compat_report.py writes `server` (the id) and `server_version`.
+        version = result.get("server_version", result.get("version")) if isinstance(result, dict) else None
+        if not isinstance(result, dict) or not isinstance(result.get("server"), str) or not result["server"] \
+                or not isinstance(version, str) or not version:
             raise Refused(f"{rel}: a matrix result must name its server and version")
-        entries.append({"name": result["server"], "version": result["version"], "ran": "S3 compatibility matrix",
-                        "source": rel})
+        if result["server"] == LAB_S3_SERVER:
+            continue  # the lab's MinIO is the entry above
+        entries.append({"name": _s3_server_name(result["server"], repo), "version": version,
+                        "ran": "S3 compatibility matrix", "source": rel})
     return {
         "lab": {"name": "MinIO", "version": lab[0], "ran": " and ".join(places), "source": COMPOSE},
         "matrix": {"available": bool(entries), "entries": entries,
