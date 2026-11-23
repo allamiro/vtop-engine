@@ -1539,6 +1539,17 @@ v0.10.4 was a patch; this release carries the features held back since v0.10.0 a
   - #714: the bar for calling VTOP production-ready. VTOP remains a prototype.
 - **Downgrade** is supported only for what the [compatibility matrix](reference/compatibility.md#downgrade) records for the previous release: the state ledger, its prune digests and the audit trail. A metadata directory raised to level 9 cannot be opened by v0.10.4, and a replica whose epoch history this release marked broken is not protected by an older binary. Nothing else is promised.
 
+## v0.11.1 — an uncompressed object is written in 1 MiB writes
+
+A patch release: no schema, wire format, feature level, config key, default or one-way step changes. It fixes a CPU regression v0.11.0 brought to uncompressed objects.
+
+- **An uncompressed object is written and copied in 1 MiB writes, not 8 KiB (bug, performance) (#932).** With `compression: none` and more than one window in flight, v0.11.0 spent four to five times the CPU per byte on macOS/APFS, and at width 8 it was slower than at width 1 (BGL, SHA-256, no compression: 277.6 MiB/s at 14.3 CPU-s/GiB at width 8, against 346.1 MiB/s at 3.5 at width 1; v0.10.4 gave 222.8 MiB/s at 3.4). The extra time was system time. An uncompressed batch went to its work file through an 8 KiB buffer, and the local backend copied it with `io::copy`, which outside Linux loops over 8 KiB. Since #892 several windows did both at once. The work file is now written through 1 MiB for every backend, and the local backend's copy reads through 1 MiB outside Linux; on Linux it still uses `copy_file_range`. Compressed objects were not affected: the encoders buffer on their own. A build with the change gave 505.6 MiB/s at 2.83 CPU-s/GiB against 265.4 MiB/s at 14.99 for v0.11.0 on the same host. Linux is not measured yet.
+
+**Upgrading from v0.11.0.** A drop-in replacement: replace the binaries in any order; v0.11.0 and v0.11.1 engines, voters and data nodes can run side by side. No config key or default changes (`scripts/config-keys-since.py v0.11.0` lists none), and no schema marker or feature level. Downgrade to v0.11.0 is as safe as running it: nothing this release writes differs.
+
+- **Helm chart 0.7.1** (from 0.7.0; `appVersion` 0.11.1). No template or values change.
+- **Known open.** Memory grows with the number of windows in flight (297 to 420 MiB at width 8 against about 170 MiB for v0.10.4 in the same run), which fits width times `max_bytes` in flight with a residual not yet explained. Everything listed as known open for v0.11.0 still is.
+
 ## v0.12.0 and beyond
 
 The theme is **the road to 1.0**: turn group commit on by default for the data
