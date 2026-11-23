@@ -17,13 +17,25 @@ CSV row; a cell a system could not run is a row saying why. See README.md.
 setting into the leader's config, only if the engine under test accepts a
 `group_commit:` section, and checks the running node's own gauge says the
 setting took; otherwise it refuses, before any Docker work or before the first
-measurement, rather than run without it.
+measurement, rather than run without it. Around each VTOP saturation run of
+such a run it reads the leader's group-commit and produce-phase counters, so
+the report can say how many requests shared a barrier and where the time went.
+
+`--producers 1,2,4,16` runs every cell once per producer count, each producer
+its own client container (its own connection and producer id) on the one
+partition. Group commit can only merge requests that are in the broker at the
+same time, and one producer never has two there, so the ablation needs this
+axis to show anything:
+
+    python3 benchmarks/kafka_compare/run.py --group-commit off,on --producers 1,2,4,16
 """
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime as dt
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -181,6 +193,71 @@ def scrape_leader_metrics(system: str) -> str:
     healthcheck uses), so no port is published and no client container is needed."""
     return sh(["docker", "exec", SYSTEM_SPEC[system]["leader"], "curl", "-sf",
                "http://127.0.0.1:9600/metrics"], timeout=60).stdout
+
+
+# The leader's counters read around each saturation run of a group-commit run (#752): how many produce
+# requests shared how many barriers, how many groups overlapped the previous group's replication, and where
+# the flush time went. The group_commit_* series exist only while group commit is on; the phase family
+# always does.
+PRODUCE_COUNTERS = (
+    "vtop_broker_group_commit_requests_total",
+    "vtop_broker_group_commits_total",
+    "vtop_broker_group_commit_overlapped_total",
+    "vtop_broker_produce_phase_seconds_total",
+)
+PHASES = ("local_fsync", "replicate", "commit")
+_SAMPLE = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+(\S+)")
+_LABEL = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
+
+
+def parse_counters(metrics: str) -> dict[str, float]:
+    """The produce counters in a /metrics text: keyed by name, and the phase family by
+    `name{phase="..."}`, summed over any other label. A series the node does not export is absent."""
+    out: dict[str, float] = {}
+    for line in metrics.splitlines():
+        match = _SAMPLE.match(line)
+        if match is None or match.group(1) not in PRODUCE_COUNTERS:
+            continue
+        try:
+            value = float(match.group(3))
+        except ValueError:
+            continue
+        if not math.isfinite(value):
+            continue
+        labels = dict(_LABEL.findall(match.group(2) or ""))
+        key = match.group(1) + (f'{{phase="{labels["phase"]}"}}' if "phase" in labels else "")
+        out[key] = out.get(key, 0.0) + value
+    return out
+
+
+def counter_deltas(before: dict[str, float], after: dict[str, float]) -> dict[str, float]:
+    """`after - before` for each counter read both times. One that went backwards (the node restarted in
+    the window) is left out rather than recorded as a negative count."""
+    return {key: round(after[key] - before[key], 9) for key in sorted(before)
+            if key in after and after[key] >= before[key]}
+
+
+def scrape_counters(ctx: dict, system: str, tag: str) -> dict[str, float] | None:
+    """The leader's produce counters now, or None (said as an event) when they cannot be read: a missed
+    scrape leaves that run's counters out of the report, it does not stop the run."""
+    try:
+        return parse_counters(scrape_leader_metrics(system))
+    except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+        ctx["env"]["events"].append({"at": utc_now(), "system": system,
+                                     "event": f"{tag}: produce counters not read: {exc}"[:900]})
+        return None
+
+
+def record_counters(ctx: dict, row: dict[str, Any], before: dict[str, float] | None,
+                    after: dict[str, float] | None) -> None:
+    """What the counters moved by over one timed run, under the row's key, in `observed.vtop_produce_counters`
+    (not part of the fingerprint: it is a measurement, like the rows)."""
+    if before is None or after is None:
+        return
+    ctx["env"]["observed"].setdefault("vtop_produce_counters", []).append({
+        "mode": row["mode"], "record_size": row["record_size"], "producers": row["producers"],
+        "group_commit": row["group_commit"], "repetition": row["repetition"],
+        "deltas": counter_deltas(before, after)})
 
 
 def check_group_commit_applied(setting: str, metrics: str) -> int:
@@ -486,15 +563,15 @@ def cluster_up(system: str, vtop_image: str, leader_config: str | None = None) -
                         "--config", "min.insync.replicas=2"], timeout=120)
 
 
-_client_seq = 0
+# Several producers start their containers from threads at once: `next` on a count is one step, so two
+# never take the same name.
+_client_seq = itertools.count(1)
 
 
 def client(system: str, command: list[str], *, timeout: float, input_text: str | None = None,
            info_logging: bool = False, check: bool = True) -> subprocess.CompletedProcess:
     """One client invocation in its own container on the system's network."""
-    global _client_seq
-    _client_seq += 1
-    name = f"kc-client-{os.getpid()}-{_client_seq}"
+    name = f"kc-client-{os.getpid()}-{next(_client_seq)}"
     env_args = ["-e", f"KAFKA_HEAP_OPTS={CLIENT_HEAP}"]
     if info_logging:
         env_args += ["-e", "KAFKA_LOG4J_OPTS=-Dlog4j2.configurationFile=/opt/kafka/config/log4j2.yaml"]
@@ -578,12 +655,67 @@ def run_producer(system: str, records: int, size: int, rate: int, timeout: float
     return result, "", wall, output
 
 
-def base_row(ctx: dict, system: str, mode: str, size: int, rep: int, group_commit: str = "") -> dict[str, Any]:
+# The fewest records one producer of several is given: a fifth of them are its warm-up, and the tool needs a
+# steady state after it.
+MIN_RECORDS_PER_PRODUCER = 10
+
+
+def split_evenly(total: int, parts: int) -> list[int]:
+    """`total` in `parts` shares that differ by at most one, the larger first."""
+    base, extra = divmod(total, parts)
+    return [base + (1 if index < extra else 0) for index in range(parts)]
+
+
+def combine_producers(results: list[perftool.ProducerResult]) -> perftool.ProducerResult:
+    """N concurrent producers' summaries as one row. Throughput adds up: each producer's steady-state rate
+    over its own run, and the runs overlap. Percentiles of different producers cannot be merged, so each is
+    the worst of the N (`lat_basis` `worst-of-N`); the average is weighted by records and the maximum is the
+    largest."""
+    records = sum(result.records for result in results)
+    return perftool.ProducerResult(
+        records=records,
+        records_per_sec=sum(result.records_per_sec for result in results),
+        mib_per_sec=sum(result.mib_per_sec for result in results),
+        lat_avg_ms=sum(result.lat_avg_ms * result.records for result in results) / records if records else 0.0,
+        lat_max_ms=max(result.lat_max_ms for result in results),
+        lat_p50_ms=max(result.lat_p50_ms for result in results),
+        lat_p95_ms=max(result.lat_p95_ms for result in results),
+        lat_p99_ms=max(result.lat_p99_ms for result in results),
+        lat_p999_ms=max(result.lat_p999_ms for result in results),
+        steady_state=all(result.steady_state for result in results),
+    )
+
+
+def run_producers(system: str, producers: int, records: int, size: int, rate: int, timeout: float
+                  ) -> tuple[perftool.ProducerResult | None, str, float, str]:
+    """`producers` perf-tool clients at once, each its own container and so its own connection and
+    producer id, sharing `records` and the offered `rate` (-1: unthrottled) evenly. (result or None, note,
+    wall seconds of the slowest, every client's raw output). One that fails fails the row, saying which."""
+    if producers == 1:
+        return run_producer(system, records, size, rate, timeout)
+    if records < producers * MIN_RECORDS_PER_PRODUCER or (rate >= 0 and rate < producers):
+        return None, (f"{records} records at {rate} records/s cannot be shared by {producers} producers "
+                      f"(at least {MIN_RECORDS_PER_PRODUCER} records and 1 record/s each)"), 0.0, ""
+    rates = [-1] * producers if rate < 0 else split_evenly(rate, producers)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=producers) as pool:
+        outcomes = list(pool.map(lambda share: run_producer(system, share[0], size, share[1], timeout),
+                                 zip(split_evenly(records, producers), rates)))
+    wall = max(outcome[2] for outcome in outcomes)
+    output = "\n".join(f"=== producer {index} of {producers} ===\n{outcome[3]}"
+                       for index, outcome in enumerate(outcomes, start=1))
+    failed = [(index, outcome[1]) for index, outcome in enumerate(outcomes, start=1) if outcome[0] is None]
+    if failed:
+        return None, "; ".join(f"producer {index} of {producers}: {note}" for index, note in failed), wall, output
+    return combine_producers([outcome[0] for outcome in outcomes]), "", wall, output
+
+
+def base_row(ctx: dict, system: str, mode: str, size: int, rep: int, group_commit: str = "",
+             producers: int = 1) -> dict[str, Any]:
     return {
         "run_id": ctx["run_id"], "env_fingerprint": ctx["fingerprint"],
         "vtop_commit": ctx["env"]["comparable"]["vtop_commit"], "kafka_image": KAFKA_IMAGE,
         "client": client_name(), "profile": PROFILE, "system": system, "mode": mode,
-        "record_size": size, "partitions": 1, "producers": 1, "compression": "none", "acks": "all",
+        "record_size": size, "partitions": 1, "producers": producers, "compression": "none", "acks": "all",
         "group_commit": group_commit, "repetition": rep, "load_basis": "kafka" if mode == "fixed_rate" else "",
         "started_at": utc_now(),
     }
@@ -597,35 +729,41 @@ def producer_row(row: dict, result: perftool.ProducerResult | None, note: str, w
     row.update(status="ok", records=result.records, records_per_sec=result.records_per_sec,
                mib_per_sec=result.mib_per_sec, lat_avg_ms=result.lat_avg_ms, lat_max_ms=result.lat_max_ms,
                lat_p50_ms=result.lat_p50_ms, lat_p95_ms=result.lat_p95_ms, lat_p99_ms=result.lat_p99_ms,
-               lat_p999_ms=result.lat_p999_ms, lat_basis="single", note=note)
+               lat_p999_ms=result.lat_p999_ms, lat_basis=schema.expected_lat_basis(str(row["producers"])),
+               note=note)
     return row
 
 
 def refuse_rows(ctx: dict, system: str, size: int, reason: str, load_pcts: list[int],
-                group_commit: str = "") -> None:
+                group_commit: str = "", producers: int = 1) -> None:
     """A row for every measurement of this system's cell, saying why it did not run."""
     for rep in range(1, ctx["reps"] + 1):
         modes = [("saturation", None)] + [("fixed_rate", pct) for pct in load_pcts]
         if ctx["consume"]:
             modes.append(("consume", None))
         for mode, pct in modes:
-            row = base_row(ctx, system, mode, size, rep, group_commit)
+            row = base_row(ctx, system, mode, size, rep, group_commit, producers)
             row.update(status="refused", note=reason, load_pct=pct)
             schema.append_row(ctx["csv"], row)
 
 
 def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | None,
-             group_commit: str = "") -> dict[int, int] | None:
+             group_commit: str = "", producers: int = 1) -> dict[int, int] | None:
     """Every measurement of one system in one cell. Returns Kafka's derived rates.
 
     `group_commit` (`off` or `on`, VTOP only) is the node's `group_commit.enabled` for this cell: its config
     is written under the run's directory, the cluster comes up with it, and the leader's own gauge must say
-    the setting took before anything is timed (GroupCommitNotApplied stops the run otherwise)."""
+    the setting took before anything is timed (GroupCommitNotApplied stops the run otherwise). With it set,
+    the leader's produce counters are read before and after each saturation run (`record_counters`).
+
+    `producers` clients produce at once in every timed produce run, sharing its records and offered rate
+    (`run_producers`); the smoke and the warm-up use one."""
     sat_records = ctx["sat_records"][size]
     load_pcts = list(stats.LOAD_FRACTIONS)
     logs = os.path.join(ctx["run_dir"], "logs")
     os.makedirs(logs, exist_ok=True)
-    tag = f"{system}-{size}B" + (f"-gc-{group_commit}" if group_commit else "")
+    tag = f"{system}-{size}B" + (f"-p{producers}" if producers != 1 else "") \
+        + (f"-gc-{group_commit}" if group_commit else "")
     leader_config = None
     if group_commit:
         configs = os.path.join(ctx["run_dir"], "configs")
@@ -655,7 +793,7 @@ def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | No
         log(f"{tag}: {reason}")
         ctx["env"]["events"].append({"at": utc_now(), "system": system, "record_size": size, "event": reason})
         _save_leader_log(system, logs, tag, ctx["vtop_image"])
-        refuse_rows(ctx, system, size, reason, load_pcts, group_commit)
+        refuse_rows(ctx, system, size, reason, load_pcts, group_commit, producers)
         cluster_down(system, ctx["vtop_image"])
         return None
     ctx["env"]["events"].append({"at": utc_now(), "system": system, "record_size": size,
@@ -669,18 +807,22 @@ def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | No
                                            info_logging=True)
     try:
         ctx["env"]["observed"].setdefault("producer_config", {})[
-            f"{system}-{size}" + (f"-gc-{group_commit}" if group_commit else "")] = \
-            perftool.parse_client_config(output)
+            f"{system}-{size}" + (f"-p{producers}" if producers != 1 else "")
+            + (f"-gc-{group_commit}" if group_commit else "")] = perftool.parse_client_config(output)
     except perftool.PerfParseError as exc:
         ctx["env"]["events"].append({"at": utc_now(), "system": system, "event": f"producer config: {exc}"})
     with open(os.path.join(logs, f"{tag}-warmup.log"), "w") as handle:
         handle.write(output)
 
     saturation = []
+    counting = system == "vtop" and bool(group_commit)
     for rep in range(1, ctx["reps"] + 1):
-        log(f"{tag}: saturation rep {rep}/{ctx['reps']} ({sat_records} records)")
-        row = base_row(ctx, system, "saturation", size, rep, group_commit)
-        result, note, wall, output = run_producer(system, sat_records, size, -1, ctx["sat_timeout"])
+        log(f"{tag}: saturation rep {rep}/{ctx['reps']} ({sat_records} records, {producers} producer(s))")
+        row = base_row(ctx, system, "saturation", size, rep, group_commit, producers)
+        before = scrape_counters(ctx, system, tag) if counting else None
+        result, note, wall, output = run_producers(system, producers, sat_records, size, -1, ctx["sat_timeout"])
+        if before is not None:
+            record_counters(ctx, row, before, scrape_counters(ctx, system, tag))
         _save_output(logs, f"{tag}-saturation-{rep}.log", output)
         if result is not None:
             saturation.append(result.records_per_sec)
@@ -696,7 +838,7 @@ def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | No
         ctx["env"]["observed"].setdefault("offered_rates", {})[str(size)] = kafka_rates
     for rep in range(1, ctx["reps"] + 1):
         for pct in load_pcts:
-            row = base_row(ctx, system, "fixed_rate", size, rep, group_commit)
+            row = base_row(ctx, system, "fixed_rate", size, rep, group_commit, producers)
             row["load_pct"] = pct
             if not kafka_rates:
                 row.update(status="refused", note="no Kafka saturation for this cell to derive the offered rate from")
@@ -707,7 +849,7 @@ def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | No
             row["offered_rate"] = rate
             log(f"{tag}: fixed rate {pct}% = {rate} records/s, rep {rep}/{ctx['reps']}")
             timeout = max(ctx["sat_timeout"], 6 * records / rate)
-            result, note, wall, output = run_producer(system, records, size, rate, timeout)
+            result, note, wall, output = run_producers(system, producers, records, size, rate, timeout)
             _save_output(logs, f"{tag}-fixed-{pct}-{rep}.log", output)
             if result is not None:
                 row["sustained"] = stats.sustained(rate, result.records_per_sec)
@@ -717,12 +859,13 @@ def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | No
 
     if ctx["consume"]:
         for rep in range(1, ctx["reps"] + 1):
-            row = base_row(ctx, system, "consume", size, rep, group_commit)
+            row = base_row(ctx, system, "consume", size, rep, group_commit, producers)
             log(f"{tag}: consume rep {rep}/{ctx['reps']} ({sat_records} records from the start of the log)")
             started = time.monotonic()
             command = ["/opt/kafka/bin/kafka-consumer-perf-test.sh", "--bootstrap-server",
                        SYSTEM_SPEC[system]["bootstrap"], "--topic", TOPIC, "--num-records", str(sat_records),
                        "--group", f"kc-{ctx['run_id']}-{system}-{size}"
+                       + (f"-p{producers}" if producers != 1 else "")
                        + (f"-gc-{group_commit}" if group_commit else "") + f"-{rep}", "--timeout", "60000",
                        "--command-property", *CONSUMER_PROPS]
             try:
@@ -833,6 +976,17 @@ def parse_sat_records(text: str, sizes: list[int]) -> dict[int, int]:
     return {size: table[size] for size in sizes}
 
 
+def parse_producers(text: str) -> list[int]:
+    """`--producers 1,2,4,16`: the producer counts each cell is run at, ascending."""
+    try:
+        counts = [int(count) for count in text.split(",")]
+    except ValueError:
+        raise SystemExit(f"--producers {text!r} is not a comma-separated list of producer counts") from None
+    if any(count < 1 for count in counts) or len(set(counts)) != len(counts):
+        raise SystemExit(f"--producers {text!r}: producer counts must be positive and distinct")
+    return sorted(counts)
+
+
 def parse_sizes(text: str) -> list[int]:
     try:
         sizes = [int(size) for size in text.split(",")]
@@ -857,6 +1011,11 @@ def check_args(args: argparse.Namespace) -> tuple[list[int], dict[int, int]]:
     """Every matrix argument, refused up front before any Docker work."""
     sizes = parse_sizes(args.sizes)
     sat_records = parse_sat_records(args.sat_records, sizes)
+    most = max(parse_producers(getattr(args, "producers", None) or "1"))
+    short = {size: count for size, count in sat_records.items() if count < most * MIN_RECORDS_PER_PRODUCER}
+    if short:
+        raise SystemExit(f"--sat-records {short} cannot be shared by {most} producers: each needs at least "
+                         f"{MIN_RECORDS_PER_PRODUCER} records")
     if args.reps < 1:
         raise SystemExit(f"--reps {args.reps}: at least one repetition is needed")
     for name, value in (("--fixed-seconds", args.fixed_seconds), ("--sat-timeout", args.sat_timeout)):
@@ -875,7 +1034,8 @@ def build_matrix(args: argparse.Namespace, sizes: list[int], sat_records: dict[i
     schema-2 axes say what the phase-1 shape does: one compression, one
     profile, Kafka-relative rates."""
     load_pcts = list(stats.LOAD_FRACTIONS)
-    matrix = {"record_sizes": sizes, "partitions": [1], "producers": [1], "compressions": ["none"],
+    producers = parse_producers(getattr(args, "producers", None) or "1")
+    matrix = {"record_sizes": sizes, "partitions": [1], "producers": producers, "compressions": ["none"],
               "acks": ["all"], "profile": PROFILE, "profiles": [PROFILE], "repetitions": args.reps,
               "load_pcts": load_pcts, "load_bases": {"kafka": load_pcts}, "consume": not args.no_consume,
               "sat_records": {str(k): v for k, v in sat_records.items()},
@@ -948,6 +1108,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="VTOP's group_commit.enabled, as a comma-separated list of off and/or on (#752): "
                              "VTOP runs once per setting, Kafka once. Refused when the engine at HEAD has no "
                              "`group_commit:` section. Left out, VTOP runs at the node's own default")
+    parser.add_argument("--producers", metavar="COUNTS", default="1",
+                        help="producer counts, comma-separated (e.g. 1,2,4,16): every cell is run at each, the "
+                             "producers being separate client containers on the one partition (#752)")
     return parser
 
 
@@ -957,6 +1120,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.check is not None:
         return check(args.check)
     sizes, sat_records = check_args(args)
+    producer_counts = parse_producers(args.producers)
     matrix = build_matrix(args, sizes, sat_records)
     settings, node_keys = check_group_commit(args)
     leader_base = _read(LEADER_CONFIG)
@@ -991,11 +1155,11 @@ def main(argv: list[str] | None = None) -> int:
     save_environment(run_dir, env)
     log(f"run {run_id} -> {run_dir} (fingerprint {ctx['fingerprint']})")
     try:
-        for size in sizes:
-            rates = run_cell(ctx, "kafka", size, None)
+        for size, producers in itertools.product(sizes, producer_counts):
+            rates = run_cell(ctx, "kafka", size, None, producers=producers)
             save_environment(run_dir, env)
             for setting in settings or [""]:
-                run_cell(ctx, "vtop", size, rates, group_commit=setting)
+                run_cell(ctx, "vtop", size, rates, group_commit=setting, producers=producers)
                 save_environment(run_dir, env)
     except BaseException as exc:
         env["run_state"] = "interrupted"

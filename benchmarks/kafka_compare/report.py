@@ -476,6 +476,8 @@ def _ratio(a: dict[str, Any], b: dict[str, Any]) -> float | None:
 def write_markdown(rows, env, run_id, csv_rel: str, env_rel: str, images: dict[str, str], doc_path: str) -> None:
     import matplotlib
 
+    every_row = rows
+    rows = headline_rows(rows, env)
     c = env["comparable"]
     sizes = env["matrix"]["record_sizes"]
     pcts = env["matrix"]["load_pcts"]
@@ -543,6 +545,14 @@ def write_markdown(rows, env, run_id, csv_rel: str, env_rel: str, images: dict[s
     add("")
     add("## Produce throughput at saturation")
     add("")
+    counts = env["matrix"]["producers"]
+    if len(counts) > 1:
+        add(f"The charts and every table but the group commit ablation are at "
+            f"{_counted([headline_producers(env)], 'producer')}; the run also measured "
+            f"{' and '.join(str(n) for n in counts if n != headline_producers(env))} producers on the same "
+            "partition, which the ablation "
+            "reports.")
+        add("")
     add(f"![Produce throughput]({images['produce-throughput']})")
     add("")
     add("| record size | system | records/s | MiB/s |")
@@ -567,7 +577,7 @@ def write_markdown(rows, env, run_id, csv_rel: str, env_rel: str, images: dict[s
                     "median records/s.")
     add("")
     if len(settings) >= 2:
-        add(ablation_section(rows, sizes, series))
+        add(ablation_section(every_row, sizes, series, env))
     add("## Produce latency at fixed offered load")
     add("")
     add(f"![Produce latency]({images['produce-latency']})")
@@ -729,8 +739,112 @@ def reading(lowest_pct: int, group_commit_measured: bool) -> str:
                           none_of_them=none_of_them)
 
 
-def ablation_section(rows, sizes: list[int], series: list[Series]) -> str:
-    """The group-commit ablation (#752): VTOP's saturation with the setting off and on, per record size."""
+# The leader's counters the harness reads around each saturation run of a group-commit run (run.py,
+# `observed.vtop_produce_counters`), and the phases of vtop_broker_produce_phase_seconds_total.
+GC_REQUESTS = "vtop_broker_group_commit_requests_total"
+GC_COMMITS = "vtop_broker_group_commits_total"
+GC_OVERLAPPED = "vtop_broker_group_commit_overlapped_total"
+PHASE_COUNTER = 'vtop_broker_produce_phase_seconds_total{{phase="{}"}}'
+PHASES = (("local_fsync", "local fsync"), ("replicate", "replicate"), ("commit", "commit"))
+
+# What the ablation can and cannot show, from how the gateway and the broker are built, not from this run.
+ABLATION_READING = """How to read it:
+
+- **One producer cannot show group commit.** A group can only hold requests that are in the broker at the same
+  time, and one producer never has two there: the gateway's session loop answers a Produce request before it
+  reads the next one from that connection, and the gateway's bridge to the broker queues an idempotent
+  producer's record sets one after another (the producer turnstile). So in the 1-producer cell every group is
+  one request, and the setting can only show its own cost; a ratio near 1 there is the expected result, not
+  evidence that group commit does nothing. Several producers on one partition (separate connections, separate
+  producer ids, one range) are what can share a barrier, so the other rows are where it shows.
+- **Partitions do not merge.** A group is formed per range: each partition is its own range with its own
+  leader log and its own coordinator, and fsyncs of different logs cannot be shared. Several partitions are
+  not evidence for or against group commit. The partitions of one Produce request are also appended one after
+  another in the gateway, which is a separate cost.
+- **Pipelining one producer's requests is not built.** Letting one connection have several record sets in
+  flight before the earlier one is durable (answered in order) is the only change that could move the
+  1-producer cell; it is not part of group commit and does not exist yet.
+- **The counters.** `mean group size` is the leader's `vtop_broker_group_commit_requests_total` over
+  `vtop_broker_group_commits_total`; `overlapped` is the share of groups whose local append and fsync ran
+  while the previous group replicated (`vtop_broker_group_commit_overlapped_total`); the last column is
+  `vtop_broker_produce_phase_seconds_total` per phase over the requests, so a time shared by a group is
+  divided among its requests. Each is read on the leader before and after every saturation repetition of the
+  setting, summed over the repetitions; the window includes the tool's warm-up records, which it produces and
+  leaves out of its own rate. With group commit off the node exports no request count, so the per-request
+  columns are for `on`; the off runs' phase totals are in `environment.json` under
+  `observed.vtop_produce_counters`. A dash is a run whose counters were not read (named in `events`)."""
+
+
+def headline_producers(env: dict[str, Any]) -> int:
+    """The producer count the charts and the main tables draw: the run's smallest. A run that swept producers
+    (the group commit ablation, #752) reports the other counts in the ablation table only."""
+    return min(env["matrix"]["producers"])
+
+
+def headline_rows(rows: list[dict[str, str]], env: dict[str, Any]) -> list[dict[str, str]]:
+    return schema.select(rows, producers=headline_producers(env))
+
+
+def is_producer_sweep(env: dict[str, Any]) -> bool:
+    """A group commit ablation run at several producer counts on one partition: the one run this report
+    draws with more than one producer count."""
+    m = env["matrix"]
+    return len(m["producers"]) > 1 and len(m.get("group_commits") or []) >= 2 and list(m["partitions"]) == [1]
+
+
+def _is_count(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value < float("inf")
+
+
+def counter_entries(env: dict[str, Any]) -> list[dict[str, Any]]:
+    """The leader's counter deltas the harness recorded (`observed.vtop_produce_counters`), each checked to be
+    what run.py writes; anything else is refused rather than read, before anything is drawn."""
+    entries = (env.get("observed") or {}).get("vtop_produce_counters") or []
+    if not isinstance(entries, list):
+        raise schema.ReportRefused("environment.json: observed.vtop_produce_counters is not a list")
+    for entry in entries:
+        deltas = entry.get("deltas") if isinstance(entry, dict) else None
+        if (not isinstance(deltas, dict) or not all(_is_count(value) for value in deltas.values())
+                or entry.get("group_commit") not in schema.GROUP_COMMITS):
+            raise schema.ReportRefused(f"environment.json: a vtop_produce_counters entry is malformed: {entry!r}"[:300])
+    return entries
+
+
+def _counter_totals(env: dict[str, Any], size: int, producers: int, setting: str) -> dict[str, float] | None:
+    """The counters' deltas over the saturation repetitions of one cell and setting, summed; None when none
+    was read."""
+    totals: dict[str, float] = {}
+    found = False
+    for entry in counter_entries(env):
+        deltas = entry["deltas"]
+        if (entry.get("mode"), entry.get("record_size"), entry.get("producers"), entry.get("group_commit")) \
+                != ("saturation", size, producers, setting):
+            continue
+        found = True
+        for key, value in deltas.items():
+            totals[key] = totals.get(key, 0.0) + float(value)
+    return totals if found else None
+
+
+def _counter_cells(totals: dict[str, float] | None) -> tuple[str, str, str]:
+    """(mean group size, overlapped share, ms per request per phase) for one cell's counters."""
+    if not totals:
+        return "-", "-", "-"
+    requests, commits = totals.get(GC_REQUESTS), totals.get(GC_COMMITS)
+    if not requests or not commits:
+        return "-", "-", "-"
+    size = f"{requests / commits:.2f}"
+    overlapped = totals.get(GC_OVERLAPPED)
+    share = f"{overlapped / commits:.0%}" if overlapped is not None else "-"
+    phases = [totals.get(PHASE_COUNTER.format(phase)) for phase, _label in PHASES]
+    per_request = " / ".join(f"{seconds * 1000 / requests:.2f}" if seconds is not None else "-"
+                             for seconds in phases)
+    return size, share, per_request
+
+
+def ablation_section(rows, sizes: list[int], series: list[Series], env: dict[str, Any]) -> str:
+    """The group-commit ablation (#752): VTOP's saturation with the setting off and on, per record size and
+    producer count, with what the leader's counters say about the groups the `on` runs formed."""
     off = next(ser for ser in series if ser.group_commit == "off")
     on = next(ser for ser in series if ser.group_commit == "on")
     lines = [
@@ -739,17 +853,25 @@ def ablation_section(rows, sizes: list[int], series: list[Series]) -> str:
         "VTOP's produce throughput at saturation with the node's `group_commit.enabled` off and on (#752): the "
         "same cells, the same client, one VTOP cluster brought up fresh per setting. `on / off` is the ratio "
         "of the two medians (the ranges are in the throughput table above). It says how far the setting moved "
-        "the cell, not why; a ratio near 1 means it did not.",
+        "the cell, not why; a ratio near 1 means it did not. The last three columns are the leader's own "
+        "counters for the `on` runs; the ms columns are local fsync / replicate / commit.",
         "",
-        "| record size | group commit off records/s | group commit on records/s | on / off |",
-        "|---|---|---|---|",
+        "| record size | producers | group commit off records/s | group commit on records/s | on / off "
+        "| mean group size (on) | overlapped (on) | ms per request (on) |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     for size in sizes:
-        cells = {ser.group_commit: cell_summary(rows, "vtop", "saturation", size, "records_per_sec",
-                                                group_commit=ser.group_commit) for ser in (off, on)}
-        ratio = _ratio(cells["on"], cells["off"])
-        lines.append(f"| {size_label(size)} | {_summary_cell(cells['off'])} | {_summary_cell(cells['on'])} | "
-                     f"{f'{ratio:.2f}x' if ratio is not None else '-'} |")
+        for producers in env["matrix"]["producers"]:
+            at = schema.select(rows, producers=producers)
+            cells = {ser.group_commit: cell_summary(at, "vtop", "saturation", size, "records_per_sec",
+                                                    group_commit=ser.group_commit) for ser in (off, on)}
+            ratio = _ratio(cells["on"], cells["off"])
+            group, share, per_request = _counter_cells(_counter_totals(env, size, producers, "on"))
+            lines.append(f"| {size_label(size)} | {producers} | {_summary_cell(cells['off'])} | "
+                         f"{_summary_cell(cells['on'])} | {f'{ratio:.2f}x' if ratio is not None else '-'} | "
+                         f"{group} | {share} | {per_request} |")
+    lines.append("")
+    lines.append(ABLATION_READING)
     lines.append("")
     return "\n".join(lines)
 
@@ -821,6 +943,9 @@ def check_drawable(rows: list[dict[str, str]], environment: dict[str, Any]) -> N
                                    "(#600); refused rather than left out")
     for column in SINGLE_VALUED:
         values = sorted({row[column] for row in rows})
+        if column == "producers" and is_producer_sweep(environment):
+            # The ablation's producer axis (#752): the charts draw the smallest count, the ablation every one.
+            continue
         if len(values) > 1:
             raise schema.ReportRefused(
                 f"the run has {len(values)} values of {column} ({', '.join(values)}); this report draws one "
@@ -836,21 +961,23 @@ def check_drawable(rows: list[dict[str, str]], environment: dict[str, Any]) -> N
 def build(run_dir: str, img_dir: str, doc_path: str) -> list[str]:
     run = schema.load_run(run_dir)  # raises ReportRefused before anything is written
     check_drawable(run.rows, run.environment)
+    counter_entries(run.environment)
     plt = _setup_matplotlib()
     os.makedirs(img_dir, exist_ok=True)
     os.makedirs(os.path.dirname(os.path.abspath(doc_path)), exist_ok=True)
     run_id = run.environment["run_id"]
     m = run.environment["matrix"]
-    shape = f"{_counted(m['partitions'], 'partition')}, {_counted(m['producers'], 'producer')}"
+    shape = f"{_counted(m['partitions'], 'partition')}, {_counted([headline_producers(run.environment)], 'producer')}"
+    drawn = headline_rows(run.rows, run.environment)
     written = []
-    written += throughput_chart(plt, run.rows, run.environment, run_id, "saturation",
+    written += throughput_chart(plt, drawn, run.environment, run_id, "saturation",
                                 "Produce throughput at saturation, VTOP vs Apache Kafka",
                                 f"{shape}, acks={'/'.join(m['acks'])}, RF 3 / min ISR 2 (VTOP: write quorum 2 of 3). "
                                 "Same JVM client container for both systems.",
                                 "kafka-compare-produce-throughput", img_dir)
-    written += latency_chart(plt, run.rows, run.environment, run_id, img_dir)
+    written += latency_chart(plt, drawn, run.environment, run_id, img_dir)
     if run.environment["matrix"].get("consume"):
-        written += throughput_chart(plt, run.rows, run.environment, run_id, "consume",
+        written += throughput_chart(plt, drawn, run.environment, run_id, "consume",
                                     "Consume throughput, VTOP vs Apache Kafka",
                                     f"{_counted(m['partitions'], 'partition')}, 1 consumer in a fresh group, "
                                     "offset commits off for both; the tool's "

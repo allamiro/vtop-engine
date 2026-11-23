@@ -524,6 +524,8 @@ def _axis_rows(env, off_rps=1000.0, on_rps=2500.0):
 
 @pytest.fixture
 def built(tmp_path):
+    # Drawing needs matplotlib, which only the benchmark-charts job installs; it runs these there.
+    pytest.importorskip("matplotlib")
     env = axis_environment()
     directory = write_run(str(tmp_path / "run"), env, _axis_rows(env))
     docs = tmp_path / "docs"
@@ -542,8 +544,11 @@ def test_each_setting_is_its_own_series_in_the_tables(built):
 def test_the_ablation_table_gives_each_record_size_off_on_and_the_ratio(built):
     _docs, _paths, text = built
     section = text.split("## Group commit ablation")[1].split("\n## ")[0]
-    assert "| record size | group commit off records/s | group commit on records/s | on / off |" in section
-    assert section.count("| 100 B |") == 1
+    assert ("| record size | producers | group commit off records/s | group commit on records/s | on / off "
+            "| mean group size (on) | overlapped (on) | ms per request (on) |") in section
+    assert section.count("| 100 B | 1 |") == 1
+    # No counters were read in this run: the counter columns say so with a dash, not a number.
+    assert "| 2.50x | - | - | - |" in section
 
 
 def test_the_environment_table_names_the_settings(built):
@@ -602,6 +607,7 @@ def test_a_cell_summary_can_select_one_setting(tmp_path):
 
 
 def test_a_run_with_one_setting_draws_a_series_labelled_with_it(tmp_path):
+    pytest.importorskip("matplotlib")
     matrix = {**AXIS, "group_commits": ["on"]}
     env = axis_environment(matrix)
     directory = write_run(str(tmp_path / "run"), env, _axis_rows(env))
@@ -632,6 +638,7 @@ def test_without_the_axis_the_series_are_the_two_systems_as_before():
 
 
 def test_the_matrix_copy_in_the_environment_is_not_mutated_by_drawing(tmp_path):
+    pytest.importorskip("matplotlib")
     env = axis_environment()
     before = copy.deepcopy(env)
     directory = write_run(str(tmp_path / "run"), env, _axis_rows(env))

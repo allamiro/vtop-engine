@@ -30,7 +30,8 @@ python3 benchmarks/kafka_compare/regenerate.py
 
 Useful knobs: `--sizes 100,1024`, `--reps 3`, `--sat-records 100:3000000,1024:1000000` (records per
 saturation run AND per consume run, per record size), `--fixed-seconds 30` (a fixed-rate run sends rate x this many records),
-`--smoke-records`, `--no-consume`, `--rebuild`, `--run-id` (one path component), `--max-hours 30`.
+`--smoke-records`, `--no-consume`, `--rebuild`, `--run-id` (one path component), `--max-hours 30`,
+`--producers 1` (producer counts; see the ablation below).
 Every one is checked before any Docker work, and so is the matrix's projected run time (`plan.py`):
 a matrix projected past `--max-hours` is refused before the first container starts.
 
@@ -66,6 +67,49 @@ python3 benchmarks/kafka_compare/run.py --group-commit off,on
   a *Group commit ablation* table (off, on, and the ratio of medians per record size), names the settings in
   the Method, the footer and the Environment table, and replaces the explanation of VTOP's per-request barrier
   with a pointer to the ablation.
+
+#### Several producers on one partition, and the leader's counters
+
+```bash
+python3 benchmarks/kafka_compare/run.py --group-commit off,on --producers 1,2,4,16 --sizes 100,1024
+```
+
+The 1-producer cell cannot show group commit, so the ablation has a producer axis:
+
+- **Why one producer shows nothing.** A commit group can only hold requests that are in the broker at the same
+  time, and one producer never has two there. The gateway's session loop answers a Produce request before it
+  reads the next one from that connection, and the gateway's bridge to the broker queues an idempotent
+  producer's record sets one after another (the producer turnstile). So with one producer every group is one
+  request, and on and off should measure the same, as they did at 1 producer and 1 partition in the first AWS
+  round on v0.11.1. That is the expected result, not evidence that group commit does nothing.
+- **What can show it.** Several producers on ONE partition: separate client containers, so separate
+  connections and producer ids, all writing one range. `--producers 1,2,4,16` runs every cell once per count;
+  each timed produce run starts that many `kafka-producer-perf-test` clients at once, sharing the run's records
+  and offered rate evenly. A row's records/s and MiB/s are the sum of the producers' steady-state rates (their
+  runs overlap; a client's container start is a second or so against minutes of run); its percentiles are the
+  worst of the N producers' (`lat_basis` `worst-of-N`), since percentiles of different producers cannot be
+  merged; its average is weighted by records. The smoke and the warm-up use one producer. Kafka runs the same
+  producer counts, so every cell has its Kafka reference.
+- **Partitions do not merge.** A group is formed per range: each partition is a range with its own leader log
+  and its own coordinator, and fsyncs of different logs cannot be shared. More partitions are not evidence for
+  or against group commit, and the ablation keeps one.
+- **Pipelining one producer's requests is not built.** Letting one connection have several record sets in
+  flight before the earlier is durable (answered in order) is the only change that could move the 1-producer
+  cell. It is not group commit and does not exist yet.
+- **The leader's counters.** In a run with `--group-commit`, `run.py` reads the leader's `/metrics` before and
+  after every VTOP saturation repetition and records what moved, under the row's key, in `environment.json`
+  under `observed.vtop_produce_counters` (not part of the fingerprint): `vtop_broker_group_commit_requests_total`,
+  `vtop_broker_group_commits_total`, `vtop_broker_group_commit_overlapped_total` and
+  `vtop_broker_produce_phase_seconds_total{phase}` for `local_fsync`, `replicate` and `commit`. The window is
+  the client's whole run, warm-up records included. A scrape that fails is an event and leaves that
+  repetition's counters out; it does not stop the run. The report's ablation table then gives, per record size
+  and producer count, the mean group size (requests over commits), the share of groups whose local append ran
+  while the previous group replicated, and the milliseconds per request spent in each phase, all for `on`: with
+  group commit off the node exports no request count, so the off runs' phase totals stay in
+  `environment.json`.
+- **Drawn at one count, tabled at all.** The report's charts and main tables are drawn at the run's smallest
+  producer count; the ablation table has a row per record size and producer count. A run that varies producers
+  without both group commit settings is still refused, as before.
 
 The only knob exposed for the ablation is `enabled`. `group_commit.max_delay_ms`, `max_records`, `max_bytes` and
 `max_pending_requests` stay at the node's defaults (natural batching, the plan's decision D1), so the run
@@ -165,7 +209,9 @@ missing, `environment.json`'s `schema_version` is malformed or newer than the re
 `environment.json` of schema 2 records no `host_disk`, the run did not finish, a row is malformed or a `failed`/`refused` row gives no reason, any expected
 row is missing or duplicated, rows come from more than one environment, commit, image or client (or, in a run whose
 CSV is schema 1, profile), the run varies along a dimension this report does not draw yet (partitions,
-producers, compression, acks, profile, or a load basis other than `kafka`; the grouped charts are #600's)
+producers outside a group commit ablation at one partition, compression, acks, profile, or a load basis other
+than `kafka`; the grouped charts are #600's), `observed.vtop_produce_counters` holds an entry `run.py` would not
+write,
 or holds a value its text does not say (a codec other than none, acks other than all, a profile other
 than the environment's, end-to-end rows), a row that repeats another profile's measurement does not match
 a measured row under that profile, the CSV's run id, commit, image, client or `acks` (and, in a run whose CSV is
