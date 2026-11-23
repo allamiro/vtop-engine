@@ -171,6 +171,22 @@ fn part_number(request_line: &str) -> Option<u32> {
 }
 
 /// The store's endpoint and the `host:port` the forwarder dials.
+/// Whether the forwarder can sit in front of the store: it needs a plain
+/// `http://` endpoint.
+fn forwardable(s: &S3Settings) -> Result<(), String> {
+    match s.endpoint.as_deref() {
+        Some(e) if e.starts_with("http://") => Ok(()),
+        Some(e) => Err(format!(
+            "the test's fault-injecting forwarder speaks plain HTTP, and the endpoint is {e}"
+        )),
+        None => Err(
+            "the test's fault-injecting forwarder needs VTOP_TEST_S3_ENDPOINT, and the SDK \
+             finds this server's endpoint itself"
+                .to_owned(),
+        ),
+    }
+}
+
 fn upstream(s: &S3Settings) -> (String, String) {
     let endpoint = s
         .endpoint
@@ -300,54 +316,56 @@ async fn verifies(backend: &S3NativeBackend, uri: &str, data: &[u8], digest: &st
 #[ignore = "requires an S3-compatible endpoint and credentials"]
 async fn live_a_part_whose_connection_is_reset_is_sent_again_alone() {
     let live = LiveS3::from_env();
-    // The forwarder's precondition, checked before the case so a store it
-    // cannot sit in front of (https, or no endpoint) is a setup error, not an
-    // unexpected failure of the capability (review of #764).
-    upstream(&live.settings);
-    live.case(
+    // The forwarder speaks plain HTTP: against a store it cannot sit in
+    // front of (AWS, over TLS) the case is recorded not_run, with why, and
+    // shown as not tested; never as a pass (#722).
+    let (name, needs) = (
         "multipart.a_reset_part_is_sent_again_alone",
-        &[Capability::Multipart],
-        || async {
-            let s = &live.settings;
-            let (endpoint, host) = upstream(s);
-            let forwarder = Forwarder::default();
-            let via = forwarder.start(host).await;
-            let backend = backend(s, &via).await;
-            backend.ensure_bucket(&bucket()).await.unwrap();
-            let dir = tempfile::tempdir().unwrap();
-            let (path, data, digest) = object(dir.path(), 1);
-            let uri = format!("s3://{}/{}", bucket(), unique_key("reset-once"));
+        &[Capability::Multipart][..],
+    );
+    if let Err(why) = forwardable(&live.settings) {
+        return live.not_run(name, needs, &why);
+    }
+    live.case(name, needs, || async {
+        let s = &live.settings;
+        let (endpoint, host) = upstream(s);
+        let forwarder = Forwarder::default();
+        let via = forwarder.start(host).await;
+        let backend = backend(s, &via).await;
+        backend.ensure_bucket(&bucket()).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (path, data, digest) = object(dir.path(), 1);
+        let uri = format!("s3://{}/{}", bucket(), unique_key("reset-once"));
 
-            forwarder.refuse.store(3, Ordering::SeqCst);
-            let mut report = MultipartReport::default();
-            // A part whose request failed every SDK attempt is retried, not
-            // the end of the upload.
-            upload_resumable_with_report(
-                &backend,
-                &config(dir.path(), 3),
-                &path,
-                &uri,
-                Some(ObjectChecksum::new("sha256", &digest)),
-                fence(&data, &digest),
-                &mut report,
-            )
-            .await
-            .expect("a part that failed every SDK attempt is retried");
+        forwarder.refuse.store(3, Ordering::SeqCst);
+        let mut report = MultipartReport::default();
+        // A part whose request failed every SDK attempt is retried, not
+        // the end of the upload.
+        upload_resumable_with_report(
+            &backend,
+            &config(dir.path(), 3),
+            &path,
+            &uri,
+            Some(ObjectChecksum::new("sha256", &digest)),
+            fence(&data, &digest),
+            &mut report,
+        )
+        .await
+        .expect("a part that failed every SDK attempt is retried");
 
-            assert_eq!(
-                [forwarder.sent(1), forwarder.sent(2), forwarder.sent(3)],
-                [1, 4, 1],
-                "only part 2's request was repeated: {report:?}"
-            );
-            assert_eq!(
-                report.part_retries, 1,
-                "the fourth request was the upload's own retry of the part: {report:?}"
-            );
-            assert!(verifies(&backend, &uri, &data, &digest).await);
-            backend.delete_object(&uri).await.unwrap();
-            let _ = endpoint;
-        },
-    )
+        assert_eq!(
+            [forwarder.sent(1), forwarder.sent(2), forwarder.sent(3)],
+            [1, 4, 1],
+            "only part 2's request was repeated: {report:?}"
+        );
+        assert_eq!(
+            report.part_retries, 1,
+            "the fourth request was the upload's own retry of the part: {report:?}"
+        );
+        assert!(verifies(&backend, &uri, &data, &digest).await);
+        backend.delete_object(&uri).await.unwrap();
+        let _ = endpoint;
+    })
     .await;
 }
 
@@ -359,81 +377,83 @@ async fn live_a_part_whose_connection_is_reset_is_sent_again_alone() {
 #[ignore = "requires an S3-compatible endpoint and credentials"]
 async fn live_a_second_backend_resumes_the_session_the_first_left() {
     let live = LiveS3::from_env();
-    // The forwarder's precondition, checked before the case so a store it
-    // cannot sit in front of (https, or no endpoint) is a setup error, not an
-    // unexpected failure of the capability (review of #764).
-    upstream(&live.settings);
-    live.case(
+    // The forwarder speaks plain HTTP: against a store it cannot sit in
+    // front of (AWS, over TLS) the case is recorded not_run, with why, and
+    // shown as not tested; never as a pass (#722).
+    let (name, needs) = (
         "multipart.a_second_backend_resumes_the_session",
         &[
             Capability::Multipart,
             Capability::MultipartResume,
             Capability::MultipartListUploads,
-        ],
-        || async {
-            let s = &live.settings;
-            let (endpoint, host) = upstream(s);
-            let forwarder = Forwarder::default();
-            let via = forwarder.start(host).await;
-            let first = backend(s, &via).await;
-            first.ensure_bucket(&bucket()).await.unwrap();
-            let dir = tempfile::tempdir().unwrap();
-            let (path, data, digest) = object(dir.path(), 2);
-            let key = unique_key("resume");
-            let uri = format!("s3://{}/{key}", bucket());
-            let cfg = config(dir.path(), 1);
+        ][..],
+    );
+    if let Err(why) = forwardable(&live.settings) {
+        return live.not_run(name, needs, &why);
+    }
+    live.case(name, needs, || async {
+        let s = &live.settings;
+        let (endpoint, host) = upstream(s);
+        let forwarder = Forwarder::default();
+        let via = forwarder.start(host).await;
+        let first = backend(s, &via).await;
+        first.ensure_bucket(&bucket()).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (path, data, digest) = object(dir.path(), 2);
+        let key = unique_key("resume");
+        let uri = format!("s3://{}/{key}", bucket());
+        let cfg = config(dir.path(), 1);
 
-            forwarder.refuse.store(usize::MAX, Ordering::SeqCst);
-            upload_resumable(
-                &first,
-                &cfg,
-                &path,
-                &uri,
-                Some(ObjectChecksum::new("sha256", &digest)),
-                fence(&data, &digest),
-            )
-            .await
-            .expect_err("part 2 is refused on every request");
-            let session = load_session(
-                &dir.path()
-                    .join(session_file_name(&uri, &fence(&data, &digest))),
-            )
-            .expect("the failed upload's session is kept");
-            assert_eq!(
-                session.parts.keys().copied().collect::<Vec<_>>(),
-                vec![1, 3]
-            );
-            let client = s3_client(s, &endpoint).await;
-            assert_eq!(
-                pending_uploads(&client, &key).await,
-                1,
-                "the store holds the upload"
-            );
-            drop(first);
+        forwarder.refuse.store(usize::MAX, Ordering::SeqCst);
+        upload_resumable(
+            &first,
+            &cfg,
+            &path,
+            &uri,
+            Some(ObjectChecksum::new("sha256", &digest)),
+            fence(&data, &digest),
+        )
+        .await
+        .expect_err("part 2 is refused on every request");
+        let session = load_session(
+            &dir.path()
+                .join(session_file_name(&uri, &fence(&data, &digest))),
+        )
+        .expect("the failed upload's session is kept");
+        assert_eq!(
+            session.parts.keys().copied().collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        let client = s3_client(s, &endpoint).await;
+        assert_eq!(
+            pending_uploads(&client, &key).await,
+            1,
+            "the store holds the upload"
+        );
+        drop(first);
 
-            forwarder.refuse.store(0, Ordering::SeqCst);
-            forwarder.reset_counts();
-            let second = backend(s, &via).await;
-            upload_resumable(
-                &second,
-                &cfg,
-                &path,
-                &uri,
-                Some(ObjectChecksum::new("sha256", &digest)),
-                fence(&data, &digest),
-            )
-            .await
-            .expect("the second backend resumes the session");
-            assert_eq!(
-                [forwarder.sent(1), forwarder.sent(2), forwarder.sent(3)],
-                [0, 1, 0],
-                "the resume sent part 2 and nothing else"
-            );
-            assert!(verifies(&second, &uri, &data, &digest).await);
-            assert_eq!(pending_uploads(&client, &key).await, 0);
-            second.delete_object(&uri).await.unwrap();
-        },
-    )
+        forwarder.refuse.store(0, Ordering::SeqCst);
+        forwarder.reset_counts();
+        let second = backend(s, &via).await;
+        upload_resumable(
+            &second,
+            &cfg,
+            &path,
+            &uri,
+            Some(ObjectChecksum::new("sha256", &digest)),
+            fence(&data, &digest),
+        )
+        .await
+        .expect("the second backend resumes the session");
+        assert_eq!(
+            [forwarder.sent(1), forwarder.sent(2), forwarder.sent(3)],
+            [0, 1, 0],
+            "the resume sent part 2 and nothing else"
+        );
+        assert!(verifies(&second, &uri, &data, &digest).await);
+        assert_eq!(pending_uploads(&client, &key).await, 0);
+        second.delete_object(&uri).await.unwrap();
+    })
     .await;
 }
 
@@ -443,59 +463,61 @@ async fn live_a_second_backend_resumes_the_session_the_first_left() {
 #[ignore = "requires an S3-compatible endpoint and credentials"]
 async fn live_the_sweep_aborts_an_abandoned_upload_at_the_store() {
     let live = LiveS3::from_env();
-    // The forwarder's precondition, checked before the case so a store it
-    // cannot sit in front of (https, or no endpoint) is a setup error, not an
-    // unexpected failure of the capability (review of #764).
-    upstream(&live.settings);
-    live.case(
+    // The forwarder speaks plain HTTP: against a store it cannot sit in
+    // front of (AWS, over TLS) the case is recorded not_run, with why, and
+    // shown as not tested; never as a pass (#722).
+    let (name, needs) = (
         "multipart.the_sweep_aborts_an_abandoned_upload",
         &[
             Capability::Multipart,
             Capability::MultipartAbort,
             Capability::MultipartListUploads,
-        ],
-        || async {
-            let s = &live.settings;
-            let (endpoint, host) = upstream(s);
-            let forwarder = Forwarder::default();
-            let via = forwarder.start(host).await;
-            let backend = backend(s, &via).await;
-            backend.ensure_bucket(&bucket()).await.unwrap();
-            let dir = tempfile::tempdir().unwrap();
-            let (path, data, digest) = object(dir.path(), 3);
-            let key = unique_key("swept");
-            let uri = format!("s3://{}/{key}", bucket());
-            let mut cfg = config(dir.path(), 1);
+        ][..],
+    );
+    if let Err(why) = forwardable(&live.settings) {
+        return live.not_run(name, needs, &why);
+    }
+    live.case(name, needs, || async {
+        let s = &live.settings;
+        let (endpoint, host) = upstream(s);
+        let forwarder = Forwarder::default();
+        let via = forwarder.start(host).await;
+        let backend = backend(s, &via).await;
+        backend.ensure_bucket(&bucket()).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (path, data, digest) = object(dir.path(), 3);
+        let key = unique_key("swept");
+        let uri = format!("s3://{}/{key}", bucket());
+        let mut cfg = config(dir.path(), 1);
 
-            forwarder.refuse.store(usize::MAX, Ordering::SeqCst);
-            upload_resumable(
-                &backend,
-                &cfg,
-                &path,
-                &uri,
-                Some(ObjectChecksum::new("sha256", &digest)),
-                fence(&data, &digest),
-            )
-            .await
-            .expect_err("part 2 is refused");
-            let client = s3_client(s, &endpoint).await;
-            assert_eq!(pending_uploads(&client, &key).await, 1);
+        forwarder.refuse.store(usize::MAX, Ordering::SeqCst);
+        upload_resumable(
+            &backend,
+            &cfg,
+            &path,
+            &uri,
+            Some(ObjectChecksum::new("sha256", &digest)),
+            fence(&data, &digest),
+        )
+        .await
+        .expect_err("part 2 is refused");
+        let client = s3_client(s, &endpoint).await;
+        assert_eq!(pending_uploads(&client, &key).await, 1);
 
-            let session_path = dir
-                .path()
-                .join(session_file_name(&uri, &fence(&data, &digest)));
-            let mut session = load_session(&session_path).unwrap();
-            session.updated_at_unix_secs = 1;
-            save_session(&session_path, &session).unwrap();
-            cfg.abandon_after_secs = 60;
-            assert_eq!(cleanup_abandoned(&backend, &cfg).await.unwrap(), 1);
-            assert!(!session_path.exists());
-            assert_eq!(
-                pending_uploads(&client, &key).await,
-                0,
-                "ListMultipartUploads no longer shows the abandoned upload"
-            );
-        },
-    )
+        let session_path = dir
+            .path()
+            .join(session_file_name(&uri, &fence(&data, &digest)));
+        let mut session = load_session(&session_path).unwrap();
+        session.updated_at_unix_secs = 1;
+        save_session(&session_path, &session).unwrap();
+        cfg.abandon_after_secs = 60;
+        assert_eq!(cleanup_abandoned(&backend, &cfg).await.unwrap(), 1);
+        assert!(!session_path.exists());
+        assert_eq!(
+            pending_uploads(&client, &key).await,
+            0,
+            "ListMultipartUploads no longer shows the abandoned upload"
+        );
+    })
     .await;
 }
