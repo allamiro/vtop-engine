@@ -1,17 +1,18 @@
 diff --git a/crates/vtop-broker/src/replication/network.rs b/crates/vtop-broker/src/replication/network.rs
-index 80f4a741..fa4d8dd2 100644
 --- a/crates/vtop-broker/src/replication/network.rs
 +++ b/crates/vtop-broker/src/replication/network.rs
-@@ -1426,6 +1426,13 @@ impl NetworkedReplicaSet {
-     /// caller. A plaintext plane does not fail over (`refuse_plaintext_promotion`
-     /// in vtop-node), so it has no deposed leader to reconcile.
+@@ -1553,6 +1553,15 @@
+     /// catch a follower up from the leader's log (#599), which needs the
+     /// range and the epoch's live grant but not the fence.
      pub fn reconcile_followers_against(&self, leader: std::sync::Weak<dyn LeaderLineage>) -> bool {
 +        // RE-INTRODUCED #641 (test build only, scripts/live-chaos/history/reintroduce):
 +        // sessions open unfenced, as before #649, so a returning deposed
-+        // leader keeps its old-epoch records under the new mark.
++        // leader keeps its old-epoch records under the new mark. The call
++        // still answers true, so a caller that requires it (the loopback
++        // harness in networked_replication.rs) goes on to show the bug.
 +        if std::hint::black_box(true) {
 +            drop(leader);
-+            return false;
++            return true;
 +        }
          if self.lineage.leader.set(leader).is_err() {
              return false;

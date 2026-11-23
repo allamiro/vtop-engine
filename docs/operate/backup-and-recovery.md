@@ -4,7 +4,8 @@ The engine recovers from its own crashes by itself. What it cannot recover
 without help is a lost ledger or lost objects, so those are what you back up.
 This page gives the commands for backing up and restoring the ledger on SQLite
 and on PostgreSQL, the recovery targets, and the drill that CI runs against
-each procedure and what it measured.
+each procedure and what it measured. When there is no backup, or the bucket or
+a whole region is lost, see [Disaster recovery](disaster-recovery.md).
 
 ## What the engine recovers by itself
 
@@ -27,11 +28,25 @@ vtopctl replay --batch-id <batch_id> --config /etc/vtop/config.yaml
 | What | Why | How |
 |---|---|---|
 | **The ledger** | Each batch's state, and the cursor recovery resumes from. The coverage audit and the scrub read it. | SQLite: the online backup, while the engine runs ([below](#sqlite)). PostgreSQL: `pg_dump`, or a base backup with WAL archiving ([below](#postgresql)). |
-| **Prune digests** | The rows pruning deleted, which the audit and scrub still account for. | `engine.ledger_digest_dir`, or `<database file>.ledger-digests/` beside a SQLite file. Copy it **after** the ledger backup, so no digest a backed-up row needs is missing. |
+| **Prune digests** | The rows pruning deleted, which the audit and scrub still account for. | `engine.ledger_digest_dir`, or `<database file>.ledger-digests/` beside a SQLite file. **On PostgreSQL, set `engine.ledger_digest_dir` to a durable directory** (the commands below use `/var/lib/vtop/ledger-digests`): unset, the digests go to `<engine.work_dir>/ledger-digests`, which is scratch and is not what this page backs up. Copy it **after** the ledger backup, so no digest a backed-up row needs is missing. |
 | **The bucket** | The archive itself: objects and manifests. | Bucket versioning, replication or the store's backup. With `upload.require_object_versioning`, manifests are pinned by version, so an overwritten manifest cannot roll a batch back. |
 | **Config and secrets** | To rebuild the engine. | Your configuration management. Never commit the secrets. |
 
 `engine.work_dir` is scratch and needs no backup.
+
+**Where and as whom.** Run the commands on this page on the engine's host (or
+a host that can reach its database), as the user the engine runs as
+(`vtop` in [the example unit](https://github.com/allamiro/vtop-engine/blob/main/examples/systemd/vtop-engine.service)),
+with `/etc/vtop/config.yaml` the engine's config. To stop and start the engine,
+use whatever runs it: `systemctl stop vtop-engine` / `systemctl start
+vtop-engine` for that unit, or scale the Deployment to 0 and back to 1. The
+PostgreSQL commands need `VTOP_STATE_STORE` exported in your shell (the same
+value the engine's `engine.state_store: { env: VTOP_STATE_STORE }` resolves
+to), a `vtopctl` built with the `postgres` feature (the release binaries are not,
+and container images up to v0.10.2 are not; see
+[Install](../install/index.md)), and, when a manifest MAC
+key is configured, that key in the environment for every `vtopctl` command
+below (`migrate`, `scrub` and `audit verify` need it).
 
 A copy of a SQLite file taken while the engine runs can miss recent writes:
 the ledger runs in WAL mode, and the newest rows may be in the `-wal` file.
@@ -139,15 +154,20 @@ which copies a consistent snapshot even while the engine writes:
 umask 077
 sqlite3 /var/lib/vtop/state.db ".timeout 10000" ".backup '/backup/state.db'"
 mkdir -p /backup/digests
-cp -a /var/lib/vtop/state.db.ledger-digests/. /backup/digests/  # after the database
+# after the database; the directory exists once `vtopctl prune-ledger` has run
+[ -d /var/lib/vtop/state.db.ledger-digests ] \
+  && cp -a /var/lib/vtop/state.db.ledger-digests/. /backup/digests/
 sqlite3 /backup/state.db 'PRAGMA integrity_check'               # prints: ok
 ```
+
+Run it as the engine's user, so the copy belongs to it.
 
 The `umask 077` matters on the way back: the engine refuses a ledger other
 local users can reach ([Secret files](secrets.md)), and `.backup` creates the
 copy with your umask's mode.
 
-**Restore.** Stop every engine first (a crashed one is already stopped).
+**Restore.** Stop every engine first (a crashed one is already stopped;
+`systemctl status vtop-engine` says which).
 
 ```bash
 rm -f /var/lib/vtop/state.db /var/lib/vtop/state.db-wal /var/lib/vtop/state.db-shm
@@ -156,7 +176,8 @@ chmod 0600 /var/lib/vtop/state.db
 rm -rf /var/lib/vtop/state.db.ledger-digests
 mkdir -p /var/lib/vtop/state.db.ledger-digests
 cp -a /backup/digests/. /var/lib/vtop/state.db.ledger-digests/
-vtopctl run --config /etc/vtop/config.yaml
+chown -R vtop:vtop /var/lib/vtop/state.db /var/lib/vtop/state.db.ledger-digests  # if you ran this as root
+systemctl start vtop-engine        # or: vtopctl run --config /etc/vtop/config.yaml
 ```
 
 Remove the old `-wal` and `-shm` files: a WAL left from the lost ledger does
@@ -188,6 +209,20 @@ vtopctl migrate --config /etc/vtop/config.yaml                  # always, before
 vtopctl run --config /etc/vtop/config.yaml
 ```
 
+**Roles.** A dump holds the database, not the cluster's roles. If your
+deployment runs the two identities of
+[PostgreSQL in depth](../POSTGRES_DEPLOYMENT.md#identities) (a migration
+owner that owns the schema and a runtime role the engine connects as), the
+server you restore into, if it is not the one you dumped from, needs both
+roles **before** `pg_restore` (create them from your deployment's own script,
+or keep `pg_dumpall --roles-only` beside the dump): the dump names the owner
+and the grants, and `--exit-on-error` stops at the first role that does not
+exist. After the restore and `vtopctl migrate`, check the runtime role's grants
+against
+[the deployment sequence](../POSTGRES_DEPLOYMENT.md#deployment-sequence), and
+run `vtopctl migrate` with `VTOP_STATE_STORE` set to the migration owner's URL,
+not the runtime role's.
+
 A dump that carries the schema as well as the rows restores into an empty
 database without disabling the commit rule's trigger: `pg_restore` loads the
 rows before it creates the triggers. `vtopctl migrate` after it re-creates the
@@ -209,8 +244,14 @@ archive_command = 'test ! -f /walarch/%f && cp %p /walarch/%f'   # any command t
 archive_timeout = 60        # force a segment switch this often while the ledger is written
 ```
 
+`archive_mode` takes a server restart; the other two reload. Then take the
+base backup, from a role that has the `REPLICATION` attribute and a
+`pg_hba.conf` entry for replication connections (without one the command stops
+with "no pg_hba.conf entry for replication connection"):
+
 ```bash
-pg_basebackup --pgdata=/basebackup/base --wal-method=stream --checkpoint=fast
+pg_basebackup --host=<primary> --username=<replication role> \
+  --pgdata=/basebackup/base --wal-method=stream --checkpoint=fast
 ```
 
 Copy the prune digests (`engine.ledger_digest_dir`) to the same storage **after
@@ -235,7 +276,9 @@ segment files it writes.
    user, mode `0700`.
 2. `touch <datadir>/recovery.signal`.
 3. Start the server with `restore_command` pointing at the archive and
-   `recovery_target_action = promote`:
+   `recovery_target_action = promote` (on the command line, as below, for a
+   restore you watch; for a service, put the two settings in the data
+   directory's `postgresql.auto.conf` and start it as you start any server):
 
    ```bash
    postgres -D <datadir> \
@@ -243,7 +286,9 @@ segment files it writes.
      -c recovery_target_action=promote
    ```
 
-4. Wait until `SELECT pg_is_in_recovery()` is false.
+4. Wait until `SELECT pg_is_in_recovery()` is false (`psql -c 'SELECT
+   pg_is_in_recovery()'` prints `f`; the server log ends the replay with
+   "archive recovery complete").
 5. Put the digest directory back (`mkdir -p` it and `cp -a /backup/digests/. <dir>/`),
    run `vtopctl migrate`, and start the engine.
 
@@ -266,6 +311,10 @@ vtopctl audit-coverage --config /etc/vtop/config.yaml --check-storage
 vtopctl scrub --config /etc/vtop/config.yaml --sample 100
 vtopctl audit verify --config /etc/vtop/config.yaml
 ```
+
+The first two read the prune digests from `engine.ledger_digest_dir`; if you
+restored them somewhere else, add `--digest-dir <dir>` to both. Each command
+exits non-zero on a finding; read the exit code, not only the text.
 
 The first reports every committed range as tiled, with no hole and every
 committed object and manifest present; a range the restored ledger does not
@@ -340,13 +389,16 @@ kept as a workflow artifact, and into the run's summary.
   of your own.
 - **The object store.** The drill's bucket is a local directory that the
   disaster does not touch. Backing up and restoring the archive is the store's
-  job (versioning, replication).
+  job (versioning, replication); a lost bucket and a lost region are drilled
+  in [Disaster recovery](disaster-recovery.md).
 - **A source that keeps its position outside the ledger.** The drill reads a
   file, whose position the engine seeds from the ledger. A Kafka source keeps
   its consumer group's offsets in the broker, which a restore of the ledger
-  does not move, so the restored ledger and the group can disagree. That is
-  not drilled: run `audit-coverage` after a restore, and do not treat the
-  restore as complete until it passes.
+  does not move, so the restored ledger and the group can disagree. The
+  [region drill](disaster-recovery.md#a-region-is-lost) restores an older
+  ledger under a newer group: the engine sees the group ahead of the ledger,
+  resumes from the ledger and says so, with no hole. Run `audit-coverage`
+  after a restore, and do not treat the restore as complete until it passes.
 - **A source that deletes after commit.** With `delete_after_commit` the engine
   removes bytes it has committed. A restore to a ledger older than a deletion
   cannot bring those bytes back from the source; the archive still holds the

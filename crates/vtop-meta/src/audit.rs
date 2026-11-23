@@ -46,7 +46,7 @@
 //! (`vtop-node` writes `vtop_observe::audit` records). With none installed a
 //! record is printed as one line on stderr, so it is never silently lost.
 
-use crate::command::MetadataCommand;
+use crate::command::{Attribution, CommandActor, MetadataCommand};
 use crate::transport::authz::AdminIdentity;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
@@ -712,6 +712,31 @@ pub fn is_attributed_when_audited(identity: &AdminIdentity, command: &MetadataCo
     )
 }
 
+/// The parameters an applied record carries when its entry was attributed
+/// (#706): who asked, from where, and which node checked the certificate.
+///
+/// They come from the committed entry, so every replica writes the same
+/// values for one entry, and a replica that lost its edge record still names
+/// the actor. `requested_by` is `certificate:<name>` for an operator,
+/// `node:<uuid>` for a data node, `meta-<id>` for a metadata node and
+/// `anonymous` for a plaintext endpoint; `requested_from` is the address the
+/// vouching leader saw (omitted when it saw none); `vouched_by` is
+/// `meta-<id>`. What the client declared is never among them.
+pub fn attribution_params(attribution: &Attribution) -> Vec<(&'static str, String)> {
+    let requested_by = match &attribution.actor {
+        CommandActor::Named(name) => format!("certificate:{name}"),
+        CommandActor::Node(uuid) => format!("node:{uuid}"),
+        CommandActor::MetaNode(id) => format!("meta-{id}"),
+        CommandActor::Anonymous => "anonymous".to_owned(),
+    };
+    let mut params = vec![("requested_by", requested_by)];
+    if let Some(peer) = attribution.peer {
+        params.push(("requested_from", peer.to_string()));
+    }
+    params.push(("vouched_by", format!("meta-{}", attribution.vouched_by)));
+    params
+}
+
 /// The record for a refused request, whatever the command: a refusal is
 /// audited even for a command whose success is not.
 pub fn refusal(identity: &AdminIdentity, command: &MetadataCommand, reason: String) -> AuditRecord {
@@ -793,5 +818,61 @@ impl Auditor for Recording {
             .unwrap_or_else(|e| e.into_inner())
             .push(record.clone());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod attribution_param_tests {
+    use super::*;
+
+    fn attribution(actor: CommandActor, peer: Option<&str>) -> Attribution {
+        Attribution {
+            actor,
+            peer: peer.map(|p| p.parse().unwrap()),
+            vouched_by: 3,
+            recorded_at_ms: 1_750_000_000_777,
+        }
+    }
+
+    /// #706: what an applied record names, for every actor shape. The time
+    /// is not among the parameters: it is the leader's clock, audit only.
+    #[test]
+    fn an_attributed_entry_names_its_actor_the_address_and_the_voucher() {
+        let uuid = Uuid::from_u128(0x10);
+        let cases = [
+            (
+                attribution(CommandActor::Named("ops-alice".into()), Some("192.0.2.44")),
+                vec![
+                    ("requested_by", "certificate:ops-alice".to_owned()),
+                    ("requested_from", "192.0.2.44".to_owned()),
+                    ("vouched_by", "meta-3".to_owned()),
+                ],
+            ),
+            (
+                attribution(CommandActor::Node(uuid), Some("2001:db8::7")),
+                vec![
+                    ("requested_by", format!("node:{uuid}")),
+                    ("requested_from", "2001:db8::7".to_owned()),
+                    ("vouched_by", "meta-3".to_owned()),
+                ],
+            ),
+            (
+                attribution(CommandActor::MetaNode(2), None),
+                vec![
+                    ("requested_by", "meta-2".to_owned()),
+                    ("vouched_by", "meta-3".to_owned()),
+                ],
+            ),
+            (
+                attribution(CommandActor::Anonymous, None),
+                vec![
+                    ("requested_by", "anonymous".to_owned()),
+                    ("vouched_by", "meta-3".to_owned()),
+                ],
+            ),
+        ];
+        for (attribution, expected) in cases {
+            assert_eq!(attribution_params(&attribution), expected);
+        }
     }
 }
