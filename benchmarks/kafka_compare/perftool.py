@@ -29,6 +29,27 @@ _PRODUCER_SUMMARY = re.compile(
 )
 
 
+# e.g. "31090 records sent, 6216.8 records/sec (0.59 MB/sec), 4908.4 ms avg latency, 5839.0 ms max latency."
+# The tool prints one every five seconds; the summary lines above carry percentiles and do not match.
+_PRODUCER_PROGRESS = re.compile(
+    rf"^[0-9]+ records sent, (?P<rps>{_NUM}) records/sec \({_NUM} MB/sec\), "
+    rf"{_NUM} ms avg latency, {_NUM} ms max latency\.\s*$"
+)
+
+
+def last_progress_rate(output: str) -> float | None:
+    """The achieved rate of the last progress line the producer tool printed, or None when it printed none.
+
+    Read only from a run that was stopped before its summary (the leg's wall limit): it says how fast the
+    system was going when it was cut off, which the failed row's note carries. It is not a measurement."""
+    rate = None
+    for line in output.splitlines():
+        match = _PRODUCER_PROGRESS.match(line.strip())
+        if match and match.group("rps") != "NaN":
+            rate = float(match.group("rps"))
+    return rate
+
+
 class ProducerResult(NamedTuple):
     records: int
     records_per_sec: float

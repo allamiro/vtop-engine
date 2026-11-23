@@ -1,0 +1,9 @@
+system,record_size,partitions,producers,compression,acks,profile,group_commit,repetition,load_basis,load_pct,bucket_ms,count
+kafka,100,1,1,none,all,defaults,,1,common,50,1,1500
+kafka,100,1,1,none,all,defaults,,1,common,50,2,1500
+vtop,100,1,1,none,all,defaults,off,1,common,50,1,1500
+vtop,100,1,1,none,all,defaults,off,1,common,50,2,1500
+vtop,100,1,1,none,all,defaults,on,1,common,50,1,1500
+vtop,100,1,1,none,all,defaults,on,1,common,50,2,1500
+kafka,100,1,1,none,all,fsync-parity,,1,common,50,1,1500
+kafka,100,1,1,none,all,fsync-parity,,1,common,50,2,1500
