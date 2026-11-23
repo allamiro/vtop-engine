@@ -9956,9 +9956,14 @@ mod tests {
             .into_iter()
             .filter(|uri| !before.contains(uri))
             .collect();
+        // The failed window's put was refused, so its rebuild is its first
+        // object; the appended lines are read for the first time. Neither
+        // overlaps the held range.
         assert!(
-            new.iter().all(|uri| uri.contains("-b0-14-")),
-            "only the failed window, whose put was refused, is a new object: {new:?}"
+            new.len() == 2
+                && new.iter().any(|uri| uri.contains("-b0-14-"))
+                && new.iter().any(|uri| uri.contains("-b28-42-")),
+            "only the failed window and the appended lines are new objects: {new:?}"
         );
     }
 
