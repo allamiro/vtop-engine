@@ -34,7 +34,10 @@ saturation run AND per consume run, per record size), `--fixed-seconds 30` (the 
 schema-4 switches `--no-e2e` (no end-to-end stage), `--no-fsync-parity` (the end-to-end stage for both systems as
 shipped only) and `--no-resources` (no cgroup windows).
 Every one is checked before any Docker work, and so is the matrix's projected run time (`plan.py`):
-a matrix projected past `--max-hours` is refused before the first container starts.
+a matrix projected past `--max-hours` is refused before the first container starts. The projection is a bound:
+each fixed-rate leg is charged its wall limit (`3 x --fixed-seconds + 60 s`), and each saturation or consume run
+the longer of its bytes at 2 MiB/s and its records at 6,000 records/s (VTOP's rate with 100 B records in the
+v0.11.1 AWS round, rounded down). `plan.py` and the runner's first line also print the figure if every leg is on time.
 
 ### Group commit on and off (#752)
 

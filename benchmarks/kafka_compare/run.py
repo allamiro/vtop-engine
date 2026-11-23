@@ -1447,7 +1447,8 @@ def main(argv: list[str] | None = None) -> int:
     leader_base = _read(LEADER_CONFIG)
     group_commit_configs = {setting: leader_config(leader_base, setting, node_keys) for setting in settings}
     hours = check_plan(matrix, args.max_hours)
-    log(f"{len(schema.expected_keys(matrix))} result rows, projected {hours:.1f} h (--max-hours {args.max_hours:g})")
+    log(f"{len(schema.expected_keys(matrix))} result rows, projected {hours:.1f} h at most, "
+        f"{plan.on_time_hours(matrix):.1f} h if every fixed-rate leg is on time (--max-hours {args.max_hours:g})")
     if args.reps < 3:
         log(f"warning: {args.reps} repetitions is below #595 rule 7's minimum of 3")
     limits = check_equal_limits()

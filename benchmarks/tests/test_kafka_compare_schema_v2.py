@@ -428,8 +428,12 @@ def test_the_projection_charges_each_fixed_rate_run_its_configured_duration():
     short = {**SMALL, "fixed_seconds": 30}
     long = {**SMALL, "fixed_seconds": 7200}
     fixed_runs = 2 * 2 * 2 * 3 * 4  # cells x profiles x systems x reps x rates: every system runs every profile's
+    # The bound charges each leg its wall limit (3 x fixed_seconds + 60 s, lesson 2 of the v0.11.1 AWS round);
+    # the on-time figure its target.
     assert plan.projected_seconds(long) - plan.projected_seconds(short) == pytest.approx(
-        fixed_runs * (7200 - 30))
+        fixed_runs * (plan.fixed_rate_wall_limit(7200) - plan.fixed_rate_wall_limit(30)))
+    assert plan.projected_seconds(long, on_time=True) - plan.projected_seconds(short, on_time=True) == \
+        pytest.approx(fixed_runs * (7200 - 30))
     with pytest.raises(plan.PlanRefused, match="over --max-hours 30"):
         plan.check_budget(long, 30)
 

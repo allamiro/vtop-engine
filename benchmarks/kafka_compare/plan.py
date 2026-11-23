@@ -230,11 +230,14 @@ def check_matrix(matrix: dict[str, Any]) -> None:
 # not a measurement; the rehearsal's first cells calibrate it.
 #
 # A matrix that sizes saturation and consume runs by record count
-# (`sat_records`, the runner today) is charged by the bytes they move at
-# SLOWEST_BYTES_PER_SECOND instead, when that is longer: phase 1's VTOP
-# moved about 2.3 MiB/s at both record sizes (run 20261109T232328Z), so 2 MiB/s
-# keeps a record-count run from passing the budget on a duration it never
-# had (review).
+# (`sat_records`, the runner today) is charged the longer of the bytes they move
+# at SLOWEST_BYTES_PER_SECOND and the records at SLOWEST_RECORDS_PER_SECOND.
+# Phase 1's VTOP moved about 2.3 MiB/s at both record sizes (run
+# 20261109T232328Z), hence 2 MiB/s. The bytes floor alone does not hold for small
+# records: in the v0.11.1 AWS round VTOP saturated at about 6.2k records/s with
+# 100 B records (0.6 MiB/s), so a 3 M-record run took about 8 minutes where the
+# bytes floor charged 2.4 (review of that round, lesson 2). The record floor is
+# that figure, rounded down.
 DEFAULT_TIMING = {
     "bring_up": 90.0,        # cluster up, smoke read-back, cluster down
     "warm_up": 30.0,         # the unrecorded warm-up run
@@ -246,6 +249,7 @@ DEFAULT_TIMING = {
     "resource_window": 6.0,
 }
 SLOWEST_BYTES_PER_SECOND = 2 * 1024 * 1024
+SLOWEST_RECORDS_PER_SECOND = 6_000
 
 
 def fixed_rate_wall_limit(fixed_seconds: float) -> float:
@@ -259,18 +263,22 @@ def fixed_rate_wall_limit(fixed_seconds: float) -> float:
     return 3.0 * float(fixed_seconds) + 60.0
 
 
-def projected_seconds(matrix: dict[str, Any], timing: dict[str, float] | None = None) -> float:
-    """Wall time of the whole matrix, both systems, every profile run.
+def projected_seconds(matrix: dict[str, Any], timing: dict[str, float] | None = None, *,
+                      on_time: bool = False) -> float:
+    """Wall time of the whole matrix, both systems, every profile run: a bound.
 
-    A VTOP cell whose configuration is the same under two profiles
+    A fixed-rate leg is charged its wall limit (`fixed_rate_wall_limit`), which is what it costs when the
+    system cannot hold the rate; `on_time=True` charges it its target instead, the figure if every leg is on
+    time. A VTOP cell whose configuration is the same under two profiles
     (`matrix.vtop_profiles_share_config`) brings its cluster up and makes its
     unrated runs once, recorded under both (`same_config_as`); its
     fixed-rate runs are made per profile.
     """
     t = {**DEFAULT_TIMING, **(timing or {})}
-    # A fixed-rate run lasts the matrix's own target (review): charging a
+    # A fixed-rate run lasts at least the matrix's own target (review): charging a
     # constant would let a long --fixed-seconds pass the budget unseen.
-    t["fixed_rate"] += float(matrix.get("fixed_seconds", 30.0))
+    fixed_seconds = float(matrix.get("fixed_seconds", 30.0))
+    t["fixed_rate"] += fixed_seconds if on_time else fixed_rate_wall_limit(fixed_seconds)
     a = axes(matrix)
     fixed = sum(len(p) for p in a.load_bases.values())
     sat_records = {int(k): int(v) for k, v in (matrix.get("sat_records") or {}).items()}
@@ -279,7 +287,8 @@ def projected_seconds(matrix: dict[str, Any], timing: dict[str, float] | None = 
     for cell in a.cells:
         sized = {mode: t[mode] for mode in ("saturation", "consume")}
         if cell.record_size in sat_records:
-            moved = sat_records[cell.record_size] * cell.record_size / SLOWEST_BYTES_PER_SECOND
+            records = sat_records[cell.record_size]
+            moved = max(records * cell.record_size / SLOWEST_BYTES_PER_SECOND, records / SLOWEST_RECORDS_PER_SECOND)
             sized = {mode: max(seconds, moved) for mode, seconds in sized.items()}
         shared = sum(sized.get(m, t[m]) for m in cell.modes if m != "fixed_rate")
         rated = t["fixed_rate"] * fixed if "fixed_rate" in cell.modes else 0.0
@@ -305,7 +314,7 @@ def projected_seconds(matrix: dict[str, Any], timing: dict[str, float] | None = 
 
 
 def check_budget(matrix: dict[str, Any], max_hours: float, timing: dict[str, float] | None = None) -> float:
-    """The projected hours, or PlanRefused when they exceed `max_hours`."""
+    """The projected hours (the bound), or PlanRefused when they exceed `max_hours`."""
     hours = projected_seconds(matrix, timing) / 3600
     if hours > max_hours:
         raise PlanRefused(f"the matrix is projected to take {hours:.1f} h, over --max-hours {max_hours:g}; "
@@ -314,12 +323,17 @@ def check_budget(matrix: dict[str, Any], max_hours: float, timing: dict[str, flo
 
 
 def summary(matrix: dict[str, Any]) -> str:
-    """The plan's one-line summary: cells, rows owed and projected hours."""
+    """The plan's one-line summary: cells, rows owed and projected hours, the bound and the on-time figure."""
     a = axes(matrix)
     hours = projected_seconds(matrix) / 3600
     settings = f" x group commit {', '.join(a.group_commits)} (VTOP)" if a.group_commits else ""
     return (f"{len(a.cells)} cells x {len(a.profiles)} profile(s) x {len(SYSTEMS)} systems{settings} x "
-            f"{a.repetitions} repetitions: {len(expected_keys(matrix))} result rows, projected {hours:.1f} h")
+            f"{a.repetitions} repetitions: {len(expected_keys(matrix))} result rows, projected {hours:.1f} h "
+            f"at most ({on_time_hours(matrix):.1f} h if every fixed-rate leg is on time)")
+
+
+def on_time_hours(matrix: dict[str, Any]) -> float:
+    return projected_seconds(matrix, on_time=True) / 3600
 
 
 def main(argv: list[str] | None = None) -> int:
