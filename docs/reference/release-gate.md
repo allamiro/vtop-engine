@@ -28,10 +28,10 @@ component is production, preview or experimental; the
 
 | Item | Value |
 |---|---|
-| Evaluated | 2026-11-22 |
+| Evaluated | 2026-11-23 |
 | Met | 17 |
-| Partial | 8 |
-| Not met | 5 |
+| Partial | 9 |
+| Not met | 4 |
 | 1.0.0-rc.1 may be cut | no |
 | 1.0.0 may be cut | no |
 
@@ -55,7 +55,7 @@ only for a met row.
 | A4 | Jepsen-style history check of the cluster plane | partial | Recorder and data-plane checker (`scripts/live-chaos/history/check_history.py`; #878), fed by scenarios 04 and 09 in `.github/workflows/ci.yml::live-chaos`. Lease and metadata histories, the 24-hour campaign and the live bug re-introductions are open. | #728 | 2026-11-22 |
 | A5 | Fuzz and mutation | met | `.github/workflows/fuzz-nightly.yml::fuzz` over 12 decoders, an hour per target each night, with a persisted corpus, and a crash opens an issue; `.github/workflows/ci.yml::mutants-gate` (`scripts/mutants-gate.py`) on the state machine; the recovery path (#900), the verify path in `vtop-upload` (#922) and the file-continuity code in `vtop-adapters` (#919) gated per file at their measured scores, nightly (`.github/workflows/fuzz-nightly.yml::mutants`). | none | 2026-11-22 |
 | A6 | Every bug lands with a test that failed first | met | The rule in `CONTRIBUTING.md`; the release notes name the tests. | none | 2026-11-22 |
-| B1 | AWS S3 and one other S3 provider | not met | The live S3 tests run on every pull request against MinIO, RustFS, Garage, SeaweedFS, Versity and CloudServer, each with its capability file (`.github/workflows/ci.yml::s3-compat`, calling `.github/workflows/s3-compat-matrix.yml::leg`; `crates/vtop-upload/tests/live_s3_verification.rs`; `crates/vtop-s3-testkit`, #764). No AWS run is in CI yet: the `s3-aws` leg is configured and runs once v0.11.0 is released. A store without Object Lock or versioning is refused at startup (#770). | #722 | 2026-11-22 |
+| B1 | AWS S3 and one other S3 provider | partial | The AWS leg runs once per release, not nightly (the maintainer's decision of 2026-11-23); the six open-source servers run in the matrix. AWS: `.github/workflows/s3-aws.yml::aws`, [run on v0.11.1 of 2026-11-23](https://github.com/allamiro/vtop-engine/actions/runs/45127198938), in both SDK checksum modes: 17 cases passed, the verification cases saw `store_checksum` for a single PUT and `read_back` for BLAKE3 and multipart, Object Lock (governance) enforced, none failed (`tests/s3-compat/results/aws.json`; `tests/s3-compat/servers/aws.yaml` settled from it). MinIO, RustFS, Garage, SeaweedFS, Versity and CloudServer pass every case their capability files expect (`.github/workflows/s3-compat-matrix.yml::leg`, with MinIO on every pull request through `.github/workflows/ci.yml::s3-compat`; `crates/vtop-s3-testkit`, #764). The table of verification method and lock behaviour per provider is `docs/reference/s3-compatibility.md`. A store without Object Lock or versioning is refused at startup (#770). Not shown against AWS: the multipart resume suite (its three cases need a plain-HTTP endpoint for their fault-injecting forwarder, so they are not run there) and the scrub of a receipt whose retention was cleared (the role deliberately lacks the governance bypass). | #741 | 2026-11-23 |
 | B2 | Real Kafka versions | met | `.github/workflows/kafka-matrix.yml::kafka` (Apache Kafka 3.7 to 4.4, TLS and SASL listeners, Redpanda; #834); `.github/workflows/kafka-cluster.yml::cluster` (three brokers, a leader stopped mid-read; #874). The [nightly of 2026-11-20](https://github.com/allamiro/vtop-engine/actions/runs/44730486247) passed; the nightly of 2026-11-21 failed one leg on a paused-partition race that #877 fixed the same day. | none | 2026-11-22 |
 | B3 | State store versions | met | `.github/workflows/postgres-matrix.yml::postgres` on PostgreSQL 14 to 18 (#761; [nightly of 2026-11-21](https://github.com/allamiro/vtop-engine/actions/runs/44881713701)); `crates/vtop-state/tests/pg_battery.rs`. | none | 2026-11-22 |
 | B4 | Platforms | met | Release archives smoked on every Linux, with a glibc 2.17 and a static musl build, and each Linux archive run against a live Kafka broker before publishing; the dry run builds the commit about to be tagged (`.github/workflows/release.yml::binaries`; #842, #901); the workspace's tests on macOS arm64, macOS x86_64 and aarch64 Linux nightly (`.github/workflows/platform-tests.yml::test`; #876). The minimum glibc and macOS versions are stated in `docs/install/binaries.md`. Its issue is closed. | none | 2026-11-22 |

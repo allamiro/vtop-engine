@@ -83,11 +83,6 @@ the reason in `detail` (the multipart tests' fault-injecting forwarder needs
 a plain-HTTP endpoint, so on AWS they are not run); the report shows its
 capabilities as not tested.
 
-`not_run` is a case the test harness cannot run against the server, with
-the reason in `detail` (the multipart tests' fault-injecting forwarder needs
-a plain-HTTP endpoint, so on AWS they are not run); the report shows its
-capabilities as not tested.
-
 An unexpected outcome fails the test with a line such as:
 
 ```text
