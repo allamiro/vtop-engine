@@ -35,9 +35,17 @@ type: application
 # 0.6.3: no template or values-key change — the shipped alert rules gain
 # VtopStateStoreWritesSlow (#872), VtopBucketVersioningPaused (#883) and
 # VtopEpochHistoryBroken (#894); carries appVersion 0.10.4.
-version: 0.6.3
+# 0.7.0: meta.adminAuthorization.enabled now defaults to true, and a render
+# with no meta.adminAuthorization.operatorCommonNames is refused unless
+# allowNoOperators or the lab opt-out is set (#864); data.kafka (off by
+# default, replicated topology only, acknowledgeUnauthenticated required,
+# advertisedHosts per data pod) serves the Kafka gateway on every candidate
+# (#860) — values-contract changes, hence the minor bump; carries appVersion
+# 0.11.0.
+# 0.7.1: no template or values change — the bump carries appVersion 0.11.1.
+version: 0.7.1
 # Must track the workspace version in Cargo.toml; the GHCR image tags follow it.
-appVersion: "0.10.4"
+appVersion: "0.11.1"
 kubeVersion: ">=1.25.0-0"
 home: https://github.com/allamiro/vtop-engine
 sources:
