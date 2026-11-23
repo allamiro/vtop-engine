@@ -1402,12 +1402,36 @@ impl InProcessFollower {
                 ) else {
                     continue;
                 };
+                // A request's records are not always consecutive offsets from
+                // its base: the leader keeps a retried record at the offset it
+                // was first written at and gives only the new ones offsets, and
+                // replicates the member whole, from the first new record's
+                // offset, or from the lowest offset when every record is a
+                // retry. So a record this replica already holds, byte for byte,
+                // under its producer, epoch and sequence, is a retry wherever
+                // it sits, and a request made only of those is no conflict. One
+                // held below the base takes no offset here; the rest are
+                // compared, in order, with what this replica holds from the
+                // base.
+                let mut fresh = false;
+                let mut placed = Vec::with_capacity(sent.len());
+                for record in &sent {
+                    match state.segment.held_offset(record) {
+                        Some(offset) if offset < request.expected_base_offset => continue,
+                        Some(_) => {}
+                        None => fresh = true,
+                    }
+                    placed.push(record);
+                }
+                if !fresh {
+                    continue;
+                }
                 // A read that fails or stops short says nothing about the
                 // bytes: left to the duplicate path, as before.
                 let Ok(held_here) = state.segment.fetch_through(
                     request.expected_base_offset,
                     usize::MAX,
-                    sent.len(),
+                    placed.len(),
                     committed,
                 ) else {
                     continue;
@@ -1415,8 +1439,8 @@ impl InProcessFollower {
                 let differs = held_here
                     .records
                     .iter()
-                    .zip(&sent)
-                    .any(|(held, sent)| held.record != *sent);
+                    .zip(&placed)
+                    .any(|(held, sent)| held.record != **sent);
                 if differs {
                     conflict = Some(request.expected_base_offset);
                     break;

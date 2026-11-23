@@ -879,6 +879,20 @@ impl ActiveSegment {
         self.fetch_through(start_offset, max_bytes, max_records, self.committed_offset)
     }
 
+    /// The offset this segment holds `record` at, when its producer state has
+    /// the same producer, epoch and sequence with the same content: the
+    /// offset [`Self::append_group`] would answer a retry of it with, as a
+    /// duplicate. `None` for a record it does not hold, for other content at
+    /// that sequence, and for a sequence older than the retry window.
+    pub fn held_offset(&self, record: &LogRecord) -> Option<u64> {
+        let seen = self
+            .producer_states
+            .get(&(record.producer_id, record.producer_epoch))?
+            .seen
+            .get(&record.sequence)?;
+        (seen.content_hash == record_content_hash(record)).then_some(seen.offset)
+    }
+
     /// Fetch records visible at or below `high_watermark`.
     ///
     /// The effective watermark is clamped to the local durable

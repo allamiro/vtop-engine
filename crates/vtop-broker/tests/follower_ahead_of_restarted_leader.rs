@@ -651,3 +651,93 @@ fn an_append_over_a_followers_tail_is_judged_by_its_bytes_and_its_mark() {
         );
     }
 }
+
+fn member(
+    range: &RangeIdentity,
+    base: u64,
+    producer: Uuid,
+    first_sequence: u64,
+    values: &[&str],
+) -> ReplicaAppendRequest {
+    ReplicaAppendRequest {
+        range: range.clone(),
+        fencing_epoch: EPOCH,
+        leader_node_id: LEADER,
+        expected_base_offset: base,
+        producer_id: producer,
+        producer_epoch: 1,
+        first_sequence,
+        records: values
+            .iter()
+            .map(|value| wire_record(value.as_bytes().to_vec()))
+            .collect(),
+    }
+}
+
+/// A produce that mixes a retry with a new record: the leader keeps the
+/// retried record at the offset it was first written at, gives the new one the
+/// next free offset, and replicates the member whole from that offset. When
+/// the acknowledgements of that append are lost and the client retries, every
+/// record is a duplicate on the leader, and the member is replicated from the
+/// lowest of their offsets, where another producer's record sits between the
+/// two. That is a retry of records this follower holds, not a conflict: it is
+/// acknowledged and nothing is discarded, whether or not the mark covers them.
+/// Compared by position, the other producer's record was taken for a conflict:
+/// discarded when unacknowledged, and the retry refused when acknowledged.
+#[test]
+fn a_retry_whose_records_are_not_at_consecutive_offsets_is_not_a_conflict() {
+    let other = Uuid::from_u128(0xB2);
+    for v2 in [false, true] {
+        for mark in [0, 3] {
+            let range = range_identity();
+            let meta = MetaFencingEpoch::new(EPOCH);
+            let dir = tempfile::tempdir().unwrap();
+            let floor = ClusterCommittedOffset::new(mark);
+            let follower = InProcessFollower::new(
+                FOLLOWERS[0],
+                create_segment(&dir, 0xE4, &range, v2),
+                ProducerEpochJournal::open(dir.path().join("epochs")).unwrap(),
+                range.clone(),
+                EPOCH,
+                meta,
+                floor.clone(),
+            )
+            .unwrap();
+            // A0 at 0, then another producer's B0 at 1.
+            follower
+                .apply_append(&member(&range, 0, PRODUCER, 0, &["a0"]))
+                .unwrap();
+            follower
+                .apply_append(&member(&range, 1, other, 0, &["b0"]))
+                .unwrap();
+            // The produce [A0, A1]: A0 is a retry that stays at 0, A1 is new
+            // at 2, and the leader replicates the member from 2.
+            follower
+                .apply_append(&member(&range, 2, PRODUCER, 0, &["a0", "a1"]))
+                .unwrap();
+            assert_eq!(follower.next_offset(), 3, "v2={v2} mark={mark}");
+            // Its acknowledgements were lost; the client retries, and the
+            // leader, finding both records, replicates the member from 0.
+            let response = follower
+                .apply_append(&member(&range, 0, PRODUCER, 0, &["a0", "a1"]))
+                .unwrap_or_else(|refusal| {
+                    panic!(
+                        "v2={v2} mark={mark}: a retry of records this follower holds was \
+                         refused: {refusal:?}"
+                    )
+                });
+            assert_eq!(response.local_committed_offset, 3, "v2={v2} mark={mark}");
+            assert_eq!(
+                follower.next_offset(),
+                3,
+                "v2={v2} mark={mark}: nothing is discarded for a retry"
+            );
+            floor.advance_to(3);
+            assert_eq!(
+                served_values(&follower),
+                ["a0", "b0", "a1"],
+                "v2={v2} mark={mark}: the other producer's record is still at 1"
+            );
+        }
+    }
+}
