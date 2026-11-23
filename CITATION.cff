@@ -13,7 +13,7 @@ repository-code: "https://github.com/allamiro/vtop-engine"
 url: "https://github.com/allamiro/vtop-engine"
 license: MIT
 version: "0.11.0"
-date-released: "2026-11-22"
+date-released: "2026-11-23"
 keywords:
   - telemetry
   - object storage
