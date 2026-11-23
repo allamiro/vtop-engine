@@ -191,6 +191,34 @@ def test_a_committed_matrix_result_joins_the_strip(data_tree):
     assert "when the matrix is published" not in facts["alts"]["card-tested"]
 
 
+def test_a_hosted_service_is_shown_as_of_its_run_date():
+    # AWS S3 has no version to record; its capability file says the SDK finds its endpoint.
+    with open(os.path.join(readme_charts.REPO, site_facts.S3_RESULTS, "aws.json"), encoding="utf-8") as handle:
+        result = json.load(handle)
+    assert result["server_version"] is None
+    facts = site_facts.site_facts()
+    rel = f"{site_facts.S3_RESULTS}/aws.json"
+    entry = next(item for item in facts["tested"]["s3"] if item.get("source") == rel)
+    assert entry["name"] == "AWS S3" and entry["version"] == f"as of {result['run_date']}"
+    assert f"AWS S3 as of {result['run_date']}" in facts["alts"]["card-tested"]
+
+
+def test_a_hosted_service_without_a_run_date_is_refused(data_tree):
+    rel = f"{site_facts.S3_RESULTS}/aws.json"
+    root = data_tree({rel: lambda _text: json.dumps({"server": "aws", "server_version": None, "cases": []})})
+    with pytest.raises(site_facts.Refused, match="name its server and version"):
+        site_facts.site_facts(root)
+
+
+def test_a_server_run_from_an_image_without_a_version_is_refused(data_tree):
+    # Only a hosted service (sdk_default_endpoint: true) may stand on its run date.
+    rel = f"{site_facts.S3_RESULTS}/garage.json"
+    root = data_tree({rel: lambda _text: json.dumps({"server": "garage", "server_version": None,
+                                                     "run_date": "2026-01-01", "cases": []})})
+    with pytest.raises(site_facts.Refused, match="name its server and version"):
+        site_facts.site_facts(root)
+
+
 def test_a_matrix_result_that_names_no_server_is_refused(data_tree):
     root = data_tree({f"{site_facts.S3_RESULTS}/x.json": lambda _text: json.dumps({"version": "1"})})
     with pytest.raises(site_facts.Refused, match="name its server and version"):
