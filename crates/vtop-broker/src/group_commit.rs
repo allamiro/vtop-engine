@@ -18,17 +18,39 @@
 //! the moment it leads: a lone request pays nothing, and the requests that
 //! arrive while one group's barrier runs form the next group, so a group is
 //! exactly as large as the barrier is long.
+//!
+//! # Two stages, in order (#752, E3)
+//!
+//! A quorum flush has a local stage (append and fsync under the broker's
+//! locks) and a replicate-and-commit stage (the replica round, the lease
+//! re-check, the high-water mark). A flush run through
+//! [`GroupCommitCoordinator::enqueue_and_wait_staged`] tells the coordinator
+//! where one ends: [`GroupStage::appended`] takes a ticket under the broker's
+//! state lock, so tickets follow offset order, and
+//! [`GroupStage::begin_replicate`] waits until every group with a lower
+//! ticket has finished its second stage, then hands the lead on. So the next
+//! group's local append and fsync run while this group replicates, as they
+//! do without group commit, where the state lock is released before the
+//! replica round; and the replicate-and-commit stages still run one at a
+//! time, in offset order, so a follower receives the groups in the order its
+//! base-offset check requires.
+//!
+//! At most two groups are in flight: the lead passes only when a group
+//! starts its second stage, and a group that finishes its local stage while
+//! another is still replicating keeps the lead until its own turn. A path
+//! that must not overlap (a group re-run request by request) calls
+//! [`GroupStage::drain`] first and runs while no earlier group replicates.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(vtop_loom))]
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 // The coordinator's own synchronisation, swapped for loom's under the model
 // test (#752); see `loom_model` below. Everything else stays std.
 #[cfg(vtop_loom)]
-use loom::sync::{Arc, Condvar, Mutex};
+use loom::sync::{Arc, Condvar, Mutex, MutexGuard};
 use vtop_protocol::{ErrorCode, Message, ProduceRequest, WireFrame};
 
 /// Thresholds that seal a commit group. The first matched trigger wins.
@@ -111,6 +133,9 @@ pub struct GroupCommitMetrics {
     overloaded_total: AtomicU64,
     /// Groups refused whole by the log and re-run request by request (#752).
     split_groups_total: AtomicU64,
+    /// Groups sealed while an earlier group was in its replicate-and-commit
+    /// stage, so their local stage overlapped its replication (#752, E3).
+    overlapped_total: AtomicU64,
     // std's, not the model's: the metrics are not part of the protocol.
     last: std::sync::Mutex<GroupCommitSample>,
 }
@@ -175,6 +200,13 @@ impl GroupCommitMetrics {
     /// Count a group re-run request by request.
     pub fn record_split(&self) {
         self.split_groups_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Groups sealed while an earlier group was replicating, so their local
+    /// append and fsync overlapped its replica round (#752, E3). Zero with
+    /// one producer, which never has a second request in the broker.
+    pub fn overlapped_total(&self) -> u64 {
+        self.overlapped_total.load(Ordering::Relaxed)
     }
 
     pub fn last_sample(&self) -> GroupCommitSample {
@@ -296,7 +328,23 @@ struct PendingEntry {
 struct CoordinatorState {
     pending: VecDeque<PendingEntry>,
     flushing: bool,
+    /// The ticket the next appended group takes (#752, E3). Only the lead
+    /// holder takes one, under the broker's state lock, so tickets follow
+    /// offset order.
+    next_ticket: u64,
+    /// The ticket whose replicate-and-commit stage may run; every lower
+    /// ticket has finished it.
+    serving: u64,
+    /// True while a group is in its replicate-and-commit stage.
+    replicating: bool,
+    /// Groups taken off the queue and not yet retired. At most
+    /// [`MAX_GROUPS_IN_FLIGHT`].
+    in_flight: usize,
 }
+
+/// Groups in flight at most: one in its replicate-and-commit stage, one in
+/// its local stage (#752, E3).
+pub const MAX_GROUPS_IN_FLIGHT: usize = 2;
 
 /// Per-broker (active segment) group-commit coordinator.
 pub struct GroupCommitCoordinator {
@@ -304,6 +352,8 @@ pub struct GroupCommitCoordinator {
     metrics: Arc<GroupCommitMetrics>,
     state: Mutex<CoordinatorState>,
     cv: Condvar,
+    /// Wakes a group waiting for its replicate-and-commit turn (#752, E3).
+    turn: Condvar,
 }
 
 impl GroupCommitCoordinator {
@@ -315,8 +365,13 @@ impl GroupCommitCoordinator {
             state: Mutex::new(CoordinatorState {
                 pending: VecDeque::new(),
                 flushing: false,
+                next_ticket: 0,
+                serving: 0,
+                replicating: false,
+                in_flight: 0,
             }),
             cv: Condvar::new(),
+            turn: Condvar::new(),
         })
     }
 
@@ -330,27 +385,40 @@ impl GroupCommitCoordinator {
 
     /// Requests queued and not yet taken into a group.
     pub fn queued_requests(&self) -> usize {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .pending
-            .len()
+        self.lock_state().pending.len()
+    }
+
+    /// Groups taken off the queue and not yet answered: at most
+    /// [`MAX_GROUPS_IN_FLIGHT`] (#752, E3).
+    pub fn groups_in_flight(&self) -> usize {
+        self.lock_state().in_flight
     }
 
     /// Enqueue `item` and block until its commit group has been flushed.
     ///
     /// `flush` runs on the leader waiter for each sealed group and must return
-    /// one response frame per queued member, in order.
+    /// one response frame per queued member, in order. Groups flushed this
+    /// way run one at a time, whole: [`Self::enqueue_and_wait_staged`] takes
+    /// a flush that lets the next group's local stage overlap.
     pub fn enqueue_and_wait<F>(&self, item: QueuedProduce, mut flush: F) -> WireFrame
     where
         F: FnMut(&[QueuedProduce]) -> Vec<WireFrame>,
     {
+        self.enqueue_and_wait_staged(item, |batch, _stage| flush(batch))
+    }
+
+    /// [`Self::enqueue_and_wait`], with a flush that reports its stages
+    /// through the [`GroupStage`] it is given (#752, E3), so the next group
+    /// can run its local stage while this one replicates. A flush that never
+    /// calls [`GroupStage::begin_replicate`] keeps the lead to the end, as
+    /// one given to [`Self::enqueue_and_wait`] does.
+    pub fn enqueue_and_wait_staged<F>(&self, item: QueuedProduce, mut flush: F) -> WireFrame
+    where
+        F: FnMut(&[QueuedProduce], &mut GroupStage<'_>) -> Vec<WireFrame>,
+    {
         let slot = WaitSlot::new();
         let become_leader = {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut state = self.lock_state();
             if state.pending.len() >= self.config.max_pending_requests {
                 let queued = state.pending.len();
                 drop(state);
@@ -413,15 +481,17 @@ impl GroupCommitCoordinator {
 
     /// Flush the group at the front of the queue, which holds this thread's
     /// own request, publish every member's answer, then hand the lead to
-    /// the next waiter or, with nothing queued, give it up (#752).
+    /// the next waiter or, with nothing queued, give it up (#752). A staged
+    /// flush hands the lead on earlier, when its replicate stage begins.
     fn lead_one_group<F>(&self, flush: &mut F)
     where
-        F: FnMut(&[QueuedProduce]) -> Vec<WireFrame>,
+        F: FnMut(&[QueuedProduce], &mut GroupStage<'_>) -> Vec<WireFrame>,
     {
         let (members, slots, reason, max_queue_wait) = self.collect_group();
-        // From here the group's answers and the lead are owed whatever the
-        // flush does: `duty` pays both when it is dropped, on the way out of
-        // this function or while a panic in `flush` unwinds through it.
+        // From here the group's answers, its place in the replicate order
+        // and the lead are owed whatever the flush does: `duty` pays all
+        // three when it is dropped, on the way out of this function or while
+        // a panic in `flush` unwinds through it.
         let mut duty = LeaderDuty {
             coordinator: self,
             unanswered: members
@@ -429,10 +499,20 @@ impl GroupCommitCoordinator {
                 .zip(slots)
                 .map(|(item, slot)| (item.request_id, item.stream_id, slot))
                 .collect(),
+            progress: StageProgress {
+                took_group: !members.is_empty(),
+                ..StageProgress::default()
+            },
         };
         if !members.is_empty() {
             let started = Instant::now();
-            let frames = flush(&members);
+            let frames = flush(
+                &members,
+                &mut GroupStage {
+                    coordinator: self,
+                    progress: &mut duty.progress,
+                },
+            );
             let sync_duration = started.elapsed();
             let records = members.iter().map(|item| item.record_count as u64).sum();
             let bytes = members.iter().map(|item| item.payload_bytes).sum();
@@ -444,18 +524,18 @@ impl GroupCommitCoordinator {
                 max_queue_wait,
                 flush_reason: Some(reason),
             });
+            // A group is answered only once every group appended before it
+            // has finished its second stage.
+            duty.finish_stage();
             duty.publish(frames);
         }
     }
 
     /// Pass the lead to the front of the queue or, with nothing queued, give
-    /// it up. Only [`LeaderDuty`]'s drop calls this, so a leader cannot leave
-    /// without it.
-    fn pass_lead(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    /// it up. Only [`LeaderDuty`]'s drop and [`GroupStage::begin_replicate`]
+    /// call this, guarded by one flag per group, so a leader cannot leave
+    /// without passing it and cannot pass it twice.
+    fn pass_lead(&self, state: &mut CoordinatorState) {
         match state.pending.front() {
             // `flushing` stays set: the lead passes, it is not given up, so
             // no arriving request can become a second leader meanwhile.
@@ -463,6 +543,28 @@ impl GroupCommitCoordinator {
             None => state.flushing = false,
         }
         self.cv.notify_all();
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, CoordinatorState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Block until `ticket` is the one being served.
+    fn await_turn<'a>(
+        &'a self,
+        mut state: MutexGuard<'a, CoordinatorState>,
+        ticket: u64,
+    ) -> MutexGuard<'a, CoordinatorState> {
+        while state.serving != ticket {
+            debug_assert!(state.serving < ticket, "a ticket is served once, in order");
+            state = self
+                .turn
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        state
     }
 
     fn collect_group(
@@ -473,10 +575,7 @@ impl GroupCommitCoordinator {
         FlushReason,
         Duration,
     ) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self.lock_state();
         let deadline = Instant::now() + self.config.max_delay;
         let reason = loop {
             let (records, bytes) = pending_totals(&state.pending);
@@ -564,6 +663,19 @@ impl GroupCommitCoordinator {
                 .all(|item| item.request.durability == members[0].request.durability),
             "a sealed group is homogeneous in durability"
         );
+        if !members.is_empty() {
+            state.in_flight += 1;
+            debug_assert!(
+                state.in_flight <= MAX_GROUPS_IN_FLIGHT,
+                "at most {MAX_GROUPS_IN_FLIGHT} groups are in flight, found {}",
+                state.in_flight
+            );
+            if state.replicating {
+                self.metrics
+                    .overlapped_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
         let reason = if split_by_durability {
             FlushReason::Durability
         } else if matches!(reason, FlushReason::SingleRequest) && members.len() > 1 {
@@ -612,9 +724,33 @@ struct LeaderDuty<'a> {
     /// `(request_id, stream_id, slot)` of each member not yet answered, in
     /// group order.
     unanswered: VecDeque<(u64, u64, Arc<WaitSlot>)>,
+    /// Where the group stands in the two stages (#752, E3).
+    progress: StageProgress,
 }
 
 impl LeaderDuty<'_> {
+    /// Retire the group, once: wait for its turn if the flush returned
+    /// before taking it, let the next ticket run, and stop counting the
+    /// group as in flight, all under one lock, so the group a retired
+    /// ticket lets run can never find three in flight.
+    fn finish_stage(&mut self) {
+        if self.progress.finished {
+            return;
+        }
+        self.progress.finished = true;
+        let mut state = self.coordinator.lock_state();
+        if let Some(ticket) = self.progress.ticket {
+            state = self.coordinator.await_turn(state, ticket);
+            state.serving += 1;
+            // Only the group being served can have set it.
+            state.replicating = false;
+            self.coordinator.turn.notify_all();
+        }
+        if self.progress.took_group {
+            state.in_flight -= 1;
+        }
+    }
+
     /// Hand each member its frame, in order. A member left without one is
     /// answered when `self` is dropped.
     fn publish(&mut self, frames: Vec<WireFrame>) {
@@ -642,6 +778,10 @@ impl LeaderDuty<'_> {
 
 impl Drop for LeaderDuty<'_> {
     fn drop(&mut self) {
+        // Before any answer: a member is acknowledged only after the groups
+        // appended before it have finished, and the next ticket must not
+        // wait for a group that has left.
+        self.finish_stage();
         if !self.unanswered.is_empty() {
             // The outcome is unknown either way: the flush may have stopped
             // after the fsync or the quorum ack. So the answer is retryable,
@@ -664,7 +804,82 @@ impl Drop for LeaderDuty<'_> {
                 ));
             }
         }
-        self.coordinator.pass_lead();
+        if !self.progress.lead_passed {
+            self.progress.lead_passed = true;
+            let mut state = self.coordinator.lock_state();
+            self.coordinator.pass_lead(&mut state);
+        }
+    }
+}
+
+/// Where one group stands in the two stages of a staged flush (#752, E3).
+#[derive(Debug, Default)]
+struct StageProgress {
+    /// The group was taken off the queue, so it counts as in flight.
+    took_group: bool,
+    /// Its place in the replicate-and-commit order, once appended.
+    ticket: Option<u64>,
+    /// It has been retired: its ticket served, no longer in flight.
+    finished: bool,
+    /// The lead has been handed on, at `begin_replicate` or at the end.
+    lead_passed: bool,
+}
+
+/// What a staged flush tells the coordinator about its group (#752, E3).
+///
+/// The flush calls [`Self::appended`] under the broker's state lock once
+/// the group's records are appended and fsynced, then, with every broker
+/// lock released, [`Self::begin_replicate`] before its replica round. A
+/// flush that calls neither runs whole, holding the lead to the end.
+pub struct GroupStage<'a> {
+    coordinator: &'a GroupCommitCoordinator,
+    progress: &'a mut StageProgress,
+}
+
+impl GroupStage<'_> {
+    /// The group's records are on the local log. Call it under the lock the
+    /// appends are made under: the ticket it takes then follows offset
+    /// order, and the replicate-and-commit stages run in that order.
+    pub fn appended(&mut self) {
+        if self.progress.ticket.is_some() {
+            return;
+        }
+        let mut state = self.coordinator.lock_state();
+        self.progress.ticket = Some(state.next_ticket);
+        state.next_ticket += 1;
+    }
+
+    /// Wait for this group's turn at replication, which comes once every
+    /// group appended before it has finished its replicate-and-commit
+    /// stage, then hand the lead to the next request, so the next group's
+    /// local stage runs while this one replicates. Call it with no broker
+    /// lock held: an earlier group's commit takes them.
+    pub fn begin_replicate(&mut self) {
+        if self.progress.ticket.is_none() {
+            // Not reported under the lock. The lead has been held since the
+            // append, so no other group has taken a ticket meanwhile, and
+            // the order is still the offset order.
+            self.appended();
+        }
+        let ticket = self.progress.ticket.expect("a ticket was just taken");
+        let mut state = self
+            .coordinator
+            .await_turn(self.coordinator.lock_state(), ticket);
+        state.replicating = true;
+        if !self.progress.lead_passed {
+            self.progress.lead_passed = true;
+            self.coordinator.pass_lead(&mut state);
+        }
+    }
+
+    /// Wait until no group appended before this one is still in its
+    /// replicate-and-commit stage, for a path that must run alone (a group
+    /// re-run request by request). This group keeps the lead, so nothing
+    /// starts behind it until it ends.
+    pub fn drain(&mut self) {
+        let state = self.coordinator.lock_state();
+        let up_to = self.progress.ticket.unwrap_or(state.next_ticket);
+        drop(self.coordinator.await_turn(state, up_to));
     }
 }
 
@@ -1157,6 +1372,114 @@ mod tests {
         );
     }
 
+    /// E3 (#752): a staged flush hands the lead on when its replicate
+    /// stage begins, so the next group's local stage runs while it
+    /// replicates; the second stages run one at a time, in ticket order;
+    /// and a third group does not start while two are in flight. Groups
+    /// hold one request each. Before the change a group held the lead until
+    /// it was answered, so group 2 could not start its local stage while
+    /// group 1 replicated.
+    #[test]
+    fn a_staged_group_hands_on_the_lead_at_its_replicate_turn_and_keeps_two_in_flight() {
+        let coord = Arc::new(
+            GroupCommitCoordinator::new(GroupCommitConfig {
+                max_records: 1,
+                ..zero_delay()
+            })
+            .unwrap(),
+        );
+        let events: Arc<Mutex<Vec<String>>> = Arc::default();
+        let gate = Arc::new(Mutex::new(()));
+        let held = gate.lock().unwrap();
+        let seen = |events: &Mutex<Vec<String>>, what: &str| {
+            events.lock().unwrap().iter().any(|event| event == what)
+        };
+        let await_event = |what: &str| {
+            let deadline = Instant::now() + ANSWER_DEADLINE;
+            while !seen(&events, what) {
+                assert!(
+                    Instant::now() < deadline,
+                    "`{what}` did not happen within {ANSWER_DEADLINE:?}; events: {:?}",
+                    events.lock().unwrap()
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let send = |request_id: u64| {
+            let coord = Arc::clone(&coord);
+            let events = Arc::clone(&events);
+            let gate = Arc::clone(&gate);
+            thread::spawn(move || {
+                coord.enqueue_and_wait_staged(
+                    QueuedProduce::new(request_id, 1, sample_request(request_id)),
+                    |batch, stage| {
+                        let id = batch[0].request_id;
+                        events.lock().unwrap().push(format!("local {id}"));
+                        stage.appended();
+                        stage.begin_replicate();
+                        events.lock().unwrap().push(format!("replicate {id}"));
+                        if id == 1 {
+                            drop(gate.lock().unwrap());
+                        }
+                        events.lock().unwrap().push(format!("done {id}"));
+                        answer(batch)
+                    },
+                )
+            })
+        };
+
+        let first = send(1);
+        await_event("replicate 1");
+        let second = send(2);
+        // The handoff: group 2's local stage runs while group 1 replicates.
+        await_event("local 2");
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !seen(&events, "replicate 2"),
+            "group 2 began replicating before group 1 finished: {:?}",
+            events.lock().unwrap()
+        );
+        let third = send(3);
+        let deadline = Instant::now() + ANSWER_DEADLINE;
+        while coord.queued_requests() < 1 {
+            assert!(Instant::now() < deadline, "request 3 was never queued");
+            thread::sleep(Duration::from_millis(1));
+        }
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !seen(&events, "local 3"),
+            "a third group started while two were in flight: {:?}",
+            events.lock().unwrap()
+        );
+        assert_eq!(coord.groups_in_flight(), MAX_GROUPS_IN_FLIGHT);
+
+        drop(held);
+        for (thread, request_id) in [(first, 1), (second, 2), (third, 3)] {
+            assert_eq!(thread.join().unwrap().request_id, request_id);
+        }
+        let events = events.lock().unwrap().clone();
+        let at = |what: &str| {
+            events
+                .iter()
+                .position(|event| event == what)
+                .unwrap_or_else(|| panic!("`{what}` never happened: {events:?}"))
+        };
+        assert!(
+            at("done 1") < at("replicate 2") && at("done 2") < at("replicate 3"),
+            "the replicate stages ran one at a time, in order: {events:?}"
+        );
+        assert!(
+            at("done 1") < at("local 3"),
+            "group 3 started only once group 1 had left: {events:?}"
+        );
+        assert_eq!(
+            coord.metrics().overlapped_total(),
+            2,
+            "groups 2 and 3 were each sealed while the group before them replicated"
+        );
+        assert_eq!(coord.groups_in_flight(), 0);
+    }
+
     /// D8 (#752): a group is homogeneous in durability. A member whose
     /// durability differs from the group's first seals the group before it
     /// and starts its own, in queue order, so no member is acknowledged at
@@ -1376,6 +1699,98 @@ mod loom_model {
                 !state.flushing,
                 "the lead was given up once the queue emptied"
             );
+        });
+    }
+
+    /// The staged flush (#752, E3): a group hands the lead on when its
+    /// replicate stage begins. In every interleaving of three producers,
+    /// each request is answered once with its own frame, no two leaders run
+    /// a local stage at once, the replicate stages run in the order the
+    /// local stages appended, at most two groups are in flight, and the
+    /// lead is given up once the queue empties (no lost wake-up: a waiter
+    /// left asleep is a deadlock loom reports). A preemption bound of 2 keeps
+    /// the model inside the CI job's budget; the handoff it checks needs one.
+    #[test]
+    fn staged_groups_overlap_in_order_with_one_leader_and_two_in_flight() {
+        use loom::sync::atomic::AtomicUsize;
+
+        struct Log {
+            next_offset: u64,
+            replicated: Vec<u64>,
+        }
+
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(2);
+        builder.check(|| {
+            let coord = Arc::new(
+                GroupCommitCoordinator::new(GroupCommitConfig {
+                    max_delay: Duration::ZERO,
+                    ..GroupCommitConfig::default()
+                })
+                .unwrap(),
+            );
+            // The broker's state lock, and the order the replicate stages ran.
+            let log = Arc::new(Mutex::new(Log {
+                next_offset: 0,
+                replicated: Vec::new(),
+            }));
+            let leaders = Arc::new(AtomicUsize::new(0));
+            let produce = |request_id: u64| {
+                let coord = Arc::clone(&coord);
+                let log = Arc::clone(&log);
+                let leaders = Arc::clone(&leaders);
+                move || {
+                    let frame = coord.enqueue_and_wait_staged(item(request_id), |batch, stage| {
+                        assert_eq!(
+                            leaders.fetch_add(1, Ordering::SeqCst),
+                            0,
+                            "two leaders ran a local stage at once"
+                        );
+                        let base = {
+                            let mut log = log.lock().unwrap();
+                            let base = log.next_offset;
+                            log.next_offset += batch.len() as u64;
+                            stage.appended();
+                            base
+                        };
+                        // The lead is still held here; it passes inside
+                        // `begin_replicate`.
+                        leaders.fetch_sub(1, Ordering::SeqCst);
+                        stage.begin_replicate();
+                        assert!(
+                            coord.groups_in_flight() <= MAX_GROUPS_IN_FLIGHT,
+                            "more than {MAX_GROUPS_IN_FLIGHT} groups in flight"
+                        );
+                        log.lock().unwrap().replicated.push(base);
+                        echo(batch)
+                    });
+                    answered_with_its_own(frame, request_id);
+                }
+            };
+            let others: Vec<_> = [2u64, 3]
+                .into_iter()
+                .map(|request_id| loom::thread::spawn(produce(request_id)))
+                .collect();
+            produce(1)();
+            for other in others {
+                other.join().unwrap();
+            }
+            let log = log.lock().unwrap();
+            assert_eq!(log.next_offset, 3, "every request was appended once");
+            assert!(
+                log.replicated.windows(2).all(|pair| pair[0] < pair[1]),
+                "the replicate stages ran out of offset order: {:?}",
+                log.replicated
+            );
+            let state = coord.state.lock().unwrap();
+            assert!(state.pending.is_empty(), "every request was taken");
+            assert!(
+                !state.flushing,
+                "the lead was given up once the queue emptied"
+            );
+            assert_eq!(state.in_flight, 0, "every group was retired");
+            assert_eq!(state.serving, state.next_ticket, "every ticket was served");
+            assert!(!state.replicating);
         });
     }
 }

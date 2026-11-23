@@ -947,6 +947,7 @@ pub struct BrokerCollector {
     group_commit_queue_wait_nanos: CounterFamily,
     group_commit_overloaded: CounterFamily,
     group_commit_split_groups: CounterFamily,
+    group_commit_overlapped: CounterFamily,
     produce_phase_seconds: CounterFamily,
     memory_rejections: CounterFamily,
     backpressure_nanos: CounterFamily,
@@ -1077,6 +1078,13 @@ impl BrokerCollector {
                 "Commit groups the log refused as a whole for something one member caused \
                  (a sequence, fencing or size refusal) and re-ran request by request, so \
                  only that member failed",
+                &[],
+            )?,
+            group_commit_overlapped: CounterFamily::new(
+                "broker_group_commit_overlapped_total",
+                "Commit groups sealed while the previous group was still in its replication \
+                 round, so their local append and fsync overlapped it; zero when one producer \
+                 writes the range",
                 &[],
             )?,
             produce_phase_seconds: CounterFamily::new(
@@ -1299,6 +1307,7 @@ impl BrokerCollector {
                     &self.group_commit_split_groups,
                     metrics.split_groups_total(),
                 ),
+                (&self.group_commit_overlapped, metrics.overlapped_total()),
             ] {
                 families.push(family.family([(Vec::new(), total)]));
             }
@@ -1333,6 +1342,7 @@ impl BrokerCollector {
             &self.group_commit_queue_wait_nanos.desc,
             &self.group_commit_overloaded.desc,
             &self.group_commit_split_groups.desc,
+            &self.group_commit_overlapped.desc,
             &self.produce_phase_seconds.desc,
             &self.memory_rejections.desc,
             &self.backpressure_nanos.desc,
