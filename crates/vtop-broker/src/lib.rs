@@ -2099,7 +2099,7 @@ impl LocalBroker {
             .iter()
             .position(|item| item.request.durability != durability)
         {
-            if let Some(stage) = stage.as_deref_mut() {
+            if let Some(stage) = stage {
                 stage.drain();
             }
             let mut frames =
@@ -2329,7 +2329,7 @@ impl LocalBroker {
                 // The re-run does not overlap (#752, E3): it starts once no
                 // earlier group is replicating, and this group keeps the
                 // lead until it ends, so nothing starts behind it.
-                if let Some(stage) = stage.as_deref_mut() {
+                if let Some(stage) = stage {
                     stage.drain();
                 }
                 return self.flush_each_alone(batch, &problem, &readmit);
@@ -2425,7 +2425,7 @@ impl LocalBroker {
         // follower after theirs, in the offset order the follower's
         // base-offset check requires. The lead passes here, so the next
         // group's local append and fsync run during this round.
-        if let Some(stage) = stage.as_deref_mut() {
+        if let Some(stage) = stage {
             stage.begin_replicate();
         }
         let replicate_started = std::time::Instant::now();

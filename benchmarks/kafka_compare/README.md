@@ -85,8 +85,12 @@ The 1-producer cell cannot show group commit, so the ablation has a producer axi
 - **What can show it.** Several producers on ONE partition: separate client containers, so separate
   connections and producer ids, all writing one range. `--producers 1,2,4,16` runs every cell once per count;
   each timed produce run starts that many `kafka-producer-perf-test` clients at once, sharing the run's records
-  and offered rate evenly. A row's records/s and MiB/s are the sum of the producers' steady-state rates (their
-  runs overlap; a client's container start is a second or so against minutes of run); its percentiles are the
+  and offered rate evenly. A row's records/s and MiB/s are what all the producers delivered over one shared
+  window: their steady-state records (and the MiB those carried) over the span from the earliest steady-state
+  start to the latest end, each producer's window being its records over its own rate, placed where its run
+  ended; the span is never shorter than the longest single window. Adding the producers' own rates would
+  overstate a row whenever they finish at different times (100,000 records in 1 s and 100,000 in 2 s add up
+  to 150,000 records/s, where 200,000 were delivered in 2 s). Its percentiles are the
   worst of the N producers' (`lat_basis` `worst-of-N`), since percentiles of different producers cannot be
   merged; its average is weighted by records. The smoke and the warm-up use one producer. Kafka runs the same
   producer counts, so every cell has its Kafka reference.

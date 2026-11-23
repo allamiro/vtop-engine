@@ -666,16 +666,44 @@ def split_evenly(total: int, parts: int) -> list[int]:
     return [base + (1 if index < extra else 0) for index in range(parts)]
 
 
-def combine_producers(results: list[perftool.ProducerResult]) -> perftool.ProducerResult:
-    """N concurrent producers' summaries as one row. Throughput adds up: each producer's steady-state rate
-    over its own run, and the runs overlap. Percentiles of different producers cannot be merged, so each is
-    the worst of the N (`lat_basis` `worst-of-N`); the average is weighted by records and the maximum is the
-    largest."""
+def _steady_seconds(result: perftool.ProducerResult) -> float:
+    """How long one producer's steady-state window lasted: its records over its own rate."""
+    return result.records / result.records_per_sec if result.records_per_sec > 0 else 0.0
+
+
+def shared_window(results: list[perftool.ProducerResult], ends: list[float] | None = None) -> float:
+    """Seconds of the one window that holds every producer's steady state.
+
+    Each producer's window is its records over its own rate; `ends` (seconds on one clock, one per
+    producer) place them, each window ending where its producer's run ended, and the shared window runs
+    from the earliest start to the latest end. It is never shorter than the longest single window, so
+    without `ends`, or with windows that ended together, it is that window: a floor."""
+    longest = max(_steady_seconds(result) for result in results)
+    if not ends:
+        return longest
+    starts = [end - _steady_seconds(result) for result, end in zip(results, ends)]
+    return max(longest, max(ends) - min(starts))
+
+
+def combine_producers(results: list[perftool.ProducerResult], ends: list[float] | None = None
+                      ) -> perftool.ProducerResult:
+    """N concurrent producers' summaries as one row.
+
+    Throughput is what all of them delivered over one shared window (`shared_window`): the producers'
+    steady-state records, and the MiB those carried, over the span from the earliest steady-state start to
+    the latest end. Adding each producer's own rate would overstate it whenever the producers finish their
+    equal shares at different times: 100,000 records in 1 s and 100,000 in 2 s add up to 150,000 records/s,
+    where 200,000 records were delivered in 2 s, 100,000 records/s.
+
+    Percentiles of different producers cannot be merged, so each is the worst of the N (`lat_basis`
+    `worst-of-N`); the average is weighted by records and the maximum is the largest."""
     records = sum(result.records for result in results)
+    window = shared_window(results, ends)
+    mib = sum(result.mib_per_sec * _steady_seconds(result) for result in results)
     return perftool.ProducerResult(
         records=records,
-        records_per_sec=sum(result.records_per_sec for result in results),
-        mib_per_sec=sum(result.mib_per_sec for result in results),
+        records_per_sec=records / window if window > 0 else 0.0,
+        mib_per_sec=mib / window if window > 0 else 0.0,
         lat_avg_ms=sum(result.lat_avg_ms * result.records for result in results) / records if records else 0.0,
         lat_max_ms=max(result.lat_max_ms for result in results),
         lat_p50_ms=max(result.lat_p50_ms for result in results),
@@ -697,16 +725,25 @@ def run_producers(system: str, producers: int, records: int, size: int, rate: in
         return None, (f"{records} records at {rate} records/s cannot be shared by {producers} producers "
                       f"(at least {MIN_RECORDS_PER_PRODUCER} records and 1 record/s each)"), 0.0, ""
     rates = [-1] * producers if rate < 0 else split_evenly(rate, producers)
+    origin = time.monotonic()
+
+    def one(share: tuple[int, int]) -> tuple[tuple[perftool.ProducerResult | None, str, float, str], float]:
+        # When this producer's run ended, on the clock every producer shares: where its steady window ends.
+        started = time.monotonic() - origin
+        outcome = run_producer(system, share[0], size, share[1], timeout)
+        return outcome, started + outcome[2]
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=producers) as pool:
-        outcomes = list(pool.map(lambda share: run_producer(system, share[0], size, share[1], timeout),
-                                 zip(split_evenly(records, producers), rates)))
+        timed = list(pool.map(one, zip(split_evenly(records, producers), rates)))
+    outcomes = [outcome for outcome, _end in timed]
+    ends = [end for _outcome, end in timed]
     wall = max(outcome[2] for outcome in outcomes)
     output = "\n".join(f"=== producer {index} of {producers} ===\n{outcome[3]}"
                        for index, outcome in enumerate(outcomes, start=1))
     failed = [(index, outcome[1]) for index, outcome in enumerate(outcomes, start=1) if outcome[0] is None]
     if failed:
         return None, "; ".join(f"producer {index} of {producers}: {note}" for index, note in failed), wall, output
-    return combine_producers([outcome[0] for outcome in outcomes]), "", wall, output
+    return combine_producers([outcome[0] for outcome in outcomes], ends), "", wall, output
 
 
 def base_row(ctx: dict, system: str, mode: str, size: int, rep: int, group_commit: str = "",

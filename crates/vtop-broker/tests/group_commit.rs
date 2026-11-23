@@ -1183,7 +1183,7 @@ fn staged_leader(config: GroupCommitConfig, segment: SegmentConfig, released: us
     std::fs::create_dir_all(&segments).unwrap();
     let set = SegmentSet::create_in(
         &env,
-        &segments,
+        segments,
         SegmentDescriptor {
             segment_id: Uuid::from_u128(0xD1),
             topic: range.topic.clone(),

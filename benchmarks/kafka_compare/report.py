@@ -764,6 +764,11 @@ ABLATION_READING = """How to read it:
 - **Pipelining one producer's requests is not built.** Letting one connection have several record sets in
   flight before the earlier one is durable (answered in order) is the only change that could move the
   1-producer cell; it is not part of group commit and does not exist yet.
+- **Several producers in one row.** Each producer is its own client container with its own connection and
+  producer id. A row's records/s and MiB/s are what all of them delivered over one shared window, from the
+  earliest producer's steady-state start to the latest one's end, not the sum of their own rates, which would
+  overstate a row whose producers finish at different times. Its percentiles are the worst of the N
+  producers' (`lat_basis` `worst-of-N`); percentiles of different producers cannot be merged.
 - **The counters.** `mean group size` is the leader's `vtop_broker_group_commit_requests_total` over
   `vtop_broker_group_commits_total`; `overlapped` is the share of groups whose local append and fsync ran
   while the previous group replicated (`vtop_broker_group_commit_overlapped_total`); the last column is

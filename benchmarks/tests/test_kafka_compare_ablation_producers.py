@@ -112,12 +112,34 @@ def _result(records, rps, p99, avg=1.0):
                                        steady_state=True)
 
 
-def test_producers_add_their_throughput_and_report_their_worst_percentiles():
+def test_producers_report_their_worst_percentiles_and_a_record_weighted_average():
     combined = run.combine_producers([_result(100, 1000.0, 10.0, avg=1.0), _result(300, 2000.0, 40.0, avg=3.0)])
     assert combined.records == 400
-    assert combined.records_per_sec == pytest.approx(3000.0)
+    # 0.1 s and 0.15 s windows: 400 records in the longer one, not 1000 + 2000 records/s.
+    assert combined.records_per_sec == pytest.approx(400 / 0.15)
     assert combined.lat_p99_ms == 40.0 and combined.lat_p50_ms == 10.0 and combined.lat_max_ms == 80.0
     assert combined.lat_avg_ms == pytest.approx((100 * 1.0 + 300 * 3.0) / 400)
+
+
+def test_producers_finishing_at_different_times_are_not_summed():
+    # The review's example: 100,000 records in 1 s and 100,000 in 2 s. Adding the two rates says
+    # 150,000 records/s; 200,000 records were delivered in 2 s, which is 100,000 records/s.
+    fast, slow = _result(100_000, 100_000.0, 5.0), _result(100_000, 50_000.0, 5.0)
+    assert fast.records_per_sec + slow.records_per_sec == 150_000.0
+    for ends in (None, [1.0, 2.0]):
+        combined = run.combine_producers([fast, slow], ends)
+        assert combined.records == 200_000
+        assert combined.records_per_sec == pytest.approx(100_000.0)
+        assert combined.mib_per_sec == pytest.approx((fast.mib_per_sec * 1 + slow.mib_per_sec * 2) / 2)
+
+
+def test_the_shared_window_runs_from_the_earliest_start_to_the_latest_end():
+    one = _result(100_000, 100_000.0, 5.0)  # a 1 s window each
+    # Ending together, the windows coincide: the floor, one window long.
+    assert run.shared_window([one, one], [5.0, 5.0]) == pytest.approx(1.0)
+    # One second apart, they span 2 s: 200,000 records in 2 s, not 200,000 records/s.
+    assert run.shared_window([one, one], [1.0, 2.0]) == pytest.approx(2.0)
+    assert run.combine_producers([one, one], [1.0, 2.0]).records_per_sec == pytest.approx(100_000.0)
 
 
 def test_n_producers_share_the_records_and_the_offered_rate(monkeypatch):
@@ -131,7 +153,9 @@ def test_n_producers_share_the_records_and_the_offered_rate(monkeypatch):
     result, note, wall, output = run.run_producers("vtop", 4, 1000, 100, 402, 60.0)
     assert sorted(calls) == sorted([(250, 101), (250, 101), (250, 100), (250, 100)])
     assert note == "" and wall == 2.0 and output.count("=== producer") == 4
-    assert result.records_per_sec == pytest.approx(402.0)
+    # 1000 records over the longest window (250 records at 100 records/s, 2.5 s), the producers' starts a
+    # few milliseconds apart at most.
+    assert result.records_per_sec == pytest.approx(400.0, rel=0.01)
     calls.clear()
     run.run_producers("vtop", 2, 1000, 100, -1, 60.0)
     assert sorted(calls) == [(500, -1), (500, -1)]
