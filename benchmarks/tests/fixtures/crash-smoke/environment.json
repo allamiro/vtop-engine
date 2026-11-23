@@ -1,0 +1,139 @@
+{
+  "comparable": {
+    "client": "kafka-verifiable-producer.sh 4.3.2 (JVM), the same invocation against both systems; reads by kafka-console-consumer.sh",
+    "client_java": "openjdk version \"21.0.12.1\" 2026-08-18 LTS",
+    "client_limits": {
+      "cpus": "1",
+      "heap": "-Xms1g -Xmx1g",
+      "memory": "2g"
+    },
+    "crash_modes": {
+      "flakey-drop": "SIGKILL of all three nodes at once, then every write the page cache had not flushed is dropped (dm-flakey drop_writes): power loss of the whole replica set",
+      "sigkill": "SIGKILL of all three nodes at once (the host's page cache survives)"
+    },
+    "data_filesystem": {
+      "fs_type": "ext4",
+      "kernel": "6.8.0-142-generic",
+      "mount_options": "rw,relatime",
+      "mount_source": "/dev/mapper/kc599-data",
+      "vm.dirty_background_ratio": "10",
+      "vm.dirty_expire_centisecs": "3000",
+      "vm.dirty_ratio": "20",
+      "vm.dirty_writeback_centisecs": "500"
+    },
+    "docker_platform": "Docker Engine - Community",
+    "docker_server_version": "29.10.0",
+    "docker_storage_driver": "overlayfs",
+    "docker_vm_arch": "aarch64",
+    "docker_vm_cpus": 4,
+    "docker_vm_kernel": "6.8.0-142-generic",
+    "docker_vm_memory_bytes": 8308219904,
+    "docker_vm_os": "Ubuntu 24.04.5 LTS",
+    "harness_commit": "168493c69b1528989f59dad76e18fa7e24724ec8",
+    "host_cpu": "aarch64",
+    "host_disk": "\"virtio vda, Lima vz VM\"",
+    "host_instance": "Apple Inc. Apple Virtualization Generic Platform",
+    "host_logical_cpus": "4",
+    "host_memory_bytes": "8308219904",
+    "host_model": "",
+    "host_os": "Linux 6.8.0-142-generic",
+    "kafka_image": "apache/kafka:4.3.2@sha256:852a0d49fc4e656b022e7f23785411802c9a088c78a7c5e39f33969de9c227a7",
+    "kafka_image_id": "sha256:852a0d49fc4e656b022e7f23785411802c9a088c78a7c5e39f33969de9c227a7",
+    "node_limits": {
+      "cpus": "1",
+      "mem_limit": "2g",
+      "memswap_limit": "2g"
+    },
+    "producer_props": [
+      "acks=all (--acks -1)",
+      "retries=2147483647",
+      "enable.idempotence=true",
+      "every other producer setting at the client default"
+    ],
+    "profiles": {
+      "kafka-defaults": "Kafka as shipped: no flush.messages, an acknowledgement is replication",
+      "kafka-fsync-parity": "log.flush.interval.messages=1 on every broker and flush.messages=1 on the topic",
+      "vtop-shipped": "node configuration as shipped: acknowledged after a quorum (2 of 3) has fsynced; answers both Kafka profiles"
+    },
+    "simulation_limits": "page-cache loss of one host for all three replicas at once; not a drive whose volatile cache lies about flushes, not a torn block, not independent crashes; the kernel can flush a little more between the kill and the drop (kill_to_drop_ms)",
+    "topology": {
+      "kafka": "3 KRaft combined broker+controller nodes, RF=3, min.insync.replicas=2",
+      "vtop": "static range leader with the Kafka gateway plus two followers, quorum 2 of 3 (compose.vtop.yml); no metadata plane, so no election after the restart"
+    },
+    "volume_filesystem": "/dev/vda1 ext4",
+    "vtop_commit": "417ed43ea91de39154877b75b32dd4506518b52f",
+    "vtop_engine_tree": "084260f1af16c06074d4558f46ddc82229e6013a",
+    "vtop_image": "vtop-bench:417ed43ea91d",
+    "vtop_image_id": "sha256:c9313aced8f1617f0772f0ce770aec35a597d840c9f7ca51ae274b3f16f50402"
+  },
+  "events": [
+    {
+      "at": "2026-11-22T17:37:06+00:00",
+      "event": "stopped before crash 2 of vtop-shipped/sigkill: another crash would pass --max-hours (0.21 h). --check lists what is owed; --resume continues."
+    }
+  ],
+  "finished_at": "2026-11-22T17:42:26+00:00",
+  "kind": "crash",
+  "label": "single Linux host, Docker Engine; indicative, not a production benchmark",
+  "matrix": {
+    "configs": [
+      "kafka-defaults",
+      "kafka-fsync-parity",
+      "vtop-shipped"
+    ],
+    "crash_modes": [
+      "sigkill",
+      "flakey-drop"
+    ],
+    "crashes": 2,
+    "rate": 1000,
+    "seed": 599,
+    "smoke": true,
+    "trigger_window_s": [
+      8.0,
+      12.0
+    ]
+  },
+  "observed": {
+    "kafka_flush": {
+      "kafka-defaults": {
+        "broker_1": [
+          "  default.replication.factor=3",
+          "  log.flush.interval.messages=9223372036854775807",
+          "  log.flush.interval.ms=null",
+          "  log.flush.scheduler.interval.ms=9223372036854775807",
+          "  min.insync.replicas=2",
+          "  replica.lag.time.max.ms=30000",
+          "  unclean.leader.election.enable=false"
+        ],
+        "topic": [
+          "  flush.messages=9223372036854775807",
+          "  flush.ms=9223372036854775807",
+          "  min.insync.replicas=2"
+        ]
+      },
+      "kafka-fsync-parity": {
+        "broker_1": [
+          "  default.replication.factor=3",
+          "  log.flush.interval.messages=1",
+          "  log.flush.interval.ms=null",
+          "  log.flush.scheduler.interval.ms=9223372036854775807",
+          "  min.insync.replicas=2",
+          "  replica.lag.time.max.ms=30000",
+          "  unclean.leader.election.enable=false"
+        ],
+        "topic": [
+          "  flush.messages=1",
+          "  flush.ms=9223372036854775807",
+          "  min.insync.replicas=2"
+        ]
+      }
+    }
+  },
+  "other_containers_at_start_count": 0,
+  "run_id": "smoke3",
+  "run_state": "complete",
+  "schema_version": 2,
+  "started_at": "2026-11-22T17:27:27+00:00",
+  "worktree_dirty": true
+}

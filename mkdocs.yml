@@ -222,6 +222,7 @@ nav:
       - benchmarks/index.md
       - Kafka comparison: benchmarks/kafka-comparison.md
       - Kafka failover: benchmarks/kafka-failover.md
+      - AWS results, v0.11.0: benchmarks/aws-v0.11.0.md
       - Throughput research: THROUGHPUT_RESEARCH.md
       - Egress transport research: EGRESS_TRANSPORT_RESEARCH.md
       - Fetch I/O research: FETCH_IO_RESEARCH.md

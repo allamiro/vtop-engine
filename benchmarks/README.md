@@ -1186,6 +1186,83 @@ committed than files were seeded (#663).
 | Lossy / policed / queued link | ✅ the netem middlebox on the `netem` profile | loss, a policer and a real bottleneck queue, which a TCP-terminating proxy cannot produce — scenarios `14-lossy-wan`, `15-policed-uplink`, `16-contended-bottleneck` (#477) |
 | What the upload costs a neighbour | ✅ `shaping_competitor`, netem only | one plain-TCP bulk flow in the same queue, measured alone / with VTOP / alone again — scenario `18-competing-flow` (#478). The competitor's goodput, not VTOP's, is what authorises a concurrency or rate knob |
 
+## Ingesting a results directory (the v0.11.0 AWS round)
+
+The round's results arrive as one tarball per benchmark (`SHA256SUMS` beside them). Everything below runs on a
+laptop, never on the benchmark host, and nothing is typed into a chart or a table: the generators read the CSVs.
+The page they feed is [`docs/benchmarks/aws-v0.11.0.md`](../docs/benchmarks/aws-v0.11.0.md); the test that
+rehearses these steps in a scratch repository is `tests/test_aws_ingest.py`.
+
+```bash
+# Once: the plotting stack the committed output is drawn with (Python 3.11 or newer; CI uses 3.12.16).
+python3 -m venv .venv-report && . .venv-report/bin/activate
+python3 -m pip install --require-hashes -r benchmarks/kafka_compare/requirements-report.txt
+
+# Per tarball: verify it, unpack it OUTSIDE the repository, check the run is complete (the first harness shown).
+( cd ~/.tmp/v011-aws && sha256sum -c SHA256SUMS )
+mkdir -p /tmp/aws-in && tar -xzf ~/.tmp/v011-aws/596-v0110-c6i4x.tar.gz -C /tmp/aws-in
+python3 benchmarks/kafka_compare/run.py --check /tmp/aws-in/v0110-596-c6i4x      # 0 = complete
+# The same `--check RUN_DIR` is on crash.py and on the archive, link and spool run.py. failover.py has none:
+# its report refuses a partial run by name.
+```
+
+Place each run under its kind's committed results location with `cp -r` (the directory name is the run id; a
+run is never renamed or edited), add the `report.json` where the table says one is needed, and commit. The
+regenerate scripts read `HEAD`, so a run that is not committed is not regenerated.
+
+| issue | `cp -r` (from `/tmp/aws-in`) | `report.json` (`doc` / `img_dir` under `docs/benchmarks/`) | writes |
+|---|---|---|---|
+| #596 throughput and latency | `v0110-596-c6i4x` to `benchmarks/kafka_compare/results/` | `kafka-comparison-aws-v0.11.0.md` / `img/aws-v0.11.0` | the same, plus `img/aws-v0.11.0/kafka-compare-*` |
+| #597 failover | `failover-v0110-c6i4x` to `benchmarks/kafka_compare/results/` | `kafka-failover-aws-v0.11.0.md` / `img/aws-v0.11.0` | the same, plus `img/aws-v0.11.0/kafka-failover-*` |
+| #599 whole-replica-set crash | `crash-v0110-c6i4x` to `benchmarks/kafka_compare/results/` | none: the default `kafka-crash.md` and `img/kafka-crash-*` | `kafka-crash.md`, `img/kafka-crash-loss.*`, `img/kafka-crash-drop-gap.*` |
+| #746 archive, store kills | `archive-store-kills-v0110` to `benchmarks/archive_compare/results/` | `archive-comparison-store-kills.md` / `archive/img/store-kills` | the same, plus `archive/img/store-kills/*` |
+| #746 archive, time kills and fault | `archive-time-kills-fault-v0110` to `benchmarks/archive_compare/results/` | `archive-comparison-time-kills-fault.md` / `archive/img/time-kills-fault` | the same, plus `archive/img/time-kills-fault/*` |
+| #747 link | `link-hosted-v0110` to `benchmarks/link_compare/results/` | none: `link-comparison.md`, `link/img/` | `link-comparison.md`, `link/img/*` |
+| #748 spool, crash | `spool-hosted-crash-v0110` to `benchmarks/spool_compare/results/` | `spool-comparison-crash.md` / `spool/img/crash` | the same, plus `spool/img/crash/*` |
+| #748 spool, rotation | `spool-hosted-rotation-v0110` to `benchmarks/spool_compare/results/` | `spool-comparison-rotation.md` / `spool/img/rotation` | the same, plus `spool/img/rotation/*` |
+
+(The run ids are the command sheet's; use the ids the runs were given.) The reason for the `report.json` column:
+the generators write fixed paths, so two committed runs of one kind write the same page and `regenerate.py` refuses
+them ("two runs write the same file"). The laptop's two committed Kafka runs keep the default paths and stay what the
+README quotes; the AWS runs sit beside them. A `report.json` is exactly
+`{"doc": "docs/benchmarks/<page>.md", "img_dir": "docs/benchmarks/<kind's image directory>/<dir>"}` and is the one
+file added to a run by hand. To REPLACE a committed run instead, `git rm -r` it and place the new one with no
+`report.json`: it rewrites the default page and images in place. The README's evidence charts and prose
+(`readme_charts.py`, `tests/test_readme_charts.py`) read the two committed Kafka runs by name; moving them to the
+AWS runs is an editorial change made on purpose, not something placing a run does.
+
+```bash
+# What goes in git: the CSVs and environment.json are what the reports read; logs/ is provenance. Keep a run
+# under about 20 MB. If logs/ is larger, leave it out of the commit and attach the tarball to the release.
+du -sh benchmarks/*_compare/results/<run-id>; find benchmarks/*_compare/results/<run-id> -size +5M
+
+git add benchmarks/<kind>_compare/results/<run-id> && git commit -m "benchmarks: the v0.11.0 AWS results, <run-id>"
+
+# Regenerate every committed run, as the CI drift check does. Exit 2 names what is wrong and writes nothing wrong.
+python3 benchmarks/kafka_compare/regenerate.py       # the Kafka throughput, failover and crash runs
+python3 benchmarks/compare_common/regenerate.py      # the archive, link and spool runs
+git status --porcelain -- docs/benchmarks/           # the new pages and images, and nothing modified
+git add docs/benchmarks && git commit -m "benchmarks: the generated pages for the v0.11.0 AWS results"
+python3 benchmarks/kafka_compare/regenerate.py && python3 benchmarks/compare_common/regenerate.py
+git status --porcelain -- docs/benchmarks/           # must print nothing: that is the drift check
+```
+
+Then add each new page under Benchmarks in `mkdocs.yml` (a page missing from the nav fails `mkdocs build
+--strict`), link it from `docs/benchmarks/aws-v0.11.0.md`, replace that page's FILL markers, and run `mkdocs build
+--strict`.
+
+What a refusal means on the day:
+
+- `report refused: ... is partial` / `run_state`: the run did not finish; `--check` lists the rows it still owes.
+  Resume it on the host (`--resume`); never edit the CSV.
+- A crash run with a configuration under ten ok crashes is refused by name
+  (`crash_report.MIN_OK_CRASHES`): the harness's `refused` and `failed` rows are kept, and ten of the planned twelve
+  must be ok. `report.py <dir> --min-ok N` previews a shorter run without committing it.
+- A Kafka throughput run that varies partitions, producers, compression or profile is refused by name until the
+  grouped charts draw that dimension (#600); the default one-partition, one-producer run is drawn.
+- A comparison run whose plan did not run a chart's cells (the hosted plans run correctness cells only) draws the
+  charts it has and names the others on the page ("Not run in this plan, so not drawn").
+
 ## Native segment write amp / proof overhead (#189)
 
 The Python scenarios above drive the **archive** `vtopctl` path. Native

@@ -10,6 +10,8 @@
 
 - [Kafka comparison](kafka-comparison.md) and [Kafka failover](kafka-failover.md):
   method, raw data and every condition.
+- [AWS results, v0.11.0](aws-v0.11.0.md): the release's AWS round, the method and the
+  limits of each benchmark, and what each result closes.
 - [Egress transport research](../EGRESS_TRANSPORT_RESEARCH.md): the upload
   path on long, lossy and policed links.
 - [Throughput research](../THROUGHPUT_RESEARCH.md): what the per-stage
