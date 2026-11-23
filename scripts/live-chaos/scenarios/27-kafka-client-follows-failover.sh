@@ -31,6 +31,13 @@
 #
 # The shape matches the benchmark's failover cell (#597) so the number is
 # comparable with what the native client measured there.
+#
+# CHAOS_KAFKA_SHAPE picks the processes (lib.sh, bring_up_kafka_candidates):
+# `split` (the default) is three metadata processes beside three candidate
+# processes; `colocated` is three `vtop-node node` processes, each a metadata
+# voter and a candidate, where the kill also takes a Raft voter (perhaps the
+# metadata leader). Scenario 30 is this file run co-located; the result line
+# names the shape and the lease it ran under.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
@@ -75,21 +82,6 @@ for n in "$FOLLOWING_A" "$FOLLOWING_B"; do
     vtop_kafka_gateway_serving 0 \
     "candidate $n follows, so its Kafka gateway must not claim to serve"
 done
-# What a client bootstrapped from a FOLLOWING candidate is told: every broker,
-# and the holder as the partition's leader. A client that dialled the wrong
-# member first is redirected by this answer alone.
-# A member learns the holder from its next lease poll, so this is a deadline
-# poll, not a one-shot read.
-assert_metadata_names_leader() { # <bootstrap-candidate> <leader-candidate>
-  local listing="" deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS))
-  until grep -q '^ *3 brokers' <<<"$listing" \
-    && grep -q "partition 0, leader $2," <<<"$listing"; do
-    [[ $SECONDS -lt $deadline ]] \
-      || fail "candidate $1 does not list three brokers and name candidate $2 (the lease holder) as the leader of partition 0: $listing"
-    listing="$("$KCAT" -L -b "127.0.0.1:$(candidate_kafka_port "$1")" -t "$TOPIC" 2>&1)" || true
-    sleep 0.2
-  done
-}
 assert_metadata_names_leader "$FOLLOWING_A" "$WINNER"
 assert_metadata_names_leader "$FOLLOWING_B" "$WINNER"
 log "exactly one gateway serves: candidate $WINNER; candidates $FOLLOWING_A and $FOLLOWING_B list all three brokers and name $WINNER as the leader"
@@ -139,15 +131,15 @@ KILL_MS="$(wall_ms)"
 kill9_pid "${CAND_PIDS[$WINNER]}"
 log "candidate $WINNER (the leader) SIGKILLed with the producer mid-stream"
 
-read -r NEW_HOLDER NEW_EPOCH <<<"$(await_lease_holder_changed "$META_LEADER_ID" "$HOLDER" \
+read -r NEW_HOLDER NEW_EPOCH <<<"$(await_lease_holder_changed "$(lease_readers_without "$WINNER")" "$HOLDER" \
   $((LEASE_DURATION_MS / 1000 + ELECTION_TIMEOUT_SECONDS)))"
 NEW_LEADER="$(candidate_by_uuid "$NEW_HOLDER")"
 [[ "$NEW_EPOCH" -gt "$EPOCH" ]] || fail "a new hold must mint a newer epoch: old $EPOCH, new $NEW_EPOCH"
 log "candidate $NEW_LEADER took the range at epoch $NEW_EPOCH, no restart"
-await_log_line "$WORKDIR/logs/data-candidate-$NEW_LEADER.log" \
+await_log_line "$(candidate_log "$NEW_LEADER")" \
   "data_node_role_changed role=leader" \
   "the survivor must become the leader in place"
-await_log_line "$WORKDIR/logs/data-candidate-$NEW_LEADER.log" \
+await_log_line "$(candidate_log "$NEW_LEADER")" \
   "kafka gateway for range .* is now serving at epoch $NEW_EPOCH" \
   "the promoted candidate's gateway must say it is serving, at the new epoch"
 await_metric_equals "$(data_metrics_addr "$((NEW_LEADER + 10))")" \
@@ -198,8 +190,9 @@ LIMIT_MS=$((FAILOVER_LIMIT_SECONDS * 1000))
 log "kill to first acknowledgement after it: ${FIRST_ACK_MS} ms; kill to the end of the outage the client saw: ${RESUME_MS} ms (longest silence ${GAP_MS} ms)"
 [[ "$RESUME_MS" -le "$LIMIT_MS" ]] \
   || fail "the client waited ${RESUME_MS} ms from the kill for an acknowledgement, over the ${LIMIT_MS} ms limit"
-printf 'KAFKA_FAILOVER client=librdkafka kill_to_first_ack_ms=%s kill_to_resume_ms=%s longest_silence_ms=%s records=%s\n' \
-  "$FIRST_ACK_MS" "$RESUME_MS" "$GAP_MS" "$RECORDS" > "$WORKDIR/failover-result.txt"
+printf 'KAFKA_FAILOVER client=librdkafka %s kill_to_first_ack_ms=%s kill_to_resume_ms=%s longest_silence_ms=%s records=%s\n' \
+  "$(kafka_failover_conditions "$WINNER")" "$FIRST_ACK_MS" "$RESUME_MS" "$GAP_MS" "$RECORDS" \
+  > "$WORKDIR/failover-result.txt"
 cat "$WORKDIR/failover-result.txt"
 
 # --- every acknowledged record reads back, once, in order -------------------
@@ -232,7 +225,7 @@ log "high watermark through Kafka: $WATERMARK ($RECORDS records and up to $NEW_E
 # What the new leader's log says about the client's retries. Informational:
 # whether a batch was in flight and already held at a quorum when the leader
 # died is the timing of the kill, so a zero here is not a failure.
-RETRIES="$(grep -c 'idempotent retry acknowledged with its original offset' "$WORKDIR/logs/data-candidate-$NEW_LEADER.log" || true)"
+RETRIES="$(grep -c 'idempotent retry acknowledged with its original offset' "$(candidate_log "$NEW_LEADER")" || true)"
 log "retried sets the new leader acknowledged with their original offsets: $RETRIES"
 
 # --- the survivors changed role in place, or stayed followers ----------------

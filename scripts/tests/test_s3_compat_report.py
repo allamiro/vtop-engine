@@ -212,6 +212,27 @@ def test_a_malformed_run_date_is_refused(tmp_path):
         report.ingest(str(src), str(repo))
 
 
+def test_an_informational_probes_observation_is_listed_and_never_judged(tmp_path):
+    """The locked-PUT probe passes whichever way the store answers; what it saw is shown as an observation, not a cell."""
+    probe = "probe.a_locked_put_without_an_integrity_header_is_handled_as_the_store_does"
+    seen = dict(case(probe, ["object_lock", "versioning", "path_style"], "pass"), observation="a locked PUT with no Content-MD5 and no checksum header was refused (400 InvalidRequest)")
+    repo = write_repo(tmp_path, [run("srv", [seen, case("v", ["put_get_head"], "pass")])])
+    assert report.main(["--repo", repo]) == 0
+    page = (tmp_path / report.PAGE).read_text()
+    assert "## Observations" in page
+    assert f"- srv, `{probe}`: a locked PUT with no Content-MD5 and no checksum header was refused (400 InvalidRequest)" in page
+    # A probe that refused (no positive body ran) saw nothing to report.
+    refused = dict(case(probe, ["object_lock"], "refused", "unsupported (refused at startup)", "object_lock"), observation="stale")
+    repo2 = write_repo(tmp_path / "two", [run("srv", [refused])])
+    assert report.main(["--repo", repo2]) == 0
+    assert "## Observations" not in (tmp_path / "two" / report.PAGE).read_text()
+    # Results with no observation render without the section (a fixture, not the
+    # committed page: once the probe's results are ingested that page has one).
+    repo3 = write_repo(tmp_path / "three", [run("srv", [case("v", ["put_get_head"], "pass")])])
+    assert report.main(["--repo", repo3]) == 0
+    assert "## Observations" not in (tmp_path / "three" / report.PAGE).read_text()
+
+
 @pytest.mark.parametrize("server", ["../../.github/workflows/evil", "a/b", ".hidden", "", "MinIO", 7])
 def test_an_ingested_server_that_is_not_a_plain_id_is_refused(tmp_path, server):
     """The lines come from a downloaded artifact, and the id names the file written under RESULTS."""

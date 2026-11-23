@@ -450,9 +450,11 @@ formats:
   - id: 23
     name: "`config.yaml`"
     class: D
-    marker: none (`config_version` planned)
+    marker: "optional `config_version`, `{CONFIG_VERSION}` today (absent reads as `{CONFIG_VERSION}`)"
     status: evolving
     at_1_0: classified at the freeze
+    constants:
+      - {file: crates/vtop-core/src/config_strict.rs, name: CONFIG_VERSION, value: '1'}
 
   - id: 24
     name: "`vtopctl validate --print-effective`"
