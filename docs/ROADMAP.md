@@ -31,6 +31,37 @@ what each release does **not** yet do.
   it. An older binary
   ignores the file, so downgrading drops the protection, not the data.
 
+## Next minor release, v0.11.0 — the actor of a cluster command is committed in the replicated log
+
+- **[#706](https://github.com/allamiro/vtop-engine/issues/706)** — the
+  actor of an audited cluster command is committed in the replicated log,
+  from metadata feature level 9. The serving leader wraps the command in a new
+  command kind (40, `Attributed`) carrying the certificate identity it
+  verified, the address the connection came from, its own node id and its own
+  clock, so the actor and the command are one log entry on every replica. The
+  last 1024 such entries are kept in the cluster state (key category 23, value
+  tag 26) and travel in snapshots. Applying the entry does exactly what
+  applying the bare command did, and a retry never rewrites who acted. A
+  client cannot send an actor of its own: the admin endpoint refuses kind 40
+  before authorization, and audits the refusal. The wrapper is applied only to
+  commands the audit list already names, never to a node's own traffic (a data
+  node handing a range back); a certificate name over 128 bytes is refused
+  before anything is proposed. Reading the tail back, request ids for
+  bootstrap and membership, and the applied records' `requested_by` field are
+  the rest of #706.
+- **Upgrade note (#706, one-way): feature level 9.** Below level 9 nothing
+  changes: the leader proposes the bare command, byte for byte as before, and
+  logs once per term that the actor is recorded at the admin endpoint only.
+  Upgrade every metadata voter and data node, then
+  `vtopctl meta enable-features --level 9`; the raise is refused until every
+  metadata member and every counted data node supports 9, and it is permanent.
+  The raise itself is a bare entry: no kind-40 entry precedes it. A voter
+  older than this release cannot decode kind 40 and reads it as a newer
+  format, not as corruption; raising the level while one remains stalls that
+  voter (and the tier, if it is a majority) exactly as every earlier level
+  does. Level 9 adds a command kind, a key category and a record value tag,
+  none of which is written below it.
+
 ## Next minor release, v0.11.0 — group commit is wired into the data node
 
 - **[#752](https://github.com/allamiro/vtop-engine/issues/752)** — group
@@ -1454,12 +1485,18 @@ A patch release: no schema, wire format, feature level, config key or one-way st
 The theme is **the gateway at the speed its durability allows, and the road
 to 1.0**: turn group commit on by default for the data node's quorum write
 (#752; it is wired and off until the A/B gates hold) and let a
-Kafka client follow a failover through a candidate node (#751); finish the
+Kafka client follow a failover through a candidate node (#751: the gateway
+is served from candidate nodes and live-chaos scenarios 27 and 28 show a
+librdkafka and a JVM client resuming 5.5 s to 6.6 s after a leader kill on one
+host, with debug binaries and a 6 s lease; what is left is the chart's default
+lease, the co-located `vtop-node node` shape, and a consumer group's
+coordinator across a failover, which #751 scopes out); finish the
 format inventory and the tested upgrade and downgrade matrix (#743); and work
 the criteria in #714 that must be met before VTOP is called anything but a
 prototype (crash and soak testing, real S3 targets, security hardening, a
 restore drill, a pilot). Failover and crash-durability measurements against
-Apache Kafka stay open (#597, #599), as does the head-to-head throughput run
+Apache Kafka stay open (#597, #599; the failover run has not been repeated
+through a Kafka client), as does the head-to-head throughput run
 (#596).
 
 ### Merged since v0.10.1
