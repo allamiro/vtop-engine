@@ -157,6 +157,13 @@ pub fn classify(command: &MetadataCommand) -> (CommandClass, Option<Uuid>) {
         // same node, exactly as the sealed-segment register does.
         | MetadataCommand::SplitRange {
             holder_node_uuid, ..
+        }
+        // A holder handing its own range back (#732). The holder-less
+        // release below stays cluster-scoped: it names no one, so no
+        // certificate can be bound to it, and a node would otherwise be able
+        // to clear any range's lease at a fencing epoch it read.
+        | MetadataCommand::ReleaseRangeLeaseAsHolder {
+            holder_node_uuid, ..
         } => (CommandClass::NodeScoped, Some(*holder_node_uuid)),
         // A version report is a node's account of itself (#634), and a raise
         // of the feature level is judged on it: a node that could report for
