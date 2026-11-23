@@ -171,3 +171,57 @@ def test_a_resume_of_a_run_that_does_not_exist_is_refused(monkeypatch, tmp_path)
     stub.install(run, str(tmp_path), set_attr=monkeypatch.setattr)
     with pytest.raises(SystemExit, match="no environment.json"):
         run.main(stub.ARGS + ["--resume", RUN_ID])
+
+
+def test_histogram_rows_of_an_end_to_end_stage_with_no_result_row_yet_are_moved_aside(monkeypatch, tmp_path):
+    # Review of #949: a kill between the histogram rows and the row that vouches for them left buckets with no
+    # row; the stage ran again and wrote them twice, and the report refused the run.
+    root = str(tmp_path)
+
+    def histogram_then_kill(ctx, row, hist):
+        key = {column: row[column] for column in schema.E2E_HIST_KEY}
+        for bucket, count in sorted(hist.items()):
+            schema.append_row(ctx["hist_csv"], {**key, "bucket_ms": bucket, "count": count}, schema.E2E_HIST_COLUMNS)
+        raise Killed()
+
+    stub.install(run, root, set_attr=monkeypatch.setattr)
+    monkeypatch.setattr(run, "write_e2e_result", histogram_then_kill)
+    with pytest.raises(Killed):
+        run.main(stub.ARGS + ["--run-id", RUN_ID])
+    directory = run_dir_of(root)
+    assert not [row for row in rows_of(directory) if row["mode"] == "e2e"]
+    assert len(rows_of(directory, schema.E2E_HIST)) == 2
+    monkeypatch.undo()
+    code, _calls = resume(monkeypatch, root)
+    assert code == 0 and run.check(directory) == 0
+    schema.load_run(directory)  # refused before: "gives bucket 1 ms twice"
+    assert len(rows_of(os.path.join(directory, "logs"), "partial-e2e-100B-e2e_hist.csv")) == 2
+
+
+def test_kafka_s_offered_rates_are_on_disk_before_its_first_fixed_rate_leg(monkeypatch, tmp_path):
+    # Review of #949: they were saved only after the whole cell, so a SIGKILL late in Kafka's cell (its rows all
+    # written, no `except` run) left a unit the resume skipped with no rates to give VTOP. What is on disk is
+    # read at the moment the first leg starts, as a SIGKILL there would leave it.
+    seen = []
+
+    def read_disk(system, rate, leader):
+        if rate > 0 and not seen:
+            seen.append(environment_of(run_dir_of(str(tmp_path)))["observed"].get("offered_rates"))
+        return rate > 0
+
+    interrupted_run(monkeypatch, str(tmp_path), kill_when=read_disk)
+    assert seen == [{"100": {"25": 75000, "50": 150000, "75": 225000}}]
+
+
+def test_a_skipped_kafka_unit_with_no_recorded_rates_derives_them_from_its_rows(monkeypatch, tmp_path):
+    root = str(tmp_path)
+    directory = interrupted_run(monkeypatch, root, kill_when=in_gc_on_fixed_leg)
+    env = environment_of(directory)
+    del env["observed"]["offered_rates"]
+    with open(os.path.join(directory, "environment.json"), "w", encoding="utf-8") as handle:
+        json.dump(env, handle)
+    code, _calls = resume(monkeypatch, root)
+    assert code == 0
+    vtop_on = [row for row in rows_of(directory) if row["group_commit"] == "on" and row["mode"] == "fixed_rate"]
+    assert {(row["status"], row["offered_rate"]) for row in vtop_on} == {("ok", "75000"), ("ok", "150000"),
+                                                                        ("ok", "225000")}
