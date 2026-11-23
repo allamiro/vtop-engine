@@ -1,0 +1,426 @@
+{
+  "cases": [
+    {
+      "capabilities": [
+        "versioning",
+        "object_lock",
+        "path_style"
+      ],
+      "case": "engine.object_lock.a_replay_over_an_ended_lock_commits_a_fresh_object",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0",
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 3.699,
+      "server": "seaweedfs",
+      "server_version": "4.53",
+      "vtop_commit": "eef5e34905261a154cd6307154d58086da236e28"
+    },
+    {
+      "capabilities": [
+        "object_lock",
+        "versioning",
+        "path_style"
+      ],
+      "case": "engine.object_lock.archives_a_batch_locked",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0",
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.041,
+      "server": "seaweedfs",
+      "server_version": "4.53",
+      "vtop_commit": "eef5e34905261a154cd6307154d58086da236e28"
+    },
+    {
+      "capabilities": [
+        "object_lock",
+        "path_style"
+      ],
+      "case": "engine.object_lock.refuses_a_plain_bucket_at_startup",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0",
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.007,
+      "server": "seaweedfs",
+      "server_version": "4.53",
+      "vtop_commit": "eef5e34905261a154cd6307154d58086da236e28"
+    },
+    {
+      "capabilities": [
+        "object_lock",
+        "versioning",
+        "object_lock_retention_clear",
+        "path_style"
+      ],
+      "case": "engine.object_lock.scrub_reports_a_receipt_without_retention",
+      "deciding_capability": "object_lock_retention_clear",
+      "detail": null,
+      "expectation": "not_applicable",
+      "expected": true,
+      "image_digest": "sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0",
+      "method": null,
+      "outcome": "not_applicable",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.0,
+      "server": "seaweedfs",
+      "server_version": "4.53",
+      "vtop_commit": "eef5e34905261a154cd6307154d58086da236e28"
+    },
+    {
+      "capabilities": [
+        "multipart",
+        "path_style"
+      ],
+      "case": "multipart.a_reset_part_is_sent_again_alone",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0",
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 3.691,
+      "server": "seaweedfs",
+      "server_version": "4.53",
+      "vtop_commit": "eef5e34905261a154cd6307154d58086da236e28"
+    },
+    {
+      "capabilities": [
+        "multipart",
+        "multipart_resume",
+        "multipart_list_uploads",
+        "path_style"
+      ],
+      "case": "multipart.a_second_backend_resumes_the_session",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0",
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 2.275,
+      "server": "seaweedfs",
+      "server_version": "4.53",
+      "vtop_commit": "eef5e34905261a154cd6307154d58086da236e28"
+    },
+    {
+      "capabilities": [
+        "multipart",
+        "multipart_abort",
+        "multipart_list_uploads",
+        "path_style"
+      ],
+      "case": "multipart.the_sweep_aborts_an_abandoned_upload",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0",
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 1.684,
+      "server": "seaweedfs",
+      "server_version": "4.53",
+      "vtop_commit": "eef5e34905261a154cd6307154d58086da236e28"
+    },
+    {
+      "capabilities": [
+        "object_lock",
+        "versioning",
+        "object_lock_enforced",
+        "path_style"
+      ],
+      "case": "object_lock.a_locked_version_survives_delete_and_overwrite",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0",
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 6.351,
+      "server": "seaweedfs",
+      "server_version": "4.53",
+      "vtop_commit": "eef5e34905261a154cd6307154d58086da236e28"
+    },
+    {
+      "capabilities": [
+        "multipart",
+        "object_lock",
+        "versioning",
+        "path_style"
+      ],
+      "case": "object_lock.a_multipart_object_carries_its_lock",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0",
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 6.398,
+      "server": "seaweedfs",
+      "server_version": "4.53",
+      "vtop_commit": "eef5e34905261a154cd6307154d58086da236e28"
+    },
+    {
+      "capabilities": [
+        "object_lock",
+        "path_style"
+      ],
+      "case": "object_lock.an_absent_lock_is_confirmed_and_a_present_one_is_not",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0",
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 6.03,
+      "server": "seaweedfs",
+      "server_version": "4.53",
+      "vtop_commit": "eef5e34905261a154cd6307154d58086da236e28"
+    },
+    {
+      "capabilities": [
+        "object_lock",
+        "versioning",
+        "path_style"
+      ],
+      "case": "object_lock.every_write_path_lands_locked",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0",
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 6.08,
+      "server": "seaweedfs",
+      "server_version": "4.53",
+      "vtop_commit": "eef5e34905261a154cd6307154d58086da236e28"
+    },
+    {
+      "capabilities": [
+        "object_lock",
+        "path_style"
+      ],
+      "case": "object_lock.the_preflight_tells_locked_from_plain",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0",
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.004,
+      "server": "seaweedfs",
+      "server_version": "4.53",
+      "vtop_commit": "eef5e34905261a154cd6307154d58086da236e28"
+    },
+    {
+      "capabilities": [
+        "put_get_head",
+        "checksum_sha256_enforced",
+        "path_style"
+      ],
+      "case": "probe.a_wrong_service_checksum_is_rejected",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0",
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.109,
+      "server": "seaweedfs",
+      "server_version": "4.53",
+      "vtop_commit": "eef5e34905261a154cd6307154d58086da236e28"
+    },
+    {
+      "capabilities": [
+        "put_get_head",
+        "conditional_put",
+        "path_style"
+      ],
+      "case": "probe.conditional_put_if_none_match",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0",
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.008,
+      "server": "seaweedfs",
+      "server_version": "4.53",
+      "vtop_commit": "eef5e34905261a154cd6307154d58086da236e28"
+    },
+    {
+      "capabilities": [
+        "put_get_head",
+        "checksum_crc32_default",
+        "path_style"
+      ],
+      "case": "probe.the_sdks_default_crc32_trailer_is_accepted",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0",
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.008,
+      "server": "seaweedfs",
+      "server_version": "4.53",
+      "vtop_commit": "eef5e34905261a154cd6307154d58086da236e28"
+    },
+    {
+      "capabilities": [
+        "multipart",
+        "path_style"
+      ],
+      "case": "receipts.a_multipart_object_names_read_back",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0",
+      "method": "read_back",
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.473,
+      "server": "seaweedfs",
+      "server_version": "4.53",
+      "vtop_commit": "eef5e34905261a154cd6307154d58086da236e28"
+    },
+    {
+      "capabilities": [
+        "put_get_head",
+        "checksum_sha256_returned",
+        "path_style"
+      ],
+      "case": "receipts.a_single_put_names_store_checksum",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0",
+      "method": "store_checksum",
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.134,
+      "server": "seaweedfs",
+      "server_version": "4.53",
+      "vtop_commit": "eef5e34905261a154cd6307154d58086da236e28"
+    },
+    {
+      "capabilities": [
+        "put_get_head",
+        "path_style"
+      ],
+      "case": "transport_conformance.tcp_tls",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0",
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.121,
+      "server": "seaweedfs",
+      "server_version": "4.53",
+      "vtop_commit": "eef5e34905261a154cd6307154d58086da236e28"
+    },
+    {
+      "capabilities": [
+        "put_get_head",
+        "path_style"
+      ],
+      "case": "verification.blake3_by_read_back",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0",
+      "method": "read_back",
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.017,
+      "server": "seaweedfs",
+      "server_version": "4.53",
+      "vtop_commit": "eef5e34905261a154cd6307154d58086da236e28"
+    },
+    {
+      "capabilities": [
+        "put_get_head",
+        "checksum_sha256_returned",
+        "path_style"
+      ],
+      "case": "verification.sha256_by_store_checksum",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0",
+      "method": "store_checksum",
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.012,
+      "server": "seaweedfs",
+      "server_version": "4.53",
+      "vtop_commit": "eef5e34905261a154cd6307154d58086da236e28"
+    },
+    {
+      "capabilities": [
+        "put_get_head",
+        "path_style"
+      ],
+      "case": "verification.sha256_verifies_strongly",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0",
+      "method": "store_checksum",
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.13,
+      "server": "seaweedfs",
+      "server_version": "4.53",
+      "vtop_commit": "eef5e34905261a154cd6307154d58086da236e28"
+    }
+  ],
+  "image_digest": "sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0",
+  "run_date": "2026-11-20",
+  "server": "seaweedfs",
+  "server_version": "4.53",
+  "vtop_commit": "eef5e34905261a154cd6307154d58086da236e28"
+}

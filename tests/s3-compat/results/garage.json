@@ -1,0 +1,426 @@
+{
+  "cases": [
+    {
+      "capabilities": [
+        "versioning",
+        "object_lock",
+        "path_style"
+      ],
+      "case": "engine.object_lock.a_replay_over_an_ended_lock_commits_a_fresh_object",
+      "deciding_capability": "versioning",
+      "detail": null,
+      "expectation": "unsupported (refused at startup)",
+      "expected": true,
+      "image_digest": "sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5",
+      "method": null,
+      "outcome": "refused",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.128,
+      "server": "garage",
+      "server_version": "v2.5.0",
+      "vtop_commit": "c8f0949c6ed6bc14197b2d6712d6d3490a79a1b1"
+    },
+    {
+      "capabilities": [
+        "object_lock",
+        "versioning",
+        "path_style"
+      ],
+      "case": "engine.object_lock.archives_a_batch_locked",
+      "deciding_capability": "object_lock",
+      "detail": null,
+      "expectation": "unsupported (refused at startup)",
+      "expected": true,
+      "image_digest": "sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5",
+      "method": null,
+      "outcome": "refused",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.009,
+      "server": "garage",
+      "server_version": "v2.5.0",
+      "vtop_commit": "c8f0949c6ed6bc14197b2d6712d6d3490a79a1b1"
+    },
+    {
+      "capabilities": [
+        "object_lock",
+        "path_style"
+      ],
+      "case": "engine.object_lock.refuses_a_plain_bucket_at_startup",
+      "deciding_capability": "object_lock",
+      "detail": null,
+      "expectation": "unsupported (refused at startup)",
+      "expected": true,
+      "image_digest": "sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5",
+      "method": null,
+      "outcome": "refused",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.009,
+      "server": "garage",
+      "server_version": "v2.5.0",
+      "vtop_commit": "c8f0949c6ed6bc14197b2d6712d6d3490a79a1b1"
+    },
+    {
+      "capabilities": [
+        "object_lock",
+        "versioning",
+        "object_lock_retention_clear",
+        "path_style"
+      ],
+      "case": "engine.object_lock.scrub_reports_a_receipt_without_retention",
+      "deciding_capability": "object_lock_retention_clear",
+      "detail": null,
+      "expectation": "not_applicable",
+      "expected": true,
+      "image_digest": "sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5",
+      "method": null,
+      "outcome": "not_applicable",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.0,
+      "server": "garage",
+      "server_version": "v2.5.0",
+      "vtop_commit": "c8f0949c6ed6bc14197b2d6712d6d3490a79a1b1"
+    },
+    {
+      "capabilities": [
+        "multipart",
+        "path_style"
+      ],
+      "case": "multipart.a_reset_part_is_sent_again_alone",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5",
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 1.698,
+      "server": "garage",
+      "server_version": "v2.5.0",
+      "vtop_commit": "c8f0949c6ed6bc14197b2d6712d6d3490a79a1b1"
+    },
+    {
+      "capabilities": [
+        "multipart",
+        "multipart_resume",
+        "multipart_list_uploads",
+        "path_style"
+      ],
+      "case": "multipart.a_second_backend_resumes_the_session",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5",
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 2.886,
+      "server": "garage",
+      "server_version": "v2.5.0",
+      "vtop_commit": "c8f0949c6ed6bc14197b2d6712d6d3490a79a1b1"
+    },
+    {
+      "capabilities": [
+        "multipart",
+        "multipart_abort",
+        "multipart_list_uploads",
+        "path_style"
+      ],
+      "case": "multipart.the_sweep_aborts_an_abandoned_upload",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5",
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 3.154,
+      "server": "garage",
+      "server_version": "v2.5.0",
+      "vtop_commit": "c8f0949c6ed6bc14197b2d6712d6d3490a79a1b1"
+    },
+    {
+      "capabilities": [
+        "object_lock",
+        "versioning",
+        "object_lock_enforced",
+        "path_style"
+      ],
+      "case": "object_lock.a_locked_version_survives_delete_and_overwrite",
+      "deciding_capability": "object_lock",
+      "detail": null,
+      "expectation": "unsupported (refused at startup)",
+      "expected": true,
+      "image_digest": "sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5",
+      "method": null,
+      "outcome": "refused",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.145,
+      "server": "garage",
+      "server_version": "v2.5.0",
+      "vtop_commit": "c8f0949c6ed6bc14197b2d6712d6d3490a79a1b1"
+    },
+    {
+      "capabilities": [
+        "multipart",
+        "object_lock",
+        "versioning",
+        "path_style"
+      ],
+      "case": "object_lock.a_multipart_object_carries_its_lock",
+      "deciding_capability": "object_lock",
+      "detail": null,
+      "expectation": "unsupported (refused at startup)",
+      "expected": true,
+      "image_digest": "sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5",
+      "method": null,
+      "outcome": "refused",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.004,
+      "server": "garage",
+      "server_version": "v2.5.0",
+      "vtop_commit": "c8f0949c6ed6bc14197b2d6712d6d3490a79a1b1"
+    },
+    {
+      "capabilities": [
+        "object_lock",
+        "path_style"
+      ],
+      "case": "object_lock.an_absent_lock_is_confirmed_and_a_present_one_is_not",
+      "deciding_capability": "object_lock",
+      "detail": null,
+      "expectation": "unsupported (refused at startup)",
+      "expected": true,
+      "image_digest": "sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5",
+      "method": null,
+      "outcome": "refused",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.004,
+      "server": "garage",
+      "server_version": "v2.5.0",
+      "vtop_commit": "c8f0949c6ed6bc14197b2d6712d6d3490a79a1b1"
+    },
+    {
+      "capabilities": [
+        "object_lock",
+        "versioning",
+        "path_style"
+      ],
+      "case": "object_lock.every_write_path_lands_locked",
+      "deciding_capability": "object_lock",
+      "detail": null,
+      "expectation": "unsupported (refused at startup)",
+      "expected": true,
+      "image_digest": "sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5",
+      "method": null,
+      "outcome": "refused",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.004,
+      "server": "garage",
+      "server_version": "v2.5.0",
+      "vtop_commit": "c8f0949c6ed6bc14197b2d6712d6d3490a79a1b1"
+    },
+    {
+      "capabilities": [
+        "object_lock",
+        "path_style"
+      ],
+      "case": "object_lock.the_preflight_tells_locked_from_plain",
+      "deciding_capability": "object_lock",
+      "detail": null,
+      "expectation": "unsupported (refused at startup)",
+      "expected": true,
+      "image_digest": "sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5",
+      "method": null,
+      "outcome": "refused",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.004,
+      "server": "garage",
+      "server_version": "v2.5.0",
+      "vtop_commit": "c8f0949c6ed6bc14197b2d6712d6d3490a79a1b1"
+    },
+    {
+      "capabilities": [
+        "put_get_head",
+        "checksum_sha256_enforced",
+        "path_style"
+      ],
+      "case": "probe.a_wrong_service_checksum_is_rejected",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5",
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.147,
+      "server": "garage",
+      "server_version": "v2.5.0",
+      "vtop_commit": "c8f0949c6ed6bc14197b2d6712d6d3490a79a1b1"
+    },
+    {
+      "capabilities": [
+        "put_get_head",
+        "conditional_put",
+        "path_style"
+      ],
+      "case": "probe.conditional_put_if_none_match",
+      "deciding_capability": "conditional_put",
+      "detail": "a second PUT with If-None-Match: * to an existing key was accepted; the key now holds \"second\"",
+      "expectation": "xfail (#722)",
+      "expected": true,
+      "image_digest": "sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5",
+      "method": null,
+      "outcome": "fail",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.011,
+      "server": "garage",
+      "server_version": "v2.5.0",
+      "vtop_commit": "c8f0949c6ed6bc14197b2d6712d6d3490a79a1b1"
+    },
+    {
+      "capabilities": [
+        "put_get_head",
+        "checksum_crc32_default",
+        "path_style"
+      ],
+      "case": "probe.the_sdks_default_crc32_trailer_is_accepted",
+      "deciding_capability": "checksum_crc32_default",
+      "detail": "the store refused the SDK's default PUT (code Some(\"InvalidRequest\")): ServiceError(ServiceError { source: InvalidRequest(InvalidRequest { message: Some(\"Bad request: Invalid payload signature\"), meta: ErrorMetadata { code: Some(\"InvalidRequest\"), message: Some(\"Bad request: Invalid payload signature\"), extras: None } }), raw: Response { status: StatusCode(400), headers: {\"content-type\": \"application/xml\", \"access-control-allow-origin\": \"*\", \"content-length\": \"254\", \"date\": \"Fri, 20 Nov 2026 20:11:35 GMT\"}, body: SdkBody { inner: Once(Some(b\"<?xml version=\\\"1.0\\\" encoding=\\\"UTF-8\\\"?><Error><Code>InvalidRequest</Code><Message>Bad request: Invalid payload signature</Message><Resource>/telemetry-raw/vtop-it-722/sdk-default-crc32-97400-1795205495939591000</Resource><Region>us-east-1</Region></Error>\")), retryable: true }, extensions: Extensions { extensions_02x: Extensions, extensions_1x: {hyper_util::client::legacy::connect::http::HttpInfo} } } })",
+      "expectation": "xfail (#778)",
+      "expected": true,
+      "image_digest": "sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5",
+      "method": null,
+      "outcome": "fail",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.007,
+      "server": "garage",
+      "server_version": "v2.5.0",
+      "vtop_commit": "c8f0949c6ed6bc14197b2d6712d6d3490a79a1b1"
+    },
+    {
+      "capabilities": [
+        "multipart",
+        "path_style"
+      ],
+      "case": "receipts.a_multipart_object_names_read_back",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5",
+      "method": "read_back",
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.504,
+      "server": "garage",
+      "server_version": "v2.5.0",
+      "vtop_commit": "c8f0949c6ed6bc14197b2d6712d6d3490a79a1b1"
+    },
+    {
+      "capabilities": [
+        "put_get_head",
+        "checksum_sha256_returned",
+        "path_style"
+      ],
+      "case": "receipts.a_single_put_names_store_checksum",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5",
+      "method": "store_checksum",
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.199,
+      "server": "garage",
+      "server_version": "v2.5.0",
+      "vtop_commit": "c8f0949c6ed6bc14197b2d6712d6d3490a79a1b1"
+    },
+    {
+      "capabilities": [
+        "put_get_head",
+        "path_style"
+      ],
+      "case": "transport_conformance.tcp_tls",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5",
+      "method": null,
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.148,
+      "server": "garage",
+      "server_version": "v2.5.0",
+      "vtop_commit": "c8f0949c6ed6bc14197b2d6712d6d3490a79a1b1"
+    },
+    {
+      "capabilities": [
+        "put_get_head",
+        "path_style"
+      ],
+      "case": "verification.blake3_by_read_back",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5",
+      "method": "read_back",
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.009,
+      "server": "garage",
+      "server_version": "v2.5.0",
+      "vtop_commit": "c8f0949c6ed6bc14197b2d6712d6d3490a79a1b1"
+    },
+    {
+      "capabilities": [
+        "put_get_head",
+        "checksum_sha256_returned",
+        "path_style"
+      ],
+      "case": "verification.sha256_by_store_checksum",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5",
+      "method": "store_checksum",
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.008,
+      "server": "garage",
+      "server_version": "v2.5.0",
+      "vtop_commit": "c8f0949c6ed6bc14197b2d6712d6d3490a79a1b1"
+    },
+    {
+      "capabilities": [
+        "put_get_head",
+        "path_style"
+      ],
+      "case": "verification.sha256_verifies_strongly",
+      "deciding_capability": null,
+      "detail": null,
+      "expectation": "pass",
+      "expected": true,
+      "image_digest": "sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5",
+      "method": "store_checksum",
+      "outcome": "pass",
+      "sdk_checksum": "when_supported",
+      "seconds": 0.123,
+      "server": "garage",
+      "server_version": "v2.5.0",
+      "vtop_commit": "c8f0949c6ed6bc14197b2d6712d6d3490a79a1b1"
+    }
+  ],
+  "image_digest": "sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5",
+  "run_date": "2026-11-20",
+  "server": "garage",
+  "server_version": "v2.5.0",
+  "vtop_commit": "c8f0949c6ed6bc14197b2d6712d6d3490a79a1b1"
+}
