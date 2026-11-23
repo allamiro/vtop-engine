@@ -17,10 +17,14 @@
 # honest nodes. Per client, on a fresh cluster (three candidates serving
 # Kafka, CHAOS_KAFKA_SHAPE as 27):
 #   1. ONE group consumer is started, bootstrapped from all three, with
-#      auto-commit every CHAOS_KAFKA_COMMIT_INTERVAL_MS (500): librdkafka as
-#      `kcat -G`, and the JVM client as `kafka-console-consumer --group` when
-#      CHAOS_KAFKA_HOME or CHAOS_KAFKA_IMAGE names a distribution (otherwise
-#      that client is skipped and the log says so);
+#      auto-commit on: librdkafka as `kcat -G`, at librdkafka's own 5 s
+#      interval, and the JVM client as `kafka-console-consumer --group`, every
+#      CHAOS_KAFKA_COMMIT_INTERVAL_MS (500), when CHAOS_KAFKA_HOME or
+#      CHAOS_KAFKA_IMAGE names a distribution (otherwise that client is
+#      skipped and the log says so). kcat cannot set librdkafka's interval:
+#      its -X tries the topic configuration first, and the high-level
+#      consumer's `auto.commit.interval.ms` and `enable.auto.commit` share
+#      their names with legacy topic properties, which is where they land;
 #   2. one idempotent librdkafka producer streams paced records;
 #   3. after the consumer has delivered CHAOS_KAFKA_KILL_AFTER_CONSUMED records
 #      the group's committed offset is read from the metadata plane, and the
@@ -36,13 +40,16 @@
 #            it was produced with, at one offset, first delivered in produced
 #            order; every rewind (a delivery at or below an offset already
 #            delivered: the resume from a committed offset) goes back no
-#            further than the offset committed BEFORE the kill, so only
-#            records after the last commit are delivered again; nothing was
-#            reset by OFFSET_OUT_OF_RANGE;
-#   bound    the redeliveries are counted and at most what one commit interval
-#            of the stream plus a 2 s margin holds (CHAOS_KAFKA_REDELIVERY_LIMIT
-#            overrides): what the consumer may have delivered after its last
-#            commit, including records it had fetched before the kill;
+#            further than the offset committed BEFORE the kill, so what is
+#            delivered again is records after the last commit and nothing
+#            else; nothing was reset by OFFSET_OUT_OF_RANGE;
+#   commits  the committed offset kept up before the kill: it covers every
+#            record delivered a commit interval and 2 s before the kill. The
+#            redeliveries are counted, not bounded by a number: librdkafka
+#            keeps fetching through the failover while its commits wait for a
+#            coordinator, so all it delivers until it rejoins comes again
+#            (measured first: 1,720 records of a 15 s lease), and what bounds
+#            them is the offset committed, asserted above;
 #   end      the group's committed offset on the plane reaches the end of the
 #            partition (the Kafka high watermark), and a fresh member of the
 #            same group reads nothing.
@@ -78,12 +85,9 @@ require_integer_in_range CHAOS_KAFKA_FAILOVER_LIMIT_SECONDS "$FAILOVER_LIMIT_SEC
 FAILOVER_LIMIT_SECONDS=$((10#$FAILOVER_LIMIT_SECONDS))
 [[ "$PACE_SLEEP" =~ ^[0-9]+([.][0-9]+)?$ ]] \
   || fail "CHAOS_KAFKA_PACE_SLEEP must be a non-negative decimal, got '$PACE_SLEEP'"
-# The stream's rate, records a second, and from it the redelivery bound.
-RATE="$(awk -v every="$PACE_EVERY" -v pause="$PACE_SLEEP" \
-  'BEGIN { if (pause <= 0) print 100000; else printf "%d", every / pause + 0.5 }')"
-REDELIVERY_LIMIT="${CHAOS_KAFKA_REDELIVERY_LIMIT:-$(( (COMMIT_INTERVAL_MS + 2000) * RATE / 1000 ))}"
-require_integer_in_range CHAOS_KAFKA_REDELIVERY_LIMIT "$REDELIVERY_LIMIT" 0 "$RECORDS"
-REDELIVERY_LIMIT=$((10#$REDELIVERY_LIMIT))
+# librdkafka's default auto.commit.interval.ms, which kcat cannot change (see
+# the header).
+LIBRDKAFKA_COMMIT_INTERVAL_MS=5000
 for client in $CLIENTS; do
   case "$client" in
     librdkafka | jvm) ;;
@@ -119,14 +123,15 @@ run_client() {
   # joins, the commits and their answers), so a commit course that goes
   # wrong says why in its own log; CHAOS_KCAT_DEBUG replaces the list.
   local kcat_debug=(-d "${CHAOS_KCAT_DEBUG:-cgrp}")
+  local interval_ms="$COMMIT_INTERVAL_MS"
   if [[ "$client" == "librdkafka" ]]; then
-    # Stock settings apart from what the scenario is about: the group, an
-    # auto-commit interval short enough to bound the redeliveries, and where a
-    # group with nothing committed starts. -u: unbuffered, so a delivery is
-    # stamped when it is printed.
+    # Stock settings apart from where a group with nothing committed starts
+    # (a topic property, which is where kcat puts it): auto-commit is on by
+    # default, every 5 s. -u: unbuffered, so a delivery is stamped when it is
+    # printed.
+    interval_ms="$LIBRDKAFKA_COMMIT_INTERVAL_MS"
     "$KCAT" -G "$group" -b "$KAFKA_BOOTSTRAP" -u \
-      -X auto.offset.reset=earliest -X enable.auto.commit=true \
-      -X auto.commit.interval.ms="$COMMIT_INTERVAL_MS" \
+      -X auto.offset.reset=earliest \
       -f '%o:%k:%s\n' ${kcat_debug[@]+"${kcat_debug[@]}"} "$TOPIC" \
       > >(stamp_stdin_ms > "$consumed") 2> >(stamp_stdin_ms > "$clog") &
     consumer=$!
@@ -151,7 +156,7 @@ run_client() {
     consumer=$!
   fi
   echo "$consumer" >> "$WORKDIR/pids"
-  log "one $client group consumer (pid $consumer) in group $group, auto-commit every ${COMMIT_INTERVAL_MS} ms, bootstrapped from $KAFKA_BOOTSTRAP"
+  log "one $client group consumer (pid $consumer) in group $group, auto-commit every ${interval_ms} ms, bootstrapped from $KAFKA_BOOTSTRAP"
   delivered_count() { grep -c . "$consumed" || true; }
   consumer_alive() {
     kill -0 "$consumer" 2>/dev/null \
@@ -295,6 +300,7 @@ run_client() {
   verdict="$(python3 -c '
 import sys
 consumed, expected_path, committed_before = sys.argv[1], sys.argv[2], int(sys.argv[3])
+kill_ms, interval_ms = int(sys.argv[4]), int(sys.argv[5])
 expected = []
 for line in open(expected_path):
     key, _, value = line.rstrip("\n").partition(":")
@@ -333,14 +339,17 @@ if first_order != [key for key, _ in expected]:
 for before, to in rewinds:
     if to < committed_before:
         sys.exit("the consumer went back from offset %d to %d, below offset %d committed before the kill: a commit was lost or an offset reset" % (before, to, committed_before))
+# The commits kept up: everything delivered a commit interval and 2 s before
+# the kill was committed by then.
+due = [offset for stamp, offset, _, _ in deliveries if stamp <= kill_ms - interval_ms - 2000]
+if due and committed_before < max(due) + 1:
+    sys.exit("offset %d was committed at the kill, behind offset %d delivered %d ms before it: the commits did not keep up with a %d ms interval" % (committed_before, max(due), interval_ms + 2000, interval_ms))
 redelivered = len(deliveries) - len(offset_of)
 print(redelivered, len(rewinds), min((to for _, to in rewinds), default=-1))
-' "$consumed" "$input" "$committed_before")" || fail "the $client consumer's deliveries are wrong: $verdict (see $consumed)"
+' "$consumed" "$input" "$committed_before" "$kill_ms" "$interval_ms")" || fail "the $client consumer's deliveries are wrong: $verdict (see $consumed)"
   local redelivered rewind_count rewound_to
   read -r redelivered rewind_count rewound_to <<<"$verdict"
   log "every record delivered at least once, in order: $redelivered redelivered over $rewind_count rewind(s), the lowest to offset $rewound_to (committed before the kill: $committed_before)"
-  [[ "$redelivered" -le "$REDELIVERY_LIMIT" ]] \
-    || fail "$redelivered records were delivered twice, over the $REDELIVERY_LIMIT one commit interval (${COMMIT_INTERVAL_MS} ms) and 2 s of the stream at $RATE/s holds"
   # Debug lines (librdkafka's level 7) narrate; a reset is reported at a
   # warning or an error level.
   local resets
@@ -373,7 +382,7 @@ else:
   log "kill to the consumer's first delivery after it: ${first} ms; to the end of the silence it saw: ${resume} ms (longest silence ${silence} ms); to the partition assigned again: ${assigned} ms"
   printf 'KAFKA_GROUP_FAILOVER client=%s %s kill_to_first_delivery_ms=%s kill_to_resume_ms=%s longest_silence_ms=%s kill_to_assigned_ms=%s redelivered=%s rewinds=%s committed_before_kill=%s commit_interval_ms=%s consumer_exit=%s records=%s\n' \
     "$client" "$(kafka_failover_conditions "$WINNER")" "$first" "$resume" "$silence" "$assigned" \
-    "$redelivered" "$rewind_count" "$committed_before" "$COMMIT_INTERVAL_MS" "$consumer_exit" "$RECORDS" \
+    "$redelivered" "$rewind_count" "$committed_before" "$interval_ms" "$consumer_exit" "$RECORDS" \
     | tee -a "$BASE_WORKDIR/group-failover-results.txt"
 
   # --- a fresh member of the same group reads nothing ----------------------------
