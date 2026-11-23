@@ -758,18 +758,18 @@ For each runbook, the second person:
 
 | Runbook | Run by | Date | Time taken | Notes folded back |
 |---|---|---|---|---|
-| The ledger is lost | desk run (agent), 2026-11-22, hands-on pending on AWS | 2026-11-22 | not timed (nothing was run) | Variables and tools defined; roles and grants, MAC key for `migrate`, the audit-trail end as a routine record, the group reset's preconditions. |
-| The bucket is lost | desk run (agent), 2026-11-22, hands-on pending on AWS | 2026-11-22 | not timed (nothing was run) | New store first (the audit needs a store that answers); bucket creation commands; renamed-database loss report that runs (psql variables, topic and partition). |
-| A region is lost | desk run (agent), 2026-11-22, hands-on pending on AWS | 2026-11-22 | not timed (nothing was run) | Roles on the new server; credentials and region; mirror offsets named as not drilled. |
-| A disk is full | desk run (agent), 2026-11-22, hands-on pending on AWS | 2026-11-22 | not timed (nothing was run) | How to find the log and the disk; what to free; how long to wait. |
-| Verification fails | desk run (agent), 2026-11-22, hands-on pending on AWS | 2026-11-22 | not timed (nothing was run) | Batch id to object key; AWS commands beside `mc`; Object Lock caveat. |
-| Key rotation | desk run (agent), 2026-11-22, hands-on pending on AWS | 2026-11-22 | not timed (nothing was run) | Key file recipe, restarts, the checking shell's access: see [the rotation page](manifest-key-rotation.md). |
+| The ledger is lost | desk run; no hands-on run yet | 2026-11-22 | not timed (nothing was run) | Variables and tools defined; roles and grants, MAC key for `migrate`, the audit-trail end as a routine record, the group reset's preconditions. |
+| The bucket is lost | desk run; no hands-on run yet | 2026-11-22 | not timed (nothing was run) | New store first (the audit needs a store that answers); bucket creation commands; renamed-database loss report that runs (psql variables, topic and partition). |
+| A region is lost | desk run; no hands-on run yet | 2026-11-22 | not timed (nothing was run) | Roles on the new server; credentials and region; mirror offsets named as not drilled. |
+| A disk is full | desk run; no hands-on run yet | 2026-11-22 | not timed (nothing was run) | How to find the log and the disk; what to free; how long to wait. |
+| Verification fails | desk run; no hands-on run yet | 2026-11-22 | not timed (nothing was run) | Batch id to object key; AWS commands beside `mc`; Object Lock caveat. |
+| Key rotation | desk run; no hands-on run yet | 2026-11-22 | not timed (nothing was run) | Key file recipe, restarts, the checking shell's access: see [the rotation page](manifest-key-rotation.md). |
 
-The six rows above are a **desk run**: an agent that did not write these pages
-read each, step by step, against the code and the drill scripts, and the notes
-are folded into the steps. Nothing was executed, so no time is recorded and no
-row is closed: each stays open until a person runs it on a lab (the AWS host)
-and writes their own row.
+The six rows above are a **desk run**: each page was read, step by step,
+against the code, the CLI and the drill scripts, and the gaps found are folded
+into the steps. Nothing was executed, so no time is recorded, and a desk run
+is not the second person's run: no row is closed until a person who did not
+write the runbook runs it on a lab and writes their own row.
 
 ### Causing each disaster by hand
 
