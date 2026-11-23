@@ -25,6 +25,13 @@ pub struct VtopConfig {
     /// only, never values.
     #[serde(skip)]
     pub configured_fields: std::collections::BTreeSet<String>,
+    /// The version of this file's layout (#743): absent means
+    /// [`crate::config_strict::CONFIG_VERSION`], the version this build
+    /// reads. A newer one is refused at load, naming both, before any other
+    /// key is read; an engine that predates the key ignores it, which is
+    /// harmless while the version is 1. See [`crate::config_strict`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_version: Option<u32>,
     pub engine: EngineConfig,
     pub batching: BatchingConfig,
     pub compression: CompressionConfig,
@@ -2032,6 +2039,9 @@ impl VtopConfig {
     /// error's text; presence is recorded only after it succeeded, so a refused
     /// file reads exactly as it did before presence was recorded.
     pub fn from_yaml_str(text: &str) -> Result<Self, VtopError> {
+        // A newer `config_version` is refused first (#743): its other keys
+        // may be ones this build cannot parse, and the version is the cause.
+        crate::config_strict::check_declared_version(text)?;
         let mut cfg: VtopConfig = serde_yaml::from_str(text)?;
         cfg.configured_fields = crate::effective_config::present_keys(text);
         Ok(cfg)
