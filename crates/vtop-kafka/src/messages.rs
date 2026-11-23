@@ -282,6 +282,13 @@ pub enum ErrorCode {
     InvalidSessionTimeout = 26,
     /// The group is rebalancing: rejoin.
     RebalanceInProgress = 27,
+    /// The leader has not yet proven where its log may be read to after a
+    /// leader change, so it serves no fetch for now (#751): a promoted node
+    /// whose promotion boundary (#240) still awaits its quorum. Kafka's own
+    /// answer for a new leader whose high watermark has not caught up. Every
+    /// stock client retries it; a code it does not expect on a Fetch, such
+    /// as `REQUEST_TIMED_OUT`, ends the JVM consumer.
+    OffsetNotAvailable = 78,
     /// KIP-394: a first join must come back with the id minted for it.
     MemberIdRequired = 79,
     /// One member over the group's cap.
@@ -338,6 +345,7 @@ impl ErrorCode {
             74 => Self::FencedLeaderEpoch,
             75 => Self::UnknownLeaderEpoch,
             76 => Self::UnsupportedCompressionType,
+            78 => Self::OffsetNotAvailable,
             79 => Self::MemberIdRequired,
             84 => Self::GroupMaxSizeReached,
             87 => Self::InvalidRecord,

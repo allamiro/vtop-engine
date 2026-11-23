@@ -115,8 +115,10 @@ run_client() {
   local consumed="$WORKDIR/consumed.txt" clog="$WORKDIR/logs/consumer.log" consumer
   : > "$consumed"
   : > "$clog"
-  local kcat_debug=()
-  [[ -n "${CHAOS_KCAT_DEBUG:-}" ]] && kcat_debug=(-d "$CHAOS_KCAT_DEBUG")
+  # The consumer's group debug is on (librdkafka's `cgrp` facility, the
+  # joins, the commits and their answers), so a commit course that goes
+  # wrong says why in its own log; CHAOS_KCAT_DEBUG replaces the list.
+  local kcat_debug=(-d "${CHAOS_KCAT_DEBUG:-cgrp}")
   if [[ "$client" == "librdkafka" ]]; then
     # Stock settings apart from what the scenario is about: the group, an
     # auto-commit interval short enough to bound the redeliveries, and where a
@@ -281,7 +283,7 @@ run_client() {
   log "the consumer's group lines: $(grep -iE 'rebalanc|assign|revok|error|fail' "$clog" | grep -viE 'commit' \
     | head -12 | cut -c1-240 | tr '\n' '|')"
   log "the consumer's commit lines ($(grep -ciE 'commit' "$clog" || true) in all): $(grep -iE 'commit' "$clog" \
-    | head -8 | cut -c1-300 | tr '\n' '|')"
+    | head -30 | cut -c1-300 | tr '\n' '|')"
   local n
   for n in 1 2 3; do
     log "candidate $n's group and commit lines: $(grep -E 'kafka offsets|kafka (OffsetCommit|JoinGroup|SyncGroup|Heartbeat)|NOT_COORDINATOR|coordinator' \
@@ -339,8 +341,12 @@ print(redelivered, len(rewinds), min((to for _, to in rewinds), default=-1))
   log "every record delivered at least once, in order: $redelivered redelivered over $rewind_count rewind(s), the lowest to offset $rewound_to (committed before the kill: $committed_before)"
   [[ "$redelivered" -le "$REDELIVERY_LIMIT" ]] \
     || fail "$redelivered records were delivered twice, over the $REDELIVERY_LIMIT one commit interval (${COMMIT_INTERVAL_MS} ms) and 2 s of the stream at $RATE/s holds"
-  ! grep -qiE 'out of range|offset reset|OFFSET_OUT_OF_RANGE' "$clog" \
-    || fail "the consumer reset its offset: $(grep -m 2 -iE 'out of range|offset reset|OFFSET_OUT_OF_RANGE' "$clog" | tr '\n' ' ')"
+  # Debug lines (librdkafka's level 7) narrate; a reset is reported at a
+  # warning or an error level.
+  local resets
+  resets="$(awk '!/[ |]%7[|]/ && tolower($0) ~ /out of range|offset reset|offset_out_of_range/' "$clog")"
+  [[ -z "$resets" ]] \
+    || fail "the consumer reset its offset: $(head -2 <<<"$resets" | tr '\n' ' ')"
 
   # --- the times ----------------------------------------------------------------
   local first resume silence assigned="n/a"
