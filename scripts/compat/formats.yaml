@@ -247,6 +247,7 @@ formats:
       - {file: crates/vtop-meta/src/command.rs, name: NODE_VERSION_REPORTS_FEATURE_LEVEL, value: '7'}
       - {file: crates/vtop-meta/src/command.rs, name: PROMOTE_UNPROVEN_FEATURE_LEVEL, value: '8'}
       - {file: crates/vtop-meta/src/command.rs, name: ATTRIBUTED_COMMANDS_FEATURE_LEVEL, value: '9'}
+      - {file: crates/vtop-meta/src/command.rs, name: HOLDER_RELEASE_FEATURE_LEVEL, value: '9'}
       - {file: crates/vtop-meta/src/command.rs, name: COMMAND_KIND_SET_FEATURE_LEVEL, value: '36'}
       - {file: crates/vtop-meta/src/command.rs, name: COMMAND_KIND_REPORT_NODE_VERSION, value: '38'}
       - {file: crates/vtop-meta/src/versions.rs, name: FIRST_MEMBER_CHECKED_FEATURE_LEVEL, value: '8'}
@@ -294,6 +295,7 @@ formats:
           COMMAND_KIND_REPORT_NODE_VERSION: 38
           COMMAND_KIND_ATTEST_UNPROVEN_PROMOTION: 39
           COMMAND_KIND_ATTRIBUTED: 40
+          COMMAND_KIND_RELEASE_RANGE_LEASE_AS_HOLDER: 41
     one_way:
       - "raising the feature level (vtopctl meta enable-features): permanent; a voter older than the level refuses a log that holds its kinds"
     fixtures: [crates/vtop-meta/tests/fixtures/meta]
