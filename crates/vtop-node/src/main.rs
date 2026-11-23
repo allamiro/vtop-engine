@@ -10,6 +10,7 @@ mod client;
 mod colocated;
 mod config;
 mod data_node;
+mod kafka_candidate;
 mod lease_agent;
 mod lease_watcher;
 mod meta_node;

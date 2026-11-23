@@ -32,6 +32,11 @@ spec:
     - name: native
       port: {{ .Values.ports.native }}
       targetPort: native
+    {{- if .Values.data.kafka.enabled }}
+    - name: kafka
+      port: {{ .Values.ports.kafka }}
+      targetPort: kafka
+    {{- end }}
     - name: obs
       port: {{ .Values.ports.observability }}
       targetPort: obs

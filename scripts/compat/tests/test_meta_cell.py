@@ -2,8 +2,9 @@
 expectation must hold a release to what the cell says a refusal is, a
 non-zero exit with the message and the directory unchanged.
 
-No release refuses a directory this build writes yet, so no real binary can
-take this path. The cell runs here against stand-ins: a copy of the cell
+The published releases take this path on the directory raised to level 9
+(expected.yaml), but only in the Compat workflow. The cell runs here against
+stand-ins, so the path is checked without them: a copy of the cell
 beside a meta-scenario.sh that only lays out a directory, and a vtop-node and
 vtopctl that answer the probe on the baseline directory and refuse the raised
 one as the environment tells them to.

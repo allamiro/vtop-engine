@@ -119,12 +119,22 @@ async fn s3_client() -> aws_sdk_s3::Client {
         .credentials_provider(Credentials::new(
             env("AWS_ACCESS_KEY_ID"),
             env("AWS_SECRET_ACCESS_KEY"),
-            None,
+            // The AWS leg assumes a role through OIDC, which gives temporary
+            // credentials with a session token; the lab's keys have none.
+            std::env::var("AWS_SESSION_TOKEN").ok(),
             None,
             "test",
         ))
         .build();
     aws_sdk_s3::Client::from_conf(conf)
+}
+
+/// An S3 AccessDenied: the AWS leg's role holds no
+/// s3:BypassGovernanceRetention, on purpose (#722).
+fn access_denied<E: aws_sdk_s3::error::ProvideErrorMetadata, R>(
+    e: &aws_sdk_s3::error::SdkError<E, R>,
+) -> bool {
+    e.as_service_error().and_then(|se| se.code()) == Some("AccessDenied")
 }
 
 /// The refusal on a store without Object Lock or versioning (#722; Garage):
@@ -295,18 +305,26 @@ impl Archived {
     }
 
     /// Delete what the batch wrote: the lab's root credentials may bypass
-    /// governance.
+    /// governance. The AWS leg's role may not, and there the bucket's
+    /// lifecycle rule removes the versions; the log says so.
     async fn clean_up(self) {
         for (uri, key, version) in self.written {
-            self.client
+            let deleted = self
+                .client
                 .delete_object()
                 .bucket(&self.bucket)
                 .key(&key)
                 .version_id(&version)
                 .bypass_governance_retention(true)
                 .send()
-                .await
-                .unwrap_or_else(|e| panic!("cleaning up {uri}: {e:?}"));
+                .await;
+            match deleted {
+                Ok(_) => {}
+                Err(e) if access_denied(&e) => eprintln!(
+                    "{uri}: governance bypass refused; left for the bucket's lifecycle rule"
+                ),
+                Err(e) => panic!("cleaning up {uri}: {e:?}"),
+            }
         }
     }
 }
@@ -401,9 +419,24 @@ async fn live_a_receipt_whose_retention_was_cleared_is_reported_by_the_scrub() {
 #[ignore = "requires an S3-compatible endpoint with Object Lock"]
 async fn live_a_replay_over_an_ended_lock_commits_a_fresh_locked_object() {
     let live = LiveS3::from_env();
-    live.case_with_refusal(
+    let (name, needs) = (
         "engine.object_lock.a_replay_over_an_ended_lock_commits_a_fresh_object",
-        &[Capability::Versioning, Capability::ObjectLock],
+        &[Capability::Versioning, Capability::ObjectLock][..],
+    );
+    // Shortening a governance retention takes s3:BypassGovernanceRetention,
+    // which the AWS leg's role deliberately lacks (no endpoint is set only
+    // for a server whose file says the SDK finds it, i.e. AWS): recorded
+    // not_run with why, never a pass (#722).
+    if live.settings.endpoint.is_none() {
+        return live.not_run(
+            name,
+            needs,
+            "the case shortens a governance retention, which needs s3:BypassGovernanceRetention; the AWS role deliberately lacks it",
+        );
+    }
+    live.case_with_refusal(
+        name,
+        needs,
         || async {
             use aws_sdk_s3::types::{ObjectLockRetention, ObjectLockRetentionMode};
             let dir = tempfile::tempdir().unwrap();
@@ -782,9 +815,11 @@ async fn live_a_tier_copy_is_written_and_checked_under_the_lock() {
                 );
             }
 
-            // Clean up: the lab's root credentials may bypass governance.
+            // Clean up: the lab's root credentials may bypass governance; a
+            // role without s3:BypassGovernanceRetention (the AWS leg's) is
+            // refused, and the bucket's lifecycle rule removes the versions.
             for (key, version) in written {
-                client
+                match client
                     .delete_object()
                     .bucket(&bucket)
                     .key(&key)
@@ -792,7 +827,13 @@ async fn live_a_tier_copy_is_written_and_checked_under_the_lock() {
                     .bypass_governance_retention(true)
                     .send()
                     .await
-                    .unwrap_or_else(|e| panic!("cleaning up {key}: {e:?}"));
+                {
+                    Ok(_) => {}
+                    Err(e) if access_denied(&e) => eprintln!(
+                        "{key}: governance bypass refused; left for the bucket's lifecycle rule"
+                    ),
+                    Err(e) => panic!("cleaning up {key}: {e:?}"),
+                }
             }
         },
         tier_copy_refused_before_writing,

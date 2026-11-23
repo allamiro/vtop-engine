@@ -164,6 +164,10 @@ pub fn classify(command: &MetadataCommand) -> (CommandClass, Option<Uuid>) {
         MetadataCommand::ReportNodeVersion { node_uuid, .. } => {
             (CommandClass::NodeScoped, Some(*node_uuid))
         }
+        // The wrapper is judged as what it carries (#706): the leader builds
+        // it after authorizing, and no client can send one, but a classifier
+        // that called it a different command would be a second policy.
+        MetadataCommand::Attributed { subject, .. } => classify(subject),
         _ => (CommandClass::ClusterScoped, None),
     }
 }

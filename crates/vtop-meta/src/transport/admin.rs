@@ -36,11 +36,36 @@ use std::sync::{Arc, Mutex};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
+/// Who is asking, as the serving node verified it (#706): the identity the
+/// connection's certificate fixed, and the address the connection came from.
+/// Built by the admin endpoint from the connection, never from a frame, so a
+/// client cannot choose either.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProposalCaller {
+    pub identity: AdminIdentity,
+    /// The peer address of the connection, canonical (an IPv4-mapped IPv6
+    /// address is read as the IPv4 address); `None` when the socket cannot
+    /// say.
+    pub peer: Option<std::net::IpAddr>,
+}
+
 /// Backend for admin RPCs — typically [`crate::raft::consensus::OpenraftConsensus`].
 #[async_trait]
 pub trait AdminHandler: Send + Sync {
     async fn status(&self) -> TransportResult<AdminStatusResponse>;
     async fn propose(&self, command: MetadataCommand) -> TransportResult<AdminProposeResponse>;
+    /// Propose `command` on behalf of `caller` (#706). A handler that records
+    /// who asked (the replicated log's attributed commands, from feature
+    /// level 9) wraps it; the default proposes it as it is, which is every
+    /// handler's behaviour below that level.
+    async fn propose_as(
+        &self,
+        command: MetadataCommand,
+        caller: &ProposalCaller,
+    ) -> TransportResult<AdminProposeResponse> {
+        let _ = caller;
+        self.propose(command).await
+    }
     /// Bootstrap a fresh group (#215 live-cluster surface).
     async fn init(&self, members: Vec<u64>) -> TransportResult<AdminMembershipResponse>;
     async fn add_learner(&self, node_id: u64) -> TransportResult<AdminMembershipResponse>;
@@ -365,6 +390,12 @@ async fn serve_admin_connection(
     // Warned once per connection (#694): the audit records of its writes
     // name no actor, and the operator should know why.
     let mut warned_anonymous = false;
+    // Observed from the socket at accept, once: it is what the leader records
+    // beside the certificate's identity (#706).
+    let caller = ProposalCaller {
+        identity: identity.clone(),
+        peer: Some(peer.ip().to_canonical()),
+    };
     let mut first = true;
     loop {
         let read = if std::mem::take(&mut first) {
@@ -392,7 +423,7 @@ async fn serve_admin_connection(
                  mTLS (admin_transport: tls) with one certificate per operator"
             );
         }
-        let response = match dispatch_admin(handler.as_ref(), &authorizer, &identity, frame).await {
+        let response = match dispatch_admin(handler.as_ref(), &authorizer, &caller, frame).await {
             Ok(frame) => frame,
             // The redirect survives the trip to the wire. Building the frame
             // from `to_string()` alone is where it used to be lost: the server
@@ -582,9 +613,10 @@ fn is_write(kind: u16) -> bool {
 async fn dispatch_admin(
     handler: &dyn AdminHandler,
     authorizer: &AdminAuthorizer,
-    identity: &AdminIdentity,
+    caller: &ProposalCaller,
     frame: VtpmFrame,
 ) -> TransportResult<VtpmFrame> {
+    let identity = &caller.identity;
     match frame.kind {
         KIND_ADMIN_STATUS_REQ => {
             AdminStatusRequest::decode(&frame.payload)?;
@@ -678,6 +710,22 @@ async fn dispatch_admin(
         }
         KIND_ADMIN_PROPOSE_REQ => {
             let request = AdminProposeRequest::decode(&frame.payload)?;
+            // The actor of a command is assigned by the serving leader from
+            // the connection's certificate (#706), never by the client. A
+            // command that arrives already attributed would let a caller
+            // choose who the log says asked, so it is refused before
+            // authorization, and the refusal is audited like any other.
+            if matches!(request.command, MetadataCommand::Attributed { .. }) {
+                let reason = "refused: the command arrived already attributed (kind 40). The \
+                              serving leader assigns the actor from the certificate of the \
+                              connection, and a client cannot choose it. Nothing was proposed";
+                crate::audit::emit(&crate::audit::refusal(
+                    identity,
+                    &request.command,
+                    reason.to_owned(),
+                ));
+                return Err(TransportError::Refused(reason.to_owned()));
+            }
             // Every refusal is audited, whatever the command (#694): a
             // refused write is the record an auditor most needs.
             if let Err(refusal) = authorizer.authorize_command(identity, &request.command) {
@@ -700,7 +748,7 @@ async fn dispatch_admin(
                     crate::audit::AuditOutcome::Success,
                 )
             });
-            let result = handler.propose(request.command).await;
+            let result = handler.propose_as(request.command, caller).await;
             // A follower's redirect is not an outcome: the client asks the
             // leader next, which writes the record that counts (review of
             // #705).
@@ -3659,6 +3707,118 @@ mod tests {
         );
         task.abort();
         task2.abort();
+    }
+
+    /// A backend that remembers who each proposal was made for (#706).
+    struct CallerRecordingHandler {
+        inner: Arc<CommittingHandler>,
+        callers: Mutex<Vec<ProposalCaller>>,
+    }
+
+    #[async_trait]
+    impl AdminHandler for CallerRecordingHandler {
+        async fn status(&self) -> TransportResult<AdminStatusResponse> {
+            self.inner.status().await
+        }
+        async fn read_segment_placement(
+            &self,
+            request: AdminReadSegmentPlacementRequest,
+        ) -> TransportResult<AdminReadSegmentPlacementResponse> {
+            self.inner.read_segment_placement(request).await
+        }
+        async fn propose(&self, command: MetadataCommand) -> TransportResult<AdminProposeResponse> {
+            self.inner.propose(command).await
+        }
+        async fn propose_as(
+            &self,
+            command: MetadataCommand,
+            caller: &ProposalCaller,
+        ) -> TransportResult<AdminProposeResponse> {
+            self.callers.lock().unwrap().push(caller.clone());
+            self.inner.propose(command).await
+        }
+        async fn init(&self, _: Vec<u64>) -> TransportResult<AdminMembershipResponse> {
+            self.inner.init(Vec::new()).await
+        }
+        async fn add_learner(&self, node_id: u64) -> TransportResult<AdminMembershipResponse> {
+            self.inner.add_learner(node_id).await
+        }
+        async fn change_membership(
+            &self,
+            voters: Vec<u64>,
+            retain: bool,
+        ) -> TransportResult<AdminMembershipResponse> {
+            self.inner.change_membership(voters, retain).await
+        }
+        async fn read_range_lease(
+            &self,
+            request: AdminReadRangeLeaseRequest,
+        ) -> TransportResult<AdminReadRangeLeaseResponse> {
+            self.inner.read_range_lease(request).await
+        }
+    }
+
+    /// #706: the identity and the address a proposal is made for come from
+    /// the connection - the certificate the handshake verified and the socket
+    /// - and a command that arrives already attributed is refused before
+    /// authorization, with an audited refusal, and never reaches the handler.
+    #[tokio::test]
+    async fn the_actor_comes_from_the_connection_and_a_client_cannot_send_one() {
+        let audit = crate::audit::Recording::installed();
+        let handler = Arc::new(CallerRecordingHandler {
+            inner: CommittingHandler::replying(MetadataResponse::TopicCreated {
+                topic_uuid: Uuid::from_u128(0x694),
+                topic_epoch: 1,
+                root_range_uuid: Uuid::from_u128(0x695),
+            }),
+            callers: Mutex::new(Vec::new()),
+        });
+        let (client, handler, task) = live_endpoint_with(
+            AdminAuthorizer::with_operators(["ops-alice".to_owned()]),
+            "ops-alice",
+            handler,
+        )
+        .await;
+        client.propose(create_topic(Uuid::new_v4())).await.unwrap();
+        assert_eq!(
+            *handler.callers.lock().unwrap(),
+            vec![ProposalCaller {
+                identity: AdminIdentity::Named("ops-alice".to_owned()),
+                peer: Some("127.0.0.1".parse().unwrap()),
+            }]
+        );
+
+        // The same command, already attributed by the client to someone else.
+        let request_id = Uuid::new_v4();
+        let forged = MetadataCommand::Attributed {
+            attribution: crate::command::Attribution {
+                actor: crate::command::CommandActor::Named("ops-bob".to_owned()),
+                peer: None,
+                vouched_by: 1,
+                recorded_at_ms: 0,
+            },
+            subject: Box::new(create_topic(request_id)),
+        };
+        let error = client.propose(forged).await.unwrap_err();
+        assert!(
+            error.to_string().contains("already attributed")
+                && error.to_string().contains("Nothing was proposed"),
+            "{error}"
+        );
+        assert_eq!(
+            handler.callers.lock().unwrap().len(),
+            1,
+            "the forged command reached the handler"
+        );
+        let records = audit.for_request(request_id);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].outcome, crate::audit::AuditOutcome::Refused);
+        assert_eq!(
+            records[0].actor,
+            crate::audit::AuditActor::Caller(AdminIdentity::Named("ops-alice".to_owned())),
+            "the refusal names the certificate, not the claimed actor"
+        );
+        task.abort();
     }
 
     /// #694: a refused write is audited whatever the command, naming the

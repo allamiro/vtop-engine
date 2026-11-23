@@ -275,6 +275,11 @@ plane). An increase of `reason="handshake_timeout"` means something opens
 connections and sends nothing, or a peer too slow to finish a handshake in
 10 s. The WARN line names the peer's address.
 
+`vtop_kafka_gateway_serving` (gauge, no labels) is 1 while the node's gateway
+serves its range and 0 while it only redirects clients (#751). Across the
+members of a candidate range, exactly one should read 1 once a failover has
+settled; none for longer than an election means no member holds the range.
+
 ### Archive scrub
 
 `vtopctl scrub` (#628) reads committed objects back and verifies them again:
