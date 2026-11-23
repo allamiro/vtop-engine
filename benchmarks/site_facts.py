@@ -180,6 +180,22 @@ def _client(text: str, where: str) -> tuple[str, str]:
     return match.group(2), match.group(1)
 
 
+def _ci_runs_live_s3_on_minio(ci: str) -> bool:
+    """Whether ci.yml runs the live S3 tests against the lab's MinIO on a pull request.
+
+    Before #837 a job started it with `docker compose up -d minio`; since #837 ci.yml calls the
+    S3 compatibility matrix (`s3-compat-matrix.yml`) with `servers` naming minio, whose leg builds
+    the same docker/minio image. Either form counts; a matrix call without minio does not.
+    """
+    if re.search(r"docker compose up -d minio\b", ci):
+        return True
+    for call in re.finditer(r"uses: \./\.github/workflows/s3-compat-matrix\.yml[ \t]*\n((?:[ \t]+\S.*\n?)*)", ci):
+        servers = re.search(r"servers:\s*'?\[([^\]]*)\]", call.group(1))
+        if servers and re.search(r"[\"']minio[\"']", servers.group(1)):
+            return True
+    return False
+
+
 def s3_servers(repo: str = REPO) -> dict[str, Any]:
     """The lab's MinIO, plus one entry per committed result of the S3 compatibility matrix (#722).
 
@@ -191,7 +207,7 @@ def s3_servers(repo: str = REPO) -> dict[str, Any]:
     if len(lab) != 1:
         raise Refused(f"{COMPOSE}: {len(lab)} vtop-minio releases, not one")
     places = ["Docker lab"]
-    if re.search(r"docker compose up -d minio\b", _read(CI, repo)):
+    if _ci_runs_live_s3_on_minio(_read(CI, repo)):
         places.append("live S3 tests in CI")
     entries = []
     for path in sorted(glob.glob(os.path.join(repo, S3_RESULTS, "*.json"))):

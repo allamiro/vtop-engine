@@ -247,8 +247,29 @@ pub(crate) fn proves(
 /// as a source). Only files on the directory's filesystem with the range's
 /// inode are opened, and only one [`proves`] to be the file is returned, with
 /// a descriptor that stays on it whatever happens to its name next.
-#[cfg(unix)]
 pub(crate) fn find(
+    path: &str,
+    patterns: &[String],
+    inode: u64,
+    content: &ContentFingerprint,
+    size_when_read: u64,
+    start: u64,
+    tail: Option<&Tail>,
+) -> Option<(PathBuf, std::fs::File)> {
+    #[cfg(unix)]
+    {
+        search(path, patterns, inode, content, size_when_read, start, tail)
+    }
+    // Without inode numbers nothing can be proven to be the file.
+    #[cfg(not(unix))]
+    {
+        let _ = (path, patterns, inode, content, size_when_read, start, tail);
+        None
+    }
+}
+
+#[cfg(unix)]
+fn search(
     path: &str,
     patterns: &[String],
     inode: u64,
@@ -292,15 +313,145 @@ pub(crate) fn find(
     })
 }
 
-#[cfg(not(unix))]
-pub(crate) fn find(
-    _path: &str,
-    _patterns: &[String],
-    _inode: u64,
-    _content: &ContentFingerprint,
-    _size_when_read: u64,
-    _start: u64,
-    _tail: Option<&Tail>,
-) -> Option<(PathBuf, std::fs::File)> {
-    None
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(unix)]
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+
+    #[cfg(unix)]
+    /// A file of `bytes` in `dir` named `name`: its inode and the fingerprint
+    /// of its first page.
+    fn file_in(
+        dir: &std::path::Path,
+        name: &str,
+        bytes: &[u8],
+    ) -> (PathBuf, u64, ContentFingerprint) {
+        let path = dir.join(name);
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(bytes).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        (path, inode, ContentFingerprint::of(bytes).unwrap())
+    }
+
+    #[cfg(unix)]
+    fn fifo_in(dir: &std::path::Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        let made = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("mkfifo");
+        assert!(made.success());
+        path
+    }
+
+    #[cfg(unix)]
+    /// Run `search` on its own thread and fail instead of hanging when it
+    /// does not finish: a search that opens a FIFO waits for a writer.
+    fn finishes<T: Send + 'static>(search: impl FnOnce() -> T + Send + 'static) -> T {
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(search());
+        });
+        result
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the search did not finish")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_length_the_file_was_seen_at_is_kept_and_never_lowered() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, inode, content) = file_in(dir.path(), "app.log", b"one\ntwo\n");
+        let mut held = HeldFile::new(std::fs::File::open(path).unwrap(), inode, content, 8, 0, 8);
+        assert_eq!(held.min_len, 8);
+        held.seen_len(100);
+        assert_eq!(held.min_len, 100, "seen longer");
+        held.seen_len(40);
+        assert_eq!(held.min_len, 100, "an append-only file never gets shorter");
+    }
+
+    /// The file a range was read from is found under the name rotation gave
+    /// it, and only when it is proven to be that file.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_is_found_where_rotation_left_it_and_only_when_proven() {
+        let dir = tempfile::tempdir().unwrap();
+        let at = dir.path().join("app.log");
+        let (_, inode, content) = file_in(dir.path(), "app.log", b"one\ntwo\n");
+        let rotated = dir.path().join("app.log.1");
+        std::fs::rename(&at, &rotated).unwrap();
+        // A new file at the path, and another file nobody asked about.
+        std::fs::write(&at, b"fresh\n").unwrap();
+        std::fs::write(dir.path().join("other.log"), b"one\ntwo\n").unwrap();
+
+        let path = at.to_string_lossy().into_owned();
+        let (found, file) = find(&path, &[], inode, &content, 8, 0, None).expect("found");
+        assert_eq!(found, rotated);
+        assert_eq!(file.metadata().unwrap().ino(), inode);
+
+        // The name is not what proves it: another first page is not the file.
+        let other = ContentFingerprint::of(b"NOPE\n").unwrap();
+        assert!(find(&path, &[], inode, &other, 8, 0, None).is_none());
+        // Nor is a file shorter than it was when the range was read.
+        assert!(find(&path, &[], inode, &content, 9, 0, None).is_none());
+        // Another inode is not the file whatever it holds.
+        assert!(find(&path, &[], inode + 1_000_000, &content, 8, 0, None).is_none());
+    }
+
+    /// An `olddir` that is configured as a source is searched by its pattern.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_rotated_into_another_directory_is_found_by_the_sources_patterns() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old");
+        std::fs::create_dir(&old).unwrap();
+        let at = dir.path().join("app.log");
+        let (_, inode, content) = file_in(dir.path(), "app.log", b"one\ntwo\n");
+        std::fs::rename(&at, old.join("app.log.1")).unwrap();
+        std::fs::write(&at, b"fresh\n").unwrap();
+
+        let path = at.to_string_lossy().into_owned();
+        assert!(
+            find(&path, &[], inode, &content, 8, 0, None).is_none(),
+            "not in the path's own directory"
+        );
+        let patterns = [
+            "/no/such/dir/*.log".to_string(),
+            "[".to_string(), // not a pattern at all
+            old.join("*.1").to_string_lossy().into_owned(),
+        ];
+        let (found, _) = find(&path, &patterns, inode, &content, 8, 0, None).expect("found");
+        assert_eq!(found, old.join("app.log.1"));
+        // Listed by the directory scan and by a pattern, it is one candidate.
+        let again = [dir.path().join("*").to_string_lossy().into_owned()];
+        let rotated = dir.path().join("app.log.1");
+        std::fs::rename(old.join("app.log.1"), &rotated).unwrap();
+        let (found, _) = find(&path, &again, inode, &content, 8, 0, None).expect("found");
+        assert_eq!(found, rotated);
+    }
+
+    /// Only a regular file with the range's inode is ever opened: opening a
+    /// FIFO waits for a writer that never comes, and would stall the search
+    /// that goes through every candidate looking for the proven one.
+    #[cfg(unix)]
+    #[test]
+    fn the_search_never_opens_what_is_not_a_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old");
+        std::fs::create_dir(&old).unwrap();
+        let (_, _, content) = file_in(dir.path(), "app.log", b"one\ntwo\n");
+        fifo_in(dir.path(), "a.fifo");
+        fifo_in(&old, "b.fifo");
+
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let patterns = vec![old.join("*").to_string_lossy().into_owned()];
+        // An inode nothing has: every entry is looked at and none is opened.
+        let found = finishes(move || {
+            find(&path, &patterns, u64::MAX, &content, 8, 0, None).map(|(found, _)| found)
+        });
+        assert_eq!(found, None);
+    }
 }
