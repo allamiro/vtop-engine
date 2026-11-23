@@ -194,6 +194,14 @@ with an endpoint set.
   anything that can reach the port and knows that UUID may produce and
   consume); a plaintext admin plane refuses an enforcing
   `admin_authorization`, since there is no CN to match.
+- Under an enforcing `admin_authorization`, a data node may act on its own
+  range lease and no other node's: acquire, renew, and from metadata feature
+  level 9 release it (`ReleaseRangeLeaseAsHolder`, #732), which names the
+  holder so the admin plane can bind it to the node's certificate and the
+  state machine applies it only while that node holds the lease. The
+  holder-less `ReleaseRangeLease` names no one and stays an operator's. Below
+  level 9 a node falls back to it, which an enforcing policy refuses, and the
+  lease then lapses on its deadline.
 - The Helm chart renders `admin_authorization` by default (#732): only the
   certificate CNs in `meta.adminAuthorization.operatorCommonNames` may run
   cluster-scoped admin commands, and the chart refuses to render with the
