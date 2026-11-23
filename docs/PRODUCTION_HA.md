@@ -1424,6 +1424,16 @@ Short procedures now; expand into a full ops runbook before go-live.
   and closes the connection; so does a member that refuses the request), or
   why it could not be reached. Levels up to 7 are still raised on the
   operator's word, because v0.8.0 and v0.9.0 implement 7 but cannot answer.
+
+  Level 9 (#706) records who asked: from it, the serving leader commits an
+  operator's audited command together with the certificate identity it
+  verified, the connection's address and its own node id, as one log entry
+  (command kind 40), and the cluster state keeps the last 1024 of them. It
+  changes nothing on the replica plane and no data node uses it, but it is
+  raised like any level above 7: every counted data node must report 9 first,
+  and every metadata member must answer that it supports 9. Below 9 the actor
+  is in the admin endpoint's audit record only. See
+  [Auditing](operate/auditing.md).
   The check runs only on a leader on this release or later: raise once
   `vtopctl meta status` shows one leads, because an older leader proposes
   the raise unchecked. It runs when the raise is proposed, not when it is

@@ -188,7 +188,7 @@ evidence charts (light and dark SVGs under `docs/assets/readme/`) from these run
 | OffsetCommit without a metadata plane | client: `Offset commit failed on partition bench-0 at offset <n>: The message format version on the broker does not support the request`; gateway: `kafka OffsetCommit refused: this gateway has no durable offset store` | `enable.auto.commit=false` for both systems |
 | compressed batches | `UnsupportedCompressionTypeException: batch 0: record batch is compressed (codec 4), which this gateway does not decompress` (zstd) | `compression.type=none` for both systems |
 | gateway on followers | the node refuses `kafka` on any role but leader or standalone | one gateway, on the range's leader |
-| gateway on a candidate (failover, #597) | ``error: `kafka` is configured on a Candidate node: the gateway is served by a leader or standalone only — it holds one broker, and a candidate's changes with the lease (#225)`` | no Kafka client can follow a VTOP failover; `failover.py` measures VTOP through its native client, labelled as such |
+| gateway on a candidate (failover, #597) | ``error: `kafka` is configured on a Candidate node: the gateway is served by a leader or standalone only — it holds one broker, and a candidate's changes with the lease (#225)`` | when #597 ran, no Kafka client could follow a VTOP failover (#751 closed that gap, and the run was not repeated); `failover.py` measures VTOP through its native client, labelled as such |
 
 Everything the producer and consumer perf tools use was served: the 4.3 JVM client found a common version
 for ApiVersions, Metadata, Produce (idempotent, the client's default, via InitProducerId), Fetch, ListOffsets
@@ -205,8 +205,9 @@ python3 benchmarks/kafka_compare/report.py benchmarks/kafka_compare/results/fail
 ```
 
 **The client paths differ, and that is the first finding.** The only VTOP shape that fails over by itself
-is every node a *candidate* (the Helm replicated topology), and a candidate refuses the Kafka gateway (row
-above). A leased leader can carry the gateway, but its followers never take the range over themselves. So the
+is every node a *candidate* (the Helm replicated topology), and in the build this run measured a candidate
+refused the Kafka gateway (row above; #751 has since lifted that, and live-chaos scenarios 27 and 28 show a
+Kafka client following a failover on one host, with debug binaries and a 6 s lease). A leased leader can carry the gateway, but its followers never take the range over themselves. So the
 Kafka side is driven by the JVM client (`kafka-verifiable-producer.sh`, idempotent, retries at the client
 default) and the VTOP side by its native client (`vtop-node produce` via
 [`vtop/failover-driver.sh`](vtop/failover-driver.sh)); every chart and table says so.
