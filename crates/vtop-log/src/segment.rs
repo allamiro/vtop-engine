@@ -879,29 +879,6 @@ impl ActiveSegment {
         self.fetch_through(start_offset, max_bytes, max_records, self.committed_offset)
     }
 
-    /// The offset this segment holds `record` at, when its producer state has
-    /// the same producer, epoch and sequence with the same content: the
-    /// offset [`Self::append_group`] would answer a retry of it with, as a
-    /// duplicate. `None` for a record it does not hold, for other content at
-    /// that sequence, and for a sequence older than the retry window.
-    pub fn held_offset(&self, record: &LogRecord) -> Option<u64> {
-        let seen = self
-            .producer_states
-            .get(&(record.producer_id, record.producer_epoch))?
-            .seen
-            .get(&record.sequence)?;
-        (seen.content_hash == record_content_hash(record)).then_some(seen.offset)
-    }
-
-    /// Whether [`Self::held_offset`] cannot answer for `record`: its producer
-    /// and epoch are known here and its sequence is below the bounded retry
-    /// window, so the record may be stored here although no lookup says so.
-    pub fn below_retry_window(&self, record: &LogRecord) -> bool {
-        self.producer_states
-            .get(&(record.producer_id, record.producer_epoch))
-            .is_some_and(|state| record.sequence < sequence_window_floor(state.latest_sequence))
-    }
-
     /// Fetch records visible at or below `high_watermark`.
     ///
     /// The effective watermark is clamped to the local durable
@@ -4126,48 +4103,6 @@ mod tests {
                 assert!(matches!(outcome, AppendOutcome::Appended { .. }));
             }
         }
-    }
-
-    /// What a replica's conflict check asks of its log (#599): the offset a
-    /// byte-for-byte retry is held at, nothing for other bytes or a producer
-    /// it never saw, and whether a sequence is too old for the window to say.
-    #[test]
-    fn held_offset_answers_inside_the_window_and_says_when_it_cannot() {
-        let directory = tempdir().unwrap();
-        let producer = Uuid::from_u128(92);
-        let mut segment = ActiveSegment::create(
-            directory.path().join("held.active"),
-            descriptor(),
-            window_config(),
-        )
-        .unwrap();
-        let total = PRODUCER_SEQUENCE_WINDOW + 10;
-        fill_past_window(&mut segment, producer, total, total);
-        let latest = total - 1;
-        let floor = latest - (PRODUCER_SEQUENCE_WINDOW - 1);
-
-        assert_eq!(
-            segment.held_offset(&record(producer, latest, b"w")),
-            Some(40 + latest)
-        );
-        assert_eq!(
-            segment.held_offset(&record(producer, floor, b"w")),
-            Some(40 + floor)
-        );
-        assert_eq!(
-            segment.held_offset(&record(producer, floor, b"different")),
-            None
-        );
-        assert!(!segment.below_retry_window(&record(producer, floor, b"w")));
-        // Stored, but older than the window: no lookup can say so.
-        assert_eq!(
-            segment.held_offset(&record(producer, floor - 1, b"w")),
-            None
-        );
-        assert!(segment.below_retry_window(&record(producer, floor - 1, b"w")));
-        let stranger = Uuid::from_u128(93);
-        assert_eq!(segment.held_offset(&record(stranger, 0, b"w")), None);
-        assert!(!segment.below_retry_window(&record(stranger, 0, b"w")));
     }
 
     #[test]

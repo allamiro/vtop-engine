@@ -1334,161 +1334,6 @@ impl InProcessFollower {
         }
     }
 
-    /// Discard the tail an append conflicts with, when it was never acknowledged
-    /// (#599).
-    ///
-    /// The conflict rule of an append that finds a different record at an
-    /// offset this replica already holds: this replica's record there, and
-    /// every record after it, is not the leader's, so they are discarded and
-    /// the leader's take their place (Raft's AppendEntries rule, here by the
-    /// bytes of the record, since a request does not carry the epoch that
-    /// wrote the one it replaces). The leader of an epoch holds every record
-    /// that epoch's quorum acknowledged: it fsyncs before it replicates, and
-    /// an acknowledgement needs its own durability. So when it appends at
-    /// `X`, nothing at or above `X` here was acknowledged. A leader that
-    /// restarted with a log shorter than its followers' (it lost a tail they
-    /// kept) is the case that reaches this, and a fence cannot settle it: the
-    /// histories agree, since the same epoch wrote both.
-    ///
-    /// What was acknowledged is never discarded. The mark this replica has
-    /// observed (`cluster_committed`, durable across a restart) is the proof
-    /// it holds; below it `truncate_to` refuses, and the append is refused
-    /// with it. The leader is then the replica that is missing acknowledged
-    /// records, and no append can repair that. A record the leader re-sends
-    /// byte for byte is a retry, not a conflict: it is left, and acknowledged
-    /// by the duplicate path as before. Before this, the duplicate path
-    /// acknowledged any append at an offset below the tail whose end was
-    /// durable here, without looking at the bytes, so a quorum was reported
-    /// for a record this replica did not hold (#261).
-    ///
-    /// Called with the meta lock held and the state lock NOT held, as
-    /// [`Self::settle_kept_dispute`] is, and only once the requests' fencing
-    /// check has passed. Only what is durable here is compared: a request
-    /// whose end is not durable is left to the refusal that follows.
-    fn discard_conflicting_tail(
-        &self,
-        requests: &[ReplicaAppendRequest],
-    ) -> Result<(), (ErrorCode, String)> {
-        let conflict = {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let tip = state.segment.next_offset();
-            let committed = state.segment.committed_offset();
-            let mut conflict = None;
-            for request in requests {
-                let held = request.expected_base_offset < tip;
-                let count = request.records.len() as u64;
-                let durable = request
-                    .expected_base_offset
-                    .checked_add(count)
-                    .is_some_and(|end| end <= committed);
-                if !held || !durable || request.records.is_empty() {
-                    continue;
-                }
-                let (stored_id, stored_epoch) = match self.segment_format {
-                    SegmentFormat::V1 => (
-                        storage_producer_id(request.producer_id, request.producer_epoch),
-                        0,
-                    ),
-                    SegmentFormat::V2 => (request.producer_id, request.producer_epoch),
-                };
-                let Ok(sent) = records_from_wire(
-                    &request.records,
-                    stored_id,
-                    stored_epoch,
-                    request.first_sequence,
-                ) else {
-                    continue;
-                };
-                // A request's records are not always consecutive offsets from
-                // its base: the leader keeps a retried record at the offset it
-                // was first written at and gives only the new ones offsets, and
-                // replicates the member whole, from the first new record's
-                // offset, or from the lowest offset when every record is a
-                // retry. So a record this replica already holds, byte for byte,
-                // under its producer, epoch and sequence, is a retry wherever
-                // it sits, and a request made only of those is no conflict. One
-                // held below the base takes no offset here; the rest are
-                // compared, in order, with what this replica holds from the
-                // base.
-                //
-                // A record older than this replica's retry window cannot be
-                // looked up, so nothing says whether it is held: such a
-                // request is not judged here and is left to the duplicate
-                // path, as before this rule.
-                if sent
-                    .iter()
-                    .any(|record| state.segment.below_retry_window(record))
-                {
-                    continue;
-                }
-                let mut fresh = false;
-                let mut placed = Vec::with_capacity(sent.len());
-                for record in &sent {
-                    match state.segment.held_offset(record) {
-                        Some(offset) if offset < request.expected_base_offset => continue,
-                        Some(_) => {}
-                        None => fresh = true,
-                    }
-                    placed.push(record);
-                }
-                if !fresh {
-                    continue;
-                }
-                // A read that fails or stops short says nothing about the
-                // bytes: left to the duplicate path, as before.
-                let Ok(held_here) = state.segment.fetch_through(
-                    request.expected_base_offset,
-                    usize::MAX,
-                    placed.len(),
-                    committed,
-                ) else {
-                    continue;
-                };
-                let differs = held_here
-                    .records
-                    .iter()
-                    .zip(&placed)
-                    .any(|(held, sent)| held.record != **sent);
-                if differs {
-                    conflict = Some(request.expected_base_offset);
-                    break;
-                }
-            }
-            conflict
-        };
-        let Some(from) = conflict else {
-            return Ok(());
-        };
-        match self.truncate_to(from) {
-            Ok(outcome) => {
-                eprintln!(
-                    "replica {}: discarded {} record(s) from offset {from} that this epoch's \
-                     leader is appending other records over; a leader holds every record its \
-                     epoch acknowledged, so they were never acknowledged (#599)",
-                    self.node_id, outcome.records_removed
-                );
-                Ok(())
-            }
-            Err(BrokerError::TruncationBelowAcknowledged {
-                requested,
-                high_watermark,
-            }) => Err((
-                ErrorCode::InvalidRequest,
-                format!(
-                    "the leader is appending other records over offset {requested}, below this \
-                     replica's high-water mark {high_watermark}; those records were \
-                     acknowledged, so this replica keeps them and does not acknowledge the \
-                     leader's. The leader is missing acknowledged records: repair it from a \
-                     replica that holds them"
-                ),
-            )),
-            Err(problem) => Err((ErrorCode::Storage, problem.to_string())),
-        }
-    }
-
     /// The refusal for an append or mark that would settle `dispute` while
     /// its durable record could not be cleared (#635).
     fn unretired(dispute: KeptDispute, problem: &BrokerError) -> (ErrorCode, String) {
@@ -2374,7 +2219,6 @@ impl InProcessFollower {
                 "replica append batch end overflows u64".to_owned(),
             ))?;
         self.settle_kept_dispute(request.fencing_epoch, batch_end)?;
-        self.discard_conflicting_tail(std::slice::from_ref(request))?;
         let mut state = self
             .state
             .lock()
@@ -2575,7 +2419,6 @@ impl InProcessFollower {
                 group_end = group_end.max(end);
             }
             self.settle_kept_dispute(first.fencing_epoch, group_end)?;
-            self.discard_conflicting_tail(requests)?;
         }
         let mut state = self
             .state
