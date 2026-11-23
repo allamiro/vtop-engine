@@ -4105,6 +4105,7 @@ name = "vtop-kafka"
 version = "0.10.4"
 dependencies = [
  "async-trait",
+ "flate2",
  "rdkafka",
  "sha2 0.11.1",
  "tempfile",
@@ -4116,6 +4117,7 @@ dependencies = [
  "vtop-log",
  "vtop-meta",
  "vtop-protocol",
+ "zstd",
 ]
 
 [[package]]
