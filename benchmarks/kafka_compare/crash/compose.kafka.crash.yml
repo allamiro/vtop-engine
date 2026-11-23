@@ -1,0 +1,29 @@
+# Kafka for the whole-replica-set crash benchmark (#599), layered on compose.kafka.yml.
+#
+# Only two things change, and neither touches what is measured:
+#   - the three brokers' data directories are bind mounts under ${CRASH_DATA_ROOT} (one filesystem
+#     for all three, so one crash is a simultaneous loss of all three replicas' page cache), as
+#     named volumes whose driver options bind them there;
+#   - the CPUs per broker come from ${CRASH_NODE_CPUS} (2, the base file's value, on the dedicated
+#     host; the smoke run lowers it, for Kafka and VTOP alike).
+# The bridge network gets its own name, so a crash run never collides with run.py or failover.py.
+services:
+  kafka-1:
+    cpus: ${CRASH_NODE_CPUS:-2}
+  kafka-2:
+    cpus: ${CRASH_NODE_CPUS:-2}
+  kafka-3:
+    cpus: ${CRASH_NODE_CPUS:-2}
+volumes:
+  kafka-1-data:
+    driver: local
+    driver_opts: { type: none, o: bind, device: "${CRASH_DATA_ROOT:?set CRASH_DATA_ROOT}/kafka-1" }
+  kafka-2-data:
+    driver: local
+    driver_opts: { type: none, o: bind, device: "${CRASH_DATA_ROOT:?set CRASH_DATA_ROOT}/kafka-2" }
+  kafka-3-data:
+    driver: local
+    driver_opts: { type: none, o: bind, device: "${CRASH_DATA_ROOT:?set CRASH_DATA_ROOT}/kafka-3" }
+networks:
+  bench:
+    name: kc-crash-kafka-bench

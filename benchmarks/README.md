@@ -1241,6 +1241,10 @@ leader) and a three-broker Apache Kafka cluster in containers with identical
 limits, one at a time, and drives both with the same JVM Kafka perf tools:
 saturation throughput, latency at fixed fractions of Kafka's saturation, and
 consume throughput, each cell proven by a byte-exact read-back first.
+`kafka_compare/crash.py` kills the whole replica set of each system at once,
+with and without the loss of the host's page cache, and counts the
+acknowledged records that did not survive (#599; needs a Linux host with
+`dm-flakey` and root for the power-loss mode).
 `kafka_compare/report.py` turns a run's CSV into the charts and
 `docs/benchmarks/kafka-comparison.md`, and refuses partial or mixed data. See
 [`kafka_compare/README.md`](kafka_compare/README.md).
