@@ -1552,6 +1552,14 @@ A patch release: no schema, wire format, feature level, config key, default or o
 
 ## v0.12.0 and beyond
 
+**Licence change.** From v0.12.0 the core is licensed under the GNU Affero
+General Public License v3.0 only (AGPL-3.0-only) instead of MIT, and is also
+offered under a commercial license (see [COMMERCIAL.md](https://github.com/allamiro/vtop-engine/blob/main/COMMERCIAL.md)).
+Releases v0.1.0 through v0.11.2 stay under MIT. Running VTOP is unaffected;
+the AGPL's conditions apply when you distribute it or let users interact with a
+modified version over a network. Outside code contributions now need a signed
+contributor license agreement (see CONTRIBUTING.md).
+
 The theme is **the road to 1.0**: turn group commit on by default for the data
 node's quorum write (#752; it is wired and off until the A/B gates hold. On
 `main` after v0.11.1, the next group's local append and fsync overlap the

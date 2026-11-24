@@ -110,8 +110,8 @@ def test_the_products_table_states_licence_version_and_evidence_from_the_registr
         row = next(line for line in table.splitlines() if line.startswith(f"| {entry['name']} |"))
         assert f" {entry['licence']} " in row, row
         assert f"[licence]({entry['evidence_url']})" in row and entry["retrieved"] in row
-    assert registry.product(reg, "vtop")["licence"] == "MIT"
-    assert "VTOP's licence is MIT" in page
+    assert registry.product(reg, "vtop")["licence"] == "AGPL-3.0-only"
+    assert "VTOP's licence is AGPL-3.0-only" in page
 
 
 def test_a_product_that_may_not_be_published_is_never_listed(tmp_path):

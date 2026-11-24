@@ -7,10 +7,11 @@ IMPORTANT — READ BEFORE USING THIS SOFTWARE.
 
 This license governs ONLY the software in directories named `ee/` and in any
 file that carries the header "VTOP Engine Enterprise Edition" (together, the
-"EE Software"). Everything else in this repository is licensed under the MIT
-License in the file LICENSE, and nothing in this document alters, limits, or
-adds conditions to those MIT-licensed files. If a file is not EE Software, the
-MIT License is your entire license for it.
+"EE Software"). Everything else in this repository is licensed under the GNU
+Affero General Public License v3.0 only in the file LICENSE (AGPL-3.0-only;
+releases v0.11.2 and earlier: the MIT License), and nothing in this document
+alters, limits, or adds conditions to those files. If a file is not EE
+Software, that license is your entire license for it.
 
 1. DEFINITIONS
 
@@ -72,9 +73,9 @@ MIT License is your entire license for it.
 5. CONTRIBUTIONS
 
    Contributions to the EE Software are accepted only under a separate written
-   agreement with the Licensor. Contributions to the MIT-licensed portion of
-   this repository are governed by that MIT License and are not affected by
-   this document. See CONTRIBUTING.md.
+   agreement with the Licensor. Contributions to the rest of this repository
+   are governed by CONTRIBUTING.md and the license in the file LICENSE, and are
+   not affected by this document.
 
 6. TERM AND TERMINATION
 

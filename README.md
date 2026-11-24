@@ -12,7 +12,7 @@ has been verified.
 
 [![CI](https://github.com/allamiro/vtop-engine/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/allamiro/vtop-engine/actions/workflows/ci.yml?query=branch%3Amain)
 [![Release](https://img.shields.io/github/v/release/allamiro/vtop-engine?sort=semver)](https://github.com/allamiro/vtop-engine/releases)
-[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
+[![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org)
 [![Status: prototype](https://img.shields.io/badge/status-prototype-blue.svg)](#status-and-limits)
 
@@ -398,7 +398,7 @@ If you use VTOP Engine in research, please cite it. GitHub's **Cite this reposit
   year    = {2026},
   version = {0.11.1},
   url     = {https://github.com/allamiro/vtop-engine},
-  license = {MIT}
+  license = {AGPL-3.0-only}
 }
 ```
 
@@ -406,15 +406,18 @@ If you use VTOP Engine in research, please cite it. GitHub's **Cite this reposit
 
 ## License
 
-VTOP Engine is open source under the **[MIT License](LICENSE)**, © 2026 Tamir
-Suliman. All of the code in this repository is MIT.
+VTOP Engine is open source under the **[GNU Affero General Public License v3.0
+only](LICENSE)** (AGPL-3.0-only) from v0.12.0, © 2026 Tamir Suliman. Releases
+v0.1.0 through v0.11.2 were published under the MIT License, and those copies
+stay under MIT.
 
 | Edition | License | Use |
 |---|---|---|
-| **Core** (this repository) | [MIT](LICENSE) | Free for any use, including production and commercial use |
+| **Core** (this repository) | [AGPL-3.0-only](LICENSE) | Free for any use, including production and commercial use. If you modify it and offer it to others, including over a network, you must offer them your modified source under the same licence |
+| **Commercial license** | by agreement | For anyone who needs to use or embed VTOP without the AGPL's conditions |
 | **Enterprise Edition** (code under `ee/`, or marked `VTOP Engine Enterprise Edition`) | [LICENSE-EE](LICENSE-EE) | Free to evaluate, develop and test; production use needs a commercial subscription |
 
 Data safety is never part of the paid edition. Durability, fencing,
-replication, failover and verification stay in the MIT core, and the core
+replication, failover and verification stay in the open core, and the core
 builds and passes CI on its own. [COMMERCIAL.md](COMMERCIAL.md) sets out these
 rules and how to ask for commercial terms.
