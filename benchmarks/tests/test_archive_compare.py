@@ -586,12 +586,12 @@ def test_each_tools_commit_rule_setting_is_the_one_the_profile_names():
     assert "schemas.enable=false" in worker and "plugin.path=/opt/connectors" in worker
 
 
-def test_the_licence_recorded_for_vtop_is_mit():
+def test_the_licence_recorded_for_vtop_is_agpl():
     reg = registry.load()
-    assert registry.product(reg, "vtop")["licence"] == "MIT"
+    assert registry.product(reg, "vtop")["licence"] == "AGPL-3.0-only"
     for rel in ("benchmarks/archive_compare/README.md",):
         assert "Apache-2.0" not in re.findall(r"(?m)^.*VTOP.*Apache-2\.0.*$", _read(rel)), rel
-    assert re.search(r"VTOP[^\n]*\bMIT\b", _read("benchmarks/archive_compare/README.md"))
+    assert re.search(r"VTOP[^\n]*\bAGPL-3\.0-only\b", _read("benchmarks/archive_compare/README.md"))
 
 
 def test_the_archive_package_names_no_tooling_that_wrote_it():

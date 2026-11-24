@@ -107,7 +107,7 @@ def test_each_chart_s_source_tool_versions_and_licences_come_from_its_run_and_th
         assert "fixture" in row, row  # the version the run recorded, not the registry's pin
         assert f" {registry.product(reg, pid)['licence']} " in row
     vtop = next(line for line in products.splitlines() if line.startswith("| VTOP |"))
-    assert "commit 000000000000" in vtop and "MIT" in vtop
+    assert "commit 000000000000" in vtop and "AGPL-3.0-only" in vtop
 
 
 def test_the_output_is_deterministic(tmp_path):

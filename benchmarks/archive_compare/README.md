@@ -9,7 +9,7 @@ bucket checker's key rules, the three tools' configurations and the lab.
 
 | system | profile | what "committed" means, from its docs |
 |---|---|---|
-| VTOP (commit under test, MIT) Kafka source, `s3_native` | `strong` (default); `verify-off` (non-default, labelled: isolates the cost of verification, never run in a crash or fault cell) | the consumer offset is committed only after the batch is VERIFIED against the stored object; auto-commit is refused |
+| VTOP (commit under test, AGPL-3.0-only) Kafka source, `s3_native` | `strong` (default); `verify-off` (non-default, labelled: isolates the cost of verification, never run in a crash or fault cell) | the consumer offset is committed only after the batch is VERIFIED against the stored object; auto-commit is refused |
 | Vector 0.61.0 (MPL-2.0) `kafka` source, `aws_s3` sink | `acks` (sink acknowledgements, memory buffer, `when_full: block`) and `disk-buffer` | with acknowledgements the offset advances after the sink delivered the event; with a disk buffer once the event is in the buffer (synced every 500 ms) |
 | Kafka Connect S3 sink, Lenses Stream Reactor 12.1.2 (Apache-2.0), on the Connect runtime of `apache/kafka` 4.3.2 | `exactly-once` | `connect.s3.exactly.once.enable` (the documented default): the object is staged under `.temp-upload/`, copied to its final key under an ETag fence, and the offset moves only after the `.indexes/` entry is updated |
 
