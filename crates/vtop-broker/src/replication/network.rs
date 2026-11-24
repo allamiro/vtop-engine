@@ -7,7 +7,7 @@
 //! the gap is still covered; sealed-segment transfer remains deferred.
 
 use super::{InProcessFollower, ReplicaQuorumResult, ReplicaSet};
-use crate::memory_budget::{BudgetRejectReason, FollowerBudget, MemoryBudgetPool};
+use crate::memory_budget::{FollowerBudget, FollowerReservation, MemoryBudgetPool};
 use crate::BrokerResult;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
@@ -1298,6 +1298,46 @@ pub struct NetworkedReplicaSet {
     /// The leader every follower session reconciles against (#641); unset
     /// until [`Self::reconcile_followers_against`]. Shared with the drivers.
     lineage: LineageCell,
+    /// The lowest base offset this replica set was asked to replicate, or
+    /// [`NO_ROUND_YET`]; it bounds the mark each driver sends (#599, see
+    /// [`mark_cap`]). Shared with the drivers.
+    tenure_start: Arc<AtomicU64>,
+}
+
+/// `tenure_start` before the first round: no mark is capped.
+const NO_ROUND_YET: u64 = u64::MAX;
+
+/// The highest committed mark one follower may be sent (#599), or `None`
+/// for no bound: the start of this leader's tenure, or further where the
+/// follower has acked this leader's records.
+///
+/// A follower applies a mark as `min(mark, its own log)`, without looking at
+/// the bytes under it. A follower that held records the restarted leader
+/// lost, and took the leader's mark before the leader's append over them,
+/// put its own records under the mark; the append then conflicted below the
+/// mark, the truncation was refused, and the follower kept records no
+/// quorum acknowledged as committed. Below the tenure's first round are the
+/// records the leader recovered, which its followers took from the same
+/// appends; from there on, only what the follower acked as the leader's is
+/// covered. A follower that acks every append is sent every mark, one ack
+/// later at most.
+fn mark_cap(tenure_start: u64, agreed_through: u64) -> Option<u64> {
+    if tenure_start == NO_ROUND_YET {
+        None
+    } else {
+        Some(tenure_start.max(agreed_through))
+    }
+}
+
+/// `update`, lowered to `cap`.
+fn capped_mark(update: CommittedHwmUpdate, cap: Option<u64>) -> CommittedHwmUpdate {
+    match cap {
+        Some(cap) => CommittedHwmUpdate {
+            committed_high_watermark: update.committed_high_watermark.min(cap),
+            ..update
+        },
+        None => update,
+    }
 }
 
 /// Where a driver finds the leader it reconciles followers against (#641).
@@ -1489,6 +1529,7 @@ impl NetworkedReplicaSet {
         };
         let handle = runtime.handle();
         let lineage: LineageCell = Arc::new(LineageSource::default());
+        let tenure_start = Arc::new(AtomicU64::new(NO_ROUND_YET));
         let mut channels = Vec::with_capacity(followers.len());
         let mut shutdown = Vec::with_capacity(followers.len());
         for config in followers {
@@ -1508,6 +1549,7 @@ impl NetworkedReplicaSet {
             let channel = Arc::new(FollowerChannel {
                 node_id: config.node_id,
                 durable_offset: AtomicU64::new(0),
+                agreed_through: AtomicU64::new(0),
                 connected: AtomicBool::new(false),
                 below_catch_up_horizon: AtomicBool::new(false),
                 protocol: AtomicU16::new(0),
@@ -1526,6 +1568,7 @@ impl NetworkedReplicaSet {
                 hwm_rx,
                 stop_rx,
                 lineage: Arc::clone(&lineage),
+                tenure_start: Arc::clone(&tenure_start),
             };
             handle.spawn(driver.run());
             channels.push(channel);
@@ -1537,6 +1580,7 @@ impl NetworkedReplicaSet {
             flow,
             _shutdown: shutdown,
             lineage,
+            tenure_start,
         })
     }
 
@@ -1650,8 +1694,9 @@ impl ReplicaSet for NetworkedReplicaSet {
         requests: &[ReplicaAppendRequest],
         leader_committed_offset: u64,
     ) -> ReplicaQuorumResult {
-        self.runtime
-            .block_on(self.replicate_append_batch_async(requests, leader_committed_offset))
+        // Queued on every follower before anything is awaited (#599).
+        let queued = self.queue_round(requests, leader_committed_offset);
+        self.runtime.block_on(self.await_quorum(queued))
     }
 
     fn propagate_committed_hwm(&self, update: &CommittedHwmUpdate) {
@@ -1665,46 +1710,69 @@ impl ReplicaSet for NetworkedReplicaSet {
 }
 
 impl NetworkedReplicaSet {
-    async fn replicate_append_batch_async(
+    /// Put one round in every follower's queue, in the caller's order and
+    /// before anything is awaited (#599).
+    ///
+    /// The round used to be queued by a task per follower, and the quorum
+    /// wait aborted every task still running once a majority had acked. A
+    /// task the runtime had not yet polled never queued its round, so a
+    /// follower could miss it with nothing to say so, and two rounds could
+    /// reach a queue out of offset order. Queueing is synchronous, so it
+    /// happens here, and only the wait for each ack is left to cancel.
+    fn queue_round(
         &self,
         requests: &[ReplicaAppendRequest],
         leader_committed_offset: u64,
-    ) -> ReplicaQuorumResult {
-        let rf = self.replication_factor();
-        let majority_followers = super::write_quorum_followers(rf);
+    ) -> Vec<(Arc<FollowerChannel>, QueuedRound)> {
+        // Before the round is queued, so no mark published for it is sent
+        // uncapped (see `mark_cap`).
+        if let Some(base) = requests
+            .iter()
+            .map(|request| request.expected_base_offset)
+            .min()
+        {
+            self.tenure_start.fetch_min(base, Ordering::SeqCst);
+        }
         if self.followers.is_empty() {
-            return ReplicaQuorumResult {
-                follower_acks: 0,
-                replication_factor: rf,
-            };
+            return Vec::new();
         }
         let batch = Arc::new(requests.to_vec());
         let bytes = approx_batch_bytes(requests);
-        let mut set = JoinSet::new();
-        for follower in &self.followers {
-            let follower = Arc::clone(follower);
-            let batch = Arc::clone(&batch);
-            let ack_timeout = self.flow.ack_timeout;
-            set.spawn(async move {
+        self.followers
+            .iter()
+            .filter_map(|follower| {
                 follower
-                    .submit_and_wait(batch, leader_committed_offset, bytes, ack_timeout)
-                    .await
-            });
-        }
+                    .enqueue(Arc::clone(&batch), leader_committed_offset, bytes)
+                    .map(|round| (Arc::clone(follower), round))
+            })
+            .collect()
+    }
 
+    /// Wait for a majority of the queued rounds' acks. A follower whose
+    /// round could not be queued is a missed ack.
+    async fn await_quorum(
+        &self,
+        queued: Vec<(Arc<FollowerChannel>, QueuedRound)>,
+    ) -> ReplicaQuorumResult {
+        let rf = self.replication_factor();
+        let majority_followers = super::write_quorum_followers(rf);
+        let ack_timeout = self.flow.ack_timeout;
+        let mut set = JoinSet::new();
+        for (follower, round) in queued {
+            set.spawn(async move { round.acked(&follower, ack_timeout).await });
+        }
         let mut follower_acks = 0usize;
-        let mut finished = 0usize;
-        let total = self.followers.len();
         while let Some(joined) = set.join_next().await {
-            finished += 1;
             if let Ok(true) = joined {
                 follower_acks += 1;
             }
-            if follower_acks >= majority_followers || finished == total {
-                set.abort_all();
+            if follower_acks >= majority_followers {
                 break;
             }
         }
+        // Only the waits stop here. Each round is already in its follower's
+        // queue, and the driver sends it whether or not anyone still waits.
+        set.abort_all();
         ReplicaQuorumResult {
             follower_acks,
             replication_factor: rf,
@@ -1715,6 +1783,12 @@ impl NetworkedReplicaSet {
 struct FollowerChannel {
     node_id: Uuid,
     durable_offset: AtomicU64,
+    /// Through which offset this follower acked this leader's records: the
+    /// `leader_committed_offset` of a round it acked as covering, or the end
+    /// of a catch-up that began at or below its cap. Raised only, by the
+    /// driver; the mark this follower is sent stops here (#599, see
+    /// [`mark_cap`]).
+    agreed_through: AtomicU64,
     connected: AtomicBool,
     /// Set when the follower is durable only below this leader's log start,
     /// where no append can reach it (#881); cleared once a session catches
@@ -1731,22 +1805,16 @@ struct FollowerChannel {
 }
 
 impl FollowerChannel {
-    async fn submit_and_wait(
+    /// Queue one round for this follower's driver, without waiting. `None`
+    /// is a missed ack: the follower's inflight budget or its queue is full,
+    /// so a slow follower can neither grow memory nor stall the quorum.
+    fn enqueue(
         &self,
         requests: Arc<Vec<ReplicaAppendRequest>>,
         leader_committed_offset: u64,
         bytes: usize,
-        ack_timeout: Duration,
-    ) -> bool {
-        // Charge follower inflight budget before queueing. On reject, treat as
-        // a missed ack (explicit overload) so a slow follower cannot grow memory.
-        let reservation = match self.budget.try_reserve_inflight(bytes as u64) {
-            Ok(reservation) => reservation,
-            Err(BudgetRejectReason::ReplicaFollower | BudgetRejectReason::ProcessCeiling) => {
-                return false;
-            }
-            Err(_) => return false,
-        };
+    ) -> Option<QueuedRound> {
+        let reservation = self.budget.try_reserve_inflight(bytes as u64).ok()?;
         let (response_tx, response_rx) = oneshot::channel();
         let cmd = FollowerCmd::Replicate {
             requests,
@@ -1755,19 +1823,49 @@ impl FollowerChannel {
             response_tx,
             catch_up_charged: false,
         };
-        if self.cmd_tx.try_send(cmd).is_err() {
-            // Channel / window pressure: treat as a missed ack so a slow
-            // follower cannot stall the quorum wait. Reservation drops here.
-            drop(reservation);
-            return false;
-        }
-        // Driver owns the byte accounting via flow windows for the on-wire
-        // path; release the ledger reservation when the waiter completes.
+        // On a full queue the reservation is released with this return.
+        self.cmd_tx.try_send(cmd).ok()?;
+        Some(QueuedRound {
+            response_rx,
+            leader_committed_offset,
+            reservation,
+        })
+    }
+
+    /// The mark this follower may be sent now (#599).
+    fn mark_cap(&self, tenure_start: &AtomicU64) -> Option<u64> {
+        mark_cap(
+            tenure_start.load(Ordering::SeqCst),
+            self.agreed_through.load(Ordering::SeqCst),
+        )
+    }
+}
+
+/// A round in one follower's queue, and the wait for its ack. Dropping it
+/// (a quorum wait that stopped) leaves the round queued.
+struct QueuedRound {
+    response_rx: oneshot::Receiver<FollowerReplicateResult>,
+    leader_committed_offset: u64,
+    /// The follower's inflight charge, released when the wait ends: the
+    /// driver accounts the bytes on the wire through its flow windows.
+    reservation: FollowerReservation,
+}
+
+impl QueuedRound {
+    /// Whether `channel`'s follower acked the round through the leader's
+    /// commit point within `ack_timeout`.
+    async fn acked(self, channel: &FollowerChannel, ack_timeout: Duration) -> bool {
+        let QueuedRound {
+            response_rx,
+            leader_committed_offset,
+            reservation,
+        } = self;
         let acked = match timeout(ack_timeout, response_rx).await {
             Ok(Ok(FollowerReplicateResult::Acked {
                 local_committed_offset,
             })) => {
-                self.durable_offset
+                channel
+                    .durable_offset
                     .fetch_max(local_committed_offset, Ordering::SeqCst);
                 local_committed_offset >= leader_committed_offset
             }
@@ -1825,6 +1923,8 @@ struct FollowerDriver {
     hwm_rx: watch::Receiver<Option<CommittedHwmUpdate>>,
     stop_rx: mpsc::Receiver<()>,
     lineage: LineageCell,
+    /// The replica set's `tenure_start`, for this follower's mark cap.
+    tenure_start: Arc<AtomicU64>,
 }
 
 /// How a session opened, as far as reconciliation goes (#641).
@@ -1903,6 +2003,24 @@ impl FollowerDriver {
     /// mark, so the next session opens fenced.
     fn session_predates_lineage(&self, fence: SessionFence) -> bool {
         fence == SessionFence::NotRequired && self.connector.is_some() && self.lineage.attached()
+    }
+
+    /// The current mark, capped for this follower (#599, see [`mark_cap`]),
+    /// when it was published since the last pass or its cap moved it off the
+    /// one this session last sent (`sent`, as epoch and mark). Marks the
+    /// cell's value seen. A republished mark is sent again, as it always
+    /// was: a follower that refused it (an epoch it had not yet adopted)
+    /// gets another chance.
+    fn mark_due(&mut self, sent: Option<(u64, u64)>) -> Option<CommittedHwmUpdate> {
+        let published = self.hwm_rx.has_changed().unwrap_or(false);
+        // The guard is a temporary of this statement: no await can hold it.
+        let current = self.hwm_rx.borrow_and_update().clone()?;
+        let update = capped_mark(current, self.channel.mark_cap(&self.tenure_start));
+        if !published && sent == Some((update.fencing_epoch, update.committed_high_watermark)) {
+            None
+        } else {
+            Some(update)
+        }
     }
 
     /// Open the session with the fence a promotion probe sends (#641; see
@@ -2250,37 +2368,15 @@ impl FollowerDriver {
         }
         self.channel.connected.store(true, Ordering::SeqCst);
 
-        // Re-send the current mark on every fresh session. `changed()` only
-        // fires on NEW values, so a follower that was down when the last update
-        // was published would otherwise sit on a stale high-water mark until
-        // the next one happened to arrive — and on a quiet range that may be
-        // never.
-        // Guard scoped and dropped before any await: a `watch` borrow is a
-        // read guard, and holding one across an await makes the whole task
-        // non-Send.
-        let current_hwm = {
-            let guard = self.hwm_rx.borrow_and_update();
-            guard.clone()
-        };
-        if let Some(update) = current_hwm {
-            if self.session_predates_lineage(session_fence) {
-                return SessionOutcome::Disconnected;
-            }
-            let frame = WireFrame {
-                request_id: 0,
-                stream_id: 0,
-                message: Message::CommittedHwmUpdate(update),
-            };
-            if write_frame(&mut stream, &frame, REPLICA_LIMITS)
-                .await
-                .is_err()
-            {
-                return SessionOutcome::Disconnected;
-            }
-        }
-
         let mut inflight: HashMap<u64, Inflight> = HashMap::new();
         let mut inflight_bytes = 0usize;
+        // The mark this session last sent, as (epoch, mark). `None` on every
+        // fresh session, so the current mark is sent again: `changed()` only
+        // fires on NEW values, and a follower that was down when the last
+        // update was published would otherwise sit on a stale high-water
+        // mark until the next one happened to arrive, which on a quiet range
+        // may be never.
+        let mut mark_sent: Option<(u64, u64)> = None;
 
         loop {
             // Two reasons an open session ends before it writes anything,
@@ -2292,6 +2388,26 @@ impl FollowerDriver {
             if !self.still_admitted(peer) || self.session_predates_lineage(session_fence) {
                 requeue_inflight(pending, &mut inflight, retransmission);
                 return SessionOutcome::Disconnected;
+            }
+            // The mark, judged on every pass rather than when it is
+            // published (#599): it is capped at what this follower has acked
+            // of this leader's records, so a mark held back by the cap goes
+            // out on the pass after the ack that lifts it.
+            if let Some(update) = self.mark_due(mark_sent) {
+                let sent = (update.fencing_epoch, update.committed_high_watermark);
+                let frame = WireFrame {
+                    request_id: 0,
+                    stream_id: 0,
+                    message: Message::CommittedHwmUpdate(update),
+                };
+                if write_frame(&mut stream, &frame, REPLICA_LIMITS)
+                    .await
+                    .is_err()
+                {
+                    requeue_inflight(pending, &mut inflight, retransmission);
+                    return SessionOutcome::Disconnected;
+                }
+                mark_sent = Some(sent);
             }
             // Drain pending catch-up / deferred replicates while the window allows.
             while can_send(&inflight, inflight_bytes, &self.flow) {
@@ -2379,7 +2495,10 @@ impl FollowerDriver {
                 }
                 // A new high-water mark. `changed()` yields once per update and
                 // always exposes the newest value, so a burst collapses to a
-                // single frame instead of a queue that can overflow.
+                // single frame instead of a queue that can overflow. This arm
+                // only wakes the loop: its top sends the mark, capped (#599),
+                // after the checks every write passes there (#634, #641), and
+                // marks it seen there, so this arm does not fire again for it.
                 changed = self.hwm_rx.changed() => {
                     if changed.is_err() {
                         // Every sender is gone, which means the replica set is
@@ -2387,30 +2506,6 @@ impl FollowerDriver {
                         // lifecycle, so let that arm decide; this one simply
                         // stops producing.
                         std::future::pending::<()>().await;
-                    }
-                    let update = {
-                        let guard = self.hwm_rx.borrow_and_update();
-                        guard.clone()
-                    };
-                    if let Some(update) = update {
-                        // The mark stays in the cell; the next session,
-                        // fenced, sends it first thing (#641). A peer the
-                        // level no longer admits gets no mark at all (#634).
-                        if !self.still_admitted(peer)
-                            || self.session_predates_lineage(session_fence)
-                        {
-                            requeue_inflight(pending, &mut inflight, retransmission);
-                            return SessionOutcome::Disconnected;
-                        }
-                        let frame = WireFrame {
-                            request_id: 0,
-                            stream_id: 0,
-                            message: Message::CommittedHwmUpdate(update),
-                        };
-                        if write_frame(&mut stream, &frame, REPLICA_LIMITS).await.is_err() {
-                            requeue_inflight(pending, &mut inflight, retransmission);
-                            return SessionOutcome::Disconnected;
-                        }
                     }
                 }
                 cmd = self.cmd_rx.recv() => {
@@ -2636,6 +2731,12 @@ impl FollowerDriver {
             let end = appends.last().map_or(from, |last| {
                 last.expected_base_offset + last.records.len() as u64
             });
+            // Judged before the frame goes: whether the follower's log below
+            // `from` is already agreed with this leader's (#599).
+            let agreed_below = self
+                .channel
+                .mark_cap(&self.tenure_start)
+                .is_none_or(|cap| from <= cap);
             let outcome = self.send_catch_up(stream, next_request_id, appends).await;
             self.budget.release_catch_up(bytes as u64);
             let durable = outcome?;
@@ -2646,6 +2747,15 @@ impl FollowerDriver {
                 // Acked short of what was sent: the follower is not taking
                 // these, and resending them would only spin.
                 return Err(SessionOutcome::Disconnected);
+            }
+            // The follower holds this leader's records through `end`, and
+            // its mark may reach that far (#599) - unless the catch-up began
+            // above its cap. It began where the follower said it was, and
+            // records it holds between its cap and there may be ones no
+            // quorum acknowledged, which a round queued behind this catch-up
+            // has yet to replace.
+            if agreed_below {
+                self.channel.agreed_through.fetch_max(end, Ordering::SeqCst);
             }
             from = durable;
         }
@@ -2861,6 +2971,15 @@ fn handle_response(
             channel
                 .durable_offset
                 .fetch_max(local_committed_offset, Ordering::SeqCst);
+            // Acked as covering the round: the follower holds this leader's
+            // records through the round's commit point, so its mark may
+            // reach that far (#599). Here, not in the round's waiter, which
+            // a quorum met elsewhere cancels and a retransmission never had.
+            if local_committed_offset >= entry.leader_committed_offset {
+                channel
+                    .agreed_through
+                    .fetch_max(entry.leader_committed_offset, Ordering::SeqCst);
+            }
             let _ = entry.response_tx.send(FollowerReplicateResult::Acked {
                 local_committed_offset,
             });
@@ -3918,6 +4037,170 @@ mod tests {
             leader_committed_offset: base_offset + 1,
             bytes,
         }
+    }
+
+    /// A follower's channel with no driver: the test holds its queue.
+    fn test_channel() -> (FollowerChannel, mpsc::Receiver<FollowerCmd>) {
+        let (_pool, budget) = test_budget();
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        let (hwm_tx, _hwm_rx) = watch::channel(None);
+        let channel = FollowerChannel {
+            node_id: Uuid::from_u128(0xA2),
+            durable_offset: AtomicU64::new(0),
+            agreed_through: AtomicU64::new(0),
+            connected: AtomicBool::new(false),
+            below_catch_up_horizon: AtomicBool::new(false),
+            protocol: AtomicU16::new(0),
+            cmd_tx,
+            hwm_tx,
+            budget,
+        };
+        (channel, cmd_rx)
+    }
+
+    /// #599: a round is in every follower's queue once the enqueue returns,
+    /// with nothing awaited, and a wait the quorum cancels leaves it there.
+    /// Before, each follower's round was queued by a task, and the quorum
+    /// aborted the tasks still running: a task not yet polled never queued
+    /// its round, and that follower never got it.
+    #[tokio::test]
+    async fn a_round_is_queued_on_every_follower_before_any_wait_and_a_cancelled_wait_keeps_it() {
+        let (first, mut first_queue) = test_channel();
+        let (second, mut second_queue) = test_channel();
+        let (first, second) = (Arc::new(first), Arc::new(second));
+        let batch = test_batch(5, 100);
+        let first_round = first
+            .enqueue(Arc::clone(&batch.requests), 6, 100)
+            .expect("the first follower's queue has room");
+        let second_round = second
+            .enqueue(Arc::clone(&batch.requests), 6, 100)
+            .expect("the second follower's queue has room");
+
+        // No await since the enqueue: the round is already queued.
+        let Ok(FollowerCmd::Replicate {
+            leader_committed_offset,
+            response_tx,
+            ..
+        }) = first_queue.try_recv()
+        else {
+            panic!("the first follower's round must be queued when the enqueue returns");
+        };
+        assert_eq!(leader_committed_offset, 6);
+
+        // The quorum wait: the second follower's wait is cancelled, as a
+        // quorum met by the first cancels it.
+        let first_wait = tokio::spawn({
+            let channel = Arc::clone(&first);
+            async move { first_round.acked(&channel, Duration::from_secs(10)).await }
+        });
+        let second_wait = tokio::spawn({
+            let channel = Arc::clone(&second);
+            async move { second_round.acked(&channel, Duration::from_secs(10)).await }
+        });
+        second_wait.abort();
+        assert!(second_wait
+            .await
+            .expect_err("the cancelled wait cannot have ended on its own")
+            .is_cancelled());
+        let Ok(FollowerCmd::Replicate {
+            leader_committed_offset,
+            ..
+        }) = second_queue.try_recv()
+        else {
+            panic!("a cancelled wait must leave its round in the follower's queue");
+        };
+        assert_eq!(leader_committed_offset, 6);
+        assert_eq!(
+            second.budget.inflight_used_bytes(),
+            0,
+            "the cancelled wait released its inflight charge"
+        );
+
+        // The first follower's ack still reaches its wait.
+        assert!(
+            response_tx
+                .send(FollowerReplicateResult::Acked {
+                    local_committed_offset: 6,
+                })
+                .is_ok(),
+            "the first wait is still listening"
+        );
+        assert!(first_wait.await.unwrap());
+        assert_eq!(first.durable_offset.load(Ordering::SeqCst), 6);
+        assert_eq!(first.budget.inflight_used_bytes(), 0);
+    }
+
+    /// #599: the mark a follower is sent stops at what it acked of this
+    /// leader's records. Unbounded before the replica set replicates
+    /// anything; at the tenure's first base offset before an ack; at a
+    /// round's commit point once the follower acks it as covering.
+    #[test]
+    fn a_followers_mark_stops_where_it_acked_this_leaders_records() {
+        let (channel, _queue) = test_channel();
+        let tenure_start = AtomicU64::new(NO_ROUND_YET);
+        let mark = |committed_high_watermark| CommittedHwmUpdate {
+            range: test_batch(0, 1).requests[0].range.clone(),
+            fencing_epoch: 1,
+            committed_high_watermark,
+        };
+        assert_eq!(channel.mark_cap(&tenure_start), None);
+        assert_eq!(
+            capped_mark(mark(6), channel.mark_cap(&tenure_start)).committed_high_watermark,
+            6,
+            "no round replicated yet: the mark goes as it was published"
+        );
+
+        // A round at base 5, nothing acked.
+        tenure_start.fetch_min(5, Ordering::SeqCst);
+        assert_eq!(channel.mark_cap(&tenure_start), Some(5));
+        assert_eq!(
+            capped_mark(mark(6), channel.mark_cap(&tenure_start)).committed_high_watermark,
+            5,
+            "a mark over a round the follower has not acked stops at the round's base"
+        );
+
+        let ack = |inflight: &mut HashMap<u64, Inflight>, local_committed_offset| {
+            let batch = test_batch(5, 100);
+            inflight.insert(
+                7,
+                Inflight {
+                    requests: batch.requests,
+                    leader_committed_offset: batch.leader_committed_offset,
+                    bytes: batch.bytes,
+                    response_tx: oneshot::channel().0,
+                },
+            );
+            let mut inflight_bytes = batch.bytes;
+            let outcome = handle_response(
+                WireFrame {
+                    request_id: 7,
+                    stream_id: 0,
+                    message: Message::ReplicaAppendResponse(ReplicaAppendResponse {
+                        local_committed_offset,
+                    }),
+                },
+                inflight,
+                &mut inflight_bytes,
+                &channel,
+            );
+            assert!(outcome == ResponseOutcome::Continue);
+        };
+        let mut inflight = HashMap::new();
+        // Acked short of the round's commit point (6): nothing agreed.
+        ack(&mut inflight, 5);
+        assert_eq!(channel.mark_cap(&tenure_start), Some(5));
+        // Acked through it.
+        ack(&mut inflight, 6);
+        assert_eq!(channel.mark_cap(&tenure_start), Some(6));
+        assert_eq!(
+            capped_mark(mark(6), channel.mark_cap(&tenure_start)).committed_high_watermark,
+            6
+        );
+        assert_eq!(
+            capped_mark(mark(9), channel.mark_cap(&tenure_start)).committed_high_watermark,
+            6,
+            "a later mark waits for the follower's ack of the records under it"
+        );
     }
 
     #[test]
