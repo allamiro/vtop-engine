@@ -1,0 +1,4 @@
+verify_done records=475000 next_offset=475000 gaps=0 high_watermark=475000
+
+--- stderr ---
+2026-11-23T07:45:17.808130Z  INFO vtop_observe::otel: OpenTelemetry export disabled (OTEL_EXPORTER_OTLP_ENDPOINT unset)

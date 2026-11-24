@@ -1,0 +1,66 @@
+2026-11-23T07:48:34.555232944Z meta_node_ready id=3 peer=0.0.0.0:9100 admin=0.0.0.0:9200 metrics=0.0.0.0:9600
+2026-11-23T07:48:34.560298059Z data_node_ready role=candidate node=aaaaaaaa-0000-0000-0000-0000000000a3 native=0.0.0.0:9400 replica=0.0.0.0:9300 metrics=0.0.0.0:9600
+2026-11-23T07:49:36.353127901Z data_node_role_changed role=leader node=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2
+2026-11-23T07:48:34.525252841Z 2026-11-23T07:48:34.524741Z  INFO vtop_observe::server: observability endpoint listening (/metrics, /healthz, /readyz) bound=0.0.0.0:9600 transport="plaintext"
+2026-11-23T07:48:34.555097316Z 2026-11-23T07:48:34.554995Z  INFO openraft::engine::engine_impl: startup begin: state: RaftState { vote: UTime { data: Vote { leader_id: LeaderId { term: 0, voted_for: None }, committed: false }, utime: Some(Instant { tv_sec: 1133, tv_nsec: 471467843 }) }, committed: None, purged_next: 0, log_ids: LogIdList { key_log_ids: [] }, membership_state: MembershipState { committed: EffectiveMembership { log_id: None, membership: Membership { configs: [], nodes: {} }, voter_ids: {} }, effective: EffectiveMembership { log_id: None, membership: Membership { configs: [], nodes: {} }, voter_ids: {} } }, snapshot_meta: SnapshotMeta { last_log_id: None, last_membership: StoredMembership { log_id: None, membership: Membership { configs: [], nodes: {} } }, snapshot_id: "" }, server_state: Learner, accepted: Accepted { leader_id: LeaderId { term: 0, voted_for: None }, log_id: None }, io_state: IOState { building_snapshot: false, vote: Vote { leader_id: LeaderId { term: 0, voted_for: None }, committed: false }, flushed: LogIOId { committed_leader_id: CommittedLeaderId { term: 0, p: PhantomData<u64> }, log_id: None }, applied: None, snapshot: None, purged: None }, purge_upto: None }, is_leader: false, is_voter: false
+2026-11-23T07:48:34.555133317Z warning: admin endpoint 0.0.0.0:9200 is authenticated but NOT authorized: any client holding a certificate signed by this CA — including every data node — may change cluster membership and grant range leases. Set `admin_authorization` to restrict cluster-scoped commands to named operator CNs.
+2026-11-23T07:48:34.560324361Z 2026-11-23T07:48:34.560264Z  INFO vtop_node::lease_agent: lease agent running range=aaaaaaaa-0000-0000-0000-0000000000c1 node=aaaaaaaa-0000-0000-0000-0000000000a3
+2026-11-23T07:48:34.567306740Z 2026-11-23T07:48:34.567246Z  WARN vtop_node::lease_agent: lease agent round failed; retrying error=read range lease: 172.18.0.3:9200 is not the metadata leader; and knows of no leader range=aaaaaaaa-0000-0000-0000-0000000000c1
+2026-11-23T07:48:34.568783771Z warning: node aaaaaaaa-0000-0000-0000-0000000000a3: version report failed: 172.18.0.3:9200 is not the metadata leader; and knows of no leader
+2026-11-23T07:48:35.424966627Z 2026-11-23T07:48:35.424916Z  INFO openraft::engine::engine_impl: now; 07:48:35.424909, vote is updated at: 07:48:34.554945, vote is updated before 869.963865ms, leader lease(600ms) will expire after 0ns
+2026-11-23T07:48:35.433705198Z 2026-11-23T07:48:35.433605Z  WARN openraft::core::raft_core: A message will be ignored because vote changed: msg sent by vote: T2-N1:uncommitted; current my vote: None; when (VoteResponse)
+2026-11-23T07:48:35.457770127Z 2026-11-23T07:48:35.457651Z  WARN openraft::core::raft_core: A message will be ignored because vote changed: msg sent by vote: T2-N1:committed; current my vote: None; when (VoteResponse)
+2026-11-23T07:48:36.587647552Z 2026-11-23T07:48:36.587501Z  WARN vtop_node::lease_agent: lease acquisition refused range=aaaaaaaa-0000-0000-0000-0000000000c1 expected_range_generation=0 reason=record not found
+2026-11-23T07:48:44.585230348Z node aaaaaaaa-0000-0000-0000-0000000000a3: metadata is below feature level 7, so this node cannot report its release yet; it keeps asking (#634)
+2026-11-23T07:49:17.794355444Z 2026-11-23T07:49:17.794285Z  INFO openraft::engine::engine_impl: now; 07:49:17.794277, vote is updated at: 07:49:16.856590, vote is updated before 937.68633ms, leader lease(600ms) will expire after 0ns
+2026-11-23T07:49:17.799618639Z 2026-11-23T07:49:17.799488Z  WARN openraft::core::raft_core: A message will be ignored because vote changed: msg sent by vote: T3-N2:uncommitted; current my vote: None; when (VoteResponse)
+2026-11-23T07:49:17.817525736Z 2026-11-23T07:49:17.817394Z  WARN openraft::core::raft_core: A message will be ignored because vote changed: msg sent by vote: T3-N2:committed; current my vote: None; when (VoteResponse)
+2026-11-23T07:49:30.720648592Z 2026-11-23T07:49:30.720591Z  WARN vtop_node::lease_agent: replica could not be fenced; excluded from the promotion quorum follower=aaaaaaaa-0000-0000-0000-0000000000a2 fencing_epoch=2 error=invalid broker configuration: replica refused the fence: Fenced this replica has not observed a grant for epoch 2; its metadata view is at 1. Retry once it catches up — a replica must not fence itself on a caller's word alone
+2026-11-23T07:49:33.210569494Z 2026-11-23T07:49:33.210402Z  WARN vtop_node::lease_agent: replica could not be fenced; excluded from the promotion quorum follower=aaaaaaaa-0000-0000-0000-0000000000a1 fencing_epoch=2 error=no answer within the probe's 2.490852541s (lookup and fence together)
+2026-11-23T07:49:33.210598936Z 2026-11-23T07:49:33.210434Z  WARN vtop_node::lease_agent: refusing promotion: too few replicas could confirm the committed boundary range=aaaaaaaa-0000-0000-0000-0000000000c1 fencing_epoch=2 reason="quorum_unavailable" answered=1 required=2 unproven=0 candidate_unproven=false
+2026-11-23T07:49:33.223985911Z 2026-11-23T07:49:33.223884Z  INFO vtop_node::lease_agent: promotion outcome recorded against the epoch's transition range=aaaaaaaa-0000-0000-0000-0000000000c1 fencing_epoch=2 attempt=1
+2026-11-23T07:49:35.795457936Z 2026-11-23T07:49:35.795306Z  INFO vtop_node::lease_agent: verified promotion: committed boundary established by quorum range=aaaaaaaa-0000-0000-0000-0000000000c1 fencing_epoch=2 committed_offset=143200 replicas=2 uncounted_unknown_lineage=0 attested=false
+2026-11-23T07:49:35.795905336Z 2026-11-23T07:49:35.795849Z  WARN vtop_node::lease_agent: metadata does not record lineage verdicts yet (feature level below 6); recording this promotion without them, and without the answers whose lineage was unknown range=aaaaaaaa-0000-0000-0000-0000000000c1 fencing_epoch=2 error=this command needs metadata feature level 6 and the cluster runs at 3; finish upgrading every metadata voter, then raise the level (vtopctl meta enable-features --level 6)
+2026-11-23T07:49:35.809143975Z 2026-11-23T07:49:35.809038Z  INFO vtop_node::lease_agent: promotion outcome recorded against the epoch's transition range=aaaaaaaa-0000-0000-0000-0000000000c1 fencing_epoch=2 attempt=2
+2026-11-23T07:49:35.809170452Z 2026-11-23T07:49:35.809071Z  INFO vtop_node::lease_agent: range lease held range=aaaaaaaa-0000-0000-0000-0000000000c1 fencing_epoch=2
+--- tail ---
+2026-11-23T07:51:21.069390856Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:21.327087657Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:21.584236466Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:21.841657876Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:22.099262844Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:22.357242110Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:22.614238693Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:22.871282373Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:23.127898517Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:23.385673949Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:23.643300909Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:23.901999028Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:24.159277944Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:24.417429673Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:24.675576098Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:24.933454327Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:25.191390845Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:25.450337393Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:25.707928507Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:25.965203317Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:26.222724018Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:26.481145021Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:26.737175538Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:26.996232090Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:27.253253844Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:27.509625847Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:27.767829995Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:28.024387004Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:28.287096109Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:28.545431317Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:28.802165964Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:29.058783548Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:29.315575090Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:29.583396644Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:29.842233706Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:30.100282034Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:30.359215503Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:30.616548791Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:30.875428264Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution
+2026-11-23T07:51:31.132891291Z could not resolve replica peer "vtop-1:9300": failed to lookup address information: Temporary failure in name resolution

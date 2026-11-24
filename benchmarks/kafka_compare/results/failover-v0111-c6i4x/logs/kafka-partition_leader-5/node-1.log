@@ -1,0 +1,141 @@
+2026-11-23T08:56:35.397745457Z ===> Setting default values of environment variables if not already set.
+2026-11-23T08:56:37.645155458Z [2026-11-23 08:56:37,644] INFO [RaftManager id=1] Starting request manager with static voters: [kafka-1:9093 (id: 1 rack: null isFenced: false), kafka-2:9093 (id: 2 rack: null isFenced: false), kafka-3:9093 (id: 3 rack: null isFenced: false)] (org.apache.kafka.raft.KafkaRaftClient)
+2026-11-23T08:56:37.646719073Z [2026-11-23 08:56:37,646] INFO [RaftManager id=1] Attempting durable transition to UnattachedState(epoch=0, leaderId=OptionalInt.empty, votedKey=Optional.empty, voters=[1, 2, 3], electionTimeoutMs=1267, highWatermark=Optional.empty) from null (org.apache.kafka.raft.QuorumState)
+2026-11-23T08:56:37.657531759Z [2026-11-23 08:56:37,657] INFO [RaftManager id=1] Completed transition to UnattachedState(epoch=0, leaderId=OptionalInt.empty, votedKey=Optional.empty, voters=[1, 2, 3], electionTimeoutMs=1267, highWatermark=Optional.empty) from null (org.apache.kafka.raft.QuorumState)
+2026-11-23T08:56:37.668799582Z [2026-11-23 08:56:37,668] WARN [RaftManager id=1] Connection to node 2 (kafka-2/172.18.0.4:9093) could not be established. Node may not be available. (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:56:37.672551930Z [2026-11-23 08:56:37,672] WARN [RaftManager id=1] Connection to node 1 (kafka-1/172.18.0.3:9093) could not be established. Node may not be available. (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:56:37.673556465Z [2026-11-23 08:56:37,673] WARN [RaftManager id=1] Connection to node 3 (kafka-3/172.18.0.2:9093) could not be established. Node may not be available. (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:56:37.828689643Z [2026-11-23 08:56:37,828] WARN [RaftManager id=1] Connection to node 2 (kafka-2/172.18.0.4:9093) could not be established. Node may not be available. (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:56:38.917667066Z [2026-11-23 08:56:38,917] INFO [RaftManager id=1] Completed transition to ProspectiveState(epoch=0, leaderId=OptionalInt.empty, votedKey=Optional.empty, epochElection=EpochElection[voterStates={1=VoterState(replicaKey=ReplicaKey(id=1, directoryId=<undefined>), state=GRANTED), 2=VoterState(replicaKey=ReplicaKey(id=2, directoryId=<undefined>), state=UNRECORDED), 3=VoterState(replicaKey=ReplicaKey(id=3, directoryId=<undefined>), state=UNRECORDED)}], electionTimeoutMs=1175, highWatermark=Optional.empty) from UnattachedState(epoch=0, leaderId=OptionalInt.empty, votedKey=Optional.empty, voters=[1, 2, 3], electionTimeoutMs=1267, highWatermark=Optional.empty) (org.apache.kafka.raft.QuorumState)
+2026-11-23T08:56:38.930519328Z [2026-11-23 08:56:38,930] INFO [RaftManager id=1] Attempting durable transition to CandidateState(localId=1, localDirectoryId=3MZQ-KMDZNozqbYAEpZ2Zw, epoch=1, epochElection=EpochElection[voterStates={1=VoterState(replicaKey=ReplicaKey(id=1, directoryId=<undefined>), state=GRANTED), 2=VoterState(replicaKey=ReplicaKey(id=2, directoryId=<undefined>), state=UNRECORDED), 3=VoterState(replicaKey=ReplicaKey(id=3, directoryId=<undefined>), state=UNRECORDED)}], highWatermark=Optional.empty, electionTimeoutMs=1486) from ProspectiveState(epoch=0, leaderId=OptionalInt.empty, votedKey=Optional.empty, epochElection=EpochElection[voterStates={1=VoterState(replicaKey=ReplicaKey(id=1, directoryId=<undefined>), state=GRANTED), 2=VoterState(replicaKey=ReplicaKey(id=2, directoryId=<undefined>), state=GRANTED), 3=VoterState(replicaKey=ReplicaKey(id=3, directoryId=<undefined>), state=UNRECORDED)}], electionTimeoutMs=1175, highWatermark=Optional.empty) (org.apache.kafka.raft.QuorumState)
+2026-11-23T08:56:38.937281123Z [2026-11-23 08:56:38,937] INFO [RaftManager id=1] Completed transition to CandidateState(localId=1, localDirectoryId=3MZQ-KMDZNozqbYAEpZ2Zw, epoch=1, epochElection=EpochElection[voterStates={1=VoterState(replicaKey=ReplicaKey(id=1, directoryId=<undefined>), state=GRANTED), 2=VoterState(replicaKey=ReplicaKey(id=2, directoryId=<undefined>), state=UNRECORDED), 3=VoterState(replicaKey=ReplicaKey(id=3, directoryId=<undefined>), state=UNRECORDED)}], highWatermark=Optional.empty, electionTimeoutMs=1486) from ProspectiveState(epoch=0, leaderId=OptionalInt.empty, votedKey=Optional.empty, epochElection=EpochElection[voterStates={1=VoterState(replicaKey=ReplicaKey(id=1, directoryId=<undefined>), state=GRANTED), 2=VoterState(replicaKey=ReplicaKey(id=2, directoryId=<undefined>), state=GRANTED), 3=VoterState(replicaKey=ReplicaKey(id=3, directoryId=<undefined>), state=UNRECORDED)}], electionTimeoutMs=1175, highWatermark=Optional.empty) (org.apache.kafka.raft.QuorumState)
+2026-11-23T08:56:38.958458424Z [2026-11-23 08:56:38,958] INFO [RaftManager id=1] Attempting durable transition to Leader(localVoterNode=VoterNode(voterKey=ReplicaKey(id=1, directoryId=3MZQ-KMDZNozqbYAEpZ2Zw), listeners=Endpoints(endpoints={ListenerName(CONTROLLER)=kafka-1/<unresolved>:9093}), supportedKRaftVersion=SupportedVersionRange[min_version:0, max_version:1]), epoch=1, epochStartOffset=0, highWatermark=Optional.empty, voterStates={1=ReplicaState(replicaKey=ReplicaKey(id=1, directoryId=<undefined>), endOffset=Optional.empty, lastFetchTimestamp=-1, lastCaughtUpTimestamp=-1, hasAcknowledgedLeader=true), 2=ReplicaState(replicaKey=ReplicaKey(id=2, directoryId=<undefined>), endOffset=Optional.empty, lastFetchTimestamp=-1, lastCaughtUpTimestamp=-1, hasAcknowledgedLeader=false), 3=ReplicaState(replicaKey=ReplicaKey(id=3, directoryId=<undefined>), endOffset=Optional.empty, lastFetchTimestamp=-1, lastCaughtUpTimestamp=-1, hasAcknowledgedLeader=false)}) from CandidateState(localId=1, localDirectoryId=3MZQ-KMDZNozqbYAEpZ2Zw, epoch=1, epochElection=EpochElection[voterStates={1=VoterState(replicaKey=ReplicaKey(id=1, directoryId=<undefined>), state=GRANTED), 2=VoterState(replicaKey=ReplicaKey(id=2, directoryId=<undefined>), state=UNRECORDED), 3=VoterState(replicaKey=ReplicaKey(id=3, directoryId=<undefined>), state=GRANTED)}], highWatermark=Optional.empty, electionTimeoutMs=1486) (org.apache.kafka.raft.QuorumState)
+2026-11-23T08:56:38.964368998Z [2026-11-23 08:56:38,964] INFO [RaftManager id=1] Completed transition to Leader(localVoterNode=VoterNode(voterKey=ReplicaKey(id=1, directoryId=3MZQ-KMDZNozqbYAEpZ2Zw), listeners=Endpoints(endpoints={ListenerName(CONTROLLER)=kafka-1/<unresolved>:9093}), supportedKRaftVersion=SupportedVersionRange[min_version:0, max_version:1]), epoch=1, epochStartOffset=0, highWatermark=Optional.empty, voterStates={1=ReplicaState(replicaKey=ReplicaKey(id=1, directoryId=<undefined>), endOffset=Optional.empty, lastFetchTimestamp=-1, lastCaughtUpTimestamp=-1, hasAcknowledgedLeader=true), 2=ReplicaState(replicaKey=ReplicaKey(id=2, directoryId=<undefined>), endOffset=Optional.empty, lastFetchTimestamp=-1, lastCaughtUpTimestamp=-1, hasAcknowledgedLeader=false), 3=ReplicaState(replicaKey=ReplicaKey(id=3, directoryId=<undefined>), endOffset=Optional.empty, lastFetchTimestamp=-1, lastCaughtUpTimestamp=-1, hasAcknowledgedLeader=false)}) from CandidateState(localId=1, localDirectoryId=3MZQ-KMDZNozqbYAEpZ2Zw, epoch=1, epochElection=EpochElection[voterStates={1=VoterState(replicaKey=ReplicaKey(id=1, directoryId=<undefined>), state=GRANTED), 2=VoterState(replicaKey=ReplicaKey(id=2, directoryId=<undefined>), state=UNRECORDED), 3=VoterState(replicaKey=ReplicaKey(id=3, directoryId=<undefined>), state=GRANTED)}], highWatermark=Optional.empty, electionTimeoutMs=1486) (org.apache.kafka.raft.QuorumState)
+2026-11-23T08:56:39.008414318Z [2026-11-23 08:56:39,008] INFO Recorded new KRaft controller, from now on will use node kafka-1:9093 (id: 1 rack: null isFenced: false) (org.apache.kafka.server.NodeToControllerRequestThread)
+2026-11-23T08:56:39.013166206Z [2026-11-23 08:56:39,012] INFO Recorded new KRaft controller, from now on will use node kafka-1:9093 (id: 1 rack: null isFenced: false) (org.apache.kafka.server.NodeToControllerRequestThread)
+2026-11-23T08:56:39.035951883Z [2026-11-23 08:56:39,035] INFO [RaftManager id=1] High watermark set to LogOffsetMetadata(offset=1, metadata=Optional[(segmentBaseOffset=0,relativePositionInSegment=106)]) for the first time for epoch 1 based on indexOfHw 1 and voters [ReplicaState(replicaKey=ReplicaKey(id=1, directoryId=<undefined>), endOffset=Optional[LogOffsetMetadata(offset=1, metadata=Optional[(segmentBaseOffset=0,relativePositionInSegment=106)])], lastFetchTimestamp=-1, lastCaughtUpTimestamp=-1, hasAcknowledgedLeader=true), ReplicaState(replicaKey=ReplicaKey(id=2, directoryId=<undefined>), endOffset=Optional[LogOffsetMetadata(offset=1, metadata=Optional[(segmentBaseOffset=0,relativePositionInSegment=106)])], lastFetchTimestamp=1795424199031, lastCaughtUpTimestamp=1795424199031, hasAcknowledgedLeader=true), ReplicaState(replicaKey=ReplicaKey(id=3, directoryId=<undefined>), endOffset=Optional[LogOffsetMetadata(offset=0, metadata=Optional[(segmentBaseOffset=0,relativePositionInSegment=0)])], lastFetchTimestamp=1795424199009, lastCaughtUpTimestamp=-1, hasAcknowledgedLeader=true)] (org.apache.kafka.raft.LeaderState)
+2026-11-23T08:56:39.043400471Z [2026-11-23 08:56:39,043] INFO Recorded new KRaft controller, from now on will use node kafka-1:9093 (id: 1 rack: null isFenced: false) (org.apache.kafka.server.NodeToControllerRequestThread)
+2026-11-23T08:56:39.043617814Z [2026-11-23 08:56:39,043] INFO Recorded new KRaft controller, from now on will use node kafka-1:9093 (id: 1 rack: null isFenced: false) (org.apache.kafka.server.NodeToControllerRequestThread)
+2026-11-23T08:56:39.068769163Z [2026-11-23 08:56:39,068] INFO Recorded new KRaft controller, from now on will use node kafka-1:9093 (id: 1 rack: null isFenced: false) (org.apache.kafka.server.NodeToControllerRequestThread)
+2026-11-23T08:56:39.102270545Z [2026-11-23 08:56:39,102] INFO [ControllerServer id=1] Loaded new metadata FinalizedFeatures[metadataVersion=4.3-IV0, finalizedFeatures={group.version=1, streams.version=1, transaction.version=2, eligible.leader.replicas.version=1, share.version=1, metadata.version=30}, finalizedFeaturesEpoch=10]. (org.apache.kafka.metadata.publisher.FeaturesPublisher)
+2026-11-23T08:56:39.105878186Z [2026-11-23 08:56:39,105] INFO [ControllerRegistrationManager id=1 incarnation=wjnzyoxrQLaqhga5GumYrQ] sendControllerRegistration: attempting to send ControllerRegistrationRequestData(controllerId=1, incarnationId=wjnzyoxrQLaqhga5GumYrQ, zkMigrationReady=false, listeners=[Listener(name='CONTROLLER', host='kafka-1', port=9093, securityProtocol=0)], features=[Feature(name='group.version', minSupportedVersion=0, maxSupportedVersion=1), Feature(name='kraft.version', minSupportedVersion=0, maxSupportedVersion=1), Feature(name='metadata.version', minSupportedVersion=7, maxSupportedVersion=30), Feature(name='share.version', minSupportedVersion=0, maxSupportedVersion=1), Feature(name='streams.version', minSupportedVersion=0, maxSupportedVersion=1), Feature(name='transaction.version', minSupportedVersion=0, maxSupportedVersion=2), Feature(name='eligible.leader.replicas.version', minSupportedVersion=0, maxSupportedVersion=1)]) (kafka.server.ControllerRegistrationManager)
+2026-11-23T08:56:39.112452880Z 	auto.leader.rebalance.enable = true
+2026-11-23T08:56:39.112503192Z 	controlled.shutdown.enable = true
+2026-11-23T08:56:39.112516187Z 	controller.quorum.election.backoff.max.ms = 1000
+2026-11-23T08:56:39.112517907Z 	controller.quorum.election.timeout.ms = 1000
+2026-11-23T08:56:39.112699272Z 	leader.imbalance.check.interval.seconds = 300
+2026-11-23T08:56:39.112805399Z 	process.roles = [broker, controller]
+2026-11-23T08:56:39.112862778Z 	replica.selector.class = null
+2026-11-23T08:56:39.112945263Z 	share.coordinator.state.topic.min.isr = 2
+2026-11-23T08:56:39.113031421Z 	transaction.state.log.min.isr = 2
+2026-11-23T08:56:39.113043159Z 	unclean.leader.election.enable = false
+2026-11-23T08:56:39.113044994Z 	unclean.leader.election.interval.ms = 300000
+2026-11-23T08:56:39.228289544Z 	auto.leader.rebalance.enable = true
+2026-11-23T08:56:39.228310884Z 	controlled.shutdown.enable = true
+2026-11-23T08:56:39.228319150Z 	controller.quorum.election.backoff.max.ms = 1000
+2026-11-23T08:56:39.228320365Z 	controller.quorum.election.timeout.ms = 1000
+2026-11-23T08:56:39.228434722Z 	leader.imbalance.check.interval.seconds = 300
+2026-11-23T08:56:39.228548125Z 	process.roles = [broker, controller]
+2026-11-23T08:56:39.228602222Z 	replica.selector.class = null
+2026-11-23T08:56:39.228685997Z 	share.coordinator.state.topic.min.isr = 2
+2026-11-23T08:56:39.228738329Z 	transaction.state.log.min.isr = 2
+2026-11-23T08:56:39.228745171Z 	unclean.leader.election.enable = false
+2026-11-23T08:56:39.228746302Z 	unclean.leader.election.interval.ms = 300000
+2026-11-23T08:56:39.233044944Z 	auto.leader.rebalance.enable = true
+2026-11-23T08:56:39.233062712Z 	controlled.shutdown.enable = true
+2026-11-23T08:56:39.233084517Z 	controller.quorum.election.backoff.max.ms = 1000
+2026-11-23T08:56:39.233086488Z 	controller.quorum.election.timeout.ms = 1000
+2026-11-23T08:56:39.233197153Z 	leader.imbalance.check.interval.seconds = 300
+2026-11-23T08:56:39.233302228Z 	process.roles = [broker, controller]
+2026-11-23T08:56:39.233360112Z 	replica.selector.class = null
+2026-11-23T08:56:39.233439272Z 	share.coordinator.state.topic.min.isr = 2
+2026-11-23T08:56:39.233512053Z 	transaction.state.log.min.isr = 2
+2026-11-23T08:56:39.233518968Z 	unclean.leader.election.enable = false
+2026-11-23T08:56:39.233520102Z 	unclean.leader.election.interval.ms = 300000
+2026-11-23T08:56:39.235164815Z [2026-11-23 08:56:39,235] INFO [BrokerServer id=1] Waiting for the broker to be unfenced (kafka.server.BrokerServer)
+2026-11-23T08:56:39.267277465Z [2026-11-23 08:56:39,267] INFO [BrokerLifecycleManager id=1] The broker has been unfenced. Transitioning from RECOVERY to RUNNING. (org.apache.kafka.server.BrokerLifecycleManager)
+2026-11-23T08:56:39.267440782Z [2026-11-23 08:56:39,267] INFO [BrokerServer id=1] Finished waiting for the broker to be unfenced (kafka.server.BrokerServer)
+2026-11-23T08:56:43.974594757Z [2026-11-23 08:56:43,974] INFO [ReplicaFetcher replicaId=1, leaderId=3, fetcherId=0] Truncating partition bench-0 with TruncationState(offset=0, completed=true) due to local high watermark 0 (kafka.server.ReplicaFetcherThread)
+2026-11-23T08:57:33.093528706Z [2026-11-23 08:57:33,093] INFO [ReplicaFetcherThread-0-3]: Shutting down (kafka.server.ReplicaFetcherThread)
+2026-11-23T08:57:33.093982199Z [2026-11-23 08:57:33,093] INFO [ReplicaFetcher replicaId=1, leaderId=3, fetcherId=0] Client requested connection close from node 3 (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:57:33.094173330Z [2026-11-23 08:57:33,094] INFO [ReplicaFetcher replicaId=1, leaderId=3, fetcherId=0] Cancelled in-flight FETCH request with correlation id 5669 due to node 3 being disconnected (elapsed time since creation: 9567ms, elapsed time since send: 9567ms, throttle time: 0ms, request timeout: 30000ms) (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:57:33.095341332Z [2026-11-23 08:57:33,094] INFO [ReplicaFetcher replicaId=1, leaderId=3, fetcherId=0] Error sending fetch request (sessionId=90622950, epoch=5669) to node 3: (org.apache.kafka.clients.FetchSessionHandler)
+2026-11-23T08:57:33.095345379Z java.io.IOException: Client was shutdown before response was read
+2026-11-23T08:57:33.095349919Z 	at kafka.server.RemoteLeaderEndPoint.fetch(RemoteLeaderEndPoint.scala:77)
+2026-11-23T08:57:34.993988529Z [2026-11-23 08:57:34,993] WARN [RaftManager id=1] Error connecting to node kafka-3:9093 (id: 3 rack: null isFenced: false) (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:57:34.994020313Z 	at org.apache.kafka.clients.NetworkClient.ready(NetworkClient.java:368)
+2026-11-23T08:57:34.994353648Z [2026-11-23 08:57:34,994] WARN [RaftManager id=1] Error connecting to node kafka-3:9093 (id: 3 rack: null isFenced: false) (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:57:34.994382569Z 	at org.apache.kafka.clients.NetworkClient.ready(NetworkClient.java:368)
+2026-11-23T08:57:35.989942977Z [2026-11-23 08:57:35,989] WARN [RaftManager id=1] Error connecting to node kafka-3:9093 (id: 3 rack: null isFenced: false) (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:57:35.989977992Z 	at org.apache.kafka.clients.NetworkClient.ready(NetworkClient.java:368)
+2026-11-23T08:57:36.990045508Z [2026-11-23 08:57:36,989] WARN [RaftManager id=1] Error connecting to node kafka-3:9093 (id: 3 rack: null isFenced: false) (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:57:36.990088758Z 	at org.apache.kafka.clients.NetworkClient.ready(NetworkClient.java:368)
+2026-11-23T08:57:37.991122378Z [2026-11-23 08:57:37,990] WARN [RaftManager id=1] Error connecting to node kafka-3:9093 (id: 3 rack: null isFenced: false) (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:57:37.991161105Z 	at org.apache.kafka.clients.NetworkClient.ready(NetworkClient.java:368)
+2026-11-23T08:57:38.990930913Z [2026-11-23 08:57:38,990] WARN [RaftManager id=1] Error connecting to node kafka-3:9093 (id: 3 rack: null isFenced: false) (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:57:38.990964957Z 	at org.apache.kafka.clients.NetworkClient.ready(NetworkClient.java:368)
+2026-11-23T08:57:39.991518734Z [2026-11-23 08:57:39,991] WARN [RaftManager id=1] Error connecting to node kafka-3:9093 (id: 3 rack: null isFenced: false) (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:57:39.991561800Z 	at org.apache.kafka.clients.NetworkClient.ready(NetworkClient.java:368)
+2026-11-23T08:57:40.991683025Z [2026-11-23 08:57:40,991] WARN [RaftManager id=1] Error connecting to node kafka-3:9093 (id: 3 rack: null isFenced: false) (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:57:40.991726778Z 	at org.apache.kafka.clients.NetworkClient.ready(NetworkClient.java:368)
+2026-11-23T08:57:41.991997509Z [2026-11-23 08:57:41,991] WARN [RaftManager id=1] Error connecting to node kafka-3:9093 (id: 3 rack: null isFenced: false) (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:57:41.992036430Z 	at org.apache.kafka.clients.NetworkClient.ready(NetworkClient.java:368)
+2026-11-23T08:57:42.992264917Z [2026-11-23 08:57:42,991] WARN [RaftManager id=1] Error connecting to node kafka-3:9093 (id: 3 rack: null isFenced: false) (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:57:42.992325763Z 	at org.apache.kafka.clients.NetworkClient.ready(NetworkClient.java:368)
+2026-11-23T08:57:43.992328084Z [2026-11-23 08:57:43,992] WARN [RaftManager id=1] Error connecting to node kafka-3:9093 (id: 3 rack: null isFenced: false) (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:57:43.992369207Z 	at org.apache.kafka.clients.NetworkClient.ready(NetworkClient.java:368)
+2026-11-23T08:57:44.992416390Z [2026-11-23 08:57:44,992] WARN [RaftManager id=1] Error connecting to node kafka-3:9093 (id: 3 rack: null isFenced: false) (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:57:44.992450951Z 	at org.apache.kafka.clients.NetworkClient.ready(NetworkClient.java:368)
+2026-11-23T08:57:51.002954152Z [2026-11-23 08:57:51,002] WARN [RaftManager id=1] Error connecting to node kafka-3:9093 (id: 3 rack: null isFenced: false) (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:57:51.003009712Z 	at org.apache.kafka.clients.NetworkClient.ready(NetworkClient.java:368)
+2026-11-23T08:57:51.003457975Z [2026-11-23 08:57:51,003] WARN [RaftManager id=1] Error connecting to node kafka-3:9093 (id: 3 rack: null isFenced: false) (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:57:51.003503546Z 	at org.apache.kafka.clients.NetworkClient.ready(NetworkClient.java:368)
+2026-11-23T08:57:51.992801783Z [2026-11-23 08:57:51,992] WARN [RaftManager id=1] Error connecting to node kafka-3:9093 (id: 3 rack: null isFenced: false) (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:57:51.992831987Z 	at org.apache.kafka.clients.NetworkClient.ready(NetworkClient.java:368)
+2026-11-23T08:57:52.993532174Z [2026-11-23 08:57:52,993] WARN [RaftManager id=1] Error connecting to node kafka-3:9093 (id: 3 rack: null isFenced: false) (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:57:52.993578304Z 	at org.apache.kafka.clients.NetworkClient.ready(NetworkClient.java:368)
+2026-11-23T08:57:53.993076803Z [2026-11-23 08:57:53,992] WARN [RaftManager id=1] Error connecting to node kafka-3:9093 (id: 3 rack: null isFenced: false) (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:57:53.993102981Z 	at org.apache.kafka.clients.NetworkClient.ready(NetworkClient.java:368)
+2026-11-23T08:57:54.993164267Z [2026-11-23 08:57:54,992] WARN [RaftManager id=1] Error connecting to node kafka-3:9093 (id: 3 rack: null isFenced: false) (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:57:54.993186096Z 	at org.apache.kafka.clients.NetworkClient.ready(NetworkClient.java:368)
+--- tail ---
+2026-11-23T08:57:52.993577040Z 	at org.apache.kafka.clients.NetworkClient.initiateConnect(NetworkClient.java:1140)
+2026-11-23T08:57:52.993578304Z 	at org.apache.kafka.clients.NetworkClient.ready(NetworkClient.java:368)
+2026-11-23T08:57:52.993579640Z 	at org.apache.kafka.server.util.InterBrokerSendThread.sendRequests(InterBrokerSendThread.java:146)
+2026-11-23T08:57:52.993580928Z 	at org.apache.kafka.server.util.InterBrokerSendThread.pollOnce(InterBrokerSendThread.java:109)
+2026-11-23T08:57:52.993582250Z 	at org.apache.kafka.server.util.InterBrokerSendThread.doWork(InterBrokerSendThread.java:137)
+2026-11-23T08:57:52.993583524Z 	at org.apache.kafka.server.util.ShutdownableThread.run(ShutdownableThread.java:136)
+2026-11-23T08:57:53.993076803Z [2026-11-23 08:57:53,992] WARN [RaftManager id=1] Error connecting to node kafka-3:9093 (id: 3 rack: null isFenced: false) (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:57:53.993088874Z java.net.UnknownHostException: kafka-3
+2026-11-23T08:57:53.993090612Z 	at java.base/java.net.InetAddress$CachedLookup.get(Unknown Source)
+2026-11-23T08:57:53.993092494Z 	at java.base/java.net.InetAddress.getAllByName0(Unknown Source)
+2026-11-23T08:57:53.993094014Z 	at java.base/java.net.InetAddress.getAllByName(Unknown Source)
+2026-11-23T08:57:53.993095263Z 	at org.apache.kafka.clients.DefaultHostResolver.resolve(DefaultHostResolver.java:27)
+2026-11-23T08:57:53.993096548Z 	at org.apache.kafka.clients.ClientUtils.resolve(ClientUtils.java:125)
+2026-11-23T08:57:53.993097804Z 	at org.apache.kafka.clients.ClusterConnectionStates$NodeConnectionState.resolveAddresses(ClusterConnectionStates.java:536)
+2026-11-23T08:57:53.993099143Z 	at org.apache.kafka.clients.ClusterConnectionStates$NodeConnectionState.currentAddress(ClusterConnectionStates.java:511)
+2026-11-23T08:57:53.993100455Z 	at org.apache.kafka.clients.ClusterConnectionStates.currentAddress(ClusterConnectionStates.java:173)
+2026-11-23T08:57:53.993101732Z 	at org.apache.kafka.clients.NetworkClient.initiateConnect(NetworkClient.java:1140)
+2026-11-23T08:57:53.993102981Z 	at org.apache.kafka.clients.NetworkClient.ready(NetworkClient.java:368)
+2026-11-23T08:57:53.993104312Z 	at org.apache.kafka.server.util.InterBrokerSendThread.sendRequests(InterBrokerSendThread.java:146)
+2026-11-23T08:57:53.993105577Z 	at org.apache.kafka.server.util.InterBrokerSendThread.pollOnce(InterBrokerSendThread.java:109)
+2026-11-23T08:57:53.993106825Z 	at org.apache.kafka.server.util.InterBrokerSendThread.doWork(InterBrokerSendThread.java:137)
+2026-11-23T08:57:53.993113308Z 	at org.apache.kafka.server.util.ShutdownableThread.run(ShutdownableThread.java:136)
+2026-11-23T08:57:54.993164267Z [2026-11-23 08:57:54,992] WARN [RaftManager id=1] Error connecting to node kafka-3:9093 (id: 3 rack: null isFenced: false) (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:57:54.993172504Z java.net.UnknownHostException: kafka-3
+2026-11-23T08:57:54.993174020Z 	at java.base/java.net.InetAddress$CachedLookup.get(Unknown Source)
+2026-11-23T08:57:54.993175669Z 	at java.base/java.net.InetAddress.getAllByName0(Unknown Source)
+2026-11-23T08:57:54.993177021Z 	at java.base/java.net.InetAddress.getAllByName(Unknown Source)
+2026-11-23T08:57:54.993178425Z 	at org.apache.kafka.clients.DefaultHostResolver.resolve(DefaultHostResolver.java:27)
+2026-11-23T08:57:54.993179669Z 	at org.apache.kafka.clients.ClientUtils.resolve(ClientUtils.java:125)
+2026-11-23T08:57:54.993180919Z 	at org.apache.kafka.clients.ClusterConnectionStates$NodeConnectionState.resolveAddresses(ClusterConnectionStates.java:536)
+2026-11-23T08:57:54.993182203Z 	at org.apache.kafka.clients.ClusterConnectionStates$NodeConnectionState.currentAddress(ClusterConnectionStates.java:511)
+2026-11-23T08:57:54.993183603Z 	at org.apache.kafka.clients.ClusterConnectionStates.currentAddress(ClusterConnectionStates.java:173)
+2026-11-23T08:57:54.993184830Z 	at org.apache.kafka.clients.NetworkClient.initiateConnect(NetworkClient.java:1140)
+2026-11-23T08:57:54.993186096Z 	at org.apache.kafka.clients.NetworkClient.ready(NetworkClient.java:368)
+2026-11-23T08:57:54.993187326Z 	at org.apache.kafka.server.util.InterBrokerSendThread.sendRequests(InterBrokerSendThread.java:146)
+2026-11-23T08:57:54.993189033Z 	at org.apache.kafka.server.util.InterBrokerSendThread.pollOnce(InterBrokerSendThread.java:109)
+2026-11-23T08:57:54.993190265Z 	at org.apache.kafka.server.util.InterBrokerSendThread.doWork(InterBrokerSendThread.java:137)
+2026-11-23T08:57:54.993191502Z 	at org.apache.kafka.server.util.ShutdownableThread.run(ShutdownableThread.java:136)
+2026-11-23T08:57:56.030818205Z [2026-11-23 08:57:56,030] INFO [ReplicaFetcherManager on broker 1] Removed fetcher for partitions Set(bench-0) (kafka.server.ReplicaFetcherManager)
+2026-11-23T08:57:58.090333662Z [2026-11-23 08:57:58,090] INFO [RaftManager id=1] Updated in-memory voters from VoterSet(voters={1=VoterNode(voterKey=ReplicaKey(id=1, directoryId=3MZQ-KMDZNozqbYAEpZ2Zw), listeners=Endpoints(endpoints={ListenerName(CONTROLLER)=kafka-1/<unresolved>:9093}), supportedKRaftVersion=SupportedVersionRange[min_version:0, max_version:1]), 2=VoterNode(voterKey=ReplicaKey(id=2, directoryId=7n2gZdbNmiiVx6J54YMn1A), listeners=Endpoints(endpoints={ListenerName(CONTROLLER)=kafka-2/<unresolved>:9093}), supportedKRaftVersion=SupportedVersionRange[min_version:0, max_version:1]), 3=VoterNode(voterKey=ReplicaKey(id=3, directoryId=7e7SLpBaKcIElertJoxJcw), listeners=Endpoints(endpoints={ListenerName(CONTROLLER)=kafka-3/<unresolved>:9093}), supportedKRaftVersion=SupportedVersionRange[min_version:0, max_version:1])}) to VoterSet(voters={1=VoterNode(voterKey=ReplicaKey(id=1, directoryId=3MZQ-KMDZNozqbYAEpZ2Zw), listeners=Endpoints(endpoints={ListenerName(CONTROLLER)=kafka-1/<unresolved>:9093}), supportedKRaftVersion=SupportedVersionRange[min_version:0, max_version:1]), 2=VoterNode(voterKey=ReplicaKey(id=2, directoryId=7n2gZdbNmiiVx6J54YMn1A), listeners=Endpoints(endpoints={ListenerName(CONTROLLER)=kafka-2/<unresolved>:9093}), supportedKRaftVersion=SupportedVersionRange[min_version:0, max_version:1]), 3=VoterNode(voterKey=ReplicaKey(id=3, directoryId=7e7SLpBaKcIElertJoxJcw), listeners=Endpoints(endpoints={ListenerName(CONTROLLER)=kafka-3/<unresolved>:9093}), supportedKRaftVersion=SupportedVersionRange[min_version:0, max_version:1])}) (org.apache.kafka.raft.internals.UpdateVoterHandler)

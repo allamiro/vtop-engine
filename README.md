@@ -18,7 +18,7 @@ has been verified.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/card-hero-dark.svg">
-  <img alt="Prototype, 0.x. Source progress moves only after the stored object is verified. The rule: SOURCE_COMMITTED is forbidden until VERIFIED is true. Measured, not claimed (single host, indicative, not a production benchmark). Acknowledged records lost or duplicated, VTOP: 0 lost, 0 duplicated. 15 leader failovers, 7,125,000 records read back, through VTOP's native client. Kafka resumed sooner after a kill -9 of the leader: 10.2 s for Kafka, 25.7 s for VTOP. Share of a lossy 100 ms link carried: 0.967. The shipped default, median of 5 runs. One upload at a time carried 0.25. Objects committed on a policed uplink: 96 of 96. 0 of 32 before the fix in #666, which lets a request's deadline grow with its body. Kafka's produce rate over VTOP's Kafka gateway: 12.0x to 13.9x (Behind). Records per second at saturation, same JVM producer, 2 CPUs per node. Here VTOP is behind." src="docs/assets/readme/card-hero-light.svg" width="600">
+  <img alt="Prototype, 0.x. Source progress moves only after the stored object is verified. The rule: SOURCE_COMMITTED is forbidden until VERIFIED is true. Measured, not claimed (single host, indicative, not a production benchmark). Acknowledged records lost or duplicated, VTOP: 0 lost, 0 duplicated. 15 leader failovers, 7,125,000 records read back, through VTOP's native client. Kafka resumed sooner after a kill -9 of the leader: 10.2 s for Kafka, 19.6 s for VTOP. Share of a lossy 100 ms link carried: 0.967. The shipped default, median of 5 runs. One upload at a time carried 0.25. Objects committed on a policed uplink: 96 of 96. 0 of 32 before the fix in #666, which lets a request's deadline grow with its body. Kafka's produce rate over VTOP's Kafka gateway: 12.0x to 13.9x (Behind). Records per second at saturation, same JVM producer, 2 CPUs per node. Here VTOP is behind." src="docs/assets/readme/card-hero-light.svg" width="600">
 </picture>
 
 [Site](https://allamiro.github.io/vtop-engine/) · [The rule](#the-one-rule) · [Evidence](#evidence) · [Quick start](#quick-start) · [How it works](#how-it-works) · [Documentation](#documentation)
@@ -137,15 +137,16 @@ Data: [`663-policed-uplink/runs.csv`](benchmarks/measurements/663-policed-uplink
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/kafka-failover-dark.svg">
-  <img alt="Dot plot of the seconds without an acknowledgement after a leader fault, Apache Kafka against VTOP. kill -9: Kafka 10.2 s, VTOP 25.7 s. Orderly stop: Kafka 0.1 s, VTOP 16.7 s. Network partition: Kafka 30.0 s, VTOP 30.1 s. No acknowledged record was lost or duplicated in any repetition." src="docs/assets/readme/kafka-failover-light.svg">
+  <img alt="Dot plot of the seconds without an acknowledgement after a leader fault, Apache Kafka against VTOP. kill -9: Kafka 10.2 s, VTOP 19.6 s. Orderly stop: Kafka 1.0 s, VTOP 7.0 s. Network partition: Kafka 30.0 s, VTOP 31.0 s. No acknowledged record was lost or duplicated in any repetition." src="docs/assets/readme/kafka-failover-light.svg">
 </picture>
 
 All 30 failovers, 15 per system, read back every acknowledged record:
 **0 lost, 0 duplicated**, 14,250,000 records in all. Kafka's producer resumes
-sooner after a `kill -9` of the leader (10.2 s, against 25.7 s for VTOP) and
-after an orderly stop; a network partition costs both about 30 s. VTOP was
-driven through its native client in that run, which predates #751: a Kafka
-client could not follow a VTOP failover then.
+sooner after a `kill -9` of the leader (10.2 s, against 19.6 s for VTOP) and
+after an orderly stop (1.0 s, against 7.0 s); a network partition costs both
+about 30 s. This is the v0.11.1 run on one AWS c6i.4xlarge, five repetitions per
+fault. VTOP was driven through its native client in that harness, so the two
+systems are measured through different clients.
 A Kafka client now can, with no restart and no configuration change (#751):
 live-chaos scenarios 27, 28, 30 and 31 killed the range leader under a stock
 librdkafka producer and under the JVM client of Apache Kafka 4.4.0, in the
@@ -168,13 +169,19 @@ Data and the full report: [kafka-failover.md](docs/benchmarks/kafka-failover.md)
 Through the same JVM producer, Kafka carries 12.0x to 13.9x the records per
 second of VTOP's Kafka gateway. Each system ran as shipped: a Kafka `acks=all`
 acknowledgement does not wait for an fsync, and a VTOP quorum acknowledgement
-waits for two replicas to fsync.
+waits for two replicas to fsync. On one AWS c6i.4xlarge with a gp3 data
+volume (v0.11.1, one producer, one partition) the gap at 100 B was 59.1x: each
+durable append took about 24 ms there, against about 6 ms on the laptop
+([aws-v0.11.1.md](docs/benchmarks/aws-v0.11.1.md)).
 Data, latency and consume results: [kafka-comparison.md](docs/benchmarks/kafka-comparison.md).
 
 > [!NOTE]
-> Both Kafka comparisons ran on one laptop (Apple M5 Max), each three-node
-> cluster in turn in the same Docker Desktop VM, at 2 CPUs and 2 GiB per node.
-> They are indicative, not a production benchmark.
+> The failover comparison ran on one AWS c6i.4xlarge (Docker Engine on Linux,
+> gp3 data volume) on v0.11.1; the throughput comparison ran on one laptop
+> (Apple M5 Max) in a Docker Desktop VM. Each three-node cluster ran in turn at
+> 2 CPUs and 2 GiB per node. Both are indicative, not a production benchmark.
+> The v0.11.1 AWS round, throughput included, is in
+> [aws-v0.11.1.md](docs/benchmarks/aws-v0.11.1.md).
 
 ---
 

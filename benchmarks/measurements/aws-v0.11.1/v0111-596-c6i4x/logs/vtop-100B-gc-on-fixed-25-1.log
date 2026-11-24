@@ -1,0 +1,87 @@
+Warmup first 552990 records. Steady state results will print after the complete test summary.
+32744 records sent, 6537.0 records/sec (0.62 MB/sec), 2264.5 ms avg latency, 4522.0 ms max latency.
+35816 records sent, 7153.2 records/sec (0.68 MB/sec), 6900.8 ms avg latency, 9272.0 ms max latency.
+35372 records sent, 7063.1 records/sec (0.67 MB/sec), 11588.8 ms avg latency, 13899.0 ms max latency.
+35076 records sent, 6976.1 records/sec (0.67 MB/sec), 16198.7 ms avg latency, 18544.0 ms max latency.
+35520 records sent, 7053.2 records/sec (0.67 MB/sec), 20847.5 ms avg latency, 23195.0 ms max latency.
+35668 records sent, 7110.8 records/sec (0.68 MB/sec), 25492.5 ms avg latency, 27827.0 ms max latency.
+29748 records sent, 644.8 records/sec (0.06 MB/sec), 29756.2 ms avg latency, 73642.0 ms max latency.
+In steady state.
+1 records sent, 0.0 records/sec (0.00 MB/sec), 43186.0 ms avg latency, 43186.0 ms max latency.
+35047 records sent, 7005.2 records/sec (0.67 MB/sec), 43189.7 ms avg latency, 43239.0 ms max latency.
+35224 records sent, 7029.3 records/sec (0.67 MB/sec), 43221.3 ms avg latency, 43265.0 ms max latency.
+35224 records sent, 7029.3 records/sec (0.67 MB/sec), 43215.4 ms avg latency, 43265.0 ms max latency.
+35224 records sent, 7022.3 records/sec (0.67 MB/sec), 43180.4 ms avg latency, 43220.0 ms max latency.
+35076 records sent, 7004.0 records/sec (0.67 MB/sec), 43158.3 ms avg latency, 43201.0 ms max latency.
+35224 records sent, 7023.7 records/sec (0.67 MB/sec), 43180.8 ms avg latency, 43216.0 ms max latency.
+35076 records sent, 6998.4 records/sec (0.67 MB/sec), 43202.7 ms avg latency, 43243.0 ms max latency.
+35372 records sent, 7056.1 records/sec (0.67 MB/sec), 43205.4 ms avg latency, 43248.0 ms max latency.
+35076 records sent, 6991.4 records/sec (0.67 MB/sec), 43193.2 ms avg latency, 43228.0 ms max latency.
+35224 records sent, 7040.6 records/sec (0.67 MB/sec), 43177.4 ms avg latency, 43232.0 ms max latency.
+35224 records sent, 7026.5 records/sec (0.67 MB/sec), 43177.2 ms avg latency, 43222.0 ms max latency.
+34928 records sent, 6966.1 records/sec (0.66 MB/sec), 43187.8 ms avg latency, 43241.0 ms max latency.
+35224 records sent, 7032.1 records/sec (0.67 MB/sec), 43206.2 ms avg latency, 43246.0 ms max latency.
+35224 records sent, 7039.2 records/sec (0.67 MB/sec), 43209.4 ms avg latency, 43266.0 ms max latency.
+35076 records sent, 7008.2 records/sec (0.67 MB/sec), 43185.4 ms avg latency, 43222.0 ms max latency.
+35224 records sent, 7018.1 records/sec (0.67 MB/sec), 43187.7 ms avg latency, 43227.0 ms max latency.
+35372 records sent, 7063.1 records/sec (0.67 MB/sec), 43190.9 ms avg latency, 43239.0 ms max latency.
+35224 records sent, 7032.1 records/sec (0.67 MB/sec), 43161.4 ms avg latency, 43204.0 ms max latency.
+35076 records sent, 7008.2 records/sec (0.67 MB/sec), 43183.3 ms avg latency, 43221.0 ms max latency.
+35076 records sent, 6994.2 records/sec (0.67 MB/sec), 43179.0 ms avg latency, 43213.0 ms max latency.
+35076 records sent, 7012.4 records/sec (0.67 MB/sec), 43164.9 ms avg latency, 43208.0 ms max latency.
+34928 records sent, 6978.6 records/sec (0.67 MB/sec), 43190.5 ms avg latency, 43236.0 ms max latency.
+35076 records sent, 7012.4 records/sec (0.67 MB/sec), 43205.1 ms avg latency, 43243.0 ms max latency.
+35076 records sent, 6995.6 records/sec (0.67 MB/sec), 43229.7 ms avg latency, 43272.0 ms max latency.
+35076 records sent, 7001.2 records/sec (0.67 MB/sec), 43224.8 ms avg latency, 43260.0 ms max latency.
+35224 records sent, 7023.7 records/sec (0.67 MB/sec), 43266.1 ms avg latency, 43317.0 ms max latency.
+35520 records sent, 7072.9 records/sec (0.67 MB/sec), 43242.2 ms avg latency, 43284.0 ms max latency.
+35224 records sent, 7026.5 records/sec (0.67 MB/sec), 43218.1 ms avg latency, 43268.0 ms max latency.
+34928 records sent, 6964.7 records/sec (0.66 MB/sec), 43239.5 ms avg latency, 43282.0 ms max latency.
+35224 records sent, 7020.9 records/sec (0.67 MB/sec), 43232.1 ms avg latency, 43281.0 ms max latency.
+35224 records sent, 7040.6 records/sec (0.67 MB/sec), 43206.0 ms avg latency, 43242.0 ms max latency.
+35224 records sent, 7013.9 records/sec (0.67 MB/sec), 43180.3 ms avg latency, 43219.0 ms max latency.
+35520 records sent, 7077.1 records/sec (0.67 MB/sec), 43159.1 ms avg latency, 43205.0 ms max latency.
+35076 records sent, 6997.0 records/sec (0.67 MB/sec), 43131.9 ms avg latency, 43169.0 ms max latency.
+34928 records sent, 6982.8 records/sec (0.67 MB/sec), 43146.9 ms avg latency, 43207.0 ms max latency.
+35224 records sent, 7025.1 records/sec (0.67 MB/sec), 43195.4 ms avg latency, 43236.0 ms max latency.
+35372 records sent, 7051.8 records/sec (0.67 MB/sec), 43195.6 ms avg latency, 43236.0 ms max latency.
+35076 records sent, 6999.8 records/sec (0.67 MB/sec), 43165.7 ms avg latency, 43200.0 ms max latency.
+35224 records sent, 7042.0 records/sec (0.67 MB/sec), 43150.6 ms avg latency, 43203.0 ms max latency.
+35076 records sent, 7008.2 records/sec (0.67 MB/sec), 43169.9 ms avg latency, 43223.0 ms max latency.
+35224 records sent, 7036.4 records/sec (0.67 MB/sec), 43166.2 ms avg latency, 43203.0 ms max latency.
+35520 records sent, 7082.8 records/sec (0.68 MB/sec), 43158.8 ms avg latency, 43206.0 ms max latency.
+35224 records sent, 7019.5 records/sec (0.67 MB/sec), 43135.8 ms avg latency, 43185.0 ms max latency.
+35224 records sent, 7030.7 records/sec (0.67 MB/sec), 43113.1 ms avg latency, 43160.0 ms max latency.
+35520 records sent, 7104.0 records/sec (0.68 MB/sec), 43071.2 ms avg latency, 43134.0 ms max latency.
+35076 records sent, 7015.2 records/sec (0.67 MB/sec), 43043.7 ms avg latency, 43085.0 ms max latency.
+35372 records sent, 7057.5 records/sec (0.67 MB/sec), 43028.4 ms avg latency, 43066.0 ms max latency.
+35372 records sent, 7073.0 records/sec (0.67 MB/sec), 43034.2 ms avg latency, 43084.0 ms max latency.
+35372 records sent, 7063.1 records/sec (0.67 MB/sec), 42981.0 ms avg latency, 43018.0 ms max latency.
+35372 records sent, 7053.2 records/sec (0.67 MB/sec), 42972.9 ms avg latency, 43010.0 ms max latency.
+35520 records sent, 7088.4 records/sec (0.68 MB/sec), 42963.7 ms avg latency, 43011.0 ms max latency.
+35076 records sent, 6998.4 records/sec (0.67 MB/sec), 42958.7 ms avg latency, 42995.0 ms max latency.
+35224 records sent, 7026.5 records/sec (0.67 MB/sec), 42959.7 ms avg latency, 43012.0 ms max latency.
+35076 records sent, 7001.2 records/sec (0.67 MB/sec), 43020.4 ms avg latency, 43086.0 ms max latency.
+35224 records sent, 7022.3 records/sec (0.67 MB/sec), 43042.3 ms avg latency, 43085.0 ms max latency.
+35224 records sent, 7033.5 records/sec (0.67 MB/sec), 43051.0 ms avg latency, 43090.0 ms max latency.
+34928 records sent, 6966.1 records/sec (0.66 MB/sec), 43098.8 ms avg latency, 43163.0 ms max latency.
+35224 records sent, 7040.6 records/sec (0.67 MB/sec), 43142.8 ms avg latency, 43181.0 ms max latency.
+35076 records sent, 6990.0 records/sec (0.67 MB/sec), 43167.8 ms avg latency, 43225.0 ms max latency.
+35224 records sent, 7020.9 records/sec (0.67 MB/sec), 43229.0 ms avg latency, 43275.0 ms max latency.
+34928 records sent, 6967.5 records/sec (0.66 MB/sec), 43249.0 ms avg latency, 43303.0 ms max latency.
+35224 records sent, 7036.4 records/sec (0.67 MB/sec), 43272.8 ms avg latency, 43321.0 ms max latency.
+2764950 records sent, 6350.761301 records/sec (0.61 MB/sec), 45160.52 ms avg latency, 84717.00 ms max latency, 43180 ms 50th, 84579 ms 95th, 84635 ms 99th, 84687 ms 99.9th.
+2211960 steady state records sent, 6175.933527 records/sec (0.59 MB/sec), 43155.56 ms avg latency, 43321.00 ms max latency, 43178 ms 50th, 43251 ms 95th, 43281 ms 99th, 43294 ms 99.9th.
+
+[2026-11-23 10:54:05,149] WARN [Producer clientId=perf-producer-client] Got error produce response with correlation id 1629 on topic-partition bench-0, retrying (2147483646 attempts left). Error: REQUEST_TIMED_OUT. Error Message: the bridge refused the append with RequestTimedOut (org.apache.kafka.clients.producer.internals.Sender)
+[2026-11-23 10:54:05,153] WARN [Producer clientId=perf-producer-client] Got error produce response with correlation id 1630 on topic-partition bench-0, retrying (2147483646 attempts left). Error: REQUEST_TIMED_OUT. Error Message: the bridge refused the append with RequestTimedOut (org.apache.kafka.clients.producer.internals.Sender)
+[2026-11-23 10:54:05,153] WARN [Producer clientId=perf-producer-client] Got error produce response with correlation id 1631 on topic-partition bench-0, retrying (2147483646 attempts left). Error: REQUEST_TIMED_OUT. Error Message: the bridge refused the append with RequestTimedOut (org.apache.kafka.clients.producer.internals.Sender)
+[2026-11-23 10:54:05,184] WARN [Producer clientId=perf-producer-client] Got error produce response with correlation id 1632 on topic-partition bench-0, retrying (2147483646 attempts left). Error: REQUEST_TIMED_OUT. Error Message: the bridge refused the append with RequestTimedOut (org.apache.kafka.clients.producer.internals.Sender)
+[2026-11-23 10:54:05,184] WARN [Producer clientId=perf-producer-client] Got error produce response with correlation id 1633 on topic-partition bench-0, retrying (2147483646 attempts left). Error: REQUEST_TIMED_OUT. Error Message: the bridge refused the append with RequestTimedOut (org.apache.kafka.clients.producer.internals.Sender)
+[2026-11-23 10:54:07,261] WARN [Producer clientId=perf-producer-client] Got error produce response with correlation id 1634 on topic-partition bench-0, retrying (2147483645 attempts left). Error: REQUEST_TIMED_OUT. Error Message: the bridge refused the append with RequestTimedOut (org.apache.kafka.clients.producer.internals.Sender)
+[2026-11-23 10:54:09,486] WARN [Producer clientId=perf-producer-client] Got error produce response with correlation id 1635 on topic-partition bench-0, retrying (2147483644 attempts left). Error: REQUEST_TIMED_OUT. Error Message: the bridge refused the append with RequestTimedOut (org.apache.kafka.clients.producer.internals.Sender)
+[2026-11-23 10:54:11,933] WARN [Producer clientId=perf-producer-client] Got error produce response with correlation id 1636 on topic-partition bench-0, retrying (2147483643 attempts left). Error: REQUEST_TIMED_OUT. Error Message: the bridge refused the append with RequestTimedOut (org.apache.kafka.clients.producer.internals.Sender)
+[2026-11-23 10:54:14,898] WARN [Producer clientId=perf-producer-client] Got error produce response with correlation id 1637 on topic-partition bench-0, retrying (2147483642 attempts left). Error: REQUEST_TIMED_OUT. Error Message: the bridge refused the append with RequestTimedOut (org.apache.kafka.clients.producer.internals.Sender)
+[2026-11-23 10:54:17,906] WARN [Producer clientId=perf-producer-client] Got error produce response with correlation id 1638 on topic-partition bench-0, retrying (2147483641 attempts left). Error: REQUEST_TIMED_OUT. Error Message: the bridge refused the append with RequestTimedOut (org.apache.kafka.clients.producer.internals.Sender)
+[2026-11-23 10:54:20,914] WARN [Producer clientId=perf-producer-client] Got error produce response with correlation id 1639 on topic-partition bench-0, retrying (2147483640 attempts left). Error: REQUEST_TIMED_OUT. Error Message: the bridge refused the append with RequestTimedOut (org.apache.kafka.clients.producer.internals.Sender)
+[2026-11-23 10:54:23,921] WARN [Producer clientId=perf-producer-client] Got error produce response with correlation id 1640 on topic-partition bench-0, retrying (2147483639 attempts left). Error: REQUEST_TIMED_OUT. Error Message: the bridge refused the append with RequestTimedOut (org.apache.kafka.clients.producer.internals.Sender)

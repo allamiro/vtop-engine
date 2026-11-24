@@ -1,0 +1,62 @@
+{
+ "vtop_engine_ref": "v0.11.1",
+ "vtop_engine_sha": "a7b4491e5b605551554c13a02978fd6319612b25",
+ "builds": {
+  "v0.11.1": {
+   "vtopctl": "/var/lib/vtop-bench/tmp/nocomp-scratch/release-v0.11.1/vtop-engine-0.11.1-x86_64-unknown-linux-gnu/vtopctl",
+   "vtopctl_version": "vtopctl 0.11.1",
+   "vtopctl_sha256": "583755fc25cc877a757d051eaba78afe127f52da07f1dbf58f2c2c377146a241"
+  },
+  "v0.11.0": {
+   "vtopctl": "/var/lib/vtop-bench/tmp/nocomp-scratch/release-v0.11.0/vtop-engine-0.11.0-x86_64-unknown-linux-gnu/vtopctl",
+   "vtopctl_version": "vtopctl 0.11.0",
+   "vtopctl_sha256": "12eb5b851f5c58467380056e4a96ee2c4c790bee2e7f0aa659031b38bd9472f0"
+  }
+ },
+ "input_kind": "bgl",
+ "input_source": "https://zenodo.org/records/8196385/files/BGL.zip?download=1 (BGL.zip sha256 d67fd82a711aea0157a9b83175892c6ee60e384a2ddf5bc51f39118453816da8)",
+ "input_bytes": 743185031,
+ "uname": "Linux ip-172-31-8-238 7.0.0-1018-aws #19~24.04.1-Ubuntu SMP PREEMPT Thu Nov 12 17:17:32 UTC 2026 x86_64",
+ "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+ "nproc": 16,
+ "placements": {
+  "data": {
+   "dir": "/var/lib/vtop-bench/tmp/nc",
+   "fs": "ext4   /dev/nvme1n1 rw,noatime"
+  },
+  "tmpfs": {
+   "dir": "/dev/shm/vtop-nc",
+   "fs": "tmpfs  tmpfs  rw,nosuid,nodev,inode64"
+  }
+ },
+ "variants": {
+  "none-nocomp-w1": [
+   "none",
+   "none",
+   1
+  ],
+  "none-nocomp": [
+   "none",
+   "none",
+   8
+  ],
+  "sha256-nocomp-w1": [
+   "sha256",
+   "none",
+   1
+  ],
+  "sha256-nocomp": [
+   "sha256",
+   "none",
+   8
+  ],
+  "size-only": [
+   "none",
+   "zstd",
+   8
+  ]
+ },
+ "reps": 3,
+ "order": "per rep: variants in the order above, builds alternated per variant",
+ "vtopctl_version": "vtopctl 0.11.1"
+}

@@ -1,0 +1,220 @@
+{
+  "comparable": {
+    "config_sha256": {
+      "fluent-bit": {
+        "durable": "834a0da8a8baa65adb35f2dea8465e005dbf457d74bde771547ef0c622317d21"
+      },
+      "vector": {
+        "acks": "96a2b40aee206c4b41b969f839466b11f08abb7a60c97052845e8b7436abe18a",
+        "disk-buffer": "f3139d15a4ad753dd327ced20c81ce3c23feca76d891d38488eedf33caee3485"
+      },
+      "vtop": {
+        "strong": "c3020bd074eaab062f84f11580db981ede048316e11c24864dc038a0d78c6207"
+      }
+    },
+    "docker_cgroup_version": "2",
+    "docker_platform": "Docker Engine - Community",
+    "docker_server_version": "29.10.0",
+    "docker_storage_driver": "overlayfs",
+    "docker_vm_arch": "x86_64",
+    "docker_vm_cpus": 16,
+    "docker_vm_kernel": "7.0.0-1018-aws",
+    "docker_vm_memory_bytes": 33081970688,
+    "harness_image": "python:3.12.16-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b",
+    "host_class": "dedicated",
+    "host_cpu": "Intel(R) Xeon(R) Platinum 8375C CPU @ 2.90GHz",
+    "host_disk": "Amazon Elastic Block Store, non-rotational (kernel flag), nvme, ext4",
+    "host_logical_cpus": "16",
+    "host_memory_bytes": "33081970688",
+    "host_os": "Linux 7.0.0-1018-aws",
+    "images": {
+      "fluent-bit": "fluent/fluent-bit:5.2.0@sha256:a48190bf67679495a332fd61025421a46e7e4d168380185a8e16da2e9acc3126",
+      "vector": "timberio/vector:0.61.0-debian@sha256:f6c23b5a7e16fb2838d33619ef7acf4bad2289a7cf22bc90efc2371f520c4ea2",
+      "vtop": "sha256:c68898ccfd25be60a11fdeedaba54a3e9493d1c475b5b60ae7d395be60d54227"
+    },
+    "minio_image": "vtop-minio:RELEASE.2025-09-07T16-13-09Z",
+    "tool_limits": "2 CPUs, 2g, no swap",
+    "vtop_commit": "a7b4491e5b605551554c13a02978fd6319612b25",
+    "vtop_engine_tree": "a2d397e542cc"
+  },
+  "configs": {
+    "fluent-bit": {
+      "durable": {
+        "path": "benchmarks/spool_compare/tools/fluent-bit/durable.conf",
+        "sha256": "834a0da8a8baa65adb35f2dea8465e005dbf457d74bde771547ef0c622317d21",
+        "text": "# Fluent Bit 5.2.0, profile `durable` (its documented best for crash safety), for the\n# spool comparison (#748). Each setting names its page under\n# https://docs.fluentbit.io/manual/ (as published for 5.x).\n#\n# telemetry: Fluent Bit has no usage reporting; its HTTP monitoring server is off\n# (administration/monitoring: `http_server`, stated here).\n#\n# What its cursor means, from its own docs: after an unexpected stop the tail\n# input's guarantee is \"at-least-once\" and the offset database may trail the\n# processed position (pipeline/inputs/tail \"Keep state\"); the S3 output buffers\n# in `store_dir` and re-sends leftovers on restart, and states no formal\n# delivery guarantee (pipeline/outputs/s3). A gap here is a measured consequence\n# of when it moves its offset, shown beside these two settings.\n\n[SERVICE]\n    # administration/configuring-fluent-bit/classic-mode/configuration-file \"flush\"\n    flush                     1\n    log_level                 info\n    http_server               off\n    # administration/buffering-and-storage: chunks on the tool's own volume ...\n    storage.path              /data/storage\n    # ... synced with fsync on every write (`storage.sync full`, not the default `normal`).\n    storage.sync              full\n    storage.checksum          on\n\n[INPUT]\n    # pipeline/inputs/tail\n    name                      tail\n    tag                       spool\n    # The active file and its rotated names, the same pattern every tool is given;\n    # a renamed file is tracked by inode in the offset database\n    # (pipeline/inputs/tail \"File rotation\").\n    path                      /spool/file/app.log*,/spool/syslog-spool/app.log*\n    # A backlog is read from its first byte, as every other tool reads it.\n    read_from_head            true\n    refresh_interval          1\n    rotate_wait               30\n    # pipeline/inputs/tail \"Keep state\": offsets in SQLite on the data volume,\n    # synced fully (`db.sync full`; the default is `normal`).\n    db                        /data/tail.db\n    db.sync                   full\n    db.locking                true\n    # administration/buffering-and-storage: the input buffers on the filesystem.\n    storage.type              filesystem\n    mem_buf_limit             64MB\n\n[OUTPUT]\n    # pipeline/outputs/s3\n    name                      s3\n    match                     spool\n    bucket                    bench\n    region                    us-east-1\n    # The lab MinIO (the S3 tap in crash cells).\n    endpoint                  http://minio:9000\n    # #744 rule 15: about 32 MiB or 60 s per object, gzip.\n    total_file_size           32M\n    upload_timeout            60s\n    compression               gzip\n    # One JSON line per record: the S3 output writes JSON lines by default.\n    json_date_key             date\n    # The S3 output's local buffer, on the tool's own volume.\n    store_dir                 /data/s3\n    # Whole objects with PutObject; ask the store to check a Content-MD5 (V1 in #744 (e)).\n    use_put_object            on\n    send_content_md5          on\n    s3_key_format             /fluent-bit/%Y/%m/%d/%H%M%S-$UUID.gz\n    retry_limit               no_limits\n"
+      }
+    },
+    "vector": {
+      "acks": {
+        "path": "benchmarks/spool_compare/tools/vector/acks.yaml",
+        "sha256": "96a2b40aee206c4b41b969f839466b11f08abb7a60c97052845e8b7436abe18a",
+        "text": "# Vector 0.61.0, profile `acks`, for the spool comparison (#748). Each setting names\n# its page under https://vector.dev/docs/ (as published for 0.61).\n#\n# telemetry: Vector has no usage reporting; its API server is off\n# (reference/api/: `api.enabled`, default false, stated here).\n\n# reference/configuration/global-options/#data_dir: checkpoints and buffers on the tool's own volume.\ndata_dir: /var/lib/vector\n\napi:\n  enabled: false\n\nsources:\n  spool:\n    # reference/configuration/sources/file/\n    type: file\n    # The active file and its rotated names, the same pattern every tool is given;\n    # a renamed file keeps its fingerprint (below) and is not read twice\n    # (sources/file/ \"File rotation\").\n    include:\n      - /spool/file/app.log*\n      - /spool/syslog-spool/app.log*\n    # A backlog is read from its first byte, as every other tool reads it.\n    read_from: beginning\n    # sources/file/#fingerprint: device and inode, so a copytruncate rotation's\n    # truncated file is recognised as the same file and re-read from zero.\n    fingerprint:\n      strategy: device_and_inode\n    # sources/file/#acknowledgements is deprecated in favour of the sink's setting below.\n\nsinks:\n  s3:\n    # reference/configuration/sinks/aws_s3/\n    type: aws_s3\n    inputs: [spool]\n    bucket: bench\n    key_prefix: \"vector/%Y/%m/%d/\"\n    region: us-east-1\n    # sinks/aws_s3/#endpoint: the lab MinIO (the S3 tap in crash cells).\n    endpoint: http://minio:9000\n    force_path_style: true\n    # #744 rule 15: one JSON line per record, gzip at its default level.\n    encoding:\n      codec: json\n    framing:\n      method: newline_delimited\n    compression: gzip\n    # #744 rule 15: about 32 MiB or 60 s per object.\n    batch:\n      max_bytes: 33554432\n      timeout_secs: 60\n    # sinks/aws_s3/#request.concurrency: the default.\n    request:\n      concurrency: adaptive\n    # reference/end-to-end-acknowledgements/: the file checkpoint advances only\n    # after this sink has delivered the event.\n    acknowledgements:\n      enabled: true\n    # reference/configuration/sinks/aws_s3/#buffer: a memory buffer that blocks\n    # when full, so nothing is acknowledged before delivery.\n    buffer:\n      type: memory\n      max_events: 10000\n      when_full: block\n    # Credentials come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in the\n    # container's environment (sinks/aws_s3/#auth, the default chain).\n"
+      },
+      "disk-buffer": {
+        "path": "benchmarks/spool_compare/tools/vector/disk-buffer.yaml",
+        "sha256": "f3139d15a4ad753dd327ced20c81ce3c23feca76d891d38488eedf33caee3485",
+        "text": "# Vector 0.61.0, profile `disk-buffer`, for the spool comparison (#748). Each setting names\n# its page under https://vector.dev/docs/ (as published for 0.61).\n#\n# telemetry: Vector has no usage reporting; its API server is off\n# (reference/api/: `api.enabled`, default false, stated here).\n\n# reference/configuration/global-options/#data_dir: checkpoints and buffers on the tool's own volume.\ndata_dir: /var/lib/vector\n\napi:\n  enabled: false\n\nsources:\n  spool:\n    # reference/configuration/sources/file/\n    type: file\n    # The active file and its rotated names, the same pattern every tool is given;\n    # a renamed file keeps its fingerprint (below) and is not read twice\n    # (sources/file/ \"File rotation\").\n    include:\n      - /spool/file/app.log*\n      - /spool/syslog-spool/app.log*\n    # A backlog is read from its first byte, as every other tool reads it.\n    read_from: beginning\n    # sources/file/#fingerprint: device and inode, so a copytruncate rotation's\n    # truncated file is recognised as the same file and re-read from zero.\n    fingerprint:\n      strategy: device_and_inode\n    # sources/file/#acknowledgements is deprecated in favour of the sink's setting below.\n\nsinks:\n  s3:\n    # reference/configuration/sinks/aws_s3/\n    type: aws_s3\n    inputs: [spool]\n    bucket: bench\n    key_prefix: \"vector/%Y/%m/%d/\"\n    region: us-east-1\n    # sinks/aws_s3/#endpoint: the lab MinIO (the S3 tap in crash cells).\n    endpoint: http://minio:9000\n    force_path_style: true\n    # #744 rule 15: one JSON line per record, gzip at its default level.\n    encoding:\n      codec: json\n    framing:\n      method: newline_delimited\n    compression: gzip\n    # #744 rule 15: about 32 MiB or 60 s per object.\n    batch:\n      max_bytes: 33554432\n      timeout_secs: 60\n    # sinks/aws_s3/#request.concurrency: the default.\n    request:\n      concurrency: adaptive\n    # reference/end-to-end-acknowledgements/: the file checkpoint advances only\n    # after this sink has delivered the event.\n    acknowledgements:\n      enabled: true\n    # reference/configuration/sinks/aws_s3/#buffer: a disk buffer; with it an event is\n    # acknowledged once it is in the buffer, which is synced every 500 ms\n    # (reference/end-to-end-acknowledgements/). The documented durability trade.\n    buffer:\n      type: disk\n      max_size: 1073741824\n      when_full: block\n    # Credentials come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in the\n    # container's environment (sinks/aws_s3/#auth, the default chain).\n"
+      }
+    },
+    "vtop": {
+      "strong": {
+        "path": "benchmarks/spool_compare/tools/vtop/strong.yaml",
+        "sha256": "c3020bd074eaab062f84f11580db981ede048316e11c24864dc038a0d78c6207",
+        "text": "# VTOP, profile `strong` (the default commit rule), for the spool comparison (#748).\n# Every setting names the page it comes from: docs/configure/reference.md (the\n# reference for every config.yaml key) and examples/config.yaml at the commit\n# under test.\n#\n# telemetry: VTOP has no usage reporting; OpenTelemetry export runs only when an\n# OTEL_EXPORTER_OTLP_*ENDPOINT is set, and the compose file sets\n# OTEL_SDK_DISABLED=true (crates/vtop-observe/src/otel/settings.rs).\n\nengine:\n  name: spool-bench\n  tenant: bench\n  # docs/configure/reference.md \"engine.state_store\": SQLite on the tool's own data volume,\n  # the same volume class as every other tool's state.\n  state_store: \"sqlite:///data/state/vtop-state.db\"\n  work_dir: /data/work\n  work_retention_seconds: 86400\n  work_max_bytes: 10737418240\n  log_level: INFO\n\nbatching:\n  # #744 rule 15: about 32 MiB or 60 s per object, whichever first; records unbounded.\n  # docs/configure/reference.md \"batching.max_bytes\", \"batching.max_batch_age_seconds\".\n  max_records: 100000000\n  max_bytes: 33554432\n  max_batch_age_seconds: 60\n  # The shipped default (examples/config.yaml \"max_concurrent_batches\").\n  max_concurrent_batches: 8\n\ncompression:\n  # #744 rule 15: gzip at the tool's documented default level (examples/config.yaml\n  # \"compression\": the code default is gzip level 6).\n  type: gzip\n  level: 6\n\nsources:\n  # docs/configure/reference.md \"sources.file.paths\" and \"sources.syslog_spool.paths\":\n  # the active file and its rotated names (app.log.1, app.log.2, ...), the same\n  # pattern every tool here is given: a backlog is written across rotated files\n  # before the tool starts (#748 `drain`). A file renamed while it is being read\n  # is followed by inode (crates/vtop-adapters/src/rotated.rs).\n  # The generator writes one of the two directories per run (the `source` variant).\n  file:\n    enabled: true\n    paths:\n      - /spool/file/app.log*\n  syslog_spool:\n    enabled: true\n    paths:\n      - /spool/syslog-spool/app.log*\n\nupload:\n  # docs/configure/reference.md \"upload\": the native S3 backend against the lab MinIO.\n  # In crash and fault cells `minio` resolves to the S3 tap, which forwards to the store.\n  backend: s3_native\n  bucket: bench\n  prefix: \"vtop/\"\n  endpoint_url: http://minio:9000\n  region: us-east-1\n  force_path_style: true\n  # The lab store is plaintext (examples/config.yaml \"verify_tls\": the explicit lab opt-out).\n  verify_tls: false\n  create_bucket: true\n  # The default: VERIFIED needs a digest derived from stored content.\n  require_strong_verification: true\n\npartitioning:\n  template: \"source={source}/format={format}/\"\n"
+      }
+    }
+  },
+  "deviations": [
+    "VTOP stores each line as read (newline-framed syslog, gzip); Vector and Fluent Bit wrap each line in a JSON object (their documented JSON output). The checker reads the id token in either form; object sizes and MiB/s are of SOURCE bytes, so the wrapping does not change them (rule 15).",
+    "Fluent Bit's S3 output has no byte-and-age pair identical to the others': `total_file_size 32M` and `upload_timeout 60s` are the closest documented settings.",
+    "Every tool reads the active file and its rotated names (`app.log*`): a backlog is written across rotated files before the tool starts. Rotated names are `app.log.<k>`, k never reused, never deleted.",
+    "Time to store-visible uses the generator's write time and MinIO's LastModified (milliseconds), both on the Docker VM's clock."
+  ],
+  "durability": {
+    "fluent-bit": {
+      "durable": {
+        "db": "/data/tail.db",
+        "db.sync": "full",
+        "storage.sync": "full",
+        "storage.type": "filesystem"
+      }
+    },
+    "vector": {
+      "acks": {
+        "acknowledgements.enabled": "true",
+        "buffer.type": "memory"
+      },
+      "disk-buffer": {
+        "acknowledgements.enabled": "true",
+        "buffer.type": "disk"
+      }
+    },
+    "vtop": {
+      "strong": {
+        "require_strong_verification": "true"
+      }
+    }
+  },
+  "events": [],
+  "finished_at": "2026-11-23T20:13:39+00:00",
+  "kind": "spool",
+  "plan": {
+    "_comment": "A GitHub-hosted runner (workflow_dispatch): crash-K1..K3, 9 kills per kind per tool, reduced backlog, 1 CPU per tool. Correctness only (#748 'Where it runs'); split from hosted-rotation so each fits one job. The backlog (about 300 MB) makes about nine 32 MiB objects per tool, so a trigger between the 1st and 3rd PUT of each life is reachable (review of #908).",
+    "cells": [
+      {
+        "cell": "smoke",
+        "minutes_per_run": 3,
+        "params": {
+          "records": 10000,
+          "rotate_bytes": 524288,
+          "seed": 748
+        },
+        "repetitions": 1,
+        "variants": [
+          {
+            "rotation": "rename",
+            "source": "file"
+          }
+        ]
+      },
+      {
+        "cell": "crash-K1",
+        "minutes_per_run": 5,
+        "params": {
+          "kill_seed": 748,
+          "kills_per_run": 3,
+          "n_range": [
+            1,
+            3
+          ],
+          "records": 1600000,
+          "rotate_bytes": 16777216,
+          "seed": 748
+        },
+        "repetitions": 3,
+        "variants": [
+          {
+            "rotation": "rename",
+            "source": "file"
+          }
+        ]
+      },
+      {
+        "cell": "crash-K2",
+        "minutes_per_run": 5,
+        "params": {
+          "kill_seed": 748,
+          "kills_per_run": 3,
+          "n_range": [
+            1,
+            3
+          ],
+          "records": 1600000,
+          "rotate_bytes": 16777216,
+          "seed": 748
+        },
+        "repetitions": 3,
+        "variants": [
+          {
+            "rotation": "rename",
+            "source": "file"
+          }
+        ]
+      },
+      {
+        "cell": "crash-K3",
+        "minutes_per_run": 5,
+        "params": {
+          "kill_seed": 748,
+          "kills_per_run": 3,
+          "n_range": [
+            1,
+            3
+          ],
+          "records": 1600000,
+          "rotate_bytes": 16777216,
+          "seed": 748
+        },
+        "repetitions": 3,
+        "variants": [
+          {
+            "rotation": "rename",
+            "source": "file"
+          }
+        ]
+      }
+    ],
+    "host_class": "dedicated",
+    "kind": "spool",
+    "name": "hosted-crash",
+    "profiles": {
+      "fluent-bit": [
+        "durable"
+      ],
+      "vector": [
+        "acks",
+        "disk-buffer"
+      ],
+      "vtop": [
+        "strong"
+      ]
+    },
+    "systems": [
+      "fluent-bit",
+      "vtop",
+      "vector"
+    ]
+  },
+  "private": false,
+  "run_id": "spool-hosted-crash-v0111",
+  "run_state": "complete",
+  "schema_version": 1,
+  "started_at": "2026-11-23T18:01:17+00:00",
+  "store": "MinIO (lab build, upstream archived)",
+  "telemetry": {
+    "fluent-bit": "no usage reporting; HTTP monitoring server off (http_server off)",
+    "vector": "no usage reporting; API server off (api.enabled: false)",
+    "vtop": "no usage reporting; OpenTelemetry export off (OTEL_SDK_DISABLED=true, no endpoint set)"
+  }
+}

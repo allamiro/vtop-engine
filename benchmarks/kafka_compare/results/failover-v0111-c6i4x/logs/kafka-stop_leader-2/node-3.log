@@ -1,0 +1,164 @@
+2026-11-23T08:13:31.166375539Z ===> Setting default values of environment variables if not already set.
+2026-11-23T08:13:33.347960958Z [2026-11-23 08:13:33,347] INFO [RaftManager id=3] Starting request manager with static voters: [kafka-1:9093 (id: 1 rack: null isFenced: false), kafka-2:9093 (id: 2 rack: null isFenced: false), kafka-3:9093 (id: 3 rack: null isFenced: false)] (org.apache.kafka.raft.KafkaRaftClient)
+2026-11-23T08:13:33.349336640Z [2026-11-23 08:13:33,349] INFO [RaftManager id=3] Attempting durable transition to UnattachedState(epoch=0, leaderId=OptionalInt.empty, votedKey=Optional.empty, voters=[1, 2, 3], electionTimeoutMs=1754, highWatermark=Optional.empty) from null (org.apache.kafka.raft.QuorumState)
+2026-11-23T08:13:33.358679316Z [2026-11-23 08:13:33,358] INFO [RaftManager id=3] Completed transition to UnattachedState(epoch=0, leaderId=OptionalInt.empty, votedKey=Optional.empty, voters=[1, 2, 3], electionTimeoutMs=1754, highWatermark=Optional.empty) from null (org.apache.kafka.raft.QuorumState)
+2026-11-23T08:13:33.368650036Z [2026-11-23 08:13:33,368] WARN [RaftManager id=3] Connection to node 3 (kafka-3/172.18.0.2:9093) could not be established. Node may not be available. (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:13:33.377799877Z [2026-11-23 08:13:33,377] WARN [RaftManager id=3] Connection to node 1 (kafka-1/172.18.0.3:9093) could not be established. Node may not be available. (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:13:33.378854218Z [2026-11-23 08:13:33,378] WARN [RaftManager id=3] Connection to node 2 (kafka-2/172.18.0.4:9093) could not be established. Node may not be available. (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:13:33.426431408Z [2026-11-23 08:13:33,426] WARN [RaftManager id=3] Connection to node 2 (kafka-2/172.18.0.4:9093) could not be established. Node may not be available. (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:13:33.441587030Z [2026-11-23 08:13:33,441] WARN [RaftManager id=3] Connection to node 1 (kafka-1/172.18.0.3:9093) could not be established. Node may not be available. (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:13:33.556591328Z [2026-11-23 08:13:33,556] WARN [RaftManager id=3] Connection to node 2 (kafka-2/172.18.0.4:9093) could not be established. Node may not be available. (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:13:34.578017235Z [2026-11-23 08:13:34,577] INFO [RaftManager id=3] Attempting durable transition to UnattachedState(epoch=1, leaderId=OptionalInt.empty, votedKey=Optional.empty, voters=[1, 2, 3], electionTimeoutMs=526, highWatermark=Optional.empty) from UnattachedState(epoch=0, leaderId=OptionalInt.empty, votedKey=Optional.empty, voters=[1, 2, 3], electionTimeoutMs=1754, highWatermark=Optional.empty) (org.apache.kafka.raft.QuorumState)
+2026-11-23T08:13:34.585491946Z [2026-11-23 08:13:34,585] INFO [RaftManager id=3] Completed transition to UnattachedState(epoch=1, leaderId=OptionalInt.empty, votedKey=Optional.empty, voters=[1, 2, 3], electionTimeoutMs=526, highWatermark=Optional.empty) from UnattachedState(epoch=0, leaderId=OptionalInt.empty, votedKey=Optional.empty, voters=[1, 2, 3], electionTimeoutMs=1754, highWatermark=Optional.empty) (org.apache.kafka.raft.QuorumState)
+2026-11-23T08:13:34.586605540Z [2026-11-23 08:13:34,586] INFO [RaftManager id=3] Attempting durable transition to UnattachedState(epoch=1, leaderId=OptionalInt.empty, votedKey=Optional[ReplicaKey(id=1, directoryId=EqtD36Jz5dv2Y58QLftRqg)], voters=[1, 2, 3], electionTimeoutMs=1414, highWatermark=Optional.empty) from UnattachedState(epoch=1, leaderId=OptionalInt.empty, votedKey=Optional.empty, voters=[1, 2, 3], electionTimeoutMs=526, highWatermark=Optional.empty) (org.apache.kafka.raft.QuorumState)
+2026-11-23T08:13:34.591904839Z [2026-11-23 08:13:34,591] INFO [RaftManager id=3] Completed transition to UnattachedState(epoch=1, leaderId=OptionalInt.empty, votedKey=Optional[ReplicaKey(id=1, directoryId=EqtD36Jz5dv2Y58QLftRqg)], voters=[1, 2, 3], electionTimeoutMs=1414, highWatermark=Optional.empty) from UnattachedState(epoch=1, leaderId=OptionalInt.empty, votedKey=Optional.empty, voters=[1, 2, 3], electionTimeoutMs=526, highWatermark=Optional.empty) (org.apache.kafka.raft.QuorumState)
+2026-11-23T08:13:34.624678499Z [2026-11-23 08:13:34,624] INFO [RaftManager id=3] Attempting durable transition to FollowerState(fetchTimeoutMs=2000, epoch=1, leader=1, leaderEndpoints=Endpoints(endpoints={ListenerName(CONTROLLER)=kafka-1/<unresolved>:9093}), votedKey=Optional[ReplicaKey(id=1, directoryId=EqtD36Jz5dv2Y58QLftRqg)], voters=[1, 2, 3], highWatermark=Optional.empty, fetchingSnapshot=Optional.empty) from UnattachedState(epoch=1, leaderId=OptionalInt.empty, votedKey=Optional[ReplicaKey(id=1, directoryId=EqtD36Jz5dv2Y58QLftRqg)], voters=[1, 2, 3], electionTimeoutMs=1414, highWatermark=Optional.empty) (org.apache.kafka.raft.QuorumState)
+2026-11-23T08:13:34.631244970Z [2026-11-23 08:13:34,631] INFO [RaftManager id=3] Completed transition to FollowerState(fetchTimeoutMs=2000, epoch=1, leader=1, leaderEndpoints=Endpoints(endpoints={ListenerName(CONTROLLER)=kafka-1/<unresolved>:9093}), votedKey=Optional[ReplicaKey(id=1, directoryId=EqtD36Jz5dv2Y58QLftRqg)], voters=[1, 2, 3], highWatermark=Optional.empty, fetchingSnapshot=Optional.empty) from UnattachedState(epoch=1, leaderId=OptionalInt.empty, votedKey=Optional[ReplicaKey(id=1, directoryId=EqtD36Jz5dv2Y58QLftRqg)], voters=[1, 2, 3], electionTimeoutMs=1414, highWatermark=Optional.empty) (org.apache.kafka.raft.QuorumState)
+2026-11-23T08:13:34.646101718Z [2026-11-23 08:13:34,645] INFO Recorded new KRaft controller, from now on will use node kafka-1:9093 (id: 1 rack: null isFenced: false) (org.apache.kafka.server.NodeToControllerRequestThread)
+2026-11-23T08:13:34.652592094Z [2026-11-23 08:13:34,652] INFO Recorded new KRaft controller, from now on will use node kafka-1:9093 (id: 1 rack: null isFenced: false) (org.apache.kafka.server.NodeToControllerRequestThread)
+2026-11-23T08:13:34.656881583Z [2026-11-23 08:13:34,656] INFO Recorded new KRaft controller, from now on will use node kafka-1:9093 (id: 1 rack: null isFenced: false) (org.apache.kafka.server.NodeToControllerRequestThread)
+2026-11-23T08:13:34.681809555Z [2026-11-23 08:13:34,681] INFO Recorded new KRaft controller, from now on will use node kafka-1:9093 (id: 1 rack: null isFenced: false) (org.apache.kafka.server.NodeToControllerRequestThread)
+2026-11-23T08:13:34.685524612Z [2026-11-23 08:13:34,685] INFO Recorded new KRaft controller, from now on will use node kafka-1:9093 (id: 1 rack: null isFenced: false) (org.apache.kafka.server.NodeToControllerRequestThread)
+2026-11-23T08:13:34.706281089Z [2026-11-23 08:13:34,706] INFO Recorded new KRaft controller, from now on will use node kafka-1:9093 (id: 1 rack: null isFenced: false) (org.apache.kafka.server.NodeToControllerRequestThread)
+2026-11-23T08:13:34.710332607Z [2026-11-23 08:13:34,710] INFO [ControllerServer id=3] Loaded new metadata FinalizedFeatures[metadataVersion=4.3-IV0, finalizedFeatures={group.version=1, streams.version=1, transaction.version=2, eligible.leader.replicas.version=1, share.version=1, metadata.version=30}, finalizedFeaturesEpoch=10]. (org.apache.kafka.metadata.publisher.FeaturesPublisher)
+2026-11-23T08:13:34.712926431Z [2026-11-23 08:13:34,712] INFO Recorded new KRaft controller, from now on will use node kafka-1:9093 (id: 1 rack: null isFenced: false) (org.apache.kafka.server.NodeToControllerRequestThread)
+2026-11-23T08:13:34.716045111Z [2026-11-23 08:13:34,715] INFO [ControllerRegistrationManager id=3 incarnation=Ml5XIK9STb6J49C_2JMFiA] sendControllerRegistration: attempting to send ControllerRegistrationRequestData(controllerId=3, incarnationId=Ml5XIK9STb6J49C_2JMFiA, zkMigrationReady=false, listeners=[Listener(name='CONTROLLER', host='kafka-3', port=9093, securityProtocol=0)], features=[Feature(name='group.version', minSupportedVersion=0, maxSupportedVersion=1), Feature(name='kraft.version', minSupportedVersion=0, maxSupportedVersion=1), Feature(name='metadata.version', minSupportedVersion=7, maxSupportedVersion=30), Feature(name='share.version', minSupportedVersion=0, maxSupportedVersion=1), Feature(name='streams.version', minSupportedVersion=0, maxSupportedVersion=1), Feature(name='transaction.version', minSupportedVersion=0, maxSupportedVersion=2), Feature(name='eligible.leader.replicas.version', minSupportedVersion=0, maxSupportedVersion=1)]) (kafka.server.ControllerRegistrationManager)
+2026-11-23T08:13:34.720034870Z 	auto.leader.rebalance.enable = true
+2026-11-23T08:13:34.720053039Z 	controlled.shutdown.enable = true
+2026-11-23T08:13:34.720061267Z 	controller.quorum.election.backoff.max.ms = 1000
+2026-11-23T08:13:34.720062466Z 	controller.quorum.election.timeout.ms = 1000
+2026-11-23T08:13:34.720204104Z 	leader.imbalance.check.interval.seconds = 300
+2026-11-23T08:13:34.720315242Z 	process.roles = [broker, controller]
+2026-11-23T08:13:34.720377502Z 	replica.selector.class = null
+2026-11-23T08:13:34.720464542Z 	share.coordinator.state.topic.min.isr = 2
+2026-11-23T08:13:34.720538462Z 	transaction.state.log.min.isr = 2
+2026-11-23T08:13:34.720547435Z 	unclean.leader.election.enable = false
+2026-11-23T08:13:34.720548667Z 	unclean.leader.election.interval.ms = 300000
+2026-11-23T08:13:34.836433423Z 	auto.leader.rebalance.enable = true
+2026-11-23T08:13:34.836451392Z 	controlled.shutdown.enable = true
+2026-11-23T08:13:34.836467075Z 	controller.quorum.election.backoff.max.ms = 1000
+2026-11-23T08:13:34.836468315Z 	controller.quorum.election.timeout.ms = 1000
+2026-11-23T08:13:34.836597795Z 	leader.imbalance.check.interval.seconds = 300
+2026-11-23T08:13:34.836696606Z 	process.roles = [broker, controller]
+2026-11-23T08:13:34.836753911Z 	replica.selector.class = null
+2026-11-23T08:13:34.836832873Z 	share.coordinator.state.topic.min.isr = 2
+2026-11-23T08:13:34.836885080Z 	transaction.state.log.min.isr = 2
+2026-11-23T08:13:34.836892131Z 	unclean.leader.election.enable = false
+2026-11-23T08:13:34.836893304Z 	unclean.leader.election.interval.ms = 300000
+2026-11-23T08:13:34.857056104Z 	auto.leader.rebalance.enable = true
+2026-11-23T08:13:34.857084139Z 	controlled.shutdown.enable = true
+2026-11-23T08:13:34.857092928Z 	controller.quorum.election.backoff.max.ms = 1000
+2026-11-23T08:13:34.857094188Z 	controller.quorum.election.timeout.ms = 1000
+2026-11-23T08:13:34.857219966Z 	leader.imbalance.check.interval.seconds = 300
+2026-11-23T08:13:34.857319413Z 	process.roles = [broker, controller]
+2026-11-23T08:13:34.857375335Z 	replica.selector.class = null
+2026-11-23T08:13:34.857452154Z 	share.coordinator.state.topic.min.isr = 2
+2026-11-23T08:13:34.857535113Z 	transaction.state.log.min.isr = 2
+2026-11-23T08:13:34.857542087Z 	unclean.leader.election.enable = false
+2026-11-23T08:13:34.857543257Z 	unclean.leader.election.interval.ms = 300000
+2026-11-23T08:13:34.858600060Z [2026-11-23 08:13:34,858] INFO [BrokerServer id=3] Waiting for the broker to be unfenced (kafka.server.BrokerServer)
+2026-11-23T08:13:34.888525368Z [2026-11-23 08:13:34,888] INFO [BrokerLifecycleManager id=3] The broker has been unfenced. Transitioning from RECOVERY to RUNNING. (org.apache.kafka.server.BrokerLifecycleManager)
+2026-11-23T08:13:34.888673183Z [2026-11-23 08:13:34,888] INFO [BrokerServer id=3] Finished waiting for the broker to be unfenced (kafka.server.BrokerServer)
+2026-11-23T08:14:18.745205280Z [2026-11-23 08:14:18,745] INFO [BrokerLifecycleManager id=3] Beginning controlled shutdown. (org.apache.kafka.server.BrokerLifecycleManager)
+2026-11-23T08:14:20.855182457Z [2026-11-23 08:14:20,855] INFO [BrokerLifecycleManager id=3] The controller has asked us to exit controlled shutdown. (org.apache.kafka.server.BrokerLifecycleManager)
+2026-11-23T08:14:20.855455809Z [2026-11-23 08:14:20,855] INFO [broker-3-to-controller-heartbeat-channel-manager]: Shutting down (org.apache.kafka.server.NodeToControllerRequestThread)
+2026-11-23T08:14:20.859294890Z [2026-11-23 08:14:20,859] INFO Node to controller channel manager for heartbeat shutdown (org.apache.kafka.server.NodeToControllerChannelManagerImpl)
+2026-11-23T08:14:20.864324956Z [2026-11-23 08:14:20,864] INFO [ExpirationReaper-3-AlterAcls]: Shutting down (org.apache.kafka.server.purgatory.DelayedOperationPurgatory$ExpiredOperationReaper)
+2026-11-23T08:14:20.866625746Z [2026-11-23 08:14:20,866] INFO [TransactionCoordinator id=3] Shutting down. (kafka.coordinator.transaction.TransactionCoordinator)
+2026-11-23T08:14:20.867056034Z [2026-11-23 08:14:20,867] INFO [TxnMarkerSenderThread-3]: Shutting down (kafka.coordinator.transaction.TransactionMarkerChannelManager)
+2026-11-23T08:14:20.869023054Z [2026-11-23 08:14:20,868] INFO [GroupCoordinator id=3] Shutting down. (org.apache.kafka.coordinator.group.GroupCoordinatorService)
+2026-11-23T08:14:20.869134441Z [2026-11-23 08:14:20,869] INFO [group-coordinator-reaper]: Shutting down (org.apache.kafka.server.util.timer.SystemTimerReaper$Reaper)
+2026-11-23T08:14:20.869443530Z [2026-11-23 08:14:20,869] INFO [GroupCoordinator id=3] Shutting down event processor. (org.apache.kafka.coordinator.common.runtime.MultiThreadedEventProcessor)
+2026-11-23T08:14:20.869574661Z [2026-11-23 08:14:20,869] INFO [group-coordinator-event-processor-0]: Shutting down. Draining the remaining events. (org.apache.kafka.coordinator.common.runtime.MultiThreadedEventProcessor$EventProcessorThread)
+2026-11-23T08:14:20.869579641Z [2026-11-23 08:14:20,869] INFO [group-coordinator-event-processor-3]: Shutting down. Draining the remaining events. (org.apache.kafka.coordinator.common.runtime.MultiThreadedEventProcessor$EventProcessorThread)
+2026-11-23T08:14:20.869600183Z [2026-11-23 08:14:20,869] INFO [group-coordinator-event-processor-2]: Shutting down. Draining the remaining events. (org.apache.kafka.coordinator.common.runtime.MultiThreadedEventProcessor$EventProcessorThread)
+2026-11-23T08:14:20.869622177Z [2026-11-23 08:14:20,869] INFO [group-coordinator-event-processor-1]: Shutting down. Draining the remaining events. (org.apache.kafka.coordinator.common.runtime.MultiThreadedEventProcessor$EventProcessorThread)
+2026-11-23T08:14:20.871447032Z [2026-11-23 08:14:20,871] INFO [network-partition-metadata-client-reaper]: Shutting down (org.apache.kafka.server.util.timer.SystemTimerReaper$Reaper)
+2026-11-23T08:14:20.871923066Z [2026-11-23 08:14:20,871] INFO [ShareCoordinator id=3] Shutting down. (org.apache.kafka.coordinator.share.ShareCoordinatorService)
+2026-11-23T08:14:20.872034660Z [2026-11-23 08:14:20,871] INFO [share-coordinator-reaper]: Shutting down (org.apache.kafka.server.util.timer.SystemTimerReaper$Reaper)
+2026-11-23T08:14:20.872327680Z [2026-11-23 08:14:20,872] INFO [ShareCoordinator id=3] Shutting down event processor. (org.apache.kafka.coordinator.common.runtime.MultiThreadedEventProcessor)
+2026-11-23T08:14:20.872465594Z [2026-11-23 08:14:20,872] INFO [share-coordinator-event-processor-0]: Shutting down. Draining the remaining events. (org.apache.kafka.coordinator.common.runtime.MultiThreadedEventProcessor$EventProcessorThread)
+2026-11-23T08:14:20.873700117Z [2026-11-23 08:14:20,873] INFO [broker-3-to-controller-directory-assignments-channel-manager]: Shutting down (org.apache.kafka.server.NodeToControllerRequestThread)
+2026-11-23T08:14:20.873942947Z [2026-11-23 08:14:20,873] INFO Node to controller channel manager for directory-assignments shutdown (org.apache.kafka.server.NodeToControllerChannelManagerImpl)
+2026-11-23T08:14:20.874320462Z [2026-11-23 08:14:20,874] INFO [ReplicaManager broker=3] Shutting down (kafka.server.ReplicaManager)
+2026-11-23T08:14:20.874689015Z [2026-11-23 08:14:20,874] INFO [LogDirFailureHandler]: Shutting down (kafka.server.ReplicaManager$LogDirFailureHandler)
+2026-11-23T08:14:20.875785515Z [2026-11-23 08:14:20,875] INFO [ReplicaFetcherManager on broker 3] shutdown completed (kafka.server.ReplicaFetcherManager)
+2026-11-23T08:14:20.876192227Z [2026-11-23 08:14:20,876] INFO [ReplicaAlterLogDirsManager on broker 3] shutdown completed (kafka.server.ReplicaAlterLogDirsManager)
+2026-11-23T08:14:20.876230578Z [2026-11-23 08:14:20,876] INFO [ExpirationReaper-3-Fetch]: Shutting down (org.apache.kafka.server.purgatory.DelayedOperationPurgatory$ExpiredOperationReaper)
+2026-11-23T08:14:20.876552823Z [2026-11-23 08:14:20,876] INFO [ExpirationReaper-3-RemoteFetch]: Shutting down (org.apache.kafka.server.purgatory.DelayedOperationPurgatory$ExpiredOperationReaper)
+2026-11-23T08:14:20.876995820Z [2026-11-23 08:14:20,876] INFO [ExpirationReaper-3-RemoteListOffsets]: Shutting down (org.apache.kafka.server.purgatory.DelayedOperationPurgatory$ExpiredOperationReaper)
+2026-11-23T08:14:20.877384782Z [2026-11-23 08:14:20,877] INFO [ExpirationReaper-3-Produce]: Shutting down (org.apache.kafka.server.purgatory.DelayedOperationPurgatory$ExpiredOperationReaper)
+2026-11-23T08:14:20.877798680Z [2026-11-23 08:14:20,877] INFO [ExpirationReaper-3-DeleteRecords]: Shutting down (org.apache.kafka.server.purgatory.DelayedOperationPurgatory$ExpiredOperationReaper)
+2026-11-23T08:14:20.878183715Z [2026-11-23 08:14:20,878] INFO [ExpirationReaper-3-ShareFetch]: Shutting down (org.apache.kafka.server.purgatory.DelayedOperationPurgatory$ExpiredOperationReaper)
+2026-11-23T08:14:20.882043200Z [2026-11-23 08:14:20,881] INFO [AddPartitionsToTxnSenderThread-3]: Shutting down (org.apache.kafka.server.transaction.AddPartitionsToTxnManager)
+2026-11-23T08:14:20.882667497Z [2026-11-23 08:14:20,882] INFO [broker-3-to-controller-alter-partition-channel-manager]: Shutting down (org.apache.kafka.server.NodeToControllerRequestThread)
+2026-11-23T08:14:20.882867848Z [2026-11-23 08:14:20,882] INFO Node to controller channel manager for alter-partition shutdown (org.apache.kafka.server.NodeToControllerChannelManagerImpl)
+2026-11-23T08:14:20.883136670Z [2026-11-23 08:14:20,883] INFO [broker-3-to-controller-forwarding-channel-manager]: Shutting down (org.apache.kafka.server.NodeToControllerRequestThread)
+2026-11-23T08:14:20.883357597Z [2026-11-23 08:14:20,883] INFO Node to controller channel manager for forwarding shutdown (org.apache.kafka.server.NodeToControllerChannelManagerImpl)
+2026-11-23T08:14:20.883757237Z [2026-11-23 08:14:20,883] INFO Shutting down. (kafka.log.LogManager)
+2026-11-23T08:14:20.908758242Z [2026-11-23 08:14:20,908] INFO [broker-3-ThrottledChannelReaper-Fetch]: Shutting down (org.apache.kafka.server.quota.ClientQuotaManager$ThrottledChannelReaper)
+2026-11-23T08:14:20.909123645Z [2026-11-23 08:14:20,909] INFO [broker-3-ThrottledChannelReaper-Produce]: Shutting down (org.apache.kafka.server.quota.ClientQuotaManager$ThrottledChannelReaper)
+2026-11-23T08:14:20.909241987Z [2026-11-23 08:14:20,909] INFO [broker-3-ThrottledChannelReaper-Request]: Shutting down (org.apache.kafka.server.quota.ClientQuotaManager$ThrottledChannelReaper)
+2026-11-23T08:14:20.909378344Z [2026-11-23 08:14:20,909] INFO [broker-3-ThrottledChannelReaper-ControllerMutation]: Shutting down (org.apache.kafka.server.quota.ClientQuotaManager$ThrottledChannelReaper)
+2026-11-23T08:14:20.909832378Z [2026-11-23 08:14:20,909] INFO [SocketServer listenerType=BROKER, nodeId=3] Shutting down socket server (kafka.network.SocketServer)
+2026-11-23T08:14:20.917740846Z [2026-11-23 08:14:20,917] INFO [share-group-lock-timeout-reaper]: Shutting down (org.apache.kafka.server.util.timer.SystemTimerReaper$Reaper)
+2026-11-23T08:14:20.918457586Z [2026-11-23 08:14:20,918] INFO [PersisterStateManager]: Shutting down (org.apache.kafka.server.share.persister.PersisterStateManager$SendThread)
+2026-11-23T08:14:20.918731524Z [2026-11-23 08:14:20,918] INFO [persister-state-manager-reaper]: Shutting down (org.apache.kafka.server.util.timer.SystemTimerReaper$Reaper)
+2026-11-23T08:14:20.919275642Z [2026-11-23 08:14:20,919] INFO [client-metrics-reaper]: Shutting down (org.apache.kafka.server.util.timer.SystemTimerReaper$Reaper)
+2026-11-23T08:14:20.921075489Z [2026-11-23 08:14:20,920] INFO [raft-expiration-reaper]: Shutting down (org.apache.kafka.raft.TimingWheelExpirationService$ExpiredOperationReaper)
+2026-11-23T08:14:20.974845678Z [2026-11-23 08:14:20,974] INFO [kafka-3-raft-io-thread]: Shutting down (org.apache.kafka.raft.KafkaRaftClientDriver)
+2026-11-23T08:14:20.974872536Z [2026-11-23 08:14:20,974] INFO [RaftManager id=3] Beginning graceful shutdown (org.apache.kafka.raft.KafkaRaftClient)
+2026-11-23T08:14:20.975132273Z [2026-11-23 08:14:20,975] INFO [RaftManager id=3] Graceful shutdown completed (org.apache.kafka.raft.KafkaRaftClient)
+2026-11-23T08:14:20.975176204Z [2026-11-23 08:14:20,975] INFO [RaftManager id=3] Completed graceful shutdown of RaftClient (org.apache.kafka.raft.KafkaRaftClientDriver)
+2026-11-23T08:14:20.976305901Z [2026-11-23 08:14:20,976] INFO [kafka-3-raft-outbound-request-thread]: Shutting down (org.apache.kafka.raft.KafkaNetworkChannel$SendThread)
+2026-11-23T08:14:20.979779342Z [2026-11-23 08:14:20,979] INFO [controller-3-to-controller-registration-channel-manager]: Shutting down (org.apache.kafka.server.NodeToControllerRequestThread)
+2026-11-23T08:14:20.980105669Z [2026-11-23 08:14:20,980] INFO Node to controller channel manager for registration shutdown (org.apache.kafka.server.NodeToControllerChannelManagerImpl)
+2026-11-23T08:14:20.980538171Z [2026-11-23 08:14:20,980] WARN [NodeToControllerChannelManager id=3 name=registration] Attempting to close NetworkClient that has already been closed. (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:14:20.980586576Z [2026-11-23 08:14:20,980] INFO Node to controller channel manager for registration shutdown (org.apache.kafka.server.NodeToControllerChannelManagerImpl)
+2026-11-23T08:14:20.984340230Z [2026-11-23 08:14:20,984] INFO [SocketServer listenerType=CONTROLLER, nodeId=3] Shutting down socket server (kafka.network.SocketServer)
+2026-11-23T08:14:20.988434957Z [2026-11-23 08:14:20,988] INFO [ExpirationReaper-3-AlterAcls]: Shutting down (org.apache.kafka.server.purgatory.DelayedOperationPurgatory$ExpiredOperationReaper)
+2026-11-23T08:14:20.989296807Z [2026-11-23 08:14:20,989] INFO [controller-3-ThrottledChannelReaper-Fetch]: Shutting down (org.apache.kafka.server.quota.ClientQuotaManager$ThrottledChannelReaper)
+2026-11-23T08:14:20.989419468Z [2026-11-23 08:14:20,989] INFO [controller-3-ThrottledChannelReaper-Produce]: Shutting down (org.apache.kafka.server.quota.ClientQuotaManager$ThrottledChannelReaper)
+2026-11-23T08:14:20.989597780Z [2026-11-23 08:14:20,989] INFO [controller-3-ThrottledChannelReaper-Request]: Shutting down (org.apache.kafka.server.quota.ClientQuotaManager$ThrottledChannelReaper)
+2026-11-23T08:14:20.989763141Z [2026-11-23 08:14:20,989] INFO [controller-3-ThrottledChannelReaper-ControllerMutation]: Shutting down (org.apache.kafka.server.quota.ClientQuotaManager$ThrottledChannelReaper)
+--- tail ---
+2026-11-23T08:14:20.980105669Z [2026-11-23 08:14:20,980] INFO Node to controller channel manager for registration shutdown (org.apache.kafka.server.NodeToControllerChannelManagerImpl)
+2026-11-23T08:14:20.980234251Z [2026-11-23 08:14:20,980] INFO [ControllerRegistrationManager id=3 incarnation=Ml5XIK9STb6J49C_2JMFiA] closed event queue. (org.apache.kafka.queue.KafkaEventQueue)
+2026-11-23T08:14:20.980455316Z [2026-11-23 08:14:20,980] INFO [controller-3-to-controller-registration-channel-manager]: Shutdown completed (org.apache.kafka.server.NodeToControllerRequestThread)
+2026-11-23T08:14:20.980538171Z [2026-11-23 08:14:20,980] WARN [NodeToControllerChannelManager id=3 name=registration] Attempting to close NetworkClient that has already been closed. (org.apache.kafka.clients.NetworkClient)
+2026-11-23T08:14:20.980586576Z [2026-11-23 08:14:20,980] INFO Node to controller channel manager for registration shutdown (org.apache.kafka.server.NodeToControllerChannelManagerImpl)
+2026-11-23T08:14:20.981051647Z [2026-11-23 08:14:20,980] INFO [ControllerRegistrationManager id=3 incarnation=Ml5XIK9STb6J49C_2JMFiA] closed event queue. (org.apache.kafka.queue.KafkaEventQueue)
+2026-11-23T08:14:20.981891960Z [2026-11-23 08:14:20,981] INFO [SocketServer listenerType=CONTROLLER, nodeId=3] Stopping socket server request processors (kafka.network.SocketServer)
+2026-11-23T08:14:20.984132202Z [2026-11-23 08:14:20,984] INFO [SocketServer listenerType=CONTROLLER, nodeId=3] Stopped socket server request processors (kafka.network.SocketServer)
+2026-11-23T08:14:20.984180691Z [2026-11-23 08:14:20,984] INFO [QuorumController id=3] QuorumController#beginShutdown: shutting down event queue. (org.apache.kafka.queue.KafkaEventQueue)
+2026-11-23T08:14:20.984340230Z [2026-11-23 08:14:20,984] INFO [SocketServer listenerType=CONTROLLER, nodeId=3] Shutting down socket server (kafka.network.SocketServer)
+2026-11-23T08:14:20.987654098Z [2026-11-23 08:14:20,987] INFO [SocketServer listenerType=CONTROLLER, nodeId=3] Shutdown completed (kafka.network.SocketServer)
+2026-11-23T08:14:20.987843079Z [2026-11-23 08:14:20,987] INFO [data-plane Kafka Request Handler on Controller 3] shutting down (kafka.server.KafkaRequestHandlerPool)
+2026-11-23T08:14:20.988182136Z [2026-11-23 08:14:20,988] INFO [data-plane Kafka Request Handler on Controller 3] shut down completely (kafka.server.KafkaRequestHandlerPool)
+2026-11-23T08:14:20.988434957Z [2026-11-23 08:14:20,988] INFO [ExpirationReaper-3-AlterAcls]: Shutting down (org.apache.kafka.server.purgatory.DelayedOperationPurgatory$ExpiredOperationReaper)
+2026-11-23T08:14:20.988712725Z [2026-11-23 08:14:20,988] INFO [ExpirationReaper-3-AlterAcls]: Stopped (org.apache.kafka.server.purgatory.DelayedOperationPurgatory$ExpiredOperationReaper)
+2026-11-23T08:14:20.988719187Z [2026-11-23 08:14:20,988] INFO [ExpirationReaper-3-AlterAcls]: Shutdown completed (org.apache.kafka.server.purgatory.DelayedOperationPurgatory$ExpiredOperationReaper)
+2026-11-23T08:14:20.989296807Z [2026-11-23 08:14:20,989] INFO [controller-3-ThrottledChannelReaper-Fetch]: Shutting down (org.apache.kafka.server.quota.ClientQuotaManager$ThrottledChannelReaper)
+2026-11-23T08:14:20.989390499Z [2026-11-23 08:14:20,989] INFO [controller-3-ThrottledChannelReaper-Fetch]: Shutdown completed (org.apache.kafka.server.quota.ClientQuotaManager$ThrottledChannelReaper)
+2026-11-23T08:14:20.989395874Z [2026-11-23 08:14:20,989] INFO [controller-3-ThrottledChannelReaper-Fetch]: Stopped (org.apache.kafka.server.quota.ClientQuotaManager$ThrottledChannelReaper)
+2026-11-23T08:14:20.989419468Z [2026-11-23 08:14:20,989] INFO [controller-3-ThrottledChannelReaper-Produce]: Shutting down (org.apache.kafka.server.quota.ClientQuotaManager$ThrottledChannelReaper)
+2026-11-23T08:14:20.989556856Z [2026-11-23 08:14:20,989] INFO [controller-3-ThrottledChannelReaper-Produce]: Shutdown completed (org.apache.kafka.server.quota.ClientQuotaManager$ThrottledChannelReaper)
+2026-11-23T08:14:20.989566667Z [2026-11-23 08:14:20,989] INFO [controller-3-ThrottledChannelReaper-Produce]: Stopped (org.apache.kafka.server.quota.ClientQuotaManager$ThrottledChannelReaper)
+2026-11-23T08:14:20.989597780Z [2026-11-23 08:14:20,989] INFO [controller-3-ThrottledChannelReaper-Request]: Shutting down (org.apache.kafka.server.quota.ClientQuotaManager$ThrottledChannelReaper)
+2026-11-23T08:14:20.989699161Z [2026-11-23 08:14:20,989] INFO [controller-3-ThrottledChannelReaper-Request]: Stopped (org.apache.kafka.server.quota.ClientQuotaManager$ThrottledChannelReaper)
+2026-11-23T08:14:20.989720442Z [2026-11-23 08:14:20,989] INFO [controller-3-ThrottledChannelReaper-Request]: Shutdown completed (org.apache.kafka.server.quota.ClientQuotaManager$ThrottledChannelReaper)
+2026-11-23T08:14:20.989763141Z [2026-11-23 08:14:20,989] INFO [controller-3-ThrottledChannelReaper-ControllerMutation]: Shutting down (org.apache.kafka.server.quota.ClientQuotaManager$ThrottledChannelReaper)
+2026-11-23T08:14:20.989842590Z [2026-11-23 08:14:20,989] INFO [controller-3-ThrottledChannelReaper-ControllerMutation]: Stopped (org.apache.kafka.server.quota.ClientQuotaManager$ThrottledChannelReaper)
+2026-11-23T08:14:20.989847774Z [2026-11-23 08:14:20,989] INFO [controller-3-ThrottledChannelReaper-ControllerMutation]: Shutdown completed (org.apache.kafka.server.quota.ClientQuotaManager$ThrottledChannelReaper)
+2026-11-23T08:14:20.989893247Z [2026-11-23 08:14:20,989] INFO [QuorumController id=3] closed event queue. (org.apache.kafka.queue.KafkaEventQueue)
+2026-11-23T08:14:20.991264296Z [2026-11-23 08:14:20,991] INFO [SharedServer id=3] Stopping SharedServer (kafka.server.SharedServer)
+2026-11-23T08:14:20.991524369Z [2026-11-23 08:14:20,991] INFO [MetadataLoader id=3] beginShutdown: shutting down event queue. (org.apache.kafka.queue.KafkaEventQueue)
+2026-11-23T08:14:20.991641649Z [2026-11-23 08:14:20,991] INFO [SnapshotGenerator id=3] close: shutting down event queue. (org.apache.kafka.queue.KafkaEventQueue)
+2026-11-23T08:14:20.991740657Z [2026-11-23 08:14:20,991] INFO [SnapshotGenerator id=3] closed event queue. (org.apache.kafka.queue.KafkaEventQueue)
+2026-11-23T08:14:20.991839325Z [2026-11-23 08:14:20,991] INFO [MetadataLoader id=3] closed event queue. (org.apache.kafka.queue.KafkaEventQueue)
+2026-11-23T08:14:20.992372486Z [2026-11-23 08:14:20,992] INFO [SnapshotGenerator id=3] closed event queue. (org.apache.kafka.queue.KafkaEventQueue)
+2026-11-23T08:14:20.993037589Z [2026-11-23 08:14:20,992] INFO Metrics scheduler closed (org.apache.kafka.common.metrics.Metrics)
+2026-11-23T08:14:20.993114125Z [2026-11-23 08:14:20,993] INFO Closing reporter org.apache.kafka.common.metrics.JmxReporter (org.apache.kafka.common.metrics.Metrics)
+2026-11-23T08:14:20.993225303Z [2026-11-23 08:14:20,993] INFO Metrics reporters closed (org.apache.kafka.common.metrics.Metrics)
+2026-11-23T08:14:20.993692425Z [2026-11-23 08:14:20,993] INFO App info kafka.server for 3 unregistered (org.apache.kafka.common.utils.AppInfoParser)
+2026-11-23T08:14:20.994042238Z [2026-11-23 08:14:20,993] INFO App info kafka.server for 3 unregistered (org.apache.kafka.common.utils.AppInfoParser)

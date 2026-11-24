@@ -33,10 +33,14 @@ README_IMAGES = sorted(glob.glob(os.path.join(REPO, "docs", "assets", "readme", 
 
 
 def committed_environments():
+    # The throughput and failover runs this footer is for. A crash run draws its own footer
+    # (crash_report.footer_text, tested in test_kafka_compare_crash_report.py).
     out = []
     for run_dir in regenerate.committed_runs():
         with open(os.path.join(run_dir, "environment.json")) as handle:
-            out.append(json.load(handle))
+            env = json.load(handle)
+        if env.get("kind") != "crash":
+            out.append(env)
     return out
 
 
@@ -122,10 +126,12 @@ def test_every_kafka_png_carries_every_required_footer_field(path):
 @pytest.mark.parametrize("path", DOCS_IMAGES + README_IMAGES, ids=os.path.basename)
 def test_the_footer_in_the_metadata_is_the_run_the_image_is_drawn_from(path):
     # The raw text, not a parse of it (a parse could drop the same thing on both sides), and the
-    # run the chart is drawn from, not any committed run.
+    # run the chart is drawn from, not any committed run: the current run of its kind (a superseded run
+    # stays committed but is no longer drawn).
     name = os.path.basename(path)
     kind = "failover" if name.startswith("kafka-failover") else "throughput"
-    env = next(env for env in committed_environments() if env.get("kind", "throughput") == kind)
+    with open(os.path.join(REPO, regenerate.current_run(kind, REPO), "environment.json")) as handle:
+        env = json.load(handle)
     assert footer.footer_text(env) in svg_footer(path), f"{name} does not carry the footer of run {env['run_id']}"
 
 

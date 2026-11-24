@@ -1,0 +1,29 @@
+placement build variant n drained | median mib_per_s cpu_s_per_gib user_s_per_gib sys_s_per_gib max_rss_mib
+data v0.11.1 none-nocomp-w1 3 3 | 143.310 3.682 1.486 2.196 106.900
+data v0.11.0 none-nocomp-w1 3 3 | 143.680 3.944 1.494 2.449 105.600
+data v0.11.1 none-nocomp 3 3 | 143.860 3.796 1.519 2.358 248.100
+data v0.11.0 none-nocomp 3 3 | 143.570 4.098 1.539 2.559 230.600
+data v0.11.1 sha256-nocomp-w1 3 3 | 142.380 5.710 3.453 2.314 109.700
+data v0.11.0 sha256-nocomp-w1 3 3 | 142.270 5.952 3.349 2.634 108.000
+data v0.11.1 sha256-nocomp 3 3 | 142.410 6.111 3.545 2.584 254.500
+data v0.11.0 sha256-nocomp 3 3 | 141.800 6.468 3.511 2.930 278.000
+data v0.11.1 size-only 3 3 | 303.700 5.709 4.093 1.617 117.800
+data v0.11.0 size-only 3 3 | 285.730 5.881 4.239 1.664 128.500
+tmpfs v0.11.1 none-nocomp-w1 3 3 | 320.460 3.819 1.534 2.285 78.300
+tmpfs v0.11.0 none-nocomp-w1 3 3 | 322.940 3.783 1.488 2.314 78.100
+tmpfs v0.11.1 none-nocomp 3 3 | 318.860 3.915 1.582 2.353 81.300
+tmpfs v0.11.0 none-nocomp 3 3 | 322.330 3.799 1.454 2.343 80.400
+tmpfs v0.11.1 sha256-nocomp-w1 3 3 | 295.780 5.891 3.345 2.532 105.500
+tmpfs v0.11.0 sha256-nocomp-w1 3 3 | 296.220 5.846 3.402 2.449 105.900
+tmpfs v0.11.1 sha256-nocomp 3 3 | 306.130 5.995 3.515 2.492 107.300
+tmpfs v0.11.0 sha256-nocomp 3 3 | 307.420 5.934 3.399 2.644 102.200
+tmpfs v0.11.1 size-only 3 3 | 314.260 5.715 4.100 1.589 108.700
+tmpfs v0.11.0 size-only 3 3 | 313.260 5.712 4.145 1.605 109.500
+data v0.11.0 none-nocomp W8/W1: sys/GiB x1.04, cpu/GiB x1.04, MiB/s x1.00
+data v0.11.0 sha256-nocomp W8/W1: sys/GiB x1.11, cpu/GiB x1.09, MiB/s x1.00
+data v0.11.1 none-nocomp W8/W1: sys/GiB x1.07, cpu/GiB x1.03, MiB/s x1.00
+data v0.11.1 sha256-nocomp W8/W1: sys/GiB x1.12, cpu/GiB x1.07, MiB/s x1.00
+tmpfs v0.11.0 none-nocomp W8/W1: sys/GiB x1.01, cpu/GiB x1.00, MiB/s x1.00
+tmpfs v0.11.0 sha256-nocomp W8/W1: sys/GiB x1.08, cpu/GiB x1.02, MiB/s x1.04
+tmpfs v0.11.1 none-nocomp W8/W1: sys/GiB x1.03, cpu/GiB x1.03, MiB/s x1.00
+tmpfs v0.11.1 sha256-nocomp W8/W1: sys/GiB x0.98, cpu/GiB x1.02, MiB/s x1.03

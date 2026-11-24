@@ -1,0 +1,22 @@
+1795424360325753 start total=475000 rate=5000 batch=100 request_timeout_ms=30000
+1795424360335002 attempt=1 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=0
+1795424360340023 attempt=1 exit=1 acked=0 reason=:59:20.336734Z  INFO vtop_observe::otel: OpenTelemetry export disabled (OTEL_EXPORTER_OTLP_ENDPOINT unset) error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1795424360449464 attempt=2 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=0
+1795424360454521 attempt=2 exit=1 acked=0 reason=:59:20.451151Z  INFO vtop_observe::otel: OpenTelemetry export disabled (OTEL_EXPORTER_OTLP_ENDPOINT unset) error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1795424360564096 attempt=3 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=0
+1795424360569094 attempt=3 exit=1 acked=0 reason=:59:20.565758Z  INFO vtop_observe::otel: OpenTelemetry export disabled (OTEL_EXPORTER_OTLP_ENDPOINT unset) error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1795424360678648 attempt=4 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=0
+1795424360683748 attempt=4 exit=1 acked=0 reason=:59:20.680313Z  INFO vtop_observe::otel: OpenTelemetry export disabled (OTEL_EXPORTER_OTLP_ENDPOINT unset) error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1795424360793920 attempt=5 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=0
+1795424360799086 attempt=5 exit=1 acked=0 reason=:59:20.795650Z  INFO vtop_observe::otel: OpenTelemetry export disabled (OTEL_EXPORTER_OTLP_ENDPOINT unset) error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1795424360909114 attempt=6 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=0
+1795424360914273 attempt=6 exit=1 acked=0 reason=:59:20.910842Z  INFO vtop_observe::otel: OpenTelemetry export disabled (OTEL_EXPORTER_OTLP_ENDPOINT unset) error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1795424361024645 attempt=7 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=0
+1795424361029918 attempt=7 exit=1 acked=0 reason=:59:21.026371Z  INFO vtop_observe::otel: OpenTelemetry export disabled (OTEL_EXPORTER_OTLP_ENDPOINT unset) error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1795424361140264 attempt=8 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=0
+1795424361145356 attempt=8 exit=1 acked=0 reason=:59:21.141977Z  INFO vtop_observe::otel: OpenTelemetry export disabled (OTEL_EXPORTER_OTLP_ENDPOINT unset) error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1795424361255639 attempt=9 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=0
+1795424428195229 attempt=9 exit=3 acked=148100 reason=2026-11-23T08:59:21.257362Z  INFO vtop_observe::otel: OpenTelemetry export disabled (OTEL_EXPORTER_OTLP_ENDPOINT unset) produce interrupted: no answer to a 100-record batch within 30000 ms 
+1795424428305519 attempt=10 produce holder=aaaaaaaa-0000-0000-0000-0000000000a2 epoch=2 addr=vtop-2:9400 first=148100
+1795424506126647 attempt=10 exit=0 acked=475000 reason=2026-11-23T09:00:28.307210Z  INFO vtop_observe::otel: OpenTelemetry export disabled (OTEL_EXPORTER_OTLP_ENDPOINT unset) 
+1795424506127088 done acked=475000 attempts=10

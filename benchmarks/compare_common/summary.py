@@ -31,6 +31,7 @@ repeats none of their prose, only the headline charts, and links to them.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from collections.abc import Mapping, Sequence
@@ -326,7 +327,16 @@ def chart_spec(chart: SummaryChart, m: Measured) -> creport.Chart:
                          tuple(metric_of(m.spec, metric_id) for metric_id in chart.metrics))
 
 
-def kind_page(kind: str) -> str:
+def kind_page(kind: str, run_dir: str | None = None) -> str:
+    """The page that holds a run's full report, relative to the summary: the kind's default page, or the page the
+    run's `report.json` names (a split plan's runs each write their own, see run_outputs.py)."""
+    if run_dir is not None:
+        path = os.path.join(run_dir, "report.json")
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as handle:
+                doc = json.load(handle).get("doc")
+            if doc:
+                return os.path.relpath(doc, os.path.dirname(DOC_REL)).replace(os.sep, "/")
     return f"{report_spec(kind).doc_name}.md"
 
 
@@ -451,7 +461,7 @@ def _status_table(measured: Mapping[str, Measured], doc_dir: str, reg: dict[str,
             continue
         c = m.env["comparable"]
         body.append([kind, cases, f"`{m.env['run_id']}`", str(c.get("host_class")), str(m.env["plan"].get("name")),
-                     m.env["started_at"][:10], f"[full report]({kind_page(kind)})"])
+                     m.env["started_at"][:10], f"[full report]({kind_page(kind, m.run_dir)})"])
     return link_table(["comparison", "use cases", "run", "host class", "plan", "date", "page"], body)
 
 

@@ -1,0 +1,14 @@
+{
+  "file": "crash.csv",
+  "found": true,
+  "vtop_rows": 60,
+  "stuck_923": 0,
+  "stuck_by_crash_mode": {},
+  "stuck_by_config": {},
+  "vtop_status_counts": {
+    "ok": 60
+  },
+  "vtop_rows_by_crash_mode": {
+    "flakey-drop": 60
+  }
+}

@@ -6,7 +6,7 @@
   <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
    <cc:Work>
     <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
-    <dc:description>Versions read from: .github/workflows/ci.yml, .github/workflows/kafka-matrix.yml, .github/workflows/postgres-matrix.yml, Cargo.lock, benchmarks/kafka_compare/results/20261109T232328Z/environment.json, benchmarks/kafka_compare/results/failover-20261111T032549Z/environment.json, docker-compose.yml, tests/s3-compat/results/aws.json, tests/s3-compat/results/cloudserver.json, tests/s3-compat/results/garage.json, tests/s3-compat/results/rustfs.json, tests/s3-compat/results/seaweedfs.json, tests/s3-compat/results/versity.json</dc:description>
+    <dc:description>Versions read from: .github/workflows/ci.yml, .github/workflows/kafka-matrix.yml, .github/workflows/postgres-matrix.yml, Cargo.lock, benchmarks/kafka_compare/results/20261109T232328Z/environment.json, benchmarks/kafka_compare/results/failover-v0111-c6i4x/environment.json, docker-compose.yml, tests/s3-compat/results/aws.json, tests/s3-compat/results/cloudserver.json, tests/s3-compat/results/garage.json, tests/s3-compat/results/rustfs.json, tests/s3-compat/results/seaweedfs.json, tests/s3-compat/results/versity.json</dc:description>
     <dc:format>image/svg+xml</dc:format>
    </cc:Work>
   </rdf:RDF>

@@ -1,0 +1,5 @@
+range_created format=v1
+data_node_ready role=follower node=aaaaaaaa-0000-0000-0000-0000000000a2 replica=0.0.0.0:9300 metrics=0.0.0.0:9600
+2026-11-24T07:00:30.415257Z  INFO vtop_observe::otel: OpenTelemetry export disabled (OTEL_EXPORTER_OTLP_ENDPOINT unset)
+2026-11-24T07:00:30.415574Z  INFO vtop_observe::server: observability endpoint listening (/metrics, /healthz, /readyz) bound=0.0.0.0:9600 transport="plaintext"
+warning: replica endpoint 0.0.0.0:9300 is PLAINTEXT: peers carry no certificate, so no peer UUID exists. Sealed-segment transfers are REFUSED on this endpoint because the transfer allowlist has nothing to match; fencing is refused for the same reason, and promotion fences its followers — so this plane REPLICATES but does NOT FAIL OVER. TLS is what moves that boundary. Replication appends are served and are authenticated only by the fencing epoch.

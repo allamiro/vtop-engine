@@ -13,6 +13,9 @@ line-length = 120
 # `TimeoutError` for asyncio - both 3.11-only - turning a ruff release into a
 # red job and the "fix" into a break for 3.9/3.10 users.
 target-version = "py39"
+# Scripts committed beside a measurement are evidence, kept byte for byte as they ran on the host: never
+# reformatted, so never linted.
+extend-exclude = ["measurements"]
 
 [lint]
 # E/F: pycodestyle errors + pyflakes (unused imports, undefined names).

@@ -1,0 +1,149 @@
+range_created format=v1
+data_node_ready role=leader node=aaaaaaaa-0000-0000-0000-0000000000a1 native=0.0.0.0:9400 replica_status=0.0.0.0:9300 metrics=0.0.0.0:9600 kafka=0.0.0.0:9092
+2026-11-23T10:29:36.242821Z  INFO vtop_observe::otel: OpenTelemetry export disabled (OTEL_EXPORTER_OTLP_ENDPOINT unset)
+2026-11-23T10:29:36.243150Z  INFO vtop_observe::server: observability endpoint listening (/metrics, /healthz, /readyz) bound=0.0.0.0:9600 transport="plaintext"
+2026-11-23T10:29:36.308076Z  INFO vtop_node::data_node: group commit on for range aaaaaaaa-0000-0000-0000-0000000000c1: window 0 ms, up to 1024 records or 1048576 bytes per group, at most 256 queued. Concurrent produce requests share one fsync and one replication round; each is still acknowledged only after both. Set `group_commit.enabled: false` to return to one barrier per request range=aaaaaaaa-0000-0000-0000-0000000000c1 max_delay_ms=0 max_records=1024 max_bytes=1048576 max_pending_requests=256
+warning: kafka gateway on 0.0.0.0:9092 speaks Kafka's protocol, which carries no vtop identity: every peer that reaches it produces and fetches as producer 3a516edc-2dce-5295-8afb-5721418cc27e (derived from principal aaaaaaaa-0000-0000-0000-0000000000ce), and an idempotent producer as an identity derived from the range and its own id, the same on every replica (#225, #457)
+warning: replica endpoint 0.0.0.0:9300 is PLAINTEXT: peers carry no certificate, so no peer UUID exists. Sealed-segment transfers are REFUSED on this endpoint because the transfer allowlist has nothing to match; fencing is refused for the same reason, and promotion fences its followers — so this plane REPLICATES but does NOT FAIL OVER. TLS is what moves that boundary. Replication appends are served and are authenticated only by the fencing epoch.
+warning: native endpoint 0.0.0.0:9400 is PLAINTEXT: sessions carry no certificate, so a principal is whatever the client declares. Sessions are admitted only if the authorizer accepts unverified principals; the fencing epoch, producer epochs, and cursor binding still apply.
+2026-11-23T10:54:05.143756Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T10:54:05.143884Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T10:54:05.144203Z  WARN vtop_kafka::native: native produce held: an earlier set of this producer failed part-way at sequence 239943; sets past it are told to retry until its retry lands producer_id=459630384365944833 producer_epoch=0 first_sequence=240091 missing=239943
+2026-11-23T10:54:05.144281Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T10:54:05.144528Z  WARN vtop_kafka::native: native produce held: an earlier set of this producer failed part-way at sequence 239943; sets past it are told to retry until its retry lands producer_id=459630384365944833 producer_epoch=0 first_sequence=240239 missing=239943
+2026-11-23T10:54:05.144565Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T10:54:05.144728Z  WARN vtop_kafka::native: native produce held: an earlier set of this producer failed part-way at sequence 239943; sets past it are told to retry until its retry lands producer_id=459630384365944833 producer_epoch=0 first_sequence=240387 missing=239943
+2026-11-23T10:54:05.144759Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T10:54:05.144884Z  WARN vtop_kafka::native: native produce held: an earlier set of this producer failed part-way at sequence 239943; sets past it are told to retry until its retry lands producer_id=459630384365944833 producer_epoch=0 first_sequence=240535 missing=239943
+2026-11-23T10:54:05.144913Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T10:54:07.260892Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T10:54:07.260972Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T10:54:09.486093Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T10:54:09.486180Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T10:54:11.932996Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T10:54:11.933079Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T10:54:14.898428Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T10:54:14.898499Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T10:54:17.906442Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T10:54:17.906514Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T10:54:20.914137Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T10:54:20.914209Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T10:54:23.921503Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T10:54:23.921576Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T10:54:24.925064Z  INFO vtop_kafka::native: idempotent retry acknowledged with its original offset (#457) producer_id=459630384365944833 producer_epoch=0 first_sequence=239943 appends=1 below_window=false base_offset=9999943
+2026-11-23T11:18:39.091957Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T11:18:39.092026Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T11:18:39.092269Z  WARN vtop_kafka::native: native produce held: an earlier set of this producer failed part-way at sequence 1945021; sets past it are told to retry until its retry lands producer_id=459630699489854209 producer_epoch=0 first_sequence=1945169 missing=1945021
+2026-11-23T11:18:39.092307Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T11:18:39.092445Z  WARN vtop_kafka::native: native produce held: an earlier set of this producer failed part-way at sequence 1945021; sets past it are told to retry until its retry lands producer_id=459630699489854209 producer_epoch=0 first_sequence=1945317 missing=1945021
+2026-11-23T11:18:39.092476Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T11:18:39.092611Z  WARN vtop_kafka::native: native produce held: an earlier set of this producer failed part-way at sequence 1945021; sets past it are told to retry until its retry lands producer_id=459630699489854209 producer_epoch=0 first_sequence=1945465 missing=1945021
+2026-11-23T11:18:39.092671Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T11:18:39.092816Z  WARN vtop_kafka::native: native produce held: an earlier set of this producer failed part-way at sequence 1945021; sets past it are told to retry until its retry lands producer_id=459630699489854209 producer_epoch=0 first_sequence=1945613 missing=1945021
+2026-11-23T11:18:39.092857Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T11:18:41.201686Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T11:18:41.201753Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T11:18:43.405084Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T11:18:43.405152Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T11:18:45.870869Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T11:18:45.870927Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T11:18:48.699616Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T11:18:48.699699Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T11:18:51.710511Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T11:18:51.710584Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T11:18:54.722783Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T11:18:54.722855Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T11:18:57.735500Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T11:18:57.735578Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T11:19:00.747215Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T11:19:00.747289Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T11:19:03.758847Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T11:19:03.758919Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T11:19:06.168799Z  INFO vtop_kafka::native: idempotent retry acknowledged with its original offset (#457) producer_id=459630699489854209 producer_epoch=0 first_sequence=1945021 appends=1 below_window=false base_offset=19999901
+2026-11-23T11:43:16.632714Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T11:43:16.632781Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T11:43:16.633047Z  WARN vtop_kafka::native: native produce held: an earlier set of this producer failed part-way at sequence 885046; sets past it are told to retry until its retry lands producer_id=459631116286311169 producer_epoch=0 first_sequence=885194 missing=885046
+2026-11-23T11:43:16.633075Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T11:43:16.633201Z  WARN vtop_kafka::native: native produce held: an earlier set of this producer failed part-way at sequence 885046; sets past it are told to retry until its retry lands producer_id=459631116286311169 producer_epoch=0 first_sequence=885342 missing=885046
+2026-11-23T11:43:16.633224Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T11:43:16.633422Z  WARN vtop_kafka::native: native produce held: an earlier set of this producer failed part-way at sequence 885046; sets past it are told to retry until its retry lands producer_id=459631116286311169 producer_epoch=0 first_sequence=885490 missing=885046
+2026-11-23T11:43:16.633451Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T11:43:16.633587Z  WARN vtop_kafka::native: native produce held: an earlier set of this producer failed part-way at sequence 885046; sets past it are told to retry until its retry lands producer_id=459631116286311169 producer_epoch=0 first_sequence=885638 missing=885046
+2026-11-23T11:43:16.633613Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T11:43:18.761926Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T11:43:18.761997Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T11:43:21.000545Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T11:43:21.000619Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T11:43:23.425779Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T11:43:23.425851Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T11:43:26.285733Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T11:43:26.285806Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T11:43:29.253846Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T11:43:29.253926Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T11:43:32.267622Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T11:43:32.267705Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T11:43:35.279969Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T11:43:35.280040Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T11:43:38.291085Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T11:43:38.291167Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T11:43:41.305700Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T11:43:41.305786Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T11:43:43.940798Z  INFO vtop_kafka::native: idempotent retry acknowledged with its original offset (#457) producer_id=459631116286311169 producer_epoch=0 first_sequence=885046 appends=1 below_window=false base_offset=29999786
+2026-11-23T12:07:53.695473Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T12:07:53.695547Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T12:07:53.695826Z  WARN vtop_kafka::native: native produce held: an earlier set of this producer failed part-way at sequence 5355090; sets past it are told to retry until its retry lands producer_id=459631331654485249 producer_epoch=0 first_sequence=5355238 missing=5355090
+2026-11-23T12:07:53.695856Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T12:07:53.695976Z  WARN vtop_kafka::native: native produce held: an earlier set of this producer failed part-way at sequence 5355090; sets past it are told to retry until its retry lands producer_id=459631331654485249 producer_epoch=0 first_sequence=5355386 missing=5355090
+2026-11-23T12:07:53.695999Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T12:07:53.696110Z  WARN vtop_kafka::native: native produce held: an earlier set of this producer failed part-way at sequence 5355090; sets past it are told to retry until its retry lands producer_id=459631331654485249 producer_epoch=0 first_sequence=5355534 missing=5355090
+2026-11-23T12:07:53.696132Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T12:07:53.696419Z  WARN vtop_kafka::native: native produce held: an earlier set of this producer failed part-way at sequence 5355090; sets past it are told to retry until its retry lands producer_id=459631331654485249 producer_epoch=0 first_sequence=5355682 missing=5355090
+2026-11-23T12:07:53.696441Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T12:07:55.821919Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T12:07:55.822002Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T12:07:58.056862Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T12:07:58.056929Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T12:08:00.547867Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T12:08:00.547939Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T12:08:03.343574Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T12:08:03.343646Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T12:08:06.357987Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T12:08:06.358065Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T12:08:09.372620Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T12:08:09.372722Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T12:08:12.386562Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T12:08:12.386628Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T12:08:15.399110Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T12:08:15.399182Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T12:08:18.412066Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T12:08:18.412142Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T12:08:21.186781Z  INFO vtop_kafka::native: idempotent retry acknowledged with its original offset (#457) producer_id=459631331654485249 producer_epoch=0 first_sequence=5355090 appends=1 below_window=false base_offset=39999760
+2026-11-23T12:32:30.960246Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T12:32:30.960326Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T12:32:30.960564Z  WARN vtop_kafka::native: native produce held: an earlier set of this producer failed part-way at sequence 4295114; sets past it are told to retry until its retry lands producer_id=459631749433854465 producer_epoch=0 first_sequence=4295262 missing=4295114
+2026-11-23T12:32:30.960593Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T12:32:30.960742Z  WARN vtop_kafka::native: native produce held: an earlier set of this producer failed part-way at sequence 4295114; sets past it are told to retry until its retry lands producer_id=459631749433854465 producer_epoch=0 first_sequence=4295410 missing=4295114
+2026-11-23T12:32:30.960768Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T12:32:30.960886Z  WARN vtop_kafka::native: native produce held: an earlier set of this producer failed part-way at sequence 4295114; sets past it are told to retry until its retry lands producer_id=459631749433854465 producer_epoch=0 first_sequence=4295558 missing=4295114
+2026-11-23T12:32:30.960910Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T12:32:30.961035Z  WARN vtop_kafka::native: native produce held: an earlier set of this producer failed part-way at sequence 4295114; sets past it are told to retry until its retry lands producer_id=459631749433854465 producer_epoch=0 first_sequence=4295706 missing=4295114
+2026-11-23T12:32:30.961059Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T12:32:33.087860Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T12:32:33.087939Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T12:32:35.318266Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T12:32:35.318341Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T12:32:37.807796Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T12:32:37.807868Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T12:32:40.609837Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T12:32:40.609911Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T12:32:43.623333Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T12:32:43.623404Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T12:32:46.635368Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T12:32:46.635451Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T12:32:49.648224Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T12:32:49.648297Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T12:32:52.640615Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T12:32:52.640711Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T12:32:55.654029Z  WARN vtop_kafka::native: native produce refused code=Overloaded quorum not reached: 0 follower ack(s), need majority of 3 which=0 sequenced=true
+2026-11-23T12:32:55.654099Z  WARN vtop_kafka::gateway: kafka produce refused topic=bench partition=0 code=7 reason=the bridge refused the append with RequestTimedOut
+2026-11-23T12:32:58.626789Z  INFO vtop_kafka::native: idempotent retry acknowledged with its original offset (#457) producer_id=459631749433854465 producer_epoch=0 first_sequence=4295114 appends=1 below_window=false base_offset=49999644
