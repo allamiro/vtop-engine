@@ -277,6 +277,71 @@ def scrape_leader_metrics(system: str) -> str:
                "http://127.0.0.1:9600/metrics"], timeout=60).stdout
 
 
+# The leader's counters read around each saturation run of a group-commit run (#752): how many produce
+# requests shared how many barriers, how many groups overlapped the previous group's replication, and where
+# the flush time went. The group_commit_* series exist only while group commit is on; the phase family
+# always does.
+PRODUCE_COUNTERS = (
+    "vtop_broker_group_commit_requests_total",
+    "vtop_broker_group_commits_total",
+    "vtop_broker_group_commit_overlapped_total",
+    "vtop_broker_produce_phase_seconds_total",
+)
+PHASES = ("local_fsync", "replicate", "commit")
+_SAMPLE = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+(\S+)")
+_LABEL = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
+
+
+def parse_counters(metrics: str) -> dict[str, float]:
+    """The produce counters in a /metrics text: keyed by name, and the phase family by
+    `name{phase="..."}`, summed over any other label. A series the node does not export is absent."""
+    out: dict[str, float] = {}
+    for line in metrics.splitlines():
+        match = _SAMPLE.match(line)
+        if match is None or match.group(1) not in PRODUCE_COUNTERS:
+            continue
+        try:
+            value = float(match.group(3))
+        except ValueError:
+            continue
+        if not math.isfinite(value):
+            continue
+        labels = dict(_LABEL.findall(match.group(2) or ""))
+        key = match.group(1) + (f'{{phase="{labels["phase"]}"}}' if "phase" in labels else "")
+        out[key] = out.get(key, 0.0) + value
+    return out
+
+
+def counter_deltas(before: dict[str, float], after: dict[str, float]) -> dict[str, float]:
+    """`after - before` for each counter read both times. One that went backwards (the node restarted in
+    the window) is left out rather than recorded as a negative count."""
+    return {key: round(after[key] - before[key], 9) for key in sorted(before)
+            if key in after and after[key] >= before[key]}
+
+
+def scrape_counters(ctx: dict, system: str, tag: str) -> dict[str, float] | None:
+    """The leader's produce counters now, or None (said as an event) when they cannot be read: a missed
+    scrape leaves that run's counters out of the report, it does not stop the run."""
+    try:
+        return parse_counters(scrape_leader_metrics(system))
+    except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+        ctx["env"]["events"].append({"at": utc_now(), "system": system,
+                                     "event": f"{tag}: produce counters not read: {exc}"[:900]})
+        return None
+
+
+def record_counters(ctx: dict, row: dict[str, Any], before: dict[str, float] | None,
+                    after: dict[str, float] | None) -> None:
+    """What the counters moved by over one timed run, under the row's key, in `observed.vtop_produce_counters`
+    (not part of the fingerprint: a measurement, like the rows)."""
+    if before is None or after is None:
+        return
+    ctx["env"]["observed"].setdefault("vtop_produce_counters", []).append({
+        "mode": row["mode"], "record_size": row["record_size"], "producers": row["producers"],
+        "group_commit": row["group_commit"], "repetition": row["repetition"],
+        "deltas": counter_deltas(before, after)})
+
+
 def check_group_commit_applied(setting: str, metrics: str) -> int:
     """The node's own gauge says what the node is running. Returns it; raises GroupCommitNotApplied when it
     is missing or is not what `setting` asked for."""
@@ -788,14 +853,37 @@ def split_evenly(total: int, parts: int) -> list[int]:
     return [base + (1 if index < extra else 0) for index in range(parts)]
 
 
+def _steady_seconds(result: perftool.ProducerResult) -> float:
+    """How long one producer's steady-state window lasted: its records over its own rate."""
+    return result.records / result.records_per_sec if result.records_per_sec > 0 else 0.0
+
+
+def shared_window(results: list[perftool.ProducerResult]) -> float:
+    """Seconds of the one window that holds every producer's steady state (#752).
+
+    The producers are started together (`run_producers`), so the window runs from their common start to the
+    last one's end: the longest producer's own steady-state window, its records over its rate. Each
+    container starts on its own, a second or so apart at most against minutes of run, and that skew is not
+    corrected for, so this is a floor on the window."""
+    return max(_steady_seconds(result) for result in results)
+
+
 def combine_producers(results: list[perftool.ProducerResult]) -> perftool.ProducerResult:
-    """N concurrent producers as one row: their records and rates summed, and each latency column the worst
-    of theirs (`lat_basis` worst-of-N). The producers' windows overlap but each container starts on its own, so
-    the summed rate is the sum of their own rates, not a rate over one shared window; a percentile of the merged
-    latencies cannot exceed the worst producer's, so the worst is a bound on it."""
+    """N concurrent producers as one row: what they delivered over one shared window, and each latency
+    column the worst of theirs (`lat_basis` worst-of-N).
+
+    Throughput is the producers' steady-state records, and the MiB those carried, over the window from their
+    common start to the last one's end (`shared_window`). Adding each producer's own rate would overstate it
+    whenever the producers finish their equal shares at different times: 100,000 records in 1 s and 100,000
+    in 2 s add up to 150,000 records/s, where 200,000 records were delivered in 2 s, 100,000 records/s (#752
+    review). A percentile of the merged latencies cannot exceed the worst producer's, so the worst is a bound
+    on it."""
+    records = sum(r.records for r in results)
+    window = shared_window(results)
+    mib = sum(r.mib_per_sec * _steady_seconds(r) for r in results)
     return perftool.ProducerResult(
-        records=sum(r.records for r in results), records_per_sec=sum(r.records_per_sec for r in results),
-        mib_per_sec=sum(r.mib_per_sec for r in results), lat_avg_ms=max(r.lat_avg_ms for r in results),
+        records=records, records_per_sec=records / window if window > 0 else 0.0,
+        mib_per_sec=mib / window if window > 0 else 0.0, lat_avg_ms=max(r.lat_avg_ms for r in results),
         lat_max_ms=max(r.lat_max_ms for r in results), lat_p50_ms=max(r.lat_p50_ms for r in results),
         lat_p95_ms=max(r.lat_p95_ms for r in results), lat_p99_ms=max(r.lat_p99_ms for r in results),
         lat_p999_ms=max(r.lat_p999_ms for r in results), steady_state=all(r.steady_state for r in results))
@@ -1283,11 +1371,16 @@ def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | No
         handle.write(output)
 
     saturation = []
+    # The leader's group and phase counters around each saturation run of a group-commit run (#752).
+    counting = system == "vtop" and bool(group_commit)
     for rep in range(1, ctx["reps"] + 1):
         log(f"{tag}: saturation rep {rep}/{ctx['reps']} ({sat_records} records)")
         row = base_row(ctx, system, "saturation", size, rep, group_commit=group_commit)
+        before = scrape_counters(ctx, system, tag) if counting else None
         (result, note, wall, output), window, werr = measure(
             ctx, system, lambda: run_producers(ctx, system, sat_records, size, -1, ctx["sat_timeout"]))
+        if before is not None:
+            record_counters(ctx, row, before, scrape_counters(ctx, system, tag))
         _save_output(logs, f"{tag}-saturation-{rep}.log", output)
         if result is not None:
             saturation.append(result.records_per_sec)

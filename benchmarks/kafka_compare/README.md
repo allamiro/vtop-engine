@@ -47,10 +47,14 @@ every run already had, so a run of either shape is still schema 4.
 
 - **Producers.** Every measured run is N `kafka-producer-perf-test` containers at once against the same topic,
   each its own idempotent producer, offered `rate / N` and sent `records / N` (unthrottled for each at
-  saturation). A row sums their records and rates and carries the worst of their percentiles, with `lat_basis`
-  `worst-of-N`. A percentile of their latencies merged cannot exceed the worst producer's, so that is an upper
-  bound; and the producers' windows overlap but do not start together, so the summed rate is the sum of their
-  own rates. A producer that fails fails the row, naming it. One producer's appends are serialised in VTOP's
+  saturation). A row sums their records and carries the worst of their percentiles, with `lat_basis`
+  `worst-of-N`; a percentile of their latencies merged cannot exceed the worst producer's, so that is an upper
+  bound. Its records/s and MiB/s are what all of them delivered over one shared window: their steady-state
+  records (and the MiB those carried) over the window from their common start to the last one's end, the
+  longest producer's own steady-state window (its records over its rate). The containers start a second or so
+  apart at most, against minutes of run, and that skew is not corrected for. Adding the producers' own rates would overstate a row whose
+  producers finish at different times (100,000 records in 1 s and 100,000 in 2 s add up to 150,000 records/s,
+  where 200,000 were delivered in 2 s). A producer that fails fails the row, naming it. One producer's appends are serialised in VTOP's
   gateway, so group commit (#752) has something to merge only at more than one.
 - **Partitions.** Kafka's topic is created with N partitions; the smoke reads every partition from its start and
   requires every record back once and each partition's records in the order produced. VTOP is not measured at
@@ -116,6 +120,24 @@ python3 benchmarks/kafka_compare/run.py --group-commit off,on
   a *Group commit ablation* table (off, on, and the ratio of medians per record size), names the settings in
   the Method, the footer and the Environment table, and replaces the explanation of VTOP's per-request barrier
   with a pointer to the ablation.
+- **The leader's counters.** Around every VTOP saturation repetition of a `--group-commit` run, `run.py` reads
+  the leader's `/metrics` and records what moved, under the row's key, in `environment.json` under
+  `observed.vtop_produce_counters` (not part of the fingerprint): `vtop_broker_group_commit_requests_total`,
+  `vtop_broker_group_commits_total`, `vtop_broker_group_commit_overlapped_total` and
+  `vtop_broker_produce_phase_seconds_total{phase}` for `local_fsync`, `replicate` and `commit`. The window is the
+  client's whole run, warm-up records included. A scrape that fails is an event and leaves that repetition's
+  counters out; it does not stop the run. The ablation table then gives, per record size, the mean group size
+  (requests over commits), the share of groups whose local append ran while the previous group replicated,
+  and the milliseconds per request in each phase, all for `on`: with group commit off the node exports no
+  request count, so the off runs' phase totals stay in `environment.json`. The report refuses an entry `run.py`
+  would not write.
+- **Where it can show.** One producer never has two requests in the broker (the gateway answers a Produce
+  request before reading the next from that connection, and its bridge queues an idempotent producer's record
+  sets one after another), so at `--producers 1` every group is one request and on and off should measure the
+  same, as they did at 1 producer and 1 partition in the first AWS round on v0.11.1. Run the ablation at
+  several producers on one partition (`--producers 2`, `4`, `16`, one run each). Partitions do not merge: each
+  is its own range with its own coordinator. Pipelining one producer's requests, the only change that could
+  move the 1-producer cell, is not built.
 
 The only knob exposed for the ablation is `enabled`. `group_commit.max_delay_ms`, `max_records`, `max_bytes` and
 `max_pending_requests` stay at the node's defaults (natural batching, the plan's decision D1), so the run

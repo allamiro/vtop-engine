@@ -32,11 +32,39 @@ Phase 1 of [#595](https://github.com/allamiro/vtop-engine/issues/595) ([#596](ht
 
 ## Group commit ablation
 
-VTOP's produce throughput at saturation with the node's `group_commit.enabled` off and on (#752): the same cells, the same client, one VTOP cluster brought up fresh per setting. `on / off` is the ratio of the two medians (the ranges are in the throughput table above). It says how far the setting moved the cell, not why; a ratio near 1 means it did not.
+VTOP's produce throughput at saturation with the node's `group_commit.enabled` off and on (#752): the same cells, the same client, one VTOP cluster brought up fresh per setting. `on / off` is the ratio of the two medians (the ranges are in the throughput table above). It says how far the setting moved the cell, not why; a ratio near 1 means it did not. This run had 1 producer. The last three columns are the leader's own counters for the `on` runs.
 
-| record size | group commit off records/s | group commit on records/s | on / off |
-|---|---|---|---|
-| 100 B | 6,000 (6,000-6,000) | 6,000 (6,000-6,000) | 1.00x |
+| record size | group commit off records/s | group commit on records/s | on / off | mean group size (on) | overlapped (on) | ms per request (on) |
+|---|---|---|---|---|---|---|
+| 100 B | 6,000 (6,000-6,000) | 6,000 (6,000-6,000) | 1.00x | - | - | - |
+
+How to read it:
+
+- **One producer cannot show group commit.** A group can only hold requests that are in the broker at the same
+  time, and one producer never has two there: the gateway's session loop answers a Produce request before it
+  reads the next one from that connection, and the gateway's bridge to the broker queues an idempotent
+  producer's record sets one after another (the producer turnstile). So with one producer every group is one
+  request, and the setting can only show its own cost; a ratio near 1 there is the expected result, not
+  evidence that group commit does nothing. Several producers on one partition (`--producers N`: separate
+  connections, separate producer ids, one range) are what can share a barrier.
+- **Partitions do not merge.** A group is formed per range: each partition is its own range with its own
+  leader log and its own coordinator, and fsyncs of different logs cannot be shared. Several partitions are
+  not evidence for or against group commit.
+- **Pipelining one producer's requests is not built.** Letting one connection have several record sets in
+  flight before the earlier one is durable (answered in order) is the only change that could move the
+  1-producer cell; it is not part of group commit and does not exist yet.
+- **Several producers in one row.** A row's records/s and MiB/s are what all its producers delivered over one
+  shared window, from their common start to the last one's end, not the sum of their own rates, which would
+  overstate a row whose producers finish at different times.
+- **The counters.** `mean group size` is the leader's `vtop_broker_group_commit_requests_total` over
+  `vtop_broker_group_commits_total`; `overlapped` is the share of groups whose local append and fsync ran
+  while the previous group replicated (`vtop_broker_group_commit_overlapped_total`); the last column is
+  `vtop_broker_produce_phase_seconds_total` per phase (local fsync / replicate / commit) over the requests, so
+  a time shared by a group is divided among its requests. Each is read on the leader before and after every
+  saturation repetition of the `on` setting, summed over the repetitions; the window includes the tool's
+  warm-up records, which it produces and leaves out of its own rate. With group commit off the node exports
+  no request count, so the off runs' phase totals stay in `environment.json` under
+  `observed.vtop_produce_counters`. A dash is a cell whose counters were not read (named in `events`).
 
 ## Produce latency at fixed offered load
 

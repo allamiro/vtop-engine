@@ -38,7 +38,7 @@ pub mod replication;
 pub mod retention_stats;
 pub mod server_metrics;
 
-use crate::group_commit::{GroupCommitConfig, GroupCommitCoordinator, QueuedProduce};
+use crate::group_commit::{GroupCommitConfig, GroupCommitCoordinator, GroupStage, QueuedProduce};
 use crate::memory_budget::{reject_message, BudgetReservation, ConnectionBudget};
 use crate::produce_phases::ProducePhase;
 use crate::replication::network::PlaintextExposure;
@@ -1946,8 +1946,12 @@ impl LocalBroker {
             }
         };
         if let Some(coordinator) = &self.group_commit {
-            let frame =
-                coordinator.enqueue_and_wait(queued, |batch| self.flush_produce_group(batch));
+            // Staged (#752, E3): the next group's local append and fsync
+            // run while this group replicates, and the replicate-and-commit
+            // stages run one at a time, in offset order.
+            let frame = coordinator.enqueue_and_wait_staged(queued, |batch, stage| {
+                self.flush_admitted(batch, &[], Some(stage))
+            });
             drop(reservation);
             return frame;
         }
@@ -2059,14 +2063,29 @@ impl LocalBroker {
     /// Append every admitted member under one local durability barrier, then
     /// (for Quorum) one replica fan-out / HWM advance covering the group.
     fn flush_produce_group(&self, batch: &[QueuedProduce]) -> Vec<WireFrame> {
-        self.flush_admitted(batch, &[])
+        self.flush_admitted(batch, &[], None)
     }
 
     /// [`Self::flush_produce_group`], with `admitted[i]`, when present, the
     /// epoch an earlier pass over the same group left the producer epoch
     /// journal at after admitting `batch[i]` (see
     /// [`ProducerEpochJournal::still_admits`]). Empty for a first pass.
-    fn flush_admitted(&self, batch: &[QueuedProduce], admitted: &[Option<u64>]) -> Vec<WireFrame> {
+    ///
+    /// `stage`, given by the group-commit coordinator, splits the flush in
+    /// two (#752, E3): the group takes its place in the replicate order
+    /// under the state lock, right after its append, and once the locks are
+    /// released it waits for the groups appended before it to finish their
+    /// replicate-and-commit stage and hands the lead on, so the next group's
+    /// local append overlaps this group's replica round. Nothing about what
+    /// is acknowledged moves: a member is answered after its own fsync, a
+    /// quorum covering its offsets, and the lease re-check, all in this
+    /// call.
+    fn flush_admitted(
+        &self,
+        batch: &[QueuedProduce],
+        admitted: &[Option<u64>],
+        mut stage: Option<&mut GroupStage<'_>>,
+    ) -> Vec<WireFrame> {
         if batch.is_empty() {
             return Vec::new();
         }
@@ -2075,15 +2094,22 @@ impl LocalBroker {
         // group before a member that asks for another, so this cannot
         // happen; were it to, each run of one durability is flushed on its
         // own, in order, and no member is acknowledged at a weaker barrier
-        // than it asked for.
+        // than it asked for. Run alone, after every earlier group, so the
+        // two halves cannot overlap each other.
         if let Some(split) = batch
             .iter()
             .position(|item| item.request.durability != durability)
         {
+            if let Some(stage) = stage {
+                stage.drain();
+            }
             let mut frames =
-                self.flush_admitted(&batch[..split], admitted.get(..split).unwrap_or(&[]));
-            frames
-                .extend(self.flush_admitted(&batch[split..], admitted.get(split..).unwrap_or(&[])));
+                self.flush_admitted(&batch[..split], admitted.get(..split).unwrap_or(&[]), None);
+            frames.extend(self.flush_admitted(
+                &batch[split..],
+                admitted.get(split..).unwrap_or(&[]),
+                None,
+            ));
             return frames;
         }
         // Lock order: metadata lease view, then broker state. Hold both only
@@ -2215,6 +2241,15 @@ impl LocalBroker {
                 .record(ProducePhase::LocalFsync, fsync_started.elapsed());
             match appended {
                 Ok(outcomes) => {
+                    // The group's place in the replicate-and-commit order,
+                    // taken under the lock its offsets were assigned under,
+                    // so the order is the offset order (#752, E3). Only a
+                    // quorum group has a second stage to order.
+                    if durability == WireDurability::Quorum {
+                        if let Some(stage) = stage.as_deref_mut() {
+                            stage.appended();
+                        }
+                    }
                     // Reclaim AFTER the append that may have rolled, under
                     // the same lock, so the sealed prefix never outlives the
                     // policy by more than one group (#290).
@@ -2291,7 +2326,15 @@ impl LocalBroker {
 
         let (tip_before, leader_committed, wire_by_member) = match prepared {
             Ok(prepared) => prepared,
-            Err((problem, readmit)) => return self.flush_each_alone(batch, &problem, &readmit),
+            Err((problem, readmit)) => {
+                // The re-run does not overlap (#752, E3): it starts once no
+                // earlier group is replicating, and this group keeps the
+                // lead until it ends, so nothing starts behind it.
+                if let Some(stage) = stage {
+                    stage.drain();
+                }
+                return self.flush_each_alone(batch, &problem, &readmit);
+            }
         };
         if durability == WireDurability::LocalFsync {
             return batch
@@ -2378,6 +2421,14 @@ impl LocalBroker {
             offset_cursor = member_end.max(offset_cursor);
         }
 
+        // This group's turn (#752, E3): every group appended before it has
+        // finished its replicate-and-commit stage, so its round reaches each
+        // follower after theirs, in the offset order the follower's
+        // base-offset check requires. The lead passes here, so the next
+        // group's local append and fsync run during this round.
+        if let Some(stage) = stage {
+            stage.begin_replicate();
+        }
         let replicate_started = std::time::Instant::now();
         let quorum = replicas.replicate_append_batch(&replica_requests, leader_committed);
         let commit_started = std::time::Instant::now();
@@ -2503,7 +2554,11 @@ impl LocalBroker {
             .iter()
             .zip(readmit)
             .flat_map(|(item, readmit)| {
-                self.flush_admitted(std::slice::from_ref(item), std::slice::from_ref(readmit))
+                self.flush_admitted(
+                    std::slice::from_ref(item),
+                    std::slice::from_ref(readmit),
+                    None,
+                )
             })
             .collect()
     }

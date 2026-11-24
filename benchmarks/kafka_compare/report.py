@@ -580,7 +580,7 @@ def write_markdown(rows, env, run_id, csv_rel: str, env_rel: str, images: dict[s
                     "median records/s.")
     add("")
     if len(settings) >= 2:
-        add(ablation_section(rows, sizes, series))
+        add(ablation_section(rows, sizes, series, env))
     add("## Produce latency at fixed offered load")
     add("")
     add(f"![Produce latency]({images['produce-latency']})")
@@ -765,27 +765,119 @@ def reading(env: dict[str, Any], lowest_pct: int, group_commit_measured: bool) -
     return text.format(lowest_pct=lowest_pct, group_commit_item=item.rstrip("\n"), none_of_them=none_of_them)
 
 
-def ablation_section(rows, sizes: list[int], series: list[Series]) -> str:
-    """The group-commit ablation (#752): VTOP's saturation with the setting off and on, per record size."""
+# The leader's counters the harness reads around each saturation run of a group-commit run (run.py,
+# `observed.vtop_produce_counters`), and the phases of vtop_broker_produce_phase_seconds_total.
+GC_REQUESTS = "vtop_broker_group_commit_requests_total"
+GC_COMMITS = "vtop_broker_group_commits_total"
+GC_OVERLAPPED = "vtop_broker_group_commit_overlapped_total"
+PHASE_COUNTER = 'vtop_broker_produce_phase_seconds_total{{phase="{}"}}'
+PHASES = ("local_fsync", "replicate", "commit")
+
+# What the ablation can and cannot show, from how the gateway and the broker are built, not from the run.
+ABLATION_READING = """\
+How to read it:
+
+- **One producer cannot show group commit.** A group can only hold requests that are in the broker at the same
+  time, and one producer never has two there: the gateway's session loop answers a Produce request before it
+  reads the next one from that connection, and the gateway's bridge to the broker queues an idempotent
+  producer's record sets one after another (the producer turnstile). So with one producer every group is one
+  request, and the setting can only show its own cost; a ratio near 1 there is the expected result, not
+  evidence that group commit does nothing. Several producers on one partition (`--producers N`: separate
+  connections, separate producer ids, one range) are what can share a barrier.
+- **Partitions do not merge.** A group is formed per range: each partition is its own range with its own
+  leader log and its own coordinator, and fsyncs of different logs cannot be shared. Several partitions are
+  not evidence for or against group commit.
+- **Pipelining one producer's requests is not built.** Letting one connection have several record sets in
+  flight before the earlier one is durable (answered in order) is the only change that could move the
+  1-producer cell; it is not part of group commit and does not exist yet.
+- **Several producers in one row.** A row's records/s and MiB/s are what all its producers delivered over one
+  shared window, from their common start to the last one's end, not the sum of their own rates, which would
+  overstate a row whose producers finish at different times.
+- **The counters.** `mean group size` is the leader's `vtop_broker_group_commit_requests_total` over
+  `vtop_broker_group_commits_total`; `overlapped` is the share of groups whose local append and fsync ran
+  while the previous group replicated (`vtop_broker_group_commit_overlapped_total`); the last column is
+  `vtop_broker_produce_phase_seconds_total` per phase (local fsync / replicate / commit) over the requests, so
+  a time shared by a group is divided among its requests. Each is read on the leader before and after every
+  saturation repetition of the `on` setting, summed over the repetitions; the window includes the tool's
+  warm-up records, which it produces and leaves out of its own rate. With group commit off the node exports
+  no request count, so the off runs' phase totals stay in `environment.json` under
+  `observed.vtop_produce_counters`. A dash is a cell whose counters were not read (named in `events`)."""
+
+
+def _is_count(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value < float("inf")
+
+
+def counter_entries(env: dict[str, Any]) -> list[dict[str, Any]]:
+    """The leader's counter deltas the harness recorded (`observed.vtop_produce_counters`), each checked to be
+    what run.py writes; anything else is refused rather than read, before anything is drawn."""
+    entries = (env.get("observed") or {}).get("vtop_produce_counters") or []
+    if not isinstance(entries, list):
+        raise schema.ReportRefused("environment.json: observed.vtop_produce_counters is not a list")
+    for entry in entries:
+        deltas = entry.get("deltas") if isinstance(entry, dict) else None
+        if (not isinstance(deltas, dict) or not all(_is_count(value) for value in deltas.values())
+                or entry.get("group_commit") not in schema.GROUP_COMMITS):
+            raise schema.ReportRefused(f"environment.json: a vtop_produce_counters entry is malformed: {entry!r}"[:300])
+    return entries
+
+
+def _counter_totals(env: dict[str, Any], size: int, setting: str) -> dict[str, float] | None:
+    """The counters' deltas over the saturation repetitions of one record size and setting, summed; None
+    when none was read."""
+    totals: dict[str, float] = {}
+    found = False
+    for entry in counter_entries(env):
+        if (entry.get("mode"), entry.get("record_size"), entry.get("group_commit")) != ("saturation", size, setting):
+            continue
+        found = True
+        for key, value in entry["deltas"].items():
+            totals[key] = totals.get(key, 0.0) + float(value)
+    return totals if found else None
+
+
+def _counter_cells(totals: dict[str, float] | None) -> tuple[str, str, str]:
+    """(mean group size, overlapped share, ms per request per phase) for one cell's counters."""
+    requests = (totals or {}).get(GC_REQUESTS)
+    commits = (totals or {}).get(GC_COMMITS)
+    if not requests or not commits:
+        return "-", "-", "-"
+    overlapped = totals.get(GC_OVERLAPPED)
+    share = f"{overlapped / commits:.0%}" if overlapped is not None else "-"
+    per_request = " / ".join(f"{totals[PHASE_COUNTER.format(phase)] * 1000 / requests:.2f}"
+                             if PHASE_COUNTER.format(phase) in totals else "-" for phase in PHASES)
+    return f"{requests / commits:.2f}", share, per_request
+
+
+def ablation_section(rows, sizes: list[int], series: list[Series], env: dict[str, Any] | None = None) -> str:
+    """The group-commit ablation (#752): VTOP's saturation with the setting off and on, per record size, and
+    what the leader's own counters say about the groups the `on` runs formed."""
     off = next(ser for ser in series if ser.group_commit == "off")
     on = next(ser for ser in series if ser.group_commit == "on")
+    producers = (env or {}).get("matrix", {}).get("producers") or [1]
     lines = [
         "## Group commit ablation",
         "",
         "VTOP's produce throughput at saturation with the node's `group_commit.enabled` off and on (#752): the "
         "same cells, the same client, one VTOP cluster brought up fresh per setting. `on / off` is the ratio "
         "of the two medians (the ranges are in the throughput table above). It says how far the setting moved "
-        "the cell, not why; a ratio near 1 means it did not.",
+        "the cell, not why; a ratio near 1 means it did not. This run had "
+        f"{_counted(producers, 'producer')}. The last three columns are the leader's own counters for the `on` "
+        "runs.",
         "",
-        "| record size | group commit off records/s | group commit on records/s | on / off |",
-        "|---|---|---|---|",
+        "| record size | group commit off records/s | group commit on records/s | on / off "
+        "| mean group size (on) | overlapped (on) | ms per request (on) |",
+        "|---|---|---|---|---|---|---|",
     ]
     for size in sizes:
         cells = {ser.group_commit: cell_summary(rows, "vtop", "saturation", size, "records_per_sec",
                                                 group_commit=ser.group_commit) for ser in (off, on)}
         ratio = _ratio(cells["on"], cells["off"])
+        group, share, per_request = _counter_cells(_counter_totals(env or {}, size, "on"))
         lines.append(f"| {size_label(size)} | {_summary_cell(cells['off'])} | {_summary_cell(cells['on'])} | "
-                     f"{f'{ratio:.2f}x' if ratio is not None else '-'} |")
+                     f"{f'{ratio:.2f}x' if ratio is not None else '-'} | {group} | {share} | {per_request} |")
+    lines.append("")
+    lines.append(ABLATION_READING)
     lines.append("")
     return "\n".join(lines)
 
@@ -831,10 +923,11 @@ def known_gaps(env: dict[str, Any]) -> str:
     if max(producers) > 1:
         lines.append(
             f"- **{_counted(producers, 'producer')}, worst of their percentiles.** Each producer is its own perf-tool "
-            "container and\n  idempotent producer, offered its share of the rate. A row sums their records and "
-            "rates (over windows that overlap\n  but do not start together) and carries the worst of their "
-            "percentiles (`lat_basis` worst-of-N): a percentile of\n  all their latencies merged cannot exceed the "
-            "worst producer's, so the latencies are an upper bound.")
+            "container and\n  idempotent producer, offered its share of the rate. A row's rate is their records over "
+            "one shared window (they\n  start together, so it is the longest producer's steady-state window), "
+            "not the sum of their own rates, and it\n  carries the worst of their percentiles (`lat_basis` "
+            "worst-of-N): a percentile of all their latencies merged\n  cannot exceed the worst producer's, so the "
+            "latencies are an upper bound.")
     fixed = KNOWN_GAPS_FIXED
     if extra_charts.has_e2e(env) or extra_charts.has_resources(env):
         measured = [what for what, present in (("end-to-end latency", extra_charts.has_e2e(env)),
@@ -911,6 +1004,7 @@ def build(run_dir: str, img_dir: str, doc_path: str) -> list[str]:
 
     run = schema.load_run(run_dir)  # raises ReportRefused before anything is written
     check_drawable(run.rows, run.environment, run.hist)
+    counter_entries(run.environment)
     plt = _setup_matplotlib()
     os.makedirs(img_dir, exist_ok=True)
     os.makedirs(os.path.dirname(os.path.abspath(doc_path)), exist_ok=True)

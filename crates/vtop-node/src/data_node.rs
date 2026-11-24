@@ -6012,6 +6012,13 @@ mod group_commit_wiring_tests {
                  or split:\n{after}"
             );
         }
+        // Exported whenever group commit is on (#752, E3). Its value depends
+        // on how the concurrent requests happened to meet, so only its
+        // presence is checked.
+        assert!(
+            sample(&after, "vtop_broker_group_commit_overlapped_total").is_some(),
+            "the overlap counter is exported while group commit is on:\n{after}"
+        );
         // The replicate phase ran: the group was a quorum write, not a local one.
         assert!(
             sample(

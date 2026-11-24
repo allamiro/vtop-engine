@@ -789,6 +789,98 @@ fn fencing_still_works_with_networked_group_commit() {
     assert_eq!(h.cluster_committed.get(), 1);
 }
 
+/// #752, E3, over the real replica plane: concurrent producers on one range
+/// with group commit on. A group's local append runs while the previous
+/// group replicates, and the replica rounds still reach each follower's
+/// driver one at a time, in offset order. Had two rounds reached a follower
+/// out of order, its base-offset check would refuse the later one and the
+/// session would resynchronise, and with both followers refusing, the
+/// produce would come back `Overloaded`: every request here must be
+/// acknowledged, the mark must cover them all, and both followers must end
+/// with the leader's whole log.
+#[test]
+fn concurrent_producers_with_overlapped_groups_replicate_in_order() {
+    const PRODUCERS: u128 = 6;
+    const REQUESTS: u64 = 5;
+    let h = harness_with(
+        FlowControlConfig {
+            ack_timeout: Duration::from_secs(10),
+            ..FlowControlConfig::default()
+        },
+        Some(GroupCommitConfig {
+            max_delay: Duration::ZERO,
+            max_records: 4,
+            max_bytes: 64 * 1024,
+            max_pending_requests: 64,
+        }),
+        None,
+        None,
+        FollowerAddressing::Resolved,
+    );
+    // The harness waits for both follower sessions but does not insist on
+    // them. A request sent before a session is up misses its quorum for that
+    // reason alone, which this test would mistake for a pair of rounds
+    // reaching a follower out of order, so it starts only once both are up.
+    // No produce is retried: a quorum miss from then on fails the test.
+    for node in [FOLLOWER_1, FOLLOWER_2] {
+        assert!(
+            await_within(Duration::from_secs(10), || {
+                h.replica_set.follower_connected(node) == Some(true)
+            }),
+            "follower {node} had no live session 10 s after the harness started"
+        );
+    }
+    let threads: Vec<_> = (0..PRODUCERS)
+        .map(|producer| {
+            let leader = Arc::clone(&h.leader);
+            let range = h.range.clone();
+            std::thread::spawn(move || {
+                for sequence in 0..REQUESTS {
+                    let frame = WireFrame {
+                        request_id: sequence + 1,
+                        stream_id: 1,
+                        message: Message::ProduceRequest(ProduceRequest {
+                            range: range.clone(),
+                            fencing_epoch: FENCING_EPOCH,
+                            producer_id: Uuid::from_u128(0xC0 + producer),
+                            producer_epoch: 1,
+                            first_sequence: sequence,
+                            durability: WireDurability::Quorum,
+                            records: vec![ProduceRecord {
+                                timestamp_millis: 1_000,
+                                key: b"k".to_vec(),
+                                value: format!("p{producer}-v{sequence}").into_bytes(),
+                            }],
+                        }),
+                    };
+                    match leader.handle(Role::Producer, frame).message {
+                        Message::ProduceResponse(_) => {}
+                        other => panic!(
+                            "producer {producer}, request {sequence}, was not acknowledged: \
+                             {other:?}"
+                        ),
+                    }
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    let total = PRODUCERS as u64 * REQUESTS;
+    assert_eq!(h.cluster_committed.get(), total);
+    assert_eq!(h.leader.local_offsets(), (total, total));
+    for follower in &h.followers {
+        assert!(
+            await_within(Duration::from_secs(10), || {
+                follower.local_committed_offset() == total
+            }),
+            "a follower ended at {} of the leader's {total} records",
+            follower.local_committed_offset()
+        );
+    }
+}
+
 /// Wait for a follower stream to drop and come back after `force_reconnect`.
 fn wait_reconnect(replica_set: &NetworkedReplicaSet, node_id: Uuid) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);

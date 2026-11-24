@@ -547,8 +547,11 @@ def test_each_setting_is_its_own_series_in_the_tables(built):
 def test_the_ablation_table_gives_each_record_size_off_on_and_the_ratio(built):
     _docs, _paths, text = built
     section = text.split("## Group commit ablation")[1].split("\n## ")[0]
-    assert "| record size | group commit off records/s | group commit on records/s | on / off |" in section
+    assert ("| record size | group commit off records/s | group commit on records/s | on / off "
+            "| mean group size (on) | overlapped (on) | ms per request (on) |") in section
     assert section.count("| 100 B |") == 1
+    # No counters were read in this run: the counter columns say so with a dash, not a number.
+    assert "| 2.50x | - | - | - |" in section
 
 
 def test_the_environment_table_names_the_settings(built):
@@ -646,3 +649,165 @@ def test_the_matrix_copy_in_the_environment_is_not_mutated_by_drawing(tmp_path):
     report.build(directory, str(docs / "img"), str(docs / "kafka-comparison.md"))
     with open(os.path.join(directory, "environment.json")) as handle:
         assert json.load(handle) == before
+
+
+# ------------------------------------------- the leader's counters and several producers (#752)
+
+METRICS = """\
+# HELP vtop_broker_group_commit_requests_total Produce requests folded into commit groups
+# TYPE vtop_broker_group_commit_requests_total counter
+vtop_broker_group_commit_requests_total {requests}
+vtop_broker_group_commits_total {commits}
+vtop_broker_group_commit_overlapped_total {overlapped}
+vtop_broker_group_commit_enabled 1
+vtop_broker_produce_phase_seconds_total{{phase="local_fsync"}} {fsync}
+vtop_broker_produce_phase_seconds_total{{phase="replicate"}} {replicate}
+vtop_broker_produce_phase_seconds_total{{phase="commit"}} 0.5
+"""
+
+
+def metrics(requests=0, commits=0, overlapped=0, fsync=0.0, replicate=0.0):
+    return METRICS.format(requests=requests, commits=commits, overlapped=overlapped, fsync=fsync,
+                          replicate=replicate)
+
+
+def test_the_counters_are_parsed_from_the_nodes_text():
+    parsed = run.parse_counters(metrics(requests=12, commits=4, overlapped=3, fsync=1.25, replicate=2.5))
+    assert parsed == {
+        "vtop_broker_group_commit_requests_total": 12.0,
+        "vtop_broker_group_commits_total": 4.0,
+        "vtop_broker_group_commit_overlapped_total": 3.0,
+        'vtop_broker_produce_phase_seconds_total{phase="local_fsync"}': 1.25,
+        'vtop_broker_produce_phase_seconds_total{phase="replicate"}': 2.5,
+        'vtop_broker_produce_phase_seconds_total{phase="commit"}': 0.5,
+    }
+
+
+def test_a_counter_that_went_backwards_is_left_out_not_recorded_negative():
+    assert run.counter_deltas({"a": 10.0, "b": 5.0, "c": 1.0}, {"a": 15.0, "b": 2.0}) == {"a": 5.0}
+
+
+def test_each_saturation_repetition_records_what_the_counters_moved_by(monkeypatch, tmp_path):
+    _fake_cluster(monkeypatch)
+    scrapes = iter([
+        metrics(),  # the gauge check after the cluster came up
+        metrics(), metrics(requests=40, commits=10, overlapped=4, fsync=1.0, replicate=2.0),
+        metrics(requests=40, commits=10, overlapped=4, fsync=1.0, replicate=2.0),
+        metrics(requests=100, commits=20, overlapped=9, fsync=1.5, replicate=4.0),
+    ])
+    monkeypatch.setattr(run, "scrape_leader_metrics", lambda system: next(scrapes))
+    ctx = {**_ctx(tmp_path, {"on": run.leader_config(LEADER, "on", {"enabled"})}), "reps": 2}
+    run.run_cell(ctx, "vtop", 100, {25: 10, 50: 20, 75: 30}, group_commit="on")
+    entries = ctx["env"]["observed"]["vtop_produce_counters"]
+    assert [(e["mode"], e["record_size"], e["group_commit"], e["repetition"]) for e in entries] \
+        == [("saturation", 100, "on", 1), ("saturation", 100, "on", 2)]
+    assert entries[0]["deltas"]["vtop_broker_group_commit_requests_total"] == 40.0
+    assert entries[1]["deltas"]["vtop_broker_group_commits_total"] == 10.0
+    assert entries[1]["deltas"]['vtop_broker_produce_phase_seconds_total{phase="replicate"}'] == 2.0
+
+
+def test_a_missed_scrape_is_an_event_and_the_run_goes_on(monkeypatch, tmp_path):
+    _fake_cluster(monkeypatch)
+    said = []
+
+    def scrape(_system):
+        said.append(1)
+        if len(said) == 1:
+            return metrics()  # the gauge check
+        raise RuntimeError("docker exec ... exited 1: curl failed")
+
+    monkeypatch.setattr(run, "scrape_leader_metrics", scrape)
+    ctx = _ctx(tmp_path, {"on": run.leader_config(LEADER, "on", {"enabled"})})
+    run.run_cell(ctx, "vtop", 100, {25: 10, 50: 20, 75: 30}, group_commit="on")
+    assert "vtop_produce_counters" not in ctx["env"]["observed"]
+    assert any("produce counters not read" in event["event"] for event in ctx["env"]["events"])
+    with open(ctx["csv"], newline="") as handle:
+        assert {row["status"] for row in csv.DictReader(handle)} == {"ok"}
+
+
+def _result(records, rps):
+    return run.perftool.ProducerResult(records=records, records_per_sec=rps, mib_per_sec=rps / 10_000,
+                                       lat_avg_ms=1.0, lat_max_ms=2.0, lat_p50_ms=1.0, lat_p95_ms=1.0,
+                                       lat_p99_ms=2.0, lat_p999_ms=2.0, steady_state=True)
+
+
+def test_producers_finishing_at_different_times_are_not_summed():
+    # The review's example: 100,000 records in 1 s and 100,000 in 2 s. Adding the two rates says
+    # 150,000 records/s; 200,000 records were delivered in 2 s, which is 100,000 records/s.
+    fast, slow = _result(100_000, 100_000.0), _result(100_000, 50_000.0)
+    assert fast.records_per_sec + slow.records_per_sec == 150_000.0
+    combined = run.combine_producers([fast, slow])
+    assert combined.records == 200_000
+    assert combined.records_per_sec == pytest.approx(100_000.0)
+    assert combined.mib_per_sec == pytest.approx((fast.mib_per_sec * 1 + slow.mib_per_sec * 2) / 2)
+    assert run.shared_window([fast, slow]) == pytest.approx(2.0)
+
+
+def test_producers_finishing_together_add_up():
+    one = _result(100_000, 100_000.0)
+    assert run.combine_producers([one, one]).records_per_sec == pytest.approx(200_000.0)
+
+
+def _counter_entry(size, setting, rep, requests, commits, overlapped, fsync, replicate, commit):
+    return {"mode": "saturation", "record_size": size, "producers": 1, "group_commit": setting,
+            "repetition": rep, "deltas": {
+                "vtop_broker_group_commit_requests_total": requests,
+                "vtop_broker_group_commits_total": commits,
+                "vtop_broker_group_commit_overlapped_total": overlapped,
+                'vtop_broker_produce_phase_seconds_total{phase="local_fsync"}': fsync,
+                'vtop_broker_produce_phase_seconds_total{phase="replicate"}': replicate,
+                'vtop_broker_produce_phase_seconds_total{phase="commit"}': commit}}
+
+
+def counted_environment():
+    env = axis_environment()
+    entries = []
+    for rep in (1, 2, 3):
+        # 600 requests in 200 groups over the three repetitions, half of them overlapped.
+        entries.append(_counter_entry(100, "on", rep, 200, 66 + (rep <= 2), 33 + (rep == 1), 1.0, 2.0, 0.1))
+        entries.append({"mode": "saturation", "record_size": 100, "producers": 1, "group_commit": "off",
+                        "repetition": rep, "deltas": {
+                            'vtop_broker_produce_phase_seconds_total{phase="local_fsync"}': 3.0}})
+    env["observed"]["vtop_produce_counters"] = entries
+    return env
+
+
+@pytest.fixture
+def counted(tmp_path):
+    pytest.importorskip("matplotlib")
+    env = counted_environment()
+    directory = write_run(str(tmp_path / "run"), env, _axis_rows(env))
+    docs = tmp_path / "docs"
+    report.build(directory, str(docs / "img"), str(docs / "kafka-comparison.md"))
+    return (docs / "kafka-comparison.md").read_text().split("## Group commit ablation")[1].split("\n## ")[0]
+
+
+def test_the_ablation_gives_the_counters_of_the_on_runs(counted):
+    # 600 requests in 200 groups, 100 overlapped; 3 s of fsync over 600 requests is 5 ms each.
+    assert "| 2.50x | 3.00 | 50% | 5.00 / 10.00 / 0.50 |" in counted
+    # The 1 KiB cell has no counters recorded: dashes, not numbers.
+    assert "| 1 KiB |" in counted and counted.split("| 1 KiB |")[1].split("\n")[0].endswith("| - | - | - |")
+
+
+def test_the_ablation_says_what_one_producer_and_several_partitions_cannot_show(counted):
+    assert "One producer cannot show group commit." in counted
+    assert "producer turnstile" in counted and "answers a Produce request before it" in counted
+    assert "Partitions do not merge." in counted
+    assert "Pipelining one producer's requests is not built." in counted
+    assert "not the sum of their\n  own rates" in counted or "not the sum of their own rates" in counted
+
+
+def test_a_malformed_counters_entry_is_refused_before_anything_is_drawn(tmp_path):
+    env = counted_environment()
+    env["observed"]["vtop_produce_counters"][0]["deltas"]["vtop_broker_group_commits_total"] = -1
+    directory = write_run(str(tmp_path / "run"), env, _axis_rows(env))
+    with pytest.raises(schema.ReportRefused, match="malformed"):
+        report.build(directory, str(tmp_path / "img"), str(tmp_path / "doc.md"))
+    assert not (tmp_path / "doc.md").exists()
+
+
+def test_the_counters_are_not_part_of_the_fingerprint():
+    env = counted_environment()
+    bare = copy.deepcopy(env)
+    bare["observed"] = {}
+    assert schema.fingerprint(env) == schema.fingerprint(bare)

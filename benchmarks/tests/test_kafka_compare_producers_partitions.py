@@ -4,8 +4,9 @@ Every row used to be 1 partition and 1 producer: `run_cell` hard-coded both and 
 idempotent producer's appends are serialised in VTOP's gateway, so group commit had nothing to merge.
 
 - Producers: N concurrent `kafka-producer-perf-test` containers, each its own idempotent producer, each offered
-  `rate / N` and sent `records / N`. The row sums their records and rates and carries the worst of their
-  percentiles, `lat_basis = worst-of-N`.
+  `rate / N` and sent `records / N`. The row sums their records over one shared window (the longest
+  producer's steady-state window, not the sum of their rates) and carries the worst of their percentiles,
+  `lat_basis = worst-of-N`.
 - Partitions: Kafka's topic is created with N partitions and the smoke reads every one. VTOP's gateway serves
   one partition per node process, one range each, so N partitions is N replicated ranges, 3N processes, which
   this harness's three single-process nodes at Kafka's per-node limits do not hold: VTOP's rows at N > 1 are
