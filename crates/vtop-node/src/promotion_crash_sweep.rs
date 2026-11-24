@@ -120,14 +120,33 @@
 //! with a fence, so such a run fails the sweep. Reproduction, kept as a
 //! guard:
 //! `reproduction_a_returning_deposed_leader_keeps_its_unacknowledged_suffix_under_the_mark`.
+//!
+//! # Client histories (#728)
+//!
+//! With `VTOP_SWEEP_HISTORY_DIR` set, a run is also written as the history a
+//! client would have recorded, in the format
+//! `scripts/live-chaos/history/check_history.py` reads, so the checker the
+//! live scenarios use judges the same run independently of the assertions
+//! above. It holds acknowledgements and reads only: every producer
+//! acknowledgement in order (a second one at the same offset stays, which is
+//! how the checker sees a replaced record), every record a leader sent and
+//! never acknowledged as indeterminate, then one read of every replica's
+//! durable log up to the final leader's high-water mark, the final leader's
+//! last. A run in which no leader finished ends with a read no node could
+//! serve. Written: each shape's run with no fault, the reproductions, and the
+//! first few failing runs of each sweep (`VTOP_SWEEP_HISTORY_FAILING`,
+//! default 5), never one file per swept run. Unset, nothing is written.
+//! `scripts/live-chaos/history/reintroduce/run.sh --sweep` runs this on a
+//! build with a fixed bug re-introduced and requires the checker to flag it.
 
 // A node is an index into the cluster, `NAMES` and the trace arrays at once.
 #![allow(clippy::needless_range_loop)]
 
 use crate::promotion::{establish, fenced_lineage, Promotion, ReplicaProbe};
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 use vtop_broker::committed_floor::CommittedFloorFile;
@@ -264,6 +283,145 @@ enum Violation {
     Liveness(String),
 }
 
+/// Where each written run's client history goes; unset, nothing is written.
+const HISTORY_DIR: &str = "VTOP_SWEEP_HISTORY_DIR";
+/// Failing runs written per swept shape: the sweeps are thousands of runs.
+const HISTORY_FAILING: &str = "VTOP_SWEEP_HISTORY_FAILING";
+const HISTORY_FAILING_DEFAULT: usize = 5;
+/// The one producer stream every record belongs to in a written history.
+const HISTORY_PRODUCER: &str = "sweep-producer";
+
+/// A run as a client saw it (see "Client histories" above).
+#[derive(Debug, Default)]
+struct ClientHistory {
+    /// The producer sequence of each record value, in the order each was
+    /// first sent. Values are unique within a run, so a sequence names one
+    /// record across the whole history, which is how the checker matches
+    /// a read to an acknowledgement.
+    sequences: HashMap<String, u64>,
+    /// Every acknowledgement to a producer, in order: (sequence, offset).
+    acks: Vec<(u64, u64)>,
+    /// One read per replica, the final leader's last: (node, its durable
+    /// records, the final leader's high-water mark).
+    reads: Vec<(usize, BTreeMap<u64, String>, u64)>,
+    /// No leader finished, so the final read found no node to serve it.
+    unserved: bool,
+}
+
+impl ClientHistory {
+    fn sent(&mut self, value: &str) {
+        let next = self.sequences.len() as u64;
+        self.sequences.entry(value.to_owned()).or_insert(next);
+    }
+
+    fn acknowledged(&mut self, value: &str, offset: u64) {
+        self.sent(value);
+        let sequence = self.sequences[value];
+        self.acks.push((sequence, offset));
+    }
+
+    /// The history as JSON lines, one event per line, in time order.
+    fn render(&self) -> String {
+        let mut lines = Vec::new();
+        let mut time = 0_u64;
+        let mut event = |mut value: Value| {
+            time += 1;
+            value["time_us"] = json!(time);
+            lines.push(value.to_string());
+        };
+        let mut batch = 0_u64;
+        for (sequence, offset) in &self.acks {
+            batch += 1;
+            event(
+                json!({"op": "produce", "type": "invoke", "process": HISTORY_PRODUCER,
+                "batch": batch, "first_sequence": sequence, "count": 1}),
+            );
+            event(
+                json!({"op": "produce", "type": "ok", "process": HISTORY_PRODUCER,
+                "batch": batch, "first_offset": offset, "committed_next_offset": offset + 1}),
+            );
+        }
+        // Sent and never acknowledged: visible once or not at all.
+        let acked: BTreeSet<u64> = self.acks.iter().map(|(sequence, _)| *sequence).collect();
+        let mut unacked: Vec<u64> = self
+            .sequences
+            .values()
+            .copied()
+            .filter(|sequence| !acked.contains(sequence))
+            .collect();
+        unacked.sort_unstable();
+        for sequence in unacked {
+            batch += 1;
+            event(
+                json!({"op": "produce", "type": "invoke", "process": HISTORY_PRODUCER,
+                "batch": batch, "first_sequence": sequence, "count": 1}),
+            );
+            event(
+                json!({"op": "produce", "type": "info", "process": HISTORY_PRODUCER,
+                "batch": batch}),
+            );
+        }
+        for (node, records, mark) in &self.reads {
+            let process = format!("read-{}", NAMES[*node]);
+            // Runs of consecutive offsets holding consecutive sequences.
+            let mut runs: Vec<(u64, u64, u64)> = Vec::new();
+            for (offset, value) in records.range(..*mark) {
+                let Some(&sequence) = self.sequences.get(value) else {
+                    event(json!({"op": "read", "type": "unkeyed", "process": process,
+                        "offset": offset}));
+                    continue;
+                };
+                match runs.last_mut() {
+                    Some((first, first_sequence, count))
+                        if *first + *count == *offset && *first_sequence + *count == sequence =>
+                    {
+                        *count += 1;
+                    }
+                    _ => runs.push((*offset, sequence, 1)),
+                }
+            }
+            for (offset, first_sequence, count) in runs {
+                event(json!({"op": "read", "type": "records", "process": process,
+                    "offset": offset, "first_sequence": first_sequence, "count": count,
+                    "values_match": true}));
+            }
+            event(json!({"op": "read", "type": "end", "process": process,
+                "high_watermark": mark, "start_offset": 0}));
+        }
+        if self.unserved {
+            event(json!({"op": "read", "type": "unserved", "process": "read-final"}));
+        }
+        let mut text = lines.join("\n");
+        text.push('\n');
+        text
+    }
+}
+
+/// Write `outcome`'s client history as `<VTOP_SWEEP_HISTORY_DIR>/<name>.jsonl`.
+/// False, and nothing written, when the variable is unset.
+fn write_history(outcome: &Outcome, name: &str) -> bool {
+    let Some(dir) = std::env::var_os(HISTORY_DIR).map(PathBuf::from) else {
+        return false;
+    };
+    let path = dir.join(format!("{name}.jsonl"));
+    if let Err(error) =
+        std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, outcome.history.render()))
+    {
+        panic!(
+            "could not write the client history {}: {error}",
+            path.display()
+        );
+    }
+    true
+}
+
+fn failing_histories_per_shape() -> usize {
+    std::env::var(HISTORY_FAILING)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(HISTORY_FAILING_DEFAULT)
+}
+
 /// How a run ended.
 #[derive(Debug)]
 struct Outcome {
@@ -286,6 +444,7 @@ struct Outcome {
     refused_to_open: Vec<(usize, String)>,
     /// The last election's result, for the failure report.
     last_promotion: Option<Promotion>,
+    history: ClientHistory,
 }
 
 impl Outcome {
@@ -364,6 +523,7 @@ struct Cluster {
     /// session (#641). A session opens with a fence, so a follower whose
     /// process or leader changed is fenced before it is sent anything.
     sessions: [Option<Session>; 3],
+    history: ClientHistory,
 }
 
 /// One leader-to-follower session, as `NetworkedReplicaSet` holds it.
@@ -466,6 +626,7 @@ fn setup_disks() -> Vec<SimDiskState> {
         last_promotion: None,
         announced_dispute: [false; 3],
         sessions: [None, None, None],
+        history: ClientHistory::default(),
     };
     for node in 0..3 {
         let opened = open_replica(node, &cluster.nodes[node].env, &cluster.nodes[node].meta)
@@ -531,6 +692,7 @@ impl Cluster {
                 value: value.clone().into_bytes(),
             }],
         };
+        self.history.sent(&value);
         self.templates.insert(value, request.clone());
         request
     }
@@ -918,6 +1080,7 @@ impl Cluster {
             let request = self.new_record(format!("e{OLD_EPOCH}-o{offset}"), OLD_EPOCH, L, offset);
             if self.replicate(L, &request, &[R]) {
                 self.note(format!("acknowledged {} at {offset}", value_of(&request)));
+                self.history.acknowledged(&value_of(&request), offset);
                 self.acknowledge(offset, value_of(&request));
             }
         }
@@ -1107,6 +1270,7 @@ impl Cluster {
             return false;
         }
         self.note(format!("acknowledged {} at {offset}", value_of(&request)));
+        self.history.acknowledged(&value_of(&request), offset);
         self.acknowledge(offset, value_of(&request));
         self.publish_mark(leader, epoch, offset + 1, &[0, 1, 2]);
         self.still_the_same(leader, &own)
@@ -1302,8 +1466,10 @@ impl Cluster {
         }
         if final_leader.is_none() {
             self.check_majority_durability();
+            self.history.unserved = true;
         }
         Outcome {
+            history: self.history,
             violations: self.violations,
             last_promotion: self.last_promotion,
             forgotten_disputes: self.forgotten_disputes,
@@ -1365,6 +1531,7 @@ impl Cluster {
                 continue;
             }
             let held = durable_records(&self.nodes[node].disk);
+            self.history.reads.push((node, held.clone(), mark));
             for offset in 0..mark {
                 let holds = held.get(&offset).cloned();
                 let expected = leader_log.get(&offset).cloned().unwrap_or_default();
@@ -1379,6 +1546,9 @@ impl Cluster {
                 }
             }
         }
+        // The final leader's read comes last: the checker judges every
+        // acknowledgement against the last read.
+        self.history.reads.push((leader, leader_log, mark));
     }
 }
 
@@ -1418,10 +1588,13 @@ fn run(shape: Shape, fault: Fault, setup: &[SimDiskState]) -> Outcome {
         last_promotion: None,
         announced_dispute: [false; 3],
         sessions: [None, None, None],
+        history: ClientHistory::default(),
     };
-    // The shared records' requests, for resending them in a catch-up.
+    // The shared records' requests, for resending them in a catch-up. Setup
+    // acknowledged each of them.
     for offset in 0..SHARED {
-        cluster.new_record(format!("e{OLD_EPOCH}-o{offset}"), OLD_EPOCH, L, offset);
+        let request = cluster.new_record(format!("e{OLD_EPOCH}-o{offset}"), OLD_EPOCH, L, offset);
+        cluster.history.acknowledged(&value_of(&request), offset);
     }
     let mut first_op = [0; 3];
     for node in 0..3 {
@@ -1552,6 +1725,9 @@ fn summary(outcome: &Outcome) -> String {
 
 fn sweep(shape: Shape, setup: &[SimDiskState]) -> Sweep {
     let clean = run(shape, Fault::None, setup);
+    if !clean.violations.is_empty() {
+        write_history(&clean, &format!("promotion-sweep-{shape:?}-no-fault"));
+    }
     assert!(
         clean.violations.is_empty(),
         "the clean run of {shape:?} must pass before faults are swept:\n{}",
@@ -1564,9 +1740,18 @@ fn sweep(shape: Shape, setup: &[SimDiskState]) -> Sweep {
         known: Vec::new(),
         new_failures: Vec::new(),
     };
+    let histories = failing_histories_per_shape();
+    let mut written = 0;
     for fault in faults_for(&clean) {
         let outcome = run(shape, fault, setup);
         result.runs += 1;
+        if !outcome.violations.is_empty() && written < histories {
+            written += 1;
+            let name = format!("promotion-sweep-{shape:?}-failing-{written}");
+            if write_history(&outcome, &name) {
+                eprintln!("client history {name}: {fault}: {}", summary(&outcome));
+            }
+        }
         let known = outcome.known_issues();
         if std::env::var_os("VTOP_SWEEP_VERBOSE").is_some() {
             let verdict = match (&known, outcome.violations.is_empty()) {
@@ -1637,8 +1822,17 @@ fn assert_sweep(shape: Shape) {
 #[test]
 fn the_611_sequence_without_a_fault_loses_no_acknowledged_record() {
     let setup = setup_disks();
-    for shape in SHAPES {
-        let outcome = run(shape, Fault::None, &setup);
+    // Every shape's history is written before any assertion can stop the
+    // test, so a build with a bug re-introduced still leaves all three.
+    let outcomes: Vec<(Shape, Outcome)> = SHAPES
+        .into_iter()
+        .map(|shape| {
+            let outcome = run(shape, Fault::None, &setup);
+            write_history(&outcome, &format!("promotion-sweep-{shape:?}-no-fault"));
+            (shape, outcome)
+        })
+        .collect();
+    for (shape, outcome) in outcomes {
         assert!(
             outcome.violations.is_empty(),
             "{}",
@@ -1734,6 +1928,7 @@ fn a_second_failover_after_a_catch_up_still_finishes_with_two_agreeing_replicas(
     let setup = setup_disks();
     let fault = Fault::ProcessDeath { node: R, step: 30 };
     let outcome = run(Shape::AckedLeaderStaysDown, fault, &setup);
+    write_history(&outcome, "promotion-sweep-second-failover");
     assert!(
         outcome.violations.is_empty(),
         "{}",
@@ -1793,6 +1988,7 @@ fn reproduction_two_caught_up_replicas_cannot_prove_a_quorum_after_the_leader_is
         plan: FaultPlan::CrashDuringWrite { op, byte_cut: 28 },
     };
     let outcome = run(Shape::AckedLeaderReturns, fault, &setup);
+    write_history(&outcome, "promotion-sweep-reproduction-640");
     assert!(
         outcome.violations.is_empty(),
         "{}",
@@ -1827,9 +2023,106 @@ fn reproduction_a_returning_deposed_leader_keeps_its_unacknowledged_suffix_under
         plan: FaultPlan::CrashBefore(op),
     };
     let outcome = run(Shape::AckedLeaderStaysDown, fault, &setup);
+    write_history(&outcome, "promotion-sweep-reproduction-641");
     assert!(
         outcome.violations.is_empty(),
         "{}",
         outcome.report(Shape::AckedLeaderStaysDown, &fault)
+    );
+}
+
+/// The client history keeps every acknowledgement, a replaced one included:
+/// `b` acknowledged at 1 and then `d` acknowledged at 1 are two `ok` events,
+/// which is how the checker sees the replacement (#728). A record sent and
+/// never acknowledged is indeterminate, and each replica's read follows the
+/// records it holds below the mark, the final leader's last.
+#[test]
+fn the_client_history_keeps_a_replaced_acknowledgement_and_reads_every_replica() {
+    let mut history = ClientHistory::default();
+    for value in ["a", "b", "c", "d"] {
+        history.sent(value);
+    }
+    history.acknowledged("a", 0);
+    history.acknowledged("b", 1);
+    history.acknowledged("d", 1);
+    let records = |values: &[&str]| -> BTreeMap<u64, String> {
+        (0..)
+            .zip(values.iter().map(|value| (*value).to_owned()))
+            .collect()
+    };
+    history.reads.push((R, records(&["a", "b", "c"]), 2));
+    history.reads.push((C, records(&["a", "d"]), 2));
+    let lines: Vec<Value> = history
+        .render()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each line is one JSON event"))
+        .collect();
+    let produce = |kind: &str, batch: u64, sequence: Option<u64>, offset: Option<u64>| {
+        let mut event = json!({"op": "produce", "type": kind, "process": HISTORY_PRODUCER,
+            "batch": batch});
+        if let Some(sequence) = sequence {
+            event["first_sequence"] = json!(sequence);
+            event["count"] = json!(1);
+        }
+        if let Some(offset) = offset {
+            event["first_offset"] = json!(offset);
+            event["committed_next_offset"] = json!(offset + 1);
+        }
+        event
+    };
+    let read = |node: &str, kind: &str, fields: Value| {
+        let mut event = json!({"op": "read", "type": kind, "process": format!("read-{node}")});
+        for (key, value) in fields.as_object().expect("an object") {
+            event[key] = value.clone();
+        }
+        event
+    };
+    let mut expected = vec![
+        produce("invoke", 1, Some(0), None),
+        produce("ok", 1, None, Some(0)),
+        produce("invoke", 2, Some(1), None),
+        produce("ok", 2, None, Some(1)),
+        produce("invoke", 3, Some(3), None),
+        produce("ok", 3, None, Some(1)),
+        produce("invoke", 4, Some(2), None),
+        produce("info", 4, None, None),
+        // R holds c at 2, above the mark: not part of its read.
+        read(
+            "R",
+            "records",
+            json!({"offset": 0, "first_sequence": 0, "count": 2, "values_match": true}),
+        ),
+        read("R", "end", json!({"high_watermark": 2, "start_offset": 0})),
+        read(
+            "C",
+            "records",
+            json!({"offset": 0, "first_sequence": 0, "count": 1, "values_match": true}),
+        ),
+        read(
+            "C",
+            "records",
+            json!({"offset": 1, "first_sequence": 3, "count": 1, "values_match": true}),
+        ),
+        read("C", "end", json!({"high_watermark": 2, "start_offset": 0})),
+    ];
+    for (time, event) in expected.iter_mut().enumerate() {
+        event["time_us"] = json!(time + 1);
+    }
+    assert_eq!(lines, expected);
+
+    // No leader finished: the history ends with a read nobody served.
+    history.reads.clear();
+    history.unserved = true;
+    let last: Value = serde_json::from_str(
+        history
+            .render()
+            .lines()
+            .next_back()
+            .expect("the history is not empty"),
+    )
+    .expect("one JSON event");
+    assert_eq!(
+        (&last["type"], &last["op"]),
+        (&json!("unserved"), &json!("read"))
     );
 }

@@ -52,6 +52,20 @@ metric labels. Pick ids an operator can read in a runbook, such as
   engine's user only; the rule and the recipes are in
   [Secret files and their permissions](secrets.md).
 
+To make the new key the example uses, on each host that needs it, as root or
+through your secret manager (the same 64 characters on every host, so generate
+it once and distribute it, never once per host):
+
+```bash
+( umask 077; openssl rand -hex 32 > /run/secrets/vtop-manifest-mac-q4 )
+chown vtop:vtop /run/secrets/vtop-manifest-mac-q4   # the engine's user
+chmod 0400 /run/secrets/vtop-manifest-mac-q4
+```
+
+The file holds only the 64 hex characters (a trailing newline is fine). Hosts
+that only audit (`vtopctl scrub`) need the key readable by the user who runs
+the scrub.
+
 ## The procedure
 
 The example rotates from the key the fleet signs with today, held in
@@ -74,7 +88,9 @@ manifest:
 ```
 
 Remove `manifest_mac_key_env`: setting both is refused. Roll this out to
-every engine, scrub job and auditor. Nothing signs with the new key yet, so
+every engine, scrub job and auditor, and **restart each engine** (the keyring
+is read at startup; there is no reload: `systemctl restart vtop-engine`, or a
+rolling restart of the Deployment). Nothing signs with the new key yet, so
 an engine that has not been rolled out yet still verifies everything the
 others write: a process still on `manifest_mac_key_env` holds one key and
 ignores key ids, as v0.8.0 does, so it verifies any manifest that key signed,
@@ -88,6 +104,8 @@ Check the startup line too.
 ```bash
 vtopctl validate --config /etc/vtop/config.yaml --print-effective | grep manifest_mac
 ```
+
+It prints one such line for each stream and one for `default`:
 
 ```text
   manifest_mac: keyring: active key q3-2026 (env, legacy); verify-only: q4-2026 (file); retired: none (global)
@@ -116,10 +134,18 @@ manifest:
       - {id: q4-2026, file: /run/secrets/vtop-manifest-mac-q4}
 ```
 
-New manifests carry `"mac_key_id": "q4-2026"`. Until the audit stream (#694)
-exists, the startup line is the record of when the active key changed.
+New manifests carry `"mac_key_id": "q4-2026"`. Restart each engine again. The
+[audit trail](auditing.md) records `migrate`, `replay` and `prune-ledger`, not
+a change of key, so the startup line (`manifest MAC keyring: active key ...`)
+is the record of when each engine began signing with the new one; keep the
+log.
 
 ### 4. Scrub, and read the counts by key
+
+Run it as a user who can read the key files and with the legacy key's
+variable exported (`VTOP_MANIFEST_MAC_KEY` here); the scrub resolves the
+keyring as the engine does, and a key it cannot read stops it before it
+reports anything, naming the key id.
 
 ```bash
 vtopctl scrub --config /etc/vtop/config.yaml
@@ -163,6 +189,12 @@ Manifests signed with it then fail authentication, by design:
 
 Re-archiving data that was signed with a withdrawn key is a separate
 decision: the engine never re-signs a stored manifest.
+
+`vtopctl audit verify` does not fail because of it: audit-trail rows keyed
+with a retired key are counted `NOT CHECKED`, their links to the rows around
+them are still checked ([Auditing](auditing.md#tamper-evidence)). To undo the
+withdrawal, move the id from `retired` back into `keys` and restart; no
+manifest was changed, so the scrub is clean again.
 
 ## What the messages mean
 

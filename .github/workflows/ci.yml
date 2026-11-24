@@ -92,6 +92,11 @@ jobs:
               - '.cargo/**'
               - 'rust-toolchain*'
               - '.github/workflows/ci.yml'
+              # Read by build-and-test's history steps (#728): the checker
+              # that judges the sweep's histories, and the patches that must
+              # still apply to the tree.
+              - 'scripts/live-chaos/history/check_history.py'
+              - 'scripts/live-chaos/history/reintroduce/**'
             # Narrow filters for the jobs that spin up external services or a
             # nightly toolchain. Each lists the crates its command actually
             # compiles, taken from `cargo tree`, rather than all of `crates/**`.
@@ -277,6 +282,9 @@ jobs:
               - 'benchmarks/tests/test_site_facts.py'
               - 'benchmarks/tests/conftest.py'
               - 'benchmarks/tests/test_kafka_compare_*.py'
+              - 'benchmarks/tests/test_aws_*.py'
+              - 'benchmarks/tests/fixtures/crash-smoke/**'
+              - 'benchmarks/tests/fixtures/kafka-schema4-runner/**'
               - 'benchmarks/tests/test_benchmark_charts_job.py'
               # The hand-written page that links the generated reports.
               - 'docs/COMPARISON.md'
@@ -336,6 +344,9 @@ jobs:
               - 'scripts/compat/cells/*.sh'
               - 'scripts/ledger-compat.sh'
               - 'scripts/restore-drill.sh'
+              # The disaster-recovery drills (#735): executable shell that
+              # gates the runbooks' claims, and the Python their checks run.
+              - 'scripts/dr-drill/**'
               # The live-chaos harness is executable shell that gates every
               # distributed-systems claim this project makes, and it was
               # unlinted: a change to lib.sh — sourced by every scenario —
@@ -394,6 +405,10 @@ jobs:
               # them, and the bootstrap runs inside each server's init.
               - 'scripts/s3-lab.sh'
               - 'docker/s3-servers/**'
+              # The host-level half of the whole-replica-set crash benchmark
+              # (#599): it runs as root against a device-mapper device, so a
+              # slip in it is not a test failure but a damaged filesystem.
+              - 'benchmarks/kafka_compare/crash/*.sh'
               - '.github/workflows/**'
 
             # `scripts/live-chaos/run-all.sh`. The harness drives real
@@ -508,6 +523,18 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      # The patches that put back #611, #641, #261 and #640 for
+      # reintroduce/run.sh (#728) are applied by context to files that keep
+      # changing. A change that moves a hunk fails here, not on the day
+      # someone runs the re-introduction.
+      - name: The re-introduction patches still apply
+        run: |
+          set -euo pipefail
+          for patch in scripts/live-chaos/history/reintroduce/*.patch; do
+            patch -p1 --batch --forward --dry-run < "$patch" > /dev/null \
+              || { echo "::error::$patch no longer applies to this tree; refresh it"; exit 1; }
+          done
+
       - name: Check formatting
         run: cargo fmt --all --check
 
@@ -520,6 +547,35 @@ jobs:
 
       - name: Test workspace
         run: cargo test --workspace --locked
+
+      # #728: the promotion crash sweep's runs with no fault, its
+      # reproductions, and the loopback test of a returning deposed leader,
+      # written as client histories and judged by check_history.py, the
+      # checker the live scenarios use. On the fixed code every one must be
+      # valid; reintroduce/run.sh --sweep shows the same checker flags each
+      # bug put back. Seconds on the build above: the full sweeps are not
+      # re-run.
+      - name: The promotion sweep's client histories are valid
+        env:
+          VTOP_SWEEP_HISTORY_DIR: ${{ runner.temp }}/sweep-histories
+        run: |
+          set -euo pipefail
+          cargo test --locked -p vtop-node --bin vtop-node -- \
+            promotion_crash_sweep::the_611_sequence_without_a_fault \
+            promotion_crash_sweep::reproduction_ \
+            promotion_crash_sweep::a_second_failover
+          cargo test --locked -p vtop-broker --test networked_replication deposed_leader
+          histories=("$VTOP_SWEEP_HISTORY_DIR"/*.jsonl)
+          # Three shapes with no fault, two reproductions, the second
+          # failover, and the deposed leader's return in two timings.
+          if [[ "${#histories[@]}" -ne 8 || ! -e "${histories[0]}" ]]; then
+            echo "::error::expected 8 client histories, found ${#histories[@]}: ${histories[*]}"
+            exit 1
+          fi
+          for history in "${histories[@]}"; do
+            echo "== $(basename "$history")"
+            python3 scripts/live-chaos/history/check_history.py "$history"
+          done
 
       - name: Release build
         run: cargo build --release --bin vtopctl --locked
@@ -1516,7 +1572,8 @@ jobs:
             scripts/check-failpoints-absent.sh scripts/kafka-broker.sh \
             scripts/gen-kafka-fixtures.sh scripts/kafka-cluster.sh \
             scripts/update-surface-snapshots.sh \
-            scripts/s3-lab.sh docker/s3-servers/init/bootstrap.sh
+            scripts/s3-lab.sh docker/s3-servers/init/bootstrap.sh \
+            benchmarks/kafka_compare/crash/*.sh
 
       # `-P scripts/live-chaos/scenarios` resolves the scenarios' dynamic
       # `source "$(dirname …)/../lib.sh"`. Without it every scenario reports
@@ -1531,7 +1588,23 @@ jobs:
             scripts/live-chaos/gen-certs.sh \
             scripts/live-chaos/scenarios/*.sh \
             scripts/live-chaos/engine/*.sh \
-            scripts/live-chaos/soak/*.sh
+            scripts/live-chaos/soak/*.sh \
+            scripts/live-chaos/history/*.sh \
+            scripts/live-chaos/history/reintroduce/*.sh
+
+      # The disaster-recovery drills (#735). `-P scripts/dr-drill` resolves
+      # the drills' `source` of their shared library, for the reason the
+      # live-chaos step above gives.
+      - name: shellcheck (disaster-recovery drills)
+        run: |
+          docker run --rm -v "$PWD:/mnt" -w /mnt \
+            koalaman/shellcheck:v0.11.0 -x -P scripts/dr-drill \
+            scripts/dr-drill/*.sh
+
+      # The drills trust these checks to find a missing record, a duplicate and
+      # an altered response; this proves they can.
+      - name: disaster-recovery drill helpers (unit tests)
+        run: python3 -m unittest discover -s scripts/dr-drill -p 'test_*.py' -v
 
       - name: bats
         run: |
@@ -1573,8 +1646,14 @@ jobs:
         run: python -m pip install --disable-pip-version-check --require-hashes -r scripts/compat/requirements.txt
       - name: the registry check can fail for each drift it exists to catch
         run: python -m unittest discover -s scripts/compat/tests -p 'test_format_registry.py' -v
-      - name: format registry (every magic and version constant has an entry)
-        run: python scripts/check-format-registry.py
+      # Also the byte lock (every golden file hashed in scripts/compat/
+      # golden.lock, a changed one fails naming the file and its format) and
+      # the freeze (a frozen format's constants, tags and golden bytes move
+      # only by a recorded exception). --base compares with the registry at
+      # HEAD^1, as the surface check below does, so a format cannot be
+      # un-frozen by editing the registry alone.
+      - name: format registry (every magic and version constant has an entry; golden files locked; frozen formats unchanged)
+        run: python scripts/check-format-registry.py --base HEAD^1
       # The upgrade-compat job's checkout is shallow, and scenario 22 reads the
       # newest release's source from its tag, so that job must fetch the tag.
       # Checked here, because the upgrade job runs only when its paths change.
@@ -1609,6 +1688,10 @@ jobs:
         run: python -m unittest discover -s scripts/tests -p 'test_check_threat_map.py' -v
       - name: threat map (every named control and test exists)
         run: python scripts/check-threat-map.py
+      # The release workflow restores no build cache and interpolates no
+      # outside text into a script (#730).
+      - name: the release workflow keeps caches out and untrusted text in env
+        run: python -m unittest discover -s scripts/tests -p 'test_release_workflow_hardening.py' -v
       # The 1.0 release gate (#741) names tests and CI jobs too, so a rename
       # fails here for the same reason. This checkout is shallow, so the
       # merged pull requests, runs and issues are checked by the docs
@@ -1824,8 +1907,10 @@ jobs:
 
       # Scenario 17 drives the Kafka gateway with a stock client: kafkacat is
       # librdkafka, the library under every non-JVM Kafka client (#225).
-      # Scenarios 17 to 21, 24, 26 and 27 use it.
-      - name: Install a stock Kafka client for scenarios 17 to 21, 24, 26 and 27
+      # Scenarios 17 to 21, 24, 26, 27 and 30 to 33 use it (27 and 30 follow a
+      # failover, split and co-located; 32 a paused leader; 33 a consumer
+      # group across a failover, #751).
+      - name: Install a stock Kafka client for scenarios 17 to 21, 24, 26, 27 and 30 to 33
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq kafkacat
@@ -1860,7 +1945,14 @@ jobs:
       # runner's JVM, once per metadata.recovery.strategy, each a full
       # failover. Measured at 75 s for both on two CPUs with debug binaries,
       # plus the image pull; scenario 27 (librdkafka, the kafkacat above) 43 s.
-      # Without the variable the scenario SKIPS (exit 77).
+      # Scenarios 30 and 31 are 27 and 28 again on three co-located
+      # `vtop-node node` processes (each a metadata voter and a candidate), and
+      # 32 pauses the leader past its lease, which a stock client waits out
+      # on its open socket (60 to 71 s measured); 33 runs a librdkafka and, with the
+      # image, a JVM consumer group through a kill (#751). Without the
+      # variable 28 and 31 SKIP (exit 77) and 33 runs librdkafka only. The
+      # same scenarios with release binaries and the chart's 15 s lease are
+      # kafka-failover-release.yml, which does not run on every pull request.
       - name: Run the live chaos suite
         id: chaos
         env:
@@ -1876,8 +1968,11 @@ jobs:
       # never reached a scenario, so no logs exist and `error` would stack a
       # spurious "no files found" on top of the real cause. The empty-artifact
       # signal only means something once the run itself has been attempted.
+      # `failure() &&` is still needed in front: an `if:` without a status
+      # function is ANDed with `success()`, so the outcome test alone made
+      # this step skip on exactly the runs it exists for (#751).
       - name: Upload scenario logs
-        if: steps.chaos.outcome == 'failure'
+        if: failure() && steps.chaos.outcome == 'failure'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: live-chaos-logs
@@ -2546,7 +2641,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.benchmark_charts == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # The chart tests alone took 7.5 min on main after #946 (the AWS ingest rehearsal regenerates a scratch
+    # repository several times), the whole job 8.5 to 9.5, and one run was cancelled at the old 10.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # The patch version is pinned: a floating "3.12" moves with the runner
@@ -2572,9 +2669,20 @@ jobs:
         # without this line the pipe into tee would hide a failing test.
         run: |
           set -o pipefail
-          python -m pytest -rs tests/test_kafka_compare_report.py tests/test_kafka_compare_regenerate.py tests/test_kafka_compare_failover.py tests/test_kafka_compare_footer.py tests/test_kafka_compare_colours.py tests/test_kafka_compare_group_commit.py tests/test_kafka_compare_ablation_producers.py tests/test_readme_charts.py tests/test_benchmark_charts_job.py tests/test_compare_reports.py tests/test_readme_cards.py tests/test_site_facts.py | tee "$RUNNER_TEMP/chart-tests.log"
+          python -m pytest -rs tests/test_kafka_compare_report.py tests/test_kafka_compare_regenerate.py tests/test_kafka_compare_failover.py tests/test_kafka_compare_footer.py tests/test_kafka_compare_colours.py tests/test_readme_charts.py tests/test_benchmark_charts_job.py tests/test_compare_reports.py tests/test_kafka_compare_crash_report.py tests/test_aws_ingest.py tests/test_kafka_compare_extra_report.py tests/test_kafka_compare_extra_charts.py tests/test_kafka_compare_group_commit.py tests/test_kafka_compare_schema4_runner.py tests/test_readme_cards.py tests/test_site_facts.py | tee "$RUNNER_TEMP/chart-tests.log"
           if grep -E "SKIPPED.*(matplotlib|PIL)" "$RUNNER_TEMP/chart-tests.log"; then
             echo "::error::A chart test skipped for want of matplotlib or Pillow, in the one job that installs them."
+            exit 1
+          fi
+      # The cross-product summary's charts (#744), on a line of its own so a
+      # test file added to the line above does not collide with it.
+      - name: Cross-product summary tests, with matplotlib
+        working-directory: benchmarks
+        run: |
+          set -o pipefail
+          python -m pytest -rs tests/test_compare_summary_charts.py | tee "$RUNNER_TEMP/summary-tests.log"
+          if grep -E "SKIPPED.*(matplotlib|PIL)" "$RUNNER_TEMP/summary-tests.log"; then
+            echo "::error::A summary chart test skipped for want of matplotlib or Pillow, in the one job that installs them."
             exit 1
           fi
       - name: Regenerate every chart and report and fail on drift

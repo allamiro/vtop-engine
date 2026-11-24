@@ -828,7 +828,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--work-dir", default=None, help="raw per-repetition data (default: a temp dir)")
     parser.add_argument("--keep-raw", action="store_true")
     parser.add_argument("--rebuild", action="store_true")
+    parser.add_argument("--host-disk", default=None, metavar="TEXT",
+                        help="name the disk behind Docker's data yourself, for a host whose probe cannot (an EBS "
+                             "NVMe volume that reports no model); recorded as given, one line, no '|'")
     args = parser.parse_args(argv)
+    phase1.checked_host_disk(args.host_disk)
 
     faults = [fault for fault in args.faults.split(",") if fault]
     systems = [system for system in args.systems.split(",") if system]
@@ -842,7 +846,7 @@ def main(argv: list[str] | None = None) -> int:
         running = sh(["docker", "ps", "-q", "--filter", f"label=com.docker.compose.project={SPEC[system]['project']}"])
         if running.stdout.strip():
             raise SystemExit(f"{SPEC[system]['project']} is already running; stop it first (one system at a time)")
-    disk = phase1.probe_host_disk()
+    disk = phase1.resolve_host_disk(args.host_disk)
     sh(["docker", "pull", "-q", KAFKA_IMAGE], timeout=1800)
     sh(["docker", "pull", "-q", PYTHON_IMAGE], timeout=1800)
     vtop_image = ensure_vtop_image(args.rebuild)

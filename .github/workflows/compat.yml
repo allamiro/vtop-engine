@@ -21,7 +21,12 @@
 #                 it), so a documented cutoff is checked on both sides on
 #                 every PR at two releases per row;
 #   nightly       every release since each cell applies, so a new tag or a
-#                 change on the runner is seen without a format change;
+#                 change on the runner is seen without a format change. The
+#                 two previous minors, N-1 and N-2, are always in it, also for
+#                 a cell a pull request runs on the newest release alone
+#                 (state written two minors back must open under this build,
+#                 docs/reference/compatibility.md); each cell's name says
+#                 which one it is;
 #   push to main  the same as a pull request;
 #   on demand     the same as nightly.
 name: Compat
@@ -86,6 +91,11 @@ jobs:
         run: python -m pip install --disable-pip-version-check --require-hashes -r scripts/compat/requirements.txt
       - name: The selection and provenance rules hold
         run: python -m unittest discover -s scripts/compat/tests -v
+      # The nightly run also holds the byte lock and the freeze, so a golden
+      # file or a frozen format that drifted is seen even when no pull request
+      # touched it.
+      - name: The golden-file lock and the frozen formats hold
+        run: python scripts/check-format-registry.py
       - name: Select
         id: select
         env:
@@ -156,7 +166,7 @@ jobs:
           retention-days: 3
 
   cell:
-    name: ${{ matrix.cell }} ${{ matrix.direction }} ${{ matrix.tag }} (expect ${{ matrix.expect }})
+    name: ${{ matrix.cell }} ${{ matrix.direction }} ${{ matrix.tag }} (${{ matrix.age }}, expect ${{ matrix.expect }})
     needs: [select, build-head]
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -240,13 +250,14 @@ jobs:
           TAG: ${{ matrix.tag }}
           DIRECTION: ${{ matrix.direction }}
           EXPECT: ${{ matrix.expect }}
+          AGE: ${{ matrix.age }}
           OUTCOME: ${{ job.status }}
         run: |
           set -euo pipefail
           mkdir -p result
-          printf '%s\t%s\t%s\t%s\t%s\n' "$CELL" "$DIRECTION" "$TAG" "$EXPECT" "$OUTCOME" \
+          printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$CELL" "$DIRECTION" "$TAG" "$AGE" "$EXPECT" "$OUTCOME" \
             > "result/$CELL-$DIRECTION-$TAG.tsv"
-          echo "| $CELL | $DIRECTION | $TAG | $EXPECT | $OUTCOME |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| $CELL | $DIRECTION | $TAG | $AGE | $EXPECT | $OUTCOME |" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
@@ -286,12 +297,12 @@ jobs:
           {
             echo "## Compatibility matrix"
             echo
-            echo "| Cell | Direction | Release | Expected | Outcome |"
-            echo "|---|---|---|---|---|"
-            sort results/*.tsv 2>/dev/null | awk -F'\t' '{ printf "| %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5 }'
+            echo "| Cell | Direction | Release | Age | Expected | Outcome |"
+            echo "|---|---|---|---|---|---|"
+            sort results/*.tsv 2>/dev/null | awk -F'\t' '{ printf "| %s | %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5, $6 }'
           } >> "$GITHUB_STEP_SUMMARY"
           got="$(cat results/*.tsv 2>/dev/null | wc -l)"
-          ok="$(cat results/*.tsv 2>/dev/null | awk -F'\t' '$5 == "success"' | wc -l)"
+          ok="$(cat results/*.tsv 2>/dev/null | awk -F'\t' '$6 == "success"' | wc -l)"
           echo "$ok of $expected cells succeeded; $got reported"
           [[ "$got" -eq "$expected" && "$ok" -eq "$expected" ]]
 

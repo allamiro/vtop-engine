@@ -37,6 +37,10 @@
 # neither set the scenario SKIPS (exit 77, which run-all.sh reports as SKIP),
 # before the harness is loaded: a workstation has no Kafka distribution to
 # hand, and that is not a failure of this build.
+#
+# CHAOS_KAFKA_SHAPE picks the processes, as in 27; scenario 31 is this file
+# run co-located (three `vtop-node node` processes, each a voter and a
+# candidate).
 KAFKA_HOME="${CHAOS_KAFKA_HOME:-}"
 KAFKA_IMAGE="${CHAOS_KAFKA_IMAGE:-}"
 if [[ -z "$KAFKA_HOME" && -z "$KAFKA_IMAGE" ]]; then
@@ -53,6 +57,7 @@ require_command java "Install a JVM, 17 or newer: the Kafka distribution's clien
 transport_plaintext && fail "scenario 28 needs TLS: candidates cannot run under CHAOS_TRANSPORT=plaintext"
 init_workdir
 BASE_WORKDIR="$WORKDIR"
+BASE_SCENARIO="$SCENARIO"
 
 RECORDS="${CHAOS_KAFKA_RECORDS:-3000}"
 KILL_AFTER_ACKS="${CHAOS_KAFKA_KILL_AFTER_ACKS:-600}"
@@ -74,20 +79,7 @@ for strategy in $STRATEGIES; do
 done
 
 # --- the Apache Kafka distribution -------------------------------------------
-if [[ -z "$KAFKA_HOME" ]]; then
-  require_command docker "CHAOS_KAFKA_IMAGE needs docker to copy the distribution out of the image."
-  KAFKA_HOME="$BASE_WORKDIR/kafka"
-  container="$(docker create "$KAFKA_IMAGE")" \
-    || fail "could not create a container from CHAOS_KAFKA_IMAGE=$KAFKA_IMAGE"
-  docker cp "$container:/opt/kafka" "$KAFKA_HOME" > /dev/null \
-    || { docker rm "$container" > /dev/null 2>&1 || true; fail "$KAFKA_IMAGE holds no /opt/kafka"; }
-  docker rm "$container" > /dev/null
-fi
-for tool in kafka-verifiable-producer kafka-console-consumer; do
-  [[ -x "$KAFKA_HOME/bin/$tool.sh" ]] || fail "$KAFKA_HOME/bin/$tool.sh is not an executable Kafka tool"
-done
-clients_jar=("$KAFKA_HOME"/libs/kafka-clients-*.jar)
-log "Kafka client tools: $KAFKA_HOME (${clients_jar[0]##*/}), JVM: $(java -version 2>&1 | head -1)"
+kafka_distribution "$BASE_WORKDIR" kafka-verifiable-producer kafka-console-consumer
 
 # run_variant <strategy> — one failover, on a fresh cluster in its own
 # directory, so the two runs share nothing but the binaries and the
@@ -97,7 +89,7 @@ run_variant() {
   WORKDIR="$BASE_WORKDIR/$strategy"
   mkdir -p "$WORKDIR/logs"
   : > "$WORKDIR/pids"
-  SCENARIO="27/$strategy"
+  SCENARIO="$BASE_SCENARIO/$strategy"
   log "--- metadata.recovery.strategy=$strategy ---"
 
   bring_up_kafka_candidates
@@ -141,12 +133,12 @@ run_variant() {
   log "candidate $WINNER (the leader) SIGKILLed with the producer mid-stream"
 
   local new_holder new_epoch new_leader
-  read -r new_holder new_epoch <<<"$(await_lease_holder_changed "$META_LEADER_ID" "$HOLDER" \
+  read -r new_holder new_epoch <<<"$(await_lease_holder_changed "$(lease_readers_without "$WINNER")" "$HOLDER" \
     $((LEASE_DURATION_MS / 1000 + ELECTION_TIMEOUT_SECONDS)))"
   new_leader="$(candidate_by_uuid "$new_holder")"
   [[ "$new_epoch" -gt "$EPOCH" ]] || fail "a new hold must mint a newer epoch: old $EPOCH, new $new_epoch"
   log "candidate $new_leader took the range at epoch $new_epoch, no restart"
-  await_log_line "$WORKDIR/logs/data-candidate-$new_leader.log" \
+  await_log_line "$(candidate_log "$new_leader")" \
     "kafka gateway for range .* is now serving at epoch $new_epoch" \
     "the promoted candidate's gateway must say it is serving, at the new epoch"
 
@@ -175,8 +167,9 @@ run_variant() {
   log "kill to first acknowledgement after it: ${first} ms; kill to the end of the outage the client saw: ${resume} ms (longest silence ${silence} ms)"
   [[ "$resume" -le $((FAILOVER_LIMIT_SECONDS * 1000)) ]] \
     || fail "the client waited ${resume} ms from the kill for an acknowledgement, over the limit of ${FAILOVER_LIMIT_SECONDS} s"
-  printf 'KAFKA_FAILOVER client=jvm strategy=%s kill_to_first_ack_ms=%s kill_to_resume_ms=%s longest_silence_ms=%s records=%s\n' \
-    "$strategy" "$first" "$resume" "$silence" "$RECORDS" | tee -a "$BASE_WORKDIR/failover-results.txt"
+  printf 'KAFKA_FAILOVER client=jvm strategy=%s %s kill_to_first_ack_ms=%s kill_to_resume_ms=%s longest_silence_ms=%s records=%s\n' \
+    "$strategy" "$(kafka_failover_conditions "$WINNER")" "$first" "$resume" "$silence" "$RECORDS" \
+    | tee -a "$BASE_WORKDIR/failover-results.txt"
 
   # Every acknowledgement is a (value, offset) the client was given. The
   # readback prints each record's offset and value, so each acknowledged
@@ -243,7 +236,7 @@ for strategy in $STRATEGIES; do
   run_variant "$strategy"
 done
 WORKDIR="$BASE_WORKDIR"
-SCENARIO="28-kafka-jvm-client-failover"
+SCENARIO="$BASE_SCENARIO"
 log "results:"
 sed 's/^/  /' "$BASE_WORKDIR/failover-results.txt"
 log "PASS"

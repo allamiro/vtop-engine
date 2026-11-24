@@ -2119,7 +2119,10 @@ async fn run_candidate(
     };
 
     // --- both planes, bound once --------------------------------------------
-    let switching = Arc::new(SwitchingReplicaHandler::new(config.node_uuid));
+    let switching = Arc::new(
+        SwitchingReplicaHandler::new(config.node_uuid)
+            .restricted_to(peers.iter().map(|peer| peer.node_uuid)),
+    );
     let replica_server = replica_server(
         &config,
         Arc::clone(&switching) as Arc<dyn ReplicaPeerHandler>,
@@ -3605,6 +3608,12 @@ async fn build_leader_phase(
 struct SwitchingReplicaHandler {
     node_uuid: Uuid,
     delegate: std::sync::RwLock<Arc<dyn ReplicaPeerHandler>>,
+    /// The nodes allowed to append to, fence or send a high-water mark to
+    /// this candidate: the rest of the range's replica set. `None` allows any
+    /// peer the transport admitted. A certificate from the plane's CA is not
+    /// membership of the set, and a deployment may use one CA for client
+    /// certificates too.
+    writers: Option<std::collections::HashSet<Uuid>>,
 }
 
 /// The delegate installed mid-transition: every method inherits the trait's
@@ -3665,7 +3674,14 @@ impl SwitchingReplicaHandler {
         Self {
             node_uuid,
             delegate: std::sync::RwLock::new(Arc::new(TransitioningHandler { node_uuid })),
+            writers: None,
         }
+    }
+
+    /// Admit writes only from `writers`, the rest of the replica set.
+    fn restricted_to(mut self, writers: impl IntoIterator<Item = Uuid>) -> Self {
+        self.writers = Some(writers.into_iter().collect());
+        self
     }
 
     fn install(&self, delegate: Arc<dyn ReplicaPeerHandler>) {
@@ -3715,6 +3731,28 @@ impl ReplicaPeerHandler for SwitchingReplicaHandler {
         update: &vtop_protocol::CommittedHwmUpdate,
     ) -> Result<(), (vtop_protocol::ErrorCode, String)> {
         self.current().observe_hwm(update)
+    }
+
+    fn authorize_writer(
+        &self,
+        peer: Option<Uuid>,
+    ) -> Result<(), (vtop_protocol::ErrorCode, String)> {
+        // No set, or no identity to judge (a plaintext plane, which the
+        // transport knob documents as unauthenticated): the plane's own rules.
+        let (Some(writers), Some(peer)) = (&self.writers, peer) else {
+            return Ok(());
+        };
+        if writers.contains(&peer) {
+            return Ok(());
+        }
+        Err((
+            vtop_protocol::ErrorCode::InvalidRequest,
+            format!(
+                "{peer} is not a member of this range's replica set (`peers`), so it may not \
+                 append to, fence or advance this replica; a certificate from the replica CA \
+                 proves a trusted peer, not a member"
+            ),
+        ))
     }
 
     fn status(
@@ -4208,6 +4246,25 @@ impl crate::lease_agent::LeasePublisher for CandidateLeasePublisher {
 
 #[cfg(test)]
 mod tests {
+    /// A candidate's replica plane takes writes from the rest of its replica
+    /// set only; one with no set, and a peer with no identity, are unchanged.
+    #[test]
+    fn a_candidate_takes_replica_writes_only_from_its_replica_set() {
+        let me = Uuid::from_u128(1);
+        let member = Uuid::from_u128(2);
+        let outsider = Uuid::from_u128(3);
+        let restricted = SwitchingReplicaHandler::new(me).restricted_to([member]);
+        assert!(restricted.authorize_writer(Some(member)).is_ok());
+        assert!(restricted.authorize_writer(Some(outsider)).is_err());
+        assert!(restricted.authorize_writer(Some(me)).is_err());
+        assert!(
+            restricted.authorize_writer(None).is_ok(),
+            "a plaintext plane presents no identity; its own rules apply"
+        );
+        let open = SwitchingReplicaHandler::new(me);
+        assert!(open.authorize_writer(Some(outsider)).is_ok());
+    }
+
     /// The production roll thresholds, so these tests exercise the same
     /// rolling behaviour a real node has rather than a size chosen to make
     /// them pass.

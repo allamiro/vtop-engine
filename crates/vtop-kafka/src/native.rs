@@ -15,7 +15,7 @@
 
 use crate::bridge::{Appended, Bridge, Fetched, Sequenced};
 use crate::messages::ErrorCode;
-use crate::records::{Record, RecordBatch};
+use crate::records::{served_timestamp, Record, RecordBatch};
 use crate::turnstile::Turnstile;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -414,6 +414,23 @@ fn kafka_code(code: NativeCode) -> ErrorCode {
     }
 }
 
+/// What a Fetch answers for a native refusal (#751). A Fetch is not a
+/// produce: its codes are the ones a consumer retries on its own, and the
+/// JVM consumer ends with "Unexpected error code" on any other. A promoted
+/// node whose boundary marker still awaits its quorum refuses reads as
+/// `Overloaded`; that is Kafka's `OFFSET_NOT_AVAILABLE` (a new leader whose
+/// high watermark has not caught up), which every client retries. Storage
+/// trouble is `KAFKA_STORAGE_ERROR`, which clients retry after a metadata
+/// refresh. Scenario 33 saw the JVM consumer die on `REQUEST_TIMED_OUT` in
+/// the first fetch after a failover.
+fn fetch_code(code: NativeCode) -> ErrorCode {
+    match code {
+        NativeCode::Overloaded => ErrorCode::OffsetNotAvailable,
+        NativeCode::Storage => ErrorCode::KafkaStorageError,
+        other => kafka_code(other),
+    }
+}
+
 impl NativeBridge {
     /// The producer's turnstile entry goes once no ticket is outstanding.
     /// Under the map lock, so a producer arriving now either finds the entry
@@ -771,7 +788,7 @@ impl Bridge for NativeBridge {
                 }
                 Message::Error(error) => {
                     tracing::warn!(code = ?error.code, message = %error.message, "native fetch refused");
-                    return Err(kafka_code(error.code));
+                    return Err(fetch_code(error.code));
                 }
                 other => {
                     tracing::warn!(?other, "native fetch answered with an unexpected message");
@@ -791,7 +808,7 @@ impl Bridge for NativeBridge {
                     .iter()
                     .map(|record| Record {
                         offset: record.offset as i64,
-                        timestamp_millis: record.timestamp_millis,
+                        timestamp_millis: served_timestamp(record.timestamp_millis),
                         key: (!record.key.is_empty()).then(|| record.key.clone()),
                         value: Some(record.value.clone()),
                         headers: Vec::new(),
@@ -949,6 +966,33 @@ mod tests {
 
     fn bridge(broker: Arc<LocalBroker>) -> NativeBridge {
         NativeBridge::new(broker, config(Durability::LocalFsync)).unwrap()
+    }
+
+    /// A promoted node whose boundary marker still awaits its quorum serves
+    /// no read (#240), and the Fetch says so with the code a consumer retries
+    /// (#751): `OFFSET_NOT_AVAILABLE`, Kafka's answer for a new leader whose
+    /// high watermark has not caught up. It was `REQUEST_TIMED_OUT`, which the
+    /// JVM consumer does not expect on a Fetch and ends on ("Unexpected error
+    /// code 7 while fetching"), as scenario 33 saw after a failover. Once the
+    /// boundary is proven the same fetch is served.
+    #[test]
+    fn a_fetch_before_the_boundary_is_proven_is_offset_not_available() {
+        let (_dir, broker) = broker();
+        let bridge = bridge(Arc::clone(&broker));
+        bridge
+            .produce("events", &[batch(&[("a", None), ("b", None)])], None)
+            .unwrap();
+        broker.set_boundary_pending(true);
+        assert_eq!(
+            bridge.fetch("events", 0, 1 << 20).unwrap_err(),
+            ErrorCode::OffsetNotAvailable
+        );
+        broker.set_boundary_pending(false);
+        let fetched = bridge.fetch("events", 0, 1 << 20).unwrap();
+        assert_eq!(
+            RecordBatch::decode(&fetched.records).unwrap().records.len(),
+            2
+        );
     }
 
     /// A refused append leaves no hole (review): the reservation stands only
@@ -1685,6 +1729,19 @@ mod tests {
             ErrorCode::RequestTimedOut
         );
         assert_eq!(kafka_code(NativeCode::Storage), ErrorCode::RequestTimedOut);
+        // A fetch answers with the codes a consumer retries (#751).
+        assert_eq!(
+            fetch_code(NativeCode::Overloaded),
+            ErrorCode::OffsetNotAvailable
+        );
+        assert_eq!(
+            fetch_code(NativeCode::Storage),
+            ErrorCode::KafkaStorageError
+        );
+        assert_eq!(
+            fetch_code(NativeCode::Fenced),
+            ErrorCode::NotLeaderOrFollower
+        );
         assert_eq!(
             kafka_code(NativeCode::SequenceConflict),
             ErrorCode::InvalidRecord

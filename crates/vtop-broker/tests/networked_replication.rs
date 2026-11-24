@@ -28,8 +28,8 @@ use vtop_log::{
     SegmentDescriptorV2,
 };
 use vtop_protocol::{
-    CommittedHwmUpdate, Durability as WireDurability, ErrorCode, ErrorResponse, Message,
-    ProduceRecord, ProduceRequest, ProduceResponse, RangeIdentity, ReplicaAppendRequest,
+    CommittedHwmUpdate, Durability as WireDurability, ErrorCode, ErrorResponse, FetchRequest,
+    Message, ProduceRecord, ProduceRequest, ProduceResponse, RangeIdentity, ReplicaAppendRequest,
     ReplicaAppendResponse, ReplicaStatusResponse, Role, WireFrame,
 };
 
@@ -1037,8 +1037,9 @@ fn a_follower_configured_by_name_is_reached_at_the_address_the_name_holds_now() 
 /// Produce under `fencing_epoch` (the helpers above pin the harness's
 /// original epoch). A retryable refusal is retried within a deadline: the
 /// quorum wait is short and every test in this file shares the CPU, and a
-/// retry of the same producer sequence is idempotent.
-fn produce_at(broker: &LocalBroker, range: RangeIdentity, epoch: u64, sequence: u64) {
+/// retry of the same producer sequence is idempotent. Returns the offset the
+/// broker acknowledged the record at.
+fn produce_at(broker: &LocalBroker, range: RangeIdentity, epoch: u64, sequence: u64) -> u64 {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let mut attempts = 0;
     loop {
@@ -1053,7 +1054,7 @@ fn produce_at(broker: &LocalBroker, range: RangeIdentity, epoch: u64, sequence: 
             request.fencing_epoch = epoch;
         }
         match broker.handle(Role::Producer, frame).message {
-            Message::ProduceResponse(_) => return,
+            Message::ProduceResponse(response) => return acknowledged_offset(&response),
             Message::Error(ErrorResponse {
                 retryable: true, ..
             }) if std::time::Instant::now() < deadline => {
@@ -1184,6 +1185,151 @@ fn a_follower_reconnecting_with_a_kept_suffix_still_receives_the_new_leaders_rec
     );
 }
 
+/// The offset a one-record produce was acknowledged at.
+fn acknowledged_offset(response: &ProduceResponse) -> u64 {
+    match response.outcomes.as_slice() {
+        [outcome] => outcome.offset,
+        other => panic!(
+            "a one-record produce was answered with {} outcomes",
+            other.len()
+        ),
+    }
+}
+
+/// The records `leader` serves to a consumer from offset 0 at `epoch`, as
+/// (offset, value): only what its committed high-water mark admits.
+fn leader_records(leader: &LocalBroker, range: RangeIdentity, epoch: u64) -> Vec<(u64, String)> {
+    let response = leader.handle(
+        Role::Consumer,
+        WireFrame {
+            request_id: 9_000,
+            stream_id: 1,
+            message: Message::FetchRequest(FetchRequest {
+                range,
+                fencing_epoch: epoch,
+                start_offset: 0,
+                max_bytes: 1 << 20,
+                max_records: 64,
+            }),
+        },
+    );
+    match response.message {
+        Message::FetchResponse(fetched) => fetched
+            .records
+            .iter()
+            .map(|record| {
+                (
+                    record.offset,
+                    String::from_utf8_lossy(&record.value).into_owned(),
+                )
+            })
+            .collect(),
+        other => panic!("the leader refused a consumer fetch at epoch {epoch}: {other:?}"),
+    }
+}
+
+/// With `VTOP_SWEEP_HISTORY_DIR` set, write what a client saw of a run as
+/// `<dir>/<name>.jsonl`, in the format
+/// `scripts/live-chaos/history/check_history.py` reads (#728); nothing when it
+/// is unset. `reintroduce/run.sh --sweep` runs the tests that call this on a
+/// build with a fixed bug re-introduced and requires the checker to flag
+/// what they wrote. A record's value names its producer sequence: `v<n>` is
+/// sequence n, and the deposed leadership's `deposed-<offset>` is 1000 plus
+/// the offset (no other record has those sequences). `acks` are the
+/// acknowledgements in order, as (sequence, offset); `unacknowledged` the
+/// sequences sent and never acknowledged; `reads` each replica's records as
+/// (offset, value), read to `mark`, the leader's last.
+fn write_client_history(
+    name: &str,
+    acks: &[(u64, u64)],
+    unacknowledged: &[u64],
+    reads: &[(&str, Vec<(u64, String)>)],
+    mark: u64,
+) {
+    let Some(dir) = std::env::var_os("VTOP_SWEEP_HISTORY_DIR").map(std::path::PathBuf::from) else {
+        return;
+    };
+    let sequence_of = |value: &str| -> Option<u64> {
+        if let Some(sequence) = value.strip_prefix('v') {
+            return sequence.parse().ok();
+        }
+        value
+            .strip_prefix("deposed-")
+            .and_then(|offset| offset.parse::<u64>().ok())
+            .map(|offset| 1_000 + offset)
+    };
+    let mut lines = Vec::new();
+    let mut time = 0_u64;
+    let mut event = |fields: String| {
+        time += 1;
+        lines.push(format!("{{{fields},\"time_us\":{time}}}"));
+    };
+    let producer = r#""process":"producer""#;
+    for (batch, (sequence, offset)) in (1_u64..).zip(acks) {
+        event(format!(
+            r#""op":"produce","type":"invoke",{producer},"batch":{batch},"first_sequence":{sequence},"count":1"#
+        ));
+        event(format!(
+            r#""op":"produce","type":"ok",{producer},"batch":{batch},"first_offset":{offset},"committed_next_offset":{}"#,
+            offset + 1
+        ));
+    }
+    let first_unacknowledged = acks.len() as u64 + 1;
+    for (batch, sequence) in (first_unacknowledged..).zip(unacknowledged) {
+        event(format!(
+            r#""op":"produce","type":"invoke",{producer},"batch":{batch},"first_sequence":{sequence},"count":1"#
+        ));
+        event(format!(
+            r#""op":"produce","type":"info",{producer},"batch":{batch}"#
+        ));
+    }
+    for (replica, records) in reads {
+        let process = format!(r#""process":"read-{replica}""#);
+        for (offset, value) in records.iter().filter(|(offset, _)| *offset < mark) {
+            match sequence_of(value.as_str()) {
+                Some(sequence) => event(format!(
+                    r#""op":"read","type":"records",{process},"offset":{offset},"first_sequence":{sequence},"count":1,"values_match":true"#
+                )),
+                None => event(format!(
+                    r#""op":"read","type":"unkeyed",{process},"offset":{offset}"#
+                )),
+            }
+        }
+        event(format!(
+            r#""op":"read","type":"end",{process},"high_watermark":{mark},"start_offset":0"#
+        ));
+    }
+    let path = dir.join(format!("{name}.jsonl"));
+    if let Err(error) =
+        std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, lines.join("\n") + "\n"))
+    {
+        panic!(
+            "could not write the client history {}: {error}",
+            path.display()
+        );
+    }
+}
+
+/// The records `follower` serves from offset 0, as (offset, value): only
+/// what its own high-water mark admits.
+fn served_records(follower: &InProcessFollower) -> Vec<(u64, String)> {
+    follower
+        .fetch(0, usize::MAX, 64)
+        .map(|batch| {
+            batch
+                .records
+                .iter()
+                .map(|fetched| {
+                    (
+                        fetched.offset,
+                        String::from_utf8_lossy(&fetched.record.value).into_owned(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The records `follower` serves from `from`, as values: only what its own
 /// high-water mark admits.
 fn served_values(follower: &InProcessFollower, from: u64) -> Vec<String> {
@@ -1271,9 +1417,12 @@ fn deposed_leader_returns(quiet: bool) {
         );
     }
     let deposed = Arc::clone(&h.followers[0]);
+    // Every acknowledgement, as (sequence, offset), for the client history.
+    let mut acks = Vec::new();
 
     for sequence in 0..5 {
-        let _ = produce_ok(&h.leader, h.range.clone(), sequence);
+        let response = produce_ok(&h.leader, h.range.clone(), sequence);
+        acks.push((sequence, acknowledged_offset(&response)));
     }
     // BOTH followers, not just the quorum's: the epoch changes next, and a
     // record still owed to follower 2 would be retransmitted under the old
@@ -1316,8 +1465,8 @@ fn deposed_leader_returns(quiet: bool) {
     h.meta.set(epoch);
     h.leader.adopt_fencing_epoch(epoch);
     h.followers[1].adopt_fencing_epoch(epoch);
-    produce_at(&h.leader, h.range.clone(), epoch, 5);
-    produce_at(&h.leader, h.range.clone(), epoch, 6);
+    acks.push((5, produce_at(&h.leader, h.range.clone(), epoch, 5)));
+    acks.push((6, produce_at(&h.leader, h.range.clone(), epoch, 6)));
     assert!(
         await_within(Duration::from_secs(5), || h.cluster_committed.get() == 7),
         "the leader committed 5 and 6 on the majority without follower 1"
@@ -1330,7 +1479,7 @@ fn deposed_leader_returns(quiet: bool) {
     );
 
     if quiet {
-        produce_at(&h.leader, h.range.clone(), epoch, 7);
+        acks.push((7, produce_at(&h.leader, h.range.clone(), epoch, 7)));
         assert!(
             await_within(Duration::from_secs(5), || h.cluster_committed.get() == 8),
             "precondition: the leader committed 7 without follower 1"
@@ -1346,13 +1495,37 @@ fn deposed_leader_returns(quiet: bool) {
     );
     down.store(false, Ordering::SeqCst);
     if !quiet {
-        produce_at(&h.leader, h.range.clone(), epoch, 7);
+        acks.push((7, produce_at(&h.leader, h.range.clone(), epoch, 7)));
     }
 
     let expected = ["v5", "v6", "v7"];
     let caught_up = await_within(Duration::from_secs(10), || {
         deposed.local_committed_offset() == 8 && served_values(&deposed, 5) == expected
     });
+    // The client history (#728), written before the assertion below so a
+    // build with #641 re-introduced still leaves it: what each replica
+    // serves, read to the leader's mark, the leader's read last. Follower 2
+    // is given the same bounded wait to reach the mark the leader published.
+    let mark = h.cluster_committed.get();
+    let _ = await_within(Duration::from_secs(5), || {
+        h.followers[1].local_committed_offset() >= mark
+    });
+    write_client_history(
+        if quiet {
+            "networked-deposed-leader-returns-quiet"
+        } else {
+            "networked-deposed-leader-returns"
+        },
+        &acks,
+        // The deposed leadership's suffix, sent and never acknowledged.
+        &(1_005..1_010).collect::<Vec<u64>>(),
+        &[
+            ("follower-2", served_records(&h.followers[1])),
+            ("deposed", served_records(&deposed)),
+            ("leader", leader_records(&h.leader, h.range.clone(), epoch)),
+        ],
+        mark,
+    );
     assert!(
         caught_up,
         "the returning replica must discard its unacknowledged epoch-18 suffix and hold the \

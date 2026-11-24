@@ -12,7 +12,10 @@ environment.json. None is typed here.
 
 A failover run (#597; its directory holds `failover.csv`) is handed to
 failover_report.py, which writes docs/benchmarks/kafka-failover.md under the
-same rules.
+same rules. A crash run (#599; `crash.csv`) is handed to crash_report.py, which
+writes docs/benchmarks/kafka-crash.md. A run whose directory holds a
+`report.json` writes its page and images where that file says (run_outputs.py),
+so a second run of a kind can sit beside the first.
 
 Output is deterministic for a given CSV, environment.json and matplotlib
 version: fixed rcParams, a fixed SVG hash salt, and no timestamps or software
@@ -28,12 +31,14 @@ from typing import Any, NamedTuple
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
-from kafka_compare import colours, footer, schema, stats  # noqa: E402
+from kafka_compare import colours, footer, run_outputs, schema, stats  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(HERE))
 DEFAULT_IMG_DIR = os.path.join(REPO, "docs", "benchmarks", "img")
 DEFAULT_DOC = os.path.join(REPO, "docs", "benchmarks", "kafka-comparison.md")
 DEFAULT_FAILOVER_DOC = os.path.join(REPO, "docs", "benchmarks", "kafka-failover.md")
+DEFAULT_CRASH_DOC = os.path.join(REPO, "docs", "benchmarks", "kafka-crash.md")
+IMG_ROOT = "docs/benchmarks/img"
 
 # One colour per system in every chart, from the registry in colours.py
 # (categorical slots 1 and 2, blue and orange, validated for CVD separation
@@ -473,11 +478,12 @@ def _ratio(a: dict[str, Any], b: dict[str, Any]) -> float | None:
     return a["summary"].median / b["summary"].median
 
 
-def write_markdown(rows, env, run_id, csv_rel: str, env_rel: str, images: dict[str, str], doc_path: str) -> None:
+def write_markdown(rows, env, run_id, csv_rel: str, env_rel: str, images: dict[str, str], doc_path: str,
+                   extra_lines: list[str] | None = None) -> None:
     import matplotlib
 
-    every_row = rows
-    rows = headline_rows(rows, env)
+    from kafka_compare import extra_charts
+
     c = env["comparable"]
     sizes = env["matrix"]["record_sizes"]
     pcts = env["matrix"]["load_pcts"]
@@ -518,10 +524,15 @@ def write_markdown(rows, env, run_id, csv_rel: str, env_rel: str, images: dict[s
     add("- **Same replication contract (rule 3).** Kafka: RF=3, `min.insync.replicas=2`, `acks=all`. VTOP: one "
         "range replicated to three nodes, acknowledged at a write quorum of 2 of 3 (`Durability::Quorum`), "
         "`acks=all` from the client.")
+    if extra_charts.has_profile_cost(env):
+        parity = ("The `fsync-parity` profile (Kafka with an fsync after every message, `flush.messages=1`) is "
+                  "measured for Kafka in the end-to-end runs only, at the same offered rate as the others; see "
+                  "*What each durability profile costs in latency*.")
+    else:
+        parity = "The `fsync-parity` profile is phase 2."
     add(f"- **Profile `{c['profile']}` (rule 4).** Each system as shipped. This is **not** durability parity: "
         "Kafka acknowledges once the in-sync replicas have the batch in their page cache (`flush.messages` "
-        "unset), while a VTOP quorum acknowledgement means two replicas have **fsynced** the append. The "
-        "`fsync-parity` profile is phase 2.")
+        "unset), while a VTOP quorum acknowledgement means two replicas have **fsynced** the append. " + parity)
     if settings:
         asked = " and ".join(f"`group_commit: {{enabled: {'true' if name == 'on' else 'false'}}}`"
                              for name in settings)
@@ -545,14 +556,6 @@ def write_markdown(rows, env, run_id, csv_rel: str, env_rel: str, images: dict[s
     add("")
     add("## Produce throughput at saturation")
     add("")
-    counts = env["matrix"]["producers"]
-    if len(counts) > 1:
-        add(f"The charts and every table but the group commit ablation are at "
-            f"{_counted([headline_producers(env)], 'producer')}; the run also measured "
-            f"{' and '.join(str(n) for n in counts if n != headline_producers(env))} producers on the same "
-            "partition, which the ablation "
-            "reports.")
-        add("")
     add(f"![Produce throughput]({images['produce-throughput']})")
     add("")
     add("| record size | system | records/s | MiB/s |")
@@ -577,7 +580,7 @@ def write_markdown(rows, env, run_id, csv_rel: str, env_rel: str, images: dict[s
                     "median records/s.")
     add("")
     if len(settings) >= 2:
-        add(ablation_section(every_row, sizes, series, env))
+        add(ablation_section(rows, sizes, series, env))
     add("## Produce latency at fixed offered load")
     add("")
     add(f"![Produce latency]({images['produce-latency']})")
@@ -635,9 +638,10 @@ def write_markdown(rows, env, run_id, csv_rel: str, env_rel: str, images: dict[s
                 mib = cell_summary(rows, ser.system, "consume", size, "mib_per_sec", group_commit=ser.group_commit)
                 add(f"| {size_label(size)} | {ser.label} | {_summary_cell(rps)} | {_summary_cell(mib, 2)} |")
         add("")
+    lines += extra_lines or []
     add("## Reading the results")
     add("")
-    add(reading(pcts[0], bool(settings)))
+    add(reading(env, pcts[0], bool(settings)))
     add("")
     add("## Gateway gaps met (rule 10)")
     add("")
@@ -730,13 +734,35 @@ Nothing here measures what VTOP adds over Kafka on this path (fenced epochs, the
 evidence chain; see [COMPARISON.md](../COMPARISON.md)), and nothing here is a failover, archive or crash
 measurement (#597, #598, #599)."""
 
-def reading(lowest_pct: int, group_commit_measured: bool) -> str:
-    """The "Reading the results" text. Its second explanation depends on whether the run measured group commit."""
+_PROBE_START = "A separate, unrecorded probe"
+_PROBE_END = "**On the latency chart:**"
+_PARITY_PHRASE = "the `fsync-parity` profile (phase 2) prices the\n   same guarantee on Kafka."
+_RELATIVE_PHRASE = "adding VTOP-relative rates is a phase-2 item."
+
+
+def reading(env: dict[str, Any], lowest_pct: int, group_commit_measured: bool) -> str:
+    """The "Reading the results" text: READING, with each sentence that says a measurement is missing replaced
+    by what this run has (a run without the data reads exactly as before), and its second explanation chosen
+    by whether the run measured group commit (#752)."""
+    from kafka_compare import extra_charts
+
+    text = READING
+    if extra_charts.has_resources(env):
+        start, end = text.index(_PROBE_START), text.index(_PROBE_END)
+        text = text[:start] + (
+            "This run records each system's CPU seconds and bytes written (*CPU and bytes written*, above), so "
+            "whether the produce path is bound by CPU or by durability round trips can be read from the run's own "
+            "counters rather than from a probe.\n\n") + text[end:]
+    if extra_charts.has_profile_cost(env):
+        text = text.replace(_PARITY_PHRASE, "the `fsync-parity` end-to-end runs (*What each durability profile "
+                                            "costs in latency*) price the\n   same guarantee on Kafka.")
+    if extra_charts.has_e2e(env) and env["matrix"]["e2e"]["load_basis"] == "common":
+        text = text.replace(_RELATIVE_PHRASE, "the end-to-end runs are offered a rate relative to the slower "
+                                              "system's saturation for that reason.")
     item = GROUP_COMMIT_MEASURED if group_commit_measured else GROUP_COMMIT_UNWIRED
     none_of_them = ("Except for group commit (2), which the ablation above measures, none of them"
                     if group_commit_measured else "None of them")
-    return READING.format(lowest_pct=lowest_pct, group_commit_item=item.rstrip("\n"),
-                          none_of_them=none_of_them)
+    return text.format(lowest_pct=lowest_pct, group_commit_item=item.rstrip("\n"), none_of_them=none_of_them)
 
 
 # The leader's counters the harness reads around each saturation run of a group-commit run (run.py,
@@ -745,56 +771,37 @@ GC_REQUESTS = "vtop_broker_group_commit_requests_total"
 GC_COMMITS = "vtop_broker_group_commits_total"
 GC_OVERLAPPED = "vtop_broker_group_commit_overlapped_total"
 PHASE_COUNTER = 'vtop_broker_produce_phase_seconds_total{{phase="{}"}}'
-PHASES = (("local_fsync", "local fsync"), ("replicate", "replicate"), ("commit", "commit"))
+PHASES = ("local_fsync", "replicate", "commit")
 
-# What the ablation can and cannot show, from how the gateway and the broker are built, not from this run.
-ABLATION_READING = """How to read it:
+# What the ablation can and cannot show, from how the gateway and the broker are built, not from the run.
+ABLATION_READING = """\
+How to read it:
 
 - **One producer cannot show group commit.** A group can only hold requests that are in the broker at the same
   time, and one producer never has two there: the gateway's session loop answers a Produce request before it
   reads the next one from that connection, and the gateway's bridge to the broker queues an idempotent
-  producer's record sets one after another (the producer turnstile). So in the 1-producer cell every group is
-  one request, and the setting can only show its own cost; a ratio near 1 there is the expected result, not
-  evidence that group commit does nothing. Several producers on one partition (separate connections, separate
-  producer ids, one range) are what can share a barrier, so the other rows are where it shows.
+  producer's record sets one after another (the producer turnstile). So with one producer every group is one
+  request, and the setting can only show its own cost; a ratio near 1 there is the expected result, not
+  evidence that group commit does nothing. Several producers on one partition (`--producers N`: separate
+  connections, separate producer ids, one range) are what can share a barrier.
 - **Partitions do not merge.** A group is formed per range: each partition is its own range with its own
   leader log and its own coordinator, and fsyncs of different logs cannot be shared. Several partitions are
-  not evidence for or against group commit. The partitions of one Produce request are also appended one after
-  another in the gateway, which is a separate cost.
+  not evidence for or against group commit.
 - **Pipelining one producer's requests is not built.** Letting one connection have several record sets in
   flight before the earlier one is durable (answered in order) is the only change that could move the
   1-producer cell; it is not part of group commit and does not exist yet.
-- **Several producers in one row.** Each producer is its own client container with its own connection and
-  producer id. A row's records/s and MiB/s are what all of them delivered over one shared window, from the
-  earliest producer's steady-state start to the latest one's end, not the sum of their own rates, which would
-  overstate a row whose producers finish at different times. Its percentiles are the worst of the N
-  producers' (`lat_basis` `worst-of-N`); percentiles of different producers cannot be merged.
+- **Several producers in one row.** A row's records/s and MiB/s are what all its producers delivered over one
+  shared window, from their common start to the last one's end, not the sum of their own rates, which would
+  overstate a row whose producers finish at different times.
 - **The counters.** `mean group size` is the leader's `vtop_broker_group_commit_requests_total` over
   `vtop_broker_group_commits_total`; `overlapped` is the share of groups whose local append and fsync ran
   while the previous group replicated (`vtop_broker_group_commit_overlapped_total`); the last column is
-  `vtop_broker_produce_phase_seconds_total` per phase over the requests, so a time shared by a group is
-  divided among its requests. Each is read on the leader before and after every saturation repetition of the
-  setting, summed over the repetitions; the window includes the tool's warm-up records, which it produces and
-  leaves out of its own rate. With group commit off the node exports no request count, so the per-request
-  columns are for `on`; the off runs' phase totals are in `environment.json` under
-  `observed.vtop_produce_counters`. A dash is a run whose counters were not read (named in `events`)."""
-
-
-def headline_producers(env: dict[str, Any]) -> int:
-    """The producer count the charts and the main tables draw: the run's smallest. A run that swept producers
-    (the group commit ablation, #752) reports the other counts in the ablation table only."""
-    return min(env["matrix"]["producers"])
-
-
-def headline_rows(rows: list[dict[str, str]], env: dict[str, Any]) -> list[dict[str, str]]:
-    return schema.select(rows, producers=headline_producers(env))
-
-
-def is_producer_sweep(env: dict[str, Any]) -> bool:
-    """A group commit ablation run at several producer counts on one partition: the one run this report
-    draws with more than one producer count."""
-    m = env["matrix"]
-    return len(m["producers"]) > 1 and len(m.get("group_commits") or []) >= 2 and list(m["partitions"]) == [1]
+  `vtop_broker_produce_phase_seconds_total` per phase (local fsync / replicate / commit) over the requests, so
+  a time shared by a group is divided among its requests. Each is read on the leader before and after every
+  saturation repetition of the `on` setting, summed over the repetitions; the window includes the tool's
+  warm-up records, which it produces and leaves out of its own rate. With group commit off the node exports
+  no request count, so the off runs' phase totals stay in `environment.json` under
+  `observed.vtop_produce_counters`. A dash is a cell whose counters were not read (named in `events`)."""
 
 
 def _is_count(value: Any) -> bool:
@@ -815,66 +822,60 @@ def counter_entries(env: dict[str, Any]) -> list[dict[str, Any]]:
     return entries
 
 
-def _counter_totals(env: dict[str, Any], size: int, producers: int, setting: str) -> dict[str, float] | None:
-    """The counters' deltas over the saturation repetitions of one cell and setting, summed; None when none
-    was read."""
+def _counter_totals(env: dict[str, Any], size: int, setting: str) -> dict[str, float] | None:
+    """The counters' deltas over the saturation repetitions of one record size and setting, summed; None
+    when none was read."""
     totals: dict[str, float] = {}
     found = False
     for entry in counter_entries(env):
-        deltas = entry["deltas"]
-        if (entry.get("mode"), entry.get("record_size"), entry.get("producers"), entry.get("group_commit")) \
-                != ("saturation", size, producers, setting):
+        if (entry.get("mode"), entry.get("record_size"), entry.get("group_commit")) != ("saturation", size, setting):
             continue
         found = True
-        for key, value in deltas.items():
+        for key, value in entry["deltas"].items():
             totals[key] = totals.get(key, 0.0) + float(value)
     return totals if found else None
 
 
 def _counter_cells(totals: dict[str, float] | None) -> tuple[str, str, str]:
     """(mean group size, overlapped share, ms per request per phase) for one cell's counters."""
-    if not totals:
-        return "-", "-", "-"
-    requests, commits = totals.get(GC_REQUESTS), totals.get(GC_COMMITS)
+    requests = (totals or {}).get(GC_REQUESTS)
+    commits = (totals or {}).get(GC_COMMITS)
     if not requests or not commits:
         return "-", "-", "-"
-    size = f"{requests / commits:.2f}"
     overlapped = totals.get(GC_OVERLAPPED)
     share = f"{overlapped / commits:.0%}" if overlapped is not None else "-"
-    phases = [totals.get(PHASE_COUNTER.format(phase)) for phase, _label in PHASES]
-    per_request = " / ".join(f"{seconds * 1000 / requests:.2f}" if seconds is not None else "-"
-                             for seconds in phases)
-    return size, share, per_request
+    per_request = " / ".join(f"{totals[PHASE_COUNTER.format(phase)] * 1000 / requests:.2f}"
+                             if PHASE_COUNTER.format(phase) in totals else "-" for phase in PHASES)
+    return f"{requests / commits:.2f}", share, per_request
 
 
-def ablation_section(rows, sizes: list[int], series: list[Series], env: dict[str, Any]) -> str:
-    """The group-commit ablation (#752): VTOP's saturation with the setting off and on, per record size and
-    producer count, with what the leader's counters say about the groups the `on` runs formed."""
+def ablation_section(rows, sizes: list[int], series: list[Series], env: dict[str, Any] | None = None) -> str:
+    """The group-commit ablation (#752): VTOP's saturation with the setting off and on, per record size, and
+    what the leader's own counters say about the groups the `on` runs formed."""
     off = next(ser for ser in series if ser.group_commit == "off")
     on = next(ser for ser in series if ser.group_commit == "on")
+    producers = (env or {}).get("matrix", {}).get("producers") or [1]
     lines = [
         "## Group commit ablation",
         "",
         "VTOP's produce throughput at saturation with the node's `group_commit.enabled` off and on (#752): the "
         "same cells, the same client, one VTOP cluster brought up fresh per setting. `on / off` is the ratio "
         "of the two medians (the ranges are in the throughput table above). It says how far the setting moved "
-        "the cell, not why; a ratio near 1 means it did not. The last three columns are the leader's own "
-        "counters for the `on` runs; the ms columns are local fsync / replicate / commit.",
+        "the cell, not why; a ratio near 1 means it did not. This run had "
+        f"{_counted(producers, 'producer')}. The last three columns are the leader's own counters for the `on` "
+        "runs.",
         "",
-        "| record size | producers | group commit off records/s | group commit on records/s | on / off "
+        "| record size | group commit off records/s | group commit on records/s | on / off "
         "| mean group size (on) | overlapped (on) | ms per request (on) |",
-        "|---|---|---|---|---|---|---|---|",
+        "|---|---|---|---|---|---|---|",
     ]
     for size in sizes:
-        for producers in env["matrix"]["producers"]:
-            at = schema.select(rows, producers=producers)
-            cells = {ser.group_commit: cell_summary(at, "vtop", "saturation", size, "records_per_sec",
-                                                    group_commit=ser.group_commit) for ser in (off, on)}
-            ratio = _ratio(cells["on"], cells["off"])
-            group, share, per_request = _counter_cells(_counter_totals(env, size, producers, "on"))
-            lines.append(f"| {size_label(size)} | {producers} | {_summary_cell(cells['off'])} | "
-                         f"{_summary_cell(cells['on'])} | {f'{ratio:.2f}x' if ratio is not None else '-'} | "
-                         f"{group} | {share} | {per_request} |")
+        cells = {ser.group_commit: cell_summary(rows, "vtop", "saturation", size, "records_per_sec",
+                                                group_commit=ser.group_commit) for ser in (off, on)}
+        ratio = _ratio(cells["on"], cells["off"])
+        group, share, per_request = _counter_cells(_counter_totals(env or {}, size, "on"))
+        lines.append(f"| {size_label(size)} | {_summary_cell(cells['off'])} | {_summary_cell(cells['on'])} | "
+                     f"{f'{ratio:.2f}x' if ratio is not None else '-'} | {group} | {share} | {per_request} |")
     lines.append("")
     lines.append(ABLATION_READING)
     lines.append("")
@@ -894,21 +895,49 @@ def known_gaps(env: dict[str, Any]) -> str:
     """The known-gaps list, with the matrix facts read from the run, not typed in."""
     m = env["matrix"]
     sizes, partitions, producers = m["record_sizes"], m["partitions"], m["producers"]
+    from kafka_compare import extra_charts
+
     profile = env["comparable"]["profile"]
+    parity_slice = extra_charts.has_profile_cost(env)
     # #596's full matrix, and which parts of it this run did not cover.
     full = (("10 KiB", 10240 in sizes), ("6 partitions", 6 in partitions), ("4 producers", 4 in producers),
-            ("zstd", False), ("`fsync-parity`", profile == "fsync-parity"))
+            ("zstd", False), ("`fsync-parity`", profile == "fsync-parity" or parity_slice))
     missing = [name for name, covered in full if not covered]
+    only = (f"profile\n  `{profile}` only." if not parity_slice else
+            f"profile\n  `{profile}` in every mode, and `fsync-parity` for Kafka's end-to-end runs only.")
     lines = [
         f"- **Matrix size.** Record sizes {' and '.join(size_label(size) for size in sizes)} only; "
-        f"{_counted(partitions, 'partition')}, {_counted(producers, 'producer')}, no compression, profile\n"
-        f"  `{profile}` only." + (f" #596's full matrix ({', '.join(missing)}) is not run." if missing else ""),
+        f"{_counted(partitions, 'partition')}, {_counted(producers, 'producer')}, no compression, " + only
+        + (f" #596's full matrix ({', '.join(missing)}) is not run." if missing else ""),
     ]
     if max(partitions) == 1:
         lines.append(
             "- **One gateway, one partition.** The gateway runs on the range's leader only; a multi-partition VTOP "
             "topic\n  needs one leader per partition and is not exercised here.")
-    return "\n".join(lines) + "\n" + KNOWN_GAPS_FIXED
+    else:
+        lines.append(
+            f"- **VTOP at {_counted(partitions, 'partition')} is not measured.** Its gateway serves one partition "
+            "per node process, so\n  that many partitions need as many replicated ranges, three node processes "
+            "each; this harness runs VTOP as three\n  single-process nodes at Kafka's per-node limits, so VTOP's "
+            "rows are `refused` rows saying so.")
+    if max(producers) > 1:
+        lines.append(
+            f"- **{_counted(producers, 'producer')}, worst of their percentiles.** Each producer is its own perf-tool "
+            "container and\n  idempotent producer, offered its share of the rate. A row's rate is their records over "
+            "one shared window (they\n  start together, so it is the longest producer's steady-state window), "
+            "not the sum of their own rates, and it\n  carries the worst of their percentiles (`lat_basis` "
+            "worst-of-N): a percentile of all their latencies merged\n  cannot exceed the worst producer's, so the "
+            "latencies are an upper bound.")
+    fixed = KNOWN_GAPS_FIXED
+    if extra_charts.has_e2e(env) or extra_charts.has_resources(env):
+        measured = [what for what, present in (("end-to-end latency", extra_charts.has_e2e(env)),
+                                               ("CPU and bytes written", extra_charts.has_resources(env)))
+                    if present]
+        fixed = fixed.replace(
+            "- **End-to-end latency, CPU and write amplification** (#596 metrics 3 and 4) are not measured yet.",
+            f"- **{' and '.join(measured).capitalize()}** (#596 metrics 3 and 4) are measured at one offered load "
+            "per cell, not as a curve. End-to-end latency has the resolution of a record's `CreateTime`, 1 ms.")
+    return "\n".join(lines) + "\n" + fixed
 
 
 # The gaps that do not depend on the run's matrix: how the harness is built.
@@ -931,26 +960,33 @@ KNOWN_GAPS_FIXED = """\
 SINGLE_VALUED = ("partitions", "producers", "compression", "acks", "profile")
 
 
-def check_drawable(rows: list[dict[str, str]], environment: dict[str, Any]) -> None:
+def check_drawable(rows: list[dict[str, str]], environment: dict[str, Any],
+                   hist: dict[tuple, dict[int, int]] | None = None) -> None:
     """Refuse a run this report would pool or mislabel (#596): one that varies
     along a dimension it does not draw, or holds a value its text does not
     say (it writes "no compression", `acks=all` and the environment's
-    profile), or rows it does not draw at all."""
+    profile), or rows it does not draw at all.
+
+    End-to-end rows are drawn (schema 4), with their histograms; so are Kafka's
+    end-to-end rows under the matrix's extra profiles, the one place a second profile is
+    allowed, because that is the profile latency chart."""
     profile = environment["comparable"].get("profile")
-    for column, said in (("compression", "none"), ("acks", "all"), ("profile", profile)):
-        values = sorted({row[column] for row in rows})
+    extra = schema.plan.extra_profiles(environment["matrix"])
+    main = [row for row in rows if not (row["mode"] == "e2e" and row["system"] == "kafka"
+                                        and row["profile"] in extra)]
+    for column, said, held in (("compression", "none", rows), ("acks", "all", rows), ("profile", profile, main)):
+        values = sorted({row[column] for row in held})
         if values != [said]:
             raise schema.ReportRefused(
                 f"the run's {column} is {', '.join(values)}; this report's text says {column} {said} and "
                 "draws nothing else until the grouped charts do (#600)")
-    if any(row["mode"] == "e2e" for row in rows):
-        raise schema.ReportRefused("the run has end-to-end latency rows, which this report does not draw yet "
-                                   "(#600); refused rather than left out")
+    ok_e2e = [row for row in rows if row["mode"] == "e2e" and row["status"] == "ok"]
+    if any(row["mode"] == "e2e" for row in rows) and (
+            hist is None or any(schema.row_key(row) not in hist for row in ok_e2e)):
+        raise schema.ReportRefused("the run has end-to-end rows without their latency histograms (schema 4's "
+                                   "e2e_hist.csv), so it cannot draw them; refused rather than left out")
     for column in SINGLE_VALUED:
-        values = sorted({row[column] for row in rows})
-        if column == "producers" and is_producer_sweep(environment):
-            # The ablation's producer axis (#752): the charts draw the smallest count, the ablation every one.
-            continue
+        values = sorted({row[column] for row in (main if column == "profile" else rows)})
         if len(values) > 1:
             raise schema.ReportRefused(
                 f"the run has {len(values)} values of {column} ({', '.join(values)}); this report draws one "
@@ -964,38 +1000,44 @@ def check_drawable(rows: list[dict[str, str]], environment: dict[str, Any]) -> N
 
 
 def build(run_dir: str, img_dir: str, doc_path: str) -> list[str]:
+    from kafka_compare import extra_charts
+
     run = schema.load_run(run_dir)  # raises ReportRefused before anything is written
-    check_drawable(run.rows, run.environment)
+    check_drawable(run.rows, run.environment, run.hist)
     counter_entries(run.environment)
     plt = _setup_matplotlib()
     os.makedirs(img_dir, exist_ok=True)
     os.makedirs(os.path.dirname(os.path.abspath(doc_path)), exist_ok=True)
     run_id = run.environment["run_id"]
     m = run.environment["matrix"]
-    shape = f"{_counted(m['partitions'], 'partition')}, {_counted([headline_producers(run.environment)], 'producer')}"
-    drawn = headline_rows(run.rows, run.environment)
+    shape = f"{_counted(m['partitions'], 'partition')}, {_counted(m['producers'], 'producer')}"
     written = []
-    written += throughput_chart(plt, drawn, run.environment, run_id, "saturation",
+    written += throughput_chart(plt, run.rows, run.environment, run_id, "saturation",
                                 "Produce throughput at saturation, VTOP vs Apache Kafka",
                                 f"{shape}, acks={'/'.join(m['acks'])}, RF 3 / min ISR 2 (VTOP: write quorum 2 of 3). "
                                 "Same JVM client container for both systems.",
                                 "kafka-compare-produce-throughput", img_dir)
-    written += latency_chart(plt, drawn, run.environment, run_id, img_dir)
+    written += latency_chart(plt, run.rows, run.environment, run_id, img_dir)
     if run.environment["matrix"].get("consume"):
-        written += throughput_chart(plt, drawn, run.environment, run_id, "consume",
+        written += throughput_chart(plt, run.rows, run.environment, run_id, "consume",
                                     "Consume throughput, VTOP vs Apache Kafka",
                                     f"{_counted(m['partitions'], 'partition')}, 1 consumer in a fresh group, "
                                     "offset commits off for both; the tool's "
                                     "fetch rate, which excludes the group join. Same JVM client container for both.",
                                     "kafka-compare-consume-throughput", img_dir)
+    extra_written, extra_files = extra_charts.draw(plt, run, img_dir)
+    written += extra_written
     doc_dir = os.path.dirname(os.path.abspath(doc_path))
     images = {
         key: os.path.relpath(os.path.join(img_dir, f"kafka-compare-{key}.png"), doc_dir)
         for key in ("produce-throughput", "produce-latency", "consume-throughput")
     }
+    images.update({key: os.path.relpath(path, doc_dir) for key, path in extra_files.items()})
     csv_rel = os.path.relpath(os.path.join(run_dir, "results.csv"), doc_dir)
     env_rel = os.path.relpath(os.path.join(run_dir, "environment.json"), doc_dir)
-    write_markdown(run.rows, run.environment, run_id, csv_rel, env_rel, images, doc_path)
+    hist_rel = os.path.relpath(os.path.join(run_dir, schema.E2E_HIST), doc_dir)
+    write_markdown(run.rows, run.environment, run_id, csv_rel, env_rel, images, doc_path,
+                   extra_charts.sections(run, images, hist_rel))
     written.append(doc_path)
     return written
 
@@ -1003,19 +1045,39 @@ def build(run_dir: str, img_dir: str, doc_path: str) -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("run_dir", help="benchmarks/kafka_compare/results/<run-id>")
-    parser.add_argument("--img-dir", default=DEFAULT_IMG_DIR)
-    parser.add_argument("--doc", default=None, help="default: kafka-comparison.md, or kafka-failover.md for a "
-                                                     "failover run")
+    parser.add_argument("--img-dir", default=None, help="default: docs/benchmarks/img/, or where the run's "
+                                                         "report.json says")
+    parser.add_argument("--doc", default=None, help="default: kafka-comparison.md, kafka-failover.md for a "
+                                                     "failover run or kafka-crash.md for a crash run, or where "
+                                                     "the run's report.json says")
+    parser.add_argument("--min-ok", type=int, default=None,
+                        help="crash run only: the fewest ok crashes a configuration may have (default "
+                             "crash_report.MIN_OK_CRASHES); lower it to preview a short run, never to commit one")
     args = parser.parse_args(argv)
     try:
+        own = run_outputs.resolve(args.run_dir, REPO, IMG_ROOT, allow_latency_run=True, allow_supersedes=True)
+        img_dir = args.img_dir or (own.img_dir if own and own.img_dir else DEFAULT_IMG_DIR)
+        doc = args.doc or (own.doc if own else None)
+        is_crash = os.path.isfile(os.path.join(args.run_dir, "crash.csv"))
+        if own and own.latency_run and not is_crash:
+            raise run_outputs.OutputsRefused(
+                f"{args.run_dir}/report.json names latency_run {own.latency_run!r}, which only a crash run may "
+                "(its page draws that run's latencies beside its losses)")
         if os.path.isfile(os.path.join(args.run_dir, "failover.csv")):
             from kafka_compare import failover_report
 
-            written = failover_report.build(args.run_dir, args.img_dir, args.doc or DEFAULT_FAILOVER_DOC,
-                                            _setup_matplotlib)
+            written = failover_report.build(args.run_dir, img_dir, doc or DEFAULT_FAILOVER_DOC, _setup_matplotlib)
+        elif os.path.isfile(os.path.join(args.run_dir, "crash.csv")):
+            from kafka_compare import crash_report
+
+            latency = (os.path.join(os.path.dirname(os.path.abspath(args.run_dir)), own.latency_run)
+                       if own and own.latency_run else None)
+            written = crash_report.build(args.run_dir, img_dir, doc or DEFAULT_CRASH_DOC, _setup_matplotlib,
+                                         **({} if args.min_ok is None else {"min_ok": args.min_ok}),
+                                         latency_run=latency)
         else:
-            written = build(args.run_dir, args.img_dir, args.doc or DEFAULT_DOC)
-    except schema.ReportRefused as exc:
+            written = build(args.run_dir, img_dir, doc or DEFAULT_DOC)
+    except (run_outputs.OutputsRefused, schema.ReportRefused) as exc:
         print(f"report refused: {exc}", file=sys.stderr)
         return 2
     for path in written:

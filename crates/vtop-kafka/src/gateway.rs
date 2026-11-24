@@ -155,6 +155,37 @@ const INITIAL_FRAME_CAPACITY: usize = 64 * 1024;
 /// What ListOffsets answers as the timestamp of a boundary lookup: unknown.
 const TIMESTAMP_UNKNOWN: i64 = -1;
 
+/// Write one framed reply, giving up when the peer has not taken it within
+/// `limit`. `Ok(false)` is the give-up; a write error is the error.
+async fn write_reply<W>(socket: &mut W, body: &[u8], limit: Duration) -> std::io::Result<bool>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(limit, socket.write_all(&frame(body))).await {
+        Ok(written) => written.map(|()| true),
+        Err(_) => Ok(false),
+    }
+}
+
+/// The most one Fetch response may carry, whatever `max_bytes` and each
+/// partition's `partition_max_bytes` ask for (50 MiB, the default of Kafka's
+/// own `fetch.max.bytes`).
+///
+/// Both numbers come off the wire as an `i32`. Taken as they stand, one
+/// request could ask a node to read, copy and encode up to 2 GiB of log into
+/// a single response, and a client can send such a request on every session
+/// it holds.
+const MAX_FETCH_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
+
+/// The byte budget for a whole Fetch response: what the client asked for,
+/// at least one byte (the at-least-one-batch rule), at most
+/// [`MAX_FETCH_RESPONSE_BYTES`].
+fn fetch_response_budget(requested: i32) -> usize {
+    usize::try_from(requested.max(1))
+        .unwrap_or(usize::MAX)
+        .min(MAX_FETCH_RESPONSE_BYTES)
+}
+
 /// Resolves when `shutdown` reads `true`; never on a dropped sender, which
 /// is not a signal (see `serve`).
 async fn shutdown_signalled(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
@@ -1115,7 +1146,17 @@ impl Gateway {
                 return Ok(());
             }
             match self.answer(&body).await {
-                Answer::Reply(bytes) => socket.write_all(&frame(&bytes)).await?,
+                Answer::Reply(bytes) => {
+                    // A peer that stops reading holds this session, and a
+                    // slot, only for the idle limit: the reads are bounded
+                    // by it, so the write is too.
+                    if !write_reply(&mut socket, &bytes, self.config.idle_timeout).await? {
+                        tracing::warn!(
+                            "kafka response not accepted within the idle limit; connection closed"
+                        );
+                        return Ok(());
+                    }
+                }
                 Answer::Close(reason) => {
                     tracing::warn!(%reason, "kafka request refused; connection closed");
                     return Ok(());
@@ -2806,7 +2847,7 @@ impl Gateway {
             // partition: the first partition with data keeps its
             // at-least-one-batch guarantee, and once the budget is spent the
             // rest report their watermarks without asking for records.
-            let mut remaining = usize::try_from(request.max_bytes.max(1)).unwrap_or(usize::MAX);
+            let mut remaining = fetch_response_budget(request.max_bytes);
             let mut total = 0_usize;
             let mut any_error = false;
             for topic in &request.topics {
@@ -6184,6 +6225,151 @@ mod tests {
         );
     }
 
+    /// A consumer that rides through a failover (#751) arrives at a
+    /// coordinator whose memory was reset: the groups are forgotten, the
+    /// committed offsets are not. Its next Heartbeat, SyncGroup and
+    /// OffsetCommit under the generation it held are refused by name and at
+    /// once, never parked: `UNKNOWN_MEMBER_ID` or `ILLEGAL_GENERATION`, the
+    /// codes on which a stock consumer rejoins. The refused commit moves
+    /// nothing, and OffsetFetch still answers the offset committed before the
+    /// reset, which is where the rejoined member resumes. Generations restart
+    /// with the coordinator's memory, so the new round is generation 1 again:
+    /// the old member is refused for its id, not only for its number.
+    #[tokio::test]
+    async fn a_member_from_before_a_reset_is_refused_by_name_and_its_commit_survives() {
+        let unknown_member = ErrorCode::UnknownMemberId.as_i16();
+        let illegal_generation = ErrorCode::IllegalGeneration.as_i16();
+        let store = Arc::new(crate::offsets::MemoryOffsetStore::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_stop, stopped) = tokio::sync::watch::channel(false);
+        let gateway = Gateway::new(
+            Arc::new(MemoryBridge::with_topics(["events"])),
+            GatewayConfig {
+                advertised_port: addr.port() as i32,
+                groups: GroupConfig {
+                    initial_rebalance_delay: Duration::from_millis(50),
+                    ..GroupConfig::default()
+                },
+                ..GatewayConfig::default()
+            },
+        )
+        .with_offsets(Arc::clone(&store) as Arc<dyn OffsetStore>);
+        let handle = gateway.handle();
+        tokio::spawn(gateway.serve(listener, stopped));
+        // Every answer below is a refusal or a read; none may wait.
+        let answer = move |key: i16, version: i16, correlation: i32, body: Vec<u8>| async move {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                call(addr, key, version, correlation, &body),
+            )
+            .await
+            .expect("answered at once, not parked")
+            .expect("answered, not closed")
+        };
+
+        let reply = answer(
+            0,
+            3,
+            1,
+            produce_body("events", 0, -1, None, &batch_bytes(&["a", "b", "c"], false)),
+        )
+        .await;
+        assert_eq!(read_produce(&reply, 3), (0, 0, None));
+        let protocols: &[(&str, &[u8])] = &[("range", b"sub-events")];
+        let joined = read_join(&answer(11, 2, 2, join_body(2, "g", "", protocols)).await, 2);
+        assert_eq!((joined.error, joined.generation), (0, 1));
+        let old = joined.member_id;
+        let assignment = consumer_assignment("events", &[0]);
+        let reply = answer(
+            14,
+            1,
+            3,
+            sync_body(1, "g", 1, &old, &[(old.as_str(), assignment.as_slice())]),
+        )
+        .await;
+        assert_eq!(read_sync(&reply, 1).0, 0);
+        let reply = answer(
+            8,
+            7,
+            4,
+            offset_commit_body(7, "g", 1, &old, "events", 0, 2, None),
+        )
+        .await;
+        assert_eq!(read_offset_commit(&reply, 7), vec![(0, 0)]);
+
+        // The failover: this node's leadership ended, or a new one began.
+        handle.reset_groups();
+
+        let reply = answer(12, 1, 5, heartbeat_body(1, "g", 1, &old)).await;
+        assert_eq!(read_error_only(&reply, 1), unknown_member, "heartbeat");
+        let reply = answer(14, 1, 6, sync_body(1, "g", 1, &old, &[])).await;
+        assert_eq!(read_sync(&reply, 1).0, unknown_member, "sync");
+        let reply = answer(
+            8,
+            7,
+            7,
+            offset_commit_body(7, "g", 1, &old, "events", 0, 3, None),
+        )
+        .await;
+        assert_eq!(
+            read_offset_commit(&reply, 7),
+            vec![(0, illegal_generation)],
+            "no group here has the generation the commit names"
+        );
+        let fetch = offset_fetch_body(3, "g", Some(&[("events", &[0][..])]));
+        let reply = answer(9, 3, 8, fetch.clone()).await;
+        assert_eq!(
+            read_offset_fetch(&reply, 3),
+            (0, vec![("events".to_owned(), vec![(0, 2, None, 0)])]),
+            "the offset committed before the reset, not moved by the refused commit"
+        );
+
+        // The member rejoins as a new one, at generation 1 again.
+        let rejoined = read_join(&answer(11, 2, 9, join_body(2, "g", "", protocols)).await, 2);
+        assert_eq!((rejoined.error, rejoined.generation), (0, 1));
+        assert_ne!(rejoined.member_id, old, "a fresh id, not the old one");
+        let reply = answer(
+            14,
+            1,
+            10,
+            sync_body(
+                1,
+                "g",
+                1,
+                &rejoined.member_id,
+                &[(rejoined.member_id.as_str(), assignment.as_slice())],
+            ),
+        )
+        .await;
+        assert_eq!(read_sync(&reply, 1).0, 0);
+        // Same generation number, old id: still refused.
+        let reply = answer(12, 1, 11, heartbeat_body(1, "g", 1, &old)).await;
+        assert_eq!(read_error_only(&reply, 1), unknown_member);
+        let reply = answer(
+            8,
+            7,
+            12,
+            offset_commit_body(7, "g", 1, &old, "events", 0, 3, None),
+        )
+        .await;
+        assert_eq!(read_offset_commit(&reply, 7), vec![(0, unknown_member)]);
+        let reply = answer(9, 3, 13, fetch).await;
+        assert_eq!(
+            read_offset_fetch(&reply, 3),
+            (0, vec![("events".to_owned(), vec![(0, 2, None, 0)])])
+        );
+        // The rejoined member commits and moves it.
+        let reply = answer(
+            8,
+            7,
+            14,
+            offset_commit_body(7, "g", 1, &rejoined.member_id, "events", 0, 3, None),
+        )
+        .await;
+        assert_eq!(read_offset_commit(&reply, 7), vec![(0, 0)]);
+    }
+
     /// The default minimum session clears every wait a heartbeat can queue
     /// behind on one connection (review): the fetch ceiling and the offset
     /// ceiling, so the heartbeat is read before the session it keeps alive
@@ -7427,6 +7613,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read_fetch(&reply, 4).1, 3, "nothing appended");
+    }
+
+    /// A peer that never reads its reply is given up on at the limit, not
+    /// waited for for ever; one that reads it gets it.
+    #[tokio::test]
+    async fn a_reply_the_peer_never_reads_is_given_up_on() {
+        use tokio::io::AsyncReadExt;
+        let body = vec![7_u8; 4096];
+        // A pipe holding 64 bytes, and a far end that never reads.
+        let (mut near, _far) = tokio::io::duplex(64);
+        let taken = write_reply(&mut near, &body, Duration::from_millis(100))
+            .await
+            .unwrap();
+        assert!(!taken, "the write must end at the limit");
+        // The same pipe, with a reader draining it.
+        let (mut near, mut far) = tokio::io::duplex(64);
+        let drain = tokio::spawn(async move {
+            let mut sink = Vec::new();
+            far.read_to_end(&mut sink).await.unwrap();
+            sink.len()
+        });
+        let taken = write_reply(&mut near, &body, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(taken);
+        drop(near);
+        assert_eq!(drain.await.unwrap(), body.len() + 4);
+    }
+
+    /// A Fetch that asks for the most an `i32` can name is served at most
+    /// [`MAX_FETCH_RESPONSE_BYTES`], and one that asks for little keeps its
+    /// own budget, never less than one byte.
+    #[test]
+    fn a_fetch_response_budget_is_capped() {
+        assert_eq!(fetch_response_budget(i32::MAX), MAX_FETCH_RESPONSE_BYTES);
+        assert_eq!(
+            fetch_response_budget(MAX_FETCH_RESPONSE_BYTES as i32 + 1),
+            MAX_FETCH_RESPONSE_BYTES
+        );
+        assert_eq!(fetch_response_budget(1 << 20), 1 << 20);
+        assert_eq!(fetch_response_budget(0), 1);
+        assert_eq!(fetch_response_budget(i32::MIN), 1);
     }
 
     /// One byte budget per response (review): the second partition gets

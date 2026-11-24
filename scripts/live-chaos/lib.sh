@@ -78,7 +78,8 @@ NATIVE_PORT="${CHAOS_NATIVE_PORT:-9400}"
 # scenario 25's leader (24 also takes
 # replica-4, replica-5 and data-metrics 4 and 5 for its second range's
 # followers, and checks its own bound), and kafka-6 to kafka-8 for the three
-# candidates of scenarios 27 and 28 (#751, candidate_kafka_port). Above the
+# candidates of scenarios 27, 28 and 30 to 32 (#751, candidate_kafka_port; one
+# scenario at a time, in either shape). Above the
 # candidate natives (NATIVE_PORT + 11..13) so the default layout has no overlap.
 KAFKA_BASE_PORT="${CHAOS_KAFKA_BASE_PORT:-$((NATIVE_PORT + 20))}"
 # Observability endpoints (#224). Every node gets one so scenarios can gate on
@@ -909,9 +910,28 @@ print(','.join(str(r['lag_records']) for r in d['replicas']))
 # Range leases (#223)
 # ---------------------------------------------------------------------------
 
-# lease_field <meta-id> <jq-ish python path> — read one field of the range lease
-# through the linearizable read.
-lease_field() { # <meta-id> <python expression over `d`>
+# lease_field <meta-id[,meta-id...]> <jq-ish python path> — read one field of
+# the range lease through the linearizable read.
+#
+# More than one id, comma separated, asks each in turn and takes the first
+# answer (#751). Only the metadata leader answers the linearizable read, and in
+# the co-located shape the process a scenario kills may BE the metadata leader:
+# a reader pinned to its id would ask a corpse until the deadline. The callers
+# that kill a co-located node pass the survivors (lease_readers_without).
+lease_field() { # <meta-id[,meta-id...]> <python expression over `d`>
+  local ids="$1" expr="$2" id value
+  local -a readers
+  IFS=',' read -ra readers <<< "$ids"
+  for id in "${readers[@]}"; do
+    if value="$(lease_field_from "$id" "$expr")"; then
+      printf '%s\n' "$value"
+      return 0
+    fi
+  done
+  return 1
+}
+
+lease_field_from() { # <meta-id> <python expression over `d`>
   local id="$1" expr="$2"
   "$VTOPCTL" --json meta range-lease --config "$(emit_admin_config "$id")" \
     --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" 2>/dev/null \
@@ -1560,9 +1580,12 @@ emit_colocated_config() {
     echo "meta:"
     sed -e '/^observability:/d' "${strip_peers[@]}" -e 's/^/  /' "$WORKDIR/meta-$id.yaml"
     echo "data:"
-    # Each host carries an independent STANDALONE range for now: replicated
-    # ranges under co-location wait on follower-side epoch propagation (the
-    # lease watcher tracked as follow-up to #223).
+    # Each host carries an independent STANDALONE range: this emitter is
+    # scenario 10's, which asserts the co-located runner itself (one
+    # endpoint, a conjoined /readyz, shared fate). A replicated range under
+    # co-location works and is a different emitter:
+    # emit_colocated_candidate_config, three `vtop-node node` processes that
+    # are each a voter and a candidate (scenarios 30 and 31, #751).
     echo "  role: standalone"
     echo "  node_uuid: $uuid"
     echo "  cluster_id: $CLUSTER_ID"
@@ -1685,7 +1708,7 @@ emit_candidate_config() {
     echo "segment_id: $SEGMENT_ID"
     echo "native_listen: \"$(candidate_native_addr "$n")\""
     echo "replica_listen: \"$(replica_addr $((n - 1)))\""
-    # The Kafka gateway (#751), for scenarios 27 and 28: every member serves
+    # The Kafka gateway (#751), for scenarios 27, 28 and 30 to 32: every member serves
     # it and lists every member as a broker, so a client bootstrapped from any
     # of them finds the holder after a failover.
     [[ -n "${CHAOS_CANDIDATE_KAFKA:-}" ]] && emit_candidate_kafka_yaml "$n"
@@ -1783,26 +1806,220 @@ candidate_by_uuid() {
   fail "lease holder $1 is not one of the three candidates"
 }
 
+# assert_metadata_names_leader <bootstrap-candidate> <leader-candidate> — what
+# a Kafka client bootstrapped from candidate <bootstrap> alone is told (#751):
+# every broker, and <leader> as the partition's leader. A client that dialled
+# a member that does not lead is redirected by this answer alone. A member
+# learns the holder from its next lease poll, so this is a deadline poll, not
+# a one-shot read. Needs KCAT, which the Kafka scenarios set.
+assert_metadata_names_leader() { # <bootstrap-candidate> <leader-candidate>
+  local listing="" deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS))
+  until grep -q '^ *3 brokers' <<<"$listing" \
+    && grep -q "partition 0, leader $2," <<<"$listing"; do
+    [[ $SECONDS -lt $deadline ]] \
+      || fail "candidate $1 does not list three brokers and name candidate $2 (the lease holder) as the leader of partition 0: $listing"
+    listing="$("${KCAT:?the scenario sets KCAT}" -L -b "127.0.0.1:$(candidate_kafka_port "$1")" -t "$TOPIC" 2>&1)" || true
+    sleep 0.2
+  done
+}
+
+# kafka_raw_produce <port> <key> <value> <wait-seconds> — ONE Kafka Produce
+# (acks=all, one record, partition 0 of $TOPIC) sent straight to 127.0.0.1:<port>
+# with no Metadata first, and the answer as one line: `acknowledged offset=N`,
+# `refused code=N name=NAME`, `closed`, `no-reply` or `unreachable ...`
+# (kafka_raw_produce.py says why a stock client cannot be used for this).
+kafka_raw_produce() { # <port> <key> <value> <wait-seconds> [--say-sent]
+  python3 "$SCRIPT_DIR/kafka_raw_produce.py" "$1" "$TOPIC" "$2" "$3" "$4" "${@:5}"
+}
+
+# kafka_distribution <copy-dir> <tool...> — the Apache Kafka distribution whose
+# JVM client tools scenarios 28, 31 and 33 run (#751): CHAOS_KAFKA_HOME names an
+# unpacked one, or CHAOS_KAFKA_IMAGE an apache/kafka image whose /opt/kafka is
+# copied into <copy-dir>/kafka with docker. Sets KAFKA_HOME, and checks each
+# named tool (bin/<tool>.sh) is there. Whether to run without either is the
+# caller's decision; this fails.
+kafka_distribution() { # <copy-dir> <tool...>
+  local copy_dir="$1" tool container clients_jar
+  shift
+  KAFKA_HOME="${CHAOS_KAFKA_HOME:-}"
+  if [[ -z "$KAFKA_HOME" ]]; then
+    local image="${CHAOS_KAFKA_IMAGE:-}"
+    [[ -n "$image" ]] || fail "set CHAOS_KAFKA_HOME to an unpacked Apache Kafka distribution, or CHAOS_KAFKA_IMAGE to an apache/kafka image"
+    require_command docker "CHAOS_KAFKA_IMAGE needs docker to copy the distribution out of the image."
+    KAFKA_HOME="$copy_dir/kafka"
+    if [[ ! -d "$KAFKA_HOME" ]]; then
+      container="$(docker create "$image")" \
+        || fail "could not create a container from CHAOS_KAFKA_IMAGE=$image"
+      docker cp "$container:/opt/kafka" "$KAFKA_HOME" > /dev/null \
+        || { docker rm "$container" > /dev/null 2>&1 || true; fail "$image holds no /opt/kafka"; }
+      docker rm "$container" > /dev/null
+    fi
+  fi
+  for tool in "$@"; do
+    [[ -x "$KAFKA_HOME/bin/$tool.sh" ]] || fail "$KAFKA_HOME/bin/$tool.sh is not an executable Kafka tool"
+  done
+  clients_jar=("$KAFKA_HOME"/libs/kafka-clients-*.jar)
+  log "Kafka client tools: $KAFKA_HOME (${clients_jar[0]##*/}), JVM: $(java -version 2>&1 | head -1)"
+}
+
+# group_cursor_offset <group> <meta-id[,meta-id...]> — the group's committed
+# offset for the range as the metadata plane holds it (#457 slice 2b, #751):
+# the NEXT offset to consume, marker records included, so comparable with the
+# Kafka high watermark; -1 while the plane knows no such group. One attempt per
+# id, each bounded (the admin transport has no deadline of its own), the first
+# that answers taken; non-zero when none did, so the caller polls.
+group_cursor_offset() { # <group> <meta-id[,meta-id...]>
+  local group="$1" ids="$2" id out="$WORKDIR/group-cursor-$1.$BASHPID.json"
+  local -a readers
+  IFS=',' read -ra readers <<< "$ids"
+  for id in "${readers[@]}"; do
+    timeout --kill-after=1 10 "$VTOPCTL" --json meta group-cursor --group-name "$group" \
+      --cluster-id "$CLUSTER_ID" --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" \
+      --config "$(emit_admin_config "$id")" > "$out" 2> /dev/null || continue
+    python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(d["cursor"]["record_offset"] if d.get("group_found") else -1)
+' "$out" 2> /dev/null && return 0
+  done
+  return 1
+}
+
+# The shape of the Kafka-candidate cluster (#751), for scenarios 27 and 28 and
+# their co-located wrappers 30 and 31:
+#   split      three `vtop-node meta` processes and three `vtop-node data`
+#              candidates (the default);
+#   colocated  three `vtop-node node` processes, each a metadata voter AND a
+#              candidate, the shape the Helm chart renders for a replicated
+#              topology and benchmarks/kafka_compare/vtop/ha-node-*.yaml run.
+#              A kill there takes a Raft voter and a candidate in one stroke,
+#              and the voter may be the metadata leader.
+KAFKA_SHAPE="${CHAOS_KAFKA_SHAPE:-split}"
+
+# candidate_log <n: 1|2|3> — the log of the process that hosts candidate <n>.
+candidate_log() {
+  if [[ "$KAFKA_SHAPE" == "colocated" ]]; then
+    echo "$WORKDIR/logs/colocated-candidate-$1.log"
+  else
+    echo "$WORKDIR/logs/data-candidate-$1.log"
+  fi
+}
+
+# lease_readers_without <n: 1|2|3> — the metadata ids to read the lease from
+# once candidate <n>'s process is gone, comma separated for lease_field. In
+# the split shape the metadata plane is untouched by a candidate's death, so
+# it is the metadata leader; co-located, the dead process took its voter with
+# it, perhaps the leader, so it is the two survivors (the leader among them
+# answers, after an election if it was the one killed).
+lease_readers_without() {
+  if [[ "$KAFKA_SHAPE" != "colocated" ]]; then
+    echo "$META_LEADER_ID"
+    return 0
+  fi
+  local m readers=()
+  for m in 1 2 3; do
+    [[ "$m" == "$1" ]] || readers+=("$m")
+  done
+  local IFS=','
+  echo "${readers[*]}"
+}
+
+# kafka_failover_conditions <killed-candidate> — the conditions a KAFKA_FAILOVER
+# result line carries beside its numbers (#751), as key=value words: the
+# shape, the binaries' profile, the lease (duration, renew, poll) and, in the
+# co-located shape, whether the killed process hosted the metadata leader
+# the cluster started with (the compound fault: a Raft election before the
+# lease can move). A number without its conditions is not comparable.
+kafka_failover_conditions() { # <killed-candidate>
+  local killed_meta_leader="n/a"
+  if [[ "$KAFKA_SHAPE" == "colocated" ]]; then
+    killed_meta_leader=no
+    [[ "$1" == "$META_LEADER_ID" ]] && killed_meta_leader=yes
+  fi
+  printf 'shape=%s profile=%s lease_ms=%s renew_ms=%s poll_ms=%s killed_meta_leader=%s\n' \
+    "$KAFKA_SHAPE" "$CHAOS_PROFILE" "$LEASE_DURATION_MS" "$LEASE_RENEW_MS" "$LEASE_POLL_MS" \
+    "$killed_meta_leader"
+}
+
+# emit_colocated_candidate_config <n: 1|2|3> — one `vtop-node node` process
+# (#751): metadata voter <n> and candidate <n>, each half exactly what the
+# split shape runs for it (emit_meta_config and emit_candidate_config, so the
+# two shapes cannot drift apart), under ONE top-level observability endpoint
+# (the co-located runner refuses a per-role block). The candidate's lease asks
+# its own process's voter first and lists all three in `admin_peers`, as
+# ha-node-*.yaml does, so a survivor's lease agent follows the metadata
+# leader to wherever an election moved it.
+emit_colocated_candidate_config() {
+  local n="$1" m data_cfg
+  local cfg="$WORKDIR/colocated-candidate-$n.yaml"
+  local peers=()
+  for m in 1 2 3; do
+    [[ "$m" == "$n" ]] || peers+=("$m")
+  done
+  emit_meta_config "$n" "${peers[@]}" > /dev/null
+  data_cfg="$(CHAOS_LEASE_ADMIN_PEERS=1 emit_candidate_config "$n" "$n")"
+  {
+    echo "meta:"
+    sed -e '/^observability:/d' -e 's/^/  /' "$WORKDIR/meta-$n.yaml"
+    echo "data:"
+    sed -e '/^observability:/d' -e 's/^/  /' "$data_cfg"
+    # The address the split shape gives candidate <n>'s data process, so a
+    # scenario scrapes the same address in either shape.
+    echo "observability: { listen: \"$(data_metrics_addr $((n + 10)))\" }"
+  } | install_config "$cfg"
+  echo "$cfg"
+}
+
+# start_colocated_candidate <n: 1|2|3> — echoes the pid. Not gated on /readyz:
+# a candidate's half is ready only after its lease agent's first metadata
+# exchange, and the metadata plane is not initialised until all three are up.
+start_colocated_candidate() {
+  local n="$1" pid
+  pid="$(start_node "colocated-candidate-$n" "colocated_node_starting" node \
+    --config "$(emit_colocated_candidate_config "$n")")"
+  echo "$pid"
+}
+
 # bring_up_kafka_candidates — the cluster scenarios 27 and 28 (#751) start
 # from: a three-node metadata plane, the topic and the three candidates
 # registered, then three candidates that each serve the Kafka gateway and list
 # all three as brokers. Nothing is scripted about who leads: it returns when
 # SOMEBODY holds the range and every member's gateway is listening.
+# CHAOS_KAFKA_SHAPE picks the processes (see KAFKA_SHAPE).
 #
 # Sets, for the caller (the scenario reads them):
 #   META_LEADER_ID   the metadata leader's node id
-#   CAND_PIDS[1..3]  the candidates' pids
+#   CAND_PIDS[1..3]  the pids of the processes hosting the candidates (in the
+#                    co-located shape each also hosts metadata voter n)
 #   HOLDER, EPOCH    the lease holder's uuid and fencing epoch at the start
 #   WINNER           the holder's candidate ordinal
 #   KAFKA_BOOTSTRAP  every member's Kafka endpoint, comma separated
 # shellcheck disable=SC2034  # read by the scenarios that source this file
 bring_up_kafka_candidates() {
   CHAOS_CANDIDATE_KAFKA=1
-  local m1 m2 m3 node
-  m1="$(start_meta_node 1 2 3)"
-  m2="$(start_meta_node 2 1 3)"
-  m3="$(start_meta_node 3 1 2)"
-  log "meta nodes up: $m1 $m2 $m3"
+  case "$KAFKA_SHAPE" in
+    split | colocated) ;;
+    *) fail "CHAOS_KAFKA_SHAPE must be split or colocated, not '$KAFKA_SHAPE'" ;;
+  esac
+  local m1 m2 m3 node n
+  CAND_PIDS=("" "" "" "")
+  if [[ "$KAFKA_SHAPE" == "colocated" ]]; then
+    for n in 1 2 3; do
+      CAND_PIDS[n]="$(start_colocated_candidate "$n")"
+    done
+    for n in 1 2 3; do
+      await_log_line "$(candidate_log "$n")" "meta_node_ready" \
+        "co-located node $n must bind its metadata voter" "$READY_TIMEOUT_SECONDS"
+      await_log_line "$(candidate_log "$n")" "data_node_ready role=candidate" \
+        "co-located node $n must bind its candidate" "$READY_TIMEOUT_SECONDS"
+    done
+    log "three co-located nodes up, each a metadata voter and a candidate: ${CAND_PIDS[1]} ${CAND_PIDS[2]} ${CAND_PIDS[3]}"
+  else
+    m1="$(start_meta_node 1 2 3)"
+    m2="$(start_meta_node 2 1 3)"
+    m3="$(start_meta_node 3 1 2)"
+    log "meta nodes up: $m1 $m2 $m3"
+  fi
   meta_admin 1 init --members 1,2,3 > /dev/null
   META_LEADER_ID="$(wait_meta_leader 1 2 3)"
   log "meta leader elected: node $META_LEADER_ID"
@@ -1815,16 +2032,24 @@ bring_up_kafka_candidates() {
       --node-uuid "$node" --addr "$REGISTER_HOST_PREFIX.1:$REGISTER_PORT" > /dev/null \
       || fail "could not register data node $node"
   done
-  CAND_PIDS=("" "" "" "")
-  CAND_PIDS[1]="$(start_candidate 1 "$META_LEADER_ID")"
-  CAND_PIDS[2]="$(start_candidate 2 "$META_LEADER_ID")"
-  CAND_PIDS[3]="$(start_candidate 3 "$META_LEADER_ID")"
-  log "three candidates up from one config shape, each serving Kafka: ${CAND_PIDS[1]} ${CAND_PIDS[2]} ${CAND_PIDS[3]}"
+  if [[ "$KAFKA_SHAPE" == "colocated" ]]; then
+    # The shared /readyz is the conjunction of both halves, and the
+    # candidate's half waits for its lease agent's first metadata exchange,
+    # which needed the plane initialised above.
+    for n in 1 2 3; do
+      await_ready "$(data_metrics_addr $((n + 10)))" "colocated-candidate-$n" "$ELECTION_TIMEOUT_SECONDS"
+    done
+  else
+    CAND_PIDS[1]="$(start_candidate 1 "$META_LEADER_ID")"
+    CAND_PIDS[2]="$(start_candidate 2 "$META_LEADER_ID")"
+    CAND_PIDS[3]="$(start_candidate 3 "$META_LEADER_ID")"
+  fi
+  log "three candidates up from one config shape ($KAFKA_SHAPE), each serving Kafka: ${CAND_PIDS[1]} ${CAND_PIDS[2]} ${CAND_PIDS[3]}"
   KAFKA_BOOTSTRAP="127.0.0.1:$(candidate_kafka_port 1),127.0.0.1:$(candidate_kafka_port 2),127.0.0.1:$(candidate_kafka_port 3)"
   read -r HOLDER EPOCH <<<"$(await_any_lease_holder "$META_LEADER_ID")"
   WINNER="$(candidate_by_uuid "$HOLDER")"
   log "candidate $WINNER ($HOLDER) took the range at epoch $EPOCH, unscripted"
-  await_log_line "$WORKDIR/logs/data-candidate-$WINNER.log" \
+  await_log_line "$(candidate_log "$WINNER")" \
     "data_node_role_changed role=leader" \
     "the winner must record its promotion as a role change"
 }
@@ -1886,6 +2111,37 @@ start_follower() {
 
 stop_pid() { kill "$1" 2>/dev/null || true; }
 kill9_pid() { kill -9 "$1" 2>/dev/null || true; }
+
+# pause_pid <pid> — SIGSTOP, and REQUIRE the stop (#751). A pause is not a
+# kill: the process keeps its sockets, the kernel keeps accepting connections
+# and buffering requests for it, and it resumes with every timer and every
+# belief it held, which is the stall a lease must survive (a GC or VM pause, a
+# hung disk). The stop is checked, not assumed: a scenario that thought it had
+# paused a leader that was in fact still running would prove nothing.
+pause_pid() { # <pid>
+  local pid="$1" deadline=$((SECONDS + STOP_TIMEOUT_SECONDS)) state=""
+  kill -STOP "$pid" 2>/dev/null || fail "could not SIGSTOP pid $pid: it is not running"
+  while :; do
+    state="$(ps -o stat= -p "$pid" 2>/dev/null || true)"
+    [[ "$state" == T* ]] && return 0
+    [[ $SECONDS -lt $deadline ]] \
+      || fail "pid $pid did not stop within ${STOP_TIMEOUT_SECONDS}s of SIGSTOP (state: ${state:-gone})"
+    sleep 0.05
+  done
+}
+
+# resume_pid <pid> — SIGCONT a process pause_pid stopped, and require it runs.
+resume_pid() { # <pid>
+  local pid="$1" deadline=$((SECONDS + STOP_TIMEOUT_SECONDS)) state=""
+  kill -CONT "$pid" 2>/dev/null || fail "could not SIGCONT pid $pid: it is not running"
+  while :; do
+    state="$(ps -o stat= -p "$pid" 2>/dev/null || true)"
+    [[ -n "$state" && "$state" != T* ]] && return 0
+    [[ $SECONDS -lt $deadline ]] \
+      || fail "pid $pid did not resume within ${STOP_TIMEOUT_SECONDS}s of SIGCONT (state: ${state:-gone})"
+    sleep 0.05
+  done
+}
 
 stop_node_now() { # <pid>
   local pid="$1" deadline=$((SECONDS + STOP_TIMEOUT_SECONDS))

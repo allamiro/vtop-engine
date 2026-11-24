@@ -1568,6 +1568,30 @@ targets, the history checker's remaining scenarios, a pilot). Failover and
 crash-durability measurements against Apache Kafka stay open (#597, #599), as
 does the head-to-head throughput run (#596).
 
+On `main` for v0.12.0 (#751, #945, #947): a Kafka client follows a failover in
+every shape the chart deploys. Live-chaos scenarios 30 and 31 run the producer
+failover on co-located `vtop-node node` processes, 32 pauses the leader past its
+lease (it acknowledges nothing and refuses by name), and 33 runs a stock
+consumer group through a kill of its coordinator; `kafka-failover-release.yml`
+measures them with release binaries and the chart's 15 s lease on a hosted
+runner (producers back 12.5 s to 15.9 s after the kill, a group 13.0 s to
+14.4 s). A Fetch to a promoted node whose boundary is not yet proven is now
+answered `OFFSET_NOT_AVAILABLE`, which consumers retry, instead of
+`REQUEST_TIMED_OUT`, on which the JVM consumer ended. Group membership is still
+not carried across a failover; members rejoin from their committed offset.
+
+In v0.12.0 so far:
+
+- **Applied audit records name the actor from the log (#706).** From
+  metadata feature level 9, each replica's applied record of an attributed
+  cluster command carries `requested_by`, `requested_from` and `vouched_by`,
+  read from the committed entry rather than from what the replica observed,
+  so every replica writes the same three values for one entry and a replica
+  that lost the edge record still names the actor. A command committed bare
+  (below level 9, or a node's own release) has none of them. Reading the
+  tail back with a command and request ids for bootstrap and membership are
+  the rest of #706.
+
 ---
 
 ## Versioning

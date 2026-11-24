@@ -1,8 +1,7 @@
 diff --git a/crates/vtop-broker/src/replication/mod.rs b/crates/vtop-broker/src/replication/mod.rs
-index 67d15312..14623993 100644
 --- a/crates/vtop-broker/src/replication/mod.rs
 +++ b/crates/vtop-broker/src/replication/mod.rs
-@@ -1850,6 +1850,14 @@ impl InProcessFollower {
+@@ -1854,6 +1854,14 @@
                  )
              })
          };
