@@ -11,11 +11,15 @@ and none is typed here:
 
 - egress-utilisation: benchmarks/measurements/483-tcp-baseline/points.csv
 - policed-uplink:     benchmarks/measurements/663-policed-uplink/runs.csv
-- kafka-failover:     benchmarks/kafka_compare/results/failover-20261111T032549Z/failover.csv
-- kafka-throughput:   benchmarks/kafka_compare/results/20261109T232328Z/results.csv
+- kafka-failover:     failover.csv of the current failover run under benchmarks/kafka_compare/results/
+- kafka-throughput:   results.csv of the current throughput run there
 - card-*:             the README's summary cards, drawn by readme_cards.py from
                       site_facts.py, which reads the same files through the
                       loaders below
+
+"Current" is kafka_compare/regenerate.py's rule (`current_run`): the one committed run of the kind that no other
+committed run supersedes (`"supersedes"` in its report.json, run_outputs.py). No run id is written here, so a newer
+run that supersedes the one charted moves the charts and the prose with it; two current runs of a kind are refused.
 
 The Kafka runs go through kafka_compare's own loaders (which refuse a partial
 or mixed run) and its own summaries, so a number here is the number
@@ -54,8 +58,9 @@ REPO = os.path.dirname(HERE)
 OUT = "docs/assets/readme"
 EGRESS = "benchmarks/measurements/483-tcp-baseline/points.csv"
 POLICED = "benchmarks/measurements/663-policed-uplink/runs.csv"
-THROUGHPUT_RUN = "benchmarks/kafka_compare/results/20261109T232328Z"
-FAILOVER_RUN = "benchmarks/kafka_compare/results/failover-20261111T032549Z"
+# The repository whose HEAD says which runs are current (git). The loaders' `repo` may be a copy of the inputs
+# (the tests' data trees, which are not repositories), so a run is resolved here and its files read there.
+RUNS_REPO = REPO
 
 # Every colour comes from the registry in kafka_compare/colours.py: the greys
 # from NEUTRALS, and the system colours from categorical slots 1 and 2, light
@@ -73,6 +78,25 @@ FAULT_ORDER = ("kill9_leader", "stop_leader", "partition_leader")
 
 class Refused(Exception):
     """The charts cannot be vouched for; the message says why."""
+
+
+def throughput_run() -> str:
+    """The Kafka comparison's current throughput run, relative to the repository: the one committed run of that
+    kind that no other supersedes (kafka_compare/regenerate.py's `current_run`, the rule the drift check draws
+    the pages by), so the README's chart, its prose and the comparison page read the same run."""
+    return _current("throughput")
+
+
+def failover_run() -> str:
+    """The current failover run, by the same rule."""
+    return _current("failover")
+
+
+def _current(kind: str) -> str:
+    try:
+        return kc_regenerate.current_run(kind, RUNS_REPO)
+    except kc_regenerate.Refused as exc:
+        raise Refused(f"the README's {kind} chart has no one run to draw: {exc}") from exc
 
 
 # ------------------------------------------------------------------------ data
@@ -138,7 +162,7 @@ def policed_runs(repo: str = REPO) -> dict[tuple[str, str], dict[str, int]]:
 
 
 def failover(repo: str = REPO) -> dict[str, Any]:
-    run = failover_schema.load_failover_run(os.path.join(repo, FAILOVER_RUN))
+    run = failover_schema.load_failover_run(os.path.join(repo, failover_run()))
     rows = run.rows
     cells = {}
     per_fault = {}
@@ -157,10 +181,10 @@ def failover(repo: str = REPO) -> dict[str, Any]:
     for system in ("kafka", "vtop"):
         mine = [row for row in rows if row["system"] == system]
         if not mine:
-            raise Refused(f"{FAILOVER_RUN}: no {system} rows")
+            raise Refused(f"{failover_run()}: no {system} rows")
         paths = {row["client_path"] for row in mine}
         if len(paths) != 1:
-            raise Refused(f"{FAILOVER_RUN}: {system} ran through more than one client path ({sorted(paths)})")
+            raise Refused(f"{failover_run()}: {system} ran through more than one client path ({sorted(paths)})")
         per_system[system] = {
             "repetitions": len(mine),
             "read_back": sum(row["verify"] == "passed" for row in mine),
@@ -171,7 +195,7 @@ def failover(repo: str = REPO) -> dict[str, Any]:
         }
     per_cell = {len(failover_report.all_rows(rows, s, f)) for f in FAULT_ORDER for s in ("kafka", "vtop")}
     if len(per_cell) != 1:
-        raise Refused(f"{FAILOVER_RUN}: repetitions per fault and system differ ({sorted(per_cell)})")
+        raise Refused(f"{failover_run()}: repetitions per fault and system differ ({sorted(per_cell)})")
     return {
         "environment": run.environment,
         "cells": cells,
@@ -188,7 +212,7 @@ def failover(repo: str = REPO) -> dict[str, Any]:
 
 
 def throughput(repo: str = REPO) -> dict[str, Any]:
-    run = schema.load_run(os.path.join(repo, THROUGHPUT_RUN))
+    run = schema.load_run(os.path.join(repo, throughput_run()))
     # The same refusal the page's report makes (#596): a run this chart
     # would pool across profiles or codecs is refused, not drawn.
     report.check_drawable(run.rows, run.environment)
@@ -432,7 +456,7 @@ def policed_chart(plt, theme, data) -> Any:
 
 
 def failover_chart(plt, theme, data) -> Any:
-    text = (f"Data: {FAILOVER_RUN}/failover.csv. Dot: median; line: min-max; the two clients are different "
+    text = (f"Data: {failover_run()}/failover.csv. Dot: median; line: min-max; the two clients are different "
             "programs.\n" + footer.footer_text(data["environment"]))
     extra = footer_height(text)
     width_in, height_in = 9.0, 3.75 + extra
@@ -477,7 +501,7 @@ def failover_chart(plt, theme, data) -> Any:
 
 
 def throughput_chart(plt, theme, data) -> Any:
-    text = (f"Data: {THROUGHPUT_RUN}/results.csv. Bar: median of {data['repetitions']} repetitions; whisker: "
+    text = (f"Data: {throughput_run()}/results.csv. Bar: median of {data['repetitions']} repetitions; whisker: "
             "min-max.\n" + footer.footer_text(data["environment"]))
     extra = footer_height(text)
     width_in, height_in = 9.0, 3.65 + extra

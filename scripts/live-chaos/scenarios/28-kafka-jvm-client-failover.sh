@@ -79,20 +79,7 @@ for strategy in $STRATEGIES; do
 done
 
 # --- the Apache Kafka distribution -------------------------------------------
-if [[ -z "$KAFKA_HOME" ]]; then
-  require_command docker "CHAOS_KAFKA_IMAGE needs docker to copy the distribution out of the image."
-  KAFKA_HOME="$BASE_WORKDIR/kafka"
-  container="$(docker create "$KAFKA_IMAGE")" \
-    || fail "could not create a container from CHAOS_KAFKA_IMAGE=$KAFKA_IMAGE"
-  docker cp "$container:/opt/kafka" "$KAFKA_HOME" > /dev/null \
-    || { docker rm "$container" > /dev/null 2>&1 || true; fail "$KAFKA_IMAGE holds no /opt/kafka"; }
-  docker rm "$container" > /dev/null
-fi
-for tool in kafka-verifiable-producer kafka-console-consumer; do
-  [[ -x "$KAFKA_HOME/bin/$tool.sh" ]] || fail "$KAFKA_HOME/bin/$tool.sh is not an executable Kafka tool"
-done
-clients_jar=("$KAFKA_HOME"/libs/kafka-clients-*.jar)
-log "Kafka client tools: $KAFKA_HOME (${clients_jar[0]##*/}), JVM: $(java -version 2>&1 | head -1)"
+kafka_distribution "$BASE_WORKDIR" kafka-verifiable-producer kafka-console-consumer
 
 # run_variant <strategy> — one failover, on a fresh cluster in its own
 # directory, so the two runs share nothing but the binaries and the

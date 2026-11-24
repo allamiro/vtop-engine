@@ -11,17 +11,21 @@ of each minor, so a new release joins the day its tag exists. Each cell's
 expected result is ``pass`` unless ``scripts/compat/expected.yaml`` lists an
 exception, so adding a refusal means editing a reviewed file.
 
-A cell with ``only_newest: true`` runs the newest release alone in both modes;
+A cell with ``only_newest: true`` runs the newest release alone on a pull
+request and the newest two (N-1 and N-2) in the full run;
 ``only_newest: [forward]`` does so for the listed directions only (a ledger is
 read by every release since ``since`` when it is upgraded, but only the
-previous release may share one with this build). A cell may also say
+previous release may share one with this build). An upgrade direction may not
+be limited this way: N-2 to N is supported for state at rest, so the release
+two minors back is always run. A cell may also say
 ``source: build`` (its old binary needs a feature the published archives lack,
 so the tag is built from source with it) and ``nightly_only: true`` (too heavy
 for a pull request: only ``full`` runs it).
 
 Modes:
 
-* ``full`` (nightly, and on demand): every release since each cell applies;
+* ``full`` (nightly, and on demand): every release since each cell applies,
+  so N-1 and N-2 are always there, and each row says which it is (``age``);
 * ``pr``: the newest released minor, plus, for each exception row, its
   boundary: the newest release the row names and the first release after it,
   so a documented cutoff is checked on both sides on every pull request at
@@ -49,6 +53,10 @@ DIRECTIONS = ("upgrade", "forward")
 SOURCES = ("release", "build")
 RESULTS = ("pass", "refuse", "hash-failure")
 FINAL = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
+# The releases a cell limited to the newest runs in the nightly matrix: N-1 and
+# N-2 (state written two minors back is supported at rest, docs/reference/
+# compatibility.md). A pull request runs the newest alone.
+FULL_WINDOW = 2
 
 
 class ExpectedError(ValueError):
@@ -155,12 +163,19 @@ def matrix(expected: dict, tags: list[str], mode: str) -> list[dict]:
             raise ExpectedError(f"cell {name}: unknown source {source!r}; one of {SOURCES}")
         if not isinstance(cell.get("nightly_only", False), bool):
             raise ExpectedError(f"cell {name}: nightly_only must be true or false")
+        if "upgrade" in newest_only:
+            raise ExpectedError(
+                f"cell {name}: an upgrade cell cannot be limited to the newest release: N-2 to N is "
+                "supported for state at rest, so what N-2 wrote must open under this build"
+            )
         applies = [tag for tag in available if version(tag) >= since]
         for direction in directions:
             # A format only the previous release may share with this build
-            # (the ledger, #743) runs the newest release alone, in the
-            # directions that say so.
-            per_cell[(name, direction)] = applies[-1:] if direction in newest_only else applies
+            # (the ledger, #743) runs the newest release alone on a pull
+            # request, in the directions that say so, and N-1 and N-2 in the
+            # nightly matrix.
+            window = (1 if mode == "pr" else FULL_WINDOW) if direction in newest_only else len(applies)
+            per_cell[(name, direction)] = applies[-window:]
 
     outcome: dict[tuple[str, str, str], dict] = {}
     boundary: set[tuple[str, str, str]] = set()
@@ -206,6 +221,9 @@ def matrix(expected: dict, tags: list[str], mode: str) -> list[dict]:
                 out.append({
                     "cell": name,
                     "tag": tag,
+                    # How many minors behind this build's newest release the
+                    # tag is: the newest is N-1, the one before N-2.
+                    "age": f"N-{len(available) - available.index(tag)}",
                     "direction": direction,
                     "expect": result["expect"],
                     "message": result["message"],

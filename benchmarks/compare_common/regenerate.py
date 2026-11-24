@@ -17,6 +17,11 @@ keeps its committed bytes.
 A kind with no committed run yet (the measured runs need the maintainer's
 hardware) is reported and skipped, and its output directory must then hold
 nothing: output with no run behind it is stale.
+
+The cross-product summary (`summary.py`, docs/benchmarks/comparison-summary.md
+and its charts) is written last, from the same committed runs, and is checked
+like any kind's output. Unlike a kind's page it exists with no run at all (every
+cell "not measured yet"), so a missing or hand-edited page is drift.
 """
 from __future__ import annotations
 
@@ -32,6 +37,7 @@ REPO = os.path.dirname(BENCH)
 if BENCH not in sys.path:
     sys.path.insert(0, BENCH)
 
+from compare_common import registry, schema, summary  # noqa: E402
 from kafka_compare import regenerate as kr  # noqa: E402
 
 OUTPUT = "docs/benchmarks"
@@ -72,12 +78,22 @@ def run_report(kind: str, run_dir: str) -> list[str]:
 
 
 def orphans(kind_outputs: dict[str, tuple[str, str]], written: set[str], repo: str = REPO) -> list[str]:
-    """Committed output of a kind (its image directory, its page) that no run wrote."""
+    """Committed output of a kind (its image directory, its page) that no run wrote, and any committed page
+    under docs/benchmarks carrying this generator's mark that no run wrote: a run that sends its page elsewhere
+    with a `report.json` (run_outputs.py) leaves that page behind when the run is deleted."""
+    from compare_common import report as creport
+
     stale = []
     for _kind, (img_dir, doc) in sorted(kind_outputs.items()):
         for name in kr._committed_names(repo, img_dir) + kr._committed_names(repo, doc):
             if os.path.realpath(os.path.join(repo, name)) not in written:
                 stale.append(name)
+    for name in kr._committed_names(repo, OUTPUT):
+        path = os.path.join(repo, name)
+        if name.endswith(".md") and os.path.isfile(path) and os.path.realpath(path) not in written:
+            with open(path, encoding="utf-8") as handle:
+                if creport.GENERATED_MARK in handle.read():
+                    stale.append(name)
     return sorted(set(stale))
 
 
@@ -109,6 +125,14 @@ def main(argv: list[str] | None = None) -> int:
                     owner[path] = run
         if clashes:
             raise kr.Refused("two runs write the same file, so only the last is checked: " + "; ".join(clashes))
+        # The summary draws the same runs once more, in its own files.
+        try:
+            written = summary.build({kind: runs[0] for kind, runs in all_runs.items() if runs}, REPO)
+        except (schema.RunRefused, registry.RegistryError) as exc:
+            raise kr.Refused(f"the summary cannot be drawn: {exc}") from exc
+        for path in written:
+            owner[os.path.realpath(path)] = "the summary"
+        outputs["summary"] = (summary.IMG_REL, summary.DOC_REL)
         stale = orphans(outputs, set(owner))
         if stale:
             raise kr.Refused("committed output that no run writes (stale; delete it or restore its run): "

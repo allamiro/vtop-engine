@@ -7,7 +7,9 @@ no matplotlib and skips them).
 """
 from __future__ import annotations
 
+import csv
 import importlib
+import json
 import os
 import re
 
@@ -112,3 +114,65 @@ def test_report_refuses_when_a_system_has_no_row_in_a_cell_it_was_expected_in(tm
     with pytest.raises(schema.RunRefused, match="vector/acks/live"):
         creport.build(run, report.REPORT, str(tmp_path), doc_path=str(tmp_path / "p.md"),
                       img_dir=str(tmp_path / "img"))
+
+
+# The plans the hosted runners and the AWS round run do not run every cell (no drain or live cells on a hosted
+# plan). A chart whose cells did not run is left out and named, not drawn empty above a table with no rows.
+PARTIAL_PLANS = {"archive": "hosted", "spool": "hosted-crash"}
+
+
+@pytest.mark.parametrize("kind", sorted(PARTIAL_PLANS))
+def test_a_plan_that_did_not_run_a_charts_cells_leaves_the_chart_out_and_says_so(kind, tmp_path):
+    fixture = importlib.import_module(f"{kind}_compare.fixture")
+    spec = importlib.import_module(f"{kind}_compare.report").REPORT
+    run = fixture.write_run(str(tmp_path / "runs"), plan_name=PARTIAL_PLANS[kind], host_class="hosted")
+    with open(os.path.join(run, f"{spec.kind.name}.csv"), newline="") as handle:
+        ran = {row["cell"] for row in csv.DictReader(handle)}
+    out = tmp_path / "out"
+    written = creport.build(run, spec, str(tmp_path), doc_path=str(out / "page.md"), img_dir=str(out / "img"))
+    page = (out / "page.md").read_text()
+    names = {os.path.basename(p) for p in written}
+    drawn = [c for c in spec.charts if ran & {cell for m in c.metrics for cell in m.cells}]
+    left_out = [c for c in spec.charts if c not in drawn]
+    assert drawn and left_out, "the partial plan must run some of the charts' cells and not others"
+    for chart in drawn:
+        assert f"{chart.name}.png" in names and f"![{chart.title}](" in page
+    for chart in left_out:
+        assert f"{chart.name}.png" not in names and f"![{chart.title}](" not in page
+    assert "Not run in this plan, so not drawn: " + ", ".join(c.title for c in left_out) + "." in page
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_a_full_plan_draws_every_chart_and_says_nothing_was_left_out(kind, tmp_path):
+    _spec, _written, out = _build(kind, tmp_path, "a")
+    assert "Not run in this plan" not in (out / "page.md").read_text()
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_a_report_json_sends_the_run_s_page_and_images_beside_the_default_ones(kind, tmp_path):
+    fixture = importlib.import_module(f"{kind}_compare.fixture")
+    spec = importlib.import_module(f"{kind}_compare.report").REPORT
+    run = fixture.write_run(str(tmp_path / "runs"))
+    with open(os.path.join(run, "report.json"), "w") as handle:
+        json.dump({"doc": f"docs/benchmarks/{kind}-comparison-aws.md",
+                   "img_dir": f"docs/benchmarks/{spec.img_dir}/aws"}, handle)
+    written = creport.build(run, spec, str(tmp_path))
+    assert str(tmp_path / "docs" / "benchmarks" / f"{kind}-comparison-aws.md") in written
+    assert all(p.startswith(str(tmp_path / "docs" / "benchmarks")) for p in written)
+    assert not (tmp_path / "docs" / "benchmarks" / f"{spec.doc_name}.md").exists()
+    assert (tmp_path / "docs" / "benchmarks" / spec.img_dir / "aws").is_dir()
+    page = (tmp_path / "docs" / "benchmarks" / f"{kind}-comparison-aws.md").read_text()
+    assert f"![{spec.charts[0].title}](" + os.path.relpath(
+        tmp_path / "docs" / "benchmarks" / spec.img_dir / "aws" / f"{spec.charts[0].name}.png",
+        tmp_path / "docs" / "benchmarks") in page
+
+
+def test_a_report_json_outside_the_kinds_directories_is_refused_as_a_refused_run(tmp_path):
+    from archive_compare import fixture, report
+
+    run = fixture.write_run(str(tmp_path / "runs"))
+    with open(os.path.join(run, "report.json"), "w") as handle:
+        json.dump({"doc": "docs/benchmarks/a.md", "img_dir": "docs/benchmarks/img/a"}, handle)
+    with pytest.raises(schema.RunRefused, match="must be a directory under docs/benchmarks/archive/img/"):
+        creport.build(run, report.REPORT, str(tmp_path))
+    assert not (tmp_path / "docs").exists()

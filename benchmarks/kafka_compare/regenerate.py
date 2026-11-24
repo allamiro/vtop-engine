@@ -13,6 +13,13 @@ or in CI. An uncommitted local run, staged or not, is ignored: the drift check
 is about what HEAD says, so every comparison here (runs, stale output, the
 committed PNG bytes) reads HEAD, never the index or the working tree.
 
+A run whose `report.json` says `"supersedes": "<run-id>"` replaces that earlier
+run of its kind (run_outputs.py): the superseded run's data stays committed and
+is checked against HEAD like any other, but it is not handed to report.py, so
+the newer run may write the pages and images the older one did.
+`current_runs` applies that, and `current_run(kind)` is the one current run of
+a kind, which readme_charts.py draws.
+
 Refuses, exit 2, writing nothing first:
 - a plotting stack other than requirements-report.txt pins, or a DejaVu Sans
   resolved from outside matplotlib's own data (a system copy of the font is
@@ -22,8 +29,11 @@ Refuses, exit 2, writing nothing first:
   untracked): report.py reads the run from disk, and the check vouches for
   what HEAD says.
 Refuses, exit 2, after regenerating:
-- two runs writing the same file: the last would silently win, and the drift
-  check would vouch only for it;
+- a `supersedes` that names no committed run, a run of another kind, a run
+  that did not start earlier, or that closes a cycle;
+- two current runs writing the same file: the last would silently win, and
+  the drift check would vouch only for it (a run that means to replace
+  another says `supersedes`);
 - a committed image under docs/benchmarks/img/, or a committed page marked as
   generated, that no run writes: a chart left behind by a rename is stale
   output nobody can regenerate.
@@ -43,6 +53,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import os
 import shlex
 import subprocess
@@ -51,6 +62,10 @@ from collections.abc import Callable, Iterable
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
+# Run as a script, the package's parent is not on the path; run_outputs is the one reader of report.json.
+sys.path.insert(0, os.path.dirname(HERE))
+from kafka_compare import run_outputs  # noqa: E402
+
 REPORT = os.path.join(HERE, "report.py")
 PINS = os.path.join(HERE, "requirements-report.txt")
 RESULTS = "benchmarks/kafka_compare/results"
@@ -144,6 +159,67 @@ def committed_runs(repo: str = REPO) -> list[str]:
     if not runs:
         raise Refused(f"no committed run under {RESULTS}/: nothing to regenerate, so nothing is checked")
     return sorted(runs)
+
+
+def _started_at(run_dir: str) -> str:
+    try:
+        with open(os.path.join(run_dir, "environment.json"), encoding="utf-8") as handle:
+            started = json.load(handle).get("started_at")
+    except (OSError, ValueError) as exc:
+        raise Refused(f"{run_dir}: no readable environment.json to order the run by: {exc}") from exc
+    if not isinstance(started, str) or not started:
+        raise Refused(f"{run_dir}/environment.json records no started_at to order the run by")
+    return started
+
+
+def current_runs(runs: list[str], repo: str = REPO) -> list[str]:
+    """The committed runs no other committed run supersedes, in their order, after checking every `supersedes`:
+    it names a committed run in the same results directory, of the same kind, that started before the run that
+    names it, and no chain of them loops."""
+    by_id = {os.path.basename(run): run for run in runs}
+    names: dict[str, str] = {}
+    for run in runs:
+        try:
+            own = run_outputs.resolve(run, repo, IMAGES, allow_latency_run=True, allow_supersedes=True)
+        except run_outputs.OutputsRefused as exc:
+            raise Refused(str(exc)) from exc
+        if own is None or own.supersedes is None:
+            continue
+        rel = os.path.relpath(run, repo)
+        target = by_id.get(own.supersedes)
+        if target is None:
+            raise Refused(f"{rel} supersedes {own.supersedes!r}, which is not a committed run in {RESULTS}/")
+        kind, target_kind = run_outputs.run_kind(run), run_outputs.run_kind(target)
+        if kind != target_kind:
+            raise Refused(f"{rel} supersedes {own.supersedes!r}, which is a {target_kind} run, not a {kind} run: "
+                          "a run replaces only a run of its own kind")
+        names[os.path.basename(run)] = own.supersedes
+    for start in names:
+        seen, at = [start], start
+        while at in names:
+            at = names[at]
+            if at in seen:
+                raise Refused(f"supersedes makes a cycle: {' -> '.join(seen + [at])}")
+            seen.append(at)
+    for run_id, target in names.items():
+        if not _started_at(by_id[target]) < _started_at(by_id[run_id]):
+            raise Refused(f"{RESULTS}/{run_id} supersedes {target!r}, which started {_started_at(by_id[target])}, "
+                          f"not before it ({_started_at(by_id[run_id])}): a run replaces only an earlier one")
+    superseded = set(names.values())
+    return [run for run in runs if os.path.basename(run) not in superseded]
+
+
+def current_run(kind: str, repo: str = REPO) -> str:
+    """The one current committed run of `kind` (throughput, failover, crash), relative to the repository, or
+    Refused naming what there is instead."""
+    mine = [run for run in current_runs(committed_runs(repo), repo) if run_outputs.run_kind(run) == kind]
+    if len(mine) != 1:
+        if not mine:
+            raise Refused(f"no current {kind} run is committed under {RESULTS}/")
+        ids = ", ".join(os.path.basename(run) for run in mine)
+        raise Refused(f"{len(mine)} current {kind} runs are committed ({ids}): name the one that replaces the "
+                      "other with `supersedes` in its report.json")
+    return os.path.relpath(mine[0], repo).replace(os.sep, "/")
 
 
 def check_runs_unchanged(runs: Iterable[str], repo: str = REPO) -> None:
@@ -258,7 +334,8 @@ def main(argv: list[str] | None = None) -> int:
         check_font()
         runs = committed_runs()
         check_runs_unchanged(runs)
-        owner = regenerate(runs)
+        current = current_runs(runs)
+        owner = regenerate(current)
         stale = orphans(owner)
         if stale:
             raise Refused("committed output that no run writes (stale; delete it or restore its generator): "
@@ -271,7 +348,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"regenerate failed: {exc}", file=sys.stderr)
         return exc.code
     for run in runs:
-        print(f"run {os.path.relpath(run, REPO)}")
+        print(f"run {os.path.relpath(run, REPO)}" + ("" if run in current else " (superseded: not drawn)"))
     for path in sorted(owner):
         note = " (pixels unchanged: committed bytes kept)" if path in kept else ""
         print(f"  wrote {os.path.relpath(path, REPO)}{note}")

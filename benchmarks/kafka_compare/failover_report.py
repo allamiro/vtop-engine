@@ -365,14 +365,15 @@ def write_markdown(run: fschema.FailoverRun, images: dict[str, str], csv_rel: di
         "plaintext replica plane).")
     add("")
     add("**That gap is closed since this run (#751), and this page was not re-measured.** A candidate now serves "
-        "the gateway, and live-chaos scenarios 27 and 28 show a stock librdkafka producer and the JVM client of "
-        "Apache Kafka follow a failover with no restart and no configuration change: they resumed 5.7 s to 6.6 s "
-        "(librdkafka, four runs) and 5.5 s to 5.8 s (JVM client, eight runs) after a leader kill, every "
+        "the gateway, and live-chaos scenarios 27, 28, 30, 31 and 33 show a stock librdkafka client and the JVM "
+        "client of Apache Kafka follow a leader kill with no restart and no configuration change, every "
         "acknowledged record read back once and in order ([the scenarios](../LIVE_CHAOS_VALIDATION.md"
-        "#kafka-clients-and-a-failover-751)). Those runs are one host, debug binaries and a 6 s lease, not this "
-        "page's shipped timeouts, so their numbers are not comparable with the ones below. They did not cover "
-        "the co-located `vtop-node node` shape that this page's cluster uses, nor a consumer group's "
-        "coordinator across a failover (#751 scopes it out), nor the chart's default lease.")
+        "#kafka-clients-and-a-failover-751)). With release binaries and the chart's default lease (15 s, renewed "
+        "every 5 s, polled every 2 s), four runs each on one GitHub-hosted runner (2 vCPUs, every process on one "
+        "host), producers resumed 12.5 s to 13.5 s after the kill under librdkafka and 13.7 s to 15.9 s under the "
+        "JVM client, in the split shape and in the co-located `vtop-node node` shape this page's cluster uses "
+        "alike, and a consumer group rejoined and read on 13.0 s to 14.4 s after it. Those numbers are one host "
+        "and a different client path from the ones below, so they are not comparable with them.")
     add("")
     add("**What was measured here, labelled everywhere:** VTOP's failover through its **native** client "
         "(`vtop-node produce`, driven by `vtop/failover-driver.sh`, which looks the leader up in the range lease "

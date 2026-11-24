@@ -1,0 +1,9 @@
+{
+ "kafka-compare-consume-throughput.svg": "a029e4b9c2245819367f875b260206be74f449c18bb9fa33466f5d3e88947a4e",
+ "kafka-compare-e2e-cdf.svg": "4f18829eb1b9a49359b3afcfbe5a8101d664d23bf7384cab3ed14f535ea4a01f",
+ "kafka-compare-produce-latency.svg": "783aedcd1586b768aebd214f6dc8171ceccd4a933f34b2459702249284fb8a17",
+ "kafka-compare-produce-throughput.svg": "77d56bb2743d8fb08704cb2342e63f7e1d6e5de25852b70cd584bfb195866570",
+ "kafka-compare-profile-latency.svg": "5d93d18a57bdda9950b2f6b73140b362555fc56fdd2e0d518abdfddb4b23bd12",
+ "kafka-compare-resources.svg": "ef59158fdd3fe2d8111030485210e6645fc5f97fd94ef3ff1d2e5e1df44f0d50",
+ "kafka-comparison.md": "11b14682039b1d2738a91eedfbf6e3062bb277dbf3976062da2d1c5e1e3eda5b"
+}

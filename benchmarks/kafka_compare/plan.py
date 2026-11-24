@@ -11,6 +11,22 @@ the schema-2 axes. Each one defaults to what that run did: compression
 end-to-end rows and no `acks` slice. Its keys are therefore the rows it
 wrote.
 
+Schema 3 adds one axis, `group_commits` (#752): VTOP's `group_commit:` setting,
+`off` and/or `on`. It belongs to VTOP alone (Kafka has no counterpart), so
+Kafka's rows carry a blank setting and VTOP owes its rows once per setting
+asked for. A matrix without the axis leaves VTOP at the node's own default and
+writes a blank setting everywhere, which is what every earlier run did.
+
+Schema 4 (#600) adds two optional keys. `resources: true` says every measured row also carries the CPU
+seconds and bytes written its window cost. `e2e.extra_profiles` lists profiles that Kafka ALONE is also
+measured under, in the end-to-end mode only, at the same common offered rate: the latency cost of a durability
+profile, read beside the crash results. VTOP owes no row for them (its rows carry a blank group-commit
+setting there too, as Kafka's always do).
+
+The end-to-end mode is owed by the 1-partition, 1-producer cells only: one consumer reads one partition at a
+common rate, and the runner measures it in a run of that shape alone. A matrix with other partition or producer
+counts owes no end-to-end rows for those cells (every committed run is 1 and 1, so its keys are unchanged).
+
     python3 benchmarks/kafka_compare/plan.py MATRIX.json [--max-hours H]
 
 prints the cells, the expected row count and the projected hours, and exits
@@ -29,6 +45,10 @@ COMPRESSIONS = ("none", "gzip", "zstd", "snappy", "lz4")
 ACKS = ("all", "1")
 PROFILES = ("defaults", "fsync-parity")
 LOAD_BASES = ("kafka", "common")
+# VTOP's `group_commit.enabled` (#752), in the order a run lists them. Written
+# into the node config as `enabled: false` / `enabled: true`, never left to the
+# binary's default, so a later change of that default cannot change what "off" means.
+GROUP_COMMITS = ("off", "on")
 SLICE_MODES = ("saturation", "consume")
 
 
@@ -54,6 +74,7 @@ class Axes(NamedTuple):
     repetitions: int
     load_bases: dict[str, list[int]]
     e2e: dict[str, Any] | None
+    group_commits: list[str]
 
 
 def axes(matrix: dict[str, Any]) -> Axes:
@@ -66,10 +87,12 @@ def axes(matrix: dict[str, Any]) -> Axes:
         main_modes.append("fixed_rate")
     if matrix.get("consume"):
         main_modes.append("consume")
-    if e2e:
-        main_modes.append("e2e")
+    # The end-to-end stage is measured at 1 partition and 1 producer only (one consumer reading one partition
+    # at a common rate): no other cell owes it.
+    e2e_modes = ["e2e"] if e2e else []
     cells = [
-        Cell(size, partitions, producers, compression, acks, tuple(main_modes))
+        Cell(size, partitions, producers, compression, acks,
+             tuple(main_modes + (e2e_modes if (partitions, producers) == (1, 1) else [])))
         for size, partitions, producers, compression, acks in itertools.product(
             matrix["record_sizes"], matrix["partitions"], matrix["producers"],
             matrix.get("compressions") or ["none"], matrix["acks"])
@@ -77,35 +100,51 @@ def axes(matrix: dict[str, Any]) -> Axes:
     for extra in matrix.get("acks_slice") or []:
         cells.append(Cell(extra["record_size"], extra["partitions"], extra["producers"], extra["compression"],
                           extra["acks"], tuple(extra["modes"])))
-    return Axes(cells, list(profiles), int(matrix["repetitions"]), dict(load_bases), e2e)
+    return Axes(cells, list(profiles), int(matrix["repetitions"]), dict(load_bases), e2e,
+                list(matrix.get("group_commits") or []))
 
 
 def expected_keys(matrix: dict[str, Any]) -> set[tuple]:
     """Every row key a complete run of `matrix` writes:
 
     (system, mode, record_size, partitions, producers, compression, acks,
-     profile, repetition, load_basis, load_pct)
+     profile, group_commit, repetition, load_basis, load_pct)
 
     with load_basis and load_pct as the CSV's text ("" where a mode has
-    none). A system that is not run at a rate still owes its row: a
-    `refused` row saying why, never a hole.
+    none), and group_commit "" for Kafka and for a matrix without the axis,
+    else VTOP's setting: VTOP owes its rows once per setting asked for. A
+    system that is not run at a rate still owes its row: a `refused` row
+    saying why, never a hole.
     """
     a = axes(matrix)
     keys = set()
     for cell in a.cells:
         for profile, system, rep in itertools.product(a.profiles, SYSTEMS, range(1, a.repetitions + 1)):
-            base = (system, None, cell.record_size, cell.partitions, cell.producers, cell.compression,
-                    cell.acks, profile, rep)
-            for mode in cell.modes:
-                if mode == "fixed_rate":
-                    for basis, pcts in a.load_bases.items():
-                        for pct in pcts:
-                            keys.add(base[:1] + (mode,) + base[2:] + (basis, str(pct)))
-                elif mode == "e2e":
-                    keys.add(base[:1] + (mode,) + base[2:] + (a.e2e["load_basis"], str(a.e2e["load_pct"])))
-                else:
-                    keys.add(base[:1] + (mode,) + base[2:] + ("", ""))
+            for group_commit in (a.group_commits or [""]) if system == "vtop" else [""]:
+                base = (system, None, cell.record_size, cell.partitions, cell.producers, cell.compression,
+                        cell.acks, profile, group_commit, rep)
+                for mode in cell.modes:
+                    if mode == "fixed_rate":
+                        for basis, pcts in a.load_bases.items():
+                            for pct in pcts:
+                                keys.add(base[:1] + (mode,) + base[2:] + (basis, str(pct)))
+                    elif mode == "e2e":
+                        keys.add(base[:1] + (mode,) + base[2:] + (a.e2e["load_basis"], str(a.e2e["load_pct"])))
+                    else:
+                        keys.add(base[:1] + (mode,) + base[2:] + ("", ""))
+    for extra in extra_profiles(matrix):
+        for cell in a.cells:
+            if "e2e" in cell.modes:
+                for rep in range(1, a.repetitions + 1):
+                    keys.add(("kafka", "e2e", cell.record_size, cell.partitions, cell.producers, cell.compression,
+                              cell.acks, extra, "", rep, a.e2e["load_basis"], str(a.e2e["load_pct"])))
     return keys
+
+
+def extra_profiles(matrix: dict[str, Any]) -> list[str]:
+    """The profiles Kafka alone is also measured under in the end-to-end mode (schema 4), or none."""
+    e2e = matrix.get("e2e")
+    return list(e2e.get("extra_profiles") or []) if isinstance(e2e, dict) else []
 
 
 def _is_int(value: Any) -> bool:
@@ -144,6 +183,7 @@ def check_matrix(matrix: dict[str, Any]) -> None:
         raise PlanRefused(f"matrix.load_bases is {matrix.get('load_bases')!r}, not a map of bases to rates")
     strings("compressions", COMPRESSIONS)
     strings("profiles", PROFILES)
+    strings("group_commits", GROUP_COMMITS)
     if any(a not in ACKS for a in matrix["acks"]):
         raise PlanRefused(f"matrix.acks is {matrix['acks']!r}; acknowledgement modes are {list(ACKS)}")
     bases = matrix.get("load_bases")
@@ -166,6 +206,19 @@ def check_matrix(matrix: dict[str, Any]) -> None:
         if (not isinstance(e2e, dict) or e2e.get("load_basis") not in LOAD_BASES
                 or not _is_int(e2e.get("load_pct")) or not 0 < e2e["load_pct"] < 100):
             raise PlanRefused(f"matrix.e2e is {e2e!r}, not {{load_basis, load_pct}}")
+        if "extra_profiles" in e2e:
+            extra = e2e["extra_profiles"]
+            if (not isinstance(extra, list) or not extra or len(set(extra)) != len(extra)
+                    or any(p not in PROFILES for p in extra)):
+                raise PlanRefused(f"matrix.e2e.extra_profiles is {extra!r}, not a list of distinct profiles from "
+                                  f"{list(PROFILES)}")
+            main = matrix.get("profiles") or [matrix.get("profile") or "defaults"]
+            already = [p for p in extra if p in main]
+            if already:
+                raise PlanRefused(f"matrix.e2e.extra_profiles names {already}, which the run already measures "
+                                  "in every mode")
+    if not isinstance(matrix.get("resources", False), bool):
+        raise PlanRefused(f"matrix.resources is {matrix.get('resources')!r}, not true or false")
     for extra in matrix.get("acks_slice") or []:
         if (not isinstance(extra, dict) or extra.get("acks") not in ACKS
                 or extra.get("compression") not in COMPRESSIONS
@@ -183,11 +236,14 @@ def check_matrix(matrix: dict[str, Any]) -> None:
 # not a measurement; the rehearsal's first cells calibrate it.
 #
 # A matrix that sizes saturation and consume runs by record count
-# (`sat_records`, the runner today) is charged by the bytes they move at
-# SLOWEST_BYTES_PER_SECOND instead, when that is longer: phase 1's VTOP
-# moved about 2.3 MiB/s at both record sizes (run 20261109T232328Z), so 2 MiB/s
-# keeps a record-count run from passing the budget on a duration it never
-# had (review).
+# (`sat_records`, the runner today) is charged the longer of the bytes they move
+# at SLOWEST_BYTES_PER_SECOND and the records at SLOWEST_RECORDS_PER_SECOND.
+# Phase 1's VTOP moved about 2.3 MiB/s at both record sizes (run
+# 20261109T232328Z), hence 2 MiB/s. The bytes floor alone does not hold for small
+# records: in the v0.11.1 AWS round VTOP saturated at about 6.2k records/s with
+# 100 B records (0.6 MiB/s), so a 3 M-record run took about 8 minutes where the
+# bytes floor charged 2.4 (review of that round, lesson 2). The record floor is
+# that figure, rounded down.
 DEFAULT_TIMING = {
     "bring_up": 90.0,        # cluster up, smoke read-back, cluster down
     "warm_up": 30.0,         # the unrecorded warm-up run
@@ -195,22 +251,40 @@ DEFAULT_TIMING = {
     "fixed_rate": 10.0,      # one fixed-rate run's overhead; its duration is matrix.fixed_seconds
     "consume": 20.0,
     "e2e": 40.0,
+    # Schema 4: the cgroup counters are read, and the nodes synced, before and after every measured run.
+    "resource_window": 6.0,
 }
 SLOWEST_BYTES_PER_SECOND = 2 * 1024 * 1024
+SLOWEST_RECORDS_PER_SECOND = 6_000
 
 
-def projected_seconds(matrix: dict[str, Any], timing: dict[str, float] | None = None) -> float:
-    """Wall time of the whole matrix, both systems, every profile run.
+def fixed_rate_wall_limit(fixed_seconds: float) -> float:
+    """The wall limit of one fixed-rate leg: three times its target and a minute for the JVM and the join.
 
-    A VTOP cell whose configuration is the same under two profiles
+    The runner sizes a leg from the system's own saturation (`min(offered, own median) x fixed_seconds`), so
+    a leg on time lasts about `fixed_seconds`; this bound is what one that is not may cost. The projection
+    charges it, so the budget holds even when every leg runs to it. Before the v0.11.1 AWS round the limit was
+    `max(--sat-timeout, 6 x records / rate)` and the record count came from the offered rate alone, so a
+    system that could not hold the rate ran a "30 s" leg for 7 to 20 minutes (VTOP at 100 B)."""
+    return 3.0 * float(fixed_seconds) + 60.0
+
+
+def projected_seconds(matrix: dict[str, Any], timing: dict[str, float] | None = None, *,
+                      on_time: bool = False) -> float:
+    """Wall time of the whole matrix, both systems, every profile run: a bound.
+
+    A fixed-rate leg is charged its wall limit (`fixed_rate_wall_limit`), which is what it costs when the
+    system cannot hold the rate; `on_time=True` charges it its target instead, the figure if every leg is on
+    time. A VTOP cell whose configuration is the same under two profiles
     (`matrix.vtop_profiles_share_config`) brings its cluster up and makes its
     unrated runs once, recorded under both (`same_config_as`); its
     fixed-rate runs are made per profile.
     """
     t = {**DEFAULT_TIMING, **(timing or {})}
-    # A fixed-rate run lasts the matrix's own target (review): charging a
+    # A fixed-rate run lasts at least the matrix's own target (review): charging a
     # constant would let a long --fixed-seconds pass the budget unseen.
-    t["fixed_rate"] += float(matrix.get("fixed_seconds", 30.0))
+    fixed_seconds = float(matrix.get("fixed_seconds", 30.0))
+    t["fixed_rate"] += fixed_seconds if on_time else fixed_rate_wall_limit(fixed_seconds)
     a = axes(matrix)
     fixed = sum(len(p) for p in a.load_bases.values())
     sat_records = {int(k): int(v) for k, v in (matrix.get("sat_records") or {}).items()}
@@ -219,10 +293,14 @@ def projected_seconds(matrix: dict[str, Any], timing: dict[str, float] | None = 
     for cell in a.cells:
         sized = {mode: t[mode] for mode in ("saturation", "consume")}
         if cell.record_size in sat_records:
-            moved = sat_records[cell.record_size] * cell.record_size / SLOWEST_BYTES_PER_SECOND
+            records = sat_records[cell.record_size]
+            moved = max(records * cell.record_size / SLOWEST_BYTES_PER_SECOND, records / SLOWEST_RECORDS_PER_SECOND)
             sized = {mode: max(seconds, moved) for mode, seconds in sized.items()}
         shared = sum(sized.get(m, t[m]) for m in cell.modes if m != "fixed_rate")
         rated = t["fixed_rate"] * fixed if "fixed_rate" in cell.modes else 0.0
+        if matrix.get("resources"):
+            runs = sum(1 for m in cell.modes if m != "fixed_rate") + (fixed if "fixed_rate" in cell.modes else 0)
+            shared += t["resource_window"] * runs
         one = t["bring_up"] + t["warm_up"] + a.repetitions * (shared + rated)
         # Kafka runs every profile in full. VTOP, when its configuration is
         # the same under all of them, brings its cluster up once and makes
@@ -232,17 +310,36 @@ def projected_seconds(matrix: dict[str, Any], timing: dict[str, float] | None = 
             vtop = one + (profiles - 1) * a.repetitions * rated
         else:
             vtop = one * profiles
-        total += one * profiles + vtop
+        # VTOP's cluster is brought up and measured afresh for every group-commit
+        # setting asked for (the node's config is read at start); Kafka's is not.
+        total += one * profiles + vtop * max(len(a.group_commits), 1)
+        if "e2e" in cell.modes:
+            # Kafka alone, once per extra profile: a fresh cluster, the warm-up, and the e2e runs.
+            total += len(extra_profiles(matrix)) * (t["bring_up"] + t["warm_up"] + a.repetitions * t["e2e"])
     return total
 
 
 def check_budget(matrix: dict[str, Any], max_hours: float, timing: dict[str, float] | None = None) -> float:
-    """The projected hours, or PlanRefused when they exceed `max_hours`."""
+    """The projected hours (the bound), or PlanRefused when they exceed `max_hours`."""
     hours = projected_seconds(matrix, timing) / 3600
     if hours > max_hours:
         raise PlanRefused(f"the matrix is projected to take {hours:.1f} h, over --max-hours {max_hours:g}; "
                           "narrow the matrix or raise the limit")
     return hours
+
+
+def summary(matrix: dict[str, Any]) -> str:
+    """The plan's one-line summary: cells, rows owed and projected hours, the bound and the on-time figure."""
+    a = axes(matrix)
+    hours = projected_seconds(matrix) / 3600
+    settings = f" x group commit {', '.join(a.group_commits)} (VTOP)" if a.group_commits else ""
+    return (f"{len(a.cells)} cells x {len(a.profiles)} profile(s) x {len(SYSTEMS)} systems{settings} x "
+            f"{a.repetitions} repetitions: {len(expected_keys(matrix))} result rows, projected {hours:.1f} h "
+            f"at most ({on_time_hours(matrix):.1f} h if every fixed-rate leg is on time)")
+
+
+def on_time_hours(matrix: dict[str, Any]) -> float:
+    return projected_seconds(matrix, on_time=True) / 3600
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -255,10 +352,7 @@ def main(argv: list[str] | None = None) -> int:
     matrix = data.get("matrix", data)
     try:
         check_matrix(matrix)
-        a = axes(matrix)
-        hours = projected_seconds(matrix) / 3600
-        print(f"{len(a.cells)} cells x {len(a.profiles)} profile(s) x {len(SYSTEMS)} systems x "
-              f"{a.repetitions} repetitions: {len(expected_keys(matrix))} result rows, projected {hours:.1f} h")
+        print(summary(matrix))
         if args.max_hours is not None:
             check_budget(matrix, args.max_hours)
     except PlanRefused as exc:

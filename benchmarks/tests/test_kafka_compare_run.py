@@ -124,7 +124,7 @@ fetch.time.ms, fetch.MB.sec, fetch.nMsg.sec
 def test_a_consumer_that_exits_nonzero_is_failed_even_with_a_summary(monkeypatch, tmp_path, returncode, status):
     rows = []
     produced = perftool.ProducerResult(1000, 1000.0, 1.0, 1.0, 2.0, 1.0, 1.0, 1.0, 1.0, True)
-    monkeypatch.setattr(run, "cluster_up", lambda *_a: None)
+    monkeypatch.setattr(run, "cluster_up", lambda *_a, **_k: None)
     monkeypatch.setattr(run, "cluster_down", lambda *_a: None)
     monkeypatch.setattr(run, "smoke", lambda *_a: None)
     monkeypatch.setattr(run, "_save_leader_log", lambda *_a: None)

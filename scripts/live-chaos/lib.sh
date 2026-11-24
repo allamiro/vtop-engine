@@ -1828,8 +1828,61 @@ assert_metadata_names_leader() { # <bootstrap-candidate> <leader-candidate>
 # with no Metadata first, and the answer as one line: `acknowledged offset=N`,
 # `refused code=N name=NAME`, `closed`, `no-reply` or `unreachable ...`
 # (kafka_raw_produce.py says why a stock client cannot be used for this).
-kafka_raw_produce() { # <port> <key> <value> <wait-seconds>
-  python3 "$SCRIPT_DIR/kafka_raw_produce.py" "$1" "$TOPIC" "$2" "$3" "$4"
+kafka_raw_produce() { # <port> <key> <value> <wait-seconds> [--say-sent]
+  python3 "$SCRIPT_DIR/kafka_raw_produce.py" "$1" "$TOPIC" "$2" "$3" "$4" "${@:5}"
+}
+
+# kafka_distribution <copy-dir> <tool...> — the Apache Kafka distribution whose
+# JVM client tools scenarios 28, 31 and 33 run (#751): CHAOS_KAFKA_HOME names an
+# unpacked one, or CHAOS_KAFKA_IMAGE an apache/kafka image whose /opt/kafka is
+# copied into <copy-dir>/kafka with docker. Sets KAFKA_HOME, and checks each
+# named tool (bin/<tool>.sh) is there. Whether to run without either is the
+# caller's decision; this fails.
+kafka_distribution() { # <copy-dir> <tool...>
+  local copy_dir="$1" tool container clients_jar
+  shift
+  KAFKA_HOME="${CHAOS_KAFKA_HOME:-}"
+  if [[ -z "$KAFKA_HOME" ]]; then
+    local image="${CHAOS_KAFKA_IMAGE:-}"
+    [[ -n "$image" ]] || fail "set CHAOS_KAFKA_HOME to an unpacked Apache Kafka distribution, or CHAOS_KAFKA_IMAGE to an apache/kafka image"
+    require_command docker "CHAOS_KAFKA_IMAGE needs docker to copy the distribution out of the image."
+    KAFKA_HOME="$copy_dir/kafka"
+    if [[ ! -d "$KAFKA_HOME" ]]; then
+      container="$(docker create "$image")" \
+        || fail "could not create a container from CHAOS_KAFKA_IMAGE=$image"
+      docker cp "$container:/opt/kafka" "$KAFKA_HOME" > /dev/null \
+        || { docker rm "$container" > /dev/null 2>&1 || true; fail "$image holds no /opt/kafka"; }
+      docker rm "$container" > /dev/null
+    fi
+  fi
+  for tool in "$@"; do
+    [[ -x "$KAFKA_HOME/bin/$tool.sh" ]] || fail "$KAFKA_HOME/bin/$tool.sh is not an executable Kafka tool"
+  done
+  clients_jar=("$KAFKA_HOME"/libs/kafka-clients-*.jar)
+  log "Kafka client tools: $KAFKA_HOME (${clients_jar[0]##*/}), JVM: $(java -version 2>&1 | head -1)"
+}
+
+# group_cursor_offset <group> <meta-id[,meta-id...]> — the group's committed
+# offset for the range as the metadata plane holds it (#457 slice 2b, #751):
+# the NEXT offset to consume, marker records included, so comparable with the
+# Kafka high watermark; -1 while the plane knows no such group. One attempt per
+# id, each bounded (the admin transport has no deadline of its own), the first
+# that answers taken; non-zero when none did, so the caller polls.
+group_cursor_offset() { # <group> <meta-id[,meta-id...]>
+  local group="$1" ids="$2" id out="$WORKDIR/group-cursor-$1.$BASHPID.json"
+  local -a readers
+  IFS=',' read -ra readers <<< "$ids"
+  for id in "${readers[@]}"; do
+    timeout --kill-after=1 10 "$VTOPCTL" --json meta group-cursor --group-name "$group" \
+      --cluster-id "$CLUSTER_ID" --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" \
+      --config "$(emit_admin_config "$id")" > "$out" 2> /dev/null || continue
+    python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(d["cursor"]["record_offset"] if d.get("group_found") else -1)
+' "$out" 2> /dev/null && return 0
+  done
+  return 1
 }
 
 # The shape of the Kafka-candidate cluster (#751), for scenarios 27 and 28 and

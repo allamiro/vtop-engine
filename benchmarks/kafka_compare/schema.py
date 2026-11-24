@@ -6,13 +6,21 @@ report never draws from anything else, so a chart cannot quietly have a hole
 where a row is missing - a cell that did not run is a ROW saying so (status
 `failed` or `refused`), and the chart shows that gap by name.
 
-There are two layouts (#596). Schema 2 (`COLUMNS`) adds compression, the load
-basis, the latency basis, the end-to-end mode, the measurement window and
+There are four layouts. Schema 2 (`COLUMNS_V2`, #596) adds compression, the
+load basis, the latency basis, the end-to-end mode, the measurement window and
 `same_config_as`, and it moves `profile` from the run-constant set into the
-row key. Schema 1 (`COLUMNS_V1`, phase 1's committed run) still loads. Its rows
-are read as schema 2 with compression `none`, load basis `kafka` on fixed-rate
-rows and latency basis `single`, which is what that run did, so its report is
-unchanged byte for byte.
+row key. Schema 3 (`COLUMNS_V3`, #752) adds `group_commit`, VTOP's
+`group_commit.enabled` for the row (`off` or `on`; blank for Kafka, which has
+no such setting, and for a run that did not vary it), and makes it part of the
+row key. Schema 4 (`COLUMNS`, #600) adds the resources a measured run's window
+cost (`delivered_bytes`, `cpu_seconds`, `disk_write_bytes`, `disk_read_bytes`,
+summed over the system's three nodes), a sidecar `e2e_hist.csv` holding each
+end-to-end row's 1 ms latency histogram, and the matrix keys `resources` and
+`e2e.extra_profiles`. Schemas 1 (`COLUMNS_V1`, phase 1's committed run), 2 and
+3 still load. Their rows are read as schema 4: schema 1 with compression
+`none`, load basis `kafka` on fixed-rate rows and latency basis `single`, which
+is what that run did, and every older row with the columns it lacks blank, so a
+committed run's report is unchanged byte for byte.
 """
 from __future__ import annotations
 
@@ -24,7 +32,7 @@ import re
 from collections.abc import Iterable
 from typing import Any, NamedTuple
 
-from kafka_compare import plan
+from kafka_compare import e2e, plan
 
 SYSTEMS = plan.SYSTEMS
 STATUSES = ("ok", "failed", "refused")
@@ -33,6 +41,7 @@ COMPRESSIONS = plan.COMPRESSIONS
 ACKS = plan.ACKS
 PROFILES = plan.PROFILES
 LOAD_BASES = plan.LOAD_BASES
+GROUP_COMMITS = plan.GROUP_COMMITS
 
 COLUMNS_V1 = (
     "run_id",
@@ -66,7 +75,7 @@ COLUMNS_V1 = (
     "note",
 )
 
-COLUMNS = (
+COLUMNS_V2 = (
     "run_id",
     "env_fingerprint",
     "vtop_commit",
@@ -109,6 +118,27 @@ COLUMNS = (
     "note",
 )
 
+# Schema 3: schema 2 plus `group_commit` after `profile` (#752). VTOP's
+# `group_commit.enabled` for this row, `off` or `on`; blank on every Kafka row
+# and on every row of a run that did not vary it.
+COLUMNS_V3 = COLUMNS_V2[:COLUMNS_V2.index("profile") + 1] + ("group_commit",) \
+    + COLUMNS_V2[COLUMNS_V2.index("profile") + 1:]
+
+# Schema 4: schema 3 plus what a measured run's window cost, after the window it covers (#600). All four are
+# blank on a row that was not measured with `matrix.resources`, and on every failed or refused row.
+RESOURCE_COLUMNS = ("delivered_bytes", "cpu_seconds", "disk_write_bytes", "disk_read_bytes")
+COLUMNS = COLUMNS_V3[:COLUMNS_V3.index("window_end_ms") + 1] + RESOURCE_COLUMNS \
+    + COLUMNS_V3[COLUMNS_V3.index("window_end_ms") + 1:]
+# The modes whose ok rows carry a resource window when the matrix asks for one.
+RESOURCE_MODES = ("saturation", "fixed_rate", "consume", "e2e")
+
+# The sidecar of the end-to-end mode: one line per (ok e2e row, 1 ms latency bucket) holding records. A row's
+# key columns, then the bucket's lower edge in ms (60000 means 60 s or more) and the count.
+E2E_HIST = "e2e_hist.csv"
+E2E_HIST_KEY = ("system", "record_size", "partitions", "producers", "compression", "acks", "profile",
+                "group_commit", "repetition", "load_basis", "load_pct")
+E2E_HIST_COLUMNS = E2E_HIST_KEY + ("bucket_ms", "count")
+
 # Columns that must be the same on every row of one run: a chart that mixed
 # them would compare two environments as if they were one (rule 9). Schema 1
 # also held `profile` constant; schema 2 makes it a key.
@@ -117,7 +147,7 @@ RUN_CONSTANT_V1 = RUN_CONSTANT + ("profile",)
 
 # The row key: completeness and duplicates are judged on it.
 KEY = ("system", "mode", "record_size", "partitions", "producers", "compression", "acks", "profile",
-       "repetition", "load_basis", "load_pct")
+       "group_commit", "repetition", "load_basis", "load_pct")
 
 _LATENCY = ("lat_p50_ms", "lat_p95_ms", "lat_p99_ms", "lat_p999_ms")
 _NUMERIC_OK = {
@@ -132,7 +162,7 @@ _HAS_LATENCY = ("saturation", "fixed_rate", "e2e")
 # unchanged from the row it repeats.
 _MEASURED = ("status", "sustained", "records", "records_per_sec", "mib_per_sec", "lat_avg_ms", "lat_max_ms",
              "lat_p50_ms", "lat_p95_ms", "lat_p99_ms", "lat_p999_ms", "lat_basis", "started_at",
-             "window_start_ms", "window_end_ms", "wall_seconds", "note")
+             "window_start_ms", "window_end_ms", "wall_seconds", "note") + RESOURCE_COLUMNS
 
 
 def expected_lat_basis(producers: str) -> str:
@@ -146,8 +176,12 @@ class ReportRefused(Exception):
 
 # environment.json's layout. A run without the key is schema 1 (both runs
 # committed before #600). Schema 2 adds `comparable.host_disk`: the disk
-# behind Docker's volumes, which every image's footer names (#600).
-SCHEMA_VERSION = 2
+# behind Docker's volumes, which every image's footer names (#600). Schema 3
+# adds `comparable.vtop_group_commit`, the group-commit settings the run
+# measured and the configuration it wrote for each (#752). Schema 4 adds the
+# matrix keys `resources` and `e2e.extra_profiles`, and with them the schema-4
+# results.csv and the `e2e_hist.csv` sidecar (#600).
+SCHEMA_VERSION = 4
 
 
 def check_schema_version(environment: dict[str, Any], env_path: str) -> None:
@@ -168,6 +202,46 @@ def check_schema_version(environment: dict[str, Any], env_path: str) -> None:
         if not isinstance(disk, str) or not disk.strip():
             raise ReportRefused(f"{env_path} is schema_version {version} but records no comparable.host_disk "
                                 f"({disk!r}): the footer of every image must name the disk")
+    matrix = environment.get("matrix")
+    if version < 4 and isinstance(matrix, dict):
+        e2e_config = matrix.get("e2e")
+        asked = [key for key, present in (("resources", "resources" in matrix),
+                                          ("e2e.extra_profiles", isinstance(e2e_config, dict)
+                                           and "extra_profiles" in e2e_config)) if present]
+        if asked:
+            raise ReportRefused(f"{env_path} is schema_version {version} but its matrix has {', '.join(asked)}: "
+                                "those are schema 4")
+    check_group_commit_record(environment, env_path, version)
+
+
+def check_group_commit_record(environment: dict[str, Any], env_path: str, version: int) -> None:
+    """The group-commit settings a run measured are recorded, and agree with its matrix (#752).
+
+    `comparable.vtop_group_commit.settings` maps each setting the matrix asks for (`matrix.group_commits`)
+    to what the harness wrote into VTOP's leader config for it, so the setting is part of the environment
+    the run's fingerprint covers. A failover run (the HA cluster, no such setting) is exempt.
+    """
+    matrix = environment.get("matrix")
+    asked = matrix.get("group_commits") if isinstance(matrix, dict) else None
+    if asked is not None and version < 3:
+        raise ReportRefused(f"{env_path} is schema_version {version} but its matrix has group_commits: "
+                            "that axis is schema 3")
+    if version < 3 or environment.get("kind") == "failover":
+        return
+    comparable = environment.get("comparable") or {}
+    recorded = comparable.get("vtop_group_commit")
+    settings = recorded.get("settings") if isinstance(recorded, dict) else None
+    if not isinstance(settings, dict):
+        raise ReportRefused(f"{env_path} is schema_version {version} but records no "
+                            f"comparable.vtop_group_commit.settings ({recorded!r}): the run's group-commit "
+                            "settings must be part of its environment")
+    if list(settings) != list(asked or []):
+        raise ReportRefused(f"{env_path} records group-commit settings {list(settings)} but its matrix's "
+                            f"group_commits is {asked!r}")
+    for name, written in settings.items():
+        if not isinstance(written, dict) or written.get("enabled") is not (name == "on"):
+            raise ReportRefused(f"{env_path}: the recorded `{name}` setting is {written!r}, which does not "
+                                f"say `enabled: {'true' if name == 'on' else 'false'}`")
 
 
 class Cell(NamedTuple):
@@ -248,14 +322,30 @@ def _key_int(row: dict[str, str], column: str, line: int) -> int:
     return int(text)
 
 
+def _upgrade_v3(row: dict[str, str]) -> dict[str, str]:
+    """A schema-3 row read as schema 4: it recorded no resources, so the four columns are blank."""
+    if None in row or any(value is None for value in row.values()):
+        return row
+    return {**row, **{column: "" for column in RESOURCE_COLUMNS}}
+
+
+def _upgrade_v2(row: dict[str, str]) -> dict[str, str]:
+    """A schema-2 row read as schema 4: it did not vary VTOP's group commit, so the setting is blank, and it
+    recorded no resources."""
+    if None in row or any(value is None for value in row.values()):
+        return row
+    return _upgrade_v3({**row, "group_commit": ""})
+
+
 def _upgrade_v1(row: dict[str, str]) -> dict[str, str]:
-    """A schema-1 row read as schema 2: what phase 1 did, said in the new
+    """A schema-1 row read as schema 4: what phase 1 did, said in the new
     columns. A short row is left as it is, so `validate_rows` refuses it by
     line."""
     if None in row or any(value is None for value in row.values()):
         return row
     out = dict(row)
     out["compression"] = "none"
+    out.update(_upgrade_v2(out))
     out["same_config_as"] = ""
     out["load_basis"] = "kafka" if row["mode"] == "fixed_rate" else ""
     out["lat_basis"] = "single" if row["status"] == "ok" and row["mode"] in _HAS_LATENCY else ""
@@ -265,26 +355,34 @@ def _upgrade_v1(row: dict[str, str]) -> dict[str, str]:
 
 
 def read_rows(csv_path: str, *, allow_empty: bool = False) -> tuple[list[dict[str, str]], int]:
-    """The rows, as schema 2, and the schema the file was written in."""
+    """The rows, as schema 4, and the schema the file was written in."""
     if not os.path.isfile(csv_path):
         raise ReportRefused(f"no results CSV at {csv_path}")
     with open(csv_path, newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         header = tuple(reader.fieldnames or ())
         if header == COLUMNS:
+            version = 4
+        elif header == COLUMNS_V3:
+            version = 3
+        elif header == COLUMNS_V2:
             version = 2
         elif header == COLUMNS_V1:
             version = 1
         else:
             raise ReportRefused(
-                f"{csv_path} has columns {reader.fieldnames}, expected schema 2 {list(COLUMNS)} "
-                f"or schema 1 {list(COLUMNS_V1)}"
+                f"{csv_path} has columns {reader.fieldnames}, expected schema 4 {list(COLUMNS)}, "
+                f"schema 3 {list(COLUMNS_V3)}, schema 2 {list(COLUMNS_V2)} or schema 1 {list(COLUMNS_V1)}"
             )
         rows = list(reader)
     if not rows and not allow_empty:
         raise ReportRefused(f"{csv_path} has a header and no rows")
     if version == 1:
         rows = [_upgrade_v1(row) for row in rows]
+    elif version == 2:
+        rows = [_upgrade_v2(row) for row in rows]
+    elif version == 3:
+        rows = [_upgrade_v3(row) for row in rows]
     return rows, version
 
 
@@ -298,13 +396,20 @@ def _whole_or_blank(row: dict[str, str], column: str, line: int) -> int | None:
 
 
 def _validate_v2_columns(row: dict[str, str], line: int) -> None:
-    """The schema-2 columns of one row (a schema-1 row has them filled in)."""
+    """The schema-2 and -3 columns of one row (an older row has them filled in)."""
     if row["compression"] not in COMPRESSIONS:
         raise ReportRefused(f"results.csv line {line}: unknown compression {row['compression']!r}")
     if row["acks"] not in ACKS:
         raise ReportRefused(f"results.csv line {line}: acks is {row['acks']!r}, not one of {list(ACKS)}")
     if row["profile"] not in PROFILES:
         raise ReportRefused(f"results.csv line {line}: unknown profile {row['profile']!r}")
+    if row["group_commit"] not in ("",) + GROUP_COMMITS:
+        raise ReportRefused(f"results.csv line {line}: group_commit is {row['group_commit']!r}, not blank or one "
+                            f"of {list(GROUP_COMMITS)}")
+    if row["group_commit"] and row["system"] != "vtop":
+        raise ReportRefused(f"results.csv line {line}: a {row['system']} row has group_commit "
+                            f"{row['group_commit']!r}; the setting is VTOP's, and {row['system']} has no "
+                            "counterpart")
     same = row["same_config_as"]
     if same:
         if same not in PROFILES or same == row["profile"]:
@@ -327,6 +432,16 @@ def _validate_v2_columns(row: dict[str, str], line: int) -> None:
         raise ReportRefused(f"results.csv line {line}: records_produced is for e2e rows only")
     if row["mode"] not in _HAS_LATENCY and row["lat_basis"]:
         raise ReportRefused(f"results.csv line {line}: a {row['mode']} row has lat_basis {row['lat_basis']!r}")
+    present = [column for column in RESOURCE_COLUMNS if row[column] != ""]
+    if present:
+        if len(present) != len(RESOURCE_COLUMNS):
+            missing = [c for c in RESOURCE_COLUMNS if row[c] == ""]
+            raise ReportRefused(f"results.csv line {line}: {', '.join(present)} given but {', '.join(missing)} "
+                                "blank: a row's resources are all there or all absent")
+        _key_int(row, "delivered_bytes", line)
+        _number(row, "cpu_seconds", line)
+        for column in ("disk_write_bytes", "disk_read_bytes"):
+            _whole_or_blank(row, column, line)
     start = _whole_or_blank(row, "window_start_ms", line)
     end = _whole_or_blank(row, "window_end_ms", line)
     if (start is None) != (end is None) or (start is not None and end < start):
@@ -334,7 +449,7 @@ def _validate_v2_columns(row: dict[str, str], line: int) -> None:
                             f"{row['window_end_ms']!r} is not a start and an end at or after it")
 
 
-def validate_rows(rows: list[dict[str, str]], version: int = 2) -> None:
+def validate_rows(rows: list[dict[str, str]], version: int = 4) -> None:
     """Every row well-formed, every run-constant column identical across rows."""
     for line, row in enumerate(rows, start=2):
         if None in row or any(value is None for value in row.values()):
@@ -429,6 +544,7 @@ def row_key(row: dict[str, str]) -> tuple:
         row["compression"],
         row["acks"],
         row["profile"],
+        row["group_commit"],
         int(row["repetition"]),
         row["load_basis"],
         row["load_pct"],
@@ -467,7 +583,7 @@ def check_matrix(matrix: dict[str, Any]) -> None:
         raise ReportRefused(f"environment.json: {exc}") from exc
 
 
-def check_identity(rows: list[dict[str, str]], environment: dict[str, Any], version: int = 2) -> None:
+def check_identity(rows: list[dict[str, str]], environment: dict[str, Any], version: int = 4) -> None:
     """Bind the CSV's identity columns to the run environment.json records.
 
     The fingerprint covers `comparable` only, while every row carries its own
@@ -531,7 +647,9 @@ class Run(NamedTuple):
     rows: list[dict[str, str]]
     environment: dict[str, Any]
     run_dir: str
-    version: int = 2
+    version: int = 4
+    # {row_key of an ok e2e row: {bucket lower edge in ms: records}} (schema 4; empty before it).
+    hist: dict[tuple, dict[int, int]] = {}
 
 
 def _load_environment(run_dir: str) -> tuple[str, dict[str, Any]]:
@@ -569,6 +687,99 @@ def check_run(run_dir: str) -> Completeness:
     return completeness(rows, matrix)
 
 
+def check_versions(environment: dict[str, Any], csv_version: int) -> None:
+    """environment.json and results.csv are written together: a schema-4 CSV under an older environment, or
+    the reverse, is two harnesses' files in one directory."""
+    version = environment.get("schema_version", 1)
+    if csv_version == 4 and version < 4:
+        raise ReportRefused(f"results.csv has the schema-4 columns but environment.json has schema_version "
+                            f"{version}: they were not written together")
+    if csv_version < 4 and version >= 4:
+        raise ReportRefused(f"environment.json has schema_version {version} but results.csv has the "
+                            f"schema-{csv_version} columns: they were not written together")
+
+
+def check_resources(rows: list[dict[str, str]], matrix: dict[str, Any]) -> None:
+    """Every ok measured row carries its resources and window when the matrix asks for them, and no row does
+    when it does not (a figure the run did not plan would have no method behind it)."""
+    asked = bool(matrix.get("resources"))
+    for line, row in enumerate(rows, start=2):
+        present = [column for column in RESOURCE_COLUMNS if row[column] != ""]
+        owed = asked and row["status"] == "ok" and row["mode"] in RESOURCE_MODES
+        if owed:
+            for column in (*RESOURCE_COLUMNS, "window_start_ms", "window_end_ms"):
+                if row[column] == "":
+                    what = "its window" if column.startswith("window") else column
+                    raise ReportRefused(f"results.csv line {line}: an ok {row['mode']} row of a run that records "
+                                        f"resources has no {what} ({column} is blank)")
+        elif present:
+            why = ("the run's matrix does not ask for resources" if not asked
+                   else f"a {row['status']} {row['mode']} row has none to carry")
+            raise ReportRefused(f"results.csv line {line}: {', '.join(present)} given, but {why}")
+
+
+def _hist_int(row: dict[str, str], column: str, line: int, floor: int, ceiling: int | None = None) -> int:
+    text = row[column]
+    ok = text == "0" or bool(_CANONICAL_INT.match(text))
+    value = int(text) if ok else -1
+    if not ok or value < floor or (ceiling is not None and value > ceiling):
+        bound = f" from {floor} to {ceiling}" if ceiling is not None else f" of at least {floor}"
+        raise ReportRefused(f"{E2E_HIST} line {line}: {column} is {text!r}, not a whole number{bound}")
+    return value
+
+
+def load_hist(run_dir: str, rows: list[dict[str, str]], matrix: dict[str, Any],
+              version: int) -> dict[tuple, dict[int, int]]:
+    """Each ok end-to-end row's latency histogram, held to its row: the file exists when the matrix has the
+    end-to-end mode, every line belongs to an ok e2e row, the counts sum to that row's `records`, and the
+    row's percentiles are the histogram's (so a table and a CDF cannot disagree)."""
+    path = os.path.join(run_dir, E2E_HIST)
+    if version < 4:
+        return {}
+    ok_e2e = {row_key(row): (line, row) for line, row in enumerate(rows, start=2)
+              if row["mode"] == "e2e" and row["status"] == "ok"}
+    if not matrix.get("e2e"):
+        if os.path.exists(path):
+            raise ReportRefused(f"{path} exists, but the matrix has no end-to-end mode to hold it")
+        return {}
+    if not os.path.isfile(path):
+        raise ReportRefused(f"no {E2E_HIST} in {run_dir}: the run's matrix has the end-to-end mode, whose "
+                            "histograms it holds")
+    hist: dict[tuple, dict[int, int]] = {}
+    with open(path, newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        if tuple(reader.fieldnames or ()) != E2E_HIST_COLUMNS:
+            raise ReportRefused(f"{path} has columns {reader.fieldnames}, expected {list(E2E_HIST_COLUMNS)}")
+        for line, entry in enumerate(reader, start=2):
+            if None in entry or any(value is None for value in entry.values()):
+                raise ReportRefused(f"{E2E_HIST} line {line} has the wrong number of fields")
+            for column in ("record_size", "partitions", "producers", "repetition"):
+                _key_int(entry, column, line)
+            bucket = _hist_int(entry, "bucket_ms", line, 0, e2e.OVERFLOW_MS)
+            count = _hist_int(entry, "count", line, 1)
+            key = (entry["system"], "e2e", int(entry["record_size"]), int(entry["partitions"]),
+                   int(entry["producers"]), entry["compression"], entry["acks"], entry["profile"],
+                   entry["group_commit"], int(entry["repetition"]), entry["load_basis"], entry["load_pct"])
+            if key not in ok_e2e:
+                raise ReportRefused(f"{E2E_HIST} line {line} is a histogram for {key[:1] + key[2:]}, which is "
+                                    "no ok e2e row of results.csv")
+            buckets = hist.setdefault(key, {})
+            if bucket in buckets:
+                raise ReportRefused(f"{E2E_HIST} line {line} gives bucket {bucket} ms twice for {key[:1] + key[2:]}")
+            buckets[bucket] = count
+    for key, (line, row) in ok_e2e.items():
+        counts = hist.get(key, {})
+        if sum(counts.values()) != int(row["records"]):
+            raise ReportRefused(f"the histogram of results.csv line {line} sums to {sum(counts.values())} records, "
+                                f"but its row consumed {row['records']}")
+        for column, (num, den) in e2e.PERCENTILES.items():
+            want = e2e.percentile_ms(counts, num, den)
+            if float(row[column]) != want:
+                raise ReportRefused(f"results.csv line {line}: {column} is {row[column]!r}, but its histogram "
+                                    f"in {E2E_HIST} says {want!r}")
+    return hist
+
+
 def load_run(run_dir: str) -> Run:
     """The rows and environment of one complete run, or ReportRefused."""
     env_path, environment = _load_environment(run_dir)
@@ -581,6 +792,7 @@ def load_run(run_dir: str) -> Run:
         raise ReportRefused(f"{env_path} records no matrix to check the CSV against")
     check_matrix(matrix)
     rows, version = read_rows(os.path.join(run_dir, "results.csv"))
+    check_versions(environment, version)
     validate_rows(rows, version)
     expected_fp = fingerprint(environment)
     if rows[0]["env_fingerprint"] != expected_fp:
@@ -590,7 +802,8 @@ def load_run(run_dir: str) -> Run:
         )
     check_identity(rows, environment, version)
     check_complete(rows, matrix)
-    return Run(rows, environment, run_dir, version)
+    check_resources(rows, matrix)
+    return Run(rows, environment, run_dir, version, load_hist(run_dir, rows, matrix, version))
 
 
 def select(rows: Iterable[dict[str, str]], **criteria: Any) -> list[dict[str, str]]:

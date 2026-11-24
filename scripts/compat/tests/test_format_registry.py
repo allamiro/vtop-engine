@@ -55,7 +55,7 @@ REGISTRY = textwrap.dedent(
 PAGE = "# Page\n\n<!-- inventory:begin -->\n<!-- inventory:end -->\n"
 
 
-class RegistryCheck(unittest.TestCase):
+class RegistryCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self.tmp.name)
@@ -79,6 +79,8 @@ class RegistryCheck(unittest.TestCase):
     def problems(self):
         return registry_check.check_source(self.root, registry_check.load(self.root))
 
+
+class RegistryCheck(RegistryCase):
     def test_a_registry_that_matches_passes(self):
         self.assertEqual(self.problems(), [])
         self.assertEqual(self.run_check(), 0)
@@ -281,9 +283,382 @@ class RegistryCheck(unittest.TestCase):
         self.assertIn("fuzz_other stray: needs a why", " ".join(self.problems()))
 
 
+GOLDEN_REGISTRY = REGISTRY.replace(
+    "    tag_sets:",
+    "    fixtures: [crates/demo/tests/fixtures]\n    tag_sets:",
+) + "golden_lock: scripts/compat/golden.lock\n"
+
+EXPECTED_CELLS = (
+    "cells:\n  demo:\n    since: v0.9.0\n    directions: [upgrade, forward]\n"
+)
+
+
+class GoldenRegistryCase(RegistryCase):
+    """A registry whose entry names a fixture directory and a lock file."""
+
+    def setUp(self):
+        super().setUp()
+        self.fixtures = self.root / "crates/demo/tests/fixtures"
+        self.fixtures.mkdir(parents=True)
+        (self.fixtures / "frame.bin").write_bytes(b"\x00VTOPDEMO\x01")
+        (self.fixtures / "state.json").write_text('{"v": 1}\n')
+        self.registry(GOLDEN_REGISTRY)
+        self.assertEqual(self.run_check("--write-lock"), 0)
+
+    def registry(self, text):
+        (self.root / "scripts/compat/formats.yaml").write_text(text)
+
+    def lock_text(self):
+        return (self.root / "scripts/compat/golden.lock").read_text()
+
+    def joined(self):
+        return "\n".join(self.problems())
+
+
+class GoldenLock(GoldenRegistryCase):
+    def test_a_regenerated_lock_passes_and_lists_every_golden_file_sorted(self):
+        self.assertEqual(self.problems(), [])
+        rows = [line.split("  ", 1) for line in self.lock_text().splitlines() if not line.startswith("#")]
+        self.assertEqual([path for _, path in rows],
+                         ["crates/demo/tests/fixtures/frame.bin", "crates/demo/tests/fixtures/state.json"])
+        self.assertTrue(all(len(digest) == 64 for digest, _ in rows))
+
+    def test_the_lock_is_in_the_form_sha256sum_reads(self):
+        import hashlib
+        digest = hashlib.sha256(b'{"v": 1}\n').hexdigest()
+        self.assertIn(f"{digest}  crates/demo/tests/fixtures/state.json", self.lock_text())
+
+    def test_a_changed_golden_file_fails_naming_the_file_and_the_format(self):
+        (self.fixtures / "state.json").write_text('{"v": 2}\n')
+        joined = self.joined()
+        self.assertIn("crates/demo/tests/fixtures/state.json", joined)
+        self.assertIn("changed", joined)
+        self.assertIn("format 1 (Demo)", joined)
+        self.assertIn("--write-lock", joined)
+        self.assertEqual(self.run_check(), 1)
+
+    def test_regenerating_the_lock_is_the_deliberate_way_to_accept_the_change(self):
+        (self.fixtures / "state.json").write_text('{"v": 2}\n')
+        self.assertEqual(self.run_check("--write-lock"), 0)
+        self.assertEqual(self.problems(), [])
+
+    def test_a_new_golden_file_with_no_lock_row_fails(self):
+        (self.fixtures / "extra.bin").write_bytes(b"x")
+        joined = self.joined()
+        self.assertIn("crates/demo/tests/fixtures/extra.bin", joined)
+        self.assertIn("not in the lock", joined)
+
+    def test_a_deleted_golden_file_fails(self):
+        (self.fixtures / "frame.bin").unlink()
+        joined = self.joined()
+        self.assertIn("crates/demo/tests/fixtures/frame.bin", joined)
+        self.assertIn("no longer exists", joined)
+
+    def test_a_fixture_no_format_names_fails(self):
+        (self.root / "crates/other/tests/fixtures").mkdir(parents=True)
+        (self.root / "crates/other/tests/fixtures/stray.bin").write_bytes(b"x")
+        joined = self.joined()
+        self.assertIn("crates/other/tests/fixtures/stray.bin", joined)
+        self.assertIn("belongs to no format", joined)
+
+    def test_snapshots_and_golden_corpus_seeds_are_golden_files_too(self):
+        (self.root / "crates/demo/tests/snapshots").mkdir()
+        (self.root / "crates/demo/tests/snapshots/a.snap").write_text("x")
+        (self.root / "fuzz/corpus/demo").mkdir(parents=True)
+        (self.root / "fuzz/corpus/demo/golden-one.seed").write_bytes(b"x")
+        (self.root / "fuzz/corpus/demo/plain.seed").write_bytes(b"x")
+        joined = self.joined()
+        self.assertIn("crates/demo/tests/snapshots/a.snap", joined)
+        self.assertIn("fuzz/corpus/demo/golden-one.seed", joined)
+        self.assertNotIn("plain.seed", joined)
+
+    def test_golden_paths_may_be_a_glob_and_are_locked(self):
+        (self.root / "fuzz/corpus/demo").mkdir(parents=True)
+        (self.root / "fuzz/corpus/demo/golden-one.seed").write_bytes(b"x")
+        self.registry(GOLDEN_REGISTRY.replace(
+            "    tag_sets:", "    golden: ['fuzz/corpus/demo/golden-*.seed']\n    tag_sets:"))
+        self.assertEqual(self.run_check("--write-lock"), 0)
+        self.assertIn("fuzz/corpus/demo/golden-one.seed", self.lock_text())
+        (self.root / "fuzz/corpus/demo/golden-one.seed").write_bytes(b"y")
+        self.assertIn("golden-one.seed", self.joined())
+
+    def test_a_golden_pattern_that_matches_nothing_fails(self):
+        self.registry(GOLDEN_REGISTRY.replace(
+            "    tag_sets:", "    golden: ['fuzz/corpus/none/golden-*.seed']\n    tag_sets:"))
+        self.assertIn("matches no file", self.joined())
+
+    def test_a_readme_is_not_a_golden_file(self):
+        (self.fixtures / "README.md").write_text("notes")
+        self.assertEqual(self.problems(), [])
+        self.assertNotIn("README.md", self.lock_text())
+
+    def test_a_missing_lock_file_fails(self):
+        (self.root / "scripts/compat/golden.lock").unlink()
+        self.assertIn("golden.lock", self.joined())
+
+    def test_a_file_two_formats_name_is_reported_with_both(self):
+        two = GOLDEN_REGISTRY.replace("not_formats:", """  - id: 2
+    name: Other
+    class: B
+    marker: none
+    status: evolving
+    at_1_0: stable
+    fixtures: [crates/demo/tests/fixtures/state.json]
+not_formats:""")
+        self.registry(two)
+        (self.fixtures / "state.json").write_text('{"v": 3}\n')
+        joined = self.joined()
+        self.assertIn("format 1 (Demo)", joined)
+        self.assertIn("format 2 (Other)", joined)
+
+    def test_the_lock_is_off_when_the_registry_names_none(self):
+        self.registry(REGISTRY)
+        self.assertEqual(self.problems(), [])
+
+
+FROZEN_BLOCK = """    state: frozen
+    frozen:
+      at: v0.12.0
+      digest: "{digest}"
+"""
+
+
+class Frozen(GoldenRegistryCase):
+    def setUp(self):
+        super().setUp()
+        (self.root / "scripts/compat/expected.yaml").write_text(EXPECTED_CELLS)
+        self.base = GOLDEN_REGISTRY.replace("    tag_sets:", "    cells: [demo]\n    fuzz: [demo_decode]\n    tag_sets:")
+        (self.root / "fuzz/fuzz_targets").mkdir(parents=True)
+        (self.root / "fuzz/fuzz_targets/demo_decode.rs").write_text("")
+        self.registry(self.base)
+        self.assertEqual(self.problems(), [])
+
+    def digest(self):
+        entry = registry_check.load(self.root)["formats"][0]
+        return registry_check.entry_digest(self.root, entry)
+
+    def freeze(self, extra="", digest=None):
+        block = FROZEN_BLOCK.format(digest=digest or self.digest()) + extra
+        self.registry(self.base.replace("    cells: [demo]\n", "    cells: [demo]\n" + block))
+
+    def test_an_entry_without_a_state_is_unfrozen_and_an_unknown_state_is_refused(self):
+        self.assertEqual(self.problems(), [])
+        for state in ("frozn", "stable", "Frozen", "null"):
+            self.registry(self.base.replace("    cells: [demo]\n", f"    cells: [demo]\n    state: {state}\n"))
+            self.assertIn("unknown state", self.joined(), state)
+
+    def test_an_explicit_unfrozen_state_is_accepted(self):
+        self.registry(self.base.replace("    cells: [demo]\n", "    cells: [demo]\n    state: unfrozen\n"))
+        self.assertEqual(self.problems(), [])
+
+    def test_a_frozen_format_with_the_right_digest_passes(self):
+        self.freeze()
+        self.assertEqual(self.problems(), [])
+        # The inventory table shows the state.
+        self.assertEqual(self.run_check("--write"), 0)
+        self.assertIn("frozen at v0.12.0", (self.root / "docs/reference/compatibility.md").read_text())
+        self.assertEqual(self.run_check(), 0)
+
+    def test_a_frozen_format_needs_its_release_and_its_digest(self):
+        self.registry(self.base.replace("    cells: [demo]\n", "    cells: [demo]\n    state: frozen\n"))
+        self.assertIn("no frozen block", self.joined())
+        self.registry(self.base.replace("    cells: [demo]\n",
+                                        "    cells: [demo]\n    state: frozen\n    frozen: {digest: abc}\n"))
+        joined = self.joined()
+        self.assertIn("frozen.at", joined)
+        self.assertIn("64 hex", joined)
+
+    def test_a_frozen_block_on_an_unfrozen_entry_is_refused(self):
+        self.registry(self.base.replace(
+            "    cells: [demo]\n",
+            "    cells: [demo]\n    state: unfrozen\n    frozen: {at: v0.12.0, digest: %s}\n" % ("a" * 64)))
+        self.assertIn("is not frozen but has a frozen block", self.joined())
+
+    def test_a_changed_golden_file_of_a_frozen_format_needs_a_recorded_exception(self):
+        self.freeze()
+        (self.fixtures / "state.json").write_text('{"v": 2}\n')
+        self.assertEqual(self.run_check("--write-lock"), 1)
+        joined = self.joined()
+        self.assertIn("format 1 (Demo) is frozen at v0.12.0", joined)
+        self.assertIn("frozen.exceptions", joined)
+        # The message hands over the digest to record.
+        self.assertIn(self.digest(), joined)
+
+    def test_a_version_bump_of_a_frozen_format_needs_a_recorded_exception(self):
+        self.freeze()
+        self.source(SOURCE.replace("DEMO_VERSION: u32 = 1", "DEMO_VERSION: u32 = 2"))
+        self.registry(self.registry_text().replace("name: DEMO_VERSION, value: '1'", "name: DEMO_VERSION, value: '2'"))
+        self.assertIn("is frozen at v0.12.0", self.joined())
+
+    def test_a_new_tag_in_a_frozen_field_list_needs_a_recorded_exception(self):
+        self.freeze()
+        self.source(SOURCE.replace("const MAX_DEMO", "const COMMAND_KIND_THIRD: u16 = 3;\nconst MAX_DEMO"))
+        self.registry(self.registry_text().replace(
+            "COMMAND_KIND_SECOND: 2}", "COMMAND_KIND_SECOND: 2, COMMAND_KIND_THIRD: 3}"))
+        self.assertIn("is frozen at v0.12.0", self.joined())
+
+    def test_a_new_golden_file_under_a_frozen_format_needs_a_recorded_exception(self):
+        self.freeze()
+        (self.fixtures / "later.bin").write_bytes(b"x")
+        self.assertEqual(self.run_check("--write-lock"), 1)
+        self.assertIn("is frozen at v0.12.0", self.joined())
+
+    def test_a_recorded_exception_lets_the_change_through_once(self):
+        self.freeze()
+        (self.fixtures / "state.json").write_text('{"v": 2}\n')
+        self.assertEqual(self.run_check("--write-lock"), 1)
+        new = self.digest()
+        self.freeze(extra=f"      exceptions:\n        - {{digest: \"{new}\", ref: \"#901\", why: the field is renamed}}\n",
+                    digest=registry_check.load(self.root)["formats"][0]["frozen"]["digest"])
+        self.assertEqual(self.problems(), [])
+
+    def test_an_exception_needs_a_digest_a_reference_and_a_reason(self):
+        self.freeze(extra="      exceptions:\n        - {digest: abc}\n")
+        joined = self.joined()
+        self.assertIn("64 hex", joined)
+        self.assertIn("needs a ref", joined)
+        self.assertIn("needs a why", joined)
+
+    def test_only_the_latest_exception_is_current(self):
+        self.freeze()
+        first = self.digest()
+        (self.fixtures / "state.json").write_text('{"v": 2}\n')
+        self.assertEqual(self.run_check("--write-lock"), 1)
+        second = self.digest()
+        original = registry_check.load(self.root)["formats"][0]["frozen"]["digest"]
+        rows = (f"      exceptions:\n        - {{digest: \"{first}\", ref: \"#1\", why: a}}\n"
+                f"        - {{digest: \"{second}\", ref: \"#2\", why: b}}\n")
+        self.freeze(extra=rows, digest=original)
+        self.assertEqual(self.problems(), [])
+        # Going back to the first state is a change too: the latest row is the one that counts.
+        (self.fixtures / "state.json").write_text('{"v": 1}\n')
+        self.assertEqual(self.run_check("--write-lock"), 1)
+        self.assertIn("is frozen at v0.12.0", self.joined())
+
+    def test_the_digest_command_prints_what_to_record(self):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(self.run_check("--digest", "1"), 0)
+        self.assertEqual(out.getvalue().strip(), self.digest())
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.run_check("--digest", "99"), 1)
+
+    def test_the_digest_follows_constants_tags_and_golden_bytes_not_the_prose(self):
+        before = self.digest()
+        self.registry(self.base.replace("status: evolving", "status: stable").replace("marker:", "marker: x #"))
+        self.assertEqual(self.digest(), before)
+        (self.fixtures / "state.json").write_text('{"v": 9}\n')
+        self.assertNotEqual(self.digest(), before)
+
+    def test_a_frozen_format_needs_golden_files_cells_both_ways_and_fuzz_or_a_recorded_waiver(self):
+        no_cells = self.base.replace("    cells: [demo]\n", "").replace("    fuzz: [demo_decode]\n", "")
+        (self.root / "scripts/compat/expected.yaml").write_text("cells: {}\n")
+        self.registry(no_cells)
+        digest = self.digest()
+        self.registry(no_cells.replace("    tag_sets:", FROZEN_BLOCK.format(digest=digest) + "    tag_sets:"))
+        joined = self.joined()
+        self.assertIn("upgrade and forward cells", joined)
+        self.assertIn("no fuzz target", joined)
+        waived = FROZEN_BLOCK.format(digest=digest) + "      waive: {cells: a wire format has no released binary, fuzz: a text format}\n"
+        # The demo fuzz target, no longer in the entry's fuzz list, must still be accounted for.
+        self.registry(no_cells.replace("    tag_sets:", waived + "    tag_sets:")
+                      + "fuzz_other:\n  demo_decode: the frozen entry waives fuzzing in this test\n")
+        self.assertEqual(self.problems(), [])
+
+    def test_a_frozen_format_with_no_golden_files_is_refused(self):
+        bare = REGISTRY.replace("    tag_sets:", "    cells: [demo]\n    fuzz: [demo_decode]\n    tag_sets:")
+        bare = bare + "golden_lock: scripts/compat/golden.lock\n"
+        for file in self.fixtures.iterdir():
+            file.unlink()
+        self.registry(bare)
+        self.assertEqual(self.run_check("--write-lock"), 0)
+        digest = self.digest()
+        self.registry(bare.replace("    tag_sets:", FROZEN_BLOCK.format(digest=digest) + "    tag_sets:"))
+        self.assertIn("no golden files", self.joined())
+
+    def registry_text(self):
+        return (self.root / "scripts/compat/formats.yaml").read_text()
+
+
+class FrozenHistory(unittest.TestCase):
+    """--base: a frozen format cannot be un-frozen, re-dated or re-digested
+    by editing the registry alone."""
+
+    def reg(self, **frozen):
+        entry = {"id": 1, "name": "Demo", "state": "frozen",
+                 "frozen": dict({"at": "v0.12.0", "digest": "a" * 64}, **frozen)}
+        return {"formats": [entry]}
+
+    def test_the_same_registry_passes(self):
+        self.assertEqual(registry_check.check_history(self.reg(), self.reg()), [])
+
+    def test_freezing_an_unfrozen_format_is_allowed(self):
+        base = {"formats": [{"id": 1, "name": "Demo"}]}
+        self.assertEqual(registry_check.check_history(base, self.reg()), [])
+
+    def test_unfreezing_is_refused(self):
+        head = {"formats": [{"id": 1, "name": "Demo", "state": "unfrozen"}]}
+        self.assertIn("was frozen at v0.12.0 and is not any more", " ".join(registry_check.check_history(self.reg(), head)))
+
+    def test_dropping_a_frozen_format_is_refused(self):
+        self.assertIn("format 1 (Demo) was frozen", " ".join(registry_check.check_history(self.reg(), {"formats": []})))
+
+    def test_changing_the_release_or_the_frozen_digest_is_refused(self):
+        joined = " ".join(registry_check.check_history(self.reg(), self.reg(at="v0.13.0", digest="b" * 64)))
+        self.assertIn("frozen.at", joined)
+        self.assertIn("frozen.digest", joined)
+
+    def test_exceptions_can_be_added_but_not_removed_or_rewritten(self):
+        row = {"digest": "c" * 64, "ref": "#1", "why": "x"}
+        base = self.reg(exceptions=[row])
+        self.assertEqual(registry_check.check_history(base, self.reg(exceptions=[row, dict(row, digest="d" * 64)])), [])
+        self.assertIn("exceptions", " ".join(registry_check.check_history(base, self.reg())))
+        self.assertIn("exceptions", " ".join(registry_check.check_history(base, self.reg(exceptions=[dict(row, why="y")]))))
+
+
+class FrozenHistoryFromGit(RegistryCase):
+    def git(self, *args):
+        import subprocess
+        subprocess.run(["git", "-C", str(self.root), "-c", "user.name=t", "-c", "user.email=t@example.com", *args],
+                       check=True, capture_output=True)
+
+    def test_base_reads_the_registry_at_a_revision_and_refuses_an_unfreeze(self):
+        digest = "a" * 64
+        frozen = REGISTRY.replace("    tag_sets:", FROZEN_BLOCK.format(digest=digest) + "    tag_sets:")
+        self.git("init", "-q")
+        (self.root / "scripts/compat/formats.yaml").write_text(frozen)
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "base")
+        (self.root / "scripts/compat/formats.yaml").write_text(REGISTRY)
+        import contextlib
+        import io
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(self.run_check("--base", "HEAD"), 1)
+        self.assertIn("was frozen at v0.12.0 and is not any more", err.getvalue())
+
+    def test_a_base_with_no_registry_yet_is_skipped_and_a_bad_revision_fails(self):
+        self.git("init", "-q")
+        (self.root / "README").write_text("x")
+        self.git("add", "README")
+        self.git("commit", "-q", "-m", "base")
+        self.assertEqual(self.run_check("--base", "HEAD"), 0)
+        import contextlib
+        import io
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.run_check("--base", "no-such-rev"), 1)
+
+
 class TheRepository(unittest.TestCase):
     def test_registry_names_every_format(self):
         self.assertEqual(registry_check.check_source(ROOT, registry_check.load(ROOT)), [])
+
+    def test_every_golden_file_is_locked_and_every_state_is_known(self):
+        registry = registry_check.load(ROOT)
+        self.assertEqual(registry["golden_lock"], "scripts/compat/golden.lock")
+        for entry in registry["formats"]:
+            self.assertIn(entry.get("state", "unfrozen"), registry_check.STATES)
 
     def test_the_page_table_is_what_the_registry_generates(self):
         self.assertEqual(registry_check.main(["--root", str(ROOT)]), 0)
