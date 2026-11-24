@@ -215,12 +215,17 @@ def test_the_fingerprint_does_not_see_the_block():
     assert kschema.fingerprint(env) == before
 
 
-def test_no_committed_kafka_run_has_a_host_metadata_block_and_all_still_load():
+def test_a_committed_kafka_run_keeps_its_host_metadata_outside_the_comparable_block():
+    # The laptop runs predate the block and have none; a run on a cloud host records it as the harness
+    # wrote it, beside `comparable`, never inside it (so the fingerprint and a resume never see it).
     runs = regenerate.committed_runs()
     assert runs
     for run_dir in runs:
         with open(os.path.join(run_dir, "environment.json")) as handle:
-            assert "host_metadata" not in json.load(handle), f"{run_dir} was edited after the fact"
+            env = json.load(handle)
+        assert "host_metadata" not in env["comparable"], f"{run_dir} carries host_metadata inside comparable"
+        if "host_metadata" in env:
+            assert isinstance(env["host_metadata"], dict), f"{run_dir}: host_metadata is not an object"
 
 
 # ------------------------------------------------------------------ --host-disk
