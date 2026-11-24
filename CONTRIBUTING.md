@@ -2,9 +2,13 @@
 
 ## Licensing of what you send
 
-By opening a pull request you agree that your contribution is licensed under
-the [MIT License](LICENSE), the same terms as the rest of the repository. That
-is the whole agreement — there is no CLA to sign.
+The repository is licensed under [AGPL-3.0-only](LICENSE) from v0.12.0, and
+the core is also offered under a commercial license (see
+[COMMERCIAL.md](COMMERCIAL.md)). A code contribution from outside can be
+accepted only after you have signed a contributor license agreement with the
+maintainer that allows both. Open the pull request as a draft and ask for the
+agreement; it is not merged before the agreement is in place. Reports, issues
+and discussion need no agreement.
 
 The one exception is **EE Software**, which is licensed under
 [LICENSE-EE](LICENSE-EE) and requires a separate written agreement before a

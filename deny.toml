@@ -33,6 +33,25 @@ allow = [
     "OpenSSL",       # ring's licence expression
 ]
 confidence-threshold = 0.9
+# The workspace's own crates carry the project's licence, AGPL-3.0-only (from
+# v0.12.0). It is allowed for them alone, so a third-party dependency under
+# AGPL is still refused until someone decides to take it.
+exceptions = [
+    { allow = ["AGPL-3.0-only"], crate = "vtop-adapters" },
+    { allow = ["AGPL-3.0-only"], crate = "vtop-broker" },
+    { allow = ["AGPL-3.0-only"], crate = "vtop-cli" },
+    { allow = ["AGPL-3.0-only"], crate = "vtop-core" },
+    { allow = ["AGPL-3.0-only"], crate = "vtop-kafka" },
+    { allow = ["AGPL-3.0-only"], crate = "vtop-log" },
+    { allow = ["AGPL-3.0-only"], crate = "vtop-meta" },
+    { allow = ["AGPL-3.0-only"], crate = "vtop-node" },
+    { allow = ["AGPL-3.0-only"], crate = "vtop-observe" },
+    { allow = ["AGPL-3.0-only"], crate = "vtop-protocol" },
+    { allow = ["AGPL-3.0-only"], crate = "vtop-s3-testkit" },
+    { allow = ["AGPL-3.0-only"], crate = "vtop-state" },
+    { allow = ["AGPL-3.0-only"], crate = "vtop-surface" },
+    { allow = ["AGPL-3.0-only"], crate = "vtop-upload" },
+]
 
 # ---------------------------------------------------------------------------
 # Advisories

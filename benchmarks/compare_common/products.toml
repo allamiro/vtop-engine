@@ -29,18 +29,18 @@ order = ["fluent-bit", "vtop", "vector", "otel-collector"]
 [products.vtop]
 name = "VTOP"
 role = "subject"
-licence = "MIT"
+licence = "AGPL-3.0-only"
 publish_ok = true
 private_ok = true
 evidence_url = "https://github.com/allamiro/vtop-engine/blob/main/LICENSE"
-retrieved = "2026-11-22"
+retrieved = "2026-11-24"
 clause = "none"
 clause_sha256 = "140bedbf9c3f6d56a9846d2ba7088798683f4da0c248231336e6a05679e4fdfe"
 version = "commit under test"
 # Built from docker/Dockerfile at the commit under test; the run records the
 # image id and the commit.
 built_from = "docker/Dockerfile"
-pinned = "2026-11-22"
+pinned = "2026-11-24"
 use_cases = ["a", "b", "c", "d", "e"]
 
 [products.kafka]

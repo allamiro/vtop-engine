@@ -11,7 +11,7 @@ authors:
     given-names: Tamir
 repository-code: "https://github.com/allamiro/vtop-engine"
 url: "https://github.com/allamiro/vtop-engine"
-license: MIT
+license: AGPL-3.0-only
 version: "0.11.1"
 date-released: "2026-11-23"
 keywords:
