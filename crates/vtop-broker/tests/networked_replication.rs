@@ -817,6 +817,19 @@ fn concurrent_producers_with_overlapped_groups_replicate_in_order() {
         None,
         FollowerAddressing::Resolved,
     );
+    // The harness waits for both follower sessions but does not insist on
+    // them. A request sent before a session is up misses its quorum for that
+    // reason alone, which this test would mistake for a pair of rounds
+    // reaching a follower out of order, so it starts only once both are up.
+    // No produce is retried: a quorum miss from then on fails the test.
+    for node in [FOLLOWER_1, FOLLOWER_2] {
+        assert!(
+            await_within(Duration::from_secs(10), || {
+                h.replica_set.follower_connected(node) == Some(true)
+            }),
+            "follower {node} had no live session 10 s after the harness started"
+        );
+    }
     let threads: Vec<_> = (0..PRODUCERS)
         .map(|producer| {
             let leader = Arc::clone(&h.leader);
@@ -856,6 +869,7 @@ fn concurrent_producers_with_overlapped_groups_replicate_in_order() {
     }
     let total = PRODUCERS as u64 * REQUESTS;
     assert_eq!(h.cluster_committed.get(), total);
+    assert_eq!(h.leader.local_offsets(), (total, total));
     for follower in &h.followers {
         assert!(
             await_within(Duration::from_secs(10), || {

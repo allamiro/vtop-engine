@@ -1379,6 +1379,15 @@ mod tests {
     /// hold one request each. Before the change a group held the lead until
     /// it was answered, so group 2 could not start its local stage while
     /// group 1 replicated.
+    ///
+    /// Groups 1 and 2 each wait at their own gate in their replicate stage,
+    /// released by the test in turn, so every step below is reached by
+    /// waiting for it and none by timing. An earlier version gated group 1
+    /// only: group 2's replicate stage then ran straight through, and group
+    /// 3 was sealed after group 2 had already finished whenever its thread
+    /// was scheduled late, so the overlap count read 1 on a loaded runner.
+    /// The count was right (group 3 had overlapped nothing); the test did
+    /// not make the overlap happen.
     #[test]
     fn a_staged_group_hands_on_the_lead_at_its_replicate_turn_and_keeps_two_in_flight() {
         let coord = Arc::new(
@@ -1389,26 +1398,30 @@ mod tests {
             .unwrap(),
         );
         let events: Arc<Mutex<Vec<String>>> = Arc::default();
-        let gate = Arc::new(Mutex::new(()));
-        let held = gate.lock().unwrap();
+        // One gate per held group: a group in its replicate stage waits at
+        // its gate until the test drops the guard.
+        let gates: Arc<[Mutex<()>; 2]> = Arc::new([Mutex::new(()), Mutex::new(())]);
+        let held_first = gates[0].lock().unwrap();
+        let held_second = gates[1].lock().unwrap();
         let seen = |events: &Mutex<Vec<String>>, what: &str| {
             events.lock().unwrap().iter().any(|event| event == what)
         };
-        let await_event = |what: &str| {
+        let await_until = |what: &str, condition: &dyn Fn() -> bool| {
             let deadline = Instant::now() + ANSWER_DEADLINE;
-            while !seen(&events, what) {
+            while !condition() {
                 assert!(
                     Instant::now() < deadline,
-                    "`{what}` did not happen within {ANSWER_DEADLINE:?}; events: {:?}",
+                    "{what} did not happen within {ANSWER_DEADLINE:?}; events: {:?}",
                     events.lock().unwrap()
                 );
                 thread::sleep(Duration::from_millis(1));
             }
         };
+        let await_event = |what: &str| await_until(what, &|| seen(&events, what));
         let send = |request_id: u64| {
             let coord = Arc::clone(&coord);
             let events = Arc::clone(&events);
-            let gate = Arc::clone(&gate);
+            let gates = Arc::clone(&gates);
             thread::spawn(move || {
                 coord.enqueue_and_wait_staged(
                     QueuedProduce::new(request_id, 1, sample_request(request_id)),
@@ -1418,7 +1431,8 @@ mod tests {
                         stage.appended();
                         stage.begin_replicate();
                         events.lock().unwrap().push(format!("replicate {id}"));
-                        if id == 1 {
+                        if let Some(gate) = usize::try_from(id - 1).ok().and_then(|i| gates.get(i))
+                        {
                             drop(gate.lock().unwrap());
                         }
                         events.lock().unwrap().push(format!("done {id}"));
@@ -1433,18 +1447,17 @@ mod tests {
         let second = send(2);
         // The handoff: group 2's local stage runs while group 1 replicates.
         await_event("local 2");
+        // Group 2 cannot take its turn while group 1 waits at its gate; a
+        // pause can only miss a violation here, never invent one.
         thread::sleep(Duration::from_millis(50));
         assert!(
             !seen(&events, "replicate 2"),
             "group 2 began replicating before group 1 finished: {:?}",
             events.lock().unwrap()
         );
+        assert_eq!(coord.metrics().overlapped_total(), 1);
         let third = send(3);
-        let deadline = Instant::now() + ANSWER_DEADLINE;
-        while coord.queued_requests() < 1 {
-            assert!(Instant::now() < deadline, "request 3 was never queued");
-            thread::sleep(Duration::from_millis(1));
-        }
+        await_until("request 3 being queued", &|| coord.queued_requests() == 1);
         thread::sleep(Duration::from_millis(50));
         assert!(
             !seen(&events, "local 3"),
@@ -1453,7 +1466,19 @@ mod tests {
         );
         assert_eq!(coord.groups_in_flight(), MAX_GROUPS_IN_FLIGHT);
 
-        drop(held);
+        // Group 1 finishes; group 2 takes its turn and waits at its own
+        // gate, and group 3 is sealed while it does.
+        drop(held_first);
+        await_event("replicate 2");
+        await_event("local 3");
+        assert_eq!(
+            coord.metrics().overlapped_total(),
+            2,
+            "groups 2 and 3 were each sealed while the group before them replicated"
+        );
+        assert_eq!(coord.groups_in_flight(), MAX_GROUPS_IN_FLIGHT);
+
+        drop(held_second);
         for (thread, request_id) in [(first, 1), (second, 2), (third, 3)] {
             assert_eq!(thread.join().unwrap().request_id, request_id);
         }
@@ -1472,11 +1497,7 @@ mod tests {
             at("done 1") < at("local 3"),
             "group 3 started only once group 1 had left: {events:?}"
         );
-        assert_eq!(
-            coord.metrics().overlapped_total(),
-            2,
-            "groups 2 and 3 were each sealed while the group before them replicated"
-        );
+        assert_eq!(coord.metrics().overlapped_total(), 2);
         assert_eq!(coord.groups_in_flight(), 0);
     }
 
