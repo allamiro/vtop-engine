@@ -82,12 +82,22 @@ change and no client change. The client's outage is the lease's lapse, the
 election of a survivor, the survivor opening the range at a write quorum
 ([#750](https://github.com/allamiro/vtop-engine/issues/750)), and one metadata
 refresh. Live-chaos scenarios 27 and 28 measure it for librdkafka and for the
-JVM client, with `metadata.recovery.strategy` both ways:
-[Kafka clients and a failover](../LIVE_CHAOS_VALIDATION.md#kafka-clients-and-a-failover-751).
+JVM client, with `metadata.recovery.strategy` both ways, and 30 and 31 in this
+chart's co-located shape: with release binaries and the chart's default lease
+(15 s) a producer resumed 12.5 s to 15.9 s after the leader was killed, on one
+GitHub-hosted runner (2 vCPUs, every process on one host)
+([Kafka clients and a failover](../LIVE_CHAOS_VALIDATION.md#kafka-clients-and-a-failover-751)).
+A leader that stalls past its lease and comes back acknowledges nothing and
+refuses by name (scenario 32).
 
 Known limits. A group's membership is held in memory by each gateway, so after
 a failover the members rejoin; committed offsets are on the metadata plane and
-survive. `kafka.brokers` must name what clients dial: a client that cannot
+survive. Measured (scenario 33, same conditions): a stock consumer group, the
+same process, read on 13.0 s to 14.4 s after the kill from its committed
+offset, and the records it had consumed after its last commit came again (41
+for a JVM consumer committing every 500 ms; 369 to 1,761 for librdkafka, which
+commits every 5 s and reads on through the failover before it rejoins). Size
+`auto.commit.interval.ms` for what a consumer may read twice. `kafka.brokers` must name what clients dial: a client that cannot
 reach or resolve the host a member advertises cannot follow a failover to it.
 
 How it

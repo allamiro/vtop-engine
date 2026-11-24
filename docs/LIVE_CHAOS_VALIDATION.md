@@ -54,12 +54,13 @@ without editing a scenario:
 | `CHAOS_META_ADMIN_BASE_PORT` | `9200` | Metadata admin ports are this base plus node ID. |
 | `CHAOS_REPLICA_BASE_PORT` | `9300` | Replica ports are this base plus replica number. |
 | `CHAOS_NATIVE_PORT` | `9400` | Native producer/fetch port. |
-| `CHAOS_KAFKA_BASE_PORT` | `9420` | Kafka gateway listeners (#225): kafka-0 for scenario 16's standalone and scenario 26's, kafka-1 for scenario 17's leader, kafka-2 for scenario 18's, kafka-3 for scenarios 19 and 20, kafka-4 and kafka-5 for the two partitions of scenarios 21 and 24, kafka-5 again for scenario 25's, kafka-6 to kafka-8 for the three candidates of scenarios 27, 28 and 30 to 32 (#751), in either shape. |
+| `CHAOS_KAFKA_BASE_PORT` | `9420` | Kafka gateway listeners (#225): kafka-0 for scenario 16's standalone and scenario 26's, kafka-1 for scenario 17's leader, kafka-2 for scenario 18's, kafka-3 for scenarios 19 and 20, kafka-4 and kafka-5 for the two partitions of scenarios 21 and 24, kafka-5 again for scenario 25's, kafka-6 to kafka-8 for the three candidates of scenarios 27, 28 and 30 to 33 (#751), in either shape. |
 | `CHAOS_KAFKA_RECORDS`, `CHAOS_KAFKA_KILL_AFTER_ACKS`, `CHAOS_KAFKA_FAILOVER_LIMIT_SECONDS` | `4000`, `800`, `60` (scenario 27); `3000`, `600`, `60` (scenario 28) | The records streamed, the acknowledgements after which the leader is killed, and the longest the client may wait for an acknowledgement after the kill (#751). |
 | `CHAOS_KAFKA_PACE_EVERY`, `CHAOS_KAFKA_PACE_SLEEP` | `10`, `0.1` | Scenario 27's pace: a pause of that many seconds after every that many records, 100 records a second. Scenario 28 sets `CHAOS_KAFKA_RATE` (default `100`), records a second, instead. |
 | `CHAOS_KAFKA_HOME`, `CHAOS_KAFKA_IMAGE`, `CHAOS_KAFKA_STRATEGIES` | unset, unset, `rebootstrap none` | Scenario 28's (and 31's) client: an unpacked Apache Kafka distribution, or an `apache/kafka` image to copy `/opt/kafka` out of with `docker`; with neither the scenario skips. The `metadata.recovery.strategy` values to run, one failover each. A JVM (17 or newer) must be on `PATH`. |
-| `CHAOS_KAFKA_SHAPE` | `split` | The processes the Kafka-candidate scenarios (27, 28, 32) run on (#751): `split` is three `vtop-node meta` processes beside three `vtop-node data` candidates; `colocated` is three `vtop-node node` processes, each a metadata voter and a candidate, whose lease asks its own voter first and lists all three in `admin_peers`. Scenarios 30 and 31 set `colocated` and run 27 and 28. |
-| `CHAOS_KAFKA_PAUSE_AFTER_ACKS`, `CHAOS_KAFKA_RESUME_ACKS`, `CHAOS_KAFKA_PAUSE_LIMIT_SECONDS` | `800`, `200`, `90` | Scenario 32: the acknowledgements after which the leader is paused, how many more must arrive through the new leader before the old one is resumed, and the longest the client may wait for an acknowledgement after the pause. 90 s because a paused leader keeps its socket open, so librdkafka waits out its stock 30 s request timeout before it looks elsewhere. |
+| `CHAOS_KAFKA_SHAPE` | `split` | The processes the Kafka-candidate scenarios (27, 28, 32, 33) run on (#751): `split` is three `vtop-node meta` processes beside three `vtop-node data` candidates; `colocated` is three `vtop-node node` processes, each a metadata voter and a candidate, whose lease asks its own voter first and lists all three in `admin_peers`. Scenarios 30 and 31 set `colocated` and run 27 and 28. |
+| `CHAOS_KAFKA_KILL_AFTER_CONSUMED`, `CHAOS_KAFKA_COMMIT_INTERVAL_MS`, `CHAOS_KAFKA_GROUP_CLIENTS` | `800`, `500`, `librdkafka jvm` | Scenario 33: the deliveries after which the leader (and the group's coordinator) is killed, the JVM consumer's `auto.commit.interval.ms`, and the consumers to run, each on a fresh cluster (the JVM one needs `CHAOS_KAFKA_HOME` or `CHAOS_KAFKA_IMAGE`, and is left out with a log line without them). `kcat` commits at librdkafka's own 5 s: its `-X` tries the topic configuration first, and `auto.commit.interval.ms` is also the name of a legacy topic property, which is where it lands. |
+| `CHAOS_KAFKA_PAUSE_AFTER_ACKS`, `CHAOS_KAFKA_RESUME_ACKS`, `CHAOS_KAFKA_PAUSE_LIMIT_SECONDS` | `800`, `200`, `120` | Scenario 32: the acknowledgements after which the leader is paused, how many more must arrive through the new leader before the old one is resumed, and the longest the client may wait for an acknowledgement after the pause. A paused leader keeps its socket open, so librdkafka waits out its own timeouts before it looks elsewhere: 60 to 71 s in CI under either lease, so the bound is 120 s (it was 90 when it assumed the 30 s request timeout alone). |
 | `CHAOS_META_METRICS_BASE_PORT` | `9500` | Metadata `/metrics` ports are this base plus node ID (#224). |
 | `CHAOS_DATA_METRICS_BASE_PORT` | `9600` | Data-plane `/metrics` ports: base+0 for the leader, base+1/2 for followers. |
 | `CHAOS_TOPIC_UUID` | `aaaaaaaa-…-b1` | Metadata's UUID for the topic, distinct from the wire-level topic name. |
@@ -138,6 +139,7 @@ checks is a gate that silently stops working.
 | `30-kafka-failover-colocated` | Scenario 27 with `CHAOS_KAFKA_SHAPE=colocated`: three `vtop-node node` processes, each a metadata voter and a candidate serving the Kafka gateway, the shape the Helm chart renders for a replicated topology and `benchmarks/kafka_compare/vtop/ha-node-*.yaml` run. The `SIGKILL` of the range's leader also removes a Raft voter, which may be the metadata leader (#751). | Every assertion of 27. The lease is read from the two survivors only, so a run that killed the metadata leader waits for an election rather than reading a dead node; the result line names the shape, the profile, the lease and whether the killed process hosted the metadata leader (`killed_meta_leader`). |
 | `31-kafka-jvm-failover-colocated` | Scenario 28 with `CHAOS_KAFKA_SHAPE=colocated` (the JVM client, both `metadata.recovery.strategy` values, each on a fresh co-located trio). Skips as 28 does (#751). | Every assertion of 28, in the co-located shape; under `none` the client still finds the new leader through a surviving member's metadata. |
 | `32-kafka-paused-leader` | Three candidates serving Kafka (as 27); one idempotent librdkafka producer streams; after 800 acknowledgements the leader is `SIGSTOP`ped. While it sleeps a survivor takes the range, one raw Kafka Produce (the request a client holding pre-failover metadata sends) is queued in the paused leader's socket, and the producer resumes through the new leader; then the old leader is `SIGCONT`ed (#751). | Safety: the queued Produce is not acknowledged, whichever of the old gateway and its lease agent runs first; no record sent to the old leader appears in the new leader's log; every acknowledged record reads back once and in order. Liveness: the old leader's `vtop_kafka_gateway_serving` goes to 0 within one renew plus one poll interval (plus 2 s for the scrape) of the resume, it logs a role change to follower, its Metadata names the new leader, and a second raw Produce to it is answered `NOT_LEADER_OR_FOLLOWER`; the producer finishes every record with no failed delivery, and the pause-to-resume time is printed and bounded by `CHAOS_KAFKA_PAUSE_LIMIT_SECONDS`. Control: the same raw Produce sent to the new leader is acknowledged, so the refusals are the old leader's answer and not a malformed request. |
+| `33-kafka-consumer-group-failover` | Three candidates serving Kafka (as 27). ONE stock group consumer with auto-commit on, bootstrapped from all three (`kcat -G` at librdkafka's 5 s interval, then, with a Kafka distribution, `kafka-console-consumer --group` every 500 ms, each on a fresh cluster), reads while one idempotent librdkafka producer streams 3,000 records; after 800 deliveries the group's committed offset is read from the metadata plane and the range's leader, which is also the group's coordinator, is `SIGKILL`ed. Group membership is not carried across a failover; the committed offset is (#751). | The same consumer process delivers every produced record at least once, with its produced value, at one offset, first delivered in produced order. Every rewind goes back no further than the offset committed before the kill, so only records after the last commit are delivered again; they are counted, not bounded by a number, because librdkafka keeps fetching through the failover while its commits wait for a coordinator, and everything it delivers before it rejoins comes again. The committed offset kept up before the kill (it covers what was delivered one commit interval and 2 s earlier). No offset reset (`OFFSET_OUT_OF_RANGE`). The group's committed offset on the plane reaches the high watermark, and a fresh member of the group reads nothing. The time from the kill to the end of the longest silence in the deliveries (the rejoin and resume) is printed and bounded by `CHAOS_KAFKA_FAILOVER_LIMIT_SECONDS`; for `kcat` so is the time until it reports the partition assigned again. |
 | `29-leader-ahead-after-full-restart` | A whole replica set killed at once and restarted over a PLAINTEXT plane, on a range in the default (v1) format (#599): after a shared prefix both followers are `SIGKILL`ed, the leader alone appends and fsyncs one batch no quorum can acknowledge (the client is told `quorum not reached`), then the leader is `SIGKILL`ed and all three nodes restart, so the leader's log is strictly longer than both followers' and its retransmission buffer is empty. `CHAOS_AHEAD_SHARED`, `CHAOS_AHEAD_LEADER_ONLY` and `CHAOS_AHEAD_AFTER` (defaults 1,000, 100 and 1,000) size the three stretches and `CHAOS_AHEAD_RECOVERY_SECONDS` (default 60) bounds the wait. | A quorum produce succeeds within the bound with no operator action; every record, the batch only the leader held included, reads back byte-exact and in order; both followers' committed offset equals the whole log; all three sealed segments pass `vtopctl segment verify`. |
 
 Scenario 07 skews a Raft **voter**. Skew on a lease **proposer** (a data node)
@@ -181,7 +183,8 @@ before its private tmpfs disappears.
 Until #751 a Kafka client could not follow a VTOP failover: a candidate refused
 the gateway, and the one shape that fails over without a restart is every node
 a candidate. Scenarios 27 and 28 are the live proof that it can now, with the
-two Kafka clients that matter, and they measure what the client sees.
+two Kafka clients that matter, and they measure what the client sees; 30 to
+33 extend them to the co-located shape, a paused leader and a consumer group.
 
 Both start three candidates with `kafka.brokers` on every one (the same list,
 each at its own broker id), bootstrap the client from all three, and
@@ -196,6 +199,8 @@ before the lease can move; each result line says whether that happened
 (`killed_meta_leader`). Scenario 32 pauses the leader instead of killing it,
 which is the case a lease exists for: the old leader keeps its sockets, wakes
 up still believing it leads, and must acknowledge nothing and refuse by name.
+Scenario 33 kills the leader under a stock consumer group, whose coordinator
+it also is.
 
 **What is measured.** Two times, from the kill, both in milliseconds, taken from
 the clock the client's acknowledgements are stamped with:
@@ -258,9 +263,8 @@ idempotent producer is refused with none, so scenario 28 sets
 5.5 s to 6.6 s against a 6 s lease. A killed leader's lease is still on
 record until it lapses, so the wait is the rest of the lease, the poll, a
 survivor opening the range at a write quorum (#750), and one metadata refresh.
-With the chart's default lease of 15 s the same failover is expected to take
-correspondingly longer; that was not measured, and these numbers are the
-harness's short lease, on one laptop. They are not comparable with the failover
+These numbers are the harness's short lease, on one laptop; the chart's lease
+is measured below. They are not comparable with the failover
 report's numbers, which use each system's shipped timeouts and a different
 client for VTOP
 ([Kafka failover](benchmarks/kafka-failover.md)). Under `rebootstrap` and `none`
@@ -270,10 +274,94 @@ refresh: `rebootstrap` acts only when no broker the client knows answers for
 happened here because every member is listed in `kafka.brokers` and two of them
 stayed up, so the two strategies behaved alike.
 
-Group consumers are not exercised by these two scenarios. A group's membership
-is in memory per gateway, so after a failover the members rejoin; committed
-offsets survive (scenario 20 covers a commit and a resume, not across a
-failover).
+### Release binaries and the chart's lease
+
+[`kafka-failover-release.yml`](../.github/workflows/kafka-failover-release.yml)
+runs scenarios 27, 28 and 30 to 33 with release binaries and the Helm chart's
+default lease (`helm/vtop/values.yaml`: 15 s long, renewed every 5 s, polled
+every 2 s), `CHAOS_KAFKA_FAILOVER_LIMIT_SECONDS=90`, four times each on a fresh
+cluster, and writes every result line to its job summary and an artifact. It
+runs when dispatched, and on a pull request that changes it or one of those
+scenarios; it does not run on every pull request.
+
+**Conditions.** One GitHub-hosted `ubuntu-latest` runner (2 vCPUs), every
+process on that one host over loopback: the metadata nodes, the candidates,
+the producer and the consumer. librdkafka from Ubuntu's `kafkacat` package,
+the JVM client of Apache Kafka 4.4.0 from the pinned `apache/kafka` image.
+These are one host class; a second (dedicated hardware) is #737's, and none of
+this ran on AWS.
+
+**Measured** in its run 45271870645 (the code of #947), four runs each, every
+run passing, times from the kill (or the pause) in seconds, min to max:
+
+| Scenario | Client | Shape | Kill to resume |
+|---|---|---|---:|
+| 27 | librdkafka producer | split | 12.5 to 13.5 |
+| 30 | librdkafka producer | co-located | 12.5 to 13.5 |
+| 28 | JVM producer, `rebootstrap` | split | 14.8 to 15.9 |
+| 28 | JVM producer, `none` | split | 13.7 to 15.4 |
+| 31 | JVM producer, `rebootstrap` | co-located | 14.9 to 15.3 |
+| 31 | JVM producer, `none` | co-located | 15.0 to 15.5 |
+| 33 | librdkafka group consumer | split | 13.5 to 14.4 |
+| 33 | JVM group consumer | split | 13.0 to 13.5 |
+
+The co-located shape costs nothing measurable over the split one, although in
+all eight of its runs (and in the debug run of ci.yml) the killed process
+hosted the metadata leader as well as the range's leader (`killed_meta_leader=yes`):
+a candidate asks its own process's voter first, so the one beside the metadata
+leader wins the first acquisition, and the kill is the compound fault every
+time. The election it forces (300 to 600 ms) is inside the lease's lapse, which
+dominates. With the 6 s lease and debug binaries (ci.yml, one run) the same
+shape resumed in 6.2 s (librdkafka) and 5.7 s (JVM, both strategies).
+
+**A paused leader (scenario 32).** In every run the old leader, resumed after
+60.9 s to 70.8 s stopped, read the Produce queued in its socket before its
+lease agent had demoted it, tried to append, found no quorum (the replicas had
+moved to the new epoch) and answered `REQUEST_TIMED_OUT`: not acknowledged, and
+not in the new leader's log. Its gateway stopped claiming to serve 27 ms to 30 ms
+after the resume (49 ms in debug), it changed role to follower, its Metadata
+named the new leader, and a second Produce to it was refused
+`NOT_LEADER_OR_FOLLOWER`. The producer resumed 60.7 s to 70.6 s after the pause,
+under the 6 s and the 15 s lease alike: a paused leader keeps its socket open,
+and librdkafka waits out its own timeouts on it before it looks elsewhere. That
+wait is the client's, not the lease's.
+
+**A consumer group (scenario 33).** A group's membership is the coordinator's
+memory and is not carried across a failover; the committed offset is, on the
+metadata plane. In every run the same consumer process (no restart) was refused
+under its old generation, rejoined the new holder's coordinator, resumed from
+the committed offset, delivered every record at least once and in order, and
+ended with the group's committed offset at the end of the partition (a fresh
+member read nothing). No offset was reset. Records after the last commit were
+delivered again, and how many depends on the client:
+
+- the JVM consumer, auto-committing every 500 ms, had 779 committed when the
+  leader died with 819 delivered, and got 41 records again;
+- librdkafka (kcat) commits at its own 5 s interval (kcat cannot change it: its
+  `-X` sets the legacy topic property of the same name), so 451 was committed at
+  the kill, and it went on fetching from the new leader with its old assignment
+  while its commits waited for a coordinator. It got 369 records again when it
+  rejoined at once, and 1,720 and 1,761 when it read on for about 14 s first.
+
+Deliveries resumed 13.0 s to 14.4 s after the kill, the lease's lapse again;
+kcat reported its partition assigned again 14.1 s to 15.4 s after it, in two
+runs after it had already read on from the new leader.
+
+Two faults the scenarios found were fixed with them:
+
+- The JVM consumer died in the first fetch after a failover ("Unexpected error
+  code 7 while fetching") in three of four runs: a promoted node refuses reads
+  until its promotion boundary is proven, and the gateway answered that
+  `REQUEST_TIMED_OUT`, which a JVM consumer does not expect on a Fetch. It is
+  now `OFFSET_NOT_AVAILABLE`, Kafka's own answer for a new leader whose high
+  watermark has not caught up, which both clients retry.
+- The workflows' log upload on failure never ran (an `if:` without a status
+  function is ANDed with `success()`).
+
+Not covered: group state carried across a failover (it is not, by design; the
+members rejoin), exactly-once consumption (that needs transactions, out of
+scope), a second host class, and a consumer of a co-located cluster (33 runs
+split only).
 
 ## Operation histories (#728)
 
@@ -740,8 +828,8 @@ production cluster daemon.
   data plane follows metadata leases from the live Raft group: scenarios 09,
   14, 23, 27, 28, 30 and 31 kill a range leader and assert that another node
   takes the range under a lease (09 also asserts that the restarted old leader
-  is refused as fenced), and 32 pauses one past its lease and asserts that it
-  comes back deposed. Scenarios 30 and 31 host a metadata voter and a candidate
+  is refused as fenced), 32 pauses one past its lease and asserts that it
+  comes back deposed, and 33 kills one under a consumer group. Scenarios 30 and 31 host a metadata voter and a candidate
   in each of three processes, so the kill also removes a voter. Membership changes (scenarios 01 to 03) and data replica-set
   changes (scenario 12) are driven by the operator; the harness does not
   claim that a data node reacts to a membership change on its own.
@@ -754,12 +842,15 @@ production cluster daemon.
   still unproven here is automated repair with no operator in the loop.
 - Scenario 04 proves acknowledged durability and same-directory recovery;
   it does not fail over. Lease-driven failover is scenarios 09, 14, 23, 27,
-  28, 30 and 31; 27, 28, 30, 31 and 32 are the ones a Kafka client rides
+  28, 30, 31 and 33; 27, 28 and 30 to 33 are the ones a Kafka client rides
   through.
 - Consumer-group cursors are exercised live through the Kafka gateway:
   scenario 20 commits a group's offset as a cursor on the metadata plane, and
-  a second consumer resumes from it (scenarios 19 and 21 run groups on nodes
-  with no metadata plane, where every commit is refused by name). The native
+  a second consumer resumes from it, and scenario 33 carries a running group
+  through a kill of its coordinator, resuming from the committed offset with
+  no restart (scenarios 19 and 21 run groups on nodes with no metadata plane,
+  where every commit is refused by name). Group membership itself is not
+  carried across a failover; members rejoin. The native
   protocol's own cursor commit is covered by the metadata state machine and
   deterministic Raft tests, not by this harness, so it claims no end-to-end
   cursor continuity across membership changes.

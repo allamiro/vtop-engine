@@ -1,0 +1,208 @@
+name: kafka failover (release binaries, chart lease)
+
+# The Kafka-client failover scenarios (#751) with what a deployment runs:
+# release binaries and the Helm chart's default lease (helm/vtop/values.yaml:
+# 15 s long, renewed every 5 s, polled every 2 s). The live-chaos job in
+# ci.yml runs the same scenarios on every pull request that touches the
+# harness or the crates, with debug binaries and the harness's 6 s lease, as a
+# correctness gate; this workflow measures the times a client sees under the
+# shipped settings, repeated, and reports them.
+#
+# Scenarios, each repeated `repetitions` times on fresh clusters:
+#   27  librdkafka producer, a candidate trio (split shape)
+#   28  the JVM producer, both metadata.recovery.strategy values (split)
+#   30  27 on three co-located `vtop-node node` processes
+#   31  28 co-located
+#   32  a leader paused past its lease and resumed (split)
+#   33  a librdkafka and a JVM consumer group across the kill (split)
+# Every result line (KAFKA_FAILOVER, KAFKA_PAUSED_LEADER, KAFKA_GROUP_FAILOVER)
+# carries its conditions (shape, profile, lease) and goes to the job summary
+# and to an artifact. The numbers are one GitHub-hosted runner (2 vCPUs,
+# every process on one host, loopback); they are not a second host class.
+#
+# NEVER on every pull request: a release build and ~10 minutes of scenarios a
+# repetition. It runs when dispatched, and on a pull request that changes this
+# file or one of the scenarios it runs. The limits are widened for the 15 s
+# lease, not loosened: CHAOS_KAFKA_FAILOVER_LIMIT_SECONDS is 90 here (the rest
+# of a 15 s lease, a metadata election in the co-located shape, and the
+# client's own refresh), against 60 for the 6 s lease.
+on:
+  workflow_dispatch:
+    inputs:
+      repetitions:
+        description: "Times each scenario runs, each on a fresh cluster"
+        required: true
+        default: "4"
+  pull_request:
+    paths:
+      - '.github/workflows/kafka-failover-release.yml'
+      - 'scripts/live-chaos/scenarios/27-kafka-client-follows-failover.sh'
+      - 'scripts/live-chaos/scenarios/28-kafka-jvm-client-failover.sh'
+      - 'scripts/live-chaos/scenarios/30-kafka-failover-colocated.sh'
+      - 'scripts/live-chaos/scenarios/31-kafka-jvm-failover-colocated.sh'
+      - 'scripts/live-chaos/scenarios/32-kafka-paused-leader.sh'
+      - 'scripts/live-chaos/scenarios/33-kafka-consumer-group-failover.sh'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kafka-failover-release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  failover:
+    name: Kafka failover, release binaries, 15 s lease
+    runs-on: ubuntu-latest
+    # A release build (about 15 minutes cold) and about 10 minutes of
+    # scenarios a repetition; four repetitions fit with room for a slow host.
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-kafka-failover-release-${{ hashFiles('**/Cargo.lock') }}
+
+      # librdkafka, the library under every non-JVM Kafka client; the JVM
+      # client comes out of the apache/kafka image below.
+      - name: Install a stock Kafka client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq kafkacat
+
+      - name: Build release binaries
+        run: |
+          cargo build --release --locked -p vtop-node --bin vtop-node
+          cargo build --release --locked -p vtop-cli --no-default-features --bin vtopctl
+
+      # Each scenario's own workdir under one root, so the logs survive for
+      # the artifact. A scenario that fails is recorded and the rest still
+      # run; the job fails at the end if any did.
+      - name: Run the scenarios
+        id: run
+        env:
+          REPETITIONS: ${{ github.event.inputs.repetitions || '4' }}
+          CHAOS_PROFILE: release
+          CHAOS_LEASE_DURATION_MS: "15000"
+          CHAOS_LEASE_RENEW_MS: "5000"
+          CHAOS_LEASE_POLL_MS: "2000"
+          CHAOS_KAFKA_FAILOVER_LIMIT_SECONDS: "90"
+          # The 4.4.0 line of kafka-matrix.yml, by the digest ci.yml pins.
+          CHAOS_KAFKA_IMAGE: apache/kafka@sha256:833b867a9585a141da455dc2b57431c65cbccb27f11c91f694444cca9f777e0f
+        run: |
+          set -uo pipefail
+          [[ "$REPETITIONS" =~ ^[1-9][0-9]?$ ]] || { echo "repetitions must be 1 to 99, got '$REPETITIONS'"; exit 1; }
+          root="$RUNNER_TEMP/kafka-failover"
+          mkdir -p "$root"
+          : > "$root/results.txt"
+          : > "$root/outcomes.txt"
+          failed=0
+          for run in $(seq 1 "$REPETITIONS"); do
+            for scenario in 27-kafka-client-follows-failover 28-kafka-jvm-client-failover \
+              30-kafka-failover-colocated 31-kafka-jvm-failover-colocated \
+              32-kafka-paused-leader 33-kafka-consumer-group-failover; do
+              echo "=== run $run: $scenario ==="
+              code=0
+              CHAOS_WORKDIR="$root/run-$run/$scenario" \
+                bash "scripts/live-chaos/scenarios/$scenario.sh" > "$root/run-$run-$scenario.out" 2>&1 \
+                || code=$?
+              tail -n 40 "$root/run-$run-$scenario.out"
+              grep -E '^KAFKA_(FAILOVER|PAUSED_LEADER|GROUP_FAILOVER) ' "$root/run-$run-$scenario.out" \
+                | sed "s/\$/ run=$run scenario=${scenario%%-*}/" >> "$root/results.txt" || true
+              echo "run=$run scenario=$scenario exit=$code" >> "$root/outcomes.txt"
+              [[ $code -eq 0 ]] || failed=1
+            done
+          done
+          exit "$failed"
+
+      - name: Summarise
+        if: always() && steps.run.outcome != 'skipped'
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/kafka-failover"
+          python3 - "$root/results.txt" "$root/outcomes.txt" >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          import shlex, statistics, sys
+          results, outcomes = sys.argv[1], sys.argv[2]
+          print("## Kafka failover: release binaries, the chart's lease")
+          print()
+          print("One GitHub-hosted runner (2 vCPUs), every process on one host, loopback. "
+                "Lease 15 s, renewed every 5 s, polled every 2 s.")
+          print()
+          print("| Scenario | Run | Exit |")
+          print("|---|---:|---:|")
+          for line in open(outcomes):
+              f = dict(w.split("=", 1) for w in line.split())
+              print("| %s | %s | %s |" % (f["scenario"], f["run"], f["exit"]))
+          print()
+          rows = {}
+          for line in open(results):
+              words = shlex.split(line)
+              kind, fields = words[0], {}
+              for w in words[1:]:
+                  if "=" in w:
+                      k, v = w.split("=", 1)
+                      fields[k] = v.strip('"')
+              rows.setdefault(kind, []).append(fields)
+          times = {
+              "KAFKA_FAILOVER": ("kill_to_first_ack_ms", "kill_to_resume_ms", "longest_silence_ms"),
+              "KAFKA_PAUSED_LEADER": ("pause_to_resume_ms", "longest_silence_ms", "cont_to_not_serving_ms"),
+              "KAFKA_GROUP_FAILOVER": ("kill_to_resume_ms", "kill_to_assigned_ms", "redelivered"),
+          }
+          for kind, entries in rows.items():
+              keys = times.get(kind, ())
+              print("### %s" % kind)
+              print()
+              print("| Scenario | Run | Client | Strategy | Shape | Killed metadata leader | " + " | ".join(keys) + " |")
+              print("|---|---:|---|---|---|---|" + "---:|" * len(keys))
+              groups = {}
+              for f in entries:
+                  label = (f.get("scenario", "?"), f.get("client", "?"), f.get("strategy", "-"), f.get("shape", "?"))
+                  groups.setdefault(label, []).append(f)
+                  print("| %s | %s | %s | %s | %s | %s | %s |" % (
+                      label[0], f.get("run", "?"), label[1], label[2], label[3],
+                      f.get("killed_meta_leader", "n/a"),
+                      " | ".join(f.get(k, "") for k in keys)))
+              print()
+              print("| Scenario | Client | Strategy | Shape | Runs | " + " | ".join("%s min / median / max" % k for k in keys) + " |")
+              print("|---|---|---|---|---:|" + "---|" * len(keys))
+              for label, fs in sorted(groups.items()):
+                  cells = []
+                  for k in keys:
+                      vals = [int(f[k]) for f in fs if f.get(k, "").lstrip("-").isdigit()]
+                      cells.append("%d / %d / %d" % (min(vals), statistics.median_low(vals), max(vals)) if vals else "")
+                  print("| %s | %s | %s | %s | %d | %s |" % (label + (len(fs), " | ".join(cells))))
+              print()
+          EOF
+
+      - name: Upload the results
+        if: always() && steps.run.outcome != 'skipped'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: kafka-failover-results
+          path: |
+            ${{ runner.temp }}/kafka-failover/results.txt
+            ${{ runner.temp }}/kafka-failover/outcomes.txt
+            ${{ runner.temp }}/kafka-failover/*.out
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload scenario logs
+        if: failure() && steps.run.outcome == 'failure'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: kafka-failover-logs
+          path: |
+            ${{ runner.temp }}/kafka-failover/**/logs/
+          if-no-files-found: error
+          retention-days: 7

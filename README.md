@@ -147,14 +147,15 @@ after an orderly stop; a network partition costs both about 30 s. VTOP was
 driven through its native client in that run, which predates #751: a Kafka
 client could not follow a VTOP failover then.
 A Kafka client now can, with no restart and no configuration change (#751):
-live-chaos scenarios 27 and 28 killed the range leader under a stock
-librdkafka producer and under the JVM client of Apache Kafka 4.4.0, and each
-resumed 5.5 s to 6.6 s later (librdkafka 5.7 s to 6.6 s in four runs, the JVM
-client 5.5 s to 5.8 s in eight), with every acknowledged record read back once
-and in order. That is one host, debug binaries and a 6 s lease, against the
-chart's 15 s default; it is not a comparison with Kafka's numbers above, and it
-does not cover the co-located `vtop-node node` shape or a consumer group across
-a failover ([details](docs/LIVE_CHAOS_VALIDATION.md#kafka-clients-and-a-failover-751)).
+live-chaos scenarios 27, 28, 30 and 31 killed the range leader under a stock
+librdkafka producer and under the JVM client of Apache Kafka 4.4.0, in the
+split and the co-located `vtop-node node` shape, with every acknowledged record
+read back once and in order. With release binaries and the chart's 15 s lease
+they resumed 12.5 s to 15.9 s after the kill, and a consumer group (scenario 33)
+read on from its committed offset 13.0 s to 14.4 s after it. That is one
+GitHub-hosted runner (2 vCPUs, every process on one host); it is not a
+comparison with Kafka's numbers above
+([details](docs/LIVE_CHAOS_VALIDATION.md#kafka-clients-and-a-failover-751)).
 Data and the full report: [kafka-failover.md](docs/benchmarks/kafka-failover.md).
 
 ### Produce throughput, against Apache Kafka
