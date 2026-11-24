@@ -1,0 +1,9 @@
+$ --endpoint-url=http://netem:9200 cp '/data/files/*' s3://vtop-link-34ccdd1846/
+exit 0
+cp /data/files/f003.bin s3://vtop-link-34ccdd1846/f003.bin
+cp /data/files/f002.bin s3://vtop-link-34ccdd1846/f002.bin
+cp /data/files/f001.bin s3://vtop-link-34ccdd1846/f001.bin
+cp /data/files/f000.bin s3://vtop-link-34ccdd1846/f000.bin
+ Container vtop-link-s5cmd-run Creating 
+ Container vtop-link-s5cmd-run Created 
+

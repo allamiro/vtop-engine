@@ -1,0 +1,51 @@
+# VTOP for the link comparison (#747). run.py fills the @...@ fields; the
+# committed text (placeholders included) is what config_sha256 hashes, and the
+# filled values are in the row's `settings` column and the run's logs.
+# Every key is in docs/configure/reference.md (the section named per key).
+# telemetry: none to turn off. VTOP sends no usage reporting; OpenTelemetry
+# export is off unless configured (docs/operate/monitoring.md), and it is not.
+engine:
+  name: link-compare
+  tenant: default
+  # engine.state_store / work_dir: the per-run tmpfs at /state (fresh every run).
+  state_store: "sqlite:///state/vtop.db"
+  work_dir: /state/work
+  # engine.log_level: info, so each committed batch logs a batch_metrics line
+  # run.sh counts to know the upload is done.
+  log_level: info
+batching:
+  # batching.max_records 1 and max_bytes above one file: one file, one batch,
+  # one object, as #483 shaped the workload (workload shape, not tuning).
+  max_records: 1
+  max_bytes: 11534336
+  # batching.max_batch_age_seconds: never the seal reason (one record seals).
+  max_batch_age_seconds: 3600
+compression:
+  # compression.type none: the files are incompressible, so the object is the
+  # payload and nothing confounds the wire bytes (#747 "Workload").
+  type: none
+checksum:
+  # checksum.algorithm sha256 (the shipped default): verification is derived
+  # from the stored content or a store-computed digest (profile `strong`).
+  algorithm: sha256
+sources:
+  file:
+    enabled: true
+    # sources.file.whole_file: each file is one record, read as stored.
+    whole_file: true
+    paths:
+      - "/data/files/*.bin"
+upload:
+  # upload.backend s3_native, through the middlebox (netem:9200), plaintext lab.
+  backend: s3_native
+  bucket: "vtop-link-f4e01947b8"
+  prefix: ""
+  endpoint_url: http://netem:9200
+  region: us-east-1
+  force_path_style: true
+  verify_tls: false
+  # upload.create_bucket false: the harness creates the bucket, for every tool.
+  create_bucket: false
+  # upload.require_strong_verification: the shipped default, stated.
+  require_strong_verification: true
+

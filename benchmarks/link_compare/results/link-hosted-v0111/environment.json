@@ -1,0 +1,274 @@
+{
+  "comparable": {
+    "docker_cgroup_version": "2",
+    "docker_platform": "Docker Engine - Community",
+    "docker_server_version": "29.10.0",
+    "docker_storage_driver": "overlayfs",
+    "docker_vm_arch": "x86_64",
+    "docker_vm_cpus": 16,
+    "docker_vm_kernel": "7.0.0-1018-aws",
+    "docker_vm_memory_bytes": 33081970688,
+    "host_class": "hosted",
+    "host_cpu": "Intel(R) Xeon(R) Platinum 8375C CPU @ 2.90GHz",
+    "host_disk": "not probed",
+    "host_logical_cpus": "16",
+    "host_memory_bytes": "33081970688",
+    "host_os": "Linux 7.0.0-1018-aws",
+    "link_profiles": {
+      "lan": {},
+      "wan100": {
+        "shaping_bottleneck_kbps": 10000,
+        "shaping_buffer_bdp": 1.0,
+        "shaping_driver": "netem",
+        "shaping_jitter_ms": 0,
+        "shaping_latency_ms": 100
+      },
+      "wan100-loss1": {
+        "shaping_bottleneck_kbps": 10000,
+        "shaping_buffer_bdp": 1.0,
+        "shaping_driver": "netem",
+        "shaping_jitter_ms": 0,
+        "shaping_latency_ms": 100,
+        "shaping_loss_model": "gemodel",
+        "shaping_loss_pct": 1.0
+      },
+      "wan100-policed": {
+        "shaping_driver": "netem",
+        "shaping_jitter_ms": 0,
+        "shaping_latency_ms": 100,
+        "shaping_policer_kbps": 10000
+      }
+    },
+    "middlebox_image": "nicolaka/netshoot:v0.16",
+    "store_image_id": "sha256:1496c263a7815a680bb40fa6074ed575d9a339336108b78996454083c0a8202c",
+    "tool_images": {
+      "aws-cli": "sha256:33a16c53ea442e918b58df67301ad76a8fb57082c39f7e78753b898c3f3e87c2",
+      "rclone": "sha256:7cbeec24a44f206067597c0368be4de90ae19a64d5113c7d1938bd737a81e466",
+      "s5cmd": "sha256:2ff939e2ee3c76adcadd78dbfc3e2569b18a3743ed9dcfccb1ec589af7fb9903",
+      "vtop": "sha256:c68898ccfd25be60a11fdeedaba54a3e9493d1c475b5b60ae7d395be60d54227"
+    },
+    "tool_limits": "2 CPUs, 2g, no swap",
+    "vtop_commit": "a7b4491e5b605551554c13a02978fd6319612b25",
+    "vtop_engine_tree": "a2d397e542cc",
+    "vtop_image": "vtop-compare:a2d397e542cc",
+    "vtop_image_id": "sha256:c68898ccfd25be60a11fdeedaba54a3e9493d1c475b5b60ae7d395be60d54227"
+  },
+  "configs": {
+    "aws-cli": {
+      "exit-code": {
+        "path": "benchmarks/link_compare/tools/aws-cli/config",
+        "sha256": "597f29388ba62bcc5f523547062efd48bc6f7c1d6fd5669ca1a79383dbf7ced0",
+        "text": "# aws-cli for the link comparison (#747): the shared config file\n# (AWS_CONFIG_FILE). At the `defaults` cell nothing below changes a transfer\n# setting: max_concurrent_requests (10), multipart_threshold (8MB),\n# multipart_chunksize (8MB) and the retry mode stay the shipped ones\n# (https://awscli.amazonaws.com/v2/documentation/api/latest/topic/s3-config.html).\n# run.py appends an `s3 =` block for equal-conns and tuned cells; the values are\n# in the row's `settings` column.\n# telemetry: none to turn off. aws-cli v2 sends no usage reporting; the only\n# client identification is the User-Agent header every SDK sends.\n[default]\n# region: the lab MinIO ignores it; SigV4 needs one\n# (https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-files.html).\nregion = us-east-1\n# s3.addressing_style path: MinIO serves path-style buckets\n# (https://awscli.amazonaws.com/v2/documentation/api/latest/topic/s3-config.html).\ns3 =\n  addressing_style = path\n"
+      }
+    },
+    "rclone": {
+      "size-and-checksum": {
+        "path": "benchmarks/link_compare/tools/rclone/rclone.conf",
+        "sha256": "c2737309922819ee3fa70be8364db42201f1df4d6e5e59fb30ecfbaffc063099",
+        "text": "# rclone for the link comparison (#747): `rclone copy /data/files lab:<bucket>/<prefix>`.\n# At the `defaults` cell the transfer flags are rclone's shipped ones:\n# --transfers 4, --s3-upload-concurrency 4, --s3-chunk-size 5Mi,\n# --s3-upload-cutoff 200Mi (https://rclone.org/s3/ and https://rclone.org/docs/).\n# run.py adds the flags of equal-conns and tuned cells; the values are in the\n# row's `settings` column. rclone checks size and checksum after each upload\n# by default (https://rclone.org/s3/#avoiding-head-requests-to-read-the-modification-time),\n# which is its profile `size-and-checksum`.\n# telemetry: none to turn off. rclone sends no usage reporting.\n[lab]\n# type/provider: the S3 backend, MinIO flavour (https://rclone.org/s3/#minio).\ntype = s3\nprovider = Minio\n# env_auth false: the keys come from RCLONE_CONFIG_LAB_ACCESS_KEY_ID and\n# RCLONE_CONFIG_LAB_SECRET_ACCESS_KEY (https://rclone.org/docs/#config-file).\nenv_auth = false\n# endpoint: through the middlebox, as every tool dials it.\nendpoint = http://netem:9200\nregion = us-east-1\n"
+      }
+    },
+    "s5cmd": {
+      "exit-code": {
+        "path": "benchmarks/link_compare/tools/s5cmd/defaults.args",
+        "sha256": "663e9e43435b59c32f4b07be12fbf2184b778de327e3ed88a7ed95a82dfb0bc0",
+        "text": "# s5cmd for the link comparison (#747). s5cmd has no config file: this is its\n# command line, one argument per line, '#' lines ignored. At the `defaults`\n# cell the transfer flags are s5cmd's shipped ones: --numworkers 256,\n# cp --concurrency 5, cp --part-size 50 (MiB)\n# (https://github.com/peak/s5cmd/blob/v2.3.0/README.md#configuring-concurrency).\n# run.py adds the flags of equal-conns and tuned cells; the values are in the\n# row's `settings` column.\n# telemetry: none to turn off. s5cmd sends no usage reporting.\n# --endpoint-url: through the middlebox, as every tool dials it.\n--endpoint-url=http://netem:9200\n"
+      }
+    },
+    "vtop": {
+      "strong": {
+        "path": "benchmarks/link_compare/tools/vtop/config.yaml.in",
+        "sha256": "8b483b8cc1e546554d01469b9017c0f8506b4a117fdb1b80b6d1ea0bb7ff0b7b",
+        "text": "# VTOP for the link comparison (#747). run.py fills the @...@ fields; the\n# committed text (placeholders included) is what config_sha256 hashes, and the\n# filled values are in the row's `settings` column and the run's logs.\n# Every key is in docs/configure/reference.md (the section named per key).\n# telemetry: none to turn off. VTOP sends no usage reporting; OpenTelemetry\n# export is off unless configured (docs/operate/monitoring.md), and it is not.\nengine:\n  name: link-compare\n  tenant: default\n  # engine.state_store / work_dir: the per-run tmpfs at /state (fresh every run).\n  state_store: \"sqlite:///state/vtop.db\"\n  work_dir: /state/work\n  # engine.log_level: info, so each committed batch logs a batch_metrics line\n  # run.sh counts to know the upload is done.\n  log_level: info\nbatching:\n  # batching.max_records 1 and max_bytes above one file: one file, one batch,\n  # one object, as #483 shaped the workload (workload shape, not tuning).\n  max_records: 1\n  max_bytes: @MAX_BYTES@\n  # batching.max_batch_age_seconds: never the seal reason (one record seals).\n  max_batch_age_seconds: 3600\n@CONCURRENCY@compression:\n  # compression.type none: the files are incompressible, so the object is the\n  # payload and nothing confounds the wire bytes (#747 \"Workload\").\n  type: none\nchecksum:\n  # checksum.algorithm sha256 (the shipped default): verification is derived\n  # from the stored content or a store-computed digest (profile `strong`).\n  algorithm: sha256\nsources:\n  file:\n    enabled: true\n    # sources.file.whole_file: each file is one record, read as stored.\n    whole_file: true\n    paths:\n      - \"/data/files/*.bin\"\nupload:\n  # upload.backend s3_native, through the middlebox (netem:9200), plaintext lab.\n  backend: s3_native\n  bucket: \"@BUCKET@\"\n  prefix: \"@PREFIX@\"\n  endpoint_url: http://netem:9200\n  region: us-east-1\n  force_path_style: true\n  verify_tls: false\n  # upload.create_bucket false: the harness creates the bucket, for every tool.\n  create_bucket: false\n  # upload.require_strong_verification: the shipped default, stated.\n  require_strong_verification: true\n@TRANSPORTS@\n"
+      }
+    }
+  },
+  "events": [],
+  "finished_at": "2026-11-23T18:01:14+00:00",
+  "kind": "link",
+  "plan": {
+    "_comment": "A GitHub-hosted runner with ifb (workflow_dispatch): objects committed of 48 on the policed link only, where the link and not the CPU decides; refused for CPU-seconds always (#744 section 4.4).",
+    "cells": [
+      {
+        "cell": "smoke",
+        "minutes_per_run": 2,
+        "params": {
+          "file_mib": 10,
+          "files": 4
+        },
+        "repetitions": 1,
+        "variants": [
+          {
+            "connections": "default",
+            "grid_point": "",
+            "link_profile": "lan"
+          }
+        ]
+      },
+      {
+        "cell": "committed",
+        "minutes_per_run": 17,
+        "params": {
+          "file_mib": 20,
+          "files": 48
+        },
+        "repetitions": 1,
+        "variants": [
+          {
+            "connections": "default",
+            "grid_point": "",
+            "link_profile": "wan100-policed"
+          }
+        ]
+      }
+    ],
+    "grids": {
+      "aws-cli": [
+        {
+          "max_concurrent_requests": 4
+        },
+        {
+          "max_concurrent_requests": 10
+        },
+        {
+          "max_concurrent_requests": 16
+        },
+        {
+          "max_concurrent_requests": 10,
+          "multipart_chunksize": 5242880
+        },
+        {
+          "max_concurrent_requests": 16,
+          "multipart_chunksize": 5242880
+        },
+        {
+          "max_concurrent_requests": 32
+        }
+      ],
+      "rclone": [
+        {
+          "transfers": 4,
+          "upload_concurrency": 1
+        },
+        {
+          "transfers": 8,
+          "upload_concurrency": 1
+        },
+        {
+          "transfers": 16,
+          "upload_concurrency": 1
+        },
+        {
+          "chunk_size": 5242880,
+          "transfers": 4,
+          "upload_concurrency": 4,
+          "upload_cutoff": 8388608
+        },
+        {
+          "chunk_size": 5242880,
+          "transfers": 8,
+          "upload_concurrency": 2,
+          "upload_cutoff": 8388608
+        },
+        {
+          "chunk_size": 5242880,
+          "transfers": 16,
+          "upload_concurrency": 2,
+          "upload_cutoff": 8388608
+        }
+      ],
+      "s5cmd": [
+        {
+          "concurrency": 1,
+          "numworkers": 4
+        },
+        {
+          "concurrency": 1,
+          "numworkers": 8
+        },
+        {
+          "concurrency": 1,
+          "numworkers": 16
+        },
+        {
+          "concurrency": 4,
+          "numworkers": 4,
+          "part_size": 5
+        },
+        {
+          "concurrency": 2,
+          "numworkers": 8,
+          "part_size": 5
+        },
+        {
+          "concurrency": 2,
+          "numworkers": 16,
+          "part_size": 5
+        }
+      ],
+      "vtop": [
+        {
+          "max_concurrency": 4,
+          "parts_in_flight": 1
+        },
+        {
+          "max_concurrency": 8,
+          "parts_in_flight": 1
+        },
+        {
+          "max_concurrency": 16,
+          "parts_in_flight": 1
+        },
+        {
+          "max_concurrency": 4,
+          "parts_in_flight": 3
+        },
+        {
+          "max_concurrency": 8,
+          "parts_in_flight": 2
+        },
+        {
+          "max_concurrency": 8,
+          "parts_in_flight": 3
+        }
+      ]
+    },
+    "host_class": "hosted",
+    "kind": "link",
+    "name": "hosted",
+    "profiles": {
+      "aws-cli": [
+        "exit-code"
+      ],
+      "rclone": [
+        "size-and-checksum"
+      ],
+      "s5cmd": [
+        "exit-code"
+      ],
+      "vtop": [
+        "strong"
+      ]
+    },
+    "systems": [
+      "aws-cli",
+      "vtop",
+      "rclone",
+      "s5cmd"
+    ]
+  },
+  "private": false,
+  "projected_hours": 1.27,
+  "run_id": "link-hosted-v0111",
+  "run_state": "complete",
+  "schema_version": 1,
+  "seed": 747,
+  "started_at": "2026-11-23T15:27:30+00:00",
+  "store": "MinIO (lab build, upstream archived)",
+  "telemetry": {
+    "aws-cli": "telemetry: none to turn off. aws-cli v2 sends no usage reporting; the only",
+    "rclone": "telemetry: none to turn off. rclone sends no usage reporting.",
+    "s5cmd": "telemetry: none to turn off. s5cmd sends no usage reporting.",
+    "vtop": "telemetry: none to turn off. VTOP sends no usage reporting; OpenTelemetry"
+  }
+}

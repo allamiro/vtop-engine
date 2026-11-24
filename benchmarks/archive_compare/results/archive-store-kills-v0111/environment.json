@@ -1,0 +1,191 @@
+{
+  "comparable": {
+    "config_sha256": {
+      "connect-lenses": {
+        "exactly-once": "ae2110e9e6f0fffce097ce89ec95f091ce8aecfda7933688e23a79b12bc2804d"
+      },
+      "vector": {
+        "acks": "e75b01ee60a5b14482ec70a822cebd9e2074cacef72f11cfab8af7cdb98c9d7e",
+        "disk-buffer": "392e9e9ecbc78bee26973f2d659fc637c8f56556191973727ccea15dbd4c1339"
+      },
+      "vtop": {
+        "strong": "1a62a61a23b7c81fb4e803097dc9a883de993a1d1eb3de43ae92204a769ffca3",
+        "verify-off": "9f2aaabd529ae6ec41baae97dc6b58877da98876e6abe98379635a00b6eb47de"
+      }
+    },
+    "docker_cgroup_version": "2",
+    "docker_platform": "Docker Engine - Community",
+    "docker_server_version": "29.10.0",
+    "docker_storage_driver": "overlayfs",
+    "docker_vm_arch": "x86_64",
+    "docker_vm_cpus": 16,
+    "docker_vm_kernel": "7.0.0-1018-aws",
+    "docker_vm_memory_bytes": 33081970688,
+    "extra_config_sha256": {
+      "connect-lenses": {
+        "worker": "c9fcb18585a7a93e04abbff9706bd946fa26c9ed99cdea20d6488e72a8cf2838"
+      }
+    },
+    "harness_image": "python:3.12.16-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b",
+    "host_class": "dedicated",
+    "host_cpu": "Intel(R) Xeon(R) Platinum 8375C CPU @ 2.90GHz",
+    "host_disk": "Amazon Elastic Block Store, non-rotational (kernel flag), nvme, ext4",
+    "host_logical_cpus": "16",
+    "host_memory_bytes": "33081970688",
+    "host_os": "Linux 7.0.0-1018-aws",
+    "images": {
+      "connect-lenses": "sha256:f6380643a8ffbabee99ab15a617d6a20cfd3b71e527d0358cd3f16729967bd88",
+      "vector": "timberio/vector:0.61.0-debian@sha256:f6c23b5a7e16fb2838d33619ef7acf4bad2289a7cf22bc90efc2371f520c4ea2",
+      "vtop": "sha256:c68898ccfd25be60a11fdeedaba54a3e9493d1c475b5b60ae7d395be60d54227"
+    },
+    "jvm_flags": {
+      "connect-lenses": "-Xmx1g"
+    },
+    "kafka_image": "apache/kafka:4.3.2@sha256:852a0d49fc4e656b022e7f23785411802c9a088c78a7c5e39f33969de9c227a7",
+    "minio_image": "vtop-minio:RELEASE.2025-09-07T16-13-09Z",
+    "source_limits": "2 CPUs, 3g, no swap",
+    "tool_limits": "2 CPUs, 2g, no swap",
+    "vtop_commit": "14edf8bc95199ddc5ba8ac11e174fd2b139d2da6",
+    "vtop_engine_tree": "a2d397e542cc"
+  },
+  "configs": {
+    "connect-lenses": {
+      "exactly-once": {
+        "path": "benchmarks/archive_compare/tools/connect-lenses/exactly-once.properties",
+        "sha256": "ae2110e9e6f0fffce097ce89ec95f091ce8aecfda7933688e23a79b12bc2804d",
+        "text": "# Kafka Connect S3 sink, Lenses Stream Reactor kafka-connect-aws-s3 12.1.2, profile `exactly-once`, for the\n# archive comparison (#746). Every setting names its page: the connector's documentation\n# https://docs.lenses.io/latest/connectors/kafka-connectors/sinks/aws-s3 (the \"KCQL\", \"Flush options\",\n# \"Compression\", \"Authentication\" and \"Configuration\" sections) as published for 12.x.\n#\n# The worker's own settings are worker.properties beside this file; the runtime is the Connect of\n# apache/kafka 4.3.2, standalone (one worker, no internal topics), the JVM heap capped at -Xmx1g by the\n# compose file.\n#\n# telemetry: Kafka Connect and the connector have no usage reporting or update check; the connector's JMX\n# metrics are not exported anywhere.\n#\n# commit rule: with connect.s3.exactly.once.enable (the documented default) the consumer offset advances only\n# after the object is at its final key and the `.indexes/` entry is updated (\"Restart behavior\").\nname=archive-bench\nconnector.class=io.lenses.streamreactor.connect.aws.s3.sink.S3SinkConnector\n# \"Configuration\": one task per partition. The consumer group is connect-archive-bench.\ntasks.max=3\ntopics=bench\n\n# \"KCQL\" and \"Flush options\" (#744 rule 15: about 32 MiB or 60 s per object, whichever first; the record\n# count is high). `flush.size` is bytes and `flush.interval` is seconds; the connector measures flush.size on the\n# staged file, so the object's size is reported as measured, not assumed to be 32 MiB. STOREAS `JSON` writes one\n# JSON object per line, as the converter in worker.properties parsed it.\nconnect.s3.kcql=INSERT INTO bench:connect SELECT * FROM bench STOREAS `JSON` PROPERTIES('flush.size'=33554432,'flush.interval'=60,'flush.count'=100000000)\n\n# \"Compression\": gzip at the connector's default level (connect.s3.compression.level is left unset).\nconnect.s3.compression.codec=GZIP\n\n# \"Authentication\" (Credentials mode: the lab MinIO's keys) and the lab store's endpoint, path-style.\nconnect.s3.aws.auth.mode=Credentials\nconnect.s3.aws.access.key=minioadmin\nconnect.s3.aws.secret.key=minioadmin\nconnect.s3.aws.region=us-east-1\nconnect.s3.custom.endpoint=http://minio:9000\nconnect.s3.path.style.access=true\n\n# \"Restart behavior\": exactly-once is the default; stated here so the profile is visible in the CSV's config hash.\nconnect.s3.exactly.once.enable=true\n\n# \"Local staging\": records are appended to a file on the worker's disk (the tool's data volume) before a flush.\nconnect.s3.local.tmp.directory=/data/tmp\n"
+      }
+    },
+    "vector": {
+      "acks": {
+        "path": "benchmarks/archive_compare/tools/vector/acks.yaml",
+        "sha256": "e75b01ee60a5b14482ec70a822cebd9e2074cacef72f11cfab8af7cdb98c9d7e",
+        "text": "# Vector 0.61.0, profile `acks`, for the archive comparison (#746). Each setting names\n# its page under https://vector.dev/docs/ (as published for 0.61).\n#\n# telemetry: Vector has no usage reporting; its API server is off\n# (reference/api/: `api.enabled`, default false, stated here).\n\n# reference/configuration/global-options/#data_dir: checkpoints and buffers on the tool's own volume.\ndata_dir: /var/lib/vector\n\napi:\n  enabled: false\n\nsources:\n  topic:\n    # reference/configuration/sources/kafka/: one topic, a consumer group of its own, from the start.\n    type: kafka\n    bootstrap_servers: kafka:9092\n    group_id: vector-bench\n    topics: [bench]\n    auto_offset_reset: earliest\n    # sources/kafka/#decoding: the record's value is the event's `message`, byte for byte.\n    decoding:\n      codec: bytes\n    # sources/kafka/#acknowledgements is deprecated in favour of the sink's setting below: the\n    # consumer group's offset moves only after the sink has delivered the event.\n\nsinks:\n  s3:\n    # reference/configuration/sinks/aws_s3/\n    type: aws_s3\n    inputs: [topic]\n    bucket: bench\n    key_prefix: \"vector/%Y/%m/%d/\"\n    region: us-east-1\n    # sinks/aws_s3/#endpoint: the lab MinIO (the S3 tap in crash cells).\n    endpoint: http://minio:9000\n    force_path_style: true\n    # #744 rule 15: one JSON line per record (the Kafka value, newline-delimited), gzip at its default level.\n    encoding:\n      codec: raw_message\n    framing:\n      method: newline_delimited\n    compression: gzip\n    # #744 rule 15: about 32 MiB or 60 s per object.\n    batch:\n      max_bytes: 33554432\n      timeout_secs: 60\n    # sinks/aws_s3/#request.concurrency: the default.\n    request:\n      concurrency: adaptive\n    # reference/end-to-end-acknowledgements/: the Kafka offset advances only after this sink\n    # has delivered the event.\n    acknowledgements:\n      enabled: true\n    # reference/configuration/sinks/aws_s3/#buffer: a memory buffer that blocks\n    # when full, so nothing is acknowledged before delivery.\n    buffer:\n      type: memory\n      max_events: 10000\n      when_full: block\n    # Credentials come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in the\n    # container's environment (sinks/aws_s3/#auth, the default chain).\n"
+      },
+      "disk-buffer": {
+        "path": "benchmarks/archive_compare/tools/vector/disk-buffer.yaml",
+        "sha256": "392e9e9ecbc78bee26973f2d659fc637c8f56556191973727ccea15dbd4c1339",
+        "text": "# Vector 0.61.0, profile `disk-buffer`, for the archive comparison (#746). Each setting names\n# its page under https://vector.dev/docs/ (as published for 0.61). It differs from `acks` in the buffer only.\n#\n# telemetry: Vector has no usage reporting; its API server is off\n# (reference/api/: `api.enabled`, default false, stated here).\n\n# reference/configuration/global-options/#data_dir: checkpoints and buffers on the tool's own volume.\ndata_dir: /var/lib/vector\n\napi:\n  enabled: false\n\nsources:\n  topic:\n    # reference/configuration/sources/kafka/: one topic, a consumer group of its own, from the start.\n    type: kafka\n    bootstrap_servers: kafka:9092\n    group_id: vector-bench\n    topics: [bench]\n    auto_offset_reset: earliest\n    # sources/kafka/#decoding: the record's value is the event's `message`, byte for byte.\n    decoding:\n      codec: bytes\n\nsinks:\n  s3:\n    # reference/configuration/sinks/aws_s3/\n    type: aws_s3\n    inputs: [topic]\n    bucket: bench\n    key_prefix: \"vector/%Y/%m/%d/\"\n    region: us-east-1\n    # sinks/aws_s3/#endpoint: the lab MinIO (the S3 tap in crash cells).\n    endpoint: http://minio:9000\n    force_path_style: true\n    # #744 rule 15: one JSON line per record (the Kafka value, newline-delimited), gzip at its default level.\n    encoding:\n      codec: raw_message\n    framing:\n      method: newline_delimited\n    compression: gzip\n    # #744 rule 15: about 32 MiB or 60 s per object.\n    batch:\n      max_bytes: 33554432\n      timeout_secs: 60\n    # sinks/aws_s3/#request.concurrency: the default.\n    request:\n      concurrency: adaptive\n    # reference/end-to-end-acknowledgements/\n    acknowledgements:\n      enabled: true\n    # reference/configuration/sinks/aws_s3/#buffer: a disk buffer; with it an event is\n    # acknowledged once it is in the buffer, which is synced every 500 ms\n    # (reference/end-to-end-acknowledgements/). The documented durability trade.\n    buffer:\n      type: disk\n      max_size: 1073741824\n      when_full: block\n    # Credentials come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in the\n    # container's environment (sinks/aws_s3/#auth, the default chain).\n"
+      }
+    },
+    "vtop": {
+      "strong": {
+        "path": "benchmarks/archive_compare/tools/vtop/strong.yaml",
+        "sha256": "1a62a61a23b7c81fb4e803097dc9a883de993a1d1eb3de43ae92204a769ffca3",
+        "text": "# VTOP, profile `strong` (the default commit rule), for the archive comparison (#746).\n# Every setting names the page it comes from: docs/configure/reference.md (the\n# reference for every config.yaml key), docs/install/kafka.md and examples/config.yaml\n# at the commit under test.\n#\n# telemetry: VTOP has no usage reporting; OpenTelemetry export runs only when an\n# OTEL_EXPORTER_OTLP_*ENDPOINT is set, and the compose file sets\n# OTEL_SDK_DISABLED=true (crates/vtop-observe/src/otel/settings.rs).\n#\n# commit rule: the Kafka offset is committed only after the batch is VERIFIED\n# (docs/install/kafka.md, `enable_auto_commit` must be false).\n\nengine:\n  name: archive-bench\n  tenant: bench\n  # docs/configure/reference.md \"engine.state_store\": SQLite on the tool's own data volume,\n  # the same volume class as every other tool's state.\n  state_store: \"sqlite:///data/state/vtop-state.db\"\n  work_dir: /data/work\n  work_retention_seconds: 86400\n  work_max_bytes: 10737418240\n  log_level: INFO\n\nbatching:\n  # #744 rule 15: about 32 MiB or 60 s per object, whichever first; records unbounded.\n  # docs/configure/reference.md \"batching.max_bytes\", \"batching.max_batch_age_seconds\".\n  max_records: 100000000\n  max_bytes: 33554432\n  max_batch_age_seconds: 60\n  # The shipped default (examples/config.yaml \"max_concurrent_batches\").\n  max_concurrent_batches: 8\n\ncompression:\n  # #744 rule 15: gzip at the tool's documented default level (examples/config.yaml\n  # \"compression\": the code default is gzip level 6).\n  type: gzip\n  level: 6\n\nsources:\n  kafka:\n    # docs/configure/reference.md \"sources.kafka\": one topic, a group of its own, from the start.\n    enabled: true\n    bootstrap_servers:\n      - kafka:9092\n    consumer_group: vtop-bench\n    topic_include_regex: \"^bench$\"\n    auto_offset_reset: earliest\n    # Must be false: offsets commit only after VERIFIED (the commit rule).\n    enable_auto_commit: false\n\nupload:\n  # docs/configure/reference.md \"upload\": the native S3 backend against the lab MinIO.\n  # In crash and fault cells `minio` resolves to the S3 tap, which forwards to the store.\n  backend: s3_native\n  bucket: bench\n  prefix: \"vtop/\"\n  endpoint_url: http://minio:9000\n  region: us-east-1\n  force_path_style: true\n  # The lab store is plaintext (examples/config.yaml \"verify_tls\": the explicit lab opt-out).\n  verify_tls: false\n  # The lab creates the bucket before any tool starts (the harness's `mc mb`), so no tool makes a bucket PUT:\n  # the S3 tap counts every PUT, and a bucket PUT answered 409 would be the Nth request that a K2 trigger\n  # waits for and never sees succeed (docs/configure/reference.md \"upload.create_bucket\", default false).\n  create_bucket: false\n  # The default: VERIFIED needs a digest derived from stored content.\n  require_strong_verification: true\n\npartitioning:\n  template: \"source={source}/format={format}/\"\n"
+      },
+      "verify-off": {
+        "path": "benchmarks/archive_compare/tools/vtop/verify-off.yaml",
+        "sha256": "9f2aaabd529ae6ec41baae97dc6b58877da98876e6abe98379635a00b6eb47de",
+        "text": "# VTOP, profile `verify-off` (non-default, labelled), for the archive comparison (#746).\n# It isolates what verification costs: the same configuration as `strong` with the verification floor lowered\n# (`upload.require_strong_verification: false`, which docs/configure/reference.md says \"accepts same-size\n# corruption\") and the checksum algorithm `none` (docs/configure/streams.md: \"`none` checks size only\"; refused\n# while the floor is strong). It is run in `drain` and `live` only, never in a crash or fault cell, where it would\n# measure a deliberate weakening (#746), and it is never a second orange bar.\n#\n# telemetry: as `strong`; the compose file sets OTEL_SDK_DISABLED=true.\n\nengine:\n  name: archive-bench\n  tenant: bench\n  state_store: \"sqlite:///data/state/vtop-state.db\"\n  work_dir: /data/work\n  work_retention_seconds: 86400\n  work_max_bytes: 10737418240\n  log_level: INFO\n\nbatching:\n  max_records: 100000000\n  max_bytes: 33554432\n  max_batch_age_seconds: 60\n  max_concurrent_batches: 8\n\ncompression:\n  type: gzip\n  level: 6\n\n# docs/configure/reference.md \"checksum.algorithm\": `none` verifies size only.\nchecksum:\n  algorithm: none\n\nsources:\n  kafka:\n    enabled: true\n    bootstrap_servers:\n      - kafka:9092\n    consumer_group: vtop-bench\n    topic_include_regex: \"^bench$\"\n    auto_offset_reset: earliest\n    enable_auto_commit: false\n\nupload:\n  backend: s3_native\n  bucket: bench\n  prefix: \"vtop/\"\n  endpoint_url: http://minio:9000\n  region: us-east-1\n  force_path_style: true\n  verify_tls: false\n  # The lab creates the bucket before any tool starts (the harness's `mc mb`), so no tool makes a bucket PUT:\n  # the S3 tap counts every PUT, and a bucket PUT answered 409 would be the Nth request that a K2 trigger\n  # waits for and never sees succeed (docs/configure/reference.md \"upload.create_bucket\", default false).\n  create_bucket: false\n  # The deliberate weakening this profile exists to measure.\n  require_strong_verification: false\n\npartitioning:\n  template: \"source={source}/format={format}/\"\n"
+      }
+    }
+  },
+  "deviations": [
+    "The record is one JSON object per Kafka value. VTOP and Vector store the value as it came, newline-framed; Connect (Lenses) parses it with its JSON converter and writes it again, so its bytes may differ and its content may not. The smoke counts byte-exact and JSON-equal records separately; the checker reads the id token in either form, and MiB/s is of source bytes (the value as produced), so the framing does not change it (rule 15).",
+    "Object size is set by each tool's documented threshold nearest to 'about 32 MiB uncompressed or 60 s': VTOP `batching.max_bytes` and Vector `batch.max_bytes` count uncompressed payload; Connect (Lenses) `flush.size` counts the staged file. The measured object sizes (p50 and p99) are reported.",
+    "Connect's `.temp-upload/` objects (the staging step of its exactly-once commit) and `.indexes/` entries (its commit-chain bookkeeping) are counted as orphan objects and listed by name, as #746 specifies; the `.indexes/` entries are permanent by design, so Connect's orphan count has a floor.",
+    "Connect's offsets are committed by its worker at `offset.flush.interval.ms` (the 60 s default), so its time to source-committed includes up to that interval; Vector commits every 5 s by default; VTOP after VERIFIED.",
+    "The producer is `kafka-console-producer.sh` (acks=all, linger.ms=5) fed by the seeded generator; the produce time of a record is the generator's write time, up to 5 ms before the send. Partitions come from the key's murmur2 hash, the broker's default partitioner, checked against the partition end offsets before a tool starts.",
+    "Time to store-visible (MinIO's LastModified, ms), time to source-committed (the broker's stamp on the group's offset commit) and the producer's write time share the Docker VM's clock; the window start and the kill times are the harness host's clock, which is the same clock on a Linux host.",
+    "Connect runs in standalone mode (one worker, no internal topics); its sink tasks' offsets are committed to the consumer group, as in distributed mode (#746 open question 2)."
+  ],
+  "events": [],
+  "finished_at": "2026-11-23T13:44:00+00:00",
+  "host_metadata": {
+    "cpu_model": "Intel(R) Xeon(R) Platinum 8375C CPU @ 2.90GHz",
+    "instance_type": "c6i.4xlarge",
+    "kernel": "Linux 7.0.0-1018-aws"
+  },
+  "kind": "archive",
+  "plan": {
+    "_comment": "The hosted plan's kills on the store's requests (K1, K2), which go through the S3 tap: one hosted job, about 3.4 hours projected, with its own smoke.",
+    "cells": [
+      {
+        "cell": "smoke",
+        "minutes_per_run": 3,
+        "params": {
+          "partitions": 3
+        },
+        "repetitions": 1,
+        "variants": [
+          {
+            "record_size": 1024,
+            "records": 10000
+          }
+        ]
+      },
+      {
+        "cell": "crash-K1",
+        "minutes_per_run": 8,
+        "params": {
+          "kill_seed": 746,
+          "kills_per_run": 3,
+          "n_range": [
+            1,
+            1
+          ],
+          "partitions": 3
+        },
+        "repetitions": 3,
+        "variants": [
+          {
+            "record_size": 1024,
+            "records": 100000
+          }
+        ]
+      },
+      {
+        "cell": "crash-K2",
+        "minutes_per_run": 8,
+        "params": {
+          "kill_seed": 746,
+          "kills_per_run": 3,
+          "n_range": [
+            1,
+            1
+          ],
+          "partitions": 3
+        },
+        "repetitions": 3,
+        "variants": [
+          {
+            "record_size": 1024,
+            "records": 100000
+          }
+        ]
+      }
+    ],
+    "host_class": "dedicated",
+    "kind": "archive",
+    "name": "hosted-store-kills",
+    "profiles": {
+      "connect-lenses": [
+        "exactly-once"
+      ],
+      "vector": [
+        "acks",
+        "disk-buffer"
+      ],
+      "vtop": [
+        "strong"
+      ]
+    },
+    "systems": [
+      "connect-lenses",
+      "vtop",
+      "vector"
+    ]
+  },
+  "private": false,
+  "run_id": "archive-store-kills-v0111",
+  "run_state": "complete",
+  "schema_version": 1,
+  "started_at": "2026-11-23T11:58:10+00:00",
+  "store": "MinIO (lab build, upstream archived)",
+  "telemetry": {
+    "connect-lenses": "no usage reporting or update check in Kafka Connect or the connector; JMX metrics not exported",
+    "vector": "no usage reporting; API server off (api.enabled: false)",
+    "vtop": "no usage reporting; OpenTelemetry export off (OTEL_SDK_DISABLED=true, no endpoint set)"
+  }
+}

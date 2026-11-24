@@ -1,0 +1,53 @@
+$ --endpoint-url=http://netem:9200 cp '/data/files/*' s3://vtop-link-877e93d96d/
+exit 0
+cp /data/files/f019.bin s3://vtop-link-877e93d96d/f019.bin
+cp /data/files/f028.bin s3://vtop-link-877e93d96d/f028.bin
+cp /data/files/f046.bin s3://vtop-link-877e93d96d/f046.bin
+cp /data/files/f003.bin s3://vtop-link-877e93d96d/f003.bin
+cp /data/files/f034.bin s3://vtop-link-877e93d96d/f034.bin
+cp /data/files/f033.bin s3://vtop-link-877e93d96d/f033.bin
+cp /data/files/f036.bin s3://vtop-link-877e93d96d/f036.bin
+cp /data/files/f017.bin s3://vtop-link-877e93d96d/f017.bin
+cp /data/files/f029.bin s3://vtop-link-877e93d96d/f029.bin
+cp /data/files/f040.bin s3://vtop-link-877e93d96d/f040.bin
+cp /data/files/f009.bin s3://vtop-link-877e93d96d/f009.bin
+cp /data/files/f013.bin s3://vtop-link-877e93d96d/f013.bin
+cp /data/files/f010.bin s3://vtop-link-877e93d96d/f010.bin
+cp /data/files/f045.bin s3://vtop-link-877e93d96d/f045.bin
+cp /data/files/f024.bin s3://vtop-link-877e93d96d/f024.bin
+cp /data/files/f000.bin s3://vtop-link-877e93d96d/f000.bin
+cp /data/files/f016.bin s3://vtop-link-877e93d96d/f016.bin
+cp /data/files/f039.bin s3://vtop-link-877e93d96d/f039.bin
+cp /data/files/f014.bin s3://vtop-link-877e93d96d/f014.bin
+cp /data/files/f038.bin s3://vtop-link-877e93d96d/f038.bin
+cp /data/files/f027.bin s3://vtop-link-877e93d96d/f027.bin
+cp /data/files/f001.bin s3://vtop-link-877e93d96d/f001.bin
+cp /data/files/f005.bin s3://vtop-link-877e93d96d/f005.bin
+cp /data/files/f031.bin s3://vtop-link-877e93d96d/f031.bin
+cp /data/files/f042.bin s3://vtop-link-877e93d96d/f042.bin
+cp /data/files/f021.bin s3://vtop-link-877e93d96d/f021.bin
+cp /data/files/f047.bin s3://vtop-link-877e93d96d/f047.bin
+cp /data/files/f008.bin s3://vtop-link-877e93d96d/f008.bin
+cp /data/files/f022.bin s3://vtop-link-877e93d96d/f022.bin
+cp /data/files/f037.bin s3://vtop-link-877e93d96d/f037.bin
+cp /data/files/f020.bin s3://vtop-link-877e93d96d/f020.bin
+cp /data/files/f018.bin s3://vtop-link-877e93d96d/f018.bin
+cp /data/files/f035.bin s3://vtop-link-877e93d96d/f035.bin
+cp /data/files/f006.bin s3://vtop-link-877e93d96d/f006.bin
+cp /data/files/f015.bin s3://vtop-link-877e93d96d/f015.bin
+cp /data/files/f004.bin s3://vtop-link-877e93d96d/f004.bin
+cp /data/files/f007.bin s3://vtop-link-877e93d96d/f007.bin
+cp /data/files/f023.bin s3://vtop-link-877e93d96d/f023.bin
+cp /data/files/f002.bin s3://vtop-link-877e93d96d/f002.bin
+cp /data/files/f026.bin s3://vtop-link-877e93d96d/f026.bin
+cp /data/files/f044.bin s3://vtop-link-877e93d96d/f044.bin
+cp /data/files/f032.bin s3://vtop-link-877e93d96d/f032.bin
+cp /data/files/f012.bin s3://vtop-link-877e93d96d/f012.bin
+cp /data/files/f025.bin s3://vtop-link-877e93d96d/f025.bin
+cp /data/files/f011.bin s3://vtop-link-877e93d96d/f011.bin
+cp /data/files/f043.bin s3://vtop-link-877e93d96d/f043.bin
+cp /data/files/f041.bin s3://vtop-link-877e93d96d/f041.bin
+cp /data/files/f030.bin s3://vtop-link-877e93d96d/f030.bin
+ Container vtop-link-s5cmd-run Creating 
+ Container vtop-link-s5cmd-run Created 
+

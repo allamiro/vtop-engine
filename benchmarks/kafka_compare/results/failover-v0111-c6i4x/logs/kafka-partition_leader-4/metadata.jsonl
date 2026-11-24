@@ -1,0 +1,12 @@
+{"broker": "kafka-1:9092", "error": null, "isr": [1, 2, 3], "leader": 2, "ok": true, "t_us": 1795423868226938}
+{"broker": "kafka-2:9092", "error": null, "isr": [1, 2, 3], "leader": 2, "ok": true, "t_us": 1795423868227230}
+{"broker": "kafka-3:9092", "error": null, "isr": [1, 2, 3], "leader": 2, "ok": true, "t_us": 1795423868227312}
+{"broker": "kafka-2:9092", "error": "TimeoutError", "isr": null, "leader": null, "ok": false, "t_us": 1795423907558848}
+{"broker": "kafka-2:9092", "error": "gaierror", "isr": null, "leader": null, "ok": false, "t_us": 1795423907560821}
+{"broker": "kafka-1:9092", "error": null, "isr": [1, 3], "leader": 3, "ok": true, "t_us": 1795423922976372}
+{"broker": "kafka-3:9092", "error": null, "isr": [1, 3], "leader": 3, "ok": true, "t_us": 1795423922983592}
+{"broker": "kafka-2:9092", "error": null, "isr": [1, 2, 3], "leader": 2, "ok": true, "t_us": 1795423937092940}
+{"broker": "kafka-2:9092", "error": null, "isr": [1, 3], "leader": 3, "ok": true, "t_us": 1795423947303443}
+{"broker": "kafka-2:9092", "error": null, "isr": [1, 2, 3], "leader": 3, "ok": true, "t_us": 1795423948204380}
+{"broker": "kafka-3:9092", "error": null, "isr": [1, 2, 3], "leader": 3, "ok": true, "t_us": 1795423948204535}
+{"broker": "kafka-1:9092", "error": null, "isr": [1, 2, 3], "leader": 3, "ok": true, "t_us": 1795423948204616}

@@ -1,0 +1,3 @@
+$ copy /data/files lab:vtop-link-547723c6fd
+exit timeout
+

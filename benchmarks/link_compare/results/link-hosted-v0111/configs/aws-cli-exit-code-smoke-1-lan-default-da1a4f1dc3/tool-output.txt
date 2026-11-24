@@ -1,0 +1,9 @@
+$ s3 cp --recursive --no-progress --endpoint-url http://netem:9200 /data/files/ s3://vtop-link-da1a4f1dc3/
+exit 0
+upload: ../data/files/f000.bin to s3://vtop-link-da1a4f1dc3/f000.bin
+upload: ../data/files/f002.bin to s3://vtop-link-da1a4f1dc3/f002.bin
+upload: ../data/files/f001.bin to s3://vtop-link-da1a4f1dc3/f001.bin
+upload: ../data/files/f003.bin to s3://vtop-link-da1a4f1dc3/f003.bin
+ Container vtop-link-aws-cli-run Creating 
+ Container vtop-link-aws-cli-run Created 
+
