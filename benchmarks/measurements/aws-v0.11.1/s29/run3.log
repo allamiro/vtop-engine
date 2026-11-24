@@ -1,0 +1,18 @@
+2026-11-24T05:42:29Z [s29] step run3: bash scripts/live-chaos/scenarios/29-leader-ahead-after-full-restart.sh
+[29-leader-ahead-after-full-restart] CHAOS_TRANSPORT=plaintext: every plane without TLS, on loopback; candidates and promotion are refused in this mode
+[29-leader-ahead-after-full-restart] workdir=/var/lib/kc599/s29/run3
+[29-leader-ahead-after-full-restart] data plane up over plaintext, leader pid=1192458
+[29-leader-ahead-after-full-restart] all three replicas hold 1000 records
+[29-leader-ahead-after-full-restart] the leader alone holds 100 more records, refused for want of a quorum
+[29-leader-ahead-after-full-restart] all three restarted; the leader's log (1100) is longer than both followers' (1000)
+[29-leader-ahead-after-full-restart] quorum produce resumed 1s after the restart, inside the 60s bound
+[29-leader-ahead-after-full-restart] every record byte-exact and in order: verify_done records=2100 next_offset=2100 gaps=0 high_watermark=2100
+2026-11-24T05:42:31.482387Z  INFO vtop_observe::otel: OpenTelemetry export disabled (OTEL_EXPORTER_OTLP_ENDPOINT unset)
+2026-11-24T05:42:31.486025Z  INFO vtop_observe::otel: OpenTelemetry export disabled (OTEL_EXPORTER_OTLP_ENDPOINT unset)
+[29-leader-ahead-after-full-restart] both followers hold all 2100 records
+[29-leader-ahead-after-full-restart] leader sealed artifact passed vtopctl segment verify
+[29-leader-ahead-after-full-restart] follower-1 sealed artifact passed vtopctl segment verify
+[29-leader-ahead-after-full-restart] follower-2 sealed artifact passed vtopctl segment verify
+[29-leader-ahead-after-full-restart] workdir kept: /var/lib/kc599/s29/run3
+[29-leader-ahead-after-full-restart] PASS
+2026-11-24T05:42:31Z [s29] step run3: exit 0

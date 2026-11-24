@@ -7,13 +7,38 @@ How does VTOP's actual job, archiving telemetry to object storage under the comm
 
 | comparison | use cases | run | host class | plan | date | page |
 |---|---|---|---|---|---|---|
-| archive | (a), (d), (e) | not measured yet |  |  |  |  |
-| spool | (b), (d) | not measured yet |  |  |  |  |
-| link | (c) | not measured yet |  |  |  |  |
+| archive | (a), (d), (e) | `archive-store-kills-v0111` | dedicated | hosted-store-kills | 2026-11-23 | [full report](archive-comparison-store-kills.md) |
+| spool | (b), (d) | `spool-hosted-crash-v0111` | dedicated | hosted-crash | 2026-11-23 | [full report](spool-comparison-crash.md) |
+| link | (c) | `link-hosted-v0111` | hosted | hosted | 2026-11-23 | [full report](link-comparison.md) |
 
 ## Where VTOP is behind, level and ahead
 
-Nothing is measured yet, so this page makes no claim about VTOP. It is filled from the scoreboard of each use case as soon as a run is committed.
+Generated from the scoreboards below; "level" is within 5% of the best other system.
+
+- **(a) Kafka topic to object storage**
+    - archive: VTOP is behind on no metric.
+    - archive: VTOP is level on no metric.
+    - archive: VTOP is ahead on no metric.
+- **(b) Files and a syslog spool to object storage**
+    - spool: VTOP is behind on no metric.
+    - spool: VTOP is level on no metric.
+    - spool: VTOP is ahead on no metric.
+- **(c) Upload over a long, lossy or policed link**
+    - link: VTOP is behind on no metric.
+    - link: VTOP is level on: objects committed, wan100-policed (48 against aws-cli's 48).
+    - link: VTOP is ahead on no metric.
+- **(d) Crash safety**
+    - archive: VTOP is behind on no metric.
+    - archive: VTOP is level on: records lost (gaps), crash-K1, 1 KiB (0 against Kafka Connect S3 (Lenses)'s 0); records lost (gaps), crash-K2, 1 KiB (0 against Kafka Connect S3 (Lenses)'s 0); duplicate records, crash-K1, 1 KiB (0 against Kafka Connect S3 (Lenses)'s 0); duplicate records, crash-K2, 1 KiB (0 against Kafka Connect S3 (Lenses)'s 0).
+    - archive: VTOP is ahead on no metric.
+    - spool: VTOP is behind on no metric.
+    - spool: VTOP is level on: lines lost (gaps), crash-K1, file, rename (0 against Vector's 0); lines lost (gaps), crash-K3, file, rename (0 against Vector's 0); duplicate lines, crash-K3, file, rename (0 against Vector's 0).
+    - spool: VTOP is ahead on: duplicate lines, crash-K1, file, rename (0).
+    - spool: No comparison (a system had no usable value): lines lost (gaps), crash-K2, file, rename; duplicate lines, crash-K2, file, rename.
+- **(e) Verification**
+    - archive: VTOP is behind on no metric.
+    - archive: VTOP is level on no metric.
+    - archive: VTOP is ahead on no metric.
 
 ## (a) Kafka topic to object storage
 
@@ -23,24 +48,52 @@ How fast, and at what cost in CPU and store requests, does each tool move one pr
 
 Records and bytes of the source that are in the store when the backlog is drained.
 
-Not measured yet: no committed `archive` run yet. Every cell below is empty until one is committed; nothing is drawn and no number is implied.
+![(a) Drain throughput](summary/img/summary-a-throughput.png)
 
-| metric | cells | Kafka Connect S3 (Lenses) | VTOP | Vector |
+Source: `archive-store-kills-v0111` ([archive.csv](../../benchmarks/archive_compare/results/archive-store-kills-v0111/archive.csv)), the `archive` kind, plan `hosted-store-kills`, host class `dedicated`, 2026-11-23, VTOP `14edf8bc9519`.
+
+**records/s** (median, min-max of the repetitions)
+
+| cell | Kafka Connect S3 (Lenses) | VTOP | Vector | Vector disk-buffer (secondary) |
 |---|---|---|---|---|
-| records/s | drain | not measured yet | not measured yet | not measured yet |
-| MiB/s of source bytes | drain | not measured yet | not measured yet | not measured yet |
+
+**MiB/s of source bytes** (median, min-max of the repetitions)
+
+| cell | Kafka Connect S3 (Lenses) | VTOP | Vector | Vector disk-buffer (secondary) |
+|---|---|---|---|---|
+
+Scoreboard (each system in its primary profile; VTOP's row is always present):
+
+| metric | cell | best | best value | VTOP | VTOP / best | VTOP is |
+|---|---|---|---|---|---|---|
 
 ### (a) CPU and store requests per GiB archived
 
 CPU-seconds from the tool container's cgroup counters; PUT and GET from the store's own request counters. VTOP reads objects back by design.
 
-Not measured yet: no committed `archive` run yet. Every cell below is empty until one is committed; nothing is drawn and no number is implied.
+![(a) CPU and store requests per GiB archived](summary/img/summary-a-cost.png)
 
-| metric | cells | Kafka Connect S3 (Lenses) | VTOP | Vector |
+Source: `archive-store-kills-v0111` ([archive.csv](../../benchmarks/archive_compare/results/archive-store-kills-v0111/archive.csv)), the `archive` kind, plan `hosted-store-kills`, host class `dedicated`, 2026-11-23, VTOP `14edf8bc9519`.
+
+**CPU-seconds per GiB archived** (median, min-max of the repetitions)
+
+| cell | Kafka Connect S3 (Lenses) | VTOP | Vector | Vector disk-buffer (secondary) |
 |---|---|---|---|---|
-| CPU-seconds per GiB archived | drain | not measured yet | not measured yet | not measured yet |
-| PUT per GiB | drain | not measured yet | not measured yet | not measured yet |
-| GET per GiB | drain | not measured yet | not measured yet | not measured yet |
+
+**PUT per GiB** (median, min-max of the repetitions)
+
+| cell | Kafka Connect S3 (Lenses) | VTOP | Vector | Vector disk-buffer (secondary) |
+|---|---|---|---|---|
+
+**GET per GiB** (median, min-max of the repetitions)
+
+| cell | Kafka Connect S3 (Lenses) | VTOP | Vector | Vector disk-buffer (secondary) |
+|---|---|---|---|---|
+
+Scoreboard (each system in its primary profile; VTOP's row is always present):
+
+| metric | cell | best | best value | VTOP | VTOP / best | VTOP is |
+|---|---|---|---|---|---|---|
 
 ## (b) Files and a syslog spool to object storage
 
@@ -50,23 +103,47 @@ How fast, and at what cost, does each tool drain a backlog of rotated, seeded RF
 
 A pre-written backlog across rotated files, drained to quiescence.
 
-Not measured yet: no committed `spool` run yet. Every cell below is empty until one is committed; nothing is drawn and no number is implied.
+![(b) Drain throughput](summary/img/summary-b-throughput.png)
 
-| metric | cells | Fluent Bit | VTOP | Vector | OpenTelemetry Collector |
-|---|---|---|---|---|---|
-| lines/s | drain | not measured yet | not measured yet | not measured yet | not measured yet |
-| MiB/s of source bytes | drain | not measured yet | not measured yet | not measured yet | not measured yet |
+Source: `spool-hosted-crash-v0111` ([spool.csv](../../benchmarks/spool_compare/results/spool-hosted-crash-v0111/spool.csv)), the `spool` kind, plan `hosted-crash`, host class `dedicated`, 2026-11-23, VTOP `a7b4491e5b60`.
+
+**lines/s** (median, min-max of the repetitions)
+
+| cell | Fluent Bit | VTOP | Vector | Vector disk-buffer (secondary) |
+|---|---|---|---|---|
+
+**MiB/s of source bytes** (median, min-max of the repetitions)
+
+| cell | Fluent Bit | VTOP | Vector | Vector disk-buffer (secondary) |
+|---|---|---|---|---|
+
+Scoreboard (each system in its primary profile; VTOP's row is always present):
+
+| metric | cell | best | best value | VTOP | VTOP / best | VTOP is |
+|---|---|---|---|---|---|---|
 
 ### (b) CPU and memory
 
 The tool container's cgroup counters over the drain window; RSS is the sampled peak.
 
-Not measured yet: no committed `spool` run yet. Every cell below is empty until one is committed; nothing is drawn and no number is implied.
+![(b) CPU and memory](summary/img/summary-b-cost.png)
 
-| metric | cells | Fluent Bit | VTOP | Vector | OpenTelemetry Collector |
-|---|---|---|---|---|---|
-| CPU-seconds per GiB | drain | not measured yet | not measured yet | not measured yet | not measured yet |
-| peak RSS (sampled), bytes | drain | not measured yet | not measured yet | not measured yet | not measured yet |
+Source: `spool-hosted-crash-v0111` ([spool.csv](../../benchmarks/spool_compare/results/spool-hosted-crash-v0111/spool.csv)), the `spool` kind, plan `hosted-crash`, host class `dedicated`, 2026-11-23, VTOP `a7b4491e5b60`.
+
+**CPU-seconds per GiB** (median, min-max of the repetitions)
+
+| cell | Fluent Bit | VTOP | Vector | Vector disk-buffer (secondary) |
+|---|---|---|---|---|
+
+**peak RSS (sampled), bytes** (median, min-max of the repetitions)
+
+| cell | Fluent Bit | VTOP | Vector | Vector disk-buffer (secondary) |
+|---|---|---|---|---|
+
+Scoreboard (each system in its primary profile; VTOP's row is always present):
+
+| metric | cell | best | best value | VTOP | VTOP / best | VTOP is |
+|---|---|---|---|---|---|---|
 
 ## (c) Upload over a long, lossy or policed link
 
@@ -76,32 +153,62 @@ How much of a 100 ms, 10 Mbit/s, lossy or policed link does each tool use, how m
 
 Fraction of the link reference, end to end.
 
-Not measured yet: no committed `link` run yet. Every cell below is empty until one is committed; nothing is drawn and no number is implied.
+![(c) Goodput at documented defaults](summary/img/summary-c-goodput.png)
 
-| metric | cells | aws-cli | VTOP | rclone | s5cmd |
-|---|---|---|---|---|---|
-| goodput, fraction of the link | defaults | not measured yet | not measured yet | not measured yet | not measured yet |
+Source: `link-hosted-v0111` ([link.csv](../../benchmarks/link_compare/results/link-hosted-v0111/link.csv)), the `link` kind, plan `hosted`, host class `hosted`, 2026-11-23, VTOP `a7b4491e5b60`.
+
+**goodput, fraction of the link** (median, min-max of the repetitions)
+
+| cell | aws-cli | VTOP | rclone | s5cmd |
+|---|---|---|---|---|
+
+Scoreboard (each system in its primary profile; VTOP's row is always present):
+
+| metric | cell | best | best value | VTOP | VTOP / best | VTOP is |
+|---|---|---|---|---|---|---|
 
 ### (c) Objects committed of N
 
 Judged by the harness's read-back and sha256, never a tool's exit code.
 
-Not measured yet: no committed `link` run yet. Every cell below is empty until one is committed; nothing is drawn and no number is implied.
+![(c) Objects committed of N](summary/img/summary-c-committed.png)
 
-| metric | cells | aws-cli | VTOP | rclone | s5cmd |
-|---|---|---|---|---|---|
-| objects committed | defaults, committed | not measured yet | not measured yet | not measured yet | not measured yet |
+Source: `link-hosted-v0111` ([link.csv](../../benchmarks/link_compare/results/link-hosted-v0111/link.csv)), the `link` kind, plan `hosted`, host class `hosted`, 2026-11-23, VTOP `a7b4491e5b60`.
+
+**objects committed** (median, min-max of the repetitions)
+
+| cell | aws-cli | VTOP | rclone | s5cmd |
+|---|---|---|---|---|
+| wan100-policed | 48 | 48 | failed | 48 |
+
+Scoreboard (each system in its primary profile; VTOP's row is always present):
+
+| metric | cell | best | best value | VTOP | VTOP / best | VTOP is |
+|---|---|---|---|---|---|---|
+| objects committed | wan100-policed | aws-cli | 48 | 48 | 1.00 | level |
 
 ### (c) Bytes on the wire and CPU
 
 Wire bytes from the middlebox's interface counters; CPU from the tool container's cgroup.
 
-Not measured yet: no committed `link` run yet. Every cell below is empty until one is committed; nothing is drawn and no number is implied.
+![(c) Bytes on the wire and CPU](summary/img/summary-c-cost.png)
 
-| metric | cells | aws-cli | VTOP | rclone | s5cmd |
-|---|---|---|---|---|---|
-| wire bytes per payload byte | defaults | not measured yet | not measured yet | not measured yet | not measured yet |
-| CPU-seconds per GiB | defaults | not measured yet | not measured yet | not measured yet | not measured yet |
+Source: `link-hosted-v0111` ([link.csv](../../benchmarks/link_compare/results/link-hosted-v0111/link.csv)), the `link` kind, plan `hosted`, host class `hosted`, 2026-11-23, VTOP `a7b4491e5b60`.
+
+**wire bytes per payload byte** (median, min-max of the repetitions)
+
+| cell | aws-cli | VTOP | rclone | s5cmd |
+|---|---|---|---|---|
+
+**CPU-seconds per GiB** (median, min-max of the repetitions)
+
+| cell | aws-cli | VTOP | rclone | s5cmd |
+|---|---|---|---|---|
+
+Scoreboard (each system in its primary profile; VTOP's row is always present):
+
+| metric | cell | best | best value | VTOP | VTOP / best | VTOP is |
+|---|---|---|---|---|---|---|
 
 ## (d) Crash safety
 
@@ -111,23 +218,67 @@ After a kill -9, run to quiescence, what is missing from the bucket (gaps) and w
 
 Summed over the runs; K1 at the start of a PUT, K2 right after the store answered it, K3 at a seeded time.
 
-Not measured yet: no committed `archive` run yet. Every cell below is empty until one is committed; nothing is drawn and no number is implied.
+![(d) Kafka to object storage: what a kill -9 costs](summary/img/summary-d-archive-crash.png)
 
-| metric | cells | Kafka Connect S3 (Lenses) | VTOP | Vector |
+Source: `archive-store-kills-v0111` ([archive.csv](../../benchmarks/archive_compare/results/archive-store-kills-v0111/archive.csv)), the `archive` kind, plan `hosted-store-kills`, host class `dedicated`, 2026-11-23, VTOP `14edf8bc9519`.
+
+**records lost (gaps)** (sum over the repetitions)
+
+| cell | Kafka Connect S3 (Lenses) | VTOP | Vector | Vector disk-buffer (secondary) |
 |---|---|---|---|---|
-| records lost (gaps) | crash-K1, crash-K2, crash-K3 | not measured yet | not measured yet | not measured yet |
-| duplicate records | crash-K1, crash-K2, crash-K3 | not measured yet | not measured yet | not measured yet |
+| crash-K1, 1 KiB | 0 | 0 | 0 | 0 |
+| crash-K2, 1 KiB | 0 | 0 | 0 | 934 |
+
+**duplicate records** (sum over the repetitions)
+
+| cell | Kafka Connect S3 (Lenses) | VTOP | Vector | Vector disk-buffer (secondary) |
+|---|---|---|---|---|
+| crash-K1, 1 KiB | 0 | 0 | 0 | 104,128 |
+| crash-K2, 1 KiB | 0 | 0 | 154,863 | 128,605 |
+
+Scoreboard (each system in its primary profile; VTOP's row is always present):
+
+| metric | cell | best | best value | VTOP | VTOP / best | VTOP is |
+|---|---|---|---|---|---|---|
+| records lost (gaps) | crash-K1, 1 KiB | Kafka Connect S3 (Lenses) | 0 | 0 |  | level |
+| records lost (gaps) | crash-K2, 1 KiB | Kafka Connect S3 (Lenses) | 0 | 0 |  | level |
+| duplicate records | crash-K1, 1 KiB | Kafka Connect S3 (Lenses) | 0 | 0 |  | level |
+| duplicate records | crash-K2, 1 KiB | Kafka Connect S3 (Lenses) | 0 | 0 |  | level |
 
 ### (d) Spool to object storage: what a kill -9 and a rotation cost
 
 Summed over the runs; K1 to K3 as above, K4 inside a seeded window after a rotation.
 
-Not measured yet: no committed `spool` run yet. Every cell below is empty until one is committed; nothing is drawn and no number is implied.
+![(d) Spool to object storage: what a kill -9 and a rotation cost](summary/img/summary-d-spool-crash.png)
 
-| metric | cells | Fluent Bit | VTOP | Vector | OpenTelemetry Collector |
-|---|---|---|---|---|---|
-| lines lost (gaps) | crash-K1, crash-K2, crash-K3, crash-K4-rotation, down-while-rotating | not measured yet | not measured yet | not measured yet | not measured yet |
-| duplicate lines | crash-K1, crash-K2, crash-K3, crash-K4-rotation, down-while-rotating | not measured yet | not measured yet | not measured yet | not measured yet |
+Source: `spool-hosted-crash-v0111` ([spool.csv](../../benchmarks/spool_compare/results/spool-hosted-crash-v0111/spool.csv)), the `spool` kind, plan `hosted-crash`, host class `dedicated`, 2026-11-23, VTOP `a7b4491e5b60`.
+
+**lines lost (gaps)** (sum over the repetitions)
+
+| cell | Fluent Bit | VTOP | Vector | Vector disk-buffer (secondary) |
+|---|---|---|---|---|
+| crash-K1, file, rename | 10,106 | 0 | 0 | 0 |
+| crash-K2, file, rename | 17,930 | failed | 0 | 0 |
+| crash-K3, file, rename | 16,789 | 0 | 0 | 0 |
+
+**duplicate lines** (sum over the repetitions)
+
+| cell | Fluent Bit | VTOP | Vector | Vector disk-buffer (secondary) |
+|---|---|---|---|---|
+| crash-K1, file, rename | 158,925 | 0 | 411,752 | 1,305,872 |
+| crash-K2, file, rename | 265,690 | failed | 636,344 | 1,517,281 |
+| crash-K3, file, rename | 55,583 | 0 | 0 | 837 |
+
+Scoreboard (each system in its primary profile; VTOP's row is always present):
+
+| metric | cell | best | best value | VTOP | VTOP / best | VTOP is |
+|---|---|---|---|---|---|---|
+| lines lost (gaps) | crash-K1, file, rename | Vector | 0 | 0 |  | level |
+| lines lost (gaps) | crash-K2, file, rename | Vector | 0 | failed |  | no comparison |
+| lines lost (gaps) | crash-K3, file, rename | Vector | 0 | 0 |  | level |
+| duplicate lines | crash-K1, file, rename | VTOP | 0 | 0 |  | ahead |
+| duplicate lines | crash-K2, file, rename | Fluent Bit | 265,690 | failed |  | no comparison |
+| duplicate lines | crash-K3, file, rename | Vector | 0 | 0 |  | level |
 
 ## (e) Verification
 
@@ -137,34 +288,50 @@ What does each tool establish about a stored object before it moves its source c
 
 The tap flips one bit in one read-back in ten. Corrupt objects the source cursor moved past; zero means every one was noticed first.
 
-Not measured yet: no committed `archive` run yet. Every cell below is empty until one is committed; nothing is drawn and no number is implied.
+![(e) A corrupted read-back](summary/img/summary-e-fault.png)
 
-| metric | cells | Kafka Connect S3 (Lenses) | VTOP | Vector |
+Source: `archive-store-kills-v0111` ([archive.csv](../../benchmarks/archive_compare/results/archive-store-kills-v0111/archive.csv)), the `archive` kind, plan `hosted-store-kills`, host class `dedicated`, 2026-11-23, VTOP `14edf8bc9519`.
+
+**corrupt objects committed past** (sum over the repetitions)
+
+| cell | Kafka Connect S3 (Lenses) | VTOP | Vector | Vector disk-buffer (secondary) |
 |---|---|---|---|---|
-| corrupt objects committed past | verify-fault | not measured yet | not measured yet | not measured yet |
+
+Scoreboard (each system in its primary profile; VTOP's row is always present):
+
+| metric | cell | best | best value | VTOP | VTOP / best | VTOP is |
+|---|---|---|---|---|---|---|
 
 ### (e) What reading back costs
 
 GET requests per GiB archived: the extra requests of a tool that reads objects back.
 
-Not measured yet: no committed `archive` run yet. Every cell below is empty until one is committed; nothing is drawn and no number is implied.
+![(e) What reading back costs](summary/img/summary-e-readback-cost.png)
 
-| metric | cells | Kafka Connect S3 (Lenses) | VTOP | Vector |
+Source: `archive-store-kills-v0111` ([archive.csv](../../benchmarks/archive_compare/results/archive-store-kills-v0111/archive.csv)), the `archive` kind, plan `hosted-store-kills`, host class `dedicated`, 2026-11-23, VTOP `14edf8bc9519`.
+
+**GET per GiB** (median, min-max of the repetitions)
+
+| cell | Kafka Connect S3 (Lenses) | VTOP | Vector | Vector disk-buffer (secondary) |
 |---|---|---|---|---|
-| GET per GiB | drain | not measured yet | not measured yet | not measured yet |
+
+Scoreboard (each system in its primary profile; VTOP's row is always present):
+
+| metric | cell | best | best value | VTOP | VTOP / best | VTOP is |
+|---|---|---|---|---|---|---|
 
 ## Products, versions and licences
 
 | product | role | licence | version | profile drawn (what its commit means) | use cases | evidence |
 |---|---|---|---|---|---|---|
-| Kafka Connect S3 (Lenses) | comparand | Apache-2.0 | 12.1.2 (pinned, not run yet) |  | (a), (d), (e) | [licence](https://github.com/lensesio/stream-reactor/blob/master/LICENSE), read 2026-11-14; publish_ok true |
-| VTOP | subject | MIT | commit under test |  | (a), (b), (c), (d), (e) | [licence](https://github.com/allamiro/vtop-engine/blob/main/LICENSE), read 2026-11-22; publish_ok true |
-| Vector | comparand | MPL-2.0 | 0.61.0 (pinned, not run yet) |  | (a), (b), (d), (e) | [licence](https://github.com/vectordotdev/vector/blob/master/LICENSE), read 2026-11-14; publish_ok true |
-| Fluent Bit | comparand | Apache-2.0 | 5.2.0 (pinned, not run yet) |  | (b), (d) | [licence](https://github.com/fluent/fluent-bit/blob/master/LICENSE), read 2026-11-14; publish_ok true |
+| Kafka Connect S3 (Lenses) | comparand | Apache-2.0 | 12.1.2 | `exactly-once` | (a), (d), (e) | [licence](https://github.com/lensesio/stream-reactor/blob/master/LICENSE), read 2026-11-14; publish_ok true |
+| VTOP | subject | MIT | commit 14edf8bc9519, commit a7b4491e5b60 | `strong` | (a), (b), (c), (d), (e) | [licence](https://github.com/allamiro/vtop-engine/blob/main/LICENSE), read 2026-11-22; publish_ok true |
+| Vector | comparand | MPL-2.0 | 0.61.0 | `acks` | (a), (b), (d), (e) | [licence](https://github.com/vectordotdev/vector/blob/master/LICENSE), read 2026-11-14; publish_ok true |
+| Fluent Bit | comparand | Apache-2.0 | 5.2.0 | `durable` | (b), (d) | [licence](https://github.com/fluent/fluent-bit/blob/master/LICENSE), read 2026-11-14; publish_ok true |
 | OpenTelemetry Collector | comparand | Apache-2.0 | 0.165.0 (pinned, not run yet) |  | (b), (d) | [licence](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/LICENSE), read 2026-11-14; publish_ok true |
-| aws-cli | comparand | Apache-2.0 | 2.40.3 (pinned, not run yet) |  | (c) | [licence](https://github.com/aws/aws-cli/blob/v2/LICENSE.txt), read 2026-11-14; publish_ok true |
-| rclone | comparand | MIT | 1.76.0 (pinned, not run yet) |  | (c) | [licence](https://github.com/rclone/rclone/blob/master/COPYING), read 2026-11-14; publish_ok true |
-| s5cmd | comparand | MIT | 2.3.0 (pinned, not run yet) |  | (c) | [licence](https://github.com/peak/s5cmd/blob/master/LICENSE), read 2026-11-14; publish_ok true |
+| aws-cli | comparand | Apache-2.0 | 2.40.3 | `exit-code` | (c) | [licence](https://github.com/aws/aws-cli/blob/v2/LICENSE.txt), read 2026-11-14; publish_ok true |
+| rclone | comparand | MIT | 1.76.0 | `size-and-checksum` | (c) | [licence](https://github.com/rclone/rclone/blob/master/COPYING), read 2026-11-14; publish_ok true |
+| s5cmd | comparand | MIT | 2.3.0 | `exit-code` | (c) | [licence](https://github.com/peak/s5cmd/blob/master/LICENSE), read 2026-11-14; publish_ok true |
 | Apache Kafka (the source) | source | Apache-2.0 | 4.3.2 (pinned, not run yet) |  | (a) | [licence](https://github.com/apache/kafka/blob/trunk/LICENSE), read 2026-11-14; publish_ok true |
 
 ## Fairness rules
@@ -201,6 +368,9 @@ Rules 1 to 10 are the Kafka comparison's (#595) with "Kafka" read as "every othe
 - **Defaults and documented best configurations only.** A tool configured differently, or tuned beyond the documented grid, may do better or worse.
 - **Products that are not run.** A product whose terms forbid publishing benchmark results, restrict testing it for competitive purposes, or leave that unclear is never run for a published chart (rule 11).
 - **Power-cut survival, other brokers, and other limit classes** are not measured here.
+- **The `archive` run:** plan `hosted-store-kills`, host class `dedicated`, store MinIO (lab build, upstream archived), host Intel(R) Xeon(R) Platinum 8375C CPU @ 2.90GHz (16 logical CPUs), per tool 2 CPUs, 2g, no swap.
+- **The `spool` run:** plan `hosted-crash`, host class `dedicated`, store MinIO (lab build, upstream archived), host Intel(R) Xeon(R) Platinum 8375C CPU @ 2.90GHz (16 logical CPUs), per tool 2 CPUs, 2g, no swap.
+- **The `link` run:** plan `hosted`, host class `hosted`, store MinIO (lab build, upstream archived), host Intel(R) Xeon(R) Platinum 8375C CPU @ 2.90GHz (16 logical CPUs), per tool 2 CPUs, 2g, no swap.
 
 ## Regenerating this page
 

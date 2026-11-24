@@ -149,9 +149,7 @@ markdown_extensions:
 # it only once a crash run is committed.
 not_in_nav: |
   /benchmarks/archive-comparison.md
-  /benchmarks/link-comparison.md
   /benchmarks/spool-comparison.md
-  /benchmarks/kafka-crash.md
 
 nav:
   - Home: index.md
@@ -235,7 +233,14 @@ nav:
       - Comparison summary: benchmarks/comparison-summary.md
       - Kafka comparison: benchmarks/kafka-comparison.md
       - Kafka failover: benchmarks/kafka-failover.md
-      - AWS results, v0.11.0: benchmarks/aws-v0.11.0.md
+      - AWS results, v0.11.1: benchmarks/aws-v0.11.1.md
+      - Kafka whole-replica-set crash: benchmarks/kafka-crash.md
+      - Archive comparison, store kills: benchmarks/archive-comparison-store-kills.md
+      - Archive comparison, time kills and fault: benchmarks/archive-comparison-time-kills-fault.md
+      - Link comparison: benchmarks/link-comparison.md
+      - Spool comparison, crash: benchmarks/spool-comparison-crash.md
+      - Spool comparison, rotation: benchmarks/spool-comparison-rotation.md
+      - AWS plan, v0.11.0: benchmarks/aws-v0.11.0.md
       - Throughput research: THROUGHPUT_RESEARCH.md
       - Egress transport research: EGRESS_TRANSPORT_RESEARCH.md
       - Fetch I/O research: FETCH_IO_RESEARCH.md

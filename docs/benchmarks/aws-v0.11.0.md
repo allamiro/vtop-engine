@@ -1,11 +1,9 @@
 # AWS results, v0.11.0
 
 > [!IMPORTANT]
-> **This page is a skeleton, written before the round ran.** It states the method and the limits now; the results
-> are added when they arrive. Every **FILL** marker below is a place that stays empty until its run is committed and
-> its generated page exists, and the page states no result while a marker is in the way. The numbers are never typed
-> here: each benchmark's tables and charts are generated from its committed CSV by the repository's generators, and
-> this page links them and says what they do and do not show.
+> **The round ran on v0.11.1, and its results are in [AWS results, v0.11.1](aws-v0.11.1.md).** This page is the
+> plan as it was written before the round, kept for its method and its limits; its **FILL** markers are answered on
+> the v0.11.1 page, not here.
 
 The v0.11.0 release is tested on AWS in one round: the engine soak, the live S3 suite, and the benchmark harnesses
 that need a dedicated Linux host. Each benchmark runs once on its host (twice where its section says so), its raw
